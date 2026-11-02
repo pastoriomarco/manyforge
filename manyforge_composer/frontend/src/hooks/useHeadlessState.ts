@@ -9,6 +9,13 @@ import { verifiedNoPhysicalComponents } from '../state/viewerModelReadiness';
 import { EMPTY_OPERATION_PROGRESS, parseOperationProgress, type OperationProgressSample } from '../utils/operationProgress';
 import { parseGlobalRuleStatus, type GlobalRuleStatus } from '../utils/globalRuleStatus';
 import {
+  parseCellLatch,
+  parseComponentStates,
+  parseRunReadiness,
+  parseSignalSamples,
+} from '../api/parsers/components';
+import type { CellState } from '../types/components';
+import {
   parseApiErrorDto,
   parseKnownProgramRunOutcome,
   parseAuthoringWorkspaceContainment,
@@ -269,7 +276,6 @@ export type ExecutionControlCommandKind =
   | 'operation_acknowledge_completed'
   | 'cell_full_stop'
   | 'execution_recovery'
-  | 'stop_recovery'
   | 'runtime_scale';
 
 const EXECUTION_OWNER_FENCED_COMMANDS = new Set<ExecutionControlCommandKind>([
@@ -278,7 +284,6 @@ const EXECUTION_OWNER_FENCED_COMMANDS = new Set<ExecutionControlCommandKind>([
   'operation_reset',
   'operation_acknowledge_completed',
   'cell_full_stop',
-  'stop_recovery',
   'runtime_scale',
 ]);
 
@@ -794,6 +799,9 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     deliveryTimer: ReturnType<typeof setTimeout> | null;
   }>();
   private readonly clientIncidents = new Map<ControlClientIncidentKind, ClientIncidentState>();
+  // Resolutions of reported activations that found no open session; each is
+  // sent once on the next server hello.
+  private readonly unsentClientIncidentResolutions: ClientIncidentState[] = [];
   private observationSerial = 0;
   private observationSocket: WebSocket | null = null;
   private observationReconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -846,6 +854,11 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     return () => this.operationProgressListeners.delete(listener);
   };
   readonly subscribeGlobalRules = this.subscribeOperationProgress;
+  // The pushed cell facts (CONTRACTS §1, §5, §7, §10); they share the
+  // progress listeners (all are event-pump facts beside the shell).
+  private cellState: CellState = EMPTY_CELL_STATE;
+  readonly getCellState = () => this.cellState;
+  readonly subscribeCellState = this.subscribeOperationProgress;
   private readonly viewerListeners = new Set<Listener>();
   private readonly executionObservationListeners = new Set<Listener>();
   private readonly observationTransportListeners = new Set<Listener>();
@@ -1197,7 +1210,9 @@ export class HeadlessStateSource implements ExecutionObservationReader {
       return;
     }
     if (existing === undefined) return;
-    this.sendClientIncidentTransition(existing, 'resolved');
+    if (!this.sendClientIncidentTransition(existing, 'resolved') && existing.activationSent) {
+      this.unsentClientIncidentResolutions.push(existing);
+    }
     this.clientIncidents.delete(kind);
   };
 
@@ -1356,6 +1371,7 @@ export class HeadlessStateSource implements ExecutionObservationReader {
   private clearControlSession(reason: string): void {
     this.operationProgress = EMPTY_OPERATION_PROGRESS;
     this.globalRules = null;
+    this.cellState = EMPTY_CELL_STATE;
     for (const listener of this.operationProgressListeners) listener();
     this.controlSessionId = null;
     this.controlReceiverIncarnation = null;
@@ -1467,6 +1483,9 @@ export class HeadlessStateSource implements ExecutionObservationReader {
           for (const incident of this.clientIncidents.values()) {
             incident.activationSent = false;
             this.sendClientIncidentTransition(incident, 'activated');
+          }
+          for (const incident of this.unsentClientIncidentResolutions.splice(0)) {
+            this.sendClientIncidentTransition(incident, 'resolved');
           }
           this.refreshControlCondition();
           this.scheduleControlHeartbeatWatch(serial, socket);
@@ -1738,7 +1757,10 @@ export class HeadlessStateSource implements ExecutionObservationReader {
       const globalRules = globalRulesPresent
         ? parseGlobalRuleStatus(shellRecord.global_rules) : null;
       delete shellRecord.global_rules;
-      const progressOnly = kind === 'delta' && (progressPresent || globalRulesPresent)
+      const cellFacts = parseCellFacts(shellRecord);
+      for (const name of CELL_FACT_KEYS) delete shellRecord[name];
+      const cellFactsPresent = Object.keys(cellFacts).length > 0;
+      const progressOnly = kind === 'delta' && (progressPresent || globalRulesPresent || cellFactsPresent)
         && Object.keys(shellRecord).every((name) => name === 'complete');
       let candidate: ComposerHeadlessState;
       let candidateExecutionTargetsWire = this.executionTargetsWire;
@@ -1890,11 +1912,16 @@ export class HeadlessStateSource implements ExecutionObservationReader {
         || record.event_class === 'critical'
         || !sameShellPublication(this.latest, candidate));
       this.latest = candidate;
-      if (progressPresent || globalRulesPresent || kind === 'snapshot') {
+      if (progressPresent || globalRulesPresent || cellFactsPresent || kind === 'snapshot') {
         if (progressPresent || kind === 'snapshot') {
           this.operationProgress = progress ?? EMPTY_OPERATION_PROGRESS;
         }
         if (globalRulesPresent || kind === 'snapshot') this.globalRules = globalRules;
+        if (cellFactsPresent || kind === 'snapshot') {
+          this.cellState = kind === 'snapshot'
+            ? { ...EMPTY_CELL_STATE, ...cellFacts }
+            : { ...this.cellState, ...cellFacts };
+        }
         for (const listener of this.operationProgressListeners) listener();
       }
       if (canonicalPositiveU64(record.state_sequence)) {
@@ -1956,16 +1983,17 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     );
   }
 
+  /** True when the transition was sent on the current session. */
   private sendClientIncidentTransition(
     incident: ClientIncidentState,
     phase: 'activated' | 'resolved',
-  ): void {
+  ): boolean {
     const socket = this.socket;
     const sessionId = this.controlSessionId;
     if (socket === null || socket.readyState !== WebSocket.OPEN || sessionId === null) {
-      return;
+      return false;
     }
-    if (phase === 'resolved' && !incident.activationSent) return;
+    if (phase === 'resolved' && !incident.activationSent) return false;
     this.controlClientSequence += 1;
     const elapsedNs = Math.max(
       0,
@@ -1985,10 +2013,12 @@ export class HeadlessStateSource implements ExecutionObservationReader {
         reason_code: phase === 'activated' ? incident.reasonCode : 'client_incident_recovered',
       }));
       if (phase === 'activated') incident.activationSent = true;
+      return true;
     } catch {
       // The connection classifier owns transport failure. Keep an unsent
       // activation in memory so a later session can report it once.
       if (phase === 'activated') incident.activationSent = false;
+      return false;
     }
   }
 
@@ -2041,10 +2071,15 @@ export class HeadlessStateSource implements ExecutionObservationReader {
       const activeSockets = headlessQualificationSnapshot().activeSockets;
       headlessMaxActiveSockets = Math.max(headlessMaxActiveSockets, activeSockets);
       publishHeadlessQualification();
-      this.publishObservationTransportStatus(
-        'waiting',
-        'Waiting for the first current measured-state sample.',
-      );
+      // An open socket is not a recovered view: a reconnect stays
+      // ``reconnecting`` until its first current sample, so a socket the
+      // source keeps closing is one stale condition, not one per attempt.
+      if (this.observationTransportStatus.phase !== 'reconnecting') {
+        this.publishObservationTransportStatus(
+          'waiting',
+          'Waiting for the first current measured-state sample.',
+        );
+      }
       // A fresh transport always asks for the current complete frame. It does
       // not request or replay motion missed while hidden or disconnected.
       this.sendObservationCredit(null);
@@ -2510,6 +2545,34 @@ export class HeadlessStateSource implements ExecutionObservationReader {
     // Cold/control changes must not strand an independently credited joint
     // frame. Observation teardown owns cancellation of that separate plane.
   }
+}
+
+const EMPTY_CELL_STATE: CellState = { components: null, latch: null, io: null, readiness: null };
+/** `/ws/control` event names (CONTRACTS §1, §5, §7, §10), carried as shell facts. */
+const CELL_FACT_KEYS = ['component_state', 'cell_latch', 'io_signals', 'run_readiness'] as const;
+
+/** Each cell fact the message carries; a null value means "not known". */
+function parseCellFacts(shell: Record<string, unknown>): Partial<CellState> {
+  const facts: Partial<CellState> = {};
+  const value = (name: typeof CELL_FACT_KEYS[number]) => shell[name];
+  if ('component_state' in shell) {
+    facts.components = value('component_state') === null ? null : parseComponentStates(value('component_state'), 'component_state');
+  }
+  if ('cell_latch' in shell) {
+    facts.latch = value('cell_latch') === null ? null : parseCellLatch(value('cell_latch'));
+  }
+  if ('io_signals' in shell) {
+    facts.io = value('io_signals') === null ? null : parseSignalSamples(value('io_signals'));
+  }
+  if ('run_readiness' in shell) {
+    facts.readiness = value('run_readiness') === null ? null : parseRunReadiness(value('run_readiness'));
+  }
+  return facts;
+}
+
+/** The pushed component states, cell latch, I/O samples and run readiness. */
+export function useCellState(source: HeadlessStateSource): CellState {
+  return useSyncExternalStore(source.subscribeCellState, source.getCellState, source.getCellState);
 }
 
 export function useHeadlessStateSource(enabled: boolean): HeadlessStateSource {

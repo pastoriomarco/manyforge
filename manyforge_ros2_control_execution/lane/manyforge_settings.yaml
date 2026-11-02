@@ -1,0 +1,27 @@
+# Mock lane: ManyForge's settings, each with its reason (CONTRACTS §12).
+# The Mock adapter's launch contribution (manyforge_roboplan
+# src/mock_lane.cpp) uses exactly these values; its test compares them.
+
+hardware:
+  # Stock mock hardware: mirrors every command into its state, so a Mock
+  # robot moves exactly as commanded with no device.
+  plugin: mock_components/GenericSystem
+  parameters:
+    # Velocity and acceleration states follow the commanded positions, so the
+    # controller's reported state (and its reference after a cancel) is the
+    # same shape as on a real robot.
+    calculate_dynamics: "true"
+  # Position commands only: the JTC of every Mock controllers file claims
+  # position.
+  joint_command_interfaces: [position]
+  # The hardware's position state starts at the Deployment's initial joint
+  # positions (instance values; the generator writes `initial_value`).
+
+# `reset_position` (Mock keeps it): a stock ForwardCommandController loaded
+# inactive next to the arm's JTC. Reset switches JTC off and the writer on,
+# publishes the Deployment's initial pose once, waits for the hardware to
+# report it, then switches back. Its name carries a digest of the exact
+# target, so a late message can only repeat the same target.
+reset_position_writer:
+  type: forward_command_controller/ForwardCommandController
+  interface_name: position

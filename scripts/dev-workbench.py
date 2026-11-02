@@ -294,6 +294,12 @@ def _ensure_current_ros_backend() -> tuple[Path, Path]:
     # overlay before spawning the Runner or Manager; Manager's installed-target
     # children inherit this same environment through their existing protocol.
     os.environ.update(_ros_setup_environment((overlay,), environment))
+    # The execution host loads its adapter families from the build tree's
+    # ament prefix (CONTRACTS §6).
+    os.environ["AMENT_PREFIX_PATH"] = os.pathsep.join(
+        path for path in (str(ros_build / "ament_cmake_index"),
+                          os.environ.get("AMENT_PREFIX_PATH", "")) if path
+    )
     return targets
 
 
@@ -719,9 +725,12 @@ class Workbench:
         command: Sequence[str],
         *,
         cwd: Path | None = None,
+        environment: dict[str, str] | None = None,
     ) -> None:
         print(f"starting {name}: {' '.join(command)}", flush=True)
-        process = subprocess.Popen(command, cwd=cwd, env=os.environ.copy())
+        process = subprocess.Popen(
+            command, cwd=cwd, env={**os.environ, **(environment or {})}
+        )
         self.processes.append((name, process))
 
     def _paths(self) -> dict[str, Path]:
@@ -1045,6 +1054,11 @@ class Workbench:
                 "--scene-asset-root",
                 str(WORKSPACE),
             ) + self._site_manager_arguments(),
+            # The execution host and its component processes inherit it: a
+            # point-cloud source sends its clouds to this Composer.
+            environment={
+                "MANYFORGE_COMPOSER_URL": f"http://127.0.0.1:{self.composer_port}"
+            },
         )
         self._wait_until(
             "Manager command socket",

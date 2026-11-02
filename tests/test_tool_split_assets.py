@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -16,7 +15,6 @@ sys.path.insert(0, str(ROOT / "scripts" / "models"))
 sys.path.insert(0, str(ROOT))
 
 import cut_combined_model  # noqa: E402
-from scripts.components import mock_controller_profiles  # noqa: E402
 
 MODELS = ROOT / "manyforge_example_models" / "models"
 MAINTAINED = ROOT / "manyforge_deployment" / "resources" / "maintained"
@@ -34,42 +32,12 @@ CUTS = (
 ARMS = ("lite6", "uf850", "ur10e", "ur5e")
 TOOLS = ("lite_gripper", "xarm_gripper", "robotiq_2f_140", "robotiq_2f_85")
 
-# D5: old profile id -> new id (absent: removed); new ids not listed are new.
-RENAMED = {
-    "lite6_isaac_commanded_v0": "lite6_isaac_commanded_v0",
-    "lite6_mock_commanded_v0": "lite6_mock_commanded_v0",
-    "lite6_real_measured_v0": "lite6_real_measured_v0",
-    "uf850_xarm_gripper_mock_commanded_v0": "uf850_mock_commanded_v0",
-    "ur10e_robotiq_assistant_isaac_commanded_v0": "ur10e_assistant_isaac_commanded_v0",
-    "ur10e_robotiq_assistant_mock_commanded_v0": "ur10e_assistant_mock_commanded_v0",
-    "ur10e_robotiq_isaac_commanded_v0": "ur10e_isaac_commanded_v0",
-    "ur10e_robotiq_mock_commanded_v0": "ur10e_mock_commanded_v0",
-    "ur5e_robotiq_mock_commanded_v0": "ur5e_mock_commanded_v0",
-}
-TOOL_PROFILES = {
-    "lite_gripper_isaac_commanded_v0": ("lite_gripper", "isaac_profile"),
-    "lite_gripper_mock_commanded_v0": ("lite_gripper", "mock_profile"),
-    "lite_gripper_pneumatic_v0": ("lite_gripper", None),
-    "robotiq_2f_140_isaac_commanded_v0": ("robotiq_2f_140", "isaac_profile"),
-    "robotiq_2f_140_mock_commanded_v0": ("robotiq_2f_140", "mock_profile"),
-    "robotiq_2f_85_mock_commanded_v0": ("robotiq_2f_85", "mock_profile"),
-    "xarm_gripper_mock_commanded_v0": ("xarm_gripper", "mock_profile"),
-}
-
-
 def _description() -> dict:
     return json.loads((MAINTAINED / "maintained_deployment_sources.v1.json").read_text())
 
 
 def _families() -> dict[str, dict]:
     return {row["model_family_id"]: row for row in _description()["model_families"]}
-
-
-def _profiles() -> dict[str, dict]:
-    return {
-        row["runtime_restoration_profile_id"]: row
-        for row in _description()["runtime_restoration_profiles"]
-    }
 
 
 def _normalized(element: ET.Element) -> bytes:
@@ -153,6 +121,61 @@ def test_only_collision_pairs_across_the_mount_are_dropped(
     for pair in pairs(MODELS / combined / f"{stem}.srdf"):
         crosses = (pair[0] in arm_links) != (pair[1] in arm_links)
         assert crosses != (pair in arm_pairs or pair in tool_pairs), pair
+
+
+def _rigid_group(urdf: Path, start: str) -> set[str]:
+    joints = [(joint.find("parent").get("link"), joint.find("child").get("link"))
+              for joint in ET.parse(urdf).getroot().findall("joint")
+              if joint.get("type") == "fixed"]
+    group = {start}
+    while True:
+        grown = {b for a, b in joints if a in group} | {a for a, b in joints if b in group}
+        if grown <= group:
+            return group
+        group |= grown
+
+
+# MOUNT_COLLISION_EXCLUSIONS_PLAN: with the mount pairs the composer adds
+# (parent group x child group, Adjacent), every example's authored
+# collision_exclusions restore exactly the arm-tool pairs of the combined SRDF
+# the mount does not cover.
+@pytest.mark.parametrize(("combined", "mount", "arm", "tool", "stem"), CUTS)
+def test_example_collision_exclusions_restore_the_combined_pairs(
+    combined: str, mount: str, arm: str, tool: str, stem: str
+) -> None:
+    tool_name = tool.split(".")[0]
+    arm_urdf = MODELS / arm / f"{arm}.urdf"
+    tool_urdf = MODELS / tool_name / f"{tool}.urdf"
+    arm_links = {link.get("name") for link in ET.parse(arm_urdf).getroot().findall("link")}
+    tool_links = {link.get("name") for link in ET.parse(tool_urdf).getroot().findall("link")}
+    combined_root = ET.parse(MODELS / combined / f"{stem}.urdf").getroot()
+    parent_link = combined_root.find(f"joint[@name='{mount}']/parent").get("link")
+    mount_pairs = {(child, parent) for parent in _rigid_group(arm_urdf, parent_link)
+                   for child in _rigid_group(tool_urdf, f"{tool_name}_mount")}
+    lost = set()
+    for row in ET.parse(MODELS / combined / f"{stem}.srdf").getroot().findall("disable_collisions"):
+        a, b = row.get("link1"), row.get("link2")
+        pair = (a, b) if a in tool_links and b in arm_links else (b, a)
+        if pair[0] in tool_links and pair[1] in arm_links and pair not in mount_pairs:
+            lost.add(pair)
+    profiles = {"lite6": "ufactory.lite6", "uf850": "ufactory.uf850",
+                "ur10e": "universal_robots.ur10e", "ur5e": "universal_robots.ur5e"}
+    checked = 0
+    for path in sorted((ROOT / "examples").glob("*.scenario/deployment.yaml")):
+        deployment = json.loads(path.read_text())
+        component_profiles = {row["component_id"]: row["component_profile_id"]
+                              for row in deployment["components"]}
+        for row in deployment["attachments"]:
+            if (component_profiles[row["parent"]["component_id"]] != profiles[arm]
+                    or not component_profiles[row["child"]["component_id"]].endswith(
+                        "." + tool_name)):
+                continue
+            checked += 1
+            authored = [(pair["child_link"], pair["parent_link"])
+                        for pair in row.get("collision_exclusions", [])]
+            assert len(authored) == len(set(authored)), path
+            assert set(authored) == lost, path
+    assert checked > 0
 
 
 def test_robotiq_2f_140_keeps_its_structural_projection() -> None:
@@ -374,154 +397,37 @@ def test_a_robot_tcp_list_names_its_tcps_and_default() -> None:
     assert target["default_tcp_frame_role_id"] == "pen"
 
 
-def test_combined_families_stay_as_fixtures_without_profiles() -> None:
-    # D2: the combined families and their types remain for the test fixtures;
-    # no maintained profile selects them, so the Real arm-only type is gone.
+def test_combined_models_are_no_maintained_family() -> None:
+    # Component model v2: a component holds an arm or a tool, never both. The
+    # combined model folders stay for their meshes only; no family, component
+    # type or model asset row names them.
     families = _families()
-    used = {row.get("model_family_id") for row in _profiles().values()}
     for combined in ("lite6_lite_gripper", "uf850_xarm_gripper",
                      "ur10e_robotiq_2f_140", "ur5e_robotiq_2f_85"):
-        assert combined in families and combined not in used
-        assert (COMPONENT_TYPES / f"{combined}.fixed_scale.component.json").is_file()
-    assert not (COMPONENT_TYPES / "lite6_lite_gripper.fixed_scale.arm_only.component.json").exists()
+        assert combined not in families
+        assert not list(COMPONENT_TYPES.glob(f"{combined}.*"))
+        assert not (MAINTAINED / "model_assets" / f"{combined}.model_asset.json").exists()
 
 
-def test_profiles_follow_the_d5_names() -> None:
-    profiles = _profiles()
-    for old, new in RENAMED.items():
-        assert new in profiles
-        if old != new:
-            assert old not in profiles
-    assert set(TOOL_PROFILES) <= set(profiles)
-    assert sorted(profiles) == list(profiles)
-
-
-@pytest.mark.parametrize("profile_id", sorted(set(RENAMED.values())))
-def test_robot_profiles_have_no_gripper(profile_id: str) -> None:
-    profile = _profiles()[profile_id]
-    assert profile["model_family_id"] in ARMS
-    runtime = profile["ros2_control_runtime"]
-    assert "gripper_target_configurations" not in runtime
-    assert "gripper_target_configurations" not in profile["source_fields"]
-    assert all(row["stream_id"] == "measured_joints" for row in runtime.get("component_streams", []))
-    family = _families()[profile["model_family_id"]]
-    (arm_joints,) = [row["source_joint_names"] for row in family["semantics"]["resource_role_bindings"]]
-    for stop in profile["stop_profiles"].values():
-        assert set(stop["per_joint_max_deceleration_rad_s2"]) == set(arm_joints)
-    if "mock_profile" in runtime:
-        assert runtime["mock_profile"] == profile["model_family_id"]
-
-
-@pytest.mark.parametrize("profile_id", sorted(TOOL_PROFILES))
-def test_tool_profiles_select_their_own_lane(profile_id: str) -> None:
-    family, selector = TOOL_PROFILES[profile_id]
-    profile = _profiles()[profile_id]
-    assert profile["model_family_id"] == family
-    runtime = profile["ros2_control_runtime"]
-    lanes = {"isaac_profile", "mock_profile", "real_profile"} & set(runtime)
-    assert lanes == ({selector} if selector else set())
-    if selector:
-        assert runtime[selector] == family
-    assert profile["stop_profiles"] == {} and profile["acceptance_obligations"] == []
-    for row in runtime.get("gripper_target_configurations", []):
-        assert row["controllable_component_id"] == family
-        assert row["mount_frame"] == f"{family}_mount"
-    streams = [row["stream_id"] for row in runtime.get("component_streams", [])]
-    if "component_streams" in runtime:
-        assert streams == (["gripper_feedback", "measured_joints"] if selector else [])
-
-
-def test_mock_rows_split_arm_and_gripper_controllers() -> None:
-    rows = {row.mock_profile: row for row in mock_controller_profiles.load(
-        ROOT / mock_controller_profiles.DEFAULT_PATH)}
-    for arm in ARMS:
-        assert rows[arm].arm_controller and rows[arm].gripper_controller is None
-    for tool in TOOLS:
-        assert rows[tool].arm_controller is None and rows[tool].gripper_controller
-        assert rows[tool].vendor_joint_constraints is None
-    lines = mock_controller_profiles.cpp_rows([rows["lite_gripper"]], "x").splitlines()
-    # M6 ARRIVE: the last column is the arm arrival tolerance (0.0 without an arm).
-    assert lines[1] == (
-        '{"lite_gripper", "MockLiteGripperSystem", ArmTemplate::kUFactory, "", '
-        'std::nullopt, "lite_gripper_controller", true, 1.5, 5.0, 0.0},'
-    )
-    # Every Mock selector of a maintained profile has a row.
-    selected = {
-        row["ros2_control_runtime"]["mock_profile"]
-        for row in _profiles().values()
-        if "mock_profile" in row.get("ros2_control_runtime", {})
-    }
-    assert selected <= set(rows)
-
-
-def _write_rows(tmp_path: Path, row: dict) -> Path:
-    path = tmp_path / "rows.yaml"
-    path.write_text(yaml.safe_dump({"mock_profiles": [row]}), encoding="utf-8")
-    return path
-
-
-def test_mock_rows_need_a_controller_and_vendor_constraints_need_an_arm(tmp_path: Path) -> None:
-    base = {"mock_profile": "t", "template": "ufactory", "hardware_component_name": "MockT",
-            "hard_stop_completion_timeout_s": 1.5, "gripper_result_timeout_s": 5.0}
-    with pytest.raises(mock_controller_profiles.MockControllerProfileError, match="names no controller"):
-        mock_controller_profiles.load(_write_rows(tmp_path, base))
-    with pytest.raises(mock_controller_profiles.MockControllerProfileError,
-                       match="absent without an arm_controller"):
-        mock_controller_profiles.load(_write_rows(tmp_path, {
-            **base, "gripper_controller": "g",
-            "vendor_joint_constraints": {"trajectory": "1.0"}}))
-    with pytest.raises(mock_controller_profiles.MockControllerProfileError, match="copied from the vendor"):
-        mock_controller_profiles.load(_write_rows(tmp_path, {**base, "arm_controller": "a"}))
-    (row,) = mock_controller_profiles.load(_write_rows(tmp_path, {**base, "gripper_controller": "g"}))
-    assert row.arm_controller is None
-
-
-def test_schema_enums_list_every_selected_profile() -> None:
-    schema = yaml.safe_load((ROOT / "manyforge_deployment/resources/closed_schema/value/"
-                             "manyforge.value_schema.runtime.ros2_control_execution.v1.yaml").read_text())
-
-    def enum(field_id: str) -> set[str]:
-        for node in _walk(schema):
-            if node.get("field_id") == field_id:
-                for constraint in node["value_schema"]["constraints"]:
-                    if constraint["kind"] == "enum":
-                        return set(constraint["values"])
-        raise AssertionError(field_id)
-
-    selected: dict[str, set[str]] = {"isaac_profile": set(), "mock_profile": set()}
-    for row in _profiles().values():
-        for key, values in selected.items():
-            if key in row.get("ros2_control_runtime", {}):
-                values.add(row["ros2_control_runtime"][key])
-    assert selected["isaac_profile"] <= enum("isaac_profile")
-    assert selected["mock_profile"] <= enum("mock_profile")
-    # Isaac: arm-only robot rows and tool rows; the enum lists exactly these
-    # (the combined ids are Mock test fixtures only, D2).
-    table = (ROOT / "manyforge_roboplan/src/retained_isaac_ros2_control_profile.cpp").read_text()
-    assert '{"lite6", "IsaacLite6TopicBasedSystem", 8.0, 1.5, nullptr}' in table
-    assert '{"ur10e", "IsaacUR10eTopicBasedSystem", 10.0, 0.5, nullptr}' in table
-    assert '{"lite_gripper", "", 0.0, 0.0, &kLiteGripperFacts}' in table
-    assert '{"robotiq_2f_140", "", 0.0, 0.0, &kRobotiq2F140Facts}' in table
-    assert enum("isaac_profile") == {"lite6", "lite_gripper", "robotiq_2f_140", "ur10e"}
-    assert "lite6_lite_gripper" not in table and "ur10e_robotiq_2f_140" not in table
-    # Decoder parity: the C++ Deployment decoder accepts exactly the enum's
-    # Mock and Isaac values (B1: a value only in the enum fails Apply).
-    decoder = (
-        ROOT / "manyforge_deployment/src/ros2_control_execution_runtime_unit_internal.cpp"
-    ).read_text()
-    for selector, field_id in (("mock", "mock_profile"), ("isaac", "isaac_profile")):
-        accepted = set(re.findall(rf'\*{selector} != "([a-z0-9_]+)"', decoder))
-        assert accepted == enum(field_id), field_id
-
-
-def _walk(value):
-    if isinstance(value, dict):
-        yield value
-        for item in value.values():
-            yield from _walk(item)
-    elif isinstance(value, list):
-        for item in value:
-            yield from _walk(item)
+def test_mock_lane_rows_split_arm_and_gripper_controllers() -> None:
+    """A robot's Mock row moves its arm (arrival tolerance), a tool's its gripper."""
+    for name in (*ARMS, *TOOLS):
+        folder = ROOT / "manyforge_example_models/models" / name
+        data = yaml.safe_load((folder / "component.yaml").read_text(encoding="utf-8"))
+        row = data["lanes"]["mock"]
+        assert row["adapter"] == "mock"
+        assert ("arrival_tolerance_rad" in row) == (name in ARMS)
+        if "vendor" in row:  # a vendor's controllers (the xArm arms)
+            continue
+        controllers = yaml.safe_load((folder / row["controllers_file"]).read_text())
+        types = {
+            key: value["type"]
+            for key, value in controllers["/**/controller_manager"]["ros__parameters"].items()
+            if isinstance(value, dict) and "type" in value
+        }
+        assert types["__controller__"] == (
+            "joint_trajectory_controller/JointTrajectoryController" if name in ARMS
+            else "position_controllers/GripperActionController")
 
 
 @pytest.mark.parametrize("name", ARMS + TOOLS)
@@ -541,23 +447,34 @@ def test_descriptor_points_at_the_split_model(name: str) -> None:
 def test_uf850_mock_scenario_uses_the_split_robot_and_tool() -> None:
     # Item 47 (UF850 runs on Mock): the arm and its xArm gripper as two
     # components, mounted flange -> mount, each on its own Mock row.
-    project = ROOT / "examples" / "uf850_xarm_gripper_mock.scenario"
+    project = ROOT / "examples" / "mock_uf850_xarm_gripper.scenario"
     deployment = json.loads((project / "deployment.yaml").read_text())
     assignment = json.loads((project / "assignment.yaml").read_text())
-    profiles, families = _profiles(), _families()
-    assert deployment["attachments"] == [{
-        "child": {"component_id": "xarm_gripper", "interface": "mount"},
-        "parent": {"component_id": "uf850_robot", "interface": "flange"},
-    }]
+    families = _families()
+    [attachment] = deployment["attachments"]
+    assert (attachment["parent"], attachment["child"]) == (
+        {"component_id": "uf850_robot", "interface": "flange"},
+        {"component_id": "xarm_gripper", "interface": "mount"},
+    )
     components = {row["component_id"]: row for row in deployment["components"]}
-    assert set(components) == {"uf850_robot", "xarm_gripper"}
+    # AUD-5: the UF850 is a machine on Mock; its arm keeps the robot's id and
+    # its I/O members are deactivated.
+    assert set(components) == {"uf850", "uf850_robot", "uf850_robot_controller_io",
+                               "uf850_robot_tool_io", "xarm_gripper"}
+    assert (components["uf850"]["component_profile_id"], components["uf850"]["lane"]) == (
+        "ufactory.uf850_machine", "mock")
+    assert (components["uf850_robot"]["owner"], components["uf850_robot"]["role"]) == (
+        "uf850", "arm")
+    assert all(components[f"uf850_robot_{role}"]["active"] is False
+               for role in ("controller_io", "tool_io"))
     assert "root_pose_in_cell" not in components["xarm_gripper"]
     for component_id, family_id in (("uf850_robot", "uf850"), ("xarm_gripper", "xarm_gripper")):
         component = components[component_id]
-        profile = profiles[component["component_profile_id"]]
-        assert profile["model_family_id"] == family_id
+        model = yaml.safe_load(
+            (ROOT / families[family_id]["component_descriptor"]).read_text(encoding="utf-8"))
+        assert component["component_profile_id"] == model["id"]
+        assert components[component.get("owner", component_id)]["lane"] == "mock"
         runtime = component["configuration"]["runtime_configuration"]
-        assert runtime["mock_profile"] == profile["ros2_control_runtime"]["mock_profile"] == family_id
         source = families[family_id]["source"]
         assert component["model_source"]["urdf"]["project_path"] == "../../" + source["urdf_path"]
         assert component["model_source"]["srdf"]["project_path"] == "../../" + source["srdf_path"]
@@ -575,20 +492,3 @@ def test_uf850_mock_scenario_uses_the_split_robot_and_tool() -> None:
     roles = {row["component_role_id"]: row["controllable_component_id"]
              for row in assignment["component_roles"]}
     assert roles == {"robot": "uf850_robot", "tool": "xarm_gripper"}
-
-
-def test_lite6_stop_contract_check_selects_the_lite6_family() -> None:
-    # The generator's Lite6 Stop-contract check keys on a model family: it must
-    # name the family the Lite6 profiles select, or it silently never runs.
-    source = (
-        ROOT / "manyforge_deployment/tools/generate_maintained_deployment_occurrences.py"
-    ).read_text()
-    [family] = re.findall(
-        r'^LITE6_NATIVE_MODEL_FAMILY_ID: Final = "([a-z0-9_]+)"$', source, re.MULTILINE
-    )
-    profiles = [
-        row for row in _description()["runtime_restoration_profiles"]
-        if row["runtime_restoration_profile_id"].startswith("lite6_")
-    ]
-    assert profiles
-    assert {row["model_family_id"] for row in profiles} == {family}

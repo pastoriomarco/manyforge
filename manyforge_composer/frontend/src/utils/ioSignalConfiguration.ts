@@ -4,28 +4,27 @@ import type { JsonValue } from '../types/api';
  * The `io_signals` rows of one runtime unit configuration
  * (manyforge.value_schema.runtime.ros2_control_execution.v1, schema82
  * interface-freeze01, and runtime.io_provider_execution.v1 for an I/O device
- * component). Boolean inputs (Mock / ROS Bool / UR io_states / ros2_control
- * GPIO / geometric contact / xArm digital) and outputs (ROS SetBool / Mock /
- * UR set_io / ros2_control GPIO) are authored here. Any other row (e.g. the
- * R7-deferred xArm controller input) is kept verbatim.
+ * component). Boolean inputs (Mock / ROS Bool / ros2_control GPIO /
+ * geometric contact) and outputs (ROS SetBool / Mock / ros2_control GPIO) are
+ * authored here. Any other row is kept verbatim. A machine's own I/O banks are
+ * not authored here: they are I/O members whose signals come from their model
+ * (CONTRACTS §16).
  */
 
-export type IoSourceProfile = 'mock' | 'ros_bool' | 'ur_io_states' | 'ros2_control_gpio' | 'geometric_contact' | 'xarm_digital';
+export type IoSourceProfile = 'mock' | 'ros_bool' | 'ros2_control_gpio' | 'geometric_contact';
 
 export const IO_SOURCE_PROFILE_LABELS: Record<IoSourceProfile, string> = {
   mock: 'Mock',
   ros_bool: 'ROS Bool topic',
-  ur_io_states: 'Universal Robots I/O states',
   ros2_control_gpio: 'ros2_control GPIO',
   geometric_contact: 'Geometric contact',
-  xarm_digital: 'xArm digital input',
 };
 
 /**
  * Input liveness (contracts 76/81): Mock is in-process; a generic ROS Bool
  * topic declares periodic (freshness = a reading within the maximum sample
  * age) or change-only (liveness unproven between changes; refused in any
- * interrupt condition); UR / ros2_control GPIO are periodic (contract 85).
+ * interrupt condition); ros2_control GPIO is periodic (contract 85).
  */
 export type IoLivenessMode = 'in_process' | 'periodic' | 'change_only';
 export type RosBoolLiveness = 'periodic' | 'change_only';
@@ -39,14 +38,12 @@ export const IO_LIVENESS_LABELS: Record<IoLivenessMode, string> = {
 export const IO_LIVENESS_UNPROVEN_WARNING =
   'Liveness unproven: this change-only source cannot prove it is alive between changes, so a reading may be old without showing stale. It cannot be used in an interrupt condition.';
 
-/** Contract 85: driver-reported freshness caveat of typed ros2_control/UR inputs. */
+/** Contract 85: driver-reported freshness caveat of typed ros2_control inputs. */
 export const IO_DRIVER_FRESHNESS_NOTE =
-  'Freshness depends on the driver reporting read errors (e.g. the UR driver currently does not).';
+  'Freshness depends on the driver reporting read errors.';
 
 export const IO_DEFAULT_INGRESS_DEPTH = 64;
 export const IO_MAXIMUM_ROWS = 4096;
-/** UR digital pin range of io_states / set_io (schema82). */
-export const IO_UR_MAXIMUM_PIN = 17;
 const MAXIMUM_SAFE = BigInt(Number.MAX_SAFE_INTEGER);
 const PORTABLE_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const NS_PER_MS = 1_000_000n;
@@ -54,14 +51,12 @@ const NS_PER_MS = 1_000_000n;
 export type IoOptionalProviderField =
   'ingress_depth' | 'initial_value';
 
-export type IoOutputProfile = 'ros_set_bool' | 'mock_output' | 'ur_set_io' | 'ros2_control_gpio' | 'xarm_digital';
+export type IoOutputProfile = 'ros_set_bool' | 'mock_output' | 'ros2_control_gpio';
 
 export const IO_OUTPUT_PROFILE_LABELS: Record<IoOutputProfile, string> = {
   ros_set_bool: 'ROS SetBool service',
   mock_output: 'Mock output',
-  ur_set_io: 'Universal Robots set_io',
   ros2_control_gpio: 'ros2_control GPIO command',
-  xarm_digital: 'xArm digital output',
 };
 
 /** Limit of an authored ROS name or GPIO selector, in UTF-8 bytes. */
@@ -70,7 +65,7 @@ export const IO_MAXIMUM_SERVICE_NAME_BYTES = 4096;
 /**
  * One editable boolean output (SX-2101): the shared row identity plus its
  * provider. An output has no freshness, edge, completion or readback field:
- * a ROS SetBool / UR set_io write completes on the service's correlated
+ * a ROS SetBool write completes on the service's correlated
  * acceptance, a ros2_control GPIO write is submitted-only (contract 83), a
  * Mock write is immediate; readback is a separately declared input.
  */
@@ -85,14 +80,10 @@ export interface IoSignalOutputDraft {
   service: string;
   /** Mock output channel (portable id). */
   channel: string;
-  /** UR pin, text until validated. */
-  pin: string;
   /** ros2_control GPIO command topic (absolute, exact). */
   topic: string;
   group: string;
   interfaceName: string;
-  robotComponentId: string;
-  bank: 'tool' | 'controller';
 }
 
 /** One editable boolean input declaration; numbers stay text until validated. */
@@ -106,16 +97,13 @@ export interface IoSignalInputDraft {
   topic: string;
   /** ROS Bool only: the declared liveness (required by the schema). */
   liveness: RosBoolLiveness;
-  /** UR io_states pin, text until validated. */
-  pin: string;
   /** ros2_control GPIO group and interface name (exact, no trim). */
   group: string;
   interfaceName: string;
-  /** Geometric contact / xArm digital: selected robot component id. */
+  /** Geometric contact: selected robot component id. */
   robotComponentId: string;
   /** Geometric contact: an existing logical Scene resource. */
   targetSceneResourceId: string;
-  bank: 'tool' | 'controller';
   /** Periodic sample-age freshness bound, in ms. */
   maximumAgeMs: string;
   ingressDepth: string;
@@ -164,26 +152,22 @@ function integerText(text: string): number | null {
 }
 
 const INPUT_PROFILES: readonly IoSourceProfile[] = [
-  'mock', 'ros_bool', 'ur_io_states', 'ros2_control_gpio', 'geometric_contact', 'xarm_digital',
+  'mock', 'ros_bool', 'ros2_control_gpio', 'geometric_contact',
 ];
-const OUTPUT_PROFILES: readonly IoOutputProfile[] = ['ros_set_bool', 'mock_output', 'ur_set_io', 'ros2_control_gpio', 'xarm_digital'];
+const OUTPUT_PROFILES: readonly IoOutputProfile[] = ['ros_set_bool', 'mock_output', 'ros2_control_gpio'];
 
 const PROVIDER_KEYS: Record<IoSourceProfile, string[]> = {
   mock: ['profile', 'ingress_depth', 'initial_value', 'echo'],
   ros_bool: ['profile', 'ingress_depth', 'topic', 'liveness'],
-  ur_io_states: ['profile', 'ingress_depth', 'topic', 'pin'],
   ros2_control_gpio: ['profile', 'ingress_depth', 'topic', 'group', 'interface_name'],
   geometric_contact: [
     'profile', 'ingress_depth', 'robot_component_id', 'target_scene_resource_id',
   ],
-  xarm_digital: ['profile', 'ingress_depth', 'robot_component_id', 'bank', 'pin'],
 };
 const OUTPUT_PROVIDER_KEYS: Record<IoOutputProfile, string[]> = {
   ros_set_bool: ['profile', 'service'],
   mock_output: ['profile', 'channel'],
-  ur_set_io: ['profile', 'service', 'pin'],
   ros2_control_gpio: ['profile', 'topic', 'group', 'interface_name'],
-  xarm_digital: ['profile', 'robot_component_id', 'bank', 'pin'],
 };
 const ROW_KEYS = [
   'controllable_component_id', 'command_target_id', 'resource_role_id', 'signal_name',
@@ -234,10 +218,7 @@ function inputDraft(row: Record<string, JsonValue>): IoSignalInputDraft | null {
     : profile === 'ros_bool' ? row.update_mode === (liveness === 'periodic' ? 'sampled' : 'change_only')
       : row.update_mode === 'sampled';
   if (!expectedUpdate) return null;
-  if ((profile !== 'mock' && profile !== 'geometric_contact' && profile !== 'xarm_digital' && typeof provider.topic !== 'string')
-    || (profile === 'ur_io_states' && safeInteger(provider.pin) === null)
-    || (profile === 'xarm_digital' && (typeof provider.robot_component_id !== 'string'
-      || (provider.bank !== 'tool' && provider.bank !== 'controller') || safeInteger(provider.pin) === null))
+  if ((profile !== 'mock' && profile !== 'geometric_contact' && typeof provider.topic !== 'string')
     || (profile === 'geometric_contact' && typeof provider.robot_component_id !== 'string')
     || (profile === 'ros2_control_gpio'
       && (typeof provider.group !== 'string' || typeof provider.interface_name !== 'string'))
@@ -262,13 +243,11 @@ function inputDraft(row: Record<string, JsonValue>): IoSignalInputDraft | null {
     profile,
     topic: typeof provider.topic === 'string' ? provider.topic : '',
     liveness: liveness ?? 'periodic',
-    pin: safeInteger(provider.pin)?.toString() ?? '0',
     group: typeof provider.group === 'string' ? provider.group : '',
     interfaceName: typeof provider.interface_name === 'string' ? provider.interface_name : '',
     targetSceneResourceId: typeof provider.target_scene_resource_id === 'string'
       ? provider.target_scene_resource_id : '',
     robotComponentId: typeof provider.robot_component_id === 'string' ? provider.robot_component_id : '',
-    bank: provider.bank === 'controller' ? 'controller' : 'tool',
     maximumAgeMs: sampleAgeOk ? nsToMsText(freshness.maximum_age_ns as number) : '',
     ingressDepth: String(safeInteger(depth) ?? IO_DEFAULT_INGRESS_DEPTH),
     initialValue: provider.initial_value === true,
@@ -290,9 +269,7 @@ function outputDraft(row: Record<string, JsonValue>): IoSignalOutputDraft | null
   if (
     provider === null || profile === undefined || !OUTPUT_PROFILES.includes(profile)
     || !exactKeys(provider, OUTPUT_PROVIDER_KEYS[profile])
-    || OUTPUT_PROVIDER_KEYS[profile].some((key) => key !== 'pin' && key !== 'profile' && typeof provider[key] !== 'string')
-    || ((profile === 'ur_set_io' || profile === 'xarm_digital') && safeInteger(provider.pin) === null)
-    || (profile === 'xarm_digital' && provider.bank !== 'tool' && provider.bank !== 'controller')
+    || OUTPUT_PROVIDER_KEYS[profile].some((key) => key !== 'profile' && typeof provider[key] !== 'string')
     || !exactKeys(row, OUTPUT_ROW_KEYS)
     || row.value_type !== 'bool' || row.direction !== 'output'
   ) return null;
@@ -309,12 +286,9 @@ function outputDraft(row: Record<string, JsonValue>): IoSignalOutputDraft | null
     profile,
     service: text('service'),
     channel: text('channel'),
-    pin: safeInteger(provider.pin)?.toString() ?? '0',
     topic: text('topic'),
     group: text('group'),
     interfaceName: text('interface_name'),
-    robotComponentId: text('robot_component_id'),
-    bank: provider.bank === 'controller' ? 'controller' : 'tool',
   };
 }
 
@@ -350,11 +324,6 @@ function selectorProblem(value: string, kind: string): string | null {
     ? `the ${kind} must be at most ${IO_MAXIMUM_SERVICE_NAME_BYTES} bytes.` : null;
 }
 
-function pinProblem(pin: string): string | null {
-  const value = integerText(pin);
-  return value === null || value > IO_UR_MAXIMUM_PIN ? `the UR pin must be 0 to ${IO_UR_MAXIMUM_PIN}.` : null;
-}
-
 function gpioProblem(draft: { topic: string; group: string; interfaceName: string }): string | null {
   return rosNameProblem(draft.topic, 'GPIO topic')
     ?? selectorProblem(draft.group, 'GPIO group')
@@ -362,11 +331,8 @@ function gpioProblem(draft: { topic: string; group: string; interfaceName: strin
 }
 
 function preservedReason(row: Record<string, JsonValue>): string {
-  if (object(row.provider)?.profile === 'xarm_controller_input') {
-    return 'xArm controller input: deferred to R7 and no longer in the R5 schema; kept unchanged. Remove it or move the signal to an I/O device.';
-  }
   return row.direction === 'output'
-    ? 'Output: not a ROS SetBool, UR set_io, ros2_control GPIO or Mock output shape; kept unchanged.'
+    ? 'Output: not a ROS SetBool, ros2_control GPIO or Mock output shape; kept unchanged.'
     : 'Not an executable boolean signal shape; kept unchanged.';
 }
 
@@ -395,12 +361,10 @@ export function newIoSignalInput(componentId = ''): IoSignalInputDraft {
     profile: 'mock',
     topic: '',
     liveness: 'periodic',
-    pin: '0',
     group: '',
     interfaceName: '',
     robotComponentId: '',
     targetSceneResourceId: '',
-    bank: 'tool',
     maximumAgeMs: '',
     ingressDepth: String(IO_DEFAULT_INGRESS_DEPTH),
     initialValue: false,
@@ -422,7 +386,7 @@ export function withIoDirection(
   return direction === 'output'
     ? {
       kind: 'output',
-      draft: { ...shared, profile: 'ros_set_bool', service: '', channel: '', pin: '0', topic: '', group: '', interfaceName: '', robotComponentId: '', bank: 'tool' },
+      draft: { ...shared, profile: 'ros_set_bool', service: '', channel: '', topic: '', group: '', interfaceName: '' },
     }
     : { kind: 'input', draft: { ...newIoSignalInput(), ...shared } };
 }
@@ -444,7 +408,7 @@ export function rowInputLiveness(row: Record<string, JsonValue> | null): IoLiven
   const provider = object(row.provider);
   const profile = provider?.profile;
   if (profile === 'mock') return 'in_process';
-  if (profile === 'ur_io_states' || profile === 'ros2_control_gpio' || profile === 'geometric_contact' || profile === 'xarm_digital') return 'periodic';
+  if (profile === 'ros2_control_gpio' || profile === 'geometric_contact') return 'periodic';
   return profile === 'ros_bool' && provider !== null ? rosBoolLiveness(provider) : null;
 }
 
@@ -474,14 +438,8 @@ export function validateIoSignalOutput(draft: IoSignalOutputDraft, index = 0): s
     return PORTABLE_ID.test(draft.channel) ? null
       : `${label}: the Mock output channel must be 1–128 letters, digits, '.', '_' or '-', starting with a letter or digit.`;
   }
-  if (draft.profile === 'xarm_digital') {
-    const max = draft.bank === 'tool' ? 4 : 15;
-    if (!PORTABLE_ID.test(draft.robotComponentId)) return `${label}: enter the xArm robot component id.`;
-    const pin = integerText(draft.pin);
-    return pin === null || pin > max ? `${label}: the xArm output pin must be 0 to ${max}.` : null;
-  }
   const problem = draft.profile === 'ros2_control_gpio' ? gpioProblem(draft)
-    : rosNameProblem(draft.service) ?? (draft.profile === 'ur_set_io' ? pinProblem(draft.pin) : null);
+    : rosNameProblem(draft.service);
   return problem === null ? null : `${label}: ${problem}`;
 }
 
@@ -514,15 +472,9 @@ export function validateIoSignalInput(draft: IoSignalInputDraft, index = 0): str
     }
     return null;
   }
-  const address = draft.profile === 'xarm_digital'
-    ? !PORTABLE_ID.test(draft.robotComponentId) ? 'enter the xArm robot component id.'
-      : (integerText(draft.pin) === null || integerText(draft.pin)! > (draft.bank === 'tool' ? 1 : 15))
-        ? `the xArm input pin must be 0 to ${draft.bank === 'tool' ? 1 : 15}.` : null
-    : draft.profile === 'ros_bool'
+  const address = draft.profile === 'ros_bool'
     ? (draft.topic.trim() === '' ? 'enter the source topic.' : null)
-    : draft.profile === 'ur_io_states'
-      ? rosNameProblem(draft.topic, 'io_states topic') ?? pinProblem(draft.pin)
-      : gpioProblem(draft);
+    : gpioProblem(draft);
   if (address !== null) return `${label}: ${address}`;
   if (inputUsesSampleAge(draft)) {
     const age = msTextToNs(draft.maximumAgeMs);
@@ -544,22 +496,17 @@ function keyOf(row: IoSignalRow): string | null {
 
 /**
  * The I/O device rules of one io_provider component's rows: at least one
- * signal, every row owned by the device itself, and no xArm controller input
- * (deferred to R7, contract 80).
+ * signal, every row owned by the device itself.
  */
 export function ioProviderRowsProblem(rows: IoSignalRow[], componentId: string): string | null {
   if (rows.length === 0) return 'An I/O device needs at least one signal; remove the device instead.';
   for (const [index, row] of rows.entries()) {
-    const { profile, owner, label } = row.kind === 'preserved'
+    const { owner, label } = row.kind === 'preserved'
       ? {
-        profile: object(row.raw.provider)?.profile,
         owner: row.raw.controllable_component_id,
         label: String(row.raw.signal_name ?? `Signal ${index + 1}`),
       }
-      : { profile: row.draft.profile, owner: row.draft.componentId, label: rowLabel(row.draft, index) };
-    if (profile === 'xarm_controller_input') {
-      return `${label}: xArm controller inputs are deferred to R7; an I/O device cannot host them.`;
-    }
+      : { owner: row.draft.componentId, label: rowLabel(row.draft, index) };
     if (owner !== componentId) return `${label}: a signal of I/O device ${componentId} must belong to ${componentId}.`;
   }
   return null;
@@ -570,19 +517,14 @@ function sourceFacts(row: Extract<IoSignalRow, { kind: 'input' | 'output' }>): s
   if (row.kind === 'output') {
     const { draft } = row;
     return JSON.stringify(['output', draft.profile,
-      draft.profile === 'ros_set_bool' || draft.profile === 'ur_set_io' ? draft.service
-        : draft.profile === 'ros2_control_gpio' ? draft.topic
-          : draft.profile === 'xarm_digital' ? [draft.robotComponentId, draft.bank] : null]);
+      draft.profile === 'ros_set_bool' ? draft.service
+        : draft.profile === 'ros2_control_gpio' ? draft.topic : null]);
   }
   const { draft } = row;
   if (draft.profile === 'geometric_contact') {
     return JSON.stringify(['input', draft.profile, integerText(draft.ingressDepth),
       draft.robotComponentId,
       draft.targetSceneResourceId, inputLivenessMode(draft)]);
-  }
-  if (draft.profile === 'xarm_digital') {
-    return JSON.stringify(['input', draft.profile, draft.robotComponentId, draft.bank,
-      integerText(draft.ingressDepth), inputLivenessMode(draft)]);
   }
   return JSON.stringify(['input', draft.profile,
     draft.profile === 'mock' ? null : draft.profile === 'ros_bool' ? draft.topic.trim() : draft.topic,
@@ -609,7 +551,6 @@ export function validateIoSignalRows(rows: IoSignalRow[], ioProviderComponentId?
   const keys = new Set<string>();
   const names = new Set<string>();
   const sources = new Map<string, string>();
-  const xarmBanks = new Map<string, string>();
   for (const row of rows) {
     const key = keyOf(row);
     if (key !== null) {
@@ -626,15 +567,6 @@ export function validateIoSignalRows(rows: IoSignalRow[], ioProviderComponentId?
       names.add(scoped);
     }
     if (row.kind === 'preserved') continue;
-    if (row.kind === 'input' && row.draft.profile === 'xarm_digital') {
-      const bank = JSON.stringify([row.draft.robotComponentId, row.draft.bank]);
-      const owner = JSON.stringify([row.draft.componentId, row.draft.sourceId]);
-      const existing = xarmBanks.get(bank);
-      if (existing !== undefined && existing !== owner) {
-        return `xArm ${row.draft.robotComponentId} ${row.draft.bank} inputs must share one I/O source.`;
-      }
-      xarmBanks.set(bank, owner);
-    }
     const facts = sourceFacts(row);
     const existing = sources.get(row.draft.sourceId);
     if (existing !== undefined && existing !== facts) {
@@ -702,13 +634,9 @@ export function ioSignalInputValue(draft: IoSignalInputDraft): Record<string, Js
     };
   }
   const periodic = inputUsesSampleAge(draft);
-  const address: Record<string, JsonValue> = draft.profile === 'xarm_digital'
-    ? { robot_component_id: draft.robotComponentId, bank: draft.bank, pin: integerText(draft.pin)! }
-    : draft.profile === 'ros_bool'
+  const address: Record<string, JsonValue> = draft.profile === 'ros_bool'
     ? { topic: draft.topic.trim(), liveness: { mode: draft.liveness } }
-    : draft.profile === 'ur_io_states'
-      ? { topic: draft.topic, pin: integerText(draft.pin)! }
-      : { topic: draft.topic, group: draft.group, interface_name: draft.interfaceName };
+    : { topic: draft.topic, group: draft.group, interface_name: draft.interfaceName };
   return {
     ...base,
     update_mode: periodic ? 'sampled' : 'change_only',
@@ -728,9 +656,7 @@ export function ioSignalOutputValue(draft: IoSignalOutputDraft): Record<string, 
   const provider: Record<string, JsonValue> = draft.profile === 'mock_output'
     ? { profile: draft.profile, channel: draft.channel }
     : draft.profile === 'ros_set_bool' ? { profile: draft.profile, service: draft.service }
-      : draft.profile === 'ur_set_io' ? { profile: draft.profile, service: draft.service, pin: integerText(draft.pin)! }
-        : draft.profile === 'xarm_digital' ? { profile: draft.profile, robot_component_id: draft.robotComponentId, bank: draft.bank, pin: integerText(draft.pin)! }
-        : { profile: draft.profile, topic: draft.topic, group: draft.group, interface_name: draft.interfaceName };
+      : { profile: draft.profile, topic: draft.topic, group: draft.group, interface_name: draft.interfaceName };
   return {
     controllable_component_id: draft.componentId,
     command_target_id: draft.targetId,
@@ -811,7 +737,7 @@ export function declaredIoSources(
     result.set(ioSourceKey(draft.componentId, draft.targetId, draft.resourceRoleId), {
       profile: draft.profile,
       sourceId: draft.sourceId,
-      topic: draft.profile === 'mock' || draft.profile === 'geometric_contact' || draft.profile === 'xarm_digital' ? null : draft.topic,
+      topic: draft.profile === 'mock' || draft.profile === 'geometric_contact' ? null : draft.topic,
       liveness: inputLivenessMode(draft),
     });
   }
@@ -822,9 +748,7 @@ export function declaredIoSources(
 export function ioInputSourceText(draft: IoSignalInputDraft): string {
   switch (draft.profile) {
     case 'ros_bool': return `ROS topic ${draft.topic}`;
-    case 'ur_io_states': return `ROS topic ${draft.topic}, pin ${draft.pin}`;
     case 'ros2_control_gpio': return `ROS topic ${draft.topic}, GPIO ${draft.group}/${draft.interfaceName}`;
-    case 'xarm_digital': return `xArm ${draft.robotComponentId} ${draft.bank} digital input pin ${draft.pin}`;
     case 'geometric_contact': return `geometric contact for ${draft.robotComponentId} with ${draft.targetSceneResourceId}`;
     case 'mock': return 'Mock input';
   }
@@ -850,6 +774,8 @@ export const IO_PROVIDER_RUNTIME_KIND = 'io_provider';
 export const IO_DEVICE_DEFAULT_LIFECYCLE_TIMEOUT_S = 10;
 /** The existing lifecycle transaction maximum (kMaxLifecycleTransactionTimeoutNs). */
 export const IO_DEVICE_MAXIMUM_LIFECYCLE_TIMEOUT_S = 3600;
+/** What the lifecycle command time limit bounds (every component kind). */
+export const LIFECYCLE_TIMEOUT_HELP = `Prepare, Enable and Disable of this component must each finish within this time (above 0, at most ${IO_DEVICE_MAXIMUM_LIFECYCLE_TIMEOUT_S} s); a step that doesn't finish in time ends with an unknown outcome and isn't resent.`;
 const COMPONENT_ID = /^[a-z][a-z0-9._-]{0,127}$/;
 const MAXIMUM_COMPONENTS = 128;
 
@@ -869,7 +795,7 @@ export function lifecycleTimeoutProblem(text: string): string | null {
 
 /**
  * Provisional prefill of the device output acknowledgement timeout (contracts
- * 65, 68, 82): it covers ROS SetBool, UR set_io and xArm outputs, to be measured on
+ * 65, 68, 82): it covers ROS SetBool outputs, to be measured on
  * the live/real lanes. ros2_control GPIO outputs are submitted-only and Mock
  * outputs immediate: neither has an acknowledgement budget.
  */
@@ -881,7 +807,7 @@ export function ioDeviceHasAcknowledgedOutput(runtimeConfiguration: Record<strin
   return Array.isArray(rows) && rows.some((value) => {
     const row = object(value);
     const profile = object(row?.provider)?.profile;
-    return row?.direction === 'output' && (profile === 'ros_set_bool' || profile === 'ur_set_io' || profile === 'xarm_digital');
+    return row?.direction === 'output' && profile === 'ros_set_bool';
   });
 }
 
@@ -906,7 +832,7 @@ export function outputAckTimeoutProblem(text: string): string | null {
 /**
  * The one `io_provider_devices` row of an I/O device. The output
  * acknowledgement timeout is carried only when given (only devices with ROS
- * SetBool / UR set_io outputs may carry it, contract 68).
+ * SetBool outputs may carry it, contract 68).
  */
 export function ioProviderDeviceValue(
   componentId: string,

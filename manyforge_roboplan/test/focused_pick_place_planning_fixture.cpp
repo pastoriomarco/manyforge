@@ -156,7 +156,7 @@ public:
     request.speed_profile = motion->speed_profile;
     request.timeouts = motion->timeouts;
     request.cache_mode = motion->cache_mode;
-    request.planning_profile = motion->planning_profile;
+    request.planner = motion->planner;
     request.target_mode = motion->target_mode;
     request.target_reference = motion->target_reference;
     request.offset_reference = motion->offset_reference;

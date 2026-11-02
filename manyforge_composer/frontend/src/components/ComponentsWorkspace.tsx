@@ -1,16 +1,11 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 
-import type { CCLCController } from '../hooks/useCCLC';
 import type { ComponentCatalogState } from '../hooks/useComponentCatalog';
 import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
-import {
-  componentHealthBadge,
-  vendorStatusFacts,
-} from '../state/componentLifecyclePresentation';
 import type { StructuralResourceState } from '../state/structuralResource';
 import type { JsonValue, SourceModelProjection } from '../types/api';
 import type { ComponentProfileFacts } from '../types/componentCatalog';
-import type { ComposerHeadlessState } from '../types/headless';
+import type { CellState, ComponentState } from '../types/components';
 import type {
   ManualControlGripperDescriptor,
   ManualControlMotionDescriptor,
@@ -19,6 +14,7 @@ import {
   COMPONENT_KIND_LABELS,
   componentFrameTargets,
   componentManagerRows,
+  mountParents,
   componentSignals,
   draftComponents,
   draftGripperFrames,
@@ -32,10 +28,14 @@ import {
 import { toolsWithoutTcp, toolWithoutTcpWarning } from '../utils/componentTcpChoices';
 import { AddComponentPanel } from './AddComponentPanel';
 import { AddAiModelForm } from './AiModelComponentForm';
-import { CCLCPanelView } from './CCLCPanel';
+import { missingComponentStateText } from '../state/componentPresentation';
+import { CellComponentsCard, ComponentStatePanel } from './ComponentStatePanel';
+import { ComponentPlacementEditor } from './ComponentPlacementEditor';
 import { ComponentTcpChoices } from './ComponentTcpChoices';
 import { ComponentTcpsCard } from './ComponentTcpsCard';
-import { CHANGE_LABELS, ComponentList, type ComponentRowHealth } from './ComponentManager';
+import { CHANGE_LABELS, ComponentList } from './ComponentManager';
+import { ComponentDetailsCard } from './ComponentDetailsCard';
+import { MachineCard } from './MachineCard';
 import {
   AddIoDeviceForm,
   DeploymentFocusedEditor,
@@ -44,19 +44,17 @@ import {
 
 /**
  * The Components section: the cell's components on the left (kind, mount,
- * lifecycle and health, Add component), and the selected component's page on
- * the right (status, vendor facts, frames, I/O signals and its settings). It
- * reuses the Deployment Draft editors and the CCLC lifecycle surface; the
- * cell-level Draft/Applied, role assignment, Changes and Apply stay under
- * Deployment, and jogging stays in Robot Control (both linked).
+ * state, Add component), and the selected component's page on the right
+ * (state and actions, placement and lane, frames, I/O signals and settings).
+ * Every state shown is the pushed `ComponentState` (R4); edits go through the
+ * Deployment Draft and the one Preview → Apply path. Jogging stays in Robot
+ * Control (linked).
  */
 export interface ComponentsWorkspaceProps {
   enabled: boolean;
   controller: DeploymentWorkspaceController;
-  cclc: CCLCController;
-  /** Manager Applied component ids: the components with a lifecycle. */
-  lifecycleIds: readonly string[];
-  snapshot: ComposerHeadlessState | null;
+  /** The pushed component states (CONTRACTS §1). */
+  cellState: CellState;
   catalog: ComponentCatalogState;
   sourceModel: StructuralResourceState<SourceModelProjection>;
   motionDescriptors: ManualControlMotionDescriptor[];
@@ -75,23 +73,10 @@ export interface ComponentsWorkspaceProps {
 
 const NO_PROFILES: Readonly<Record<string, ComponentProfileFacts>> = {};
 
-function lifecycleAdmission(snapshot: ComposerHeadlessState | null) {
-  return {
-    mutationAvailable: snapshot?.authoringAdmission.authoringAllowed === true,
-    mutationUnavailableReason: snapshot === null
-      ? 'Current backend admission is unavailable.'
-      : snapshot.programCycle.state === 'terminal_awaiting_reset'
-        ? 'Reset the completed Program cycle before changing lifecycle or routes.'
-        : 'Lifecycle and route changes require current Idle admission.',
-  };
-}
-
 export function ComponentsWorkspace({
   enabled,
   controller,
-  cclc,
-  lifecycleIds,
-  snapshot,
+  cellState,
   catalog,
   sourceModel,
   motionDescriptors,
@@ -109,24 +94,38 @@ export function ComponentsWorkspace({
     () => componentManagerRows(document, appliedIds, catalog.catalog?.componentProfiles),
     [appliedIds, catalog.catalog, document],
   );
+  const mounts = useMemo(() => mountParents(document), [document]);
   const feedback = useMemo(() => roleFeedback(
     programComponentRoles, programRoleAssignment, rows, catalog.catalog?.componentProfiles ?? {},
   ), [catalog.catalog, programComponentRoles, programRoleAssignment, rows]);
-  const health = useMemo(() => Object.fromEntries(lifecycleIds.map((id): [string, ComponentRowHealth] => {
-    const live = id === cclc.controllableComponentId ? cclc.snapshot : null;
-    const observed = cclc.componentHealth[id];
-    return [id, componentHealthBadge(live ?? observed?.snapshot ?? null, observed?.error ?? null)];
-  })), [cclc.componentHealth, cclc.controllableComponentId, cclc.snapshot, lifecycleIds]);
-  const [selected, setSelected] = useState<string | null>(cclc.controllableComponentId || null);
+  const states = useMemo(() => Object.fromEntries((cellState.components ?? [])
+    .map((state): [string, ComponentState] => [state.component_id, state])), [cellState.components]);
+  const [selected, setSelected] = useState<string | null>(null);
   const row = rows.find((candidate) => candidate.componentId === selected) ?? rows[0] ?? null;
   const selectedId = row?.componentId ?? null;
-  // The lifecycle surface follows the page; never while a request is in flight.
-  const { busy: cclcBusy, controllableComponentId, setControllableComponentId } = cclc;
-  useEffect(() => {
-    if (selectedId !== null && !cclcBusy && lifecycleIds.includes(selectedId)
-      && controllableComponentId !== selectedId) setControllableComponentId(selectedId);
-  }, [cclcBusy, controllableComponentId, lifecycleIds, selectedId, setControllableComponentId]);
-  const admission = lifecycleAdmission(snapshot);
+  // A machine is one card (CONTRACTS §16): selecting its owner or a member shows it.
+  const owner = row === null ? null : row.kind === 'machine' ? row
+    : rows.find((candidate) => candidate.componentId === row.owner && candidate.kind === 'machine') ?? null;
+  const members = owner === null ? [] : rows.filter((candidate) => candidate.owner === owner.componentId);
+  const pageProps = (pageRow: ComponentManagerRow) => ({
+    row: pageRow,
+    enabled,
+    controller,
+    state: states[pageRow.componentId] ?? null,
+    states: cellState.components ?? [],
+    statesKnown: cellState.components !== null,
+    sourceModel,
+    profileFacts: pageRow.profileId === null ? undefined : catalog.catalog?.componentProfiles[pageRow.profileId],
+    profiles: catalog.catalog?.componentProfiles ?? NO_PROFILES,
+    motionDescriptors,
+    gripperDescriptors,
+    programSceneIds,
+    roles: rolesOfComponent(feedback, pageRow.componentId).map((role) => role.roleId),
+    robotControl: robotControlIds.includes(pageRow.componentId),
+    onOpenRobotControl,
+    onOpenDeployment,
+    onRemoved: () => setSelected(null),
+  });
 
   return (
     <section className="panel dpanel components-workspace" aria-labelledby="components-workspace-title">
@@ -136,7 +135,7 @@ export function ComponentsWorkspace({
           <h2 id="components-workspace-title">Components</h2>
         </div>
         <button type="button" className="quiet-button" disabled={!enabled}
-          onClick={() => { void controller.refresh(); catalog.reload(); void cclc.refresh(); }}>
+          onClick={() => { void controller.refresh(); catalog.reload(); }}>
           Refresh
         </button>
       </header>
@@ -151,11 +150,8 @@ export function ComponentsWorkspace({
       )}
       <div className="components-layout">
         <div className="components-column">
-          {enabled && (
-            <CCLCPanelView part="cell" enabled={enabled} controller={cclc}
-              componentIds={[...lifecycleIds]} {...admission} />
-          )}
-          <ComponentList rows={rows} health={health} selectedId={selectedId} onSelect={setSelected} />
+          {enabled && <CellComponentsCard states={cellState.components} enabled={enabled} mounts={mounts} />}
+          <ComponentList rows={rows} states={states} selectedId={selectedId} onSelect={setSelected} />
           <AddComponentPanel
             controller={controller}
             catalog={catalog.catalog}
@@ -169,26 +165,24 @@ export function ComponentsWorkspace({
         <div className="components-column">
           {row === null ? (
             <p className="panel-state">Add a component, or open a Scenario, to see its page.</p>
+          ) : owner !== null ? (
+            <>
+              <MachineCard
+                owner={owner}
+                members={members}
+                machine={catalog.catalog?.machines.find((machine) => machine.modelId === owner.profileId)}
+                profiles={catalog.catalog?.componentProfiles ?? NO_PROFILES}
+                controller={controller}
+                states={cellState.components}
+                enabled={enabled}
+                selectedId={row.componentId}
+                onSelect={setSelected}
+                onRemoved={() => setSelected(null)}
+              />
+              {row !== owner && <ComponentPage key={row.componentId} {...pageProps(row)} member />}
+            </>
           ) : (
-            <ComponentPage
-              key={row.componentId}
-              row={row}
-              enabled={enabled}
-              controller={controller}
-              cclc={cclc}
-              lifecycle={lifecycleIds.includes(row.componentId)}
-              admission={admission}
-              sourceModel={sourceModel}
-              profileFacts={row.profileId === null ? undefined : catalog.catalog?.componentProfiles[row.profileId]}
-              profiles={catalog.catalog?.componentProfiles ?? NO_PROFILES}
-              motionDescriptors={motionDescriptors}
-              gripperDescriptors={gripperDescriptors}
-              programSceneIds={programSceneIds}
-              roles={rolesOfComponent(feedback, row.componentId).map((role) => role.roleId)}
-              robotControl={robotControlIds.includes(row.componentId)}
-              onOpenRobotControl={onOpenRobotControl}
-              onOpenDeployment={onOpenDeployment}
-            />
+            <ComponentPage key={row.componentId} {...pageProps(row)} />
           )}
         </div>
       </div>
@@ -196,17 +190,25 @@ export function ComponentsWorkspace({
   );
 }
 
-/** One component: what it is, its live status, frames, I/O and settings. */
+/**
+ * One component: what it is, its live status, frames, I/O and settings. A
+ * machine member's page follows its machine card, which shows its status.
+ */
 function ComponentPage({
-  row, enabled, controller, cclc, lifecycle, admission, sourceModel, profileFacts, profiles, motionDescriptors,
-  gripperDescriptors, programSceneIds, roles, robotControl, onOpenRobotControl, onOpenDeployment,
+  row, enabled, controller, state, states, statesKnown, sourceModel, profileFacts, profiles, motionDescriptors,
+  gripperDescriptors, programSceneIds, roles, robotControl, onOpenRobotControl, onOpenDeployment, onRemoved,
+  member = false,
 }: {
   row: ComponentManagerRow;
   enabled: boolean;
   controller: DeploymentWorkspaceController;
-  cclc: CCLCController;
-  lifecycle: boolean;
-  admission: ReturnType<typeof lifecycleAdmission>;
+  /** Its pushed state; null while it is not in the cell. */
+  state: ComponentState | null;
+  /** The cell's pushed states. */
+  states: readonly ComponentState[];
+  /** False while the cell's states can't be read (shown as unavailable). */
+  statesKnown: boolean;
+  member?: boolean;
   sourceModel: StructuralResourceState<SourceModelProjection>;
   /** The component type's catalog facts; undefined until the catalog is read. */
   profileFacts: ComponentProfileFacts | undefined;
@@ -219,11 +221,10 @@ function ComponentPage({
   robotControl: boolean;
   onOpenRobotControl: (componentId: string) => void;
   onOpenDeployment: (tab: ComponentManagerTab) => void;
+  onRemoved: () => void;
 }) {
   const id = row.componentId;
   const document = controller.workspace?.draft.document ?? null;
-  const snapshot = lifecycle && cclc.controllableComponentId === id ? cclc.snapshot : null;
-  const vendor = snapshot === null ? [] : vendorStatusFacts(snapshot);
   const mountedTool = toolOnFlange(document, id);
   const frames = componentFrameTargets(sourceModel.status === 'ready' ? sourceModel.data.targets : null, document, id);
   const gripperFrames = draftGripperFrames(document, id);
@@ -240,6 +241,7 @@ function ComponentPage({
         </header>
         <dl>
           <div><dt>Profile</dt><dd>{row.profileId ?? 'not in the Draft'}</dd></div>
+          {row.owner !== null && <div><dt>Machine</dt><dd>{row.owner} · {row.role ?? 'member'}{row.active ? '' : ' · deactivated'}</dd></div>}
           {row.mount !== null && <div><dt>Mounted on</dt><dd>{row.mount}</dd></div>}
           {mountedTool !== null && <div><dt>Tool on its flange</dt><dd>{mountedTool}</dd></div>}
           <div><dt>Deployment</dt><dd>{CHANGE_LABELS[row.change]}</dd></div>
@@ -264,24 +266,19 @@ function ComponentPage({
         </div>
       </section>
 
-      {!lifecycle ? (
+      {member ? null : state === null ? (
         <section className="dcard" aria-label={`${id} status`}>
           <h4>Status</h4>
-          <p className="muted">Not running: the next Apply brings it up (Deployment, Changes).</p>
+          <p className="muted">{missingComponentStateText(statesKnown)}</p>
         </section>
-      ) : snapshot === null && cclc.controllableComponentId !== id ? (
-        <p className="panel-state" role="status">Reading {id} lifecycle…</p>
       ) : (
-        <CCLCPanelView part="component" enabled={enabled} controller={cclc} componentIds={[id]} {...admission} />
+        <>
+          <ComponentStatePanel state={state} enabled={enabled} states={states} />
+          <ComponentDetailsCard state={state} />
+        </>
       )}
-      {vendor.length > 0 && (
-        <section className="dcard" aria-labelledby="component-vendor-title">
-          <h4 id="component-vendor-title">Vendor status</h4>
-          <dl>
-            {vendor.map((fact) => <div key={fact.label}><dt>{fact.label}</dt><dd>{fact.value}</dd></div>)}
-          </dl>
-          <p className="field-help">As the driver reports it; Prepare or Recover clears an error left after an emergency stop when the driver supports it.</p>
-        </section>
+      {row.change !== 'removed' && (
+        <ComponentPlacementEditor row={row} controller={controller} profiles={profiles} onRemoved={onRemoved} />
       )}
 
       <ComponentTcpsCard componentId={id} controller={controller} frames={frames}

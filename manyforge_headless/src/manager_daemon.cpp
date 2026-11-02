@@ -4,6 +4,7 @@
 #include "manyforge_headless/scene_runtime_pose_projector.hpp"
 #include "manyforge_headless/scene_runtime_state_owner.hpp"
 #include "manyforge_headless/source_snapshot.hpp"
+#include "manager_response_transport_internal.hpp"
 #include "program_runner_publisher_fault_internal.hpp"
 #include "scene_admission_reconciliation_internal.hpp"
 #include <manyforge_deployment/execution_runtime_contract.hpp>
@@ -20,7 +21,7 @@
 #include <manyforge_deployment/program_contract.hpp>
 #include <manyforge_deployment/program_binding_outcome.hpp>
 #include <manyforge_component_manager/manager_runtime_convergence_coordinator.hpp>
-#include <manyforge_component_manager/retained_native_runtime_unit_adapter.hpp>
+#include <manyforge_component_manager/retained_execution_host_unit_adapter.hpp>
 #include <manyforge_component_manager/retained_posix_runtime_unit_adapter.hpp>
 #include <manyforge_component_manager/runtime_unit_adapter_router.hpp>
 #include <manyforge_component_manager/site_settings.hpp>
@@ -375,12 +376,9 @@ public:
       FailErrno("create Manager command socket");
     }
     const int receive_buffer_bytes = static_cast<int>(kMaximumCommandBytes);
-    const int send_buffer_bytes = static_cast<int>(kMaximumResponseBytes);
     if (::setsockopt(descriptor_.get(), SOL_SOCKET, SO_RCVBUF,
                      &receive_buffer_bytes,
-                     sizeof(receive_buffer_bytes)) != 0 ||
-        ::setsockopt(descriptor_.get(), SOL_SOCKET, SO_SNDBUF,
-                     &send_buffer_bytes, sizeof(send_buffer_bytes)) != 0) {
+                     sizeof(receive_buffer_bytes)) != 0) {
       FailErrno("configure Manager command socket buffers");
     }
     sockaddr_un address{};
@@ -432,8 +430,8 @@ struct DaemonConfig final {
   std::filesystem::path program_cycle_journal;
   std::filesystem::path projection_root;
   std::filesystem::path program_runner_liveness_socket;
-  /// Optional approved root for relative Program scene meshes. The native
-  /// runtime adapter opens it once; empty means relative meshes fail closed.
+  /// Optional approved root for relative Program scene meshes. The execution
+  /// host adapter opens it once; empty means relative meshes fail closed.
   std::filesystem::path scene_asset_root;
   /// Optional generic machine site document (`manyforge.site.v1`).
   std::optional<std::filesystem::path> site_settings_path;
@@ -471,11 +469,11 @@ LoadSiteSettingsDocument(const std::optional<std::filesystem::path> &path) {
   return document;
 }
 enum class CommandKind {
-  kCanonicalEmptySelection,
   kDeploymentCandidatePreview,
   kApply,
   kApplyStatus,
   kApplyAcknowledge,
+  kApplyReleaseForNew,
   kStopComponentProcess,
   kComponentProcessStopResult,
   kComponentProcessStopOffer,
@@ -496,7 +494,6 @@ enum class CommandKind {
 [[nodiscard]] bool
 RequiresCurrentPackageGeneration(const CommandKind command) noexcept {
   switch (command) {
-  case CommandKind::kCanonicalEmptySelection:
   case CommandKind::kDeploymentCandidatePreview:
   case CommandKind::kSceneCommit:
   case CommandKind::kSceneCandidatePreview:
@@ -511,6 +508,7 @@ RequiresCurrentPackageGeneration(const CommandKind command) noexcept {
   case CommandKind::kApply:
   case CommandKind::kApplyStatus:
   case CommandKind::kApplyAcknowledge:
+  case CommandKind::kApplyReleaseForNew:
   case CommandKind::kStopComponentProcess:
   case CommandKind::kComponentProcessStopResult:
   case CommandKind::kComponentProcessStopOffer:
@@ -798,22 +796,8 @@ component_manager::ManagerApplyPreparedActivationDTO RequiredPreparedActivation(
   Require(assistant_mode == "required" || assistant_mode == "optional" ||
               assistant_mode == "forbidden",
           "Apply prepared activation assistant_mode is unsupported");
-  const auto origin = deployment::parse_prepared_activation_origin(
-      RequiredMember(value, "origin"));
-  if (const auto *sealed =
-          std::get_if<deployment::PreparedSealedCanonicalEmptyOrigin>(&origin)) {
-    Require(no_program &&
-                sealed->deployment_artifact_id.value() ==
-                    RequiredString(value, "deployment_artifact_id") &&
-                sealed->deployment_revision.value() == deployment_revision &&
-                sealed->retained_bundle_id.value() ==
-                    RequiredString(value, "retained_bundle_id") &&
-                sealed->graph_revision.value() ==
-                    RequiredString(value, "graph_revision") &&
-                deployment::sealed_canonical_empty_capture_digest(*sealed).value() ==
-                    captured_input_digest,
-            "Apply sealed empty origin differs from its preparation");
-  }
+  static_cast<void>(deployment::parse_prepared_activation_origin(
+      RequiredMember(value, "origin")));
   if (!no_program) {
     static_cast<void>(RequiredString(value, "program_id"));
     Require(core::IsExactLowercaseSha256Digest(RequiredString(value, "program_revision")),
@@ -837,14 +821,13 @@ component_manager::ManagerApplyPreparedActivationDTO RequiredPreparedActivation(
 /// A caller therefore cannot submit an outcome the preparer did not produce.
 bool PreparedActivationIsStoredExactly(
     const std::filesystem::path &activation_root,
-    const component_manager::ManagerApplyPreparedActivationDTO &activation,
-    const deployment::CanonicalEmptyRetainedBundleAdmission *admission) {
+    const component_manager::ManagerApplyPreparedActivationDTO &activation) {
   if (activation_root.empty()) {
     return false;
   }
   const auto stored =
       deployment::FilesystemPreparedActivationRepository(activation_root)
-          .get_verified(activation.prepared_activation_id, admission);
+          .get_verified(activation.prepared_activation_id);
   if (stored == nullptr) {
     return false;
   }
@@ -1459,10 +1442,6 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
     result.component_process_stop = RequiredComponentProcessStop(RequiredMember(root, "request"));
     return result;
   }
-  if (command == "canonical_empty_selection") {
-    RequireExactObjectSize(root, 2U, "canonical-empty selection command");
-    return ManagerCommand{.kind = CommandKind::kCanonicalEmptySelection};
-  }
   if (command == "deployment_candidate_preview") {
     RequireExactObjectSize(root, 10U, "deployment candidate preview command");
     const auto deployment_revision =
@@ -1622,16 +1601,21 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
         RequiredMember(root, "expected_runtime_identity"));
     return result;
   }
-  if (command == "apply_status" || command == "apply_acknowledge") {
-    const bool acknowledging = command == "apply_acknowledge";
+  if (command == "apply_status" || command == "apply_acknowledge" ||
+      command == "apply_release_for_new") {
+    const bool acknowledging = command != "apply_status";
+    const bool for_new = command == "apply_release_for_new";
     try {
-      RequireExactObjectSize(root, acknowledging ? 5U : 4U, "Apply status command");
-      ManagerCommand result{.kind = command == "apply_status"
-                                        ? CommandKind::kApplyStatus
-                                        : CommandKind::kApplyAcknowledge};
-      result.apply_id = core::ApplyId(RequiredString(root, "apply_id"));
-      result.apply_generation = core::ApplyGeneration(RequiredUnsigned(
-          RequiredMember(root, "apply_generation"), "apply_generation"));
+      RequireExactObjectSize(root, for_new ? 3U : acknowledging ? 5U : 4U,
+                             "Apply status command");
+      ManagerCommand result{.kind = command == "apply_status" ? CommandKind::kApplyStatus
+                                    : for_new ? CommandKind::kApplyReleaseForNew
+                                              : CommandKind::kApplyAcknowledge};
+      if (!for_new) {
+        result.apply_id = core::ApplyId(RequiredString(root, "apply_id"));
+        result.apply_generation = core::ApplyGeneration(RequiredUnsigned(
+            RequiredMember(root, "apply_generation"), "apply_generation"));
+      }
       if (acknowledging) {
         const auto &context = RequiredMember(root, "request_context");
         const auto *correlation = context.find_object_member("correlation_id");
@@ -1702,13 +1686,6 @@ ManagerCommand DecodeCommand(const std::string_view bytes) {
       initialization == "initialize"
           ? component_manager::ManagerSceneInitialization::kInitialize
           : component_manager::ManagerSceneInitialization::kPreserve;
-  const auto prepared = content_identity::parse_canonical_json(
-      result.prepared_activation->canonical_receipt_json);
-  const auto origin_kind =
-      RequiredString(RequiredMember(prepared, "origin"), "kind");
-  Require(initialization == "preserve" || origin_kind == "scenario" ||
-              origin_kind == "sealed_canonical_empty",
-          "Apply origin does not support Scene initialization");
   result.expected_current_retained_bundle_id =
       core::RetainedBundleId(expected_retained_bundle_id);
   result.expected_current_graph_revision =
@@ -2336,14 +2313,14 @@ CanonicalValue DeploymentApplyImpact(
     const deployment::RetainedBundle &candidate,
     const std::filesystem::path &activation_root,
     const core::ContentDigest &prepared_activation_id,
-    const deployment::CanonicalEmptyRetainedBundleAdmission &admission) {
+    const deployment::SiteFacts &site_facts) {
   const auto delta =
-      deployment::derive_apply_component_delta(current, candidate);
+      deployment::derive_apply_component_delta(current, candidate, site_facts);
   Require(!activation_root.empty(),
           "Deployment impact requires the trusted activation store");
   const auto prepared =
       deployment::FilesystemPreparedActivationRepository(activation_root)
-          .get_verified(prepared_activation_id, &admission);
+          .get_verified(prepared_activation_id);
   Require(prepared != nullptr &&
               prepared->retained_bundle_id() == candidate.retained_bundle_id(),
           "Deployment impact names no stored prepared activation for the "
@@ -2667,9 +2644,15 @@ std::optional<std::string> ReceiveCommand(const int client) {
 void TrySendResponse(const int client,
                      const CanonicalValue &response) noexcept {
   try {
-    const auto bytes = content_identity::canonical_json(response);
-    if (bytes.empty() || bytes.size() > kMaximumResponseBytes) {
+    auto bytes = content_identity::canonical_json(response);
+    if (bytes.empty()) {
       return;
+    }
+    if (bytes.size() >
+        detail::AtomicResponseCapacity(client, kMaximumResponseBytes)) {
+      bytes = content_identity::canonical_json(ErrorResponse(
+          "manager_command_response_oversized",
+          "Manager response exceeds the bounded private transport"));
     }
     pollfd descriptor{client, POLLOUT, 0};
     int ready = -1;
@@ -2722,9 +2705,8 @@ public:
   explicit ManagerVerifiedPackageView(
       std::filesystem::path package_root,
       std::optional<std::filesystem::path> activation_root =
-          std::nullopt,
-      const deployment::CanonicalEmptyRetainedBundleAdmission *admission = nullptr)
-      : package_root_(package_root), activation_root_(activation_root), admission_(admission),
+          std::nullopt)
+      : package_root_(package_root), activation_root_(activation_root),
         bundles_(package_root, activation_root),
         artifacts_(package_root, activation_root) {}
 
@@ -2769,7 +2751,7 @@ public:
     const auto &maps = bundle.value().compiled_products.symbol_role_maps;
     if (outcome != nullptr && RequiredString(*outcome, "kind") == "no_program") {
       if (!activation_root_.has_value() ||
-          !PreparedActivationIsStoredExactly(*activation_root_, activation, admission_)) {
+          !PreparedActivationIsStoredExactly(*activation_root_, activation)) {
         throw std::invalid_argument("Apply empty Scene requires exact no_program evidence");
       }
       // Empty initial intents still go through the normal Scene staging and
@@ -2823,7 +2805,7 @@ public:
       }
       const auto prepared =
           deployment::FilesystemPreparedActivationRepository(*activation_root_)
-              .get_verified(activation.prepared_activation_id, admission_);
+              .get_verified(activation.prepared_activation_id);
       if (prepared == nullptr ||
           prepared->retained_bundle_id() != bundle.retained_bundle_id() ||
           prepared->program_revision() != program->value().program_revision) {
@@ -3023,7 +3005,6 @@ public:
 private:
   std::filesystem::path package_root_;
   std::optional<std::filesystem::path> activation_root_;
-  const deployment::CanonicalEmptyRetainedBundleAdmission *admission_;
   deployment::FilesystemVerifiedRetainedBundleSource bundles_;
   deployment::FilesystemVerifiedRetainedProductArtifactSource artifacts_;
   mutable std::mutex mutex_;
@@ -3047,15 +3028,15 @@ private:
       component_manager::ManagerActiveRuntimeConvergenceState::kConverged) {
     return false;
   }
-  std::size_t native_execution_hosts = 0U;
+  std::size_t execution_hosts = 0U;
   for (const auto &row : runtime.plan.runtime_units) {
     if (row.process_adapter_contract_id ==
         deployment::execution_runtime_contract::
             kProcessAdapterContractId) {
-      ++native_execution_hosts;
+      ++execution_hosts;
     }
   }
-  return native_execution_hosts == 1U;
+  return execution_hosts == 1U;
 }
 
 class DaemonPlannedMaintenanceGate final
@@ -3173,6 +3154,7 @@ public:
   explicit ManagerDaemon(DaemonConfig config)
       : config_(ValidateConfig(std::move(config))),
         site_settings_document_(LoadSiteSettingsDocument(config_.site_settings_path)),
+        site_facts_(component_manager::SiteFactsOfDocument(site_settings_document_)),
         started_at_(std::chrono::steady_clock::now()),
         package_generation_(config_.install_root,
                             deployment::runtime_contract_declaration_registry()
@@ -3186,8 +3168,8 @@ public:
             package_generation_.descriptor_bound_root(),
             config_.activation_root.empty()
                 ? std::nullopt
-                : std::optional(config_.activation_root), &admission_),
-        native_runtime_adapter_(
+                : std::optional(config_.activation_root)),
+        execution_host_adapter_(
             InstalledTargetRoot(), package_generation_.descriptor_bound_root(),
             config_.manager_state_root, config_.manager_run_root,
             config_.execution_state_root, config_.execution_run_root,
@@ -3202,9 +3184,9 @@ public:
         stores_(config_.manager_state_root, admission_),
         scene_owner_(config_.logical_scene_database, admission_,
                      stores_.active_bundle_publication_store(),
-                     verified_package_, native_runtime_adapter_,
-                     native_runtime_adapter_),
-        original_manager_scene_maintenance_(scene_owner_, native_runtime_adapter_),
+                     verified_package_, execution_host_adapter_,
+                     execution_host_adapter_),
+        original_manager_scene_maintenance_(scene_owner_, execution_host_adapter_),
         scene_runtime_pose_projector_(
             scene_owner_, admission_.cell_id(),
             [this](const core::RetainedBundleId &retained_bundle_id,
@@ -3232,7 +3214,7 @@ public:
               &reference_runtime_adapter_, &reference_runtime_adapter_},
              {std::string(deployment::execution_runtime_contract::
                               kProcessAdapterContractId),
-              &native_runtime_adapter_, &native_runtime_adapter_}}),
+              &execution_host_adapter_, &execution_host_adapter_}}),
         active_runtime_(
             plan_source_, runtime_adapter_router_, runtime_adapter_router_,
             [this] { return ElapsedNs(); },
@@ -3245,8 +3227,8 @@ public:
         named_apply_(
             stores_.apply_journal(), plan_source_, verified_package_,
             verified_package_, stores_.active_bundle_publication_store(),
-            original_manager_scene_maintenance_, &scene_owner_, native_runtime_adapter_,
-            native_runtime_adapter_, native_runtime_adapter_,
+            original_manager_scene_maintenance_, &scene_owner_, execution_host_adapter_,
+            execution_host_adapter_, execution_host_adapter_,
             runtime_adapter_router_, runtime_adapter_router_,
             planned_maintenance_,
             manager_runtime_epoch_, "linux",
@@ -3263,7 +3245,8 @@ public:
             },
             [this](const auto &intent, const auto attempt) {
               return PrepareSuccessfulApplySettlement(intent, attempt);
-            }),
+            },
+            site_facts_),
         scene_runtime_owner_([] { return HostMonotonicNs(); },
                              [] { return RandomToken("scene-init-"); }),
         manager_channel_(config_.projection_root,
@@ -3675,7 +3658,7 @@ private:
           publication.request.candidate_projection_revision, publication.publication_generation,
           publication.durable_public_pointer_content_digest, unit.runtime_unit_id,
           core::RuntimeEpoch(host->runtime_epoch()), manager_runtime_epoch_};
-      const auto observed = native_runtime_adapter_.InspectInstalledComponentProcesses(request);
+      const auto observed = execution_host_adapter_.InspectInstalledComponentProcesses(request);
       if (!observed.ok()) return Offer::Err(observed.error());
       if (!observed.value().valid() || observed.value().request != request)
         return unavailable("the installed process inventory has a foreign original scope");
@@ -3686,7 +3669,8 @@ private:
         if (++count > component_manager::kMaximumComponentProcessInventoryEntries)
           return unavailable("the complete addressed process union exceeds its existing bound");
         if (row.process_owner_kind == component_manager::ManagerComponentProcessOwnerKindDTO::kPneumaticNoneLocal) {
-          const auto verified = component_manager::ValidateManagerPneumaticNoneProcessOwner(*bundle, request, row);
+          const auto verified = component_manager::ValidateManagerPneumaticNoneProcessOwner(
+              *bundle, site_facts_, request, row);
           if (!verified.ok()) return Offer::Err(verified.error());
           const auto& proof = *row.pneumatic_none_owner;
           // This is an installed logical owner, not a launch or a drain receipt.
@@ -3968,7 +3952,7 @@ private:
   void SubmitCellAdmissionReadiness(
       const core::CellAdmissionReadinessSnapshotDTO &snapshot) {
     const auto updated =
-        native_runtime_adapter_.UpdateCellAdmissionReadiness(snapshot);
+        execution_host_adapter_.UpdateCellAdmissionReadiness(snapshot);
     if (!updated.ok()) {
       throw std::runtime_error(
           "Kernel rejected Manager-owned cell-admission readiness: " +
@@ -4080,7 +4064,7 @@ private:
                   product->product_identity() == row.product_identity &&
                   product->manager_liveness_policy().has_value() &&
                   *product->manager_liveness_policy() == retained_policy,
-              "active native runtime has no exact retained liveness policy");
+              "active execution host has no exact retained liveness policy");
     }
     bool wake = false;
     {
@@ -4123,7 +4107,7 @@ private:
   ///
   /// Traced path (UA3.1): ProbeProgramRunnerLiveness (read-only socket probe) ->
   /// required-set construction from the currently observed epochs ->
-  /// RenewProgramRunnerLiveness -> RetainedNativeRuntimeAdapter
+  /// RenewProgramRunnerLiveness -> RetainedExecutionHostAdapter
   /// RenewManagerLivenessBatch -> Kernel liveness publication ->
   /// BuildCellAdmissionReadiness. This lane performs no process lifecycle call:
   /// it never reaches the active-runtime coordinator's Observe/Initialize and
@@ -4220,7 +4204,7 @@ private:
           continue;
         }
         track_failure("required_native_receiver_observable",
-                      "native_runtime_unit",
+                      "execution_host_unit",
                       row.runtime_unit_id.value());
         const auto *observation =
             runtime.observations.observation(row.runtime_unit_id.value());
@@ -4357,7 +4341,7 @@ private:
       const auto responses =
           requests.empty()
               ? std::vector<core::ManagerLivenessObservationDTO>{}
-              : native_runtime_adapter_.RenewManagerLivenessBatch(requests);
+              : execution_host_adapter_.RenewManagerLivenessBatch(requests);
       if (responses.size() != native_receivers.size()) {
         throw std::runtime_error(
             "native liveness batch returned the wrong receiver count");
@@ -4366,7 +4350,7 @@ private:
         const auto &receiver = native_receivers[index];
         const auto &response = responses[index];
         track_failure("native_receiver_reconciliation_identity",
-                      "native_runtime_unit",
+                      "execution_host_unit",
                       receiver.runtime_unit_id.value());
         if (response.active_bundle_id != required_set.active_bundle_id ||
             response.required_runtime_set_digest != digest ||
@@ -4428,7 +4412,7 @@ private:
                     "cell-role:program_runner",
                     runner.runtime_unit_id.value());
       const auto published_runner =
-          native_runtime_adapter_.Publish(runner_renewal.observation);
+          execution_host_adapter_.Publish(runner_renewal.observation);
       if (!published_runner.ok()) {
         throw std::runtime_error(
             "Kernel rejected Program Runner liveness observation: " +
@@ -5819,8 +5803,8 @@ private:
         Require(request.manager_runtime_epoch == manager_runtime_epoch_,
                 "component process Stop names another Manager occurrence");
         const auto result = command.kind == CommandKind::kStopComponentProcess
-            ? native_runtime_adapter_.StopComponentProcess(request)
-            : native_runtime_adapter_.ReadComponentProcessStop({request});
+            ? execution_host_adapter_.StopComponentProcess(request)
+            : execution_host_adapter_.ReadComponentProcessStop({request});
         if (!result.ok()) {
           auto fields = DetailedErrorResponse(result.error().code,
               result.error().message, result.error().details).as_object();
@@ -5832,33 +5816,6 @@ private:
         }
         return false;
   }
-      case CommandKind::kCanonicalEmptySelection: {
-        // These are sealed package facts, not a prepared activation or
-        // authority to bypass the ordinary candidate-preview and Apply path.
-        auto response = CanonicalValue(CanonicalValue::Object{
-            {"api_version",
-             CanonicalValue(std::string(kManagerCommandResponseApiVersion))},
-            {"ok", CanonicalValue(true)},
-            {"canonical_empty_selection",
-             CanonicalValue(CanonicalValue::Object{
-                 {"request_owner_epoch", CanonicalValue(manager_owner_epoch_)},
-                 {"cell_id", CanonicalValue(admission_.cell_id().value())},
-                 {"deployment_artifact_id",
-                  CanonicalValue(admission_.deployment_artifact_id().value())},
-                 {"deployment_revision",
-                  CanonicalValue(admission_.deployment_revision().value())},
-                 {"candidate_retained_bundle_id",
-                  CanonicalValue(admission_.retained_bundle_id().value())},
-                 {"candidate_graph_revision",
-                  CanonicalValue(admission_.graph_revision().value())},
-                 {"admission_digest",
-                  CanonicalValue(admission_.admission_digest().value())},
-             })},
-        });
-        RequireCurrentPackageGeneration();
-        TrySendResponse(client.get(), response);
-        break;
-      }
       case CommandKind::kDeploymentCandidatePreview: {
         Require(command.request_owner_epoch.has_value() &&
                     command.deployment_artifact_id.has_value() &&
@@ -5922,7 +5879,7 @@ private:
             return false;
           }
           const auto host_continuity =
-              component_manager::VerifyNativeExecutionHostContinuity(
+              component_manager::VerifyExecutionHostContinuity(
                   *current_bundle, *candidate_bundle, verified_package_);
           if (!host_continuity.ok()) {
             const auto &error = host_continuity.error();
@@ -5933,7 +5890,7 @@ private:
           }
           auto impact = DeploymentApplyImpact(
               *current_bundle, *candidate_bundle, config_.activation_root,
-              *command.prepared_activation_id, admission_);
+              *command.prepared_activation_id, site_facts_);
           DeploymentCandidateReceipt receipt{
               *command.deployment_artifact_id,
               *command.deployment_revision,
@@ -6042,7 +5999,7 @@ private:
           }
           if (!existing.has_value() &&
               !PreparedActivationIsStoredExactly(config_.activation_root,
-                                                 *command.prepared_activation, &admission_)) {
+                                                 *command.prepared_activation)) {
             TrySendResponse(
                 client.get(),
                 ApplyKnownNoEffectErrorResponse(
@@ -6091,7 +6048,7 @@ private:
             Require(current_bundle != nullptr && candidate_bundle != nullptr,
                     "Apply could not resolve its exact previewed graphs");
             const auto host_continuity =
-                component_manager::VerifyNativeExecutionHostContinuity(
+                component_manager::VerifyExecutionHostContinuity(
                     *current_bundle, *candidate_bundle, verified_package_);
             if (!host_continuity.ok()) {
               TrySendResponse(
@@ -6102,7 +6059,7 @@ private:
             }
             auto impact = DeploymentApplyImpact(
                 *current_bundle, *candidate_bundle, config_.activation_root,
-                candidate_receipt.prepared_activation_id, admission_);
+                candidate_receipt.prepared_activation_id, site_facts_);
             if (DeploymentApplyImpactDigest(impact) !=
                 candidate_receipt.impact_digest) {
               TrySendResponse(
@@ -6174,6 +6131,26 @@ private:
               ApplyErrorResponseFromJournalEvidence(command, error,
                                                     "apply_rejected"));
         }
+        return false;
+      }
+      case CommandKind::kApplyReleaseForNew: {
+        // New (R3, N7): release whatever failed Apply still holds the cell.
+        Require(command.request_id.has_value() && command.source_label.has_value(),
+                "decoded Apply release for New lacks its request context");
+        const auto released = named_apply_.ReleaseFailedApplyForNew(
+            core::RequestId(*command.request_id), *command.source_label);
+        TrySendResponse(client.get(), CanonicalValue(CanonicalValue::Object{
+            {"api_version", CanonicalValue(std::string(kManagerCommandResponseApiVersion))},
+            {"error", CanonicalValue(nullptr)},
+            {"ok", CanonicalValue(true)},
+            {"released", released.has_value()
+                             ? CanonicalValue(CanonicalValue::Object{
+                                   {"apply_generation", Unsigned(released->apply_generation.value(),
+                                                                 "Apply generation")},
+                                   {"apply_id", CanonicalValue(released->apply_id.value())},
+                               })
+                             : CanonicalValue(nullptr)},
+        }));
         return false;
       }
       case CommandKind::kApplyStatus:
@@ -6696,12 +6673,14 @@ private:
   DaemonConfig config_;
   // Own the exact validated site document before constructing child adapters.
   std::optional<std::string> site_settings_document_;
+  // Its device addresses: every component spec is derived with them.
+  deployment::SiteFacts site_facts_;
   std::chrono::steady_clock::time_point started_at_;
   ManagerPackageGeneration package_generation_;
   DaemonLock daemon_lock_;
   deployment::CanonicalEmptyRetainedBundleAdmission admission_;
   ManagerVerifiedPackageView verified_package_;
-  component_manager::RetainedNativeRuntimeUnitAdapter native_runtime_adapter_;
+  component_manager::RetainedExecutionHostUnitAdapter execution_host_adapter_;
   component_manager::ExternallyProvisionedManagerStores stores_;
   manyforge::scene::LogicalSceneOwner scene_owner_;
   OriginalManagerSceneMaintenanceAdapter original_manager_scene_maintenance_;

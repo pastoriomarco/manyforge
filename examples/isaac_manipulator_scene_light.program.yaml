@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: isaac_manipulator_scene_light
-program_revision: sha256:2c88ab2a374e599c0f6fbbac480a4a54bfc915cfe7506bd4bec9fc68d2de7971
+program_revision: sha256:ef6b4dc6dace18cb936c860d6fc1c0148b87a3b381142c30549aa2676ecd1dcb
 program_profile: composable-cell-v1
 name: isaac_manipulator_scene_light
 description: Retained Isaac Sim light-scene pick-and-place Program for the UR10e and Robotiq 2F-140. It
@@ -44,9 +44,6 @@ target_roles:
       parameters: {}
       disposition: required
     - capability_id: planning.motion.pose_goal
-      parameters: {}
-      disposition: required
-    - capability_id: planning.profile.balanced
       parameters: {}
       disposition: required
     - capability_id: planning.trajectory.time_parameterized

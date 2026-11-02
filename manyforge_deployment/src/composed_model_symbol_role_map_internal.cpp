@@ -391,19 +391,28 @@ using SymbolIndex = std::map<SymbolKey, std::string>;
 
 [[nodiscard]] CanonicalValue occurrence_projection(
     const CompositionModelOccurrence& occurrence,
-    const core::ModelAssetDTO& asset, const SymbolIndex& symbols) {
+    const core::ModelAssetDTO& asset,
+    const std::vector<core::ModelCustomTcpDTO>& custom_tcps,
+    const SymbolIndex& symbols) {
+  // The asset's frame roles and the occurrence's custom TCPs (a custom TCP's
+  // link is named by its frame role), as the composition exports them.
+  std::map<std::string, std::string, std::less<>> frame_links;
+  for (const auto& role : asset.frame_role_bindings)
+    frame_links.emplace(role.frame_role_id.value(),
+                        core::frame_role_link_name(role));
+  for (const auto& custom : custom_tcps)
+    frame_links.emplace(custom.frame_role_id.value(),
+                        custom.frame_role_id.value());
   CanonicalValue::Array frame_roles;
-  frame_roles.reserve(asset.frame_role_bindings.size());
-  for (const auto& role : asset.frame_role_bindings) {
+  frame_roles.reserve(frame_links.size());
+  for (const auto& [role, link] : frame_links) {
     frame_roles.emplace_back(CanonicalValue::Object{
-        {"frame_role_id", CanonicalValue(role.frame_role_id.value())},
-        {"source_link_name",
-         CanonicalValue(core::frame_role_link_name(role))},
+        {"frame_role_id", CanonicalValue(role)},
+        {"source_link_name", CanonicalValue(link)},
         {"compiled_link_name",
          CanonicalValue(require_compiled(
              symbols, occurrence.model_instance_id,
-             OccurrenceSymbolKind::kLink, {},
-             core::frame_role_link_name(role)))},
+             OccurrenceSymbolKind::kLink, {}, link))},
     });
   }
 
@@ -501,8 +510,17 @@ using SymbolIndex = std::map<SymbolKey, std::string>;
   CanonicalValue::Array occurrences;
   occurrences.reserve(composition.model_occurrences().size());
   for (const auto& occurrence : composition.model_occurrences()) {
+    const auto& models = composition.graph().model_instances;
+    const auto model = std::find_if(
+        models.begin(), models.end(), [&](const auto& candidate) {
+          return candidate.model_instance_id == occurrence.model_instance_id;
+        });
+    if (model == models.end()) {
+      throw std::logic_error("composed occurrence has no graph model instance");
+    }
     occurrences.push_back(occurrence_projection(
-        occurrence, require_asset(occurrence, composition), symbols));
+        occurrence, require_asset(occurrence, composition), model->custom_tcps,
+        symbols));
   }
 
   CanonicalValue::Array symbol_rows;

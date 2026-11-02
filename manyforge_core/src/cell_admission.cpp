@@ -125,15 +125,12 @@ constexpr std::size_t kJsonStructuralAllowanceBytes = 16U * 1024U;
       return role == CellAdmissionOwnerRoleDTO::kAuthoringOwner;
     case CellAdmissionClaimKindDTO::kManagerApply:
       return role == CellAdmissionOwnerRoleDTO::kManager;
-    case CellAdmissionClaimKindDTO::kComponentLifecycle:
-      return role == CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner;
     case CellAdmissionClaimKindDTO::kAuthoredScene:
       return role == CellAdmissionOwnerRoleDTO::kAuthoredSceneOwner;
     case CellAdmissionClaimKindDTO::kManualOperation:
       return role == CellAdmissionOwnerRoleDTO::kManualOperationOwner;
     case CellAdmissionClaimKindDTO::kInterventionOrRecovery:
-      return role == CellAdmissionOwnerRoleDTO::kInterventionOrRecoveryOwner ||
-             role == CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner;
+      return role == CellAdmissionOwnerRoleDTO::kInterventionOrRecoveryOwner;
   }
   return false;
 }
@@ -173,8 +170,6 @@ std::string_view to_string(CellAdmissionClaimKindDTO value) noexcept {
       return "authoring_mutation";
     case CellAdmissionClaimKindDTO::kManagerApply:
       return "manager_apply";
-    case CellAdmissionClaimKindDTO::kComponentLifecycle:
-      return "component_lifecycle";
     case CellAdmissionClaimKindDTO::kAuthoredScene:
       return "authored_scene";
     case CellAdmissionClaimKindDTO::kManualOperation:
@@ -193,8 +188,6 @@ std::string_view to_string(CellAdmissionOwnerRoleDTO value) noexcept {
       return "authoring_owner";
     case CellAdmissionOwnerRoleDTO::kManager:
       return "manager";
-    case CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner:
-      return "component_lifecycle_owner";
     case CellAdmissionOwnerRoleDTO::kAuthoredSceneOwner:
       return "authored_scene_owner";
     case CellAdmissionOwnerRoleDTO::kManualOperationOwner:
@@ -352,28 +345,6 @@ Result<void> ValidateCellAdmissionClaimIntent(const CellAdmissionClaimIntentDTO&
          evidence.offer_transaction_id != intent.owner_transaction_id ||
          !evidence.parent_program_cycle_claim_generation || intent.scope.resources.empty())) {
       return Invalid<void>("manual_handover_evidence_invalid");
-    }
-    // Both recovery offers remain private CCLC/Kernel composition. The route
-    // owner retains its observation-only, one-configuration shape; selected
-    // bring-up has the selected component's physical closure: its resources and
-    // adopted controller configurations, both empty for an input-only provider
-    // component; the CCLC status and the Kernel check them per domain. Shape
-    // validation alone never authorizes either operation.
-    if (intervention && intent.owner_role == CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner) {
-      const bool exact_owner =
-          evidence.offering_owner_role == intent.owner_role &&
-          evidence.offering_owner_epoch == intent.owner_epoch &&
-          evidence.offer_transaction_id == intent.owner_transaction_id &&
-          evidence.offer_digest == intent.request_payload_digest &&
-          !evidence.parent_program_cycle_claim_generation.has_value();
-      const bool route = intent.owner_transaction_id.starts_with("route-selection.") &&
-                         intent.scope.resources.empty() && intent.scope.configurations.size() == 1U;
-      const bool selected = intent.owner_transaction_id.starts_with("selected-lifecycle.");
-      if (!exact_owner || (!route && !selected)) {
-        return Invalid<void>(intent.owner_transaction_id.starts_with("selected-lifecycle.")
-                                 ? "cclc_selected_recovery_evidence_invalid"
-                                 : "cclc_route_recovery_evidence_invalid");
-      }
     }
   }
   if (intent.program_node_evidence.has_value()) {

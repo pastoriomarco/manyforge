@@ -1,83 +1,53 @@
 # ROS Environment Profiles
 
-> **Current `dev` boundary:** `isaac_i9.env.sh` is the active I9 topology input
-> for the source-matched mechanical Isaac/Jazzy product. The older
-> FoundationPose profile remains a historical reference; it is not the I9
-> topology API. Sourcing either file alone is not scenario qualification.
+Sourceable ROS 2 environment profiles for shells that take part in a
+multi-machine cell (the Isaac Sim shell, a perception container, the shell that
+runs `./scripts/compose-dev.sh start`). Sourcing one is optional.
 
-This directory contains sourceable ROS 2 environment profiles from the last
-qualified ManyForge operator workflows.
+The workbench itself needs none of them: `./scripts/compose-dev.sh start`
+passes `ROS_DOMAIN_ID` (default `0`), `RMW_IMPLEMENTATION` (default
+`rmw_fastrtps_cpp`), `ROS_AUTOMATIC_DISCOVERY_RANGE`, `ROS_STATIC_PEERS` and the
+DDS profile variables through from its own environment when they are set, and
+never picks peers itself. With `ROS_AUTOMATIC_DISCOVERY_RANGE` unset ROS uses
+`SUBNET`, which reaches Isaac Sim and other ROS machines on the LAN;
+`LOCALHOST` isolates a machine.
 
-## I9 laptop and Orin topology
+Both profiles unset stale Fast DDS discovery-server/profile and Cyclone DDS
+inputs, then set `ROS_DOMAIN_ID`, `RMW_IMPLEMENTATION`,
+`ROS_AUTOMATIC_DISCOVERY_RANGE` and `ROS_STATIC_PEERS`. Override each with its
+`MANYFORGE_`-prefixed counterpart (`MANYFORGE_ROS_DOMAIN_ID`,
+`MANYFORGE_RMW_IMPLEMENTATION`, `MANYFORGE_ROS_AUTOMATIC_DISCOVERY_RANGE`,
+`MANYFORGE_ROS_STATIC_PEERS`), identically in every participant shell.
 
-Source `isaac_i9.env.sh` in the laptop Isaac shell and in every Orin ROS
-participant/container shell:
+## `isaac_i9.env.sh`: explicit peer list
 
 ```bash
 MANYFORGE_ROOT="${MANYFORGE_ROOT:-${HOME}/workspaces/dev_ws/src/manyforge}"
 source "${MANYFORGE_ROOT}/config/ros/isaac_i9.env.sh"
 ```
 
-Its recorded default is one role-free explicit peer list:
+Defaults (an already set standard variable is kept):
 
 - `ROS_DOMAIN_ID=0`
 - `RMW_IMPLEMENTATION=rmw_fastrtps_cpp`
 - `ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST`
 - `ROS_STATIC_PEERS=192.168.1.132;192.168.1.68`
 
-The profile unsets stale Fast DDS discovery-server/profile and Cyclone DDS
-inputs. A different domain or peer set is valid only when applied to every
-participant as one recorded topology input. Use `MANYFORGE_ROS_DOMAIN_ID`,
-`MANYFORGE_RMW_IMPLEMENTATION`,
-`MANYFORGE_ROS_AUTOMATIC_DISCOVERY_RANGE`, and
-`MANYFORGE_ROS_STATIC_PEERS` for that deliberate whole-topology override.
+Set the peers to your machines' addresses before sourcing.
 
-The Orin launcher derives `/manyforge/<controllable_component_id>` from
-`MANYFORGE_ISAAC_COMPONENT_ID` and passes that same namespace to the retained
-execution backend, controller manager, command gate, and gripper adapter. Raw
-Isaac transport topics remain explicit launch inputs so a multi-world fixture
-can assign disjoint wires without changing the retained single-UR10 defaults.
+## `isaac_lite6_trocar_foundationpose.env.sh`: Isaac Sim + Isaac ROS perception
 
-## Isaac Lite6 Trocar FoundationPose
-
-The historical multi-machine workflow used
-`isaac_lite6_trocar_foundationpose.env.sh`
-where Isaac Sim runs on the laptop, Isaac ROS 4.4 YOLOv8/FoundationPose runs on
-Thor or another Jetson, and ManyForge runs its ROS-capable launcher on the
-Thor/Jetson host.
-
-Its captured setup sourced the same profile in every ROS participant shell:
+For Isaac Sim on one machine, Isaac ROS YOLOv8/FoundationPose on a Jetson, and
+ManyForge on that Jetson. Override the host addresses before sourcing:
 
 ```bash
+export MANYFORGE_THOR_IP=<jetson-ip>            # default 192.168.1.136
+export MANYFORGE_ISAAC_SIM_IP=<isaac-sim-ip>    # default 192.168.1.132
 MANYFORGE_ROOT="${MANYFORGE_ROOT:-${HOME}/workspaces/dev_ws/src/manyforge}"
 source "${MANYFORGE_ROOT}/config/ros/isaac_lite6_trocar_foundationpose.env.sh"
 ```
 
-The default topology is:
-
-- Thor / ManyForge / Isaac ROS host: `192.168.1.136`
-- Isaac Sim laptop: `192.168.1.132`
-- ROS domain: `0`
-- RMW: Fast DDS (`rmw_fastrtps_cpp`)
-- Discovery: `ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST` with explicit
-  `ROS_STATIC_PEERS`
-
-For a different LAN, override the host IPs before sourcing:
-
-```bash
-export MANYFORGE_THOR_IP=<thor-or-jetson-ip>
-export MANYFORGE_ISAAC_SIM_IP=<isaac-sim-laptop-ip>
-MANYFORGE_ROOT="${MANYFORGE_ROOT:-${HOME}/workspaces/dev_ws/src/manyforge}"
-source "${MANYFORGE_ROOT}/config/ros/isaac_lite6_trocar_foundationpose.env.sh"
-```
-
-The profile intentionally overwrites existing `ROS_DOMAIN_ID`,
-`RMW_IMPLEMENTATION`, `ROS_AUTOMATIC_DISCOVERY_RANGE`, and `ROS_STATIC_PEERS`
-so stale shell state does not leak into a commissioning session. Override with
-`MANYFORGE_ROS_DOMAIN_ID`, `MANYFORGE_RMW_IMPLEMENTATION`,
-`MANYFORGE_ROS_AUTOMATIC_DISCOVERY_RANGE`, or `MANYFORGE_ROS_STATIC_PEERS` only
-when intentionally qualifying a different topology.
-
-See `docs/operations/ISAAC_LITE6_TROCAR_FOUNDATIONPOSE.md` for the retained
-bring-up sequence, camera QoS settings, TF checks, and future smoke-acceptance
-requirements. It is not a current command sequence.
+It sets `ROS_DOMAIN_ID=0`, Fast DDS, `ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST`
+and `ROS_STATIC_PEERS=<jetson>;<isaac-sim>`, overwriting what the shell had
+(only the `MANYFORGE_` overrides change them). See
+`docs/operations/ISAAC_LITE6_TROCAR_FOUNDATIONPOSE.md` for that workflow.

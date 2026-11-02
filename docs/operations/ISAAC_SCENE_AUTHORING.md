@@ -2,7 +2,7 @@
 
 How to mirror objects from an Isaac Sim stage in a ManyForge Scene, and how to
 stream their poses from Isaac at runtime. The bundled
-`examples/isaac-ur10e-light-scene.scenario` is a complete example: its Program
+`examples/sim_ur10e_pick_and_place.scenario` is a complete example: its Program
 scene uses the OBJ meshes in `examples/isaac_manipulator_scene_light/meshes/`.
 
 ManyForge does not include a tool that exports meshes from Isaac Sim. Export
@@ -44,7 +44,9 @@ In `program.yaml` an object looks like this (from the bundled example):
 
 ## 3. Check the scene in Composer
 
-Start Isaac Sim yourself and open the stage; the workbench attaches to it.
+Start Isaac Sim yourself and open the stage with its ROS 2 bridge; the
+workbench reaches it over DDS
+([ROS and DDS](DEVELOPMENT_WORKBENCH.md#ros-and-dds)) and does not start it.
 From the ManyForge repository root, start the workbench (see
 [`DEVELOPMENT_WORKBENCH.md`](DEVELOPMENT_WORKBENCH.md)):
 
@@ -67,7 +69,7 @@ Static OBJ files define object shape. Object pose can also be observed
 from Isaac at runtime through a pose-source component of the Deployment. In
 Composer, each object's **Object pose source** card selects the apply policy
 for its source/object binding through normal Draft, Save and Apply. The Isaac
-pose source in `examples/isaac-ur10e-light-scene.scenario` polls the simulator
+pose source in `examples/sim_ur10e_pick_and_place.scenario` polls the simulator
 every 250 ms (`simulation.poll_period_ms`) in frame `universe`.
 
 For camera/perception scenes such as the Lite6 trocar FoundationPose workflow,

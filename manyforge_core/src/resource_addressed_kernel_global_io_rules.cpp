@@ -44,12 +44,8 @@ Result<void> validate_global_definitions(
         std::any_of(rule.required_signal_sources.begin(), rule.required_signal_sources.end(),
                     [](const auto& id) { return !global_identity(id); }) ||
         (rule.stop_entry_stage_id && !global_identity(*rule.stop_entry_stage_id)) ||
-        (rule.notify_on_trip &&
-         (rule.full_stop_on_trip || rule.idle_behaviour || rule.stop_entry_stage_id)) ||
-        (rule.post_latch_disposition != InterruptPostLatchDisposition::kAwaitOperatorAck &&
-         rule.post_latch_disposition != InterruptPostLatchDisposition::kAutoClearOnSignalRelease) ||
-        (rule.idle_behaviour && *rule.idle_behaviour != IoRuleIdleBehaviourDTO::kLatch &&
-         *rule.idle_behaviour != IoRuleIdleBehaviourDTO::kIgnore))
+        (rule.on_trip == IoRuleOnTripDTO::kNotify &&
+         (rule.after_stop != IoRuleAfterStopDTO::kHold || rule.stop_entry_stage_id)))
       return Result<void>::Err(global_rule_error("io_global_rule_definition_invalid"));
     previous = &rule.policy_id;
     if (waiting && (program_binding_id || !canonical_global_names(rule.waiting_for_program_keys) ||
@@ -129,6 +125,33 @@ Result<void> validate_global_installation(
   const auto configuration = service->RuleServiceConfiguration();
   if (!configuration.ok()) return Result<void>::Err(configuration.error());
   return validate_global_catalog(*catalog, configuration.value());
+}
+
+ErrorDTO rule_holds_error(const InterruptPolicyId& rule_id, const char* why) {
+  return {"rule_holds", "Rule " + rule_id.value() + " holds its scope (" + why + ")",
+          {{"rule_id", rule_id.value()}}};
+}
+
+bool reads_program_keys(const IoActivationRulePolicyBindingDTO& rule) {
+  return rule.condition &&
+         std::any_of(rule.condition->inputs().begin(), rule.condition->inputs().end(),
+                     [](const auto& input) {
+                       return std::holds_alternative<IoConditionBlackboardKeyDTO>(input.source);
+                     });
+}
+
+bool qualification_reason_is(const std::optional<ErrorDTO>& error, std::string_view reason) {
+  if (!error) return false;
+  const auto found = error->details.find("reason");
+  return found != error->details.end() && found->second == reason;
+}
+
+// Before the first Program key baseline a key rule has nothing to watch
+// yet: the run publishes its keys first. Not a loss, not a hold.
+template <class Row>
+bool key_baseline_pending(const Row& row, const IoActivationRulePolicyBindingDTO& rule) {
+  return !row.watched && !row.registration && reads_program_keys(rule) &&
+         qualification_reason_is(row.qualification_error, "io_rule_baseline_unavailable");
 }
 
 }  // namespace
@@ -345,47 +368,39 @@ Result<void> ResourceAddressedExecutionKernel::install_global_io_rule_catalog_lo
   for (std::size_t index = 0; index < rule_count; ++index) {
     const auto& candidate = *catalog;
     const auto& rule = candidate.rules[index];
-    if (!rule.waiting_for_program_keys.empty()) {
-      rows.push_back({{rule.policy_id, IoGlobalRuleState::kClear, std::nullopt}, std::nullopt,
-                      std::nullopt, std::nullopt, false, false});
-      continue;  // No invented value, observer, or externally projected clear.
+    // Load starts every rule at its `active_at_start` (CONTRACTS §8, §11).
+    GlobalIoRuleRuntime row{{rule.policy_id, rule.active_at_start ? IoGlobalRuleState::kClear
+                                                                  : IoGlobalRuleState::kInactive},
+                            std::nullopt, std::nullopt, std::nullopt, rule.active_at_start, false,
+                            false};
+    if (!rule.active_at_start || !rule.waiting_for_program_keys.empty()) {
+      rows.push_back(std::move(row));
+      continue;  // Not watching: no observer, no invented value.
     }
-    const auto armed = arm_global_io_rule_locked(rule, candidate.context, expected_service, false);
+    const auto armed = arm_global_io_rule_locked(rule, candidate.context, expected_service);
     if (!armed.ok()) {
-      const auto reason = armed.error().details.find("reason");
-      if (rule.notify_on_trip || (reason != armed.error().details.end() &&
-          (reason->second == "io_rule_baseline_unavailable" ||
-           reason->second == "io_rule_source_disabled"))) {
-        // Catalog installation and source qualification are distinct. A real
-        // first sample can arm this same row on the existing ingress schedule.
-        // This neither manufactures clear-source readiness nor adds admission.
-        rows.push_back({{rule.policy_id,
-                         rule.notify_on_trip ? IoGlobalRuleState::kUnknown : IoGlobalRuleState::kClear,
-                         std::nullopt, rule.notify_on_trip ? std::optional(armed.error()) : std::nullopt},
-                        std::nullopt, std::nullopt, armed.error(), false, false});
-        continue;
-      }
-      const auto retired = retire_staged_global_io_rules_locked();
-      return retired.ok() ? Result<void>::Err(armed.error()) : retired;
+      // Can't watch yet: a real first sample arms this row on the existing
+      // ingress schedule; until then it gates its scope.
+      row.state = {rule.policy_id, IoGlobalRuleState::kUnknown, std::nullopt, armed.error()};
+      row.qualification_error = armed.error();
+      rows.push_back(std::move(row));
+      continue;
     }
     registrations.push_back(armed.value());
-    const auto& token = armed.value();
-    if (token.owner_epoch != candidate.context.owner_epoch ||
-        token.catalog_generation != candidate.context.catalog_generation ||
-        token.policy_id != rule.policy_id ||
-        token.scope != IoRuleScopeDTO{IoActivationRuleScopeDTO{
-                           candidate.context.retained_bundle_id, candidate.context.graph_revision}}) {
+    if (!global_rule_registration_matches(armed.value(), candidate.context, rule.policy_id)) {
       const auto retired = retire_staged_global_io_rules_locked();
       if (!retired.ok()) return retired;
       return Result<void>::Err(global_rule_error("io_global_rule_service_identity_mismatch"));
     }
-    const auto evidence = expected_service->ReadRuleEvidence(token);
+    const auto evidence = expected_service->ReadRuleEvidence(armed.value());
     if (!evidence.ok()) {
       const auto retired = retire_staged_global_io_rules_locked();
       return retired.ok() ? Result<void>::Err(evidence.error()) : retired;
     }
-    rows.push_back({{rule.policy_id, IoGlobalRuleState::kClear, std::nullopt}, token,
-                    evidence.value(), std::nullopt, false, false});
+    row.registration = armed.value();
+    row.evidence = evidence.value();
+    row.watched = true;
+    rows.push_back(std::move(row));
   }
   const auto retired = retire_global_io_rules_locked();
   if (!retired.ok()) {
@@ -416,11 +431,14 @@ Result<void> ResourceAddressedExecutionKernel::install_global_io_rule_catalog_lo
                         });
   });
   registrations.clear();  // Registration ownership moved to the active rows.
+  // A condition that already holds at Load trips at once. Nothing moves while
+  // a catalog installs, so the trip only publishes `tripped` (and gates).
   for (std::size_t index = 0; index < global_io_rules_.size(); ++index) {
-    const auto& evidence = global_io_rules_[index].evidence;
-    if (evidence && evidence->trip)
-      set_global_io_rule_state_locked(index, IoGlobalRuleState::kTripped,
-                                      evidence->trip->triggering_acquisition);
+    auto& row = global_io_rules_[index];
+    if (!row.registration || !row.evidence || !row.evidence->trip) continue;
+    row.trip_consumed = true;
+    set_global_io_rule_state_locked(index, IoGlobalRuleState::kTripped,
+                                    row.evidence->trip->triggering_acquisition);
   }
   execution_event_change_signal().Notify();  // New catalog for event streams.
   return Result<void>::Ok();
@@ -446,35 +464,26 @@ ResourceAddressedExecutionKernel::installed_global_io_rule_catalog() const {
 std::optional<IoRuleStateProjectionDTO>
 ResourceAddressedExecutionKernel::ReadInterruptRuleStateBaseline() const {
   std::lock_guard lock(state_mutex_);
-  if (global_io_rule_waiting_for_program_) {
-    if ((global_io_rule_projection_in_flight_ || !global_io_rule_projection_queue_.empty()) &&
-        stop_projection_worker_) stop_projection_worker_->PublishGlobalRuleStates();
+  const bool projecting =
+      global_io_rule_projection_in_flight_ || !global_io_rule_projection_queue_.empty();
+  if (projecting && stop_projection_worker_) stop_projection_worker_->PublishGlobalRuleStates();
+  if (global_io_rule_waiting_for_program_)
     return IoRuleStateProjectionDTO{IoRuleStateProjectionStatusDTO::kPending, std::nullopt,
                                     nullptr, std::nullopt, global_io_rule_waiting_for_program_};
-  }
   if (!global_io_rule_catalog_) {
     if (!global_io_rule_applied_context_) return std::nullopt;
-    const bool pending = global_io_rule_projection_in_flight_ ||
-                         !global_io_rule_projection_queue_.empty();
-    if (pending && stop_projection_worker_) stop_projection_worker_->PublishGlobalRuleStates();
     return IoRuleStateProjectionDTO{
-        pending ? IoRuleStateProjectionStatusDTO::kPending : IoRuleStateProjectionStatusDTO::kReady,
+        projecting ? IoRuleStateProjectionStatusDTO::kPending : IoRuleStateProjectionStatusDTO::kReady,
         std::nullopt, nullptr, global_io_rule_applied_context_};
   }
-  if (global_io_rule_projection_in_flight_ || !global_io_rule_projection_queue_.empty() ||
-      std::any_of(global_io_rules_.begin(), global_io_rules_.end(),
-                  [](const auto& row) {
-                    // An unavailable notify observation is a qualified unknown;
-                    // a retained latch is qualified history, not a fresh reading.
-                    return !row.registration &&
-                           row.state.state != IoGlobalRuleState::kUnknown &&
-                           !(row.state.state == IoGlobalRuleState::kLatched &&
-                             row.latch_registration && row.latched_evidence);
-                  })) {
-    if (stop_projection_worker_) stop_projection_worker_->PublishGlobalRuleStates();
+  // A rule waiting for its Program has no state yet; every other row always
+  // has one (inactive, clear, tripped, or withdrawn while it can't watch).
+  if (projecting || std::any_of(global_io_rule_catalog_->rules.begin(),
+                                global_io_rule_catalog_->rules.end(), [](const auto& rule) {
+                                  return !rule.waiting_for_program_keys.empty();
+                                }))
     return IoRuleStateProjectionDTO{IoRuleStateProjectionStatusDTO::kPending, std::nullopt,
                                     global_io_rule_catalog_};
-  }
   IoRuleStateBaselineDTO baseline{global_io_rule_catalog_->context,
                                   global_io_rule_through_sequence_, {}};
   baseline.states.reserve(global_io_rules_.size());
@@ -503,28 +512,38 @@ void ResourceAddressedExecutionKernel::set_global_io_rule_state_locked(
     std::optional<IoRuleAcquisitionKeyDTO> acquisition,
     std::optional<ErrorDTO> unavailable_reason) {
   auto& row = global_io_rules_.at(index);
-  if (state == IoGlobalRuleState::kClear || state == IoGlobalRuleState::kUnknown)
-    acquisition.reset();
+  if (state != IoGlobalRuleState::kTripped) acquisition.reset();
+  if (state != IoGlobalRuleState::kUnknown) unavailable_reason.reset();
   const IoRuleStateDTO next{row.state.rule_id, state, std::move(acquisition),
                             std::move(unavailable_reason)};
   if (row.state == next) return;
-  if (state == IoGlobalRuleState::kLatched && row.state.state != IoGlobalRuleState::kLatched) {
-    row.latch_registration = row.registration;
-    row.latched_evidence = row.evidence;
-  }
-  row.state = next;  // Actual latch/condition truth never waits for journal I/O.
+  row.state = next;
   if (global_io_rule_projection_queue_.size() == config_.request_replay_capacity) {
     // The bounded forensic queue cannot block Stop. An omitted transition is
-    // covered by the next actual ready baseline after older work drains; it
-    // will never be appended later and overwrite that baseline.
+    // covered by the next ready baseline after older work drains.
     global_io_rule_projection_gap_ = true;
   } else {
     global_io_rule_projection_queue_.push_back(
         {global_io_rule_catalog_->context, next, clock_.now()});
   }
   stop_projection_worker_->PublishGlobalRuleStates();
-  if (global_io_rule_catalog_->rules.at(index).notify_on_trip)
-    execution_event_change_signal().Notify();
+  execution_event_change_signal().Notify();  // State key and readiness changed.
+}
+
+Result<void> ResourceAddressedExecutionKernel::unwatch_global_io_rule_locked(
+    std::size_t index, ErrorDTO reason) {
+  auto& row = global_io_rules_.at(index);
+  if (row.registration) {
+    const auto retired = global_io_rule_service_->RetireRule(*row.registration);
+    if (!retired.ok()) return Result<void>::Err(retired.error());
+    row.evidence = retired.value();
+    row.registration.reset();
+  }
+  row.trip_consumed = false;
+  row.qualification_error = reason;
+  set_global_io_rule_state_locked(index, IoGlobalRuleState::kUnknown, std::nullopt,
+                                  std::move(reason));
+  return Result<void>::Ok();
 }
 
 void ResourceAddressedExecutionKernel::ProjectGlobalIoRuleStates() noexcept {
@@ -587,111 +606,79 @@ bool ResourceAddressedExecutionKernel::global_io_rule_applies_locked(
   return std::binary_search(group.subjects.begin(), group.subjects.end(), subject);
 }
 
+std::optional<ErrorDTO> ResourceAddressedExecutionKernel::global_io_rule_hold_locked(
+    const std::size_t index, const bool output_write) const {
+  const auto& row = global_io_rules_[index];
+  const auto& rule = global_io_rule_catalog_->rules[index];
+  if (!row.active || !rule.waiting_for_program_keys.empty()) return std::nullopt;
+  // Before its first successful arm (no reading yet) a rule refuses motion in
+  // its scope but not output writes.
+  if (!row.watched && output_write) return std::nullopt;
+  // Can't watch: any referenced signal without a fresh reading right now.
+  for (const auto& input : rule.condition->inputs()) {
+    const auto* signal = std::get_if<IoSignalId>(&input.source);
+    if (!signal) continue;
+    const auto observed = global_io_rule_service_->ReadSignal(*signal);
+    if (!observed.ok() || observed.value().availability != IoSignalAvailability::kFresh)
+      return rule_holds_error(rule.policy_id, "a signal is not fresh");
+  }
+  if (key_baseline_pending(row, rule)) return std::nullopt;
+  if (!row.registration) return rule_holds_error(rule.policy_id, "it can't watch its signals");
+  const auto evidence = global_io_rule_service_->ReadRuleEvidence(*row.registration);
+  if (!evidence.ok() || !evidence.value().source_losses.empty() ||
+      evidence.value().evaluation_error)
+    return rule_holds_error(rule.policy_id, "it can't watch its signals");
+  if (rule.on_trip == IoRuleOnTripDTO::kStop && row.state.state == IoGlobalRuleState::kTripped)
+    return rule_holds_error(rule.policy_id, "its condition holds");
+  return std::nullopt;
+}
+
 std::optional<ErrorDTO> ResourceAddressedExecutionKernel::global_io_rule_command_refusal_locked(
     const RuntimeParticipantBindingDTO& binding, const ActiveOperation* operation) const {
   if (!global_io_rule_catalog_) return std::nullopt;
   for (std::size_t index = 0; index < global_io_rules_.size(); ++index) {
-    const auto& row = global_io_rules_[index];
     const auto& rule = global_io_rule_catalog_->rules[index];
     if (!global_io_rule_applies_locked(rule, binding)) continue;
-    if (rule.notify_on_trip) {
-      bool unavailable = row.state.state == IoGlobalRuleState::kUnknown || !row.registration;
-      for (const auto& input : rule.condition->inputs()) {
-        const auto* signal = std::get_if<IoSignalId>(&input.source);
-        if (!signal) continue;
-        const auto observed = global_io_rule_service_->ReadSignal(*signal);
-        unavailable = unavailable || !observed.ok() ||
-            observed.value().availability != IoSignalAvailability::kFresh;
-      }
-      if (row.registration) {
-        const auto evidence = global_io_rule_service_->ReadRuleEvidence(*row.registration);
-        const auto current = global_io_rule_service_->ReadRuleConditionSnapshot(*row.registration);
-        unavailable = unavailable || !evidence.ok() || !current.ok() ||
-            (evidence.ok() && (!evidence.value().source_losses.empty() ||
-                               evidence.value().evaluation_error.has_value())) ||
-            (current.ok() && !current.value().value.has_value());
-      }
-      if (unavailable)
-        return ErrorDTO{std::string(to_string(ErrorCode::kInvalidStateTransition)),
-                        "Global interrupt rule " + rule.policy_id.value() + " cannot watch",
-                        {{"reason", "global_interrupt_gated"},
-                         {"rule_id", rule.policy_id.value()}}};
-      continue;
-    }
-    if (row.state.state == IoGlobalRuleState::kLatched) {
-      // on_trip gate: a condition latch that clears by itself is a wait, not a fault.
-      const bool gated = !row.source_loss_latch &&
-          rule.post_latch_disposition == InterruptPostLatchDisposition::kAutoClearOnSignalRelease;
-      return ErrorDTO{std::string(to_string(ErrorCode::kInvalidStateTransition)),
-                      "Global interrupt rule " + rule.policy_id.value() +
-                          (gated ? " is active" : " is latched"),
-                      {{"reason", gated ? "global_interrupt_gated" : "global_interrupt_latched"},
-                       {"rule_id", rule.policy_id.value()}}};
-    }
-    const bool reads_blackboard = std::any_of(rule.condition->inputs().begin(),
-        rule.condition->inputs().end(), [](const auto& input) {
-          return std::holds_alternative<IoConditionBlackboardKeyDTO>(input.source);
-        });
-    const bool predecessor_only = operation && reads_blackboard &&
-        !program_blackboard_source_matches_operation_locked(*operation);
-    // Contract106 excludes key operands from contract75 first-reading
-    // admission. A whole condition can still wait for its BB baseline while
-    // its actual signal operands are independently fresh. Do not manufacture
-    // a condition value or registration to admit that motion. The current-Run
-    // source fence above and actual armed source-loss containment remain.
-    const bool waiting_for_key_baseline = reads_blackboard && !row.waiting_for_inactive &&
-        row.qualification_error && [&] {
-          const auto reason = row.qualification_error->details.find("reason");
-          return reason != row.qualification_error->details.end() &&
-                 reason->second == "io_rule_baseline_unavailable";
-        }();
-    // A consumed rule still requires its actual inactive rearm. Other failed
-    // qualifications also retain their existing missing-registration refusal.
-    bool unavailable = predecessor_only || (!row.registration && !waiting_for_key_baseline);
-    // The first signal without a fresh reading, so the operator sees what is missing.
-    std::map<std::string, std::string> waiting_signal;
-    for (const auto& input : rule.condition->inputs()) {
-      const auto* signal = std::get_if<IoSignalId>(&input.source);
-      if (!signal) continue;
-      const auto observed = global_io_rule_service_->ReadSignal(*signal);
-      const bool fresh = observed.ok() &&
-          observed.value().availability == IoSignalAvailability::kFresh;
-      unavailable = unavailable || !fresh;
-      if (fresh || !waiting_signal.empty()) continue;
-      waiting_signal = {{"signal_component_id", signal->controllable_component_id.value()},
-                        {"signal_name", signal->name}};
-      if (observed.ok())
-        waiting_signal.emplace("source_id", observed.value().descriptor.source_id.value());
-    }
-    bool actual_loss = row.last_source_loss.has_value();
-    if (row.registration) {
-      const auto actual = global_io_rule_service_->ReadRuleEvidence(*row.registration);
-      unavailable = unavailable || !actual.ok();
-      actual_loss = actual_loss || (actual.ok() &&
-          (!actual.value().source_losses.empty() || actual.value().evaluation_error));
-    }
-    unavailable = unavailable || actual_loss;
-    if (unavailable) {
-      const bool initial = !actual_loss;
-      // Contract75 first-reading readiness gates motion, not a genuine typed
-      // logical output. Actual Everything latches (including armed loss86)
-      // still close its full scope above; normal output lifecycle admission
-      // remains independently required by component_command_refusal_locked.
-      if (initial && binding.io_output_binding) continue;
-      auto details = std::move(waiting_signal);
-      details.emplace("reason", initial ? "global_interrupt_source_not_ready"
-                                        : "global_interrupt_source_unavailable");
-      details.emplace("rule_id", rule.policy_id.value());
-      return ErrorDTO{std::string(to_string(ErrorCode::kInvalidStateTransition)),
-          "Rule " + rule.policy_id.value() + " waiting for its source", std::move(details)};
-    }
+    if (auto hold = global_io_rule_hold_locked(index, false)) return hold;
+    // A key rule watches only the current Run's published keys.
+    if (operation && global_io_rules_[index].active && reads_program_keys(rule) &&
+        !program_blackboard_source_matches_operation_locked(*operation))
+      return rule_holds_error(rule.policy_id, "it can't watch this Run's keys");
   }
   return std::nullopt;
 }
 
+std::vector<ErrorDTO> ResourceAddressedExecutionKernel::ReadRuleHolds() const {
+  std::lock_guard lock(state_mutex_);
+  std::vector<ErrorDTO> holds;
+  if (!global_io_rule_catalog_) return holds;
+  for (std::size_t index = 0; index < global_io_rules_.size(); ++index) {
+    auto hold = global_io_rule_hold_locked(index, false);
+    if (!hold) continue;
+    // The rule's scope, so readiness blocks Execute/Resume only when it meets
+    // the Program's components (CONTRACTS §8, §10).
+    const auto& scope = global_io_rule_catalog_->rules[index].scope;
+    if (std::holds_alternative<IoActivationEverythingScopeDTO>(scope)) {
+      hold->details["scope"] = "everything";
+    } else if (std::holds_alternative<IoActivationAllMotionScopeDTO>(scope)) {
+      hold->details["scope"] = "all_motion";
+    } else {
+      std::set<std::string> ids;
+      for (const auto& subject : std::get<IoActivationExecutionGroupsScopeDTO>(scope).subjects)
+        ids.insert(subject.controllable_component_id.value());
+      std::string joined;
+      for (const auto& id : ids) joined += (joined.empty() ? "" : ",") + id;
+      hold->details["scope"] = "execution_groups";
+      hold->details["component_ids"] = std::move(joined);
+    }
+    holds.push_back(std::move(*hold));
+  }
+  return holds;
+}
+
 Result<IoRuleRegistrationDTO> ResourceAddressedExecutionKernel::arm_global_io_rule_locked(
     const IoActivationRulePolicyBindingDTO& rule, const IoRuleStateContextDTO& context,
-    const std::shared_ptr<IIoSignalService>& service, bool require_inactive) {
+    const std::shared_ptr<IIoSignalService>& service) {
   if (std::any_of(
           rule.required_signal_sources.begin(), rule.required_signal_sources.end(),
           [&](const auto& source) { return planned_disabled_io_sources_.contains(source); }))
@@ -701,11 +688,7 @@ Result<IoRuleRegistrationDTO> ResourceAddressedExecutionKernel::arm_global_io_ru
   if (!rule.waiting_for_program_keys.empty())
     return Result<IoRuleRegistrationDTO>::Err(global_rule_error("io_global_rule_waiting_for_program"));
   auto sources = rule.required_signal_sources;
-  const bool reads_blackboard = std::any_of(
-      rule.condition->inputs().begin(), rule.condition->inputs().end(), [](const auto& input) {
-        return std::holds_alternative<IoConditionBlackboardKeyDTO>(input.source);
-      });
-  if (reads_blackboard) {
+  if (reads_program_keys(rule)) {
     // The producer retains literal key references, never a caller-selected BB
     // source. Join only this owner's actual admitted occurrence on this service.
     if (!program_blackboard_source_ || program_blackboard_source_retired_ ||
@@ -719,26 +702,20 @@ Result<IoRuleRegistrationDTO> ResourceAddressedExecutionKernel::arm_global_io_ru
     std::sort(sources.begin(), sources.end());
     sources.erase(std::unique(sources.begin(), sources.end()), sources.end());
   }
+  // A condition that already holds trips at once (activation, rearm).
   return service->ArmRule(
       {rule.policy_id, IoActivationRuleScopeDTO{context.retained_bundle_id, context.graph_revision},
-       rule.condition, require_inactive ? MotionInterruptActivationMode::kRequireInactiveAtArm
-                                        : MotionInterruptActivationMode::kTripIfAlreadyActive,
-       std::move(sources)});
+       rule.condition, MotionInterruptActivationMode::kTripIfAlreadyActive, std::move(sources)});
 }
 
 Result<void> ResourceAddressedExecutionKernel::SetGlobalIoSourcesPlannedDisabled(
     const std::shared_ptr<IIoSignalService>& expected_service,
-    std::span<const InterruptSourceId> sources,
-    const LifecycleTransactionId& actual_lifecycle_transaction, bool disabled) {
+    std::span<const InterruptSourceId> sources, bool disabled) {
   std::lock_guard submit_lock(submission_mutex_);
   std::lock_guard admission_lock(*admission_mutex_);
-  // Claim changes use the same admission mutex. Read the owner before state
-  // to avoid inverting the owner callbacks that inspect Kernel state.
-  const auto authority = require_held_lifecycle_claim_locked(actual_lifecycle_transaction);
   std::lock_guard lock(state_mutex_);
   if (expected_service != io_signal_service_)
     return Result<void>::Err(global_rule_error("io_global_rule_service_identity_mismatch"));
-  if (!authority.ok()) return authority;
   if (!disabled) {
     for (const auto& source : sources) planned_disabled_io_sources_.erase(source);
     return Result<void>::Ok();  // Only actual fresh acquisitions may rearm.
@@ -748,77 +725,27 @@ Result<void> ResourceAddressedExecutionKernel::SetGlobalIoSourcesPlannedDisabled
   if (program_cycle_claim_run_)
     return Result<void>::Err(global_rule_error("io_rule_source_disable_program_active"));
   if (!global_io_rule_catalog_) return Result<void>::Ok();
-  auto next_disabled = planned_disabled_io_sources_;
-  for (const auto& source : sources) {
+  for (const auto& source : sources)
     if (source.empty()) return Result<void>::Err(global_rule_error("io_rule_source_invalid"));
-    // Only dependencies of the installed global catalog need an arm fence.
-    if (std::any_of(global_io_rule_catalog_->rules.begin(), global_io_rule_catalog_->rules.end(),
-                    [&](const auto& rule) {
-                      return std::find(rule.required_signal_sources.begin(),
-                                       rule.required_signal_sources.end(),
-                                       source) != rule.required_signal_sources.end();
-                    }))
-      next_disabled.insert(source);
-  }
-  // Process already-delivered evidence before planned cessation. This invokes
-  // no automatic recovery and the existing idle proof excludes physical work.
-  const auto evaluated = global_io_rule_service_->EvaluateRules();
-  if (!evaluated.ok()) return evaluated;
-  StopWorkHandoff handoff;
-  const auto prior = process_global_io_rule_evidence_locked(handoff);
-  if (!prior.ok()) return prior;
-  if (handoff.control || handoff.projection)
-    return Result<void>::Err(global_rule_error("io_rule_source_disable_not_idle"));
-  planned_disabled_io_sources_.swap(next_disabled);
-  const auto partial_failure = [](ErrorDTO error) {
-    error.details.emplace("io_source_transition_effects", "observed");
-    return Result<void>::Err(std::move(error));
-  };
+  const ErrorDTO disabled_reason{kErrorMotionInterruptArmFailed,
+                                 "Input source is intentionally disabled",
+                                 {{"reason", "io_rule_source_disabled"}}};
   for (std::size_t index = 0; index < global_io_rules_.size(); ++index) {
-    auto& row = global_io_rules_[index];
     const auto& rule = global_io_rule_catalog_->rules[index];
     if (std::none_of(rule.required_signal_sources.begin(), rule.required_signal_sources.end(),
                      [&](const auto& source) {
                        return std::find(sources.begin(), sources.end(), source) != sources.end();
                      }))
       continue;
-    if (row.registration) {
-      const auto retired = global_io_rule_service_->RetireRule(*row.registration);
-      if (!retired.ok()) return partial_failure(retired.error());
-      row.evidence = retired.value();
-      if (!rule.notify_on_trip && row.evidence->evaluation_error &&
-          row.evidence->source_losses.empty() && !row.evidence->trip) {
-        row.registration.reset();
-        row.qualification_error = row.evidence->evaluation_error;
-        return partial_failure(*row.evidence->evaluation_error);
-      }
-      // Retire returns the final eligible evidence atomically. Preserve a loss
-      // or trip arriving after the preceding read; never erase an old latch.
-      if (rule.notify_on_trip) {
-        if (row.evidence->trip && !row.response_consumed)
-          set_global_io_rule_state_locked(index, IoGlobalRuleState::kTripped,
-                                          row.evidence->trip->triggering_acquisition);
-        row.response_consumed = true;
-      } else if (!row.evidence->source_losses.empty()) {
-        row.source_loss_latch = true;
-        row.last_source_loss = row.evidence;
-        set_global_io_rule_state_locked(index, IoGlobalRuleState::kLatched);
-      } else if (row.evidence->trip && !row.response_consumed) {
-        set_global_io_rule_state_locked(index, IoGlobalRuleState::kTripped,
-                                        row.evidence->trip->triggering_acquisition);
-        if (rule.idle_behaviour == IoRuleIdleBehaviourDTO::kLatch)
-          set_global_io_rule_state_locked(index, IoGlobalRuleState::kLatched,
-                                          row.evidence->trip->triggering_acquisition);
-        row.response_consumed = true;
-      }
-      row.registration.reset();
-    }
-    row.qualification_error = ErrorDTO{kErrorMotionInterruptArmFailed,
-                                       "Input source is intentionally disabled",
-                                       {{"reason", "io_rule_source_disabled"}}};
-    if (rule.notify_on_trip)
-      set_global_io_rule_state_locked(index, IoGlobalRuleState::kUnknown, {},
-                                      row.qualification_error);
+    // Only dependencies of the installed global catalog need an arm fence.
+    for (const auto& source : sources)
+      if (std::find(rule.required_signal_sources.begin(), rule.required_signal_sources.end(),
+                    source) != rule.required_signal_sources.end())
+        planned_disabled_io_sources_.insert(source);
+    // An active rule whose source is off can't watch and gates its scope.
+    if (!global_io_rules_[index].active) continue;
+    const auto unwatched = unwatch_global_io_rule_locked(index, disabled_reason);
+    if (!unwatched.ok()) return unwatched;
   }
   return Result<void>::Ok();
 }
@@ -827,40 +754,26 @@ Result<void> ResourceAddressedExecutionKernel::arm_pending_global_io_rules_locke
   if (!global_io_rule_catalog_) return Result<void>::Ok();
   if (!global_io_rule_service_ || global_io_rules_.size() != global_io_rule_catalog_->rules.size())
     return Result<void>::Err(global_rule_error("io_global_rule_owner_incomplete"));
+  const auto& context = global_io_rule_catalog_->context;
   for (std::size_t index = 0; index < global_io_rules_.size(); ++index) {
     auto& row = global_io_rules_[index];
-    if (row.registration || row.state.state == IoGlobalRuleState::kLatched) continue;
     const auto& rule = global_io_rule_catalog_->rules[index];
-    if (!rule.waiting_for_program_keys.empty()) continue;
-    if (rule.notify_on_trip && row.notify_failure_needs_containment && !row.response) continue;
-    const auto& context = global_io_rule_catalog_->context;
-    const auto armed = arm_global_io_rule_locked(
-        rule, context, global_io_rule_service_, row.waiting_for_inactive);
+    if (!row.active || row.registration || !rule.waiting_for_program_keys.empty()) continue;
+    const auto armed = arm_global_io_rule_locked(rule, context, global_io_rule_service_);
     if (!armed.ok()) {
       row.qualification_error = armed.error();
-      if (rule.notify_on_trip) {
-        row.notify_failure_needs_containment = true;
-        set_global_io_rule_state_locked(index, IoGlobalRuleState::kUnknown, {}, armed.error());
-      }
-      const auto reason = armed.error().details.find("reason");
-      if (rule.notify_on_trip || (reason != armed.error().details.end() &&
-          (reason->second == "io_rule_baseline_unavailable" ||
-           reason->second == "io_rule_source_disabled" ||
-           (row.waiting_for_inactive && reason->second == "io_rule_active_at_arm"))))
-        continue;
-      return Result<void>::Err(armed.error());
+      set_global_io_rule_state_locked(index, IoGlobalRuleState::kUnknown, std::nullopt,
+                                      armed.error());
+      continue;  // Can't watch yet; a later fresh sample rearms it.
     }
-    row.registration = armed.value(); // Retain actual handle even on a bad adapter response.
-    if (armed.value().owner_epoch != context.owner_epoch ||
-        armed.value().catalog_generation != context.catalog_generation ||
-        armed.value().policy_id != rule.policy_id ||
-        armed.value().scope != IoRuleScopeDTO{
-            IoActivationRuleScopeDTO{context.retained_bundle_id, context.graph_revision}})
+    row.registration = armed.value();  // Retain the actual handle even on a bad response.
+    if (!global_rule_registration_matches(armed.value(), context, rule.policy_id))
       return Result<void>::Err(global_rule_error("io_global_rule_service_identity_mismatch"));
     row.qualification_error.reset();
-    row.response_consumed = false;
-    if (!rule.notify_on_trip) row.response.reset();
-    row.waiting_for_inactive = false;
+    row.trip_consumed = false;
+    row.watched = true;
+    if (row.state.state == IoGlobalRuleState::kUnknown)
+      set_global_io_rule_state_locked(index, IoGlobalRuleState::kClear);
   }
   return Result<void>::Ok();
 }
@@ -876,12 +789,12 @@ Result<bool> ResourceAddressedExecutionKernel::global_io_rule_supersedes_node_lo
   for (std::size_t index = 0; index < global_io_rules_.size(); ++index) {
     const auto& row = global_io_rules_[index];
     const auto& rule = global_io_rule_catalog_->rules[index];
-    if (!row.registration || !global_io_rule_applies_locked(rule, participant.binding.value()))
+    if (!row.active || !row.registration || rule.on_trip != IoRuleOnTripDTO::kStop ||
+        !global_io_rule_applies_locked(rule, participant.binding.value()))
       continue;
     const auto actual = global_io_rule_service_->ReadRuleEvidence(*row.registration);
     if (!actual.ok()) return Result<bool>::Err(actual.error());
-    if (rule.notify_on_trip && actual.value().source_losses.empty()) continue;
-    if (!actual.value().trip && actual.value().source_losses.empty()) continue;
+    if (!actual.value().trip) continue;
     if (rule.effective_priority != node.effective_priority) {
       if (rule.effective_priority > node.effective_priority) return Result<bool>::Ok(true);
       continue;
@@ -907,14 +820,25 @@ Result<bool> ResourceAddressedExecutionKernel::global_io_rule_supersedes_node_lo
   return Result<bool>::Ok(false);
 }
 
+// CONTRACTS §8. Per active rule:
+// - can't watch (source loss, evaluation error, setup failed): the operator's
+//   Stop on the rule's scope for motion moving in it, then withdraw the key
+//   and gate until a fresh rearm;
+// - a new trip: `notify` publishes `tripped`; `stop` issues the operator's Stop
+//   on the rule's scope (if motion in scope is executing), publishes
+//   `tripped`, and gates while the condition holds;
+// - condition false after a trip: renew the registration, publish `clear`.
+// Paused while the cell is latched (R1). One Stop handoff per call.
 Result<void> ResourceAddressedExecutionKernel::process_global_io_rule_evidence_locked(
-    StopWorkHandoff& handoff, const OperationId* dispatch_boundary,
-    std::optional<std::size_t> recovering_index, std::optional<std::size_t> only_index) {
-  if (!global_io_rule_catalog_) return Result<void>::Ok();
-  if (!only_index) {
-    const auto pending = arm_pending_global_io_rules_locked();
-    if (!pending.ok()) return pending;
+    StopWorkHandoff& handoff, const OperationId* dispatch_boundary) {
+  if (!global_io_rule_catalog_ || cell_latched_locked()) return Result<void>::Ok();
+  for (std::size_t index = 0; index < global_io_rules_.size(); ++index) {
+    if (!global_io_rules_[index].hold_run) continue;
+    const auto held = hold_program_run_for_rule_locked(index, handoff);
+    if (!held.ok() || handoff.control || handoff.projection) return held;
   }
+  const auto pending = arm_pending_global_io_rules_locked();
+  if (!pending.ok()) return pending;
   struct CandidateOrder final {
     std::size_t index;
     std::vector<ResourceId> resources;
@@ -923,10 +847,10 @@ Result<void> ResourceAddressedExecutionKernel::process_global_io_rule_evidence_l
   std::vector<CandidateOrder> order;
   order.reserve(global_io_rules_.size());
   for (std::size_t index = 0; index < global_io_rules_.size(); ++index) {
-    if ((recovering_index && index != *recovering_index) ||
-        (only_index && index != *only_index)) continue;
-    if (!global_io_rule_catalog_->rules[index].waiting_for_program_keys.empty()) continue;
     auto& row = global_io_rules_[index];
+    const auto& rule = global_io_rule_catalog_->rules[index];
+    if (!row.active || !rule.waiting_for_program_keys.empty() || key_baseline_pending(row, rule))
+      continue;
     if (row.registration) {
       const auto actual = global_io_rule_service_->ReadRuleEvidence(*row.registration);
       if (!actual.ok()) return Result<void>::Err(actual.error());
@@ -934,15 +858,14 @@ Result<void> ResourceAddressedExecutionKernel::process_global_io_rule_evidence_l
     }
     std::vector<ResourceId> resources;
     for (const auto& registration : registrations_) {
-      if (!global_io_rule_applies_locked(global_io_rule_catalog_->rules[index],
-                                         registration.binding.value())) continue;
+      if (!global_io_rule_applies_locked(rule, registration.binding.value())) continue;
       for (const auto& resource : registration.binding.value().resources)
         resources.push_back(resource.resource_id);
     }
     std::sort(resources.begin(), resources.end());
     resources.erase(std::unique(resources.begin(), resources.end()), resources.end());
     order.push_back({index, std::move(resources),
-                     row.evidence ? rule_source_order(*row.evidence) : std::nullopt});
+                     row.registration ? rule_source_order(*row.evidence) : std::nullopt});
   }
   std::sort(order.begin(), order.end(), [&](const auto& left, const auto& right) {
     const auto& a = global_io_rule_catalog_->rules[left.index];
@@ -955,161 +878,17 @@ Result<void> ResourceAddressedExecutionKernel::process_global_io_rule_evidence_l
     } else if (left.source.has_value() != right.source.has_value()) return left.source.has_value();
     return a.policy_id < b.policy_id;
   });
-  // Design rule B: only this Apply's staged successor (Stage needs the held
-  // fence + exact parent) on a different service makes the current service's
-  // loss its planned handover; no live operation may need this Stop.
-  const bool planned_service_handover =
-      staged_global_io_rule_catalog_ && staged_global_io_rule_catalog_->fence &&
-      staged_global_io_rule_catalog_->parent &&
-      staged_global_io_rule_catalog_->service != global_io_rule_service_ &&
-      std::none_of(active_operations_.begin(), active_operations_.end(),
-                   [](const auto& entry) { return !terminal(entry.second->state.state); });
-  for (const auto& candidate_order : order) {
-    const auto index = candidate_order.index;
+  // The operator's Stop on the rule's scope for motion moving in it (Full Stop
+  // for `everything`). True when a Stop was accepted.
+  const auto stop_scope = [&](const CandidateOrder& candidate, bool watch_lost) -> Result<bool> {
+    const auto index = candidate.index;
     auto& row = global_io_rules_[index];
     const auto& policy = global_io_rule_catalog_->rules[index];
-    if (row.state.state == IoGlobalRuleState::kLatched && !recovering_index) {
-      const auto refreshed = refresh_global_latched_condition_locked(index);
-      if (!refreshed.ok()) row.qualification_error = refreshed.error();
-      continue;
-    }
-    // A notify failure has no fabricated registration or trip. Retain its
-    // unknown state through the Stop's terminal boundary, even if it rearms.
-    if (policy.notify_on_trip && row.response) {
-      const bool settled = std::any_of(stop_terminal_history_.begin(), stop_terminal_history_.end(),
-          [&](const auto& record) {
-            return record && record->certificate.stop_id == row.response->stop_id &&
-                   record->certificate.stop_generation == row.response->stop_generation;
-          });
-      if (!settled) continue;
-      row.response.reset();
-    }
-    if (!row.registration && !policy.notify_on_trip) continue;
-    std::optional<IoRuleConditionSnapshotDTO> current;
-    if (row.registration) {
-      const auto observed = global_io_rule_service_->ReadRuleEvidence(*row.registration);
-      if (!observed.ok()) return Result<void>::Err(observed.error());
-      row.evidence = observed.value();
-      const auto snapshot = global_io_rule_service_->ReadRuleConditionSnapshot(*row.registration);
-      if (!snapshot.ok()) return Result<void>::Err(snapshot.error());
-      current = snapshot.value();
-    }
-    bool loss = row.evidence && !row.evidence->source_losses.empty();
-    bool matched = row.evidence && row.evidence->trip.has_value();
-    if (!policy.notify_on_trip && row.evidence->evaluation_error && !loss && !matched)
-      return Result<void>::Err(*row.evidence->evaluation_error);
-    if (policy.notify_on_trip) {
-      const bool failed = !row.registration || loss || row.evidence->evaluation_error;
-      if (!failed) {
-        if (matched && !row.response_consumed) {
-          set_global_io_rule_state_locked(index, IoGlobalRuleState::kTripped,
-                                          row.evidence->trip->triggering_acquisition);
-          row.response_consumed = true;
-        }
-        if (row.response_consumed && current->value == std::optional(false)) {
-          // A fresh active baseline after retirement observes a racing retrip.
-          const auto retired = global_io_rule_service_->RetireRule(*row.registration);
-          if (!retired.ok()) return Result<void>::Err(retired.error());
-          row.evidence = retired.value();
-          row.registration.reset();
-          row.waiting_for_inactive = false;
-          if (!row.evidence->source_losses.empty() || row.evidence->evaluation_error) {
-            row.qualification_error = row.evidence->evaluation_error.value_or(ErrorDTO{
-                kErrorMotionInterruptArmFailed, "Notify rule input is unavailable",
-                {{"reason", "io_rule_source_unavailable"}}});
-            set_global_io_rule_state_locked(index, IoGlobalRuleState::kUnknown, {},
-                                            row.qualification_error);
-          } else {
-            const auto& context = global_io_rule_catalog_->context;
-            const auto armed = arm_global_io_rule_locked(policy, context, global_io_rule_service_, false);
-            if (!armed.ok()) {
-              row.qualification_error = armed.error();
-              row.notify_failure_needs_containment = true;
-              set_global_io_rule_state_locked(index, IoGlobalRuleState::kUnknown, {}, armed.error());
-            } else {
-              row.registration = armed.value(); // Retain actual handle even on a bad adapter response.
-              if (armed.value().owner_epoch != context.owner_epoch ||
-                  armed.value().catalog_generation != context.catalog_generation ||
-                  armed.value().policy_id != policy.policy_id ||
-                  armed.value().scope != IoRuleScopeDTO{
-                      IoActivationRuleScopeDTO{context.retained_bundle_id, context.graph_revision}})
-                return Result<void>::Err(global_rule_error("io_global_rule_service_identity_mismatch"));
-              row.qualification_error.reset();
-              row.response_consumed = false;
-              set_global_io_rule_state_locked(index, IoGlobalRuleState::kClear);
-              continue;
-            }
-          }
-        } else {
-          if (!matched && current->value == std::optional(false))
-            set_global_io_rule_state_locked(index, IoGlobalRuleState::kClear);
-          continue;
-        }
-      } else if (row.registration) {
-        const auto retired = global_io_rule_service_->RetireRule(*row.registration);
-        if (!retired.ok()) return Result<void>::Err(retired.error());
-        row.evidence = retired.value();
-        row.registration.reset();
-        row.waiting_for_inactive = false;
-        row.qualification_error = row.evidence->evaluation_error.value_or(ErrorDTO{
-            kErrorMotionInterruptArmFailed, "Notify rule input is unavailable",
-            {{"reason", "io_rule_source_unavailable"}}});
-        set_global_io_rule_state_locked(index, IoGlobalRuleState::kUnknown, {},
-                                        row.qualification_error);
-      }
-      if (!row.qualification_error) continue;
-      loss = true;
-      matched = false;
-    }
-    // Design rule B: the outgoing ingress loss of the staged handover is not
-    // latched. Activation retires this row and the successor arms (or
-    // waits for its first sample) on the new service. The loss stays in this
-    // registration's evidence, so motion stays refused, and a discarded
-    // handover latches it on the next pass.
-    if (!policy.notify_on_trip && loss && !matched && !recovering_index &&
-        planned_service_handover) continue;
-    // Defer all row/event publication until the response decision has either
-    // succeeded or proved no effect is needed. Recovery keeps its old scoped
-    // latch in place even while the successor's Stop is being accepted.
-    const auto publish_fact = [&](bool latch) {
-      if (policy.notify_on_trip) return;
-      if (recovering_index) set_global_io_rule_state_locked(index, IoGlobalRuleState::kClear);
-      if (matched) set_global_io_rule_state_locked(index, IoGlobalRuleState::kTripped,
-          row.evidence->trip->triggering_acquisition);
-      if (latch) {
-        row.source_loss_latch = loss;
-        if (loss) row.last_source_loss = row.evidence;
-        set_global_io_rule_state_locked(index, IoGlobalRuleState::kLatched,
-            matched ? row.evidence->trip->triggering_acquisition : std::nullopt);
-      }
-    };
-    if (!matched && !loss) {
-      if (recovering_index || current->value == std::optional(false))
-        set_global_io_rule_state_locked(index, IoGlobalRuleState::kClear);
-      continue;
-    }
-    if (!loss && !recovering_index && row.response_consumed &&
-        current->value == std::optional(false)) {
-      // Retain the factual trip in history before releasing its nonlatched
-      // level. A new exact inactive registration can observe the next edge.
-      publish_fact(false);
-      const auto retired = global_io_rule_service_->RetireRule(*row.registration);
-      if (!retired.ok()) return Result<void>::Err(retired.error());
-      row.evidence = retired.value();
-      row.registration.reset();
-      row.waiting_for_inactive = true;
-      set_global_io_rule_state_locked(index, IoGlobalRuleState::kClear);
-      continue;
-    }
-    GlobalInterruptStopSelection selection{policy.policy_id,
-        policy.notify_on_trip ? std::nullopt : row.registration,
-        policy.notify_on_trip ? std::nullopt : row.evidence,
-        policy.notify_on_trip ? row.qualification_error : std::nullopt,
-        std::holds_alternative<IoActivationEverythingScopeDTO>(policy.scope) ||
-            policy.full_stop_on_trip,
-        policy.effective_priority, {}, candidate_order.resources};
-    bool scoped_motion = false;
-    bool scoped_stopping = false;
+    GlobalInterruptStopSelection selection{policy.policy_id, row.registration,
+        row.registration ? row.evidence : std::optional<IoRuleEvidenceDTO>{}, watch_lost,
+        std::holds_alternative<IoActivationEverythingScopeDTO>(policy.scope),
+        !watch_lost && policy.after_stop == IoRuleAfterStopDTO::kFailNode,
+        policy.effective_priority, {}, candidate.resources};
     bool eligible_effect = false;
     std::vector<StopOperationTargetDTO> operations;
     for (auto& [operation_id, operation] : active_operations_) {
@@ -1131,13 +910,12 @@ Result<void> ResourceAddressedExecutionKernel::process_global_io_rule_evidence_l
               [&](const auto& resource) {
                 return std::binary_search(resident->resources.begin(), resident->resources.end(), resource);
               })) resident = nullptr;
-        const bool stopping = resident != nullptr;
         const bool executing = public_row->state == OperationStateKind::kExecuting || boundary;
-        if (!stopping && !executing) continue;
-        scoped_motion = scoped_motion || executing;
-        scoped_stopping = scoped_stopping || stopping;
-        int active_priority = -1;
+        if (!resident && !executing) continue;
         if (resident) {
+          // Existing stopping-phase arbitration admits strictly higher rules
+          // only; an equal or lower one is already contained by that Stop.
+          int active_priority = -1;
           for (const auto& winner : resident->interrupt_winners) {
             const auto& scope = std::get<IoOperationRuleScopeDTO>(winner.registration.scope);
             if (scope.operation_id == operation_id &&
@@ -1150,11 +928,7 @@ Result<void> ResourceAddressedExecutionKernel::process_global_io_rule_evidence_l
                   return selected.operation_id == operation_id &&
                          selected.participant_id == participant.slot_owner.participant_id;
                 })) active_priority = std::max(active_priority, winner.priority);
-          // Existing stopping-phase arbitration admits strictly higher fault
-          // rules only. Equal/lower condition facts are tripped/history, never
-          // queued. Actual required-source loss still joins this same Stop as
-          // failure evidence; it cannot become desired-trip success.
-          if (matched && !loss && policy.effective_priority <= active_priority) continue;
+          if (policy.effective_priority <= active_priority) continue;
         }
         eligible_effect = true;
         operation_selected = true;
@@ -1164,10 +938,10 @@ Result<void> ResourceAddressedExecutionKernel::process_global_io_rule_evidence_l
         if (!participant.prepared_participant || !participant.ordinary_stop_plan ||
             public_row->command_id.empty() ||
             !public_row->command_generation.nonzero())
-          return Result<void>::Err(global_rule_error("io_global_rule_response_membership_stale"));
+          return Result<bool>::Err(global_rule_error("io_global_rule_response_membership_stale"));
         const auto entry = ResolvePreparedIoRuleStopEntry(*participant.ordinary_stop_plan,
                                                           policy.stop_entry_stage_id);
-        if (!entry.ok()) return Result<void>::Err(entry.error());
+        if (!entry.ok()) return Result<bool>::Err(entry.error());
         selection.participants.push_back({operation_id, participant.slot_owner.participant_id,
             participant.preparation_id, participant.prepared_participant->prepared_contract_digest,
             public_row->command_id, public_row->command_generation,
@@ -1177,80 +951,158 @@ Result<void> ResourceAddressedExecutionKernel::process_global_io_rule_evidence_l
           operation->state.operation_revision,
           operation->state.active_stop_generation.value_or(StopGeneration(0U))});
     }
+    if (!eligible_effect || (selection.participants.empty() && !selection.everything))
+      return Result<bool>::Ok(false);  // Nothing in scope moves.
     std::sort(selection.participants.begin(), selection.participants.end(),
         [](const auto& a, const auto& b) {
           return std::tie(a.operation_id, a.participant_id) <
                  std::tie(b.operation_id, b.participant_id);
         });
-    if (eligible_effect && (!selection.participants.empty() || selection.everything)) {
-      std::string request_material = config_.request_owner_epoch.value() + "\nglobal-rule-stop\n";
-      if (policy.notify_on_trip) {
-        request_material += policy.policy_id.value();
-        for (const auto& operation : operations)
-          request_material += "\n" + operation.operation_id.value() + "\n" +
-                              std::to_string(operation.expected_operation_revision.value());
-      } else {
-        request_material += std::to_string(row.registration->catalog_generation) + "\n" +
-                            std::to_string(row.registration->registration_id);
-      }
-      const auto request = content_identity::sha256_digest(request_material);
-      const PublicRequestContextDTO context{RequestId(request), config_.request_owner_epoch,
-                                             "kernel.global_io_rule", std::nullopt};
-      const std::string reason = policy.notify_on_trip ? row.qualification_error->code
-          : loss ? "interrupt_source_unavailable" : "interrupt_fault";
-      EmergencyStopProjectedIntentDTO intent = selection.everything
-          ? EmergencyStopProjectedIntentDTO{FullStopIntentDTO{context, cell_stop_generation_,
-                RequestAttributionDTO{RequestTransportDTO::kInternal,
-                                      RequestAssuranceDTO::kUnverified, std::nullopt}}}
-          : EmergencyStopProjectedIntentDTO{StopIntentDTO{context, std::move(operations), reason}};
-      const auto stopped = accept_stop_locked(std::move(intent), handoff, clock_.now(), nullptr,
-          nullptr, std::nullopt, nullptr, nullptr, {}, &selection);
-      if (!stopped.ok()) return Result<void>::Err(stopped.error());
-      row.response = stopped.value();
-      if (policy.notify_on_trip) row.notify_failure_needs_containment = false;
-      for (const auto& selected : selection.participants) {
-        auto* owner = find_active_operation_locked(selected.operation_id);
-        if (!owner) continue;
-        for (auto& participant : owner->state.participants) {
-          if (participant.participant_id != selected.participant_id) continue;
-          for (auto& outcome : participant.io_rule_outcomes) {
-            if (outcome.arbitration_disposition == IoRuleArbitrationDispositionDTO::kActive)
-              outcome.arbitration_disposition = IoRuleArbitrationDispositionDTO::kSuperseded;
-            outcome.stop_id = stopped.value().stop_id;
-            outcome.stop_generation = stopped.value().stop_generation;
-          }
+    std::string material = config_.request_owner_epoch.value() + "\nglobal-rule-stop\n" +
+                           policy.policy_id.value() + (watch_lost ? "\nwatch-lost" : "\ntrip");
+    if (row.registration) material += "\n" + std::to_string(row.registration->registration_id);
+    for (const auto& operation : operations)
+      material += "\n" + operation.operation_id.value() + "\n" +
+                  std::to_string(operation.expected_operation_revision.value());
+    // The rule id rides on the Stop as its correlation (run end: stopped by rule).
+    const PublicRequestContextDTO request_context{
+        RequestId(content_identity::sha256_digest(material)), config_.request_owner_epoch,
+        "kernel.global_io_rule", policy.policy_id.value()};
+    EmergencyStopProjectedIntentDTO intent = selection.everything
+        ? EmergencyStopProjectedIntentDTO{FullStopIntentDTO{request_context, cell_stop_generation_,
+              RequestAttributionDTO{RequestTransportDTO::kInternal,
+                                    RequestAssuranceDTO::kUnverified, std::nullopt}}}
+        : EmergencyStopProjectedIntentDTO{StopIntentDTO{request_context, std::move(operations),
+              std::string(watch_lost ? "interrupt_source_unavailable" : "interrupt_fault")}};
+    const auto stopped = accept_stop_locked(std::move(intent), handoff, clock_.now(), nullptr,
+        nullptr, nullptr, nullptr, {}, &selection);
+    if (!stopped.ok()) return Result<bool>::Err(stopped.error());
+    for (const auto& selected : selection.participants) {
+      auto* owner = find_active_operation_locked(selected.operation_id);
+      if (!owner) continue;
+      for (auto& participant : owner->state.participants) {
+        if (participant.participant_id != selected.participant_id) continue;
+        for (auto& outcome : participant.io_rule_outcomes) {
+          if (outcome.arbitration_disposition == IoRuleArbitrationDispositionDTO::kActive)
+            outcome.arbitration_disposition = IoRuleArbitrationDispositionDTO::kSuperseded;
+          outcome.stop_id = stopped.value().stop_id;
+          outcome.stop_generation = stopped.value().stop_generation;
         }
       }
-      row.response_consumed = true;
-      // Trip and real armed-loss latches share this row and its exact scope.
-      // A loss latch requires operator recovery and never invents Tripped.
-      publish_fact(matched || loss);
-      if (loss && !policy.notify_on_trip) row.last_source_loss = row.evidence;
-      return Result<void>::Ok();  // One existing bounded Stop handoff per step.
     }
-    if (policy.notify_on_trip) {
-      row.notify_failure_needs_containment = false;
+    return Result<bool>::Ok(true);
+  };
+  const auto& context = global_io_rule_catalog_->context;
+  for (const auto& candidate_order : order) {
+    const auto index = candidate_order.index;
+    auto& row = global_io_rules_[index];
+    const auto& policy = global_io_rule_catalog_->rules[index];
+    if (!row.registration) {
+      // Before its first reading a rule only refuses motion (outputs pass, see
+      // the hold); once it has watched, a failed rearm is a lost watch.
+      if (!row.watched) continue;
+      const auto stopped = stop_scope(candidate_order, true);
+      if (!stopped.ok()) return Result<void>::Err(stopped.error());
+      if (stopped.value()) return Result<void>::Ok();
       continue;
     }
-    if (scoped_stopping && !scoped_motion) {
-      publish_fact(loss);
-      row.response_consumed = true;
-      continue;  // No queued action; normal idle is evaluated after Stop.
-    }
-    if (loss) {
-      // Contract86: actual armed loss also latches while idle/no Run. Startup
-      // without a first qualified reading never had a registration and never
-      // reaches this branch. No Tripped state or Stop identity is invented.
-      publish_fact(true);
-      row.response_consumed = true;
+    const auto& evidence = *row.evidence;
+    if (!evidence.source_losses.empty() || evidence.evaluation_error) {
+      auto reason = evidence.evaluation_error.value_or(ErrorDTO{kErrorMotionInterruptArmFailed,
+          "Rule input is unavailable", {{"reason", "io_rule_source_unavailable"}}});
+      const auto stopped = stop_scope(candidate_order, true);
+      if (!stopped.ok()) return Result<void>::Err(stopped.error());
+      const auto unwatched = unwatch_global_io_rule_locked(index, std::move(reason));
+      if (!unwatched.ok()) return unwatched;
+      if (stopped.value()) return Result<void>::Ok();
       continue;
     }
-    const bool run_in_flight = program_cycle_claim_run_.has_value();
-    const bool idle_latch = policy.idle_behaviour
-        ? *policy.idle_behaviour == IoRuleIdleBehaviourDTO::kLatch : run_in_flight;
-    publish_fact(idle_latch);
-    row.response_consumed = true;
+    const auto snapshot = global_io_rule_service_->ReadRuleConditionSnapshot(*row.registration);
+    if (!snapshot.ok()) return Result<void>::Err(snapshot.error());
+    const bool released = snapshot.value().value == std::optional(false);
+    if (row.trip_consumed && released) {
+      // The trip is over: a new registration observes the next edge.
+      const auto retired = global_io_rule_service_->RetireRule(*row.registration);
+      if (!retired.ok()) return Result<void>::Err(retired.error());
+      row.evidence = retired.value();
+      row.registration.reset();
+      row.trip_consumed = false;
+      const auto armed = arm_global_io_rule_locked(policy, context, global_io_rule_service_);
+      if (!armed.ok()) {
+        row.qualification_error = armed.error();
+        set_global_io_rule_state_locked(index, IoGlobalRuleState::kUnknown, std::nullopt,
+                                        armed.error());
+        continue;
+      }
+      row.registration = armed.value();
+      if (!global_rule_registration_matches(armed.value(), context, policy.policy_id))
+        return Result<void>::Err(global_rule_error("io_global_rule_service_identity_mismatch"));
+      set_global_io_rule_state_locked(index, IoGlobalRuleState::kClear);
+      continue;
+    }
+    if (!evidence.trip || row.trip_consumed) {
+      if (!evidence.trip && released) set_global_io_rule_state_locked(index, IoGlobalRuleState::kClear);
+      continue;
+    }
+    const auto acquisition = evidence.trip->triggering_acquisition;
+    row.trip_consumed = true;
+    if (policy.on_trip == IoRuleOnTripDTO::kNotify) {
+      set_global_io_rule_state_locked(index, IoGlobalRuleState::kTripped, acquisition);
+      continue;
+    }
+    // AUD-6: `hold` is the operator's Stop: the run is held too (below, or
+    // on the next step when this one used its Stop handoff).
+    row.hold_run = policy.after_stop == IoRuleAfterStopDTO::kHold;
+    const auto stopped = stop_scope(candidate_order, false);
+    if (!stopped.ok()) {
+      row.hold_run = false;
+      row.trip_consumed = false;  // Retried on the next pass.
+      return Result<void>::Err(stopped.error());
+    }
+    set_global_io_rule_state_locked(index, IoGlobalRuleState::kTripped, acquisition);
+    if (stopped.value()) return Result<void>::Ok();  // One bounded Stop handoff per step.
+    if (row.hold_run) {
+      const auto held = hold_program_run_for_rule_locked(index, handoff);
+      if (!held.ok()) return held;
+      if (handoff.control || handoff.projection) return Result<void>::Ok();
+    }
   }
+  return Result<void>::Ok();
+}
+
+// AUD-6: `stop` + `hold` is the operator's Stop. The run is held at once,
+// whatever moves, as the Stop button holds it (group `all`), also when nothing
+// in the rule's scope moves; Resume and Execute then wait for the rule
+// (`rule_holds`). `fail_node` leaves the run going: its next motion in scope
+// fails. Without a Program run there is nothing to hold.
+Result<void> ResourceAddressedExecutionKernel::hold_program_run_for_rule_locked(
+    const std::size_t index, StopWorkHandoff& handoff) {
+  auto& row = global_io_rules_[index];
+  row.hold_run = false;
+  if (!program_cycle_claim_run_ || !program_cycle_claim_run_->capture)
+    return Result<void>::Ok();
+  const auto& policy = global_io_rule_catalog_->rules[index];
+  std::string material = config_.request_owner_epoch.value() + "\nglobal-rule-hold\n" +
+                         policy.policy_id.value() + "\n" +
+                         program_cycle_claim_run_->program_run_id.value();
+  if (row.registration) material += "\n" + std::to_string(row.registration->registration_id);
+  const ProgramExecutionSelectionRequestDTO hold{
+      PublicRequestContextDTO{RequestId(content_identity::sha256_digest(material)),
+                              config_.request_owner_epoch, "kernel.global_io_rule",
+                              policy.policy_id.value()},
+      program_cycle_claim_run_->program_runner_owner_epoch,
+      program_cycle_claim_run_->claim_generation,
+      program_cycle_claim_run_->program_run_id,
+      {"all"},
+      RequestAttributionDTO{RequestTransportDTO::kInternal, RequestAssuranceDTO::kUnverified,
+                            std::nullopt}};
+  const auto held = stop_program_selection_locked(hold, handoff, clock_.now());
+  if (!held.ok()) return Result<void>::Err(held.error());
+  // The run end names the rule (stopped_by: rule) until Resume releases it.
+  const auto fence =
+      std::find_if(program_run_stop_fences_.begin(), program_run_stop_fences_.end(),
+                   [&](const auto& row) { return row.program_run_id == hold.program_run_id; });
+  if (fence != program_run_stop_fences_.end()) fence->held_by_rule = policy.policy_id;
   return Result<void>::Ok();
 }
 
@@ -1265,26 +1117,26 @@ Result<void> ResourceAddressedExecutionKernel::validate_global_io_rule_stop_lock
       [](const auto& rule, const auto& id) { return rule.policy_id < id; });
   if (policy == global_io_rule_catalog_->rules.end() ||
       policy->policy_id != selection.policy_id ||
+      (!selection.watch_lost && policy->on_trip != IoRuleOnTripDTO::kStop) ||
       policy->effective_priority != selection.priority ||
-      (std::holds_alternative<IoActivationEverythingScopeDTO>(policy->scope) ||
-       policy->full_stop_on_trip) != selection.everything)
+      std::holds_alternative<IoActivationEverythingScopeDTO>(policy->scope) != selection.everything ||
+      (!selection.watch_lost && policy->after_stop == IoRuleAfterStopDTO::kFailNode) !=
+          selection.fail_node)
     return Result<void>::Err(global_rule_error("io_global_rule_response_policy_stale"));
   const auto index = static_cast<std::size_t>(policy - global_io_rule_catalog_->rules.begin());
   const auto& row = global_io_rules_.at(index);
-  if (selection.watch_error) {
-    if (!policy->notify_on_trip || selection.registration || selection.evidence ||
-        row.registration || row.state.state != IoGlobalRuleState::kUnknown ||
-        row.qualification_error != selection.watch_error)
-      return Result<void>::Err(global_rule_error("io_global_rule_response_evidence_stale"));
-  } else if (!selection.registration || !selection.evidence ||
-      selection.registration->owner_epoch != global_io_rule_catalog_->context.owner_epoch ||
-      selection.registration->catalog_generation != global_io_rule_catalog_->context.catalog_generation ||
-      selection.registration->policy_id != selection.policy_id ||
-      row.registration != selection.registration || row.evidence != selection.evidence ||
-      (!selection.evidence->trip && selection.evidence->source_losses.empty() &&
-       !selection.evidence->evaluation_error)) {
+  const bool watching = selection.registration && selection.evidence &&
+      row.registration == selection.registration && row.evidence == selection.evidence &&
+      global_rule_registration_matches(*selection.registration, global_io_rule_catalog_->context,
+                                       selection.policy_id);
+  const bool evidence_current = selection.watch_lost
+      ? (selection.registration
+             ? watching && (!selection.evidence->source_losses.empty() ||
+                            selection.evidence->evaluation_error)
+             : !row.registration && row.qualification_error && !key_baseline_pending(row, *policy))
+      : watching && selection.evidence->trip;
+  if (!row.active || !evidence_current)
     return Result<void>::Err(global_rule_error("io_global_rule_response_evidence_stale"));
-  }
   const GlobalInterruptStopParticipant* previous = nullptr;
   for (const auto& selected : selection.participants) {
     if (previous && std::tie(previous->operation_id, previous->participant_id) >=
@@ -1313,6 +1165,109 @@ Result<void> ResourceAddressedExecutionKernel::validate_global_io_rule_stop_lock
     const auto entry = ResolvePreparedIoRuleStopEntry(selected.plan, policy->stop_entry_stage_id);
     if (!entry.ok() || entry.value() != selected.stop_entry)
       return Result<void>::Err(global_rule_error("io_global_rule_response_plan_stale"));
+  }
+  return Result<void>::Ok();
+}
+
+Result<void> ResourceAddressedExecutionKernel::set_global_io_rule_active_locked(
+    const std::size_t index, const bool active) {
+  auto& row = global_io_rules_.at(index);
+  if (row.active == active) return Result<void>::Ok();
+  row.active = active;
+  row.trip_consumed = false;
+  row.watched = false;
+  row.qualification_error.reset();
+  if (!active) {
+    // An inactive rule doesn't watch, trip, stop or gate.
+    if (row.registration) {
+      const auto retired = global_io_rule_service_->RetireRule(*row.registration);
+      if (!retired.ok()) return Result<void>::Err(retired.error());
+      row.evidence = retired.value();
+      row.registration.reset();
+    }
+    set_global_io_rule_state_locked(index, IoGlobalRuleState::kInactive);
+    return Result<void>::Ok();
+  }
+  set_global_io_rule_state_locked(index, IoGlobalRuleState::kClear);
+  // Arms with trip-if-already-active: a holding condition trips at the next
+  // evaluation, which the caller runs at once.
+  return arm_pending_global_io_rules_locked();
+}
+
+Result<void> ResourceAddressedExecutionKernel::set_rule_active(const InterruptPolicyId& rule_id,
+                                                                const bool active) {
+  {
+    std::lock_guard lock(state_mutex_);
+    const auto found = !global_io_rule_catalog_ ? global_io_rules_.end()
+        : std::find_if(global_io_rules_.begin(), global_io_rules_.end(),
+                       [&](const auto& row) { return row.state.rule_id == rule_id; });
+    if (found == global_io_rules_.end())
+      return Result<void>::Err({"rule_unknown", "Rule " + rule_id.value() + " is not in the Deployment",
+                                {{"rule_id", rule_id.value()}}});
+    const auto changed = set_global_io_rule_active_locked(
+        static_cast<std::size_t>(found - global_io_rules_.begin()), active);
+    if (!changed.ok()) return changed;
+  }
+  // The trip of a rule activated while its condition holds is evaluated now;
+  // an evaluation failure surfaces on the host's next ProcessIoRuleEvidence.
+  (void)ProcessIoRuleEvidence();
+  return Result<void>::Ok();
+}
+
+Result<void> ResourceAddressedExecutionKernel::reset_rule_activation() {
+  {
+    std::lock_guard lock(state_mutex_);
+    if (!global_io_rule_catalog_) return Result<void>::Ok();
+    for (std::size_t index = 0; index < global_io_rules_.size(); ++index) {
+      const auto changed = set_global_io_rule_active_locked(
+          index, global_io_rule_catalog_->rules[index].active_at_start);
+      if (!changed.ok()) return changed;
+    }
+  }
+  (void)ProcessIoRuleEvidence();
+  return Result<void>::Ok();
+}
+
+Result<void> ResourceAddressedExecutionKernel::clear_outside_change(const IoSignalId& output) {
+  std::lock_guard lock(state_mutex_);
+  if (!io_signal_service_)
+    return Result<void>::Err({"io_signal_unknown", "No I/O signals are installed",
+                              {{"signal_component_id", output.controllable_component_id.value()},
+                               {"signal_name", output.name}}});
+  return io_signal_service_->ClearOutsideChange(output);
+}
+
+Result<void> ResourceAddressedExecutionKernel::admit_output_write(
+    const IoSignalId& output, const bool manual) const {
+  std::lock_guard lock(state_mutex_);
+  if (auto refusal = cell_latch_refusal_locked()) {
+    refusal->details.emplace("signal_component_id", output.controllable_component_id.value());
+    refusal->details.emplace("signal_name", output.name);
+    return Result<void>::Err(std::move(*refusal));
+  }
+  // CONTRACTS §7 (IO-MAN): a manual write waits only while motion executes
+  // in the cell: an operation (arm motion or gripper command) dispatching,
+  // executing or stopping, or a running immediate step. A queued, planning or
+  // prepared operation has not moved yet; last write wins otherwise.
+  const auto moving = [](const auto& row) {
+    const auto state = row.second->state.state;
+    return state == OperationStateKind::kDispatching ||
+           state == OperationStateKind::kExecuting || state == OperationStateKind::kStopping;
+  };
+  if (manual && (!immediate_step_engines_.empty() ||
+                 std::any_of(active_operations_.begin(), active_operations_.end(), moving)))
+    return Result<void>::Err(
+        {"io_manual_write_motion_executing", "Motion is executing",
+         {{"signal_component_id", output.controllable_component_id.value()},
+          {"signal_name", output.name}}});
+  if (!global_io_rule_catalog_) return Result<void>::Ok();
+  // Only an `everything` rule covers an output.
+  for (std::size_t index = 0; index < global_io_rules_.size(); ++index) {
+    const auto& rule = global_io_rule_catalog_->rules[index];
+    if (!std::holds_alternative<IoActivationEverythingScopeDTO>(rule.scope) ||
+        !rule.waiting_for_program_keys.empty())
+      continue;
+    if (auto hold = global_io_rule_hold_locked(index, true)) return Result<void>::Err(*hold);
   }
   return Result<void>::Ok();
 }

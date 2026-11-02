@@ -9,7 +9,7 @@ import hashlib
 import json
 import logging
 import math
-from threading import Event, Lock
+from threading import Event, Lock, Thread
 import time
 from typing import Any, Callable, Mapping, Sequence
 
@@ -19,6 +19,7 @@ from starlette.responses import JSONResponse
 from manyforge_behavior.node_environment import build_node_environment
 from manyforge_behavior.skill_loader import default_skills_dir, load_skill_catalog
 
+from .activity_history import apply_record, component_action_record, record_activity
 from .client import MAX_HTTP_RESPONSE_BYTES
 from .execution import ExecutionPort
 from .manager import ManagerPort
@@ -28,7 +29,7 @@ from .models import (
     AcknowledgeAllAlarmsRequest,
     ActivationPreparationRequest,
     CallerAttributionRequest,
-    CanonicalEmptyActivationPreparationRequest,
+    ApplyOutcomeRequest,
     HistorianReconcileRequest,
     IoSignalReadRequest,
     ManagerApplyRequest,
@@ -65,13 +66,26 @@ from .models import (
     SceneTransactionRequest,
     SkillExpansionRequest,
     StopIntentRequest,
-    GlobalIoRuleRecoveryIntentRequest,
-    StopFaultRecoveryIntentRequest,
     validate_failure_details_and_origin,
 )
 from .cell_admission import CellAdmissionError
+from .component_model import (
+    ComponentModel,
+    ComponentState,
+    SignalSample,
+    DEFAULT_LIFECYCLE_TIMEOUT_S,
+    action_wait_s,
+    group_action_order,
+    launch_settle_bound_s,
+    lifecycle_timeouts_s,
+    parse_component_model,
+    manual_operation_resident,
+    run_readiness,
+    wait_for_action,
+)
 from .component_overview import ComponentOverviewFacts
 from .native import HeadlessApiError, HeadlessCorePort, ViewerModelAsset
+from .activation_preparer import _program_catalog
 from .apply_follower import CommittedApplyFollower
 from .program_runner_client import ProgramRunnerClientError, ProgramRunnerPort
 from .program_cycle import program_operation_failures
@@ -259,6 +273,40 @@ def _bounded_text(value: object, *, maximum_bytes: int) -> bool:
     )
 
 
+_RUN_END_REASONS = frozenset({"completed", "failed", "stopped", "cell_fault"})
+_RUN_END_DETAIL_FIELDS = frozenset(
+    {"node_instance_id", "error", "stopped_by", "rule_id", "component_id"}
+)
+
+
+def _valid_run_end(value: object) -> bool:
+    """CONTRACTS §9 `{end_reason, details}`; absent while the run goes on."""
+
+    if value is None:
+        return True
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"end_reason", "details"}
+        or value["end_reason"] not in _RUN_END_REASONS
+        or not isinstance(value["details"], dict)
+        or not set(value["details"]) <= _RUN_END_DETAIL_FIELDS
+    ):
+        return False
+    details = value["details"]
+    error = details.get("error")
+    return (
+        details.get("stopped_by") in (None, "operator", "rule")
+        and (
+            error is None
+            or (isinstance(error, dict) and isinstance(error.get("code"), str))
+        )
+        and all(
+            details.get(name) is None or _bounded_text(details[name], maximum_bytes=512)
+            for name in ("node_instance_id", "rule_id", "component_id")
+        )
+    )
+
+
 def _sha256_identity(value: object) -> bool:
     return (
         isinstance(value, str)
@@ -271,7 +319,7 @@ def _sha256_identity(value: object) -> bool:
 @lru_cache(maxsize=1)
 def _build_skills():
     """One installed build input, never a mutable runtime skill registry."""
-    environment = build_node_environment()
+    environment = _palette_environment()
     return environment, load_skill_catalog(
         default_skills_dir(), catalog=environment.catalog
     )
@@ -280,6 +328,27 @@ def _build_skills():
 @lru_cache(maxsize=1)
 def _palette_environment():
     return build_node_environment()
+
+
+def warm_builtin_node_environment() -> None:
+    """Build the immutable built-in node environment once, before serving.
+
+    Building it parses and validates the node catalog in pure Python (about
+    a CPU-second). Built lazily, it ran right after the first Apply on
+    request threads, once per concurrent request (``lru_cache`` doesn't make
+    concurrent first callers wait), holding the GIL for seconds while the
+    machines were prepared: the alarm-attention publisher and the
+    execution-socket clients then missed their deadlines. A build that fails
+    here stays uncached, and the requests that need it report it as before.
+    """
+
+    try:
+        _build_skills()
+        _program_catalog()
+    except (OSError, ValueError) as error:  # unreadable or invalid build inputs
+        logging.getLogger(__name__).warning(
+            "built-in node environment is unavailable: %s", error
+        )
 
 
 def _palette_missing_capability(entry: Any, offers: set[str]) -> str | None:
@@ -353,7 +422,6 @@ class HeadlessService:
         execution: ExecutionPort | None = None,
         program_runner: ProgramRunnerPort | None = None,
         cell_admission: Any | None = None,
-        cclc: Any | None = None,
         activation_preparer: Any | None = None,
     ) -> None:
         self.core = core
@@ -361,7 +429,6 @@ class HeadlessService:
         self.execution = execution
         self.program_runner = program_runner
         self.cell_admission = cell_admission
-        self.cclc = cclc
         self.activation_preparer = activation_preparer
         # The motion-attention projection the Kernel acknowledged holding
         # (OperatorAlarmAttentionPublisher.kernel_held_attention); None in a
@@ -380,12 +447,8 @@ class HeadlessService:
         self.initial_scene_observer: Callable[[], None] | None = None
         self._node_previews_lock = Lock()
         self._node_previews_in_flight: set[tuple[str, str]] = set()
-        # Item 38: set when this service ran the Kernel's Force close step
-        # (armed Full Stop, Close retirement). It lives for that attempt only:
-        # the next preparation of any kind consumes it, success or failure, and
-        # the attempt's step `end` (SX-616) or a new arm clears it. Callers
-        # cannot set it.
-        self._force_close_in_progress = False
+        # One group action runs at a time (CONTRACTS §2); held by its thread.
+        self._group_action_lock = Lock()
         # Each Apply Headless forwards is followed to its committed outcome,
         # which wakes the Program runner (see apply_follower).
         self.apply_follower: CommittedApplyFollower | None = (
@@ -736,57 +799,202 @@ class HeadlessService:
             trusted_principal_id=attribution.principal_id,
         )
 
-    def execution_stop_fault(self) -> dict[str, Any]:
-        return self._execution().stop_fault()
+    # Component model v2 (CONTRACTS §1, §2, §5, §7, §10) ------------------
 
-    def execution_recover_stop_fault(
-        self,
-        request: StopFaultRecoveryIntentRequest | GlobalIoRuleRecoveryIntentRequest,
-    ) -> dict[str, Any]:
-        return self._execution().recover_stop_fault(request)
-
-    def scenario_force_close_arm(self, stop_generation: int) -> dict[str, Any]:
-        """Item 37: the Kernel confirms the operator's Full Stop for Force close."""
-
-        self._force_close_in_progress = False
-        return self._execution().force_close(step="arm", stop_generation=stop_generation)
-
-    def scenario_force_close_operations(
-        self, context: CallerAttributionRequest
-    ) -> dict[str, Any]:
-        """Item 37: the Kernel step, then one History row of what stays unknown."""
-
-        response = self._execution().force_close(step="close_operations")
+    def component_model(self) -> ComponentModel:
+        response = self._execution().component_model()
         if response.get("ok") is not True:
-            return response
-        self._force_close_in_progress = True
-        result = response["result"]
-        record = {
-            "schema_version": "manyforge.scenario_force_close.v1",
-            "reason_code": "cell_force_closed_by_operator",
-            "request_id": context.request_id,
-            "source_label": context.source_label,
-            "stop_generation": result["stop_generation"],
-            "operations": result["operations"],
-            "released_orphan_resources": result["released_orphan_resources"],
-            # FIX1: the cell-wide motion block of an unresolved closure ended.
-            "motion_block_cleared": result.get("motion_block_cleared") is True,
-        }
-        try:
-            history = self.core.record_scenario_force_close(record)
-        except HeadlessApiError as error:
-            # The Kernel step already happened; a lost History row is logged.
-            logging.getLogger(__name__).warning(
-                "Force close History row was not recorded: %s", error.code
+            error = response.get("error") if isinstance(response.get("error"), dict) else {}
+            raise HeadlessApiError(
+                str(error.get("code") or "execution_command_response_invalid"),
+                str(error.get("message") or "component model is unavailable"),
             )
-            history = {"event_id": None, "recorded": False}
-        return {**response, "history": history}
+        return parse_component_model(response)
 
-    def scenario_force_close_end(self) -> dict[str, Any]:
-        """SX-616: the caller's Force close sequence ended; its exception ends."""
+    def components(self) -> list[ComponentState]:
+        return self.component_model().component_states
 
-        self._force_close_in_progress = False
-        return {"ok": True, "command": "force_close", "result": {"step": "end", "operations": []}}
+    def cell_latch(self) -> dict[str, Any]:
+        return dict(self.component_model().cell_latch)
+
+    def io_signals(self) -> list[SignalSample]:
+        return self.component_model().signal_samples
+
+    def run_readiness(self) -> dict[str, Any]:
+        """CONTRACTS §10: the one owner of RunReadiness."""
+
+        model = self.component_model()
+        try:
+            cycle: dict[str, Any] | None = self.program_cycle_status()
+        except HeadlessApiError:
+            cycle = None
+        try:
+            status: dict[str, Any] | None = self.program_applied_status()
+        except HeadlessApiError:
+            status = None
+        return dict(
+            run_readiness(
+                model,
+                cycle,
+                program_status=status,
+                manual_operation_in_progress=manual_operation_resident(
+                    self.execution_control_state()
+                ),
+            )
+        )
+
+    def _action_refusal(self, response: dict[str, Any]) -> HeadlessApiError:
+        error = response.get("error") if isinstance(response.get("error"), dict) else {}
+        return HeadlessApiError(
+            str(error.get("code") or "execution_command_response_invalid"),
+            str(error.get("message") or "component action was refused"),
+            details=error.get("details") if isinstance(error.get("details"), dict) else None,
+        )
+
+    def component_action(self, component_id: str, action: str) -> dict[str, Any]:
+        """Hand one action to the coordinator; its result is `last_action`."""
+
+        try:
+            response = self._execution().component_action(component_id, action)
+            if response.get("ok") is not True:
+                raise self._action_refusal(response)
+        except HeadlessApiError as refusal:
+            # Never dispatched, so the host publishes no `last_action` for it.
+            record_activity(self.core, component_action_record(
+                component_id, action, "refused",
+                {"code": refusal.code, "message": str(refusal)},
+            ))
+            raise
+        return {"action": action}
+
+    def _stop_generation(self) -> Any:
+        """The cell's Stop generation; it changes with every new Stop."""
+
+        control = self.execution_control_state().get("control_state")
+        stop = control.get("cell_stop_action") if isinstance(control, dict) else None
+        return stop.get("expected_stop_generation") if isinstance(stop, dict) else None
+
+    def component_actions(self, action: str, component_ids: list[str]) -> dict[str, Any]:
+        """One action on the named components, one at a time (CONTRACTS §2).
+
+        Order: `prepare` runs owners before their members, `disable`,
+        `power_off` and `reboot` run members before their owner, anything
+        else keeps cell order (`group_action_order`). Each action is
+        dispatched after the previous one finished, bounded as the host bounds
+        it (`action_wait_s`): the component's authored lifecycle timeout from
+        the active cell graph; a `prepare` of a component with no action since
+        its launch also waits up to the launch bound, the cell's lifecycle
+        timeouts summed (a result that doesn't come back is `unknown`). A
+        refusal or failure of one doesn't stop the rest (each result is that
+        component's `last_action`), except: a Stop ends the group, and the
+        members of an owner whose `prepare` failed are skipped
+        (`owner_not_prepared`, logged).
+        A group request while another group runs is refused
+        (`component_action_in_progress`).
+        """
+
+        states = self.component_model().component_states
+        order = group_action_order(states, action)
+        unknown = sorted(set(component_ids) - set(order))
+        if unknown:
+            raise HeadlessApiError(
+                "component_not_found",
+                f"component {unknown[0]} is not in the cell",
+                details={"component_id": unknown[0]},
+            )
+        selected = [component_id for component_id in order if component_id in component_ids]
+        owner_of = {
+            state["component_id"]: state["owner_id"] for state in states if "owner_id" in state
+        }
+        previous = {
+            state["component_id"]: state.get("last_action") for state in states
+        }
+        timeouts = lifecycle_timeouts_s(self.manager_graph()["cell_graph"])
+        launch_bound_s = launch_settle_bound_s(
+            timeouts.get(component_id, DEFAULT_LIFECYCLE_TIMEOUT_S) for component_id in order
+        )
+        stop_generation = self._stop_generation()
+        logger = logging.getLogger(__name__)
+
+        def read_states() -> list[ComponentState]:
+            return self.component_model().component_states
+
+        def run() -> None:
+            try:
+                run_group()
+            finally:
+                self._group_action_lock.release()
+
+        def run_group() -> None:
+            failed_owners: set[str] = set()
+            for component_id in selected:
+                if self._stop_generation() != stop_generation:
+                    logger.warning(
+                        "component_group_action_stopped",
+                        extra={"component_id": component_id, "action": action,
+                               "error_code": "component_action_interrupted_by_stop"},
+                    )
+                    return
+                if owner_of.get(component_id) in failed_owners:
+                    logger.warning(
+                        "component_group_action_step_skipped",
+                        extra={"component_id": component_id, "action": action,
+                               "error_code": "owner_not_prepared"},
+                    )
+                    record_activity(self.core, component_action_record(
+                        component_id, action, "refused",
+                        {"code": "owner_not_prepared",
+                         "message": f"{component_id} wasn't tried: its machine "
+                         f"{owner_of[component_id]} didn't prepare"},
+                    ))
+                    continue
+                try:
+                    self.component_action(component_id, action)
+                    result = wait_for_action(
+                        read_states,
+                        component_id,
+                        action,  # type: ignore[arg-type]
+                        previous[component_id],
+                        timeout_s=action_wait_s(
+                            action,
+                            timeouts.get(component_id, DEFAULT_LIFECYCLE_TIMEOUT_S),
+                            launch_bound_s,
+                            # The host starts a launched component without a
+                            # `last_action`; its first Prepare awaits the launch.
+                            launch_settled=previous[component_id] is not None,
+                        ),
+                    )
+                except HeadlessApiError as error:
+                    logger.warning(
+                        "component_group_action_step_refused",
+                        extra={
+                            "component_id": component_id,
+                            "action": action,
+                            "error_code": error.code,
+                        },
+                    )
+                    result = None
+                if result is not None and result.get("outcome") == "succeeded":
+                    continue
+                if action == "prepare":
+                    failed_owners.add(component_id)
+                error_code = (result or {}).get("error", {}).get("code")
+                if error_code == "component_action_interrupted_by_stop":
+                    return
+
+        if not self._group_action_lock.acquire(blocking=False):
+            raise HeadlessApiError(
+                "component_action_in_progress",
+                "A group action is still running; wait for it to finish",
+            )
+        Thread(target=run, name="component-group-action", daemon=True).start()
+        return {"action": action}
+
+    def set_io_output(self, signal_id: str, value: bool | float) -> dict[str, Any]:
+        response = self._execution().set_io_output(signal_id, value, origin="manual")
+        if response.get("ok") is not True:
+            raise self._action_refusal(response)
+        return dict(response["result"])
 
     def execution_set_runtime_scale_control(
         self,
@@ -852,10 +1060,16 @@ class HeadlessService:
         else:
             projections["program_cycle"] = program_cycle
         capture("applied_program", self.program_applied)
+        capture("applied_program_status", self.program_applied_status)
         capture("source_model", self.source_model)
         capture("execution_identity", self.execution_identity)
         capture("execution_targets", self.execution_targets)
         capture("execution_control", self.execution_control_state)
+        component_model: ComponentModel | None = None
+        try:
+            component_model = self.component_model()
+        except HeadlessApiError as error:
+            errors["component_model"] = {"code": error.code, "message": str(error)}
         return ComponentOverviewFacts(
             runtime=projections["runtime"],
             alarms=projections["alarms"],
@@ -866,13 +1080,10 @@ class HeadlessService:
             execution_identity_response=projections["execution_identity"],
             execution_targets_response=projections["execution_targets"],
             execution_control_response=projections["execution_control"],
+            component_model=component_model,
             errors=errors,
+            applied_program_status=projections["applied_program_status"],
         )
-
-    def component_overview(self) -> dict[str, Any]:
-        """Return one pure reduction over one exact read of each owner."""
-
-        return self.component_overview_facts().reduce()
 
     def scene_resource_poses(
         self,
@@ -914,9 +1125,6 @@ class HeadlessService:
             "source_owner_id": section.get("source_owner_id"),
             "source_content_digest": section.get("source_content_digest"),
         }
-
-    def canonical_empty_selection(self) -> dict[str, Any]:
-        return self.manager.canonical_empty_selection()
 
     def manager_status(self) -> dict[str, Any]:
         runtime, section = self._source_section("manager")
@@ -1382,7 +1590,7 @@ class HeadlessService:
             )
         executable = projection.get("executable")
         try:
-            origin = validate_prepared_activation_origin(projection.get("origin"))
+            validate_prepared_activation_origin(projection.get("origin"))
         except ProgramBindingTransportError as error:
             raise HeadlessApiError("program_applied_selection_invalid", "native core returned an invalid Applied origin") from error
         expected_fields = {
@@ -1426,12 +1634,6 @@ class HeadlessService:
             )
             or not isinstance(projection.get("deployment_revision"), str)
             or not _sha256_identity(projection["deployment_revision"])
-            or (origin["kind"] == "sealed_canonical_empty" and (
-                projection.get("program_id") is not None or executable
-                or any(origin[field] != projection.get(field) for field in (
-                    "deployment_artifact_id", "deployment_revision", "retained_bundle_id", "graph_revision",
-                ))
-            ))
         ):
             raise HeadlessApiError(
                 "program_applied_selection_invalid",
@@ -1487,14 +1689,12 @@ class HeadlessService:
                         committed["record_digest"])
             applied = self.program_applied_status()
             if (committed["scene_initialization"] == "initialize"
-                and applied["origin"]["kind"] in {"scenario", "sealed_canonical_empty"}
                 and applied["program_id"] is None
                 and applied["record_digest"] == identity[2]):
                 self._clear_empty_applied(identity)
                 return
             if (
                 committed["scene_initialization"] != "initialize"
-                or applied["origin"]["kind"] != "scenario"
                 or applied["program_id"] is None
                 or applied["record_digest"] != committed["record_digest"]
             ):
@@ -1870,8 +2070,10 @@ class HeadlessService:
         except (rfc8785.CanonicalizationError, TypeError, ValueError):
             calculated_policy_digest = None
         if (
-            # `operation_failures` is always present (empty when none).
-            set(projection) != expected_fields | {"operation_failures"}
+            # `operation_failures` is always present (empty when none);
+            # `run_end` (CONTRACTS §9 ProgramRunEnd) once the run has ended.
+            set(projection) - {"run_end"} != expected_fields | {"operation_failures"}
+            or not _valid_run_end(projection.get("run_end"))
             or projection.get("schema_version") != PROGRAM_RUN_STATUS_VERSION
             or not _bounded_text(owner_id, maximum_bytes=512)
             or not _bounded_text(owner_epoch, maximum_bytes=512)
@@ -2572,64 +2774,6 @@ class HeadlessService:
         except ProgramRunnerClientError as error:
             raise self._runner_error(error) from error
 
-    def component_process_stop_offer(self, component_id: str) -> dict[str, Any]:
-        return self.manager.component_process_stop_offer(component_id)
-
-    def stop_component_process(self, request: Any) -> dict[str, Any]:
-        return self.manager.stop_component_process(request)
-
-    def component_process_stop_result(self, request: Any) -> dict[str, Any]:
-        return self.manager.component_process_stop_result(request)
-
-    def component_lifecycle_submit(self, request: Any) -> dict[str, Any]:
-        if self.cclc is None:
-            raise HeadlessApiError(
-                "cclc_open_unavailable", "CCLC owner is not configured"
-            )
-        payload = request.model_dump(
-            mode="json", exclude={"confirmed"}, exclude_none=True
-        )
-        return self.cclc.submit_lifecycle(payload)
-
-    def component_lifecycle_status(self, transaction_id: str) -> dict[str, Any] | None:
-        if self.cclc is None:
-            raise HeadlessApiError(
-                "cclc_open_unavailable", "CCLC owner is not configured"
-            )
-        return self.cclc.lifecycle_status(transaction_id)
-
-    def component_lifecycle_request_result(self, request: Any) -> dict[str, Any] | None:
-        if self.cclc is None:
-            raise HeadlessApiError(
-                "cclc_open_unavailable", "CCLC owner is not configured"
-            )
-        return self.cclc.lifecycle_request_result(
-            request.model_dump(mode="json", exclude={"confirmed"}, exclude_none=True)
-        )
-
-    def route_selection_submit(self, request: Any) -> dict[str, Any]:
-        if self.cclc is None:
-            raise HeadlessApiError(
-                "cclc_open_unavailable", "CCLC owner is not configured"
-            )
-        payload = request.model_dump(
-            mode="json",
-            exclude={"confirmed"},
-            exclude_none=True,
-        )
-        return self.cclc.submit_route(payload)
-
-    def route_selection_request_result(self, request: Any) -> dict[str, Any] | None:
-        if self.cclc is None:
-            raise HeadlessApiError(
-                "cclc_open_unavailable", "CCLC owner is not configured"
-            )
-        # Preserve the original intent, including absent fields on legacy
-        # requests. Only Core may decide admission or replay membership.
-        return self.cclc.route_request_result(
-            request.model_dump(mode="json", exclude={"confirmed"}, exclude_none=True)
-        )
-
     @staticmethod
     def _verified_viewer_asset(
         asset: ViewerModelAsset,
@@ -2999,6 +3143,14 @@ class HeadlessService:
 
         return self.core.record_client_incident(**kwargs)
 
+    def record_apply_outcome(self, request: ApplyOutcomeRequest) -> dict[str, Any]:
+        """One Load/New/Apply/Revert terminal into History (``activity_history``)."""
+
+        body = request.model_dump(mode="json", exclude_none=True)
+        return self.core.record_activity(apply_record(
+            body["apply_kind"], body["outcome"], body.get("error"), body["components"]
+        ))
+
     def historian_reconcile(
         self,
         request: HistorianReconcileRequest,
@@ -3042,121 +3194,23 @@ class HeadlessService:
             )
         return self.manager.preview_deployment_candidate(request)
 
-    def _scenario_closing(self) -> bool:
-        """The Kernel reports authoring closed *only* by the closing scope.
-
-        `stop_fault_recovery_closing` on the Stop-fault offer means every other
-        admission condition holds (SX-370); `_not_ready` or no reason does not.
-        A latch whose Stop has not certified yet is a typed wait.
-        """
-
-        try:
-            response = self._execution().stop_fault()
-        except HeadlessApiError:
-            return False
-        offer = response.get("stop_fault") if isinstance(response, Mapping) else None
-        if not isinstance(offer, Mapping):
-            return False
-        latch = offer.get("latch")
-        if isinstance(latch, Mapping) and latch.get("stop_certificate") is None:
-            raise HeadlessApiError(
-                "authoring_not_ready",
-                "The cell Stop is still settling; retry Close in a moment",
-            )
-        return offer.get("recovery_unavailable_reason") == "stop_fault_recovery_closing"
-
-    def _require_no_carried_objects(self) -> None:
-        """Close refuses while a part is attached: the caller detaches first.
-
-        The canonical-empty Apply preserves the Scene, so an attachment would
-        outlive its carrier and could no longer be detached.
-        """
-
-        _runtime, section = self._source_section("logical_scene")
-        snapshot = section["payload"].get("snapshot")
-        attachments = (
-            snapshot.get("carried_object_attachments")
-            if isinstance(snapshot, Mapping) else None
-        )
-        if not attachments:
-            return
-        raise HeadlessApiError(
-            "scenario_close_attachment_present",
-            "Detach every carried object before Close",
-            details={"carried_objects": [
-                {
-                    key: row.get(key)
-                    for key in (
-                        "scene_resource_id",
-                        "controllable_component_id",
-                        "command_target_id",
-                    )
-                }
-                for row in attachments
-                if isinstance(row, Mapping)
-            ]},
-        )
-
-    def prepare_activation(
-        self, request: ActivationPreparationRequest | CanonicalEmptyActivationPreparationRequest
-    ) -> dict[str, Any]:
+    def prepare_activation(self, request: ActivationPreparationRequest) -> dict[str, Any]:
         if self.activation_preparer is None:
             raise HeadlessApiError(
                 "activation_preparer_unavailable",
                 "Activation preparation is not configured",
             )
-        canonical_empty = isinstance(request, CanonicalEmptyActivationPreparationRequest)
-        # Item 38: one preparation consumes the Force close exception, whatever
-        # its outcome (SX-616).
-        force_close_bypass = canonical_empty and self._force_close_in_progress
-        self._force_close_in_progress = False
-
-        def admitted() -> bool:
-            try:
-                admission = self._cell_admission().get()
-            except CellAdmissionError as error:
-                raise self._admission_error(error) from error
-            # The request's admission generation is evidence only: preparation
-            # follows the current admission facts.
-            if admission.get("authoring_allowed") is True:
-                return True
-            # D6 (SX-366/370): while Scenario Close runs, authoring stays
-            # closed; only the verified canonical-empty preparation, from any
-            # caller, is admitted, and only when the Kernel reports that the
-            # closing scope is the sole blocker.
-            return canonical_empty and self._scenario_closing()
-
-        if not admitted():
+        try:
+            admission = self._cell_admission().get()
+        except CellAdmissionError as error:
+            raise self._admission_error(error) from error
+        # The request's admission generation is evidence only: preparation
+        # follows the current admission facts.
+        if admission.get("authoring_allowed") is not True:
             raise HeadlessApiError(
                 "authoring_not_ready",
                 "Activation preparation requires the current idle admission",
             )
-        if canonical_empty:
-            # Item 38 (b): during Force close a part whose detach was refused
-            # (the robot's process is gone) may stay attached.
-            if not force_close_bypass:
-                self._require_no_carried_objects()
-            selection = self.manager.canonical_empty_selection()
-            origin = request.origin.model_dump(mode="json")
-            selected_origin = {
-                "kind": "sealed_canonical_empty", "cell_id": selection["cell_id"],
-                "deployment_artifact_id": selection["deployment_artifact_id"],
-                "deployment_revision": selection["deployment_revision"],
-                "retained_bundle_id": selection["candidate_retained_bundle_id"],
-                "graph_revision": selection["candidate_graph_revision"],
-                "admission_digest": selection["admission_digest"],
-            }
-            if selection["request_owner_epoch"] != request.request_owner_epoch or selected_origin != origin:
-                raise HeadlessApiError("stale_generation", "Canonical-empty selection changed before preparation")
-            receipt = self.activation_preparer.prepare_canonical_empty(selection)
-            try:
-                after = self.manager.canonical_empty_selection()
-                if after != selection or not admitted():
-                    raise HeadlessApiError("stale_generation", "Canonical-empty selection or admission changed during preparation")
-            except Exception:
-                self.activation_preparer.release(receipt["prepared_activation_id"])
-                raise
-            return {"prepared_activation": receipt}
         return {
             "prepared_activation": self.activation_preparer.prepare(
                 source_document_digest=request.source_document_digest,
@@ -3202,6 +3256,11 @@ class HeadlessService:
         return self.manager.acknowledge_apply(
             apply_id, apply_generation, request_context
         )
+
+    def manager_apply_release_for_new(
+        self, request_context: ManagerApplyAcknowledgementContext
+    ) -> dict[str, Any]:
+        return self.manager.release_failed_apply_for_new(request_context)
 
     def scene_commit(
         self,

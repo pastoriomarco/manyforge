@@ -85,6 +85,10 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute_immediate
       }
     }
     state_lock.lock();
+    // R1: a cell latch refuses every node command and manual work.
+    if (auto refusal = cell_latch_refusal_locked()) {
+      return Result<OperationAcceptedDTO>::Err(std::move(*refusal));
+    }
     // A2a-1 (decided): no "component enabled" or "motion admission open"
     // check; the adapter's step handles a component that is not enabled.
     // A non-motion transaction, as an output: its node's own stop policy

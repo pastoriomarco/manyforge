@@ -16,11 +16,8 @@ import tempfile
 import threading
 from typing import Any, Callable, Mapping
 
-from pydantic import ValidationError
-
-from .models import ManagerApplyPreparedActivation, PreparedSealedCanonicalEmptyOrigin
-
 import rfc8785
+import yaml
 
 from manyforge_behavior.catalog import NodeCatalog
 from manyforge_behavior.model_source_capture import SOURCE_CLOSURE_SCHEMA
@@ -69,39 +66,30 @@ _PROFILE_DESCRIPTION = Path(
 )
 
 
-# Approved model-free profiles: runtime marker key -> (exact profile row,
-# Deployment runtime_kind of its components).
+# Model-free components name a constant id (no model): id -> Deployment
+# runtime_kind of its components.
 _MODEL_FREE_PROFILES = {
-    marker: (
-        {
-            "runtime_restoration_profile_id": profile_id,
-            marker: {},
-            "source_fields": {},
-            "stop_profiles": {},
-            "acceptance_obligations": [],
-        },
-        runtime_kind,
-    )
-    for marker, profile_id, runtime_kind in (
-        ("io_provider_runtime", "io_device_v0", "io_provider"),
-        ("pose_source_runtime", "pose_source_v0", "pose_source"),
-        ("ai_model_runtime", "ai_model_v0", "ai_model"),
-    )
+    "io_device_v0": "io_provider",
+    "pose_source_v0": "pose_source",
+    "ai_model_v0": "ai_model",
 }
+# A machine (owner) or a model-form I/O member model (the description's
+# `component_models`): its rows carry no model source and no runtime_kind.
+_COMPONENT_MODEL = object()
 
 
 def _model_preparation_profiles(
     capability_root: Path,
-) -> dict[str, tuple[str, str] | str]:
-    """Read the minimum repository-owned profile facts needed by Python XML prep.
+) -> dict[str, tuple[str, str] | str | object]:
+    """Map each `component_profile_id` to what Python XML prep needs.
 
-    Native preparation independently validates the complete profile and intent
-    join.  This projection only supplies the model identity and accepted package
-    prefix required to rewrite the already captured source bytes.  An approved
-    model-free profile (I/O device ``io_provider_runtime``, pose source
-    ``pose_source_runtime`` or AI model ``ai_model_runtime``) maps to its components' Deployment runtime kind:
-    it has no model to prepare.  Only its exact approved row is accepted;
-    every other row must name a known model family.
+    Native preparation independently validates the complete model and intent
+    join.  This projection only supplies, per component model (the model
+    descriptor's ``id``, read through its family's ``component_descriptor``),
+    the family's model asset id and accepted package prefix required to
+    rewrite the already captured source bytes.  A model-free id (I/O device,
+    pose source, AI model) maps to its components' Deployment runtime kind:
+    it has no model to prepare.
     """
 
     try:
@@ -111,21 +99,32 @@ def _model_preparation_profiles(
             "activation_model_profile_invalid",
             "Activation model profiles could not be loaded",
         ) from error
-    if not isinstance(root, dict):
-        raise HeadlessApiError(
-            "activation_model_profile_invalid",
-            "Activation model profiles have an invalid shape",
-        )
-    families: dict[str, tuple[str, str]] = {}
-    family_rows = root.get("model_families")
+    family_rows = root.get("model_families") if isinstance(root, dict) else None
     if not isinstance(family_rows, list):
         raise HeadlessApiError(
             "activation_model_profile_invalid",
             "Activation model families are missing",
         )
+    profiles: dict[str, tuple[str, str] | str | object] = dict(_MODEL_FREE_PROFILES)
+    for descriptor_path in root.get("component_models", []):
+        try:
+            descriptor = yaml.safe_load(
+                (capability_root / str(descriptor_path)).read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeError, yaml.YAMLError) as error:
+            raise HeadlessApiError(
+                "activation_model_profile_invalid",
+                f"Component model {descriptor_path} could not be loaded",
+            ) from error
+        model_id = descriptor.get("id") if isinstance(descriptor, dict) else None
+        if not isinstance(model_id, str) or not model_id or model_id in profiles:
+            raise HeadlessApiError(
+                "activation_model_profile_invalid",
+                f"Component model {descriptor_path} has an invalid or duplicate id",
+            )
+        profiles[model_id] = _COMPONENT_MODEL
     for row in family_rows:
         source = row.get("source") if isinstance(row, dict) else None
-        family_id = row.get("model_family_id") if isinstance(row, dict) else None
         model_asset_id = row.get("model_asset_id") if isinstance(row, dict) else None
         prefix = (
             source.get("accepted_package_uri_prefix")
@@ -133,57 +132,34 @@ def _model_preparation_profiles(
             else None
         )
         if (
-            not isinstance(family_id, str)
-            or not family_id
-            or not isinstance(model_asset_id, str)
+            not isinstance(model_asset_id, str)
             or not model_asset_id
             or not isinstance(prefix, str)
             or not prefix
-            or family_id in families
         ):
             raise HeadlessApiError(
                 "activation_model_profile_invalid",
                 "Activation model families contain an invalid row",
             )
-        families[family_id] = (model_asset_id, prefix)
-    profiles: dict[str, tuple[str, str] | str] = {}
-    profile_rows = root.get("runtime_restoration_profiles")
-    if not isinstance(profile_rows, list):
-        raise HeadlessApiError(
-            "activation_model_profile_invalid",
-            "Activation runtime profiles are missing",
-        )
-    for row in profile_rows:
-        profile_id = (
-            row.get("runtime_restoration_profile_id")
-            if isinstance(row, dict)
-            else None
-        )
-        model_free = next(
-            (
-                approved
-                for marker, approved in _MODEL_FREE_PROFILES.items()
-                if isinstance(row, dict) and marker in row
-            ),
-            None,
-        )
-        family_id = row.get("model_family_id") if isinstance(row, dict) else None
-        family = (
-            model_free[1]
-            if model_free is not None
-            else families.get(family_id) if isinstance(family_id, str) else None
-        )
-        if (
-            not isinstance(profile_id, str)
-            or not profile_id
-            or (row != model_free[0] if model_free is not None else family is None)
-            or profile_id in profiles
-        ):
+        descriptor_path = row.get("component_descriptor")
+        if descriptor_path is None:
+            continue  # a test-fixture family no component selects
+        try:
+            descriptor = yaml.safe_load(
+                (capability_root / str(descriptor_path)).read_text(encoding="utf-8")
+            )
+        except (OSError, UnicodeError, yaml.YAMLError) as error:
             raise HeadlessApiError(
                 "activation_model_profile_invalid",
-                "Activation runtime profiles contain an invalid row",
+                f"Component model {descriptor_path} could not be loaded",
+            ) from error
+        model_id = descriptor.get("id") if isinstance(descriptor, dict) else None
+        if not isinstance(model_id, str) or not model_id or model_id in profiles:
+            raise HeadlessApiError(
+                "activation_model_profile_invalid",
+                f"Component model {descriptor_path} has an invalid or duplicate id",
             )
-        profiles[profile_id] = family
+        profiles[model_id] = (model_asset_id, prefix)
     return profiles
 
 
@@ -339,14 +315,6 @@ def _require_stored_product(
             "activation_preparer_response_invalid",
             "Stored prepared activation differs from the preparer receipt",
         )
-    if receipt["origin"]["kind"] == "sealed_canonical_empty":
-        try:
-            ManagerApplyPreparedActivation.model_validate(dict(receipt))
-        except ValidationError as error:
-            raise HeadlessApiError(
-                "activation_preparer_response_invalid",
-                "Activation preparer returned an invalid sealed origin or receipt",
-            ) from error
     identity = dict(value)
     prepared_activation_id = identity.pop("prepared_activation_id")
     expected_identity = "sha256:" + hashlib.sha256(
@@ -362,15 +330,6 @@ def _require_stored_product(
             "activation_preparer_response_invalid",
             "Stored prepared activation has an invalid payload",
         )
-    if value["origin"]["kind"] == "sealed_canonical_empty":
-        payload = value["activation_payload"]
-        if (payload.get("program") is not None
-                or "program_binding" not in payload or payload["program_binding"] is not None
-                or payload.get("program_role_assignment") != {"component_roles": [], "target_roles": []}):
-            raise HeadlessApiError(
-                "activation_preparer_response_invalid",
-                "Sealed empty preparation returned fabricated Program facts",
-            )
     return value
 
 
@@ -434,6 +393,14 @@ def _prepare_model_closure(
                     "Deployment components do not match captured model profiles",
                 )
             seen_components.add(component_id)
+            if profile is _COMPONENT_MODEL:
+                # A machine owner or a model-form I/O member: no model.
+                if "model_source" in component or source is not None:
+                    raise HeadlessApiError(
+                        "activation_model_profile_invalid",
+                        "Deployment components do not match captured model profiles",
+                    )
+                continue
             if isinstance(profile, str):
                 # A registered model-free profile (I/O device or pose source):
                 # only a component of its runtime kind with no model source and
@@ -494,8 +461,6 @@ class ActivationPreparer:
         runtime_cell_id: str,
         timeout_seconds: float | None,
         publish_canonical_empty: bool = False,
-        canonical_empty_package_root: Path | None = None,
-        canonical_empty_admission_filename: Path | None = None,
     ) -> None:
         if not isinstance(runtime_cell_id, str) or re.fullmatch(
             r"[a-z][a-z0-9_.-]{0,127}", runtime_cell_id
@@ -508,8 +473,6 @@ class ActivationPreparer:
         self._profiles = _model_preparation_profiles(capability_root)
         self._timeout_seconds = timeout_seconds
         self._publish_canonical_empty = publish_canonical_empty
-        self._canonical_empty_package_root = canonical_empty_package_root
-        self._canonical_empty_admission_filename = canonical_empty_admission_filename
         self._lock = threading.Lock()
         self._prepared: dict[str, dict[str, Any]] = {}
 
@@ -563,37 +526,9 @@ class ActivationPreparer:
 
         return self._prepare(request_value, origin, captured_input_digest)
 
-    def prepare_canonical_empty(self, selection: Mapping[str, Any]) -> dict[str, Any]:
-        """Prepare the actual sealed selection through the same bounded worker."""
-        if (self._canonical_empty_package_root is None
-                or self._canonical_empty_admission_filename is None):
-            raise HeadlessApiError(
-                "canonical_empty_preparation_unavailable",
-                "Canonical-empty preparation requires the configured Manager admission",
-            )
-        origin = PreparedSealedCanonicalEmptyOrigin.model_validate({
-            "kind": "sealed_canonical_empty", "cell_id": selection["cell_id"],
-            "deployment_artifact_id": selection["deployment_artifact_id"],
-            "deployment_revision": selection["deployment_revision"],
-            "retained_bundle_id": selection["candidate_retained_bundle_id"],
-            "graph_revision": selection["candidate_graph_revision"],
-            "admission_digest": selection["admission_digest"],
-        }).model_dump(mode="json")
-        if origin["cell_id"] != self._runtime_cell_id:
-            raise HeadlessApiError("stale_generation", "Sealed admission names a different runtime cell")
-        captured = "sha256:" + hashlib.sha256(rfc8785.dumps({
-            "schema_version": "manyforge.sealed_canonical_empty_capture.v1",
-            "origin": origin,
-        })).hexdigest()
-        return self._prepare(lambda: {
-            "schema_version": "manyforge.sealed_canonical_empty_preparation_request.v1",
-            "runtime_cell_id": self._runtime_cell_id, "origin": origin,
-            "captured_input_digest": captured,
-        }, origin, captured, sealed=True)
-
     def _prepare(
         self, request_value: Callable[[], dict[str, Any]], origin: dict[str, Any],
-        captured_input_digest: str, *, sealed: bool = False,
+        captured_input_digest: str,
     ) -> dict[str, Any]:
         if not self._lock.acquire(blocking=False):
             raise HeadlessApiError(
@@ -627,12 +562,7 @@ class ActivationPreparer:
                 "--activation-root",
                 str(self._activation_root),
             ]
-            if sealed:
-                command.extend([
-                    "--canonical-empty-package-root", str(self._canonical_empty_package_root),
-                    "--canonical-empty-admission-filename", str(self._canonical_empty_admission_filename),
-                ])
-            elif self._publish_canonical_empty:
+            if self._publish_canonical_empty:
                 command.append("--publish-canonical-empty")
             with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
                 try:

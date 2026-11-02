@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol
 
 
 class ExecutionTransport(Protocol):
@@ -93,9 +93,17 @@ class ExecutionTransport(Protocol):
 
     def stop_status(self, stop_id: str) -> dict[str, Any]: ...
 
-    def stop_fault(self) -> dict[str, Any]: ...
+    def set_rule_active(self, rule_id: str, active: bool) -> dict[str, Any]: ...
 
-    def recover_stop_fault(self, body: Mapping[str, Any]) -> dict[str, Any]: ...
+    def reset_rule_activation(self) -> dict[str, Any]: ...
+
+    def clear_outside_change(
+        self, controllable_component_id: str, signal_name: str
+    ) -> dict[str, Any]: ...
+
+    def set_io_output(
+        self, signal_id: str, value: bool | float, *, origin: str
+    ) -> dict[str, Any]: ...
 
 
 # Transport loss and malformed replies: they cannot prove what
@@ -136,6 +144,16 @@ class KernelImmediateStepFailedError(RuntimeError):
         self.code = code
         self.details = dict(details)
         self.active_tcp = active_tcp
+
+
+class IoOutputWriteFailedError(RuntimeError):
+    """An output write ended `failed` or `unknown` (CONTRACTS §7), with the
+    host's typed error. It is never resent."""
+
+    def __init__(self, code: str, message: str, outcome: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.outcome = outcome
 
 
 class KernelOperationObservationUnavailableError(RuntimeError):
@@ -637,21 +655,63 @@ class KernelClient:
             )
         return response
 
-    def stop_fault(self) -> dict[str, Any]:
-        method = getattr(self._transport, "stop_fault", None)
+    def _required(self, name: str) -> Callable[..., Any]:
+        method = getattr(self._transport, name, None)
         if not callable(method):
-            raise TypeError("execution transport has no callable stop_fault")
-        return self._successful(method(), label="Stop-fault observation")
+            raise TypeError(f"execution transport has no callable {name}")
+        return method
 
-    def recover_stop_fault(self, request: Mapping[str, Any]) -> dict[str, Any]:
-        method = getattr(self._transport, "recover_stop_fault", None)
-        if not callable(method):
-            raise TypeError("execution transport has no callable recover_stop_fault")
+    def set_rule_active(self, rule_id: str, active: bool) -> dict[str, Any]:
+        """Kernel `set_rule_active` (CONTRACTS §8); `rule_unknown` is refused."""
+
+        if not isinstance(rule_id, str) or not rule_id or type(active) is not bool:
+            raise ValueError("set_rule_active requires a rule id and a boolean")
         return self._successful(
-            method(request),
-            label="Stop-fault recovery",
+            self._required("set_rule_active")(rule_id, active), label="rule activation"
         )
 
+    def reset_rule_activation(self) -> dict[str, Any]:
+        """Every global rule returns to its `active_at_start` (run end, Reset)."""
+
+        return self._successful(
+            self._required("reset_rule_activation")(), label="rule activation reset"
+        )
+
+    def clear_outside_change(
+        self, controllable_component_id: str, signal_name: str
+    ) -> dict[str, Any]:
+        """Kernel `clear_outside_change` (CONTRACTS §7); writes nothing."""
+
+        return self._successful(
+            self._required("clear_outside_change")(controllable_component_id, signal_name),
+            label="outside change clear",
+        )
+
+    def set_io_output(
+        self, component_id: str, signal_name: str, value: bool | float
+    ) -> dict[str, Any]:
+        """One output write by signal id through the one write path (CONTRACTS
+        §7), sent once. A refusal (`cell_latched`, `rule_holds`) raises the
+        transport's typed error; a `failed` or `unknown` result raises
+        `IoOutputWriteFailedError` with the host's code."""
+
+        response = self._successful(
+            self._required("set_io_output")(
+                f"{component_id}/{signal_name}", value, origin="program"
+            ),
+            label="output write",
+        )
+        result = response["result"]
+        if result["outcome"] == "succeeded":
+            return result
+        error = result.get("error")
+        if not isinstance(error, Mapping) or not isinstance(error.get("code"), str):
+            raise KernelClientResponseError(
+                f"output write ended {result['outcome']} without a typed error"
+            )
+        raise IoOutputWriteFailedError(
+            error["code"], str(error.get("message") or error["code"]), result["outcome"]
+        )
 
 class MockKernelClient:
     """Removed stateful semantic mock; tests fake the thin HTTP transport."""
@@ -668,6 +728,7 @@ __all__ = [
     "EXECUTION_TRANSPORT_FAILURE_CODES",
     "ExecutionState",
     "ExecutionTransport",
+    "IoOutputWriteFailedError",
     "KernelClient",
     "KernelOperationAdmissionRejectedError",
     "KernelImmediateStepFailedError",

@@ -59,13 +59,4 @@ namespace manyforge::deployment::detail {
     const ActivationDeploymentComponent &component,
     const core::ComponentTypeDTO &type);
 
-/// Under `tcp_speed_check: active_tcp_and_flange` (the default) the TCP-speed
-/// maximum also holds at the robot's `flange` frame. A robot model without a
-/// `flange` frame role is refused here, at Apply, with the typed
-/// `robot_flange_frame_missing` (the runtime host would refuse it at
-/// activation). `active_tcp` needs no flange.
-void require_speed_check_flange(
-    std::string_view component_id, std::string_view tcp_speed_check,
-    std::span<const core::ModelFrameRoleBindingDTO> frame_role_bindings);
-
 } // namespace manyforge::deployment::detail

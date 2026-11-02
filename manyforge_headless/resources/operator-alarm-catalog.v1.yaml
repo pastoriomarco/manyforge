@@ -1,6 +1,6 @@
 schema_version: manyforge.operator_alarm_catalog.v1
 catalog_version: 2.9.0
-descriptor_digest: sha256:8101bde7ece439e7cbc8d8ff1c47570d2a1c09b447d642e3a31638e2589084c6
+descriptor_digest: sha256:366e2643d348456d350b638b9b2c2ab22828f2475e05f26b6d9f6b1941623413
 definitions:
   - definition_id: manyforge.motion.runtime_collision
     version: 2
@@ -13,10 +13,12 @@ definitions:
       recovery; priority does not imply a safety-rated annunciator.
     consequence: >-
       Motion remains stopped and attempting recovery without inspecting the
-      contact can repeat or worsen the collision episode.
+      contact can repeat or worsen the collision episode. Acknowledgement
+      never gates motion.
     operator_response: >-
       Inspect the normalized contact pair and recovery offer, remove or repair
-      the cause, acknowledge attention, then use the permitted recovery action.
+      the cause, then use the permitted recovery action. Acknowledge the alarm
+      to move it to History.
     scope_fields: [subject_kind, subject_id, resource_ids]
     set_authority: manyforge.kernel.runtime_collision_condition
     clear_authority: manyforge.kernel.runtime_collision_condition
@@ -26,7 +28,7 @@ definitions:
       - direct_control
     acknowledgement_required: true
     acknowledgement_reason_required: false
-    requires_motion_attention: true
+    requires_motion_attention: false
     max_evidence_refs: 32
 
   - definition_id: manyforge.motion.runtime_monitor_observation_lost
@@ -42,11 +44,12 @@ definitions:
     consequence: >-
       Motion remains stopped. Nothing was detected in contact, but the robot's
       position was not confirmed while it stopped, so recovering without
-      checking the robot can repeat the stop.
+      checking the robot can repeat the stop. Acknowledgement never gates
+      motion.
     operator_response: >-
       Check the robot controller, its connection and the robot component's
-      status (an open component incident names its cause), acknowledge
-      attention, then use the permitted recovery action.
+      status (an open component incident names its cause), then use the
+      permitted recovery action. Acknowledge the alarm to move it to History.
     scope_fields: [subject_kind, subject_id, resource_ids]
     set_authority: manyforge.kernel.runtime_collision_condition
     clear_authority: manyforge.kernel.runtime_collision_condition
@@ -56,7 +59,7 @@ definitions:
       - direct_control
     acknowledgement_required: true
     acknowledgement_reason_required: false
-    requires_motion_attention: true
+    requires_motion_attention: false
     max_evidence_refs: 32
 
   - definition_id: manyforge.motion.execution_fault
@@ -70,10 +73,11 @@ definitions:
       operator attention but is not a reported collision condition.
     consequence: >-
       The affected execution remains stopped or unavailable until the recovery
-      context is resolved or reset.
+      context is resolved or reset. Acknowledgement never gates motion.
     operator_response: >-
-      Review the fault and recovery offer, repair the reported cause,
-      acknowledge attention, then select an enabled recovery or safe reset.
+      Review the fault and recovery offer, repair the reported cause, then
+      select an enabled recovery or safe reset. Acknowledge the alarm to move
+      it to History.
     scope_fields: [subject_kind, subject_id, resource_ids]
     set_authority: manyforge.kernel.operation_condition
     clear_authority: manyforge.kernel.operation_condition
@@ -83,7 +87,7 @@ definitions:
       - direct_control
     acknowledgement_required: true
     acknowledgement_reason_required: false
-    requires_motion_attention: true
+    requires_motion_attention: false
     max_evidence_refs: 32
 
   - definition_id: manyforge.program.operation_failure
@@ -98,9 +102,11 @@ definitions:
     consequence: >-
       The affected Program failure remains unresolved until an accepted
       operator release or completed Reset resolves that exact occurrence.
+      Acknowledgement never gates work: it gates no motion.
     operator_response: >-
       Review the original operation failure and recovery offer, repair the
-      cause, acknowledge attention, then use an enabled release or Reset.
+      cause, then use an enabled release or Reset; acknowledge the alarm to
+      move it to History.
     scope_fields: [subject_kind, subject_id, resource_ids]
     set_authority: manyforge.program_runner.failure_condition
     clear_authority: manyforge.program_runner.failure_condition
@@ -109,34 +115,7 @@ definitions:
       - program
     acknowledgement_required: true
     acknowledgement_reason_required: false
-    requires_motion_attention: true
-    max_evidence_refs: 32
-
-  - definition_id: manyforge.motion.stop_fault
-    version: 1
-    title: Motion Stop requires recovery
-    message_template: "Stop recovery required for {subject_id}"
-    alarm_class: motion
-    priority: high
-    priority_rationale: >-
-      Motion admission remains closed because an exact Stop outcome escalated,
-      became uncertain, or otherwise requires explicit recovery.
-    consequence: >-
-      New motion cannot be admitted until the latched Stop condition is reset
-      against its exact certificate and current runtime context.
-    operator_response: >-
-      Review the Stop reason, latch, and certificate, acknowledge attention,
-      then use Reset when the runtime offers that exact recovery action.
-    scope_fields: [subject_kind, subject_id, resource_ids]
-    set_authority: manyforge.kernel.stop_fault_condition
-    clear_authority: manyforge.kernel.stop_fault_condition
-    adapter_id: manyforge.alarm_adapter.kernel_condition
-    runtime_modes:
-      - program
-      - direct_control
-    acknowledgement_required: true
-    acknowledgement_reason_required: false
-    requires_motion_attention: true
+    requires_motion_attention: false
     max_evidence_refs: 32
 
   - definition_id: manyforge.scene.pose_apply_fault
@@ -150,10 +129,11 @@ definitions:
       updated after initialization is complete.
     consequence: >-
       The planning scene can remain stale or inconsistent with the required
-      observation source.
+      observation source. Acknowledgement never gates motion.
     operator_response: >-
       Inspect source health and object/policy compatibility, restore a valid
       observation or configuration, and wait for a successful matching apply.
+      Acknowledge the alarm to move it to History.
     scope_fields: [subject_kind, subject_id, resource_ids]
     set_authority: manyforge.runtime.scene_pose_condition
     clear_authority: manyforge.runtime.scene_pose_condition
@@ -163,7 +143,7 @@ definitions:
       - direct_control
     acknowledgement_required: true
     acknowledgement_reason_required: false
-    requires_motion_attention: true
+    requires_motion_attention: false
     max_evidence_refs: 16
 
   - definition_id: manyforge.runtime.scene_initialization_fault
@@ -177,10 +157,12 @@ definitions:
       runtime unsuitable for motion until repaired or replaced.
     consequence: >-
       Pose updates and motion admission remain fenced because the authored
-      scene is not known to be established.
+      scene is not known to be established. Acknowledgement never gates
+      motion.
     operator_response: >-
       Inspect reset/seed diagnostics, restore the backend, then retry the
-      matching initialization or load a valid program/deployment.
+      matching initialization or load a valid program/deployment. Acknowledge
+      the alarm to move it to History.
     scope_fields: [subject_kind, subject_id, resource_ids]
     set_authority: manyforge.runtime.scene_initialization_condition
     clear_authority: manyforge.runtime.scene_initialization_condition
@@ -189,7 +171,7 @@ definitions:
       - all
     acknowledgement_required: true
     acknowledgement_reason_required: false
-    requires_motion_attention: true
+    requires_motion_attention: false
     max_evidence_refs: 16
 
   - definition_id: manyforge.runtime.provider_unavailable
@@ -202,11 +184,13 @@ definitions:
       A required external state or execution provider is explicitly unavailable
       after initialization and trustworthy motion cannot proceed.
     consequence: >-
-      Observed state, scene projection, or execution feedback may be unavailable
-      or stale for the affected runtime lane.
+      Observed state, scene projection, or execution feedback may be
+      unavailable or stale for the affected runtime lane. Acknowledgement
+      never gates motion.
     operator_response: >-
       Restore the named provider and wait for an explicit fresh ready status;
-      absence of another failure does not clear this alarm.
+      absence of another failure does not clear this alarm. Acknowledge the
+      alarm to move it to History.
     scope_fields: [subject_kind, subject_id, resource_ids]
     set_authority: manyforge.runtime.provider_health_condition
     clear_authority: manyforge.runtime.provider_health_condition
@@ -215,37 +199,8 @@ definitions:
       - all
     acknowledgement_required: true
     acknowledgement_reason_required: false
-    requires_motion_attention: true
+    requires_motion_attention: false
     max_evidence_refs: 16
-
-  - definition_id: manyforge.runtime.component_lifecycle_fault
-    version: 2
-    title: Controlled-component lifecycle fault
-    message_template: "Lifecycle fault on {subject_id}"
-    alarm_class: runtime_health
-    priority: high
-    priority_rationale: >-
-      A current controlled-component fault, warning, recovery latch, or
-      uncertain lifecycle transaction requires operator attention before the
-      affected resources can be admitted.
-    consequence: >-
-      Component readiness and command dispatch remain fail-closed until CCLC
-      publishes a fresh matching clear or reconciliation result.
-    operator_response: >-
-      Inspect component and lifecycle diagnostics, correct the physical cause,
-      apply only an offered recovery action, and wait for a fresh reconciled
-      provider snapshot.
-    scope_fields: [subject_kind, subject_id, resource_ids]
-    set_authority: manyforge.cclc.lifecycle_condition
-    clear_authority: manyforge.cclc.lifecycle_condition
-    adapter_id: manyforge.alarm_adapter.cclc_condition
-    runtime_modes:
-      - program
-      - direct_control
-    acknowledgement_required: true
-    acknowledgement_reason_required: false
-    requires_motion_attention: true
-    max_evidence_refs: 32
 
   - definition_id: manyforge.runtime.alarm_scope_unavailable
     version: 2
@@ -313,10 +268,14 @@ definitions:
       An unrecoverable Workbench runtime fault requires prompt operator
       attention and a Workbench restart.
     consequence: >-
-      The Program owner is unavailable. Motion containment remains owned by the existing Manager-presence lease and Stop certificate; this alarm does not prove that motion has stopped.
+      The Program owner is unavailable. Motion containment remains owned by
+      the existing Manager-presence lease and Stop certificate; this alarm
+      does not prove that motion has stopped. Acknowledgement never gates
+      motion.
     operator_response: >-
-      Review the fault details and containment status, acknowledge attention,
-      then restart the Workbench. Acknowledgement does not clear the fault.
+      Review the fault details and containment status, then restart the
+      Workbench. Acknowledge the alarm to move it to History. Acknowledgement
+      does not clear the fault.
     scope_fields: [subject_kind, subject_id, resource_ids]
     set_authority: manyforge.kernel.runtime_fault_condition
     clear_authority: manyforge.kernel.runtime_fault_condition
@@ -326,7 +285,7 @@ definitions:
       - direct_control
     acknowledgement_required: true
     acknowledgement_reason_required: false
-    requires_motion_attention: true
+    requires_motion_attention: false
     max_evidence_refs: 1
 
   - definition_id: manyforge.runtime.operation_journal_write_fault
@@ -339,10 +298,13 @@ definitions:
       An unrecoverable Workbench runtime fault requires prompt operator
       attention and a Workbench restart.
     consequence: >-
-      The operation journal has failed and admission remains closed. Unresolved write outcomes remain retained; no automatic write retry or in-app Reset clears this fault.
+      The operation journal has failed and admission remains closed.
+      Unresolved write outcomes remain retained; no automatic write retry or
+      in-app Reset clears this fault. Acknowledgement never gates motion.
     operator_response: >-
-      Review the fault details and containment status, acknowledge attention,
-      then restart the Workbench. Acknowledgement does not clear the fault.
+      Review the fault details and containment status, then restart the
+      Workbench. Acknowledge the alarm to move it to History. Acknowledgement
+      does not clear the fault.
     scope_fields: [subject_kind, subject_id, resource_ids]
     set_authority: manyforge.kernel.runtime_fault_condition
     clear_authority: manyforge.kernel.runtime_fault_condition
@@ -352,7 +314,7 @@ definitions:
       - direct_control
     acknowledgement_required: true
     acknowledgement_reason_required: false
-    requires_motion_attention: true
+    requires_motion_attention: false
     max_evidence_refs: 1
 
   - definition_id: manyforge.runtime.kernel_internal_fault
@@ -365,10 +327,16 @@ definitions:
       An unrecoverable Workbench runtime fault requires prompt operator
       attention and a Workbench restart.
     consequence: >-
-      A callback on the Stop or safety path failed. The Kernel requested one Full Stop, not retried, and keeps new motion admission closed; clearing a Stop fault does not reopen it. The details name the first typed cause, whether that Full Stop was accepted (or its refusal code) and how many later failures followed.
+      A callback on the Stop or safety path failed. The Kernel requested one
+      Full Stop, not retried, and new motion stays blocked until the execution
+      host restarts; Execute's readiness shows it as
+      execution_host_internal_fault. The details name the first typed cause,
+      whether that Full Stop was accepted (or its refusal code) and how many
+      later failures followed. Acknowledgement never gates motion.
     operator_response: >-
-      Review the fault details and containment status, acknowledge attention,
-      then restart the Workbench. Acknowledgement does not clear the fault.
+      Review the fault details and containment status, then restart the
+      Workbench. Acknowledge the alarm to move it to History. Acknowledgement
+      does not clear the fault.
     scope_fields: [subject_kind, subject_id, resource_ids]
     set_authority: manyforge.kernel.runtime_fault_condition
     clear_authority: manyforge.kernel.runtime_fault_condition
@@ -378,7 +346,7 @@ definitions:
       - direct_control
     acknowledgement_required: true
     acknowledgement_reason_required: false
-    requires_motion_attention: true
+    requires_motion_attention: false
     max_evidence_refs: 1
 
   - definition_id: scene.carried_object_lost

@@ -326,7 +326,7 @@ def test_motion_start_and_resume_refresh_tcp_before_host_action(method, request_
         return SimpleNamespace(state=SimpleNamespace(value="running"), run_revision=2)
 
     runtime._refresh_active_tcp = lambda: calls.append("tcp")  # noqa: SLF001
-    runtime._verify_selected_motion_feedback = lambda *_args: None  # noqa: SLF001
+    runtime._require_run_readiness = lambda *_args: None  # noqa: SLF001
     runtime._host = SimpleNamespace(**{method: host_action})  # noqa: SLF001
     runtime._control_effect = lambda _request, *, kind, effect: {"run": effect()}  # noqa: SLF001
     runtime._project_run = lambda run: run  # noqa: SLF001

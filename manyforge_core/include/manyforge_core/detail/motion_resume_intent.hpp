@@ -56,6 +56,12 @@ inline ResolvedMotionSpecDTO resume_motion_from_current_tcp(const MotionResumeIn
     path->waypoints.erase(path->waypoints.begin(),
                           path->waypoints.begin() + intent.next_cartesian_waypoint);
     path->waypoints.insert(path->waypoints.begin(), current_tcp);
+    // The current TCP is the new start; later corners keep their radii.
+    if (!path->blend_radii_m.empty()) {
+      path->blend_radii_m.erase(path->blend_radii_m.begin(),
+                                path->blend_radii_m.begin() + intent.next_cartesian_waypoint);
+      path->blend_radii_m.insert(path->blend_radii_m.begin(), 0.0);
+    }
   }
   return motion;
 }

@@ -10,6 +10,7 @@
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/geometry.hpp>
 #include <manyforge_core/types/interrupt.hpp>
+#include <manyforge_core/types/robot_defaults.generated.hpp>
 #include <manyforge_core/types/robot_state.hpp>
 #include <map>
 #include <optional>
@@ -52,6 +53,18 @@ enum class StopLeadInAnchor {
 [[nodiscard]] inline std::string_view stop_lead_in_anchor_string(const StopLeadInAnchor anchor) {
   return anchor == StopLeadInAnchor::kMeasured ? "measured" : "commanded";
 }
+
+[[nodiscard]] inline constexpr std::optional<StopLeadInAnchor> stop_lead_in_anchor_from_string(
+    std::string_view value) noexcept {
+  if (value == "commanded") return StopLeadInAnchor::kCommanded;
+  if (value == "measured") return StopLeadInAnchor::kMeasured;
+  return std::nullopt;
+}
+
+/// A Real robot's Deployment `stop_lead_in_anchor` default
+/// (manyforge_core/resources/robot_defaults.tsv).
+inline constexpr StopLeadInAnchor kDefaultStopLeadInAnchor =
+    stop_lead_in_anchor_from_string(kDefaultStopLeadInAnchorName).value();
 
 /// Backend-declared planner parameters for production `soft_on_path`.
 /// These are deployment/runtime facts, not behavior-node policy: the
@@ -453,8 +466,6 @@ struct ControlledStopResultDTO {
       case MotionInterruptStopCommandSource::kJtcSpeedScalingRamp:
       case MotionInterruptStopCommandSource::kJtcCancelDecelerateOnCancel:
       case MotionInterruptStopCommandSource::kJtcCancelUnprofiledHold:
-      case MotionInterruptStopCommandSource::kNativeSimulatedStop:
-      case MotionInterruptStopCommandSource::kNativeSimulatedPathRamp:
       case MotionInterruptStopCommandSource::kRobotNativeStop:
       case MotionInterruptStopCommandSource::kDiagnosticOther:
         return true;
@@ -537,8 +548,7 @@ struct ControlledStopResultDTO {
 struct MotionInterruptScopeDTO {
   /// Unique within the active execute request.
   std::string scope_id;
-  /// References a registered `InterruptPolicyDefinition` whose
-  /// `scope_kind == kMove`.
+  /// References a compiled node-rule policy whose `scope_kind == kMove`.
   std::string policy_id;
   MotionInterruptActivationMode activation_mode =
       MotionInterruptActivationMode::kRequireInactiveAtArm;
@@ -611,7 +621,6 @@ struct ExecutionStopSnapshotDTO {
 /// `terminal_cause == kSignalTrip`. The DTO requires a validated stop
 /// snapshot, so it is never present on failure outcomes.
 struct MotionTripOutcomeDTO {
-  std::string latch_id;
   std::string source_id;
   std::string policy_id;
   std::string scope_id;

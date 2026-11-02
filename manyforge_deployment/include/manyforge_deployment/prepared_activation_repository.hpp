@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -7,7 +8,6 @@
 
 #include <manyforge_core/types/retained_product.hpp>
 #include <manyforge_deployment/prepared_activation_input.hpp>
-#include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
 
@@ -17,6 +17,13 @@ namespace manyforge::deployment {
 /// catalog artifacts). The preparer returns only the compact receipt naming it.
 inline constexpr std::uint64_t kMaxPreparedActivationBytes =
     128ULL * 1024ULL * 1024ULL;
+
+/// Prepared activations kept in one activation store. Writing a new one (or
+/// re-adopting an existing one, which refreshes it) deletes the least recently
+/// written beyond this count. Only the Apply being prepared, previewed or in
+/// flight and its immediate predecessors read a stored value, so a small count
+/// bounds the store (each value is at most `kMaxPreparedActivationBytes`).
+inline constexpr std::size_t kMaximumRetainedPreparedActivations = 8U;
 
 /// Recompile the prepared Program outcome from the carried Program, authored
 /// role assignment, retained bundle, model map and catalog artifacts, and
@@ -40,7 +47,7 @@ prepared_activation_artifact_rows(std::vector<PreparedActivationArtifact> artifa
 /// Scenario-level facts of one prepared activation that are not derived from
 /// the retained bundle, Program or role assignment.
 struct PreparedActivationAssemblyInput final {
-  PreparedActivationOrigin origin;
+  PreparedScenarioOrigin origin;
   core::ContentDigest captured_input_digest;
   /// One of "required", "optional" or "forbidden".
   std::string assistant_mode;
@@ -57,18 +64,6 @@ struct PreparedActivationAssemblyInput final {
     const VerifiedRetainedModelMap &model_map,
     const ProgramBindingContract &program, const CanonicalValue &role_assignment,
     const ICatalogArtifactSource &catalog, const IRawArtifactStore &raw_artifacts);
-
-/// Derive the no-Program origin and capture from the actual verified admission.
-/// Preserve its exact infrastructure bundle and required retained artifacts.
-[[nodiscard]] PreparedActivationInput assemble_sealed_canonical_empty_activation(
-    const CanonicalEmptyRetainedBundleAdmission &admission,
-    const ICatalogArtifactSource &catalog,
-    const FilesystemVerifiedRawArtifactSource &raw_artifacts);
-
-/// Compare a structurally parsed sealed origin with the actual owner proof.
-void verify_prepared_canonical_empty_origin(
-    const PreparedActivationInput &prepared,
-    const CanonicalEmptyRetainedBundleAdmission &admission);
 
 /// Assemble for a candidate whose retained product set may contain no model
 /// map. Absence is accepted only when the candidate has no controllable
@@ -90,15 +85,18 @@ public:
   explicit FilesystemPreparedActivationRepository(
       std::filesystem::path trusted_root);
 
-  /// Publish once; an existing file must hold identical bytes.
+  /// Publish once; an existing file must hold identical bytes. Either way the
+  /// value becomes the most recent one and the store is then trimmed to
+  /// `kMaximumRetainedPreparedActivations`.
   [[nodiscard]] bool put_if_absent(const PreparedActivationInput &prepared) const;
 
   /// The verified stored value, or null when none is stored under this id.
   [[nodiscard]] std::shared_ptr<const PreparedActivationInput>
-  get_verified(const core::ContentDigest &prepared_activation_id,
-               const CanonicalEmptyRetainedBundleAdmission *sealed_admission = nullptr) const;
+  get_verified(const core::ContentDigest &prepared_activation_id) const;
 
 private:
+  [[nodiscard]] bool publish(const PreparedActivationInput &prepared) const;
+
   std::filesystem::path root_;
 };
 

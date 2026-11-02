@@ -15,7 +15,6 @@
 #include <string_view>
 #include <type_traits>
 #include <utility>
-#include <variant>
 #include <vector>
 
 namespace manyforge::roboplan_backend {
@@ -329,81 +328,37 @@ paired_arm_joints(const ModelScan &model,
 }
 
 [[nodiscard]] std::string
-mock_section(const ModelScan &model,
-             const std::vector<std::string> &arm_joint_names,
-             const MockControllerLane &lane) {
-  if (lane.hardware_component_name.empty()) {
-    fail("the mock lane has no hardware component name");
+ros2_control_section(const ModelScan &model,
+                     const std::vector<std::string> &arm_joint_names,
+                     const Ros2ControlLane &lane) {
+  if (lane.hardware_component_name.empty() || lane.plugin.empty() ||
+      lane.joint_command_interfaces.empty()) {
+    fail("the component hardware has no name, plugin or joint command interface");
   }
-  const auto &hardware = lane.hardware;
-  if (hardware.plugin.empty() || hardware.joint_command_interfaces.empty()) {
-    fail("the component hardware has no plugin or joint command interface");
-  }
-  const bool seeded = hardware.seeds_initial_positions;
   const bool model_backed_gripper =
       lane.gripper.has_value() && lane.gripper->source_joint_name.has_value();
-  if (lane.gripper_output_mode != core::GripperOutputMode::kCommanded &&
-      lane.gripper_output_mode != core::GripperOutputMode::kNone) {
-    fail("the mock lane has an invalid gripper output mode");
-  }
-  const bool no_gripper_output =
-      lane.gripper_output_mode == core::GripperOutputMode::kNone;
-  if (no_gripper_output && (arm_joint_names.empty() || !model_backed_gripper)) {
-    fail("no-output controller generation requires an arm and a model-backed gripper binding");
-  }
   std::vector<GeneratedJoint> joints;
-  if (arm_joint_names.empty() && model_backed_gripper) {
+  if (arm_joint_names.empty()) {
+    if (!model_backed_gripper) {
+      fail("the retained binding names no arm joint or model-backed gripper joint");
+    }
     if (!lane.initial_joint_positions_rad.empty()) {
       fail("the deployment has initial arm positions without an arm binding");
     }
   } else {
     joints = paired_arm_joints(model, arm_joint_names,
-                              lane.initial_joint_positions_rad,
-                              "the deployment", seeded);
+                               lane.initial_joint_positions_rad, "the deployment",
+                               !lane.initial_joint_positions_rad.empty());
   }
   if (model_backed_gripper) {
-    const auto &gripper_joint = *lane.gripper->source_joint_name;
     validate_gripper_model_binding(model, arm_joint_names, *lane.gripper);
-    if (!lane.gripper->projected_initial_position.has_value() &&
-        !no_gripper_output && seeded) {
-      fail("gripper joint '" + gripper_joint +
-           "' has no retained model projection for its initial value");
-    }
-    if (!no_gripper_output) {
-      joints.push_back(GeneratedJoint{
-          gripper_joint, seeded ? lane.gripper->projected_initial_position
-                                : std::nullopt});
-    }
-  } else if (lane.gripper_required) {
-    fail(lane.gripper.has_value()
-             ? "the mock profile requires a gripper, but the gripper binding "
-               "has no model-backed source joint"
-             : "the mock profile requires a gripper, but the deployment has "
-               "no gripper binding");
+    joints.push_back(GeneratedJoint{*lane.gripper->source_joint_name,
+                                    lane.gripper->projected_initial_position});
+  } else if (lane.gripper.has_value()) {
+    fail("the gripper binding has no model-backed source joint");
   }
-  return hardware_section(lane.hardware_component_name, hardware.plugin,
-                          hardware.parameters, joints,
-                          hardware.joint_command_interfaces);
-}
-
-[[nodiscard]] std::string
-isaac_section(const ModelScan &model,
-              const std::vector<std::string> &arm_joint_names,
-              const IsaacControllerLane &lane) {
-  if (lane.hardware_component_name.empty() ||
-      lane.joint_commands_topic.empty() || lane.joint_states_topic.empty()) {
-    fail("the Isaac lane has no hardware component name or topics");
-  }
-  const auto joints = paired_arm_joints(model, arm_joint_names,
-                                        lane.initial_joint_positions_rad,
-                                        "the Isaac profile");
-  return hardware_section(lane.hardware_component_name,
-                          "topic_based_ros2_control/TopicBasedSystem",
-                          {{"joint_commands_topic", lane.joint_commands_topic},
-                           {"joint_states_topic", lane.joint_states_topic},
-                           {"trigger_joint_command_threshold", number_text(-1.0)},
-                           {"sum_wrapped_joint_states", "false"}},
-                          joints, {"position"});
+  return hardware_section(lane.hardware_component_name, lane.plugin,
+                          lane.parameters, joints, lane.joint_command_interfaces);
 }
 
 [[nodiscard]] bool horizontal_space(const char character) noexcept {
@@ -425,32 +380,11 @@ isaac_section(const ModelScan &model,
 
 } // namespace
 
-Ros2ControlHardwareSpec mock_generic_system_hardware() {
-  Ros2ControlHardwareSpec hardware;
-  hardware.plugin = "mock_components/GenericSystem";
-  hardware.parameters = {{"calculate_dynamics", "true"}};
-  hardware.joint_command_interfaces = {"position"};
-  hardware.seeds_initial_positions = true;
-  return hardware;
-}
-
 std::string generate_controller_robot_description(
     const ControllerRobotDescriptionRequest &request) {
   const auto model = scan_model(request.model_urdf);
-  if (request.gripper_without_control_interfaces.has_value()) {
-    validate_gripper_model_binding(model, request.arm_joint_names,
-                                   *request.gripper_without_control_interfaces);
-  }
-  const auto section = std::visit(
-      [&](const auto &lane) {
-        using Lane = std::decay_t<decltype(lane)>;
-        if constexpr (std::is_same_v<Lane, MockControllerLane>) {
-          return mock_section(model, request.arm_joint_names, lane);
-        } else {
-          return isaac_section(model, request.arm_joint_names, lane);
-        }
-      },
-      request.lane);
+  const auto section =
+      ros2_control_section(model, request.arm_joint_names, request.lane);
 
   const std::string_view text = request.model_urdf;
   const auto root_end = *model.root_end_tag;

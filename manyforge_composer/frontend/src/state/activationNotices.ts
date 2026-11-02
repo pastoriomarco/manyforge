@@ -3,7 +3,7 @@ import { errorCatalogRow, errorPresentation } from './commandRefusal';
 import type { WorkbenchNotice } from './workbenchNotices';
 
 const WORKBENCH_REPOSITORY_ROOT = '/workspace';
-const CLOSE_WORKBENCH_COMMAND = './scripts/compose-dev.sh stop --keep-evidence';
+const STOP_WORKBENCH_COMMAND = './scripts/compose-dev.sh stop --keep-evidence';
 const SINGLE_FILE_SCENARIO_SUFFIXES = ['.scenario.yaml', '.scenario.yml'] as const;
 const SCENARIO_COMPOSITION_REFUSED = 'scenario_composition_refused';
 
@@ -34,10 +34,10 @@ function reloadUnavailableReason(
     return 'No Saved Scenario path is available, so this workbench can only be closed.';
   }
   if (isSingleFileScenarioPath(savedScenarioPath)) {
-    return 'The Saved Scenario is a single-file artifact, while this workbench start command accepts Scenario project directories; only Close is available.';
+    return 'The Saved Scenario is a single-file artifact, while this workbench start command accepts Scenario project directories; only stopping the workbench is available.';
   }
   if (repositoryRelativePath === null) {
-    return 'The Saved Scenario is outside the mounted repository, so a new workbench cannot reload it; only Close is available.';
+    return 'The Saved Scenario is outside the mounted repository, so a new workbench cannot reload it; only stopping the workbench is available.';
   }
   return null;
 }
@@ -105,7 +105,7 @@ export function activationFailureNotice(
       domain: 'activation',
       title: 'Scenario refused',
       message: `${failure.message}${component === undefined ? '' : ` (component ${component})`}. `
-        + `${guidance} Close and preserve evidence: ${CLOSE_WORKBENCH_COMMAND}, then start the `
+        + `${guidance} Stop the workbench and keep evidence: ${STOP_WORKBENCH_COMMAND}, then start the `
         + `workbench again. (${applyId})`,
     };
   }
@@ -144,8 +144,8 @@ export function activationFailureNotice(
     const nothingHeld = !durable && isKnownPreEffectRefusal && !acknowledgement.outcomeUnknown;
     const offerState = acknowledgement.outcomeUnknown
       ? ' The acknowledgement outcome is unknown. The Manager permits no second attempt, so nothing is resent and Acknowledge only re-reads the status. '
-        + 'Nothing in the Manager settles this attempt short of a cold restart: if admission stays closed, close and preserve evidence '
-        + `(${CLOSE_WORKBENCH_COMMAND}) and start the workbench again.`
+        + 'Nothing in the Manager settles this attempt short of a cold restart: if admission stays closed, stop the workbench and keep evidence '
+        + `(${STOP_WORKBENCH_COMMAND}) and start the workbench again.`
       : !durable && isBeforeEffectFailure && !isKnownPreEffectRefusal
         ? ' Manager reports acknowledgement unavailable, which does not prove the Apply hold is released; Acknowledge re-reads the status.'
         : '';
@@ -184,9 +184,9 @@ export function activationFailureNotice(
     : null;
   const reloadAvailability = reloadUnavailableReason(savedScenarioPath, relativePath);
   const commands = reloadPath === null
-    ? `Close and preserve evidence: ${CLOSE_WORKBENCH_COMMAND}`
-    : `Close and preserve evidence: ${CLOSE_WORKBENCH_COMMAND} `
-      + `Reload: ${CLOSE_WORKBENCH_COMMAND} && ./scripts/compose-dev.sh start --project ${shellQuote(reloadPath)}`;
+    ? `Stop the workbench and keep evidence: ${STOP_WORKBENCH_COMMAND}`
+    : `Stop the workbench and keep evidence: ${STOP_WORKBENCH_COMMAND} `
+      + `Reload: ${STOP_WORKBENCH_COMMAND} && ./scripts/compose-dev.sh start --project ${shellQuote(reloadPath)}`;
   return {
     id,
     severity: 'error',

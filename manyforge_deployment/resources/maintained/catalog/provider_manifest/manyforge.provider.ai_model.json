@@ -1,9 +1,5 @@
 {
   "api_version": "manyforge.provider_manifest.v1",
-  "lifecycle_plan_catalog": {
-    "catalog_api_version": "manyforge.brand_lifecycle_plan_catalog.v1",
-    "semantic_digest": "sha256:a2c5c8391d356e7bfe3f1931a2e14743674a82b2b798b56868d7b8ab792d02a2"
-  },
   "offered_capabilities": [
     {
       "capability_definition_revision": "sha256:c458ea512ad5b71be1a3a9f92908d8a36b2a9a8f5cb3b31556c42e0d468c9270",
@@ -38,5 +34,5 @@
   ],
   "provider_contracts": [],
   "provider_manifest_id": "manyforge.provider.ai_model",
-  "provider_manifest_revision": "sha256:a35dbf3fac9051b766361afbd48486a59a2841dc32cde69eb29b22584d38a0e3"
+  "provider_manifest_revision": "sha256:ee01436500a274179ab3935aeeb94700d1b3ef11ce360c8573542943e3dbe074"
 }

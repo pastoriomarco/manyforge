@@ -1,0 +1,3094 @@
+#include <manyforge_deployment/execution_runtime_contract.hpp>
+#include <manyforge_roboplan/execution_runtime_qualification.hpp>
+#include "retained_execution_host_internal.hpp"
+#include <algorithm>
+#include <cmath>
+#include <iostream>
+#include <iterator>
+#include <manyforge_content_identity/canonical_value.hpp>
+#include <manyforge_content_identity/content_identity.hpp>
+#include <manyforge_core/motion_interrupt/stop_profile_mapper.hpp>
+#include <manyforge_core/program_frame_identity.hpp>
+#include <manyforge_roboplan/retained_execution_host.hpp>
+#include <manyforge_roboplan/retained_cell_runtime.hpp>
+#include <manyforge_roboplan/retained_gripper_runtime.hpp>
+#include <manyforge_roboplan/retained_gripper_route_publication_owner.hpp>
+#include <map>
+#include <mutex>
+#include <set>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <tuple>
+#include <utility>
+
+namespace manyforge::roboplan_backend {
+
+std::vector<core::ResolvedFrameDTO> retained_motion_planner_frames(
+    const core::RuntimeParticipantBinding &runtime,
+    const deployment::VerifiedRetainedModelMap *model_map) {
+  const auto &value = runtime.value();
+  std::vector<core::ResolvedFrameDTO> frames;
+  // B7: every frame is stamped with its owner. A target's frames belong to its
+  // own component (no alias rows since B2), so the participant's frames carry
+  // the motion component; mounted tools' frames carry the tool (below).
+  for (const auto &frame : value.frame_bindings)
+    frames.emplace_back(core::ResolvedComponentModelFrameDTO{
+        value.controllable_component_id, frame.model_instance_id,
+        frame.frame_role_id, frame.compiled_frame_name, frame.model_revision});
+  if (!model_map)
+    return frames;
+  if (model_map->query().retained_bundle_id != value.retained_bundle_id ||
+      value.model_groups.size() != 1U)
+    throw std::invalid_argument(
+        "planner frame inventory crosses its retained motion product");
+  const auto &group = value.model_groups.front();
+  const auto model =
+      std::find_if(value.model_bindings.begin(), value.model_bindings.end(),
+                   [&](const auto &row) {
+                     return row.model_instance_id == group.model_instance_id;
+                   });
+  if (model == value.model_bindings.end())
+    throw std::invalid_argument(
+        "planner frame inventory has no exact motion model");
+  // A tool mounted on the motion component moves with it in the one composed
+  // cell model, so its frames (its TCPs) are planner frames too, each once and
+  // owner-stamped (B4: the mounts and model owners come from the cell
+  // kinematic index).
+  const auto &index = model_map->kinematic_index();
+  const auto mounted = index.self_and_mounted(value.controllable_component_id);
+  const auto on_mounted_component = [&](const core::ModelInstanceId &instance) {
+    const auto *owner = index.owner_of(instance);
+    return owner != nullptr && *owner != value.controllable_component_id &&
+           mounted.contains(*owner);
+  };
+  for (const auto &target : model_map->targets()) {
+    if (!mounted.contains(target.controllable_component_id))
+      continue;
+    for (const auto &exposed : target.frames) {
+      const auto *frame =
+          std::get_if<deployment::CompositionComponentModelFrame>(
+              &exposed.frame);
+      if (!frame || !mounted.contains(frame->controllable_component_id) ||
+          (frame->model_instance_id == group.model_instance_id
+               ? frame->model_revision != model->model_revision
+               : !on_mounted_component(frame->model_instance_id)))
+        continue;
+      core::ResolvedFrameDTO resolved = core::ResolvedComponentModelFrameDTO{
+          frame->controllable_component_id, frame->model_instance_id,
+          exposed.frame_role_id, frame->compiled_frame_name,
+          frame->model_revision};
+      if (std::find(frames.begin(), frames.end(), resolved) == frames.end())
+        frames.push_back(std::move(resolved));
+    }
+  }
+  if (frames.size() > core::kMaxProgramNestedRoleBindings)
+    throw std::invalid_argument(
+        "planner frame inventory exceeds its fixed bound");
+  return frames;
+}
+
+std::vector<std::string> retained_motion_planner_frame_names(
+    const core::RuntimeParticipantBinding &runtime,
+    const deployment::VerifiedRetainedModelMap *model_map) {
+  std::vector<std::string> names;
+  for (const auto &frame : retained_motion_planner_frames(runtime, model_map))
+    names.push_back(core::compiled_frame_name(frame));
+  return names;
+}
+
+RetainedPlanningSceneSynchronizer::RetainedPlanningSceneSynchronizer(
+    std::shared_ptr<core::IPlanningSceneSynchronizer> target)
+    : target_(std::move(target)) {
+  if (target_ == nullptr) {
+    throw std::invalid_argument(
+        "retained planning-scene synchronizer target is required");
+  }
+}
+
+void RetainedPlanningSceneSynchronizer::ReplaceTarget(
+    std::shared_ptr<core::IPlanningSceneSynchronizer> target) {
+  if (target == nullptr) {
+    throw std::invalid_argument(
+        "retained planning-scene synchronizer target is required");
+  }
+  std::lock_guard lock(mutex_);
+  target_ = std::move(target);
+}
+
+RetainedReferencePoseResolverProxy::RetainedReferencePoseResolverProxy(
+    std::shared_ptr<core::IReferencePoseResolver> target)
+    : target_(std::move(target)) {
+  if (target_ == nullptr) {
+    throw std::invalid_argument(
+        "retained reference-pose resolver target is required");
+  }
+}
+
+void RetainedReferencePoseResolverProxy::ReplaceTarget(
+    std::shared_ptr<core::IReferencePoseResolver> target) {
+  if (target == nullptr) {
+    throw std::invalid_argument(
+        "retained reference-pose resolver target is required");
+  }
+  std::lock_guard lock(mutex_);
+  target_ = std::move(target);
+}
+
+std::shared_ptr<core::IReferencePoseResolver>
+RetainedReferencePoseResolverProxy::CurrentTarget() const {
+  std::lock_guard lock(mutex_);
+  return target_;
+}
+
+core::Result<core::ProgramFrameResolutionContextDTO>
+RetainedReferencePoseResolverProxy::capture_program_frame_resolution_context(
+    core::ProgramFrameResolutionCaptureDTO capture) const {
+  const auto target = CurrentTarget();
+  if (target == nullptr) {
+    return core::Result<core::ProgramFrameResolutionContextDTO>::Err(
+        core::ErrorDTO{"reference_resolver_target_missing",
+                       "retained reference-pose resolver has no active target",
+                       {}});
+  }
+  return target->capture_program_frame_resolution_context(std::move(capture));
+}
+
+core::Result<core::Pose3DTO>
+RetainedReferencePoseResolverProxy::resolve_reference_pose(
+    const core::ReferenceDTO &reference,
+    const core::ProgramFrameResolutionContextDTO &context) const {
+  const auto target = CurrentTarget();
+  if (target == nullptr) {
+    return core::Result<core::Pose3DTO>::Err(core::ErrorDTO{
+        "reference_resolver_target_missing",
+        "retained reference-pose resolver has no active target", {}});
+  }
+  return target->resolve_reference_pose(reference, context);
+}
+
+core::Result<core::ResolvedSceneFramePoseDTO>
+RetainedReferencePoseResolverProxy::resolve_scene_frame(
+    const core::SceneFrameRefDTO &reference,
+    const core::SceneFrameResolutionContextDTO &context) const {
+  const auto target = CurrentTarget();
+  if (target == nullptr) {
+    return core::Result<core::ResolvedSceneFramePoseDTO>::Err(core::ErrorDTO{
+        "reference_resolver_target_missing",
+        "retained reference-pose resolver has no active target", {}});
+  }
+  return target->resolve_scene_frame(reference, context);
+}
+
+core::Result<core::ProjectionRevisionDTO>
+RetainedPlanningSceneSynchronizer::SynchronizeBeforePlanning() {
+  std::shared_ptr<core::IPlanningSceneSynchronizer> target;
+  {
+    std::lock_guard lock(mutex_);
+    target = target_;
+  }
+  if (target == nullptr) {
+    return core::Result<core::ProjectionRevisionDTO>::Err(core::ErrorDTO{
+        "planning_scene_synchronizer_target_missing",
+        "retained planning-scene synchronizer has no active target", {}});
+  }
+  return target->SynchronizeBeforePlanning();
+}
+
+RetainedExecutionHost::~RetainedExecutionHost() {
+  // The borrowed process-stable cell Kernel and journal outlive this runtime;
+  // only this runtime's pointers to them are cleared. Every peer must stop
+  // naming this runtime as its cell root before this object dies.
+  for (const auto &peer : participant_peers) {
+    if (peer != nullptr && peer->cell_runtime_root == this) {
+      peer->cell_runtime_root = nullptr;
+    }
+  }
+  cell_addressed_kernel = nullptr;
+  cell_operation_journal = nullptr;
+  // Both roots and former peers can retire in different orders across an
+  // Apply. Never leave a self- or predecessor-root pointer dangling after
+  // this owner is destroyed.
+  cell_runtime_root = nullptr;
+  // participant_peers retires with ordinary member destruction, after this
+  // body; a peer kept alive elsewhere still resolves its live cell root.
+}
+namespace {
+
+/// Working motion, or an ended execution whose effect settlement is
+/// uncertain (an unresolved intervention), blocks generation changes.
+[[nodiscard]] bool
+motion_participant_unresolved(const core::ExecutionStatus &status) noexcept {
+  if (!status.fact.has_value())
+    return status.state != core::ExecutionState::kIdle;
+  return status.fact->effect ==
+         core::ParticipantEffectKnowledge::kEffectUncertain;
+}
+
+using manyforge::content_identity::CanonicalValue;
+
+void require_planner_binding(
+    const core::RuntimeParticipantBinding &runtime,
+    const RoboPlanPlannerBackend &planner,
+    const core::ProjectionRevisionDTO &projection_revision,
+    const deployment::VerifiedRetainedModelMap *model_map) {
+  const auto &value = runtime.value();
+  const auto &candidate = planner.candidate_binding();
+  if (value.model_groups.size() != 1U) {
+    throw std::invalid_argument(
+        "native planner requires one retained participant model group");
+  }
+  const auto &model_group = value.model_groups.front();
+  const auto model = std::find_if(
+      value.model_bindings.begin(), value.model_bindings.end(),
+      [&](const auto &binding) {
+        return binding.model_instance_id == model_group.model_instance_id;
+      });
+  if (model == value.model_bindings.end() ||
+      std::count_if(value.model_bindings.begin(), value.model_bindings.end(),
+                    [&](const auto &binding) {
+                      return binding.model_instance_id ==
+                             model_group.model_instance_id;
+                    }) != 1) {
+    throw std::invalid_argument(
+        "native planner model group has no exact retained model binding");
+  }
+  const auto permitted_frames =
+      retained_motion_planner_frames(runtime, model_map);
+  std::vector<std::string> resource_joint_names;
+  resource_joint_names.reserve(value.resources.size());
+  for (const auto &resource : value.resources) {
+    resource_joint_names.push_back(resource.compiled_resource_name);
+  }
+  if (planner.projection_binding().projection_revision != projection_revision ||
+      candidate.controllable_component_id != value.controllable_component_id ||
+      candidate.command_target_id != value.command_target_id ||
+      candidate.model_instance_id != model_group.model_instance_id ||
+      candidate.model_revision != model->model_revision ||
+      candidate.compiled_group_name != model_group.compiled_group_name ||
+      candidate.compiled_joint_names != resource_joint_names ||
+      candidate.permitted_frames != permitted_frames) {
+    throw std::invalid_argument(
+        "native planner crosses its retained participant or projection");
+  }
+  std::vector<core::ResourceId> resources;
+  resources.reserve(value.resources.size());
+  for (const auto &resource : value.resources) {
+    resources.push_back(resource.resource_id);
+  }
+  if (candidate.resources != resources) {
+    throw std::invalid_argument(
+        "native planner resource order differs from its retained target");
+  }
+}
+
+[[nodiscard]] std::shared_ptr<core::ICollisionQueryEngine> collision_engine(
+    const collision::ManyForgeCollisionEngine::SharedModelPtr &model,
+    const collision::ManyForgeCollisionEngine::SharedSceneCachePtr &cache) {
+  return std::make_shared<collision::ManyForgeCollisionEngine>(model, cache);
+}
+
+[[nodiscard]] bool same_provider_runtime(
+    const core::RuntimeCapabilityProviderPathDTO &left,
+    const core::RuntimeCapabilityProviderPathDTO &right) noexcept {
+  return left.provider_instance_id == right.provider_instance_id &&
+         left.provider_manifest_id == right.provider_manifest_id &&
+         left.provider_manifest_revision == right.provider_manifest_revision &&
+         left.provider_runtime_unit_id == right.provider_runtime_unit_id &&
+         left.provider_runtime_epoch == right.provider_runtime_epoch;
+}
+
+[[nodiscard]] const core::JsonValueDTO *
+json_member(const core::JsonObjectDTO &object,
+            const std::string_view name) noexcept {
+  const auto found = object.find(name);
+  return found == object.end() ? nullptr : &found->second;
+}
+
+[[nodiscard]] const core::JsonValueDTO::Object &
+json_object(const core::JsonValueDTO &value, const std::string_view field) {
+  const auto *object = std::get_if<core::JsonValueDTO::Object>(&value.value);
+  if (object == nullptr) {
+    throw std::invalid_argument(std::string(field) + " is not an object");
+  }
+  return *object;
+}
+
+[[nodiscard]] const core::JsonValueDTO::Array &
+json_array(const core::JsonValueDTO &value, const std::string_view field) {
+  const auto *array = std::get_if<core::JsonValueDTO::Array>(&value.value);
+  if (array == nullptr) {
+    throw std::invalid_argument(std::string(field) + " is not an array");
+  }
+  return *array;
+}
+
+[[nodiscard]] const std::string &json_string(const core::JsonValueDTO &value,
+                                             const std::string_view field) {
+  const auto *text = std::get_if<std::string>(&value.value);
+  if (text == nullptr || text->empty()) {
+    throw std::invalid_argument(std::string(field) +
+                                " is not a non-empty string");
+  }
+  return *text;
+}
+
+[[nodiscard]] double json_positive_number(const core::JsonValueDTO &value,
+                                          const std::string_view field) {
+  const auto *number = std::get_if<double>(&value.value);
+  if (number == nullptr || !std::isfinite(*number) || *number <= 0.0) {
+    throw std::invalid_argument(std::string(field) +
+                                " is not a finite positive number");
+  }
+  return *number;
+}
+
+[[nodiscard]] std::vector<core::HardStopResourceLimitDTO>
+retained_default_stop_limits(
+    const core::RuntimeParticipantBinding &binding,
+    const std::optional<core::RuntimeParticipantStopReadiness> &readiness) {
+  if (!readiness.has_value()) {
+    return {};
+  }
+  const auto &stages =
+      readiness->value().resolved_stop_base_plan.escalation_stages;
+  if (stages.empty() ||
+      !stages.front().default_contract_parameters.has_value()) {
+    return {};
+  }
+  const auto *limits_value = json_member(
+      *stages.front().default_contract_parameters, "per_resource_limits");
+  if (limits_value == nullptr) {
+    return {};
+  }
+  const auto &limits =
+      json_array(*limits_value, "Stop default per_resource_limits");
+  if (limits.size() != binding.value().resources.size()) {
+    throw std::invalid_argument(
+        "Stop default resource limits do not cover the exact binding");
+  }
+
+  std::map<core::ResourceId, core::CoordinateKind> expected;
+  for (const auto &resource : binding.value().resources) {
+    if (!expected.emplace(resource.resource_id, resource.coordinate_kind)
+             .second) {
+      throw std::invalid_argument(
+          "runtime binding repeats a Stop resource identity");
+    }
+  }
+  std::vector<core::HardStopResourceLimitDTO> result;
+  result.reserve(limits.size());
+  std::set<core::ResourceId> actual;
+  for (const auto &value : limits) {
+    const auto &row = json_object(value, "Stop default resource limit");
+    const auto *resource_value = json_member(row, "resource_id");
+    const auto *threshold_value = json_member(row, "settle_velocity_threshold");
+    if (resource_value == nullptr || threshold_value == nullptr) {
+      throw std::invalid_argument(
+          "Stop default resource limit is missing an exact field");
+    }
+    const core::ResourceId resource_id(
+        json_string(*resource_value, "Stop default resource_id"));
+    const auto expected_kind = expected.find(resource_id);
+    if (expected_kind == expected.end() || !actual.insert(resource_id).second) {
+      throw std::invalid_argument(
+          "Stop default resource limits are duplicated or out of scope");
+    }
+    const auto &threshold =
+        json_object(*threshold_value, "Stop default settle velocity");
+    const auto *kind_value = json_member(threshold, "coordinate_kind");
+    if (kind_value == nullptr) {
+      throw std::invalid_argument(
+          "Stop default settle velocity has no coordinate kind");
+    }
+    const auto &kind =
+        json_string(*kind_value, "Stop default settle coordinate kind");
+    if (expected_kind->second == core::CoordinateKind::kAngular) {
+      const auto *number = json_member(threshold, "value_rad_s");
+      if (kind != "angular_rad_s" || number == nullptr) {
+        throw std::invalid_argument(
+            "Stop default settle velocity differs from an angular resource");
+      }
+      result.push_back(
+          {resource_id, core::AngularVelocityDTO{json_positive_number(
+                            *number, "Stop default value_rad_s")}});
+    } else {
+      const auto *number = json_member(threshold, "value_m_s");
+      if (kind != "linear_m_s" || number == nullptr) {
+        throw std::invalid_argument(
+            "Stop default settle velocity differs from a linear resource");
+      }
+      result.push_back(
+          {resource_id, core::LinearVelocityDTO{json_positive_number(
+                            *number, "Stop default value_m_s")}});
+    }
+  }
+  std::sort(result.begin(), result.end(),
+            [](const auto &left, const auto &right) {
+              return left.resource_id < right.resource_id;
+            });
+  return result;
+}
+
+struct RetainedControlledStopProfiles final {
+  core::MotionInterruptStopProfileDTO operator_profile;
+  core::MotionInterruptStopProfileDTO fault_profile;
+};
+
+[[nodiscard]] std::optional<RetainedControlledStopProfiles>
+retained_controlled_stop_profiles(
+    const core::RuntimeParticipantBinding &binding,
+    const std::optional<core::RuntimeParticipantStopReadiness> &readiness) {
+  if (!readiness.has_value()) {
+    return std::nullopt;
+  }
+  const auto &stages =
+      readiness->value().resolved_stop_base_plan.escalation_stages;
+  const auto controlled =
+      std::find_if(stages.begin(), stages.end(), [](const auto &stage) {
+        return stage.containment_command.command_kind ==
+               core::StopContainmentCommandKind::kMotionControlledStop;
+      });
+  if (controlled == stages.end()) {
+    return std::nullopt;
+  }
+  if (std::count_if(
+          stages.begin(), stages.end(),
+          [](const auto &stage) {
+            return stage.containment_command.command_kind ==
+                   core::StopContainmentCommandKind::kMotionControlledStop;
+          }) != 1 ||
+      !controlled->default_contract_parameters.has_value()) {
+    throw std::invalid_argument(
+        "retained motion Stop plan has no single exact controlled profile");
+  }
+  auto decoded =
+      core::map_motion_controlled_stop_contract_parameters_to_profile(
+          *controlled->default_contract_parameters, binding.value().resources,
+          "operator_soft_on_path");
+  if (!decoded.ok()) {
+    throw std::invalid_argument(decoded.error().message);
+  }
+  auto operator_profile = std::move(decoded.value());
+  auto fault_profile = operator_profile;
+  // Native-only fallback. ROS/Mock composition replaces this with the exact
+  // Deployment-authored fault profile below, including spring_back_fast.
+  fault_profile.profile_id = "fault_spring_back_hold";
+  fault_profile.stop_mode = core::MotionInterruptStopMode::kSpringBackHold;
+  fault_profile.allow_natural_completion_on_short_path = false;
+  fault_profile.fallback_stop_modes.clear();
+  if (const auto error =
+          core::motion_interrupt_stop_profile_field_error(fault_profile);
+      !error.empty()) {
+    throw std::invalid_argument("retained fault Stop profile is invalid: " +
+                                error);
+  }
+  // Resolve each configured mode before execution. In particular, the fault
+  // Spring preset uses its half-duration, not a copied Soft ramp's preset.
+  auto frozen_operator =
+      core::resolve_motion_interrupt_stop_jerk_limits(operator_profile);
+  auto frozen_fault =
+      core::resolve_motion_interrupt_stop_jerk_limits(fault_profile);
+  if (!frozen_operator.ok() || !frozen_fault.ok())
+    throw std::invalid_argument(!frozen_operator.ok()
+                                    ? frozen_operator.error().message
+                                    : frozen_fault.error().message);
+  return RetainedControlledStopProfiles{std::move(frozen_operator.value()),
+                                        std::move(frozen_fault.value())};
+}
+
+// This policy belongs to the currently installed cell product, not a retained
+// component's bundle or a planner configuration captured before Apply.
+[[nodiscard]] std::optional<double> current_cell_takeover_budget(
+    const RetainedCellRuntime *cell,
+    const core::RuntimeParticipantBinding &binding,
+    std::optional<double> core::RuntimeParticipantExecutionRegistration::*
+        field = &core::RuntimeParticipantExecutionRegistration::
+                    motion_takeover_preparation_budget_s) {
+  if (cell == nullptr ||
+      binding.value().capability_id.value() != "execution.trajectory.execute") {
+    return std::nullopt;
+  }
+  for (const auto &row : cell->participant_registrations()) {
+    const auto &source = row.binding.value();
+    if (source.controllable_component_id ==
+            binding.value().controllable_component_id &&
+        source.command_target_id == binding.value().command_target_id &&
+        source.capability_id == binding.value().capability_id) {
+      return row.*field;
+    }
+  }
+  return std::nullopt;
+}
+
+[[nodiscard]] core::RuntimeParticipantExecutionRegistration
+runtime_registration(
+    core::RuntimeParticipantBinding binding,
+    const std::optional<core::RuntimeParticipantStopReadiness> &readiness,
+    core::IResolvedParticipantExecutionEngine *engine,
+    core::IControlDomainExecutionPort *stop_execution_port,
+    const std::optional<core::RuntimeParticipantPolicySelection>
+        &participant_policy,
+    std::optional<core::MotionInterruptStopProfileDTO>
+        default_operator_stop_profile = std::nullopt,
+    std::optional<core::MotionInterruptStopProfileDTO>
+        default_fault_stop_profile = std::nullopt,
+    std::optional<double> deployment_maximum_tcp_linear_speed_mps =
+        std::nullopt,
+    const bool fault_stop_profile_from_deployment = false) {
+  if (participant_policy.has_value() &&
+      (participant_policy->value().controllable_component_id !=
+           binding.value().controllable_component_id ||
+       participant_policy->value().command_target_id !=
+           binding.value().command_target_id)) {
+    throw std::invalid_argument(
+        "participant motion policy crosses its participant binding");
+  }
+  if (const auto retained_profiles =
+          retained_controlled_stop_profiles(binding, readiness);
+      retained_profiles.has_value()) {
+    if (default_operator_stop_profile.has_value() &&
+        *default_operator_stop_profile != retained_profiles->operator_profile) {
+      throw std::invalid_argument(
+          "runtime operator Stop profile differs from retained Stop authority");
+    }
+    default_operator_stop_profile = retained_profiles->operator_profile;
+    // Q37: a Deployment-authored fault profile is the authority as given;
+    // only the native lane still derives it from the operator profile.
+    if (!fault_stop_profile_from_deployment) {
+      if (default_fault_stop_profile.has_value() &&
+          *default_fault_stop_profile != retained_profiles->fault_profile) {
+        throw std::invalid_argument(
+            "runtime fault Stop profile differs from retained Stop authority");
+      }
+      default_fault_stop_profile = retained_profiles->fault_profile;
+    }
+  }
+  auto defaults = retained_default_stop_limits(binding, readiness);
+  return core::RuntimeParticipantExecutionRegistration{
+      std::move(binding),
+      readiness,
+      std::move(defaults),
+      core::MotionInterruptNodeCategory::kGeneric,
+      engine,
+      stop_execution_port,
+      participant_policy,
+      dynamic_cast<core::IResolvedPreparedParticipantExecutionEngine *>(engine),
+      std::move(default_operator_stop_profile),
+      std::move(default_fault_stop_profile),
+      deployment_maximum_tcp_linear_speed_mps};
+}
+
+// Active TCP (M7): Set TCP rides on the robot's motion-engine registrations.
+void attach_set_tcp(const RetainedExecutionHost &runtime,
+                    core::RuntimeParticipantExecutionRegistration &registration) {
+  if (runtime.set_tcp && registration.engine == runtime.participant_engine.get())
+    registration.set_tcp = runtime.set_tcp;
+}
+
+// Rebuilding route/readiness facts must retain the active cell's motion
+// policy. Ordinary participant construction still starts without this policy.
+template <typename... Args>
+[[nodiscard]] core::RuntimeParticipantExecutionRegistration
+runtime_registration(const RetainedExecutionHost &owner, Args &&...args) {
+  auto registration = runtime_registration(std::forward<Args>(args)...);
+  const auto *cell = owner.cell_runtime_owner;
+  if (cell == nullptr && owner.cell_runtime_root != nullptr) {
+    cell = owner.cell_runtime_root->cell_runtime_owner;
+  }
+  registration.motion_takeover_preparation_budget_s =
+      current_cell_takeover_budget(cell, registration.binding);
+  registration.motion_takeover_planning_budget_s = current_cell_takeover_budget(
+      cell, registration.binding,
+      &core::RuntimeParticipantExecutionRegistration::
+          motion_takeover_planning_budget_s);
+  attach_set_tcp(owner, registration);
+  return registration;
+}
+
+[[nodiscard]] std::optional<core::RuntimeParticipantStopReadiness>
+readiness_for(const std::vector<core::RuntimeParticipantExecutionRegistration>
+                  &registrations,
+              const core::RuntimeParticipantBinding &binding) {
+  const auto found = std::find_if(
+      registrations.begin(), registrations.end(),
+      [&](const auto &row) { return row.binding.value() == binding.value(); });
+  return found == registrations.end() ? std::nullopt : found->stop_readiness;
+}
+
+[[nodiscard]] bool same_supporting_provider_runtime(
+    const std::vector<core::RuntimeCapabilityProviderPathDTO> &primary,
+    const std::vector<core::RuntimeCapabilityProviderPathDTO> &alias) noexcept {
+  return !primary.empty() &&
+         std::all_of(alias.begin(), alias.end(),
+                     [&](const auto &candidate) {
+                       return std::any_of(primary.begin(), primary.end(),
+                                          [&](const auto &selected) {
+                                            return same_provider_runtime(
+                                                selected, candidate);
+                                          });
+                     }) &&
+         std::all_of(primary.begin(), primary.end(), [&](const auto &selected) {
+           return std::any_of(
+               alias.begin(), alias.end(), [&](const auto &candidate) {
+                 return same_provider_runtime(selected, candidate);
+               });
+         });
+}
+
+[[nodiscard]] bool same_physical_binding_except_collision_bodies(
+    const core::RuntimeParticipantBinding &primary,
+    const core::RuntimeParticipantBinding &alias,
+    const bool permit_supporting_capability_expansion,
+    const bool compare_frames = true) noexcept {
+  const auto &left = primary.value();
+  const auto &right = alias.value();
+  // Contact policies belong to the verified Program view, not the physical
+  // owner. Keep them on the alias while matching every physical identity below.
+  return left.retained_bundle_id == right.retained_bundle_id &&
+         left.graph_revision == right.graph_revision &&
+         left.controllable_component_id == right.controllable_component_id &&
+         left.component_type_id == right.component_type_id &&
+         left.component_type_revision == right.component_type_revision &&
+         left.command_target_id == right.command_target_id &&
+         left.capability_id == right.capability_id &&
+         left.capability_definition_revision ==
+             right.capability_definition_revision &&
+         left.command_schema == right.command_schema &&
+         left.model_bindings == right.model_bindings &&
+         left.model_groups == right.model_groups &&
+         (!compare_frames || left.frame_bindings == right.frame_bindings) &&
+         left.resources == right.resources &&
+         left.control_path == right.control_path &&
+         left.capability_provider_path == right.capability_provider_path &&
+         (left.supporting_capability_provider_paths ==
+              right.supporting_capability_provider_paths ||
+          (permit_supporting_capability_expansion &&
+           same_supporting_provider_runtime(
+               left.supporting_capability_provider_paths,
+               right.supporting_capability_provider_paths))) &&
+         left.runtime_unit_epochs == right.runtime_unit_epochs;
+}
+
+// Locates the physical owner of a resolved Program participant. A Program may
+// declare fewer collision bodies than its physical owner (each selected body
+// must match exactly one owner body, as the participant resolver checks), and
+// fewer frames: a robot's direct-control binding holds every TCP of its target
+// (its flange and a mounted tool's default TCP), a Program only the frames it
+// names. Every other field matches exactly.
+[[nodiscard]] bool program_view_within_physical_owner(
+    const core::RuntimeParticipantBinding &physical,
+    const core::RuntimeParticipantBinding &selected) noexcept {
+  const auto &available = physical.value().collision_body_bindings;
+  const auto &bodies = selected.value().collision_body_bindings;
+  const auto &owner_frames = physical.value().frame_bindings;
+  const auto &frames = selected.value().frame_bindings;
+  return same_physical_binding_except_collision_bodies(physical, selected,
+                                                       true, false) &&
+         std::all_of(frames.begin(), frames.end(), [&](const auto &frame) {
+           // Contact body roles on a frame belong to the Program view.
+           return std::any_of(
+               owner_frames.begin(), owner_frames.end(),
+               [&](const auto &candidate) {
+                 return core::same_program_frame(candidate, frame);
+               });
+         }) &&
+         std::all_of(bodies.begin(), bodies.end(), [&](const auto &body) {
+           return std::count_if(
+                      available.begin(), available.end(),
+                      [&](const auto &candidate) {
+                        return candidate.model_instance_id ==
+                                   body.model_instance_id &&
+                               candidate.model_revision == body.model_revision &&
+                               candidate.compiled_collision_body_names ==
+                                   body.compiled_collision_body_names;
+                      }) == 1;
+         });
+}
+
+[[nodiscard]] bool represents_binding(
+    const core::RuntimeParticipantBinding &candidate,
+    const core::ControlBindingId &binding_id,
+    const core::ControlBindingRevision &binding_revision) noexcept {
+  return candidate.value().control_path.has_value() &&
+         candidate.value().control_path->control_binding_id == binding_id &&
+         candidate.value().control_path->control_binding_revision ==
+             binding_revision;
+}
+
+template <typename Value>
+[[nodiscard]] core::Result<Value> route_publication_error(
+    std::string reason, std::string message,
+    core::ErrorCode code = core::ErrorCode::kInvariantViolation) {
+  return core::Result<Value>::Err(
+      core::ErrorDTO{std::string(core::to_string(code)),
+                     std::move(message),
+                     {{"reason", std::move(reason)}}});
+}
+
+[[nodiscard]] core::Result<core::RuntimeParticipantBinding>
+rebase_program_alias(const core::RuntimeParticipantBinding &alias,
+                     const core::RuntimeParticipantBinding &old_physical,
+                     const core::RuntimeParticipantBinding &new_physical) {
+  if (!program_view_within_physical_owner(old_physical, alias)) {
+    return route_publication_error<core::RuntimeParticipantBinding>(
+        "route_publication_alias_crosses_physical_owner",
+        "runtime Program alias differs from its previous physical owner");
+  }
+  auto candidate = alias.value();
+  candidate.control_path = new_physical.value().control_path;
+  candidate.runtime_unit_epochs = new_physical.value().runtime_unit_epochs;
+  auto sealed = core::verify_runtime_participant_binding(std::move(candidate));
+  if (!sealed.ok()) {
+    return route_publication_error<core::RuntimeParticipantBinding>(
+        "route_publication_alias_rebind_invalid", sealed.error().message);
+  }
+  if (!program_view_within_physical_owner(new_physical, sealed.value())) {
+    return route_publication_error<core::RuntimeParticipantBinding>(
+        "route_publication_alias_rebind_mismatch",
+        "rebound Program alias differs from its new physical owner");
+  }
+  return sealed;
+}
+
+[[nodiscard]] core::RuntimeParticipantAdmissionResolver
+make_kernel_participant_resolver(
+    RetainedRuntimeParticipantResolver binding_resolver,
+    std::vector<core::RuntimeParticipantExecutionRegistration>
+        physical_registrations) {
+  if (!binding_resolver) {
+    return {};
+  }
+  return [binding_resolver = std::move(binding_resolver),
+          physical_registrations = std::move(physical_registrations)](
+             const core::OperationIntentDTO &operation,
+             const std::size_t participant_index)
+             -> core::Result<core::RuntimeParticipantExecutionRegistration> {
+    auto binding = binding_resolver(operation, participant_index);
+    if (!binding.ok()) {
+      return core::Result<core::RuntimeParticipantExecutionRegistration>::Err(
+          binding.error());
+    }
+    const auto& selected = binding.value().binding;
+    const core::RuntimeParticipantExecutionRegistration *physical = nullptr;
+    for (const auto &candidate : physical_registrations) {
+      if (!program_view_within_physical_owner(candidate.binding, selected)) {
+        continue;
+      }
+      if (physical != nullptr) {
+        return route_publication_error<
+            core::RuntimeParticipantExecutionRegistration>(
+            "runtime_participant_physical_owner_ambiguous",
+            "resolved Program participant matches multiple physical owners");
+      }
+      physical = &candidate;
+    }
+    if (physical == nullptr) {
+      return route_publication_error<
+          core::RuntimeParticipantExecutionRegistration>(
+          "runtime_participant_stop_port_missing",
+          "resolved Program participant has no exact composed physical owner",
+          core::ErrorCode::kMissingReference);
+    }
+    try {
+      auto registration = runtime_registration(
+          std::move(binding.value().binding), physical->stop_readiness,
+          physical->engine, physical->stop_execution_port,
+          physical->participant_policy, physical->default_operator_stop_profile,
+          physical->default_fault_stop_profile,
+          physical->deployment_maximum_tcp_linear_speed_mps,
+          // The physical registration already settled the fault profile from
+          // the same readiness (derived or Deployment-authored); keep it.
+          true);
+      registration.intrinsic_direct_control =
+          binding.value().intrinsic_direct_control;
+      registration.motion_endpoint_owner =
+          binding.value().motion_endpoint_owner;
+      // Active TCP (M7): the robot's Set TCP, from its physical registration.
+      registration.set_tcp = physical->set_tcp;
+      registration.direct_control_joint_limits =
+          physical->direct_control_joint_limits;
+      registration.motion_takeover_preparation_budget_s =
+          physical->motion_takeover_preparation_budget_s;
+      registration.motion_takeover_planning_budget_s =
+          physical->motion_takeover_planning_budget_s;
+      return core::Result<core::RuntimeParticipantExecutionRegistration>::Ok(
+          std::move(registration));
+    } catch (const std::exception &exception) {
+      return route_publication_error<
+          core::RuntimeParticipantExecutionRegistration>(
+          "runtime_participant_stop_readiness_invalid", exception.what());
+    }
+  };
+}
+
+[[nodiscard]] bool same_readiness_after_product_reseal(
+    const std::optional<core::RuntimeParticipantStopReadiness> &predecessor,
+    const std::optional<core::RuntimeParticipantStopReadiness> &candidate) {
+  if (predecessor.has_value() != candidate.has_value()) return false;
+  if (!predecessor.has_value()) return true;
+  const auto &before = predecessor->value();
+  const auto &after = candidate->value();
+  if (before.controllable_component_id != after.controllable_component_id ||
+      before.component_lifecycle_generation !=
+          after.component_lifecycle_generation ||
+      before.expected_controller_domain != after.expected_controller_domain) {
+    return false;
+  }
+  auto prior_plan = before.resolved_stop_base_plan;
+  const auto &next_plan = after.resolved_stop_base_plan;
+  prior_plan.resolved_stop_base_plan_id =
+      next_plan.resolved_stop_base_plan_id;
+  prior_plan.retained_bundle_id = next_plan.retained_bundle_id;
+  prior_plan.graph_revision = next_plan.graph_revision;
+  return prior_plan == next_plan;
+}
+
+// The moving-takeover budgets are cell context: the candidate registrations
+// carry the candidate's (refreshed on retain), so they are not compared.
+[[nodiscard]] bool same_registration_after_product_reseal(
+    const core::RuntimeParticipantExecutionRegistration &predecessor,
+    const core::RuntimeParticipantExecutionRegistration &candidate) {
+  const bool policy_equal =
+      predecessor.participant_policy.has_value() ==
+          candidate.participant_policy.has_value() &&
+      (!predecessor.participant_policy.has_value() ||
+       predecessor.participant_policy->value() ==
+           candidate.participant_policy->value());
+  return retained_bindings_preserve_physical_owner_after_product_reseal(
+             predecessor.binding, candidate.binding) &&
+         same_readiness_after_product_reseal(predecessor.stop_readiness,
+                                             candidate.stop_readiness) &&
+         predecessor.retained_default_stop_limits ==
+             candidate.retained_default_stop_limits &&
+         predecessor.stop_node_category == candidate.stop_node_category &&
+         predecessor.engine == candidate.engine &&
+         predecessor.stop_execution_port == candidate.stop_execution_port &&
+         policy_equal &&
+         predecessor.prepared_motion_engine ==
+             candidate.prepared_motion_engine &&
+         predecessor.default_operator_stop_profile ==
+             candidate.default_operator_stop_profile &&
+         predecessor.default_fault_stop_profile ==
+             candidate.default_fault_stop_profile &&
+         predecessor.deployment_maximum_tcp_linear_speed_mps ==
+             candidate.deployment_maximum_tcp_linear_speed_mps &&
+         predecessor.intrinsic_direct_control ==
+             candidate.intrinsic_direct_control &&
+         predecessor.direct_control_joint_limits ==
+             candidate.direct_control_joint_limits;
+}
+
+} // namespace
+
+void RetainedGripperRoutePublicationOwner::BindMotionRoot(
+    const std::shared_ptr<RetainedExecutionHost>& root) {
+  if (!root || root->cell_addressed_kernel != &kernel_ ||
+      root->clock.get() != &clock_ || !participant_peers_.empty() ||
+      transition_mutex_ != &mutex_)
+    throw std::invalid_argument("scalar route owner requires its exact existing motion root");
+  transition_owner_ = root;
+  transition_is_motion_root_ = true;
+  transition_mutex_ = &root->route_publication_mutex_;
+}
+
+core::Result<void> RetainedGripperRoutePublicationOwner::ValidateInstalledOwner(
+    const std::shared_ptr<void>& transition_owner) const {
+  // Caller holds the same transition mutex as installed peer-list writers.
+  // The prior lookup released it before delegation, so validate again before
+  // any channel/backend rebind; a removed/replaced scalar cannot be revived.
+  if (transition_is_motion_root_) {
+    const auto root = std::static_pointer_cast<RetainedExecutionHost>(transition_owner);
+    if (!root || std::count(root->independent_gripper_peers.begin(),
+        root->independent_gripper_peers.end(), gripper_) != 1)
+      return route_publication_error<void>("route_publication_physical_owner_changed",
+          "scalar route no longer names the installed owner", core::ErrorCode::kMissingReference);
+  }
+  if (cell_owner_) {
+    const auto actual = gripper_->registrations();
+    const auto& rows = cell_owner_->participant_registrations();
+    for (const auto& expected : actual) {
+      const auto matches = std::count_if(rows.begin(), rows.end(), [&](const auto& row) {
+        return row.binding.value() == expected.binding.value() && row.engine == expected.engine &&
+            row.stop_execution_port == expected.stop_execution_port &&
+            row.stop_readiness.has_value() == expected.stop_readiness.has_value() &&
+            (!row.stop_readiness || row.stop_readiness->value() == expected.stop_readiness->value());
+      });
+      if (matches != 1)
+        return route_publication_error<void>("route_publication_physical_owner_changed",
+            "scalar registration set is no longer the exact installed owner", core::ErrorCode::kMissingReference);
+    }
+    if (std::count_if(rows.begin(), rows.end(), [&](const auto& row) {
+          return row.engine == gripper_->participant_engine() &&
+              row.binding.value().controllable_component_id == gripper_->binding().value().controllable_component_id;
+        }) != static_cast<std::ptrdiff_t>(actual.size()))
+      return route_publication_error<void>("route_publication_physical_owner_changed",
+          "installed scalar has unexpected logical registrations", core::ErrorCode::kMissingReference);
+  }
+  return core::Result<void>::Ok();
+}
+
+core::RuntimeParticipantAdmissionResolver
+make_retained_cell_kernel_participant_resolver(
+    RetainedRuntimeParticipantResolver binding_resolver,
+    std::vector<core::RuntimeParticipantExecutionRegistration>
+        physical_registrations) {
+  return make_kernel_participant_resolver(std::move(binding_resolver),
+                                         std::move(physical_registrations));
+}
+
+namespace detail {
+
+[[nodiscard]] core::Result<core::RuntimeParticipantBinding>
+rebase_runtime_binding_to_predecessor(
+    const core::RuntimeParticipantBinding &binding,
+    const core::ActiveControlConfigurationDTO &configuration) {
+  const auto &value = binding.value();
+  if (!configuration.locally_valid() ||
+      !configuration.locally_valid() ||
+      configuration.state !=
+          core::ActiveControlConfigurationStateDTO::kReconciled ||
+      !value.control_path.has_value()) {
+    return route_publication_error<core::RuntimeParticipantBinding>(
+        "route_predecessor_rebind_input_invalid",
+        "durable route predecessor rebind has no exact control path",
+        core::ErrorCode::kInvalidRequest);
+  }
+  const auto &path = *value.control_path;
+  const auto selected =
+      std::find_if(configuration.binding_routes.begin(),
+                   configuration.binding_routes.end(), [&](const auto &row) {
+                     return row.control_binding_id == path.control_binding_id;
+                   });
+  if (path.control_domain_id != configuration.control_domain_id ||
+      path.control_domain_revision != configuration.control_domain_revision ||
+      path.controller_topology_id != configuration.controller_topology_id ||
+      path.topology_revision != configuration.topology_revision ||
+      path.provider_runtime_unit_id != configuration.source_runtime_unit_id ||
+      selected == configuration.binding_routes.end() ||
+      selected->control_binding_revision != path.control_binding_revision) {
+    return route_publication_error<core::RuntimeParticipantBinding>(
+        "route_predecessor_rebind_mismatch",
+        "durable route predecessor crosses its retained runtime binding",
+        core::ErrorCode::kInvalidRequest);
+  }
+  auto candidate = value;
+  candidate.control_path->control_route_id = selected->control_route_id;
+  candidate.control_path->activation_set_id = configuration.activation_set_id;
+  candidate.control_path->active_control_configuration_id =
+      configuration.active_control_configuration_id;
+  candidate.control_path->active_control_configuration_generation =
+      configuration.active_control_configuration_generation;
+  // Qualification comes from this already verified binding's retained route,
+  // not from the durable configuration or its generation. Re-adopting that
+  // same route must preserve the exact proof; another route stays unqualified
+  // until the retained readiness resolver supplies its own route proof.
+  if (candidate.control_path->runtime_scale_qualification.has_value() &&
+      candidate.control_path->runtime_scale_qualification->control_route_id !=
+          selected->control_route_id) {
+    candidate.control_path->runtime_scale_qualification.reset();
+  }
+  auto sealed = core::verify_runtime_participant_binding(std::move(candidate));
+  if (!sealed.ok()) {
+    return route_publication_error<core::RuntimeParticipantBinding>(
+        "route_predecessor_rebind_invalid", sealed.error().message,
+        core::ErrorCode::kInvalidRequest);
+  }
+  return sealed;
+}
+
+RetainedObservedStateChannelConfig select_retained_state_channel_config(
+    std::optional<RetainedObservedStateChannelConfig> selected,
+    const core::RuntimeParticipantBinding &) {
+  if (selected.has_value()) {
+    return std::move(*selected);
+  }
+  throw std::invalid_argument(
+      "retained runtime execution adapter set is incomplete or owns a "
+      "second state authority");
+}
+
+} // namespace detail
+
+std::shared_ptr<RetainedExecutionHost>
+create_retained_execution_host_participants(
+    RetainedExecutionHostInput input, RetainedExecutionHostConfig config,
+    std::shared_ptr<WallClock> shared_clock,
+    std::shared_ptr<SimpleScheduler> shared_scheduler) {
+  if ((shared_clock == nullptr) != (shared_scheduler == nullptr)) {
+    throw std::invalid_argument("execution host clock and scheduler "
+                                "capabilities must be supplied together");
+  }
+  if (!input.scene || !input.scene_mutex || !input.state_projector ||
+      !input.collision_publisher || !input.planner ||
+      !input.collision_shared_model || !input.reference_resolver_factory ||
+      config.kernel.validation_collision_workers < 1 ||
+      config.kernel.validation_collision_workers > 64 ||
+      config.kernel.runtime_collision_lookahead_workers < 1 ||
+      config.kernel.runtime_collision_lookahead_workers > 64 ||
+      (!config.initial_motion_positions_rad.empty() &&
+       (config.initial_motion_positions_rad.size() !=
+            input.motion_binding.value().resources.size() ||
+        std::any_of(
+            config.initial_motion_positions_rad.begin(),
+            config.initial_motion_positions_rad.end(),
+            [](const double value) { return !std::isfinite(value); })))) {
+    throw std::invalid_argument(
+        "execution host composition input is incomplete or unbounded");
+  }
+  const auto controlled_stop_profiles = retained_controlled_stop_profiles(
+      input.motion_binding, input.motion_stop_readiness);
+  std::optional<core::MotionInterruptStopProfileDTO>
+      motion_operator_stop_profile;
+  std::optional<core::MotionInterruptStopProfileDTO> motion_fault_stop_profile;
+  if (controlled_stop_profiles.has_value()) {
+    motion_operator_stop_profile = controlled_stop_profiles->operator_profile;
+    motion_fault_stop_profile = controlled_stop_profiles->fault_profile;
+  }
+  // Q37 (as main): the Deployment-authored fault profile is read directly,
+  // with its defaults resolved once at load (item 24); nothing is derived.
+  if (input.fault_stop_profile_from_deployment) {
+    motion_fault_stop_profile.reset();
+    if (input.deployment_fault_stop_profile.has_value()) {
+      auto resolved = core::resolve_motion_interrupt_stop_jerk_limits(
+          *input.deployment_fault_stop_profile);
+      if (!resolved.ok()) {
+        throw std::invalid_argument(
+            "Deployment fault Stop profile is invalid: " +
+            resolved.error().message);
+      }
+      // The component-authored map may also name gripper/mimic joints.
+      // Like the operator profile's retained resource projection, select only
+      // this participant's actual source joints, keeping its own fault values.
+      // Missing arm limits remain absent for the existing strict Prepare check.
+      const auto &resources = input.motion_binding.value().resources;
+      const auto outside_participant = [&](const auto &limit) {
+        return std::none_of(resources.begin(), resources.end(), [&](const auto &resource) {
+          return resource.source_joint_name.has_value() &&
+                 *resource.source_joint_name == limit.first;
+        });
+      };
+      std::erase_if(resolved.value().per_joint_max_deceleration, outside_participant);
+      std::erase_if(resolved.value().per_joint_max_jerk, outside_participant);
+      if (resolved.value().per_joint_settle_velocity_threshold.has_value()) {
+        std::erase_if(*resolved.value().per_joint_settle_velocity_threshold,
+                      outside_participant);
+        if (resolved.value().per_joint_settle_velocity_threshold->empty())
+          resolved.value().per_joint_settle_velocity_threshold.reset();
+      }
+      motion_fault_stop_profile = std::move(resolved.value());
+    }
+  }
+  const auto current_inventory =
+      input.collision_publisher->current_scene_snapshot_lease_inventory();
+  if (!current_inventory.has_value() ||
+      !current_inventory->projection_binding.valid() ||
+      !current_inventory->bundle.world ||
+      !current_inventory->bundle.policy.has_value()) {
+    throw std::invalid_argument(
+        "execution host requires one initialized retained collision world");
+  }
+  const auto &projection_revision =
+      current_inventory->projection_binding.projection_revision;
+  const auto &motion_value = input.motion_binding.value();
+  if (input.control_binding_representatives.empty()) {
+    input.control_binding_representatives.push_back(input.motion_binding);
+  }
+  if (std::any_of(input.control_binding_representatives.begin(),
+                  input.control_binding_representatives.end(),
+                  [](const auto &candidate) {
+                    return !candidate.value().control_path.has_value();
+                  })) {
+    throw std::invalid_argument(
+        "native control inventory contains an unaddressed representative");
+  }
+  std::sort(input.control_binding_representatives.begin(),
+            input.control_binding_representatives.end(),
+            [](const auto &left, const auto &right) {
+              return left.value().control_path->control_binding_id <
+                     right.value().control_path->control_binding_id;
+            });
+  const std::size_t registration_count =
+      input.control_binding_representatives.size() +
+      input.motion_binding_aliases.size();
+  const auto representative_owner_count = [&](const auto &candidate) {
+    return static_cast<std::size_t>(retained_bindings_share_backend_owner(
+        input.motion_binding, candidate));
+  };
+  const auto contains_exact_representative = [&](const auto &binding) {
+    return std::count_if(input.control_binding_representatives.begin(),
+                         input.control_binding_representatives.end(),
+                         [&](const auto &candidate) {
+                           return candidate.value() == binding.value();
+                         }) == 1;
+  };
+  if (registration_count > core::kMaxOperationParticipants ||
+      std::any_of(input.control_binding_representatives.begin(),
+                  input.control_binding_representatives.end(),
+                  [&](const auto &candidate) {
+                    return !candidate.value().control_path.has_value() ||
+                           representative_owner_count(candidate) != 1U;
+                  }) ||
+      std::adjacent_find(
+          input.control_binding_representatives.begin(),
+          input.control_binding_representatives.end(),
+          [](const auto &left, const auto &right) {
+            return left.value().control_path->control_binding_id ==
+                   right.value().control_path->control_binding_id;
+          }) != input.control_binding_representatives.end() ||
+      !contains_exact_representative(input.motion_binding) ||
+      std::any_of(input.motion_binding_aliases.begin(),
+                  input.motion_binding_aliases.end(), [&](const auto &alias) {
+                    return !program_view_within_physical_owner(
+                        input.motion_binding, alias);
+                  })) {
+    // Preserve the refusal while identifying the guard that rejected the
+    // inventory; process startup otherwise reports only the shared message.
+    if (registration_count > core::kMaxOperationParticipants) {
+      std::cerr << "native control inventory guard: registration_count="
+                << registration_count << " exceeds participant limit="
+                << core::kMaxOperationParticipants << '\n';
+    } else {
+      const auto bad_owner = std::find_if(
+          input.control_binding_representatives.begin(),
+          input.control_binding_representatives.end(), [&](const auto &candidate) {
+            return !candidate.value().control_path.has_value() ||
+                   representative_owner_count(candidate) != 1U;
+          });
+      if (bad_owner != input.control_binding_representatives.end()) {
+        std::cerr << "native control inventory guard: representative binding="
+                  << bad_owner->value().control_path->control_binding_id.value()
+                  << " owner count=" << representative_owner_count(*bad_owner)
+                  << '\n';
+      } else {
+        const auto duplicate = std::adjacent_find(
+            input.control_binding_representatives.begin(),
+            input.control_binding_representatives.end(),
+            [](const auto &left, const auto &right) {
+              return left.value().control_path->control_binding_id ==
+                     right.value().control_path->control_binding_id;
+            });
+        if (duplicate != input.control_binding_representatives.end()) {
+          std::cerr << "native control inventory guard: duplicate representative binding="
+                    << duplicate->value().control_path->control_binding_id.value()
+                    << '\n';
+        } else if (!contains_exact_representative(input.motion_binding)) {
+          std::cerr << "native control inventory guard: motion representative is not exact and unique\n";
+        } else {
+          const auto alias = std::find_if(
+              input.motion_binding_aliases.begin(),
+              input.motion_binding_aliases.end(), [&](const auto &candidate) {
+                return !program_view_within_physical_owner(
+                    input.motion_binding, candidate);
+              });
+          std::cerr << "native control inventory guard: motion alias crosses or widens physical binding";
+          if (alias != input.motion_binding_aliases.end() &&
+              alias->value().control_path.has_value()) {
+            std::cerr << " binding="
+                      << alias->value().control_path->control_binding_id.value();
+          }
+          std::cerr << '\n';
+        }
+      }
+    }
+    throw std::invalid_argument(
+        "native control inventory is incomplete, duplicated, or crosses its "
+        "physical backend owner");
+  }
+  if (motion_value.control_path.has_value() &&
+      motion_value.control_path->runtime_scale_qualification.has_value()) {
+    const auto &runtime_scale =
+        *motion_value.control_path->runtime_scale_qualification;
+    if (runtime_scale.acknowledgement_kind !=
+            core::RuntimeScaleAcknowledgementKind::kAppliedState ||
+        runtime_scale.coordinated_barrier_id.has_value() ||
+        runtime_scale.maximum_slew_per_second !=
+            qualified_runtime_scale_slew_per_second()) {
+      throw std::invalid_argument("native motion runtime-scale qualification "
+                                  "differs from the selected mechanism");
+    }
+  }
+  if (projection_revision.retained_bundle_id !=
+          motion_value.retained_bundle_id ||
+      projection_revision.graph_revision != motion_value.graph_revision) {
+    throw std::invalid_argument(
+        "execution host motion binding crosses its collision projection");
+  }
+  require_planner_binding(
+      input.motion_binding, *input.planner, projection_revision,
+      input.planner_model_map ? &*input.planner_model_map : nullptr);
+
+  std::optional<core::RuntimeParticipantPolicySelection>
+      motion_participant_policy =
+          core::select_runtime_participant_policy(input.motion_binding);
+
+  if (!input.deployment_maximum_tcp_linear_speed_mps.has_value() ||
+      !std::isfinite(*input.deployment_maximum_tcp_linear_speed_mps) ||
+      *input.deployment_maximum_tcp_linear_speed_mps <= 0.0 ||
+      *input.deployment_maximum_tcp_linear_speed_mps > 1000.0) {
+    throw std::invalid_argument(
+        "native motion target requires one finite positive Deployment TCP "
+        "linear-speed maximum");
+  }
+
+  auto runtime = std::make_shared<RetainedExecutionHost>(input.motion_binding);
+  runtime->motion_binding_aliases = std::move(input.motion_binding_aliases);
+  runtime->control_binding_representatives =
+      std::move(input.control_binding_representatives);
+  runtime->motion_operator_stop_profile = motion_operator_stop_profile;
+  runtime->motion_fault_stop_profile = motion_fault_stop_profile;
+  runtime->motion_fault_stop_profile_from_deployment =
+      input.fault_stop_profile_from_deployment;
+  runtime->motion_participant_policy = motion_participant_policy;
+  runtime->deployment_maximum_tcp_linear_speed_mps =
+      input.deployment_maximum_tcp_linear_speed_mps;
+  runtime->direct_control_joint_limits =
+      std::move(input.direct_control_joint_limits);
+  runtime->participant_resolver_factory =
+      std::move(input.participant_resolver_factory);
+  runtime->prepare_measured_sources = std::move(input.prepare_measured_sources);
+  // TCP-C: FK of every listed TCP, a mounted tool's included (planner frames).
+  auto mounted_frame_names = retained_motion_planner_frame_names(
+      runtime->motion_binding,
+      input.planner_model_map ? &*input.planner_model_map : nullptr);
+  runtime->kinematic_model = std::make_shared<RetainedKinematicModelProxy>(
+      make_retained_motion_model_generation(
+          runtime->motion_binding, std::move(input.scene),
+          std::move(input.scene_mutex), std::move(input.state_projector),
+          std::move(mounted_frame_names)));
+  const auto model_generation = runtime->kinematic_model->current_generation();
+  runtime->collision_publisher = std::move(input.collision_publisher);
+
+  runtime->clock = shared_clock != nullptr ? std::move(shared_clock)
+                                           : std::make_shared<WallClock>();
+  runtime->scheduler =
+      shared_scheduler != nullptr
+          ? std::move(shared_scheduler)
+          : std::make_shared<SimpleScheduler>(std::move(config.scheduler));
+  runtime->cache = std::make_unique<core::TrajectoryCache>(config.cache);
+  runtime->planner = std::move(input.planner);
+
+  auto motion_state_config = detail::select_retained_state_channel_config(
+      std::move(input.motion_state_channel_config), runtime->motion_binding);
+  auto observation_wake = input.observation_wake != nullptr
+                              ? std::move(input.observation_wake)
+                              : std::make_shared<RetainedObservationWake>();
+  runtime->motion_state_channel =
+      std::make_shared<RetainedObservedStateChannel>(
+          runtime->motion_binding, model_generation->state_projector,
+          std::move(motion_state_config), runtime->clock.get(),
+          observation_wake);
+  const auto initial_timestamp_ns = runtime->clock->now();
+  if (runtime->motion_state_channel->query_context().state_authority_class ==
+      core::StateAuthorityClass::kMeasured) {
+    // CP8 step 1: measured arm state is never seeded from the model or an
+    // initial pose; it stays unavailable until its measured source publishes.
+    if (!config.initial_motion_positions_rad.empty()) {
+      throw std::invalid_argument(
+          "native measured motion state accepts no initial pose");
+    }
+  } else {
+    const auto motion_initialized =
+        config.initial_motion_positions_rad.empty()
+            ? runtime->motion_state_channel->initialize_from_projection(
+                  initial_timestamp_ns)
+            : runtime->motion_state_channel->source_kind() == core::ObservedStateSourceKind::kCommandedState
+                  ? runtime->motion_state_channel->publish_commanded_initialization_and_project(
+                        config.initial_motion_positions_rad,
+                        std::vector<double>(config.initial_motion_positions_rad.size(), 0.0),
+                        initial_timestamp_ns)
+                  : runtime->motion_state_channel->publish_and_project(
+                        config.initial_motion_positions_rad,
+                        std::vector<double>(config.initial_motion_positions_rad.size(), 0.0),
+                        initial_timestamp_ns, initial_timestamp_ns);
+    if (!motion_initialized.applied()) {
+      throw std::invalid_argument(
+          "native motion state could not be seeded from the retained model");
+    }
+  }
+  runtime->angular_observed_state =
+      std::make_unique<core::AddressedAngularObservedRobotStateAdapter>(
+          runtime->motion_state_channel->publication());
+  if (input.ordinary_motion_jerk && input.ordinary_motion_jerk->enabled) {
+    auto limits = runtime->kinematic_model->joint_limits(
+        motion_value.controllable_component_id.value(),
+        motion_value.command_target_id.value());
+    if (!limits.ok())
+      throw std::invalid_argument(limits.error().message);
+    auto profile = deployment::execution_runtime_contract::
+        resolve_ordinary_motion_jerk_policy(
+            *input.ordinary_motion_jerk,
+            runtime->motion_binding.value().resources, limits.value());
+    if (!profile.ok())
+      throw std::invalid_argument(profile.error().message);
+    for (const auto &[joint, cap] : runtime->direct_control_joint_limits) {
+      if (!cap.max_jerk_rad_s3)
+        continue;
+      const auto found = profile.value().limits.find(joint);
+      if (!profile.value().enabled || found == profile.value().limits.end() ||
+          !std::isfinite(*cap.max_jerk_rad_s3) || *cap.max_jerk_rad_s3 <= 0.0 ||
+          *cap.max_jerk_rad_s3 >
+              std::get<core::AngularJerkDTO>(found->second).value_rad_s3)
+        throw std::invalid_argument(
+            "manual jerk cap conflicts with the ordinary-motion policy for " +
+            joint);
+    }
+    auto selected = core::apply_deployment_motion_jerk_policy(
+        *motion_participant_policy, runtime->motion_binding,
+        std::move(profile.value()));
+    if (!selected.ok())
+      throw std::invalid_argument(selected.error().message);
+    motion_participant_policy = std::move(selected.value());
+    runtime->motion_participant_policy = motion_participant_policy;
+  }
+
+  if (input.backend_factory) {
+    auto selected = input.backend_factory(
+        runtime->motion_binding, runtime->motion_state_channel,
+        *runtime->clock, *runtime->scheduler);
+    runtime->execution = std::move(selected.execution);
+    runtime->rebind_motion_route = std::move(selected.rebind_motion_route);
+    runtime->set_tcp = std::move(selected.set_tcp);
+  }
+  if (!runtime->execution || !runtime->rebind_motion_route ||
+      runtime->execution->observed_robot_state_publication() !=
+          &runtime->motion_state_channel->publication().numeric_publication()) {
+    throw std::invalid_argument(
+        "retained runtime execution adapter set is incomplete or owns a "
+        "second state authority");
+  }
+  if (const auto rebound = runtime->rebind_motion_route(
+          runtime->motion_binding, runtime->motion_binding_aliases);
+      !rebound.ok()) {
+    throw std::invalid_argument(rebound.error().message);
+  }
+
+  runtime->reference_resolver =
+      input.reference_resolver_factory({runtime->motion_state_channel});
+  if (!runtime->reference_resolver) {
+    throw std::invalid_argument(
+        "execution host reference resolver factory returned no resolver");
+  }
+  runtime->reference_resolver_proxy =
+      std::make_shared<RetainedReferencePoseResolverProxy>(
+          runtime->reference_resolver);
+
+  const auto &shared_model = input.collision_shared_model;
+  if (!shared_model) {
+    throw std::invalid_argument(
+        "native collision publisher has no retained shared model");
+  }
+  runtime->runtime_collision_engine = collision_engine(
+      shared_model,
+      collision::ManyForgeCollisionEngine::make_shared_scene_cache(
+          shared_model));
+  runtime->collision_shared_model = shared_model;
+  runtime->geometric_contact_scene_cache =
+      collision::ManyForgeCollisionEngine::make_shared_scene_cache(
+          shared_model);
+  const auto validation_cache =
+      collision::ManyForgeCollisionEngine::make_shared_scene_cache(
+          shared_model);
+  runtime->validation_collision_engines.reserve(
+      static_cast<std::size_t>(config.kernel.validation_collision_workers));
+  for (std::size_t index = 0U;
+       index <
+       static_cast<std::size_t>(config.kernel.validation_collision_workers);
+       ++index) {
+    runtime->validation_collision_engines.push_back(
+        collision_engine(shared_model, validation_cache));
+  }
+  const auto lookahead_cache =
+      collision::ManyForgeCollisionEngine::make_shared_scene_cache(
+          shared_model);
+  runtime->lookahead_collision_engines.reserve(static_cast<std::size_t>(
+      config.kernel.runtime_collision_lookahead_workers));
+  for (std::size_t index = 0U;
+       index < static_cast<std::size_t>(
+                   config.kernel.runtime_collision_lookahead_workers);
+       ++index) {
+    runtime->lookahead_collision_engines.push_back(
+        collision_engine(shared_model, lookahead_cache));
+  }
+
+  if (input.planning_scene_synchronizer != nullptr) {
+    runtime->planning_scene_synchronizer =
+        std::make_shared<RetainedPlanningSceneSynchronizer>(
+            std::move(input.planning_scene_synchronizer));
+  }
+  core::ExecutionKernelPorts ports{*runtime->angular_observed_state,
+                                   *runtime->kinematic_model,
+                                   *runtime->reference_resolver_proxy,
+                                   *runtime->kinematic_model,
+                                   *runtime->kinematic_model,
+                                   nullptr,
+                                   runtime->planning_scene_synchronizer.get()};
+  runtime->participant_engine = std::make_shared<core::ExecutionKernel>(
+      *runtime->planner, ports, *runtime->execution, *runtime->clock,
+      *runtime->scheduler, *runtime->cache, std::move(config.kernel));
+  runtime->participant_engine->set_collision_resources(
+      *runtime->collision_publisher, runtime->runtime_collision_engine,
+      runtime->validation_collision_engines,
+      runtime->lookahead_collision_engines);
+  runtime->participant_engine->set_collision_validation_policy_snapshot(
+      runtime->collision_publisher->collision_policy_snapshot());
+  std::vector<core::RuntimeParticipantExecutionRegistration> registrations;
+  registrations.reserve(runtime->control_binding_representatives.size() +
+                        runtime->motion_binding_aliases.size());
+  for (const auto &representative : runtime->control_binding_representatives) {
+    const bool primary =
+        representative.value() == runtime->motion_binding.value();
+    registrations.push_back(runtime_registration(
+        representative,
+        primary ? input.motion_stop_readiness : std::nullopt,
+        runtime->participant_engine.get(),
+        static_cast<core::IControlDomainExecutionPort *>(
+            runtime->execution.get()),
+        primary ? motion_participant_policy : std::nullopt,
+        motion_operator_stop_profile, motion_fault_stop_profile,
+        input.deployment_maximum_tcp_linear_speed_mps,
+        input.fault_stop_profile_from_deployment));
+  }
+  for (const auto &alias : runtime->motion_binding_aliases) {
+    registrations.push_back(runtime_registration(
+        alias, input.motion_stop_readiness, runtime->participant_engine.get(),
+        runtime->execution.get(), motion_participant_policy,
+        motion_operator_stop_profile, motion_fault_stop_profile,
+        input.deployment_maximum_tcp_linear_speed_mps,
+        input.fault_stop_profile_from_deployment));
+  }
+  std::vector<core::RuntimeParticipantExecutionRegistration>
+      physical_registrations;
+  physical_registrations.push_back(runtime_registration(
+      runtime->motion_binding, input.motion_stop_readiness,
+      runtime->participant_engine.get(), runtime->execution.get(),
+      motion_participant_policy, motion_operator_stop_profile,
+      motion_fault_stop_profile,
+      input.deployment_maximum_tcp_linear_speed_mps,
+      input.fault_stop_profile_from_deployment));
+  physical_registrations.back().direct_control_joint_limits =
+      runtime->direct_control_joint_limits;
+  for (auto &registration : registrations) attach_set_tcp(*runtime, registration);
+  attach_set_tcp(*runtime, physical_registrations.back());
+  auto binding_resolver = std::move(input.participant_resolver);
+  if (runtime->participant_resolver_factory) {
+    binding_resolver =
+        runtime->participant_resolver_factory({runtime->motion_binding});
+  }
+  auto participant_resolver = make_kernel_participant_resolver(
+      std::move(binding_resolver), std::move(physical_registrations));
+  runtime->participant_registrations = std::move(registrations);
+  runtime->participant_resolver = std::move(participant_resolver);
+  return runtime;
+}
+
+namespace {
+
+struct CollectedExecutionHostParticipants final {
+  std::vector<core::RuntimeParticipantExecutionRegistration> registrations;
+  std::vector<core::RuntimeParticipantExecutionRegistration> physical;
+  std::vector<core::RuntimeParticipantBinding> physical_bindings;
+};
+
+[[nodiscard]] CollectedExecutionHostParticipants
+collect_execution_host_participants(
+    const std::vector<std::shared_ptr<RetainedExecutionHost>> &runtimes) {
+  CollectedExecutionHostParticipants collected;
+  for (const auto &runtime : runtimes) {
+    collected.registrations.insert(collected.registrations.end(),
+                                   runtime->participant_registrations.begin(),
+                                   runtime->participant_registrations.end());
+    const auto append_physical =
+        [&](const core::RuntimeParticipantBinding &binding) {
+          collected.physical_bindings.push_back(binding);
+          const auto found = std::find_if(
+              runtime->participant_registrations.begin(),
+              runtime->participant_registrations.end(),
+              [&](const auto &registration) {
+                return registration.binding.value() == binding.value();
+              });
+          if (found == runtime->participant_registrations.end()) {
+            throw std::invalid_argument(
+                "native participant join has no physical registration");
+          }
+          collected.physical.push_back(*found);
+        };
+    append_physical(runtime->motion_binding);
+  }
+  return collected;
+}
+
+} // namespace
+
+void join_retained_execution_host_participants(
+    const std::shared_ptr<RetainedExecutionHost> &primary,
+    std::vector<std::shared_ptr<RetainedExecutionHost>> peers,
+    RetainedRuntimeParticipantResolverFactory participant_resolver_factory) {
+  // A robot whose other components are tools (gripper-only owners, not
+  // runtimes) joins with no peers, as a rejoin may.
+  if (primary == nullptr || primary->clock == nullptr ||
+      primary->scheduler == nullptr || !participant_resolver_factory ||
+      primary->cell_runtime_root != nullptr ||
+      !primary->participant_peers.empty()) {
+    throw std::invalid_argument("native participant join is incomplete or duplicated");
+  }
+  std::vector<std::shared_ptr<RetainedExecutionHost>> runtimes{primary};
+  for (auto &peer : peers) {
+    if (peer == nullptr || peer.get() == primary.get() ||
+        peer->clock != primary->clock || peer->scheduler != primary->scheduler ||
+        !peer->participant_peers.empty()) {
+      throw std::invalid_argument("native participant join crosses runtime ownership");
+    }
+    runtimes.push_back(peer);
+  }
+
+  auto collected = collect_execution_host_participants(runtimes);
+  if (collected.registrations.size() >
+          core::kMaxProgramExecutionMemberships ||
+      collected.physical.size() > kNativeMaximumLiveStopParticipants) {
+    throw std::invalid_argument("native participant join exceeds the cell bound");
+  }
+  auto binding_resolver =
+      participant_resolver_factory(collected.physical_bindings);
+  if (!binding_resolver) {
+    throw std::invalid_argument("native participant join has no resolver");
+  }
+  primary->participant_registrations = std::move(collected.registrations);
+  primary->participant_resolver = make_kernel_participant_resolver(
+      std::move(binding_resolver), std::move(collected.physical));
+  primary->participant_resolver_factory = std::move(participant_resolver_factory);
+  primary->cell_runtime_root = primary.get();
+  for (const auto &peer : peers) peer->cell_runtime_root = primary.get();
+  primary->participant_peers = std::move(peers);
+}
+
+core::Result<void> rejoin_retained_execution_host_participants(
+    const std::shared_ptr<RetainedExecutionHost> &primary,
+    std::vector<std::shared_ptr<RetainedExecutionHost>> peers,
+    RetainedRuntimeParticipantResolverFactory participant_resolver_factory,
+    core::IResourceOperationAdmissionGate &admission_gate,
+    const core::ConfigurationFenceId &fence_id,
+    const core::ConfigurationFenceScopeDTO &scope) {
+  const auto fail = [](std::string reason, std::string message) {
+    return route_publication_error<void>(std::move(reason),
+                                         std::move(message));
+  };
+  if (primary == nullptr || !participant_resolver_factory ||
+      fence_id.empty() || !scope.valid() ||
+      !admission_gate.exact_fence_is_held(fence_id, scope)) {
+    return fail("native_participant_rejoin_fence_or_owner_invalid",
+                "native participant rejoin requires a complete candidate and exact held Apply fence");
+  }
+
+  std::vector<std::shared_ptr<RetainedExecutionHost>> runtimes{primary};
+  runtimes.insert(runtimes.end(), peers.begin(), peers.end());
+  std::set<RetainedExecutionHost *> unique_runtimes;
+  std::vector<RetainedExecutionHost *> lock_order;
+  std::set<core::ControllableComponentId> component_ids;
+  std::map<core::ControlDomainId, core::ControllableComponentId> domain_owners;
+  std::map<core::ResourceId, core::ControllableComponentId> resource_owners;
+  std::vector<core::RuntimeParticipantExecutionRegistration> registrations;
+  std::vector<core::RuntimeParticipantExecutionRegistration> physical;
+  std::vector<core::RuntimeParticipantBinding> physical_bindings;
+  std::set<RetainedExecutionHost *> predecessor_roots;
+
+  for (const auto &runtime : runtimes) {
+    if (runtime == nullptr || !unique_runtimes.insert(runtime.get()).second ||
+        runtime->clock == nullptr || runtime->scheduler == nullptr ||
+        runtime->motion_binding.value().controllable_component_id.empty() ||
+        runtime->participant_engine == nullptr ||
+        runtime->motion_state_channel == nullptr) {
+      return fail("native_participant_rejoin_owner_invalid",
+                  "candidate cell has a null, duplicated, or incomplete component owner");
+    }
+    lock_order.push_back(runtime.get());
+    if (!component_ids
+             .insert(runtime->motion_binding.value().controllable_component_id)
+             .second) {
+      return fail("native_participant_rejoin_component_duplicated",
+                  "candidate cell repeats a controllable component owner");
+    }
+    if (runtime->cell_runtime_root != nullptr)
+      predecessor_roots.insert(runtime->cell_runtime_root);
+    if (runtime->clock != primary->clock ||
+        runtime->scheduler != primary->scheduler) {
+      return fail("native_participant_rejoin_time_owner_mismatch",
+                  "candidate component engines do not share the cell clock and scheduler");
+    }
+    for (const auto &binding : runtime->control_binding_representatives) {
+      if (!binding.value().control_path.has_value()) {
+        return fail("native_participant_rejoin_binding_route_missing",
+                    "candidate component representative has no control route");
+      }
+      const auto &component = binding.value().controllable_component_id;
+      const auto &domain = binding.value().control_path->control_domain_id;
+      const auto [domain_at, domain_inserted] =
+          domain_owners.emplace(domain, component);
+      if (!domain_inserted && domain_at->second != component) {
+        return fail("native_participant_rejoin_shared_domain_unsupported",
+                    "native control domain is shared by distinct component owners");
+      }
+    }
+    const auto add_resources = [&](const core::RuntimeParticipantBinding &binding) {
+      for (const auto &resource : binding.value().resources) {
+        const auto [at, inserted] = resource_owners.emplace(
+            resource.resource_id,
+            binding.value().controllable_component_id);
+        if (!inserted) return false;
+      }
+      return true;
+    };
+    if (!add_resources(runtime->motion_binding)) {
+      return fail("native_participant_rejoin_resource_overlap",
+                  "candidate component owners share a native physical resource");
+    }
+  }
+  if (predecessor_roots.size() > 1U) {
+    return fail("native_participant_rejoin_predecessor_root_ambiguous",
+                "candidate components came from multiple native cell roots");
+  }
+
+  std::sort(lock_order.begin(), lock_order.end());
+  std::vector<std::unique_lock<std::mutex>> locks;
+  locks.reserve(lock_order.size());
+  for (auto *runtime : lock_order)
+    locks.emplace_back(runtime->route_publication_mutex_);
+  if (!admission_gate.exact_fence_is_held(fence_id, scope)) {
+    return fail("native_participant_rejoin_fence_changed",
+                "candidate cell lost its exact Apply fence during validation");
+  }
+
+  for (const auto &runtime : runtimes) {
+    std::vector<core::RuntimeParticipantExecutionRegistration> local;
+    for (const auto &registration : runtime->participant_registrations) {
+      if (registration.binding.value().controllable_component_id ==
+          runtime->motion_binding.value().controllable_component_id) {
+        local.push_back(registration);
+      }
+    }
+    if (local.empty()) {
+      return fail("native_participant_rejoin_registration_missing",
+                  "candidate component has no local execution registrations");
+    }
+    const auto collect_physical = [&](
+        const core::RuntimeParticipantBinding &binding) -> bool {
+      const auto selected = std::find_if(
+          local.begin(), local.end(), [&](const auto &registration) {
+            return registration.binding.value() == binding.value();
+          });
+      if (selected == local.end()) return false;
+      physical_bindings.push_back(binding);
+      physical.push_back(*selected);
+      return true;
+    };
+    if (!collect_physical(runtime->motion_binding)) {
+      return fail("native_participant_rejoin_physical_registration_missing",
+                  "candidate component lacks exact physical registrations and Stop readiness");
+    }
+    const auto expected_count =
+        runtime->control_binding_representatives.size() +
+        runtime->motion_binding_aliases.size();
+    std::vector<core::RuntimeParticipantBinding> expected_bindings;
+    expected_bindings.reserve(expected_count);
+    expected_bindings.insert(expected_bindings.end(),
+                             runtime->control_binding_representatives.begin(),
+                             runtime->control_binding_representatives.end());
+    expected_bindings.insert(expected_bindings.end(),
+                             runtime->motion_binding_aliases.begin(),
+                             runtime->motion_binding_aliases.end());
+    std::set<core::ControlBindingId> local_ids;
+    if (local.size() != expected_count ||
+        std::any_of(local.begin(), local.end(), [&](const auto &row) {
+          return !row.binding.value().control_path.has_value() ||
+                 !local_ids.insert(row.binding.value()
+                                       .control_path->control_binding_id)
+                      .second ||
+                 std::none_of(expected_bindings.begin(),
+                              expected_bindings.end(), [&](const auto &expected) {
+                                return expected.value() ==
+                                       row.binding.value();
+                              });
+        }) ||
+        local_ids.size() != expected_bindings.size()) {
+      return fail("native_participant_rejoin_registration_count_mismatch",
+                  "candidate component registrations do not exactly match its selected bindings");
+    }
+    registrations.insert(registrations.end(), local.begin(), local.end());
+  }
+  if (registrations.size() > core::kMaxProgramExecutionMemberships ||
+      physical.size() > kNativeMaximumLiveStopParticipants) {
+    return fail("native_participant_rejoin_cell_bound_exceeded",
+                "candidate cell exceeds a qualified limit");
+  }
+  RetainedRuntimeParticipantResolver binding_resolver;
+  try {
+    binding_resolver = participant_resolver_factory(physical_bindings);
+  } catch (const std::exception &exception) {
+    return fail("native_participant_rejoin_resolver_factory_failed",
+                exception.what());
+  } catch (...) {
+    return fail("native_participant_rejoin_resolver_factory_failed",
+                "candidate native resolver factory threw an unknown exception");
+  }
+  if (!binding_resolver) {
+    return fail("native_participant_rejoin_resolver_missing",
+                "candidate native resolver factory returned no resolver");
+  }
+  auto aggregate_resolver = make_kernel_participant_resolver(
+      std::move(binding_resolver), physical);
+  if (!aggregate_resolver) {
+    return fail("native_participant_rejoin_resolver_aggregate_failed",
+                "candidate native resolver could not be aggregated");
+  }
+  if (!admission_gate.exact_fence_is_held(fence_id, scope)) {
+    return fail("native_participant_rejoin_fence_changed",
+                "candidate cell lost its exact Apply fence before publication");
+  }
+
+  // All candidate validation is complete. Move the prepared aggregate into
+  // the new root.
+  primary->participant_registrations = std::move(registrations);
+  primary->participant_resolver = std::move(aggregate_resolver);
+  primary->participant_resolver_factory =
+      std::move(participant_resolver_factory);
+  for (const auto &runtime : runtimes) {
+    if (runtime.get() != primary.get()) {
+      runtime->participant_peers.clear();
+      runtime->cell_runtime_root = primary.get();
+    }
+  }
+  primary->cell_runtime_root = primary.get();
+  primary->participant_peers = std::move(peers);
+  return core::Result<void>::Ok();
+}
+
+core::Result<void> reseal_retained_execution_host_for_apply(
+    RetainedExecutionHost &runtime, RetainedExecutionHostResealInput input) {
+  const auto fail = [](std::string reason, std::string message) {
+    return route_publication_error<void>(std::move(reason),
+                                         std::move(message));
+  };
+  if (input.apply_fence_id.empty() || !input.apply_scope.valid() ||
+      !input.admission_gate.exact_fence_is_held(input.apply_fence_id,
+                                                input.apply_scope)) {
+    return fail("native_product_reseal_fence_not_held",
+                "retained native owner re-seal requires the exact held Apply fence");
+  }
+
+  // Every reader and writer of a participant's routes (route publication,
+  // measured-source staging) serializes
+  // on its cell root's mutex, so the re-seal must hold that same mutex: a peer
+  // participant's own mutex would leave those readers running against the
+  // bindings and registrations replaced below.
+  auto *const cell_root = runtime.cell_runtime_root != nullptr
+                              ? runtime.cell_runtime_root
+                              : &runtime;
+  std::lock_guard lock(cell_root->route_publication_mutex_);
+  if (!input.admission_gate.exact_fence_is_held(input.apply_fence_id,
+                                                input.apply_scope)) {
+    return fail("native_product_reseal_fence_changed",
+                "retained native owner lost its exact Apply fence");
+  }
+  if (runtime.clock == nullptr || runtime.motion_state_channel == nullptr ||
+      runtime.execution == nullptr || !runtime.rebind_motion_route ||
+      runtime.participant_engine == nullptr ||
+      runtime.reference_resolver_proxy == nullptr ||
+      input.reference_resolver == nullptr ||
+      input.motion_binding.value().control_path == std::nullopt ||
+      input.motion_binding.value().controllable_component_id !=
+          runtime.motion_binding.value().controllable_component_id ||
+      !retained_bindings_preserve_physical_owner_after_product_reseal(
+          runtime.motion_binding, input.motion_binding)) {
+    return fail("native_product_reseal_physical_identity_changed",
+                "candidate product changes the retained component's physical controller identity");
+  }
+
+  const auto motion_status = runtime.participant_engine->get_status();
+  if (motion_participant_unresolved(motion_status)) {
+    return fail("native_product_reseal_motion_not_idle",
+                "retained native controller has active or unresolved motion work");
+  }
+
+  std::vector<core::RuntimeParticipantBinding> expected_bindings;
+  expected_bindings.reserve(input.control_binding_representatives.size() +
+                            input.motion_binding_aliases.size());
+  expected_bindings.insert(expected_bindings.end(),
+                           input.control_binding_representatives.begin(),
+                           input.control_binding_representatives.end());
+  expected_bindings.insert(expected_bindings.end(),
+                           input.motion_binding_aliases.begin(),
+                           input.motion_binding_aliases.end());
+  if (expected_bindings.empty() ||
+      input.participant_registrations.size() != expected_bindings.size()) {
+    return fail("native_product_reseal_registration_set_incomplete",
+                "candidate registrations do not exactly cover its control bindings");
+  }
+  std::set<core::ControlBindingId> expected_ids;
+  for (const auto &binding : expected_bindings) {
+    if (!binding.value().control_path.has_value() ||
+        !expected_ids
+             .insert(binding.value().control_path->control_binding_id)
+             .second) {
+      return fail("native_product_reseal_binding_set_ambiguous",
+                  "candidate component repeats or omits a control binding identity");
+    }
+  }
+  std::set<core::ControlBindingId> registration_ids;
+  for (const auto &candidate : input.participant_registrations) {
+    const auto &binding = candidate.binding;
+    if (!binding.value().control_path.has_value() ||
+        !registration_ids
+             .insert(binding.value().control_path->control_binding_id)
+             .second ||
+        std::none_of(expected_bindings.begin(), expected_bindings.end(),
+                     [&](const auto &expected) {
+                       return expected.value() == binding.value();
+                     })) {
+      return fail("native_product_reseal_registration_set_mismatch",
+                  "candidate registration does not exactly match one unique component binding");
+    }
+    const auto predecessor = std::find_if(
+        runtime.participant_registrations.begin(),
+        runtime.participant_registrations.end(), [&](const auto &prior) {
+          return prior.binding.value().control_path.has_value() &&
+                 prior.binding.value().control_path->control_binding_id ==
+                     binding.value().control_path->control_binding_id &&
+                 prior.binding.value().controllable_component_id ==
+                     binding.value().controllable_component_id;
+        });
+    if (predecessor == runtime.participant_registrations.end() ||
+        std::count_if(runtime.participant_registrations.begin(),
+                      runtime.participant_registrations.end(),
+                      [&](const auto &prior) {
+                        return prior.binding.value().control_path.has_value() &&
+                               prior.binding.value().control_path->control_binding_id ==
+                                   binding.value().control_path->control_binding_id &&
+                               prior.binding.value().controllable_component_id ==
+                                   binding.value().controllable_component_id;
+                      }) != 1 ||
+        !same_registration_after_product_reseal(*predecessor, candidate)) {
+      return fail("native_product_reseal_registration_identity_changed",
+                  "candidate registration changes a retained engine, route, policy, or Stop fact");
+    }
+    if (!retained_bindings_share_backend_owner(input.motion_binding, binding) ||
+        candidate.engine != runtime.participant_engine.get()) {
+      return fail("native_product_reseal_registration_owner_mismatch",
+                  "candidate binding does not resolve to exactly one retained engine");
+    }
+  }
+  if (registration_ids != expected_ids) {
+    return fail("native_product_reseal_registration_set_mismatch",
+                "candidate component registrations omit a control binding");
+  }
+  if (std::any_of(input.motion_binding_aliases.begin(),
+                  input.motion_binding_aliases.end(), [&](const auto &alias) {
+                    return !program_view_within_physical_owner(
+                        input.motion_binding, alias);
+                  })) {
+    return fail("native_product_reseal_alias_identity_changed",
+                "candidate Program alias widens or changes the retained physical owner");
+  }
+
+  const auto old_motion = runtime.motion_binding;
+  const auto old_motion_aliases = runtime.motion_binding_aliases;
+  const auto transition_time_ns = runtime.clock->now();
+  bool motion_channel_attempted = false;
+  bool motion_backend_attempted = false;
+  const auto rollback = [&]() noexcept {
+    bool complete = true;
+    try {
+      if (motion_channel_attempted && runtime.motion_state_channel != nullptr) {
+        const bool channel_restored =
+            runtime.motion_state_channel
+                ->RebindRoute(old_motion, runtime.clock->now())
+                .ok();
+        complete = channel_restored && complete;
+        if (motion_backend_attempted && runtime.rebind_motion_route &&
+            channel_restored) {
+          complete = runtime.rebind_motion_route(old_motion,
+                                                 old_motion_aliases)
+                         .ok() &&
+                     complete;
+        } else if (motion_backend_attempted) {
+          complete = false;
+        }
+      } else if (motion_backend_attempted) {
+        complete = false;
+      }
+    } catch (...) {
+      complete = false;
+    }
+    return complete;
+  };
+
+  motion_channel_attempted = true;
+  auto rebound = runtime.motion_state_channel->RebindRoute(
+      input.motion_binding, transition_time_ns);
+  if (!rebound.ok()) {
+    if (!rollback()) {
+      return fail("native_product_reseal_rollback_failed",
+                  "motion state rebind failed and its predecessor could not be restored");
+    }
+    return core::Result<void>::Err(rebound.error());
+  }
+  motion_backend_attempted = true;
+  rebound = runtime.rebind_motion_route(input.motion_binding,
+                                       input.motion_binding_aliases);
+  if (!rebound.ok()) {
+    if (!rollback()) {
+      return fail("native_product_reseal_rollback_failed",
+                  "motion backend rebind failed and its predecessor could not be restored");
+    }
+    return core::Result<void>::Err(rebound.error());
+  }
+
+  runtime.motion_binding = std::move(input.motion_binding);
+  runtime.motion_binding_aliases = std::move(input.motion_binding_aliases);
+  runtime.control_binding_representatives =
+      std::move(input.control_binding_representatives);
+  runtime.participant_registrations = std::move(input.participant_registrations);
+  runtime.reference_resolver = std::move(input.reference_resolver);
+  runtime.reference_resolver_proxy->ReplaceTarget(runtime.reference_resolver);
+  if (const auto primary = readiness_for(runtime.participant_registrations,
+                                         runtime.motion_binding);
+      primary.has_value()) {
+    const auto registration = std::find_if(
+        runtime.participant_registrations.begin(),
+        runtime.participant_registrations.end(), [&](const auto &row) {
+          return row.binding.value() == runtime.motion_binding.value();
+        });
+    if (registration != runtime.participant_registrations.end()) {
+      runtime.motion_participant_policy = registration->participant_policy;
+      runtime.deployment_maximum_tcp_linear_speed_mps =
+          registration->deployment_maximum_tcp_linear_speed_mps;
+      runtime.direct_control_joint_limits =
+          registration->direct_control_joint_limits;
+    }
+  }
+  return core::Result<void>::Ok();
+}
+
+core::Result<void> refresh_retained_execution_host_model_for_apply(
+    RetainedExecutionHost &runtime,
+    RetainedExecutionHostModelRefreshInput input) {
+  const auto fail = [](std::string reason, std::string message) {
+    return route_publication_error<void>(std::move(reason),
+                                         std::move(message));
+  };
+  if (input.apply_fence_id.empty() || !input.apply_scope.valid() ||
+      !input.admission_gate.exact_fence_is_held(input.apply_fence_id,
+                                                input.apply_scope)) {
+    return fail("native_model_refresh_fence_not_held",
+                "retained model refresh requires the exact held Apply fence");
+  }
+  // Route readers and route publication serialize on the cell root; model
+  // consumers are replaced under the same order as the re-seal.
+  auto *const cell_root = runtime.cell_runtime_root != nullptr
+                              ? runtime.cell_runtime_root
+                              : &runtime;
+  std::lock_guard lock(cell_root->route_publication_mutex_);
+  if (!input.admission_gate.exact_fence_is_held(input.apply_fence_id,
+                                                input.apply_scope)) {
+    return fail("native_model_refresh_fence_changed",
+                "retained model refresh lost its exact Apply fence");
+  }
+  const auto &candidate = input.candidate;
+  if (candidate == nullptr || candidate->scene == nullptr ||
+      candidate->state_projector == nullptr ||
+      candidate->kinematics == nullptr ||
+      candidate->trajectory_validator == nullptr ||
+      candidate->collision_trajectory_projector == nullptr ||
+      runtime.kinematic_model == nullptr || runtime.clock == nullptr ||
+      runtime.motion_state_channel == nullptr ||
+      runtime.participant_engine == nullptr) {
+    return fail("native_model_refresh_incomplete",
+                "retained model refresh has no complete candidate generation");
+  }
+
+  // Drain: no planning, validation or execution may span
+  // the generation change. Admission is already closed by the fence.
+  const auto motion_status = runtime.participant_engine->get_status();
+  if (motion_participant_unresolved(motion_status)) {
+    return fail("native_model_refresh_motion_not_idle",
+                "retained controller has active or unresolved motion work");
+  }
+
+  // Retaining the controller is valid only while its own model facts are
+  // unchanged; only their placement in the whole cell may differ.
+  const auto &motion = runtime.motion_binding.value();
+  const auto &component = motion.controllable_component_id.value();
+  const auto &target = motion.command_target_id.value();
+  const auto current_limits =
+      runtime.kinematic_model->joint_limits(component, target);
+  const auto candidate_limits =
+      candidate->kinematics->joint_limits(component, target);
+  const auto current_names = runtime.kinematic_model->group_joint_names(target);
+  const auto candidate_names = candidate->kinematics->group_joint_names(target);
+  if (!current_limits.ok() || !candidate_limits.ok() || !current_names.ok() ||
+      !candidate_names.ok() ||
+      current_names.value() != candidate_names.value() ||
+      current_limits.value().joint_names !=
+          candidate_limits.value().joint_names ||
+      current_limits.value().position_lower_rad !=
+          candidate_limits.value().position_lower_rad ||
+      current_limits.value().position_upper_rad !=
+          candidate_limits.value().position_upper_rad ||
+      current_limits.value().velocity_max_rad_s !=
+          candidate_limits.value().velocity_max_rad_s ||
+      current_limits.value().acceleration_max_rad_s2 !=
+          candidate_limits.value().acceleration_max_rad_s2) {
+    return fail("native_model_refresh_controller_model_changed",
+                "candidate cell model changes the retained controller's own "
+                "kinematic target");
+  }
+  // Install. The proxy waits for in-flight host/Kernel model calls; each
+  // channel waits for its in-flight projection, then projects its latest
+  // owner sample into the candidate scene.
+  runtime.kinematic_model->ReplaceGeneration(candidate);
+  const auto now_ns = runtime.clock->now();
+  if (auto replaced = runtime.motion_state_channel->ReplaceKinematicProjector(
+          candidate->state_projector, now_ns);
+      !replaced.ok()) {
+    return core::Result<void>::Err(replaced.error());
+  }
+  if (runtime.kinematic_model->current_generation() != candidate ||
+      runtime.motion_state_channel->kinematic_projector() !=
+          candidate->state_projector) {
+    return fail("native_model_refresh_readback_mismatch",
+                "retained model consumers do not read back one candidate "
+                "generation");
+  }
+  return core::Result<void>::Ok();
+}
+
+namespace {
+
+[[nodiscard]] bool runtime_owns_domain(
+    const RetainedExecutionHost &runtime,
+    const core::ControlDomainId &domain_id) {
+  return std::any_of(
+      runtime.control_binding_representatives.begin(),
+      runtime.control_binding_representatives.end(), [&](const auto &binding) {
+        return binding.value().control_path.has_value() &&
+               binding.value().control_path->control_domain_id == domain_id;
+      });
+}
+
+template <typename Visitor>
+void for_each_cell_runtime(RetainedExecutionHost &runtime, Visitor visitor) {
+  auto *root = runtime.cell_runtime_root != nullptr ? runtime.cell_runtime_root
+                                                    : &runtime;
+  visitor(*root);
+  for (const auto &peer : root->participant_peers) visitor(*peer);
+}
+
+[[nodiscard]] std::vector<core::RuntimeParticipantBinding> composed_bindings(
+    const std::vector<core::RuntimeParticipantExecutionRegistration>& rows) {
+  std::vector<core::RuntimeParticipantBinding> result;
+  result.reserve(rows.size());
+  for (const auto& row : rows) result.push_back(row.binding);
+  return result;
+}
+
+enum class ParticipantResolverRebuildPurpose {
+  kRoutePublication,
+  kComponentReadiness,
+  kPredecessorAdoption,
+};
+
+// Pure preparation only. Callers retain their own authority, commit, rollback
+// and success-only adoption sequence around this shared resolver construction.
+[[nodiscard]] core::Result<core::RuntimeParticipantAdmissionResolver>
+rebuild_participant_resolver(
+    const RetainedRuntimeParticipantResolverFactory &factory,
+    bool had_participant_resolver,
+    const std::vector<core::RuntimeParticipantExecutionRegistration>
+        &registrations,
+    std::vector<core::RuntimeParticipantExecutionRegistration>
+        &&physical_registrations,
+    ParticipantResolverRebuildPurpose purpose) {
+  struct Diagnostic final {
+    const char *failed_reason;
+    const char *failed_message;
+    const char *missing_reason;
+    const char *missing_message;
+  };
+  static constexpr Diagnostic diagnostics[]{
+      {"route_publication_resolver_factory_failed",
+       "native participant resolver factory returned no resolver",
+       "route_publication_resolver_factory_missing",
+       "dynamic native participant resolution cannot retain stale physical "
+       "facts"},
+      {"component_readiness_resolver_factory_failed",
+       "native participant resolver factory returned no resolver",
+       "component_readiness_resolver_factory_missing",
+       "dynamic native participant resolution cannot retain stale readiness"},
+      {"route_predecessor_resolver_factory_failed",
+       "native predecessor resolver factory returned no resolver",
+       "route_predecessor_resolver_factory_missing",
+       "native predecessor adoption cannot retain a stale resolver"}};
+  const auto &diagnostic = diagnostics[static_cast<std::size_t>(purpose)];
+  RetainedRuntimeParticipantResolver binding_resolver;
+  if (factory) {
+    binding_resolver = factory(composed_bindings(registrations));
+    if (!binding_resolver) {
+      return route_publication_error<core::RuntimeParticipantAdmissionResolver>(
+          diagnostic.failed_reason, diagnostic.failed_message);
+    }
+  } else if (had_participant_resolver) {
+    return route_publication_error<core::RuntimeParticipantAdmissionResolver>(
+        diagnostic.missing_reason, diagnostic.missing_message);
+  }
+  return core::Result<core::RuntimeParticipantAdmissionResolver>::Ok(
+      make_kernel_participant_resolver(std::move(binding_resolver),
+                                       std::move(physical_registrations)));
+}
+
+struct CellParticipantSet final {
+  std::vector<core::RuntimeParticipantExecutionRegistration> registrations;
+  std::vector<core::RuntimeParticipantBinding> physical_bindings;
+};
+
+[[nodiscard]] CellParticipantSet compose_cell_participants(
+    RetainedExecutionHost &changed,
+    const std::vector<core::RuntimeParticipantExecutionRegistration> &changed_registrations,
+    const core::RuntimeParticipantBinding &changed_motion) {
+  CellParticipantSet result;
+  for_each_cell_runtime(changed, [&](RetainedExecutionHost &runtime) {
+    if (&runtime == &changed) {
+      result.registrations.insert(result.registrations.end(),
+                                  changed_registrations.begin(),
+                                  changed_registrations.end());
+      result.physical_bindings.push_back(changed_motion);
+      return;
+    }
+    for (const auto &registration : runtime.participant_registrations) {
+      const auto &binding = registration.binding.value();
+      if (binding.control_path &&
+          runtime_owns_domain(runtime, binding.control_path->control_domain_id))
+        result.registrations.push_back(registration);
+    }
+    result.physical_bindings.push_back(runtime.motion_binding);
+  });
+  auto *const root = changed.cell_runtime_root != nullptr
+                         ? changed.cell_runtime_root
+                         : &changed;
+  for (const auto &gripper : root->independent_gripper_peers) {
+    if (gripper == nullptr)
+      throw std::logic_error("cell route has a missing independent gripper");
+    const auto aliases = gripper->registrations();
+    result.registrations.insert(result.registrations.end(), aliases.begin(), aliases.end());
+    result.physical_bindings.push_back(gripper->binding());
+  }
+  return result;
+}
+
+} // namespace
+
+void RetainedExecutionHost::BindCellRuntimeOwner(
+    RetainedCellRuntime& cell, const std::string& /*runtime_epoch*/,
+    const std::string& cell_id) {
+  auto& runtime = *this;
+  auto* const stable_kernel_owner = &cell.addressed_kernel();
+  auto* const stable_operation_journal = &cell.operation_journal();
+  runtime.cell_addressed_kernel = stable_kernel_owner;
+  runtime.cell_operation_journal = stable_operation_journal;
+  runtime.addressed_request_owner_epoch =
+      stable_kernel_owner->request_owner_epoch();
+  runtime.addressed_cell_id = core::CellId(cell_id);
+  const auto seed_current_policy = [&](RetainedExecutionHost &component) {
+    for (auto &row : component.participant_registrations) {
+      row.motion_takeover_preparation_budget_s =
+          current_cell_takeover_budget(&cell, row.binding);
+      row.motion_takeover_planning_budget_s = current_cell_takeover_budget(
+          &cell, row.binding,
+          &core::RuntimeParticipantExecutionRegistration::
+              motion_takeover_planning_budget_s);
+    }
+  };
+  seed_current_policy(runtime);
+  for (const auto &peer : runtime.participant_peers) {
+    peer->cell_addressed_kernel = stable_kernel_owner;
+    peer->cell_operation_journal = stable_operation_journal;
+    peer->addressed_request_owner_epoch =
+        runtime.addressed_request_owner_epoch;
+    peer->addressed_cell_id = runtime.addressed_cell_id;
+    seed_current_policy(*peer);
+  }
+}
+
+void RetainedExecutionHost::AdoptVerifiedParticipantResolverFactory(
+    RetainedRuntimeParticipantResolverFactory &&factory) {
+  auto *root = cell_runtime_root != nullptr ? cell_runtime_root : this;
+  std::lock_guard lock(root->route_publication_mutex_);
+  root->participant_resolver_factory.swap(factory);
+}
+
+void RetainedExecutionHost::BindIndependentGripperPeers(
+    const std::shared_ptr<RetainedExecutionHost>& root,
+    std::vector<std::shared_ptr<RetainedGripperRuntime>> peers) {
+  if (root.get() != this)
+    throw std::invalid_argument("scalar topology must bind its exact retained root");
+  std::lock_guard lock(route_publication_mutex_);
+  independent_gripper_peers.swap(peers);
+  installed_self_ = root;
+}
+
+core::Result<std::shared_ptr<RetainedGripperRoutePublicationOwner>>
+RetainedExecutionHost::CurrentIndependentGripperRouteOwner(const core::ControlDomainId& domain) const {
+  using Result = core::Result<std::shared_ptr<RetainedGripperRoutePublicationOwner>>;
+  std::lock_guard lock(route_publication_mutex_);
+  std::shared_ptr<RetainedGripperRuntime> selected;
+  for (const auto& gripper : independent_gripper_peers) {
+    if (!gripper) return Result::Err({"missing_reference", "installed scalar peer is absent", {}});
+    const auto binding = gripper->binding();
+    if (!binding.value().control_path || binding.value().control_path->control_domain_id != domain) continue;
+    if (selected) return Result::Err({"invalid_request", "scalar domain has multiple actual owners", {}});
+    selected = gripper;
+  }
+  if (!selected) return Result::Ok(nullptr);
+  bool arm_owns_domain = false;
+  const auto note_arm_domains = [&](const RetainedExecutionHost& runtime) {
+    for (const auto& binding : runtime.control_binding_representatives)
+      if (binding.value().control_path && binding.value().control_path->control_domain_id == domain)
+        arm_owns_domain = true;
+  };
+  note_arm_domains(*this);
+  for (const auto& peer : participant_peers) note_arm_domains(*peer);
+  if (arm_owns_domain) return Result::Err(
+      {"invalid_request", "scalar domain aliases an existing arm-component owner", {}});
+  auto root = installed_self_.lock();
+  if (!root || root.get() != this || !root->cell_runtime_owner || !root->clock ||
+      root->cell_addressed_kernel != &root->cell_runtime_owner->addressed_kernel())
+    return Result::Err({"missing_reference", "scalar route lost its exact installed root", {}});
+  const std::weak_ptr<RetainedExecutionHost> weak_root = root;
+  auto candidate = [weak_root, selected](const auto&, const auto& replacement)
+      -> core::Result<RetainedGripperRoutePublicationOwner::KernelCandidate> {
+    using CandidateResult = core::Result<RetainedGripperRoutePublicationOwner::KernelCandidate>;
+    // The route owner has reacquired this same mutex and verified the selected
+    // installed owner before any physical rebind. Re-read current data here;
+    // no captured predecessor bundle/model/factory survives an Apply.
+    auto current = weak_root.lock();
+    if (!current || !current->cell_runtime_owner || !current->participant_resolver_factory ||
+        std::count(current->independent_gripper_peers.begin(), current->independent_gripper_peers.end(), selected) != 1)
+      return CandidateResult::Err({"missing_reference", "scalar candidate lost its installed owner or factory", {}});
+    auto rows = current->cell_runtime_owner->participant_registrations();
+    if (replacement.size() != selected->registrations().size())
+      return CandidateResult::Err({"missing_reference", "scalar candidate omits installed aliases", {}});
+    for (const auto& next : replacement) {
+      const auto old = std::find_if(rows.begin(), rows.end(), [&](const auto& row) {
+        return row.engine == selected->participant_engine() &&
+               row.binding.value().controllable_component_id == next.binding.value().controllable_component_id &&
+               row.binding.value().command_target_id == next.binding.value().command_target_id &&
+               row.binding.value().control_path && next.binding.value().control_path &&
+               row.binding.value().control_path->control_binding_id == next.binding.value().control_path->control_binding_id &&
+               row.binding.value().capability_id == next.binding.value().capability_id;
+      });
+      if (old == rows.end()) return CandidateResult::Err(
+          {"missing_reference", "scalar candidate has no actual installed registration", {}});
+      *old = next;
+    }
+    const auto primary = std::find_if(replacement.begin(), replacement.end(), [&](const auto& row) {
+      return row.binding.value().capability_id == selected->binding().value().capability_id;
+    });
+    if (primary == replacement.end()) return CandidateResult::Err(
+        {"missing_reference", "scalar candidate has no primary command registration", {}});
+    auto binding_resolver = current->participant_resolver_factory(composed_bindings(rows));
+    if (!binding_resolver) return CandidateResult::Err(
+        {"missing_reference", "current scalar participant resolver factory returned no resolver", {}});
+    auto resolver = make_retained_cell_kernel_participant_resolver(std::move(binding_resolver), rows);
+    auto cache = rows;
+    auto cached_resolver = resolver;
+    std::function<void()> adopt = [current = std::move(current), cache = std::move(cache),
+        cached_resolver = std::move(cached_resolver)]() mutable noexcept {
+      current->participant_registrations.swap(cache);
+      current->participant_resolver.swap(cached_resolver);
+    };
+    return CandidateResult::Ok({std::move(rows), std::move(resolver), std::move(adopt)});
+  };
+  auto route = std::make_shared<RetainedGripperRoutePublicationOwner>(
+      selected, *root->clock, *root->cell_addressed_kernel, std::move(candidate), root->cell_runtime_owner);
+  route->BindMotionRoot(root);
+  return Result::Ok(std::move(route));
+}
+
+core::Result<std::vector<core::RuntimeParticipantBinding>>
+RetainedExecutionHost::ReadCurrentPhysicalParticipants(
+    const core::ActiveControlConfigurationDTO &configuration) const {
+  if (!configuration.locally_valid() ||
+      configuration.state !=
+          core::ActiveControlConfigurationStateDTO::kReconciled) {
+    return route_publication_error<
+        std::vector<core::RuntimeParticipantBinding>>(
+        "route_publication_configuration_invalid",
+        "native route publication requested an invalid configuration",
+        core::ErrorCode::kInvalidRequest);
+  }
+  const auto* root = cell_runtime_root != nullptr ? cell_runtime_root : this;
+  auto scalar = root->CurrentIndependentGripperRouteOwner(configuration.control_domain_id);
+  if (!scalar.ok()) return core::Result<std::vector<core::RuntimeParticipantBinding>>::Err(scalar.error());
+  if (scalar.value()) return scalar.value()->ReadCurrentPhysicalParticipants(configuration);
+
+  const auto owns_domain = [&](const auto &runtime) {
+    return std::any_of(
+        runtime.control_binding_representatives.begin(),
+        runtime.control_binding_representatives.end(), [&](const auto &binding) {
+          return binding.value().control_path.has_value() &&
+                 binding.value().control_path->control_domain_id ==
+                     configuration.control_domain_id;
+        });
+  };
+  if (!owns_domain(*this)) {
+    const auto peer = std::find_if(
+        participant_peers.begin(), participant_peers.end(),
+        [&](const auto &candidate) { return owns_domain(*candidate); });
+    if (peer != participant_peers.end())
+      return (*peer)->ReadCurrentPhysicalParticipants(configuration);
+  }
+  auto *const cell_root = cell_runtime_root != nullptr ? cell_runtime_root
+                                                       : const_cast<RetainedExecutionHost *>(this);
+  std::lock_guard lock(cell_root->route_publication_mutex_);
+  std::vector<core::RuntimeParticipantBinding> result;
+  result.reserve(configuration.binding_routes.size());
+  for (const auto &selected : configuration.binding_routes) {
+    const core::RuntimeParticipantBinding *physical = nullptr;
+    for (const auto &candidate : control_binding_representatives) {
+      if (!candidate.value().control_path.has_value()) {
+        continue;
+      }
+      const auto &path = *candidate.value().control_path;
+      if (path.control_domain_id != configuration.control_domain_id ||
+          path.control_binding_id != selected.control_binding_id ||
+          path.control_binding_revision != selected.control_binding_revision) {
+        continue;
+      }
+      if (physical != nullptr) {
+        return route_publication_error<
+            std::vector<core::RuntimeParticipantBinding>>(
+            "route_publication_physical_binding_ambiguous",
+            "execution host has multiple physical owners for one binding");
+      }
+      physical = &candidate;
+    }
+    if (physical == nullptr) {
+      return route_publication_error<
+          std::vector<core::RuntimeParticipantBinding>>(
+          "route_publication_physical_binding_missing",
+          "execution host omits a selected physical binding",
+          core::ErrorCode::kMissingReference);
+    }
+    result.push_back(*physical);
+  }
+  return core::Result<std::vector<core::RuntimeParticipantBinding>>::Ok(
+      std::move(result));
+}
+
+core::Result<std::optional<core::ActiveControlConfigurationDTO>>
+RetainedExecutionHost::ReadCurrentPublishedRouteConfiguration(
+    const core::ControlDomainId &control_domain_id) const {
+  auto *const kernel = cell_addressed_kernel;
+  if (kernel == nullptr) {
+    return route_publication_error<
+        std::optional<core::ActiveControlConfigurationDTO>>(
+        "route_publication_kernel_missing",
+        "native route current-fact read has no stable Kernel owner",
+        core::ErrorCode::kMissingReference);
+  }
+  const auto readback =
+      kernel->current_runtime_route_configuration(control_domain_id);
+  if (!readback.ok()) {
+    return core::Result<std::optional<core::ActiveControlConfigurationDTO>>::
+        Err(readback.error());
+  }
+  if (!readback.value().has_value()) {
+    return core::Result<std::optional<core::ActiveControlConfigurationDTO>>::Ok(
+        std::nullopt);
+  }
+  return core::Result<std::optional<core::ActiveControlConfigurationDTO>>::Ok(
+      readback.value()->active_configuration);
+}
+
+namespace {
+
+template <typename Value>
+core::Result<Value> measured_source_unavailable(std::string reason,
+                                                std::string message) {
+  return core::Result<Value>::Err({"runtime_measured_source_unavailable",
+                                   std::move(message),
+                                   {{"reason", std::move(reason)}}});
+}
+
+// Caller holds the existing cell route-publication exclusion. Include every
+// registered domain, not just the operation's selected motion participant.
+using MeasuredRouteReadbacks = std::vector<
+    std::pair<core::ControlDomainId,
+              std::optional<core::RuntimeRouteConfigurationReadbackDTO>>>;
+
+core::Result<MeasuredRouteReadbacks>
+measured_route_readbacks(const RetainedExecutionHost &runtime) {
+  using Result = core::Result<MeasuredRouteReadbacks>;
+  const auto *root = runtime.cell_runtime_root != nullptr
+                         ? runtime.cell_runtime_root
+                         : &runtime;
+  auto *kernel = root->cell_addressed_kernel;
+  if (kernel == nullptr)
+    return measured_source_unavailable<MeasuredRouteReadbacks>(
+        "measured_kernel_missing", "Measured routes have no current Kernel");
+  std::set<core::ControlDomainId> domains;
+  const auto add = [&](const auto &binding) {
+    if (binding.value().control_path)
+      domains.insert(binding.value().control_path->control_domain_id);
+  };
+  for (const auto &row : root->participant_registrations)
+    add(row.binding);
+  for (const auto &row : runtime.control_binding_representatives)
+    add(row);
+  add(runtime.motion_binding);
+  MeasuredRouteReadbacks result;
+  result.reserve(domains.size());
+  for (const auto &domain : domains) {
+    auto current = kernel->current_runtime_route_configuration(domain);
+    if (!current.ok())
+      return Result::Err(current.error());
+    // Missing route truth remains part of the authenticated closure. It does
+    // not make an unrelated component's existing route publication fail.
+    result.emplace_back(domain, std::move(current.value()));
+  }
+  return Result::Ok(std::move(result));
+}
+
+std::vector<core::ActiveControlConfigurationDTO>
+measured_configurations(const MeasuredRouteReadbacks &readbacks) {
+  std::vector<core::ActiveControlConfigurationDTO> result;
+  result.reserve(readbacks.size());
+  for (const auto &[domain, row] : readbacks)
+    if (row)
+      result.push_back(row->active_configuration);
+  return result;
+}
+
+bool measured_physical_scope_matches(
+    const RetainedExecutionHost &runtime,
+    const core::RuntimeParticipantBinding &motion,
+    const std::vector<core::RuntimeParticipantBinding> &representatives) {
+  if (runtime.motion_binding.value() != motion.value() ||
+      runtime.control_binding_representatives.size() != representatives.size())
+    return false;
+  for (std::size_t i = 0; i < representatives.size(); ++i)
+    if (runtime.control_binding_representatives[i].value() !=
+        representatives[i].value())
+      return false;
+  return true;
+}
+
+core::Result<void> validate_prepared_measured_sources(
+    const RetainedPreparedRobotMeasuredSources &prepared,
+    const core::RuntimeParticipantBinding &motion,
+    const std::vector<core::ActiveControlConfigurationDTO> &configurations) {
+  return ValidateRetainedPreparedMeasuredSources(
+      prepared, motion.value().controllable_component_id,
+      std::span<const core::RuntimeParticipantBinding>(&motion, 1U), configurations);
+}
+
+void enable_prepared_measured_sources(
+    const RetainedPreparedRobotMeasuredSources &prepared) noexcept {
+  // Composition supplies the actual no-throw gate. A throwing callback violates
+  // that construction contract and cannot become a partial association commit.
+  prepared.enable_publication();
+}
+
+} // namespace
+
+core::Result<void> ValidateRetainedPreparedMeasuredSources(
+    const RetainedPreparedRobotMeasuredSources &prepared,
+    const core::ControllableComponentId &component,
+    std::span<const core::RuntimeParticipantBinding> physical_bindings,
+    const std::vector<core::ActiveControlConfigurationDTO> &configurations) {
+  const auto unavailable = [] {
+    return measured_source_unavailable<void>(
+        "measured_prepared_scope_mismatch",
+        "Prepared sources cross their physical route");
+  };
+  if (!prepared.enable_publication ||
+      prepared.source_view.component_id !=
+          component)
+    return unavailable();
+  for (const auto &source : prepared.source_view.sources) {
+    auto valid = source.descriptor.validate();
+    if (!valid.ok())
+      return valid;
+    const auto &query = source.descriptor.publication.query_context;
+    const auto matches = [&](const core::RuntimeParticipantBinding &binding) {
+      const auto &value = binding.value();
+      if (!value.control_path)
+        return false;
+      const auto &path = *value.control_path;
+      if (query.controllable_component_id != value.controllable_component_id ||
+          query.command_target_id != value.command_target_id ||
+          query.capability_id != value.capability_id ||
+          query.control_domain_id != path.control_domain_id ||
+          query.control_domain_revision != path.control_domain_revision ||
+          query.control_binding_id != path.control_binding_id ||
+          query.control_binding_revision != path.control_binding_revision ||
+          query.controller_topology_id != path.controller_topology_id ||
+          query.topology_revision != path.topology_revision ||
+          query.control_route_id != path.control_route_id ||
+          query.control_interface_contract_id !=
+              path.control_interface_contract_id ||
+          query.control_interface_revision != path.control_interface_revision ||
+          query.active_control_configuration_id !=
+              path.active_control_configuration_id ||
+          query.active_control_configuration_generation !=
+              path.active_control_configuration_generation ||
+          query.provider_instance_id != path.provider_instance_id ||
+          query.provider_manifest_id != path.provider_manifest_id ||
+          query.provider_manifest_revision != path.provider_manifest_revision ||
+          query.runtime_epoch != path.provider_runtime_epoch ||
+          query.resources.size() != value.resources.size())
+        return false;
+      for (std::size_t i = 0; i < value.resources.size(); ++i) {
+        const auto &resource = value.resources[i];
+        if (query.resources[i] != resource.resource_id ||
+            query.joint_names[i] != resource.compiled_resource_name ||
+            query.coordinate_kinds[i] != resource.coordinate_kind ||
+            !resource.source_joint_name ||
+            source.descriptor.source_joint_names[i] !=
+                *resource.source_joint_name)
+          return false;
+      }
+      return std::any_of(
+          configurations.begin(), configurations.end(),
+          [&](const auto &configuration) {
+            return configuration.control_domain_id == path.control_domain_id &&
+                   configuration.control_domain_revision ==
+                       path.control_domain_revision &&
+                   configuration.active_control_configuration_id ==
+                       path.active_control_configuration_id &&
+                   configuration.active_control_configuration_generation ==
+                       path.active_control_configuration_generation &&
+                   configuration.controller_topology_id ==
+                       path.controller_topology_id &&
+                   configuration.topology_revision == path.topology_revision &&
+                   configuration.activation_set_id == path.activation_set_id &&
+                   configuration.source_runtime_unit_id ==
+                       path.provider_runtime_unit_id &&
+                   configuration.source_runtime_epoch ==
+                       path.provider_runtime_epoch &&
+                   configuration.state ==
+                       core::ActiveControlConfigurationStateDTO::kReconciled &&
+                   std::any_of(configuration.binding_routes.begin(),
+                               configuration.binding_routes.end(),
+                               [&](const auto &route) {
+                                 return route.control_binding_id ==
+                                            path.control_binding_id &&
+                                        route.control_binding_revision ==
+                                            path.control_binding_revision &&
+                                        route.control_route_id ==
+                                            path.control_route_id;
+                               });
+          });
+    };
+    if (std::none_of(physical_bindings.begin(), physical_bindings.end(), matches))
+      return unavailable();
+  }
+  return core::Result<void>::Ok();
+}
+
+
+
+core::Result<core::RobotMeasuredStateSourceView>
+RetainedExecutionHost::PrepareCurrentMeasuredSources() {
+  using Result = core::Result<core::RobotMeasuredStateSourceView>;
+  // Owning holders precede the exclusion so every return/exception releases
+  // subscriptions and their shared clocks only after the route lock retires.
+  std::shared_ptr<const RetainedPreparedRobotMeasuredSources> previous;
+  std::shared_ptr<const RetainedPreparedRobotMeasuredSources> candidate;
+  RetainedRobotMeasuredSourcePreparer preparer;
+  auto *root = cell_runtime_root != nullptr ? cell_runtime_root : this;
+  std::unique_lock lock(root->route_publication_mutex_);
+  if (!prepare_measured_sources)
+    return measured_source_unavailable<core::RobotMeasuredStateSourceView>(
+        "measured_preparer_missing",
+        "The runtime has no measured producer preparer");
+  try {
+    preparer = prepare_measured_sources;
+    previous = prepared_measured_sources_;
+    const auto motion = motion_binding;
+    const auto representatives = control_binding_representatives;
+    auto readbacks = measured_route_readbacks(*this);
+    if (!readbacks.ok())
+      return Result::Err(readbacks.error());
+    auto configurations = measured_configurations(readbacks.value());
+    lock.unlock();
+    auto staged = preparer(motion, configurations);
+    if (!staged.ok())
+      return Result::Err(staged.error());
+    candidate = std::move(staged.value());
+    std::optional<core::RobotMeasuredStateSourceView> source_view;
+    if (candidate) {
+      auto valid = validate_prepared_measured_sources(*candidate, motion,
+                                                      configurations);
+      if (!valid.ok())
+        return Result::Err(valid.error());
+      source_view = candidate->source_view;
+    }
+    if ((cell_runtime_root != nullptr ? cell_runtime_root : this) != root)
+      return measured_source_unavailable<core::RobotMeasuredStateSourceView>(
+          "measured_source_association_changed",
+          "Measured cell root changed while preparing sources");
+    lock.lock();
+    auto current = measured_route_readbacks(*this);
+    if (!current.ok())
+      return Result::Err(current.error());
+    if (prepared_measured_sources_ != previous ||
+        !measured_physical_scope_matches(*this, motion, representatives) ||
+        current.value() != readbacks.value())
+      return measured_source_unavailable<core::RobotMeasuredStateSourceView>(
+          "measured_source_association_changed",
+          "Measured route changed while preparing sources");
+    prepared_measured_sources_.swap(candidate);
+    if (prepared_measured_sources_)
+      enable_prepared_measured_sources(*prepared_measured_sources_);
+    lock.unlock();
+    if (!source_view)
+      return measured_source_unavailable<core::RobotMeasuredStateSourceView>(
+          "measured_prepared_sources_missing",
+          "Current measured sources are unavailable");
+    return Result::Ok(std::move(*source_view));
+  } catch (const std::exception &exception) {
+    return measured_source_unavailable<core::RobotMeasuredStateSourceView>(
+        "measured_source_preparation_failed", exception.what());
+  } catch (...) {
+    return measured_source_unavailable<core::RobotMeasuredStateSourceView>(
+        "measured_source_preparation_failed",
+        "Measured source preparation failed");
+  }
+}
+
+std::optional<core::RequiredRobotMeasuredStateSource>
+RetainedExecutionHost::TryReadMotionMeasuredSource() const {
+  const auto *root = cell_runtime_root != nullptr ? cell_runtime_root : this;
+  std::unique_lock lock(root->route_publication_mutex_, std::try_to_lock);
+  if (!lock.owns_lock() || !prepared_measured_sources_)
+    return std::nullopt;
+  const auto &motion = motion_binding.value();
+  for (const auto &source : prepared_measured_sources_->source_view.sources) {
+    const auto &query = source.descriptor.publication.query_context;
+    if (source.reader &&
+        query.controllable_component_id == motion.controllable_component_id &&
+        query.command_target_id == motion.command_target_id)
+      return source;
+  }
+  return std::nullopt;
+}
+
+std::vector<core::RuntimeParticipantBinding>
+RetainedExecutionHost::CurrentPhysicalBindings() const {
+  const auto *const cell_root =
+      cell_runtime_root != nullptr ? cell_runtime_root : this;
+  std::lock_guard lock(cell_root->route_publication_mutex_);
+  return {motion_binding};
+}
+
+core::Result<core::RuntimeRouteConfigurationReadbackDTO>
+RetainedExecutionHost::PublishAndReadBackRouteConfiguration(
+    const core::ActiveControlConfigurationDTO &configuration,
+    std::vector<RouteReadinessParticipant> participants) {
+  if (!configuration.locally_valid()) {
+    return route_publication_error<core::RuntimeRouteConfigurationReadbackDTO>(
+        "route_publication_configuration_invalid",
+        "native route publication has an invalid configuration",
+        core::ErrorCode::kInvalidRequest);
+  }
+  const auto* root = cell_runtime_root != nullptr ? cell_runtime_root : this;
+  auto scalar = root->CurrentIndependentGripperRouteOwner(configuration.control_domain_id);
+  if (!scalar.ok()) return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(scalar.error());
+  if (scalar.value()) return scalar.value()->PublishAndReadBackRouteConfiguration(configuration, std::move(participants));
+
+  const auto owns_domain = [&](const auto &runtime) {
+    return std::any_of(
+        runtime.control_binding_representatives.begin(),
+        runtime.control_binding_representatives.end(), [&](const auto &binding) {
+          return binding.value().control_path.has_value() &&
+                 binding.value().control_path->control_domain_id ==
+                     configuration.control_domain_id;
+        });
+  };
+  if (!owns_domain(*this)) {
+    const auto peer = std::find_if(
+        participant_peers.begin(), participant_peers.end(),
+        [&](const auto &candidate) { return owns_domain(*candidate); });
+    if (peer != participant_peers.end())
+      return (*peer)->PublishAndReadBackRouteConfiguration(
+          configuration, std::move(participants));
+  }
+  std::shared_ptr<const RetainedPreparedRobotMeasuredSources>
+      candidate_measured_sources;
+  std::shared_ptr<const RetainedPreparedRobotMeasuredSources>
+      previous_measured_sources;
+  RetainedRobotMeasuredSourcePreparer measured_preparer;
+  core::RuntimeParticipantAdmissionResolver staged_root_resolver;
+  core::RuntimeParticipantAdmissionResolver displaced_local_resolver;
+  auto *const cell_root = cell_runtime_root != nullptr ? cell_runtime_root : this;
+  std::unique_lock lock(cell_root->route_publication_mutex_);
+  auto *const kernel = cell_addressed_kernel;
+  if (kernel == nullptr || participant_engine == nullptr) {
+    return route_publication_error<core::RuntimeRouteConfigurationReadbackDTO>(
+        "route_publication_kernel_missing",
+        "native route publication has no stable addressed Kernel owner",
+        core::ErrorCode::kMissingReference);
+  }
+
+  if (configuration.state == core::ActiveControlConfigurationStateDTO::
+                                 kExternalOrUnknownUnreconciled) {
+    if (!participants.empty()) {
+      return route_publication_error<
+          core::RuntimeRouteConfigurationReadbackDTO>(
+          "route_publication_unreconciled_participants_present",
+          "unreconciled route publication contains readiness participants",
+          core::ErrorCode::kInvalidRequest);
+    }
+    auto published =
+        kernel->publish_runtime_route_configuration(configuration);
+    if (!published.ok()) {
+      return published;
+    }
+    return kernel->runtime_route_configuration_readback(
+        configuration.control_domain_id,
+        configuration.active_control_configuration_id,
+        configuration.active_control_configuration_generation);
+  }
+  if (configuration.state !=
+          core::ActiveControlConfigurationStateDTO::kReconciled ||
+      participants.size() != configuration.binding_routes.size()) {
+    return route_publication_error<core::RuntimeRouteConfigurationReadbackDTO>(
+        "route_publication_participant_set_invalid",
+        "reconciled route publication has an incomplete participant set",
+        core::ErrorCode::kInvalidRequest);
+  }
+
+  try {
+    auto next_motion = motion_binding;
+    auto next_representatives = control_binding_representatives;
+    std::map<core::ControlBindingId,
+             std::optional<core::RuntimeParticipantStopReadiness>>
+        readiness_by_binding;
+    std::optional<core::RuntimeParticipantPolicySelection>
+        motion_participant_policy;
+    const auto current_registration =
+        [&](const core::RuntimeParticipantBinding &binding)
+        -> const core::RuntimeParticipantExecutionRegistration * {
+      const auto found = std::find_if(
+          participant_registrations.begin(), participant_registrations.end(),
+          [&](const auto &candidate) {
+            return candidate.binding.value() == binding.value();
+          });
+      return found == participant_registrations.end() ? nullptr : &*found;
+    };
+    for (const auto &representative : control_binding_representatives) {
+      const auto *current = current_registration(representative);
+      if (current == nullptr ||
+          !representative.value().control_path.has_value()) {
+        throw std::logic_error(
+            "native control representative has no current registration");
+      }
+      readiness_by_binding.emplace(
+          representative.value().control_path->control_binding_id,
+          current->stop_readiness);
+    }
+    if (const auto *current = current_registration(motion_binding);
+        current != nullptr) {
+      motion_participant_policy = current->participant_policy;
+    }
+
+    std::set<core::ControlBindingId> supplied_bindings;
+    for (auto &participant : participants) {
+      const auto &value = participant.participant_binding.value();
+      if (!value.control_path.has_value() ||
+          value.control_path->control_domain_id !=
+              configuration.control_domain_id ||
+          participant.readiness_row.control_binding_id !=
+              value.control_path->control_binding_id ||
+          participant.readiness_row.control_binding_revision !=
+              value.control_path->control_binding_revision ||
+          participant.readiness_row.controllable_component_id !=
+              value.controllable_component_id ||
+          participant.readiness_row.resolved_stop_base_plan_id !=
+              participant.stop_readiness.value()
+                  .resolved_stop_base_plan.resolved_stop_base_plan_id ||
+          !supplied_bindings.insert(value.control_path->control_binding_id)
+               .second) {
+        return route_publication_error<
+            core::RuntimeRouteConfigurationReadbackDTO>(
+            "route_publication_participant_referent_mismatch",
+            "route readiness participant differs from its publication row");
+      }
+      const auto current = std::find_if(
+          control_binding_representatives.begin(),
+          control_binding_representatives.end(), [&](const auto &candidate) {
+            return represents_binding(
+                candidate, value.control_path->control_binding_id,
+                value.control_path->control_binding_revision);
+          });
+      if (current == control_binding_representatives.end() ||
+          std::find_if(std::next(current),
+                       control_binding_representatives.end(),
+                       [&](const auto &candidate) {
+                         return represents_binding(
+                             candidate, value.control_path->control_binding_id,
+                             value.control_path->control_binding_revision);
+                       }) != control_binding_representatives.end()) {
+        return route_publication_error<
+            core::RuntimeRouteConfigurationReadbackDTO>(
+            "route_publication_physical_binding_mismatch",
+            "route readiness participant has no sole control representative");
+      }
+      const auto index = static_cast<std::size_t>(
+          std::distance(control_binding_representatives.begin(), current));
+      if (current->value() == motion_binding.value())
+        next_motion = participant.participant_binding;
+      readiness_by_binding.at(value.control_path->control_binding_id) =
+          std::move(participant.stop_readiness);
+      next_representatives[index] = std::move(participant.participant_binding);
+    }
+    if (supplied_bindings.size() != configuration.binding_routes.size() ||
+        std::any_of(configuration.binding_routes.begin(),
+                    configuration.binding_routes.end(), [&](const auto &row) {
+                      return !supplied_bindings.contains(
+                          row.control_binding_id);
+                    })) {
+      return route_publication_error<
+          core::RuntimeRouteConfigurationReadbackDTO>(
+          "route_publication_selected_binding_missing",
+          "route readiness omits one selected physical binding",
+          core::ErrorCode::kMissingReference);
+    }
+
+    const auto readiness_for_binding = [&](const auto &binding) {
+      return readiness_by_binding.at(
+          binding.value().control_path->control_binding_id);
+    };
+    const auto motion_readiness = readiness_for_binding(next_motion);
+
+    std::vector<core::RuntimeParticipantBinding> next_motion_aliases;
+    next_motion_aliases.reserve(motion_binding_aliases.size());
+    for (const auto &alias : motion_binding_aliases) {
+      auto rebound =
+          rebase_program_alias(alias, motion_binding, next_motion);
+      if (!rebound.ok()) {
+        return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
+            rebound.error());
+      }
+      next_motion_aliases.push_back(std::move(rebound.value()));
+    }
+
+    std::vector<core::RuntimeParticipantExecutionRegistration> registrations;
+    registrations.reserve(next_representatives.size() +
+                          next_motion_aliases.size());
+    for (const auto &representative : next_representatives) {
+      if (!retained_bindings_share_backend_owner(next_motion, representative)) {
+        return route_publication_error<
+            core::RuntimeRouteConfigurationReadbackDTO>(
+            "route_publication_backend_owner_mismatch",
+            "rebound control representative has no sole backend owner");
+      }
+      const bool primary = representative.value() == next_motion.value();
+      registrations.push_back(runtime_registration(
+          *this, representative, readiness_for_binding(representative),
+          participant_engine.get(),
+          static_cast<core::IControlDomainExecutionPort *>(execution.get()),
+          primary ? motion_participant_policy : std::nullopt,
+          motion_operator_stop_profile, motion_fault_stop_profile,
+          deployment_maximum_tcp_linear_speed_mps,
+          motion_fault_stop_profile_from_deployment));
+    }
+    for (const auto &alias : next_motion_aliases) {
+      registrations.push_back(runtime_registration(
+          *this, alias, motion_readiness, participant_engine.get(),
+          execution.get(), motion_participant_policy,
+          motion_operator_stop_profile, motion_fault_stop_profile,
+          deployment_maximum_tcp_linear_speed_mps,
+          motion_fault_stop_profile_from_deployment));
+    }
+
+    auto local_registrations = registrations;
+    auto cell_participants = compose_cell_participants(
+        *this, registrations, next_motion);
+    registrations = std::move(cell_participants.registrations);
+    std::vector<core::RuntimeParticipantExecutionRegistration>
+        cell_physical_registrations;
+    for (const auto &physical_binding : cell_participants.physical_bindings) {
+      const auto registration = std::find_if(
+          registrations.begin(), registrations.end(), [&](const auto &candidate) {
+            return candidate.binding.value() == physical_binding.value();
+          });
+      if (registration == registrations.end()) {
+        return route_publication_error<core::RuntimeRouteConfigurationReadbackDTO>(
+            "route_publication_physical_binding_missing",
+            "cell route publication has no physical participant registration");
+      }
+      cell_physical_registrations.push_back(*registration);
+    }
+    auto rebuilt_resolver = rebuild_participant_resolver(
+        cell_root->participant_resolver_factory,
+        static_cast<bool>(cell_root->participant_resolver), registrations,
+        std::move(cell_physical_registrations),
+        ParticipantResolverRebuildPurpose::kRoutePublication);
+    if (!rebuilt_resolver.ok()) {
+      return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
+          std::move(rebuilt_resolver.error()));
+    }
+    auto kernel_resolver = std::move(rebuilt_resolver.value());
+    if (cell_root != this)
+      staged_root_resolver = kernel_resolver;
+
+    const auto old_motion = motion_binding;
+    const auto old_representatives = control_binding_representatives;
+    if (prepare_measured_sources) {
+      measured_preparer = prepare_measured_sources;
+      previous_measured_sources = prepared_measured_sources_;
+      auto before = measured_route_readbacks(*this);
+      if (!before.ok())
+        return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
+            before.error());
+      auto configurations = measured_configurations(before.value());
+      const auto selected = std::find_if(
+          configurations.begin(), configurations.end(), [&](const auto &row) {
+            return row.control_domain_id == configuration.control_domain_id;
+          });
+      if (selected == configurations.end())
+        configurations.push_back(configuration);
+      else
+        *selected = configuration;
+      lock.unlock();
+      auto staged =
+          measured_preparer(next_motion, configurations);
+      if (!staged.ok())
+        return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
+            staged.error());
+      candidate_measured_sources = std::move(staged.value());
+      if (candidate_measured_sources) {
+        auto valid = validate_prepared_measured_sources(
+            *candidate_measured_sources, next_motion, configurations);
+        if (!valid.ok())
+          return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
+              valid.error());
+      }
+      if ((cell_runtime_root != nullptr ? cell_runtime_root : this) !=
+          cell_root)
+        return measured_source_unavailable<
+            core::RuntimeRouteConfigurationReadbackDTO>(
+            "measured_source_association_changed",
+            "Measured cell root changed while staging a successor");
+      lock.lock();
+      auto current = measured_route_readbacks(*this);
+      if (!current.ok())
+        return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Err(
+            current.error());
+      if (prepared_measured_sources_ != previous_measured_sources ||
+          !measured_physical_scope_matches(*this, old_motion,
+                                           old_representatives) ||
+          current.value() != before.value())
+        return measured_source_unavailable<
+            core::RuntimeRouteConfigurationReadbackDTO>(
+            "measured_source_association_changed",
+            "Measured route changed while staging a successor");
+    }
+    const auto transition_time_ns = clock->now();
+    bool motion_rebound = false;
+    const auto rollback_physical_route = [&]() noexcept {
+      try {
+        if (motion_rebound && execution != nullptr) {
+          const auto now_ns = clock->now();
+          if (motion_state_channel->RebindRoute(old_motion, now_ns).ok()) {
+            static_cast<void>(
+                rebind_motion_route(old_motion, motion_binding_aliases));
+          }
+        }
+      } catch (...) {
+      }
+    };
+    if (next_motion.value() != motion_binding.value()) {
+      auto rebound =
+          motion_state_channel->RebindRoute(next_motion, transition_time_ns);
+      if (!rebound.ok()) {
+        return route_publication_error<
+            core::RuntimeRouteConfigurationReadbackDTO>(
+            "route_publication_motion_state_rebind_failed",
+            rebound.error().message);
+      }
+      motion_rebound = true;
+      rebound = rebind_motion_route(next_motion, next_motion_aliases);
+      if (!rebound.ok()) {
+        rollback_physical_route();
+        return route_publication_error<
+            core::RuntimeRouteConfigurationReadbackDTO>(
+            "route_publication_motion_backend_rebind_failed",
+            rebound.error().message);
+      }
+    }
+    // Stage the stable cell-owner snapshot before changing Kernel state.
+    // Its later adoption is a no-throw swap under the same route fence.
+    std::vector<core::RuntimeParticipantExecutionRegistration>
+        stable_cell_registrations;
+    core::RuntimeParticipantAdmissionResolver stable_cell_resolver;
+    if (cell_root->cell_runtime_owner != nullptr) {
+      stable_cell_registrations = registrations;
+      stable_cell_resolver = kernel_resolver;
+    }
+    auto root_physical_cache = registrations;
+    auto published = kernel->publish_runtime_route_configuration(
+        configuration, registrations, kernel_resolver);
+    if (!published.ok()) {
+      rollback_physical_route();
+      return published;
+    }
+    auto readback = kernel->runtime_route_configuration_readback(
+        configuration.control_domain_id,
+        configuration.active_control_configuration_id,
+        configuration.active_control_configuration_generation);
+    if (!readback.ok() || readback.value() != published.value()) {
+      rollback_physical_route();
+      return route_publication_error<
+          core::RuntimeRouteConfigurationReadbackDTO>(
+          "route_publication_independent_readback_mismatch",
+          "native Kernel readback differs from its route publication");
+    }
+
+    motion_binding = std::move(next_motion);
+    motion_binding_aliases = std::move(next_motion_aliases);
+    control_binding_representatives = std::move(next_representatives);
+    if (cell_root == this) {
+      participant_registrations.swap(root_physical_cache);
+    } else {
+      participant_registrations.swap(local_registrations);
+      cell_root->participant_registrations.swap(root_physical_cache);
+    }
+    participant_resolver.swap(kernel_resolver);
+    displaced_local_resolver.swap(kernel_resolver);
+    if (cell_root != this) {
+      cell_root->participant_resolver.swap(staged_root_resolver);
+    }
+    if (cell_root->cell_runtime_owner != nullptr) {
+      cell_root->cell_runtime_owner->AdoptVerifiedComponentReadinessSnapshot(
+          std::move(stable_cell_registrations),
+          std::move(stable_cell_resolver));
+    }
+    if (measured_preparer) {
+      prepared_measured_sources_.swap(candidate_measured_sources);
+      if (prepared_measured_sources_)
+        enable_prepared_measured_sources(*prepared_measured_sources_);
+    }
+
+    return readback;
+  } catch (const std::exception &exception) {
+    return route_publication_error<core::RuntimeRouteConfigurationReadbackDTO>(
+        "route_publication_native_composition_failed", exception.what());
+  } catch (...) {
+    return route_publication_error<core::RuntimeRouteConfigurationReadbackDTO>(
+        "route_publication_native_composition_failed",
+        "native route publication failed");
+  }
+}
+
+} // namespace manyforge::roboplan_backend

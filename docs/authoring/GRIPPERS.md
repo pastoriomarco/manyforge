@@ -5,13 +5,14 @@
 A gripper is its own component, a tool, separate from the robot that carries
 it. In the Deployment:
 
-- The robot component uses an arm-only model and profile (for example
-  `lite6_robot` with `lite6_mock_commanded_v0`). It has no gripper row and no
-  `gripper_feedback` stream.
+- The robot component uses an arm-only model (for example `lite6_robot`, the
+  `arm` member of the machine `lite6`, model `ufactory.lite6`). It has no
+  gripper row and no `gripper_feedback` stream.
 - The tool component is named after its tool family (`lite_gripper`,
-  `robotiq_2f_140`, `robotiq_2f_85`). It uses the tool model and carries the
-  gripper row (`gripper_target_configurations`, command target `gripper`). The
-  row's `mount_frame` is the tool's root link. The tool has no
+  `robotiq_2f_140`, `robotiq_2f_85`) and selects the tool model by its id
+  (`component_profile_id: ufactory.lite_gripper`). It carries the gripper row
+  (`gripper_target_configurations`, command target `gripper`). The row's
+  `mount_frame` is the tool's root link. The tool has no
   `root_pose_in_cell`.
 - One `attachments` row mounts the tool on the robot:
   `{"parent": {"component_id": "lite6_robot", "interface": "flange"},
@@ -21,20 +22,33 @@ it. In the Deployment:
   components share one interface, mark exactly one attachment row
   `primary: true` in the Scenario Deployment. If only one tool shares the
   interface, it is the primary tool.
+- The attachment row may list `collision_exclusions`:
+  `[{"child_link": "lite_gripper_left_finger", "parent_link": "link4"}, ...]`.
+  Each pair is a tool link and a link of the parent's model that never touch,
+  so planning skips checking them. The pairs depend on the arm–tool
+  combination, so they live on the mount, not in the tool package. ManyForge
+  checks only that each link exists (Apply refuses with
+  `component_attachments` otherwise); a wrong pair hides a real collision.
+  On the Components page the mounted tool's **Collision exclusions with
+  parent** field edits them (one `tool_link parent_link` pair per line);
+  moving the tool to another parent clears them. They are cell context: an
+  Apply that changes only them restarts nothing.
 
-The tool's profile selects its lane:
+The tool's `lane` selects how it runs:
 
-| Tool profile | Lane | Streams |
+| Tool `lane` | Runs on | Streams |
 | --- | --- | --- |
-| `<tool>_mock_commanded_v0` | Mock: simulated fingers, the tool's own Mock controller | `gripper_feedback`, `measured_joints` |
-| `<tool>_isaac_commanded_v0` | Isaac: the simulator's gripper transport | `gripper_feedback`, `measured_joints` |
-| `<tool>_pneumatic_v0` | None of its own: the pneumatic tool's lane is that of the I/O components its `pneumatic_io` names | none |
+| `mock` | Mock: simulated fingers, the tool's own Mock gripper controller | `gripper_feedback`, `measured_joints` |
+| `isaac` | Isaac: the simulator's gripper transport (below) | `gripper_feedback`, `measured_joints` |
+| none (pneumatic tools only) | The host's generic adapter; the valve and sensors are signals of I/O components on any lane | none |
 
-A pneumatic tool takes its signals from I/O components, so the same tool row
-serves Mock I/O devices and Real `xarm_digital` outputs, with any robot lane.
-A commanded `<tool>_pneumatic_v0` tool needs `pneumatic_io`; with
-`output_mode: none` it is display only (as in
-`examples/lite6_real_arm_observation.scenario`).
+A lane-free pneumatic tool takes its signals from I/O components, so the same
+tool row serves Mock I/O devices and a Real machine's control-box outputs
+(for example `lite6_robot_controller_io` `CO0`), with any robot lane. Its
+adapter has no device of its own: Prepare, Enable, Disable and Recover succeed
+at once, and it is busy while an open or close runs. A commanded lane-free
+tool needs `pneumatic_io`; with `output_mode: none` it is display only (as in
+`examples/real_lite6_arm_observation.scenario`).
 
 A Program keeps its roles: `gripper` targets the component assigned to role
 `tool`. A move chooses its TCP with the selector ([TCPs](TCPS.md)):
@@ -59,8 +73,9 @@ one or two existing Boolean I/O output signals. You can also map named inputs:
 `open`, `closed`, `pressure` and `workpiece_grasped`. Outputs and inputs may
 belong to different I/O components. Configure the actual wiring, signal
 polarity and sensor source for the cell before using hardware. Signal-backed
-pneumatic I/O belongs to the `<tool>_pneumatic_v0` profile; the Isaac tool
-profile uses the simulator's gripper transport and takes no `pneumatic_io`.
+pneumatic I/O belongs to a lane-free tool; on the Isaac lane the tool uses the
+simulator's gripper transport, and Apply refuses `pneumatic_io` there
+(`pneumatic_io_unsupported_on_isaac`).
 
 Each Program gripper command can select the named inputs and values it
 requires. All selected inputs must match: the current fresh value is checked,
@@ -74,9 +89,9 @@ behavior applies.
 For a signal-backed pneumatic gripper, manual Open and Close are available
 only while the Program is idle. They write the configured outputs and complete
 without waiting for the Program node's required inputs. For both paths, outputs
-set to `false` are written before outputs set to `true`. A refused or uncertain
-output write stops the command; the ordinary I/O recovery rules apply before another
-command. A bare gripper operation outside these paths changes only its logical
+set to `false` are written before outputs set to `true`. A refused write, or
+one whose outcome is unknown, fails the command; nothing resends it, and an
+unknown output stays unknown until the device reports it. A bare gripper operation outside these paths changes only its logical
 state and does not itself write the valve outputs.
 
 Do not command the same pneumatic gripper, or grippers sharing valve outputs,
@@ -85,36 +100,34 @@ while a gripper command is running. Operators sharing a cell must not issue
 overlapping manual commands to the same mapped valves. The last write to each
 output wins.
 
-If a Program Stop holds admission while valve writes are in progress, Resume
-can continue after an already-accepted write settles while held. A write
-refused before admission can instead cause a fresh attempt that reissues
-already-confirmed values, writing false outputs before true outputs. An
-uncertain write uses the normal recovery rules. Once waiting for inputs or
-dwell, the normal while-held rules apply.
+A Stop does not cut off an output write: a write already sent completes, and
+its result settles the command. Once waiting for inputs or dwell, the normal
+while-held rules apply.
 
 If Close has required inputs, success means those input values matched; it does
 not by itself add typed physical-grasp evidence to the Scene attachment. A
 `workpiece_grasped` signal can also be used in a carrying-related interrupt
-rule. Source-loss handling can still apply when the input source becomes
-unavailable, even while the carrying condition is false.
+rule ([Interrupts](INTERRUPTS.md)). While the rule can't watch its signal
+(stale or missing), it holds its scope (`rule_holds`), even while the carrying
+condition is false, and clears by itself when the signal is fresh again.
 
 ### Examples
 
-- `examples/lite6_pneumatic_mock.scenario` uses a separate Mock I/O device. Its
+- `examples/mock_lite6_pneumatic_pick_and_place.scenario` uses a separate Mock I/O device. Its
   delayed valve-to-input echo is synthetic; it does not prove a physical grasp.
-- `examples/lite6_pneumatic_grasp_confirmed_mock.scenario` is the same cell
+- `examples/mock_lite6_pneumatic_grasp_confirmation.scenario` is the same cell
   with grasp confirmation required on its `lite_gripper` tool (see Grasp
   confirmation below). Its Close has no required inputs, so the
   `workpiece_grasped` evidence alone decides the Close. The Mock echo is still
   synthetic.
-- `examples/lite6_pneumatic_real_no_sensor.scenario` is the starting point for
+- `examples/real_lite6_pneumatic_valve_only.scenario` is the starting point for
   a valve-only gripper without a sensor. It uses a site robot address and one
-  valve output on a controller pin. Close completes after its
-  `command_duration_s` dwell; nothing confirms the grasp, and there is no
-  workpiece-loss rule. Its pin and polarity are illustrative: adapt and verify
+  valve output on a control-box pin (`lite6_robot_controller_io` `CO0`).
+  Close completes after its `command_duration_s` dwell; nothing confirms the
+  grasp, and there is no workpiece-loss rule. Its pin and polarity are illustrative: adapt and verify
   them for the actual wiring before using hardware.
-- `examples/lite6_pneumatic_real.scenario` is the one to adapt when a grasp
-  sensor is wired. It uses a site robot address, a valve output and a
+- `examples/real_lite6_pneumatic_pick_and_place.scenario` is the one to adapt
+  when a grasp sensor is wired. It uses a site robot address, a valve output and a
   separate periodically published Boolean sensor input; Close waits for the
   input and a workpiece-loss rule watches it while carrying. Its pin, polarity
   and topic are illustrative: adapt and verify them for the actual wiring and
@@ -163,10 +176,88 @@ The position check runs only when the Close completes. A Close that the
 gripper driver itself reports as failed fails with that driver error.
 
 On a Mock cell the evidence is synthetic. In
-`examples/lite6_pneumatic_grasp_confirmed_mock.scenario`, the Mock I/O device
+`examples/mock_lite6_pneumatic_grasp_confirmation.scenario`, the Mock I/O device
 echoes the valve to `workpiece_grasped` after 100 ms, well within the Close's
 0.8 s dwell. To see `grasp_not_confirmed`, raise the echo's `delay_ms` above
 the dwell (for example to 3000) and Apply.
+
+## When a gripper command completes
+
+A controlled gripper (a position gripper on a controller: the Mock lane's
+gripper controller, Isaac's GripperCommand transport, or the Real driver) is
+done when its controller reports the command done. `command_duration_s` with
+**Wait for command duration** (`wait_for_duration: true`) makes the node wait
+**longer** than that: until the duration has also passed since the command
+started. That is settling time, useful mostly for pneumatic and other grippers
+without a controller; a controlled gripper rarely needs it. A pneumatic gripper
+has no controller report: its `command_duration_s` is the dwell.
+
+| Gripper | Wait for command duration off | on | Stop |
+|---|---|---|---|
+| Controlled | the controller's result (Isaac `isaac_joint_state_effort` has none: after `command_duration_s`) | the controller's result and `command_duration_s`, whichever comes last | cancels the goal, unless the command is already done (below) |
+| Pneumatic | the confirmed output write, then the `command_duration_s` dwell (with required inputs: the inputs, `command_duration_s` the maximum wait) | same as off (ignored) | no cancel: a sent write completes, then the while-held rules apply |
+
+The flag works the same on Mock, Isaac and Real; the Mock example Programs
+with a position gripper set it. In a Pick or Place template,
+`tool_wait_for_duration` sets it on the template's gripper node, like
+`tool_command_duration_s`.
+
+If the controller's report doesn't come, the command fails after its result
+timeout (`gripper_result_timeout`):
+
+- controlled grippers: `gripper_result_timeout_s` in the component model's
+  lane row (5 s in the component template; the Robotiq examples use 15 s),
+  counted after `command_duration_s`;
+- pneumatic grippers: `delivery_result_timeout_s` on the gripper's row of the
+  Deployment's Current gripper configuration, default 1 s, for the output
+  write's delivery result.
+
+**Stop.** A Stop sends no cancel when a controlled gripper's command is
+already done: the controller reported it reached the goal, the fingers are
+within the Stop finish tolerance of the target (see below), or the node set
+`command_duration_s` and that long has passed since the command started (the
+author's declared duration; a too-short one lets a still-moving gripper
+finish). The command then finishes and the controller's own result ends it,
+like a robot move stopped in its last moment; this includes a Stop while the
+command waits for its duration. Otherwise the Stop cancels the goal: the
+controller holds the fingers where they are and accepts the cancel, and that
+acceptance ends the command (or the goal's own result, if it comes first; a
+later one is ignored). The next gripper command can then start.
+
+## Stop near the target
+
+One case where a Stop does not cancel a controlled gripper's goal (above) is
+the Stop finish tolerance: when the fingers are already within it of the
+commanded position, the command finishes and the controller's own result
+settles it, instead of the fingers being held short of the target. The tolerance is in the gripper's position unit (m
+or rad) and deliberately wide. Its default is the tool's lane row
+`gripper_stop_finish_tolerance` (about 5% of the stroke: Robotiq 2F-85
+0.04 rad, 2F-140 0.035 rad, xArm gripper 0.04 rad, Lite gripper 0.0004 m on
+Mock). A position gripper's row can override it, from the Deployment's
+gripper settings ("Stop finish tolerance"; blank keeps the default) or as
+`"stop_finish_tolerance": <value>` (0 or more; 0 always cancels). Like other
+gripper settings it takes effect at the confirmed Apply, which replaces the
+tool.
+
+## Grippers in Isaac
+
+In Isaac a tool's finger joints are part of the robot's articulation; the
+tool has no controller manager of its own. Its launch
+(`isaac_gripper.launch.py`) publishes the tool's description. The tool's
+`lanes.isaac` row picks the transport (`gripper_transport`):
+
+- `ros_gripper_command` (Robotiq 2F-140): a GripperCommand action
+  `<controller>/gripper_cmd`, served by a bridge that the tool's launch also
+  runs; its parameters are the lane's `gripper_bridges/<model>.yaml`, named
+  by the row's `gripper_bridge`. The row also has
+  `gripper_stop_finish_tolerance`.
+- `isaac_joint_state_effort` (Lite gripper): an effort written straight to
+  the joint command topic, completion after the dwell, no bridge.
+
+The row also names the command and state topics, the completion policy and
+the open/closed positions and efforts; `manyforge_isaac_adapter/lane/README.md`
+lists them. While the simulation isn't playing, a new gripper command on the
+tool fails with `simulation_not_playing`.
 
 ## Position without feedback
 

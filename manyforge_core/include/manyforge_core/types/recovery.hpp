@@ -45,7 +45,6 @@ enum class AtRestEvidence {
 enum class RecoveryClass {
   kNone,
   kRuntimeCollision,
-  kStopFaultIntervention,
   kFailedValidation,
   kOrdinaryOperatorStop,
   kUnknownFault,
@@ -106,7 +105,6 @@ enum class MotionRetryIneligibilityReason {
   kValidationNotConclusiveCollision,
   kStopOwnerActive,
   kStrongerAuthorityActive,
-  kQueuedLatchPresent,
   kLatchPresent,
   kStopNotSettled,
   kStopNotNominal,
@@ -128,7 +126,7 @@ struct MotionRetryEligibilityDTO final {
 };
 
 /// Immutable record that a stop authority reached a definitive result.
-/// Keyed by (execution_id, latch_id, stop_owner kind+generation); a late
+/// Keyed by (execution_id, stop_owner kind+generation); a late
 /// completion from an older owner generation can never overwrite or become
 /// authoritative for a newer generation (spec/230 §3.7.1).
 struct KernelStopCertificateDTO {
@@ -140,9 +138,6 @@ struct KernelStopCertificateDTO {
   StopOwnerKind stop_owner = StopOwnerKind::kOperatorStopWorker;
   std::uint64_t stop_owner_generation = 0;
   std::uint64_t execution_id = 0;
-  /// Interrupt latch this stop belongs to; empty for ordinary operator /
-  /// motion-trip stops that carry no latch.
-  std::string latch_id;
   std::uint64_t control_command_epoch = 0;
   std::string requested_stop_mode;
   std::string executed_stop_mode;
@@ -200,7 +195,6 @@ struct KernelRecoveryAssessmentDTO {
   ExecutionState execution_state = ExecutionState::kIdle;
   RecoveryClass recovery_class = RecoveryClass::kNone;
   RecoveryAssessmentStatus status = RecoveryAssessmentStatus::kUnavailable;
-  std::string latch_id;
   std::string source_id;
   std::string policy_id;
   InterruptPreemptionResult preemption_result = InterruptPreemptionResult::kNoneRequired;
@@ -220,7 +214,6 @@ struct KernelRecoveryAssessmentDTO {
   bool observed_state_measured = false;
   std::int64_t observed_state_valid_until_ns = 0;
   bool stronger_authority_active = false;
-  bool queued_latch_present = false;
   bool retry_admissible = false;
   std::vector<RecoveryAction> allowed_actions;
   /// Stable machine-readable reason for the current status.
@@ -245,7 +238,6 @@ struct KernelRecoveryActionRequestDTO {
   std::uint64_t expected_assessment_revision = 0;
   std::uint64_t expected_control_command_epoch = 0;
   std::uint64_t expected_execution_id = 0;
-  std::string expected_latch_id;
   std::string expected_stop_certificate_id;
   std::uint64_t expected_stop_owner_generation = 0;
   std::string reason;
@@ -254,7 +246,7 @@ struct KernelRecoveryActionRequestDTO {
   bool fresh_motion_attempt{false};
 };
 
-/// Result of `ApplyRecoveryAction`. On rejection the kernel state, latch,
+/// Result of `ApplyRecoveryAction`. On rejection the kernel state,
 /// certificate, stop owner, backend command, and control epoch are unchanged
 /// and `resulting_assessment` carries the newest assessment.
 struct KernelRecoveryActionResultDTO {

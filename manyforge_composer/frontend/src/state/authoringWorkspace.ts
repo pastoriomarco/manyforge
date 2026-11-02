@@ -168,6 +168,23 @@ export function draftEditUnavailableReason(
 }
 
 /**
+ * Why New, Load or Close (CONTRACTS §11) is unavailable, or ``null``. A
+ * finished or stopped run doesn't block them: the server Resets a run awaiting
+ * Reset first and refuses a run in progress with its typed reason (R3, as M7).
+ * A closed Kernel admission (a held claim) doesn't block them either: New
+ * always works (R3), so the server decides and names any refusal. Only an
+ * Apply in flight disables them (the caller's Manager gate).
+ */
+export function scenarioReplacementUnavailableReason(
+  published: PublishedAuthoringWorkspace | null,
+  snapshot: ComposerHeadlessState | null,
+): string | null {
+  const cause = authoringUnavailableCause(published, snapshot);
+  return cause === 'execution_active' || cause === 'not_admitted'
+    ? null : authoringUnavailableReason(published, snapshot);
+}
+
+/**
  * The typed cause behind :func:`authoringUnavailableReason`, so presentation
  * can distinguish normal execution/synchronization (information) from lost
  * authoritative state without treating a closed permission gate as a fault.

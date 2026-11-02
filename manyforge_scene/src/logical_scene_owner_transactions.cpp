@@ -1232,22 +1232,29 @@ std::uint64_t NextSceneOwnerEventSequence(sqlite3 *database) {
   return watermark + 1U;
 }
 
+} // namespace
+
 // Compaction is transparent to callers: it prunes the resident ledger behind
 // a checkpoint of the active head and keeps the request owner epoch in force,
 // so neither the triggering request nor any other caller has to refresh.
+// A maintenance fold runs the same compaction before the bounded maintenance
+// history evicts a completion the replay would otherwise still consume; it
+// needs only a settled head, not a full ledger or an open maintenance window.
 void CompactSceneTransactionHistory(
     sqlite3 *database, const DurableState &durable_state,
-    const SceneTransactionStoreState &transactions) {
+    const SceneTransactionStoreState &transactions,
+    const bool maintenance_fold) {
   const auto access = AccessStatus(durable_state);
-  if (!access.scene_writes_open || !access.projection_leases_open ||
+  if ((!maintenance_fold &&
+       (!access.scene_writes_open || !access.projection_leases_open ||
+        transactions.resident_transaction_count <
+            kMaximumLogicalSceneTransactions ||
+        transactions.next_transaction_sequence <= 1U ||
+        transactions.next_owner_event_sequence <= 1U)) ||
       durable_state.projection_desynchronized ||
       durable_state.unresolved_scene_transaction ||
       transactions.projection_desynchronized ||
-      transactions.unresolved_native_attempt ||
-      transactions.resident_transaction_count <
-          kMaximumLogicalSceneTransactions ||
-      transactions.next_transaction_sequence <= 1U ||
-      transactions.next_owner_event_sequence <= 1U) {
+      transactions.unresolved_native_attempt) {
     throw LogicalSceneOwnerConflictError(
         "logical-scene history compaction requires a settled quiescent head");
   }
@@ -1291,10 +1298,11 @@ void CompactSceneTransactionHistory(
   update.Bind(2, CheckedSafeCounter(request_epoch_generation,
                                     "request epoch generation"));
   update.Bind(3, request_owner_epoch.value());
-  update.Bind(4, CheckedSafeCounter(transactions.next_transaction_sequence - 1U,
-                                    "compacted transaction sequence"));
-  update.Bind(5, CheckedSafeCounter(transactions.next_owner_event_sequence - 1U,
-                                    "compacted owner event sequence"));
+  // A maintenance fold may run before any Scene transaction (watermark 0).
+  update.Bind(4, static_cast<std::int64_t>(
+                     transactions.next_transaction_sequence - 1U));
+  update.Bind(5, static_cast<std::int64_t>(
+                     transactions.next_owner_event_sequence - 1U));
   update.Bind(6, static_cast<std::int64_t>(
                      durable_state.migrated_structural_completions.size()));
   update.Bind(7, static_cast<std::int64_t>(std::ranges::count_if(
@@ -1340,6 +1348,8 @@ void CompactSceneTransactionHistory(
   }
 }
 
+namespace {
+
 void InsertSceneTransactionOwnerEvent(
     sqlite3 *database, const std::uint64_t owner_event_sequence,
     const std::uint64_t transaction_sequence) {
@@ -1361,7 +1371,7 @@ void InsertSceneTransactionOwnerEvent(
 void InsertProjectionAttempt(
     sqlite3 *database, const std::uint64_t transaction_sequence,
     const std::size_t ordinal,
-    const core::ProjectionNativeRuntimeBindingDTO &binding) {
+    const core::ProjectionExecutionHostBindingDTO &binding) {
   Statement statement(
       database, "INSERT INTO logical_scene_projection_attempts("
                 "transaction_sequence,projection_ordinal,provider_binding_id,"
@@ -1449,9 +1459,9 @@ void InsertProjectionResult(sqlite3 *database,
 // being recovered.  Keep this relaxation deliberately narrow: a different
 // provider, provider revision, or runtime unit is still a different
 // projection and must fail closed.
-[[nodiscard]] bool SameNativeRuntimeBindingExceptEpoch(
-    const core::ProjectionNativeRuntimeBindingDTO &lhs,
-    const core::ProjectionNativeRuntimeBindingDTO &rhs) noexcept {
+[[nodiscard]] bool SameExecutionHostBindingExceptEpoch(
+    const core::ProjectionExecutionHostBindingDTO &lhs,
+    const core::ProjectionExecutionHostBindingDTO &rhs) noexcept {
   return lhs.provider_binding_id == rhs.provider_binding_id &&
          lhs.provider_binding_revision == rhs.provider_binding_revision &&
          lhs.runtime_unit_id == rhs.runtime_unit_id &&
@@ -1464,7 +1474,7 @@ void InsertProjectionResult(sqlite3 *database,
 namespace manyforge::scene::logical_scene_owner_detail {
 
 [[nodiscard]] RequiredSceneProjection ResolveRequiredProjection(
-    const core::ProjectionNativeRuntimeBindingDTO &binding,
+    const core::ProjectionExecutionHostBindingDTO &binding,
     const core::IPlannerSceneProjectionResolver *resolver,
     const ProjectionRevisionDTO &selected_revision) {
   if (resolver == nullptr) {
@@ -1509,8 +1519,8 @@ namespace manyforge::scene::logical_scene_owner_detail {
     throw LogicalSceneOwnerConflictError(
         "native projection returned malformed health");
   }
-  if (health.native_runtime_binding != binding &&
-      !SameNativeRuntimeBindingExceptEpoch(health.native_runtime_binding,
+  if (health.execution_host_binding != binding &&
+      !SameExecutionHostBindingExceptEpoch(health.execution_host_binding,
                                             binding)) {
     throw LogicalSceneOwnerConflictError(
         "resolved native projection differs from the selected host "
@@ -1764,7 +1774,7 @@ ResolveFrameAcrossProjections(
     }
     leases.emplace_back(projection.projection, lease_id);
     const auto &runtime_unit_id =
-        projection.preflight_health.native_runtime_binding.runtime_unit_id;
+        projection.preflight_health.execution_host_binding.runtime_unit_id;
     if (answered_units.contains(runtime_unit_id)) {
       continue;
     }
@@ -1802,13 +1812,13 @@ ResolveFrameAcrossProjections(
   if (robot_frame_claimed_twice) {
     throw SceneRequestRejectionError(
         "missing_reference",
-        "more than one native runtime unit owns this robot frame",
+        "more than one execution host unit owns this robot frame",
         {{"reason", "scene_frame_owner_ambiguous"}});
   }
   if (static_frame_disagrees) {
     throw SceneRequestRejectionError(
         "missing_reference",
-        "native runtime units disagree on a static scene frame",
+        "execution host units disagree on a static scene frame",
         {{"reason", "scene_frame_resolution_ambiguous"}});
   }
   if (!owner_resolution.has_value()) {
@@ -1955,11 +1965,11 @@ NormalizeProjectionResult(const core::SceneTransactionDTO &transaction,
       result.transaction_sequence != transaction.transaction_sequence ||
       result.proposed_projection_revision !=
           transaction.proposed_projection_revision ||
-      (!SameNativeRuntimeBindingExceptEpoch(
-           result.resulting_health.native_runtime_binding,
-           preflight_health.native_runtime_binding) &&
-       result.resulting_health.native_runtime_binding !=
-           preflight_health.native_runtime_binding) ||
+      (!SameExecutionHostBindingExceptEpoch(
+           result.resulting_health.execution_host_binding,
+           preflight_health.execution_host_binding) &&
+       result.resulting_health.execution_host_binding !=
+           preflight_health.execution_host_binding) ||
       result.resulting_health.source_sequence <
           preflight_health.source_sequence) {
     return contract_error();
@@ -2147,7 +2157,7 @@ LogicalSceneOwner::PreviewResolvedSceneCandidate(
   }
 
   std::vector<RequiredSceneProjection> projections;
-  const auto required_bindings = ActiveNativeRuntimeBindings(observed_state);
+  const auto required_bindings = ActiveExecutionHostBindings(observed_state);
   projections.reserve(required_bindings.size());
   for (const auto &binding : required_bindings) {
     try {
@@ -2384,7 +2394,7 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
       }
       impl_->InvalidateSceneCommitState();
       CompactSceneTransactionHistory(database, observed_state,
-                                     *observed_transactions);
+                                     *observed_transactions, false);
       compaction.Commit();
       observed_transactions->resident_transaction_count = 0U;
       impl_->StoreSceneCommitState(observed_state, observed_transactions,
@@ -2394,7 +2404,7 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
   }
 
   std::vector<RequiredSceneProjection> projections;
-  const auto required_bindings = ActiveNativeRuntimeBindings(observed_state);
+  const auto required_bindings = ActiveExecutionHostBindings(observed_state);
   projections.reserve(required_bindings.size());
   for (const auto &binding : required_bindings) {
     try {
@@ -2547,7 +2557,7 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
     Transaction attempt(database, "BEGIN IMMEDIATE");
     InsertProjectionAttempt(
         database, scene_transaction.transaction_sequence, 0U,
-        projections.front().preflight_health.native_runtime_binding);
+        projections.front().preflight_health.execution_host_binding);
     attempt.Commit();
   }
 
@@ -2629,7 +2639,7 @@ LogicalSceneOwner::Commit(const SceneTransactionRequestDTO &request) {
     if (ordinal + 1U < projections.size()) {
       InsertProjectionAttempt(
           database, scene_transaction.transaction_sequence, ordinal + 1U,
-          projections[ordinal + 1U].preflight_health.native_runtime_binding);
+          projections[ordinal + 1U].preflight_health.execution_host_binding);
     } else {
       InsertSceneOutcome(database,
                          request.request_context.request_owner_epoch.value(),

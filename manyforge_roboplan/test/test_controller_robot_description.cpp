@@ -140,22 +140,6 @@ void XMLCALL tree_text(void *data, const XML_Char *text, int length) {
   return buffer;
 }
 
-/// Python str.format of the stored Isaac templates with the given values.
-[[nodiscard]] std::string format_template(
-    std::string text, const std::map<std::string, std::string> &values) {
-  for (const auto &[key, value] : values) {
-    const std::string placeholder = "{" + key + "}";
-    for (auto at = text.find(placeholder); at != std::string::npos;
-         at = text.find(placeholder, at + value.size())) {
-      text.replace(at, placeholder.size(), value);
-    }
-  }
-  if (text.find('{') != std::string::npos) {
-    throw std::runtime_error("unformatted placeholder left in template");
-  }
-  return text;
-}
-
 struct ExpectedJoint final {
   std::string name;
   double initial_value{};
@@ -275,12 +259,12 @@ void expect_model_unchanged(const std::string &model_text,
 [[nodiscard]] ControllerRobotDescriptionRequest
 mock_request(const std::string &urdf, const std::vector<std::string> &arm,
              std::vector<double> initial,
-             std::optional<MockGripperBinding> gripper = std::nullopt,
-             const bool gripper_required = false) {
+             std::optional<MockGripperBinding> gripper = std::nullopt) {
   return ControllerRobotDescriptionRequest{
       urdf, arm,
-      MockControllerLane{"ManyForgeMockSystem", std::move(initial),
-                         std::move(gripper), gripper_required}};
+      Ros2ControlLane{"ManyForgeMockSystem", "mock_components/GenericSystem",
+                      {{"calculate_dynamics", "true"}}, {"position"}, std::move(initial),
+                      std::move(gripper)}};
 }
 
 // ---------------------------------------------------------------------------
@@ -295,8 +279,7 @@ TEST(ControllerRobotDescription, MockFormForEveryOfflineModel) {
       gripper = MockGripperBinding{model.gripper_joint, 0.0125};
     }
     const auto generated = generate_controller_robot_description(
-        mock_request(text, model.arm_joints, initial, gripper,
-                     model.gripper_joint.has_value()));
+        mock_request(text, model.arm_joints, initial, gripper));
     expect_model_unchanged(text, generated, "ManyForgeMockSystem",
                            model.source_ros2_control_count);
     std::vector<ExpectedJoint> expected;
@@ -313,48 +296,6 @@ TEST(ControllerRobotDescription, MockFormForEveryOfflineModel) {
   }
 }
 
-TEST(ControllerRobotDescription, NoOutputMockPreservesGeometryAndOnlyControlsArm) {
-  for (const auto& model : offline_models()) {
-    if (!model.gripper_joint.has_value()) continue;
-    SCOPED_TRACE(model.path);
-    const auto text = read_repository_file(model.path);
-    const auto initial = ramp(model.arm_joints.size());
-    auto request = mock_request(text, model.arm_joints, initial,
-                                MockGripperBinding{model.gripper_joint, std::nullopt}, true);
-    std::get<MockControllerLane>(request.lane).gripper_output_mode =
-        manyforge::core::GripperOutputMode::kNone;
-    const auto generated = generate_controller_robot_description(request);
-    expect_model_unchanged(text, generated, "ManyForgeMockSystem",
-                           model.source_ros2_control_count);
-    std::vector<ExpectedJoint> expected;
-    for (std::size_t index = 0; index < model.arm_joints.size(); ++index) {
-      expected.push_back({model.arm_joints[index], initial[index]});
-    }
-    expect_hardware(parse(generated).children.back(), "ManyForgeMockSystem",
-                    "mock_components/GenericSystem",
-                    {{"calculate_dynamics", "true"}}, expected);
-    // An actual supplied scalar may be validated, but it is no hardware seed.
-    std::get<MockControllerLane>(request.lane).gripper->projected_initial_position = 0.0125;
-    EXPECT_EQ(generate_controller_robot_description(request), generated);
-  }
-}
-
-TEST(ControllerRobotDescription, ExplicitCommandedPreservesTheDefaultDescription) {
-  for (const auto& model : offline_models()) {
-    SCOPED_TRACE(model.path);
-    const auto text = read_repository_file(model.path);
-    const auto initial = ramp(model.arm_joints.size());
-    const auto gripper = model.gripper_joint.has_value()
-        ? std::optional(MockGripperBinding{model.gripper_joint, 0.0125})
-        : std::nullopt;
-    auto request = mock_request(text, model.arm_joints, initial, gripper,
-                                model.gripper_joint.has_value());
-    const auto original = generate_controller_robot_description(request);
-    std::get<MockControllerLane>(request.lane).gripper_output_mode =
-        manyforge::core::GripperOutputMode::kCommanded;
-    EXPECT_EQ(generate_controller_robot_description(request), original);
-  }
-}
 
 TEST(ControllerRobotDescription, GripperOnlyMockPreservesEveryModelElement) {
   for (const auto &model : offline_models()) {
@@ -362,7 +303,7 @@ TEST(ControllerRobotDescription, GripperOnlyMockPreservesEveryModelElement) {
     SCOPED_TRACE(model.path);
     const auto text = read_repository_file(model.path);
     const auto generated = generate_controller_robot_description(mock_request(
-        text, {}, {}, MockGripperBinding{model.gripper_joint, 0.0125}, true));
+        text, {}, {}, MockGripperBinding{model.gripper_joint, 0.0125}));
     expect_model_unchanged(text, generated, "ManyForgeMockSystem",
                            model.source_ros2_control_count);
     expect_hardware(parse(generated).children.back(), "ManyForgeMockSystem",
@@ -372,33 +313,6 @@ TEST(ControllerRobotDescription, GripperOnlyMockPreservesEveryModelElement) {
   }
 }
 
-TEST(ControllerRobotDescription, IsaacFormForEveryOfflineModel) {
-  for (const auto &model : offline_models()) {
-    SCOPED_TRACE(model.path);
-    const auto text = read_repository_file(model.path);
-    const auto initial = ramp(model.arm_joints.size());
-    const auto generated = generate_controller_robot_description(
-        ControllerRobotDescriptionRequest{
-            text, model.arm_joints,
-            IsaacControllerLane{"IsaacTestTopicBasedSystem", "/cmd", "/state",
-                                initial}});
-    expect_model_unchanged(text, generated, "IsaacTestTopicBasedSystem",
-                           model.source_ros2_control_count);
-    std::vector<ExpectedJoint> expected;
-    for (std::size_t index = 0; index < model.arm_joints.size(); ++index) {
-      expected.push_back({model.arm_joints[index], initial[index]});
-    }
-    // The gripper stays on its own bridge: arm joints only.
-    expect_hardware(parse(generated).children.back(),
-                    "IsaacTestTopicBasedSystem",
-                    "topic_based_ros2_control/TopicBasedSystem",
-                    {{"joint_commands_topic", "/cmd"},
-                     {"joint_states_topic", "/state"},
-                     {"trigger_joint_command_threshold", "-1"},
-                     {"sum_wrapped_joint_states", "false"}},
-                    expected);
-  }
-}
 
 constexpr const char *kSynthetic = R"(<?xml version="1.0" encoding="utf-8"?>
 <!-- vendor wrapper with two hardware blocks -->
@@ -436,8 +350,7 @@ constexpr const char *kSynthetic = R"(<?xml version="1.0" encoding="utf-8"?>
 TEST(ControllerRobotDescription, RemovesEveryHardwareBlockAndPassesUnknownContentThrough) {
   const std::string text = kSynthetic;
   const auto generated = generate_controller_robot_description(mock_request(
-      text, {"j1", "j2"}, {0.5, -0.25}, MockGripperBinding{"finger", 0.02},
-      true));
+      text, {"j1", "j2"}, {0.5, -0.25}, MockGripperBinding{"finger", 0.02}));
   expect_model_unchanged(text, generated, "ManyForgeMockSystem", 3U);
   EXPECT_EQ(generated.find("ArmHardware"), std::string::npos);
   EXPECT_EQ(generated.find("HandHardware"), std::string::npos);
@@ -468,18 +381,6 @@ TEST(ControllerRobotDescription, RemovesEveryHardwareBlockAndPassesUnknownConten
             std::string::npos);
 }
 
-TEST(ControllerRobotDescription, GripperBindingWithoutModelJointAddsNoGripperUnlessRequired) {
-  const std::string text = kSynthetic;
-  const auto generated = generate_controller_robot_description(mock_request(
-      text, {"j1"}, {0.0}, MockGripperBinding{std::nullopt, std::nullopt},
-      false));
-  expect_hardware(parse(generated).children.back(), "ManyForgeMockSystem",
-                  "mock_components/GenericSystem",
-                  {{"calculate_dynamics", "true"}}, {{"j1", 0.0}});
-  const auto without_binding = generate_controller_robot_description(
-      mock_request(text, {"j1"}, {0.0}));
-  EXPECT_EQ(without_binding, generated);
-}
 
 void expect_refused(const ControllerRobotDescriptionRequest &request,
                     const std::string &diagnostic) {
@@ -492,54 +393,6 @@ void expect_refused(const ControllerRobotDescriptionRequest &request,
   }
 }
 
-// CP8 step 2a: a measured hardware (Real) uses the same generator with its
-// own plugin, parameters and command interfaces and writes no initial value.
-TEST(ControllerRobotDescription, MeasuredHardwareSectionIsTheSpecWithoutInitialValues) {
-  const auto text = read_repository_file(
-      "manyforge_example_models/models/lite6_lite_gripper/lite6_lite_gripper.urdf");
-  const std::vector<std::string> arm{"joint1", "joint2", "joint3",
-                                     "joint4", "joint5", "joint6"};
-  Ros2ControlHardwareSpec hardware;
-  hardware.plugin = "vendor_hardware/System";
-  hardware.parameters = {{"address", "R10.0.0.1"}, {"mode", "a&b"}};
-  hardware.joint_command_interfaces = {"position", "velocity"};
-  hardware.seeds_initial_positions = false;
-  auto request = mock_request(text, arm, {});
-  std::get<MockControllerLane>(request.lane).hardware = hardware;
-  const auto generated = generate_controller_robot_description(request);
-  expect_model_unchanged(text, generated, "ManyForgeMockSystem", 2U);
-  const auto section = generated.substr(generated.find("  <ros2_control "));
-  EXPECT_EQ(section.substr(0U, section.find("    <joint name=\"joint2\">")),
-            "  <ros2_control name=\"ManyForgeMockSystem\" type=\"system\">\n"
-            "    <hardware>\n"
-            "      <plugin>vendor_hardware/System</plugin>\n"
-            "      <param name=\"address\">R10.0.0.1</param>\n"
-            "      <param name=\"mode\">a&amp;b</param>\n"
-            "    </hardware>\n"
-            "    <joint name=\"joint1\">\n"
-            "      <command_interface name=\"position\"/>\n"
-            "      <command_interface name=\"velocity\"/>\n"
-            "      <state_interface name=\"position\"/>\n"
-            "      <state_interface name=\"velocity\"/>\n"
-            "    </joint>\n");
-  EXPECT_EQ(generated.find("initial_value"), std::string::npos);
-
-  // A deployment pose is never written into measured hardware.
-  auto seeded = mock_request(text, arm, ramp(arm.size()));
-  std::get<MockControllerLane>(seeded.lane).hardware = hardware;
-  EXPECT_THROW(static_cast<void>(generate_controller_robot_description(seeded)),
-               ControllerRobotDescriptionError);
-  // The hardware data must name a plugin and a command interface.
-  auto no_plugin = request;
-  std::get<MockControllerLane>(no_plugin.lane).hardware.plugin.clear();
-  EXPECT_THROW(static_cast<void>(generate_controller_robot_description(no_plugin)),
-               ControllerRobotDescriptionError);
-  auto no_interface = request;
-  std::get<MockControllerLane>(no_interface.lane)
-      .hardware.joint_command_interfaces.clear();
-  EXPECT_THROW(static_cast<void>(generate_controller_robot_description(no_interface)),
-               ControllerRobotDescriptionError);
-}
 
 TEST(ControllerRobotDescription, FailsClosedOnInvalidInputs) {
   const std::string text = kSynthetic;
@@ -549,8 +402,7 @@ TEST(ControllerRobotDescription, FailsClosedOnInvalidInputs) {
                  "1 initial joint positions for 2 arm joints");
   expect_refused(mock_request(text, {"j1"}, {0.0, 0.0}),
                  "2 initial joint positions for 1 arm joints");
-  expect_refused(mock_request(text, {"j1", "j2"}, {}),
-                 "0 initial joint positions for 2 arm joints");
+  // No seeds is valid: hardware that reports measured state (Real) has none.
   expect_refused(mock_request(text, {"j1", "joint_7"}, {0.0, 0.0}),
                  "arm joint 'joint_7' is not a joint of the model");
   expect_refused(mock_request(text, {"j1", "j2"}, {0.0, nan}),
@@ -574,29 +426,23 @@ TEST(ControllerRobotDescription, FailsClosedOnInvalidInputs) {
                               MockGripperBinding{"j1", 0.0}),
                  "gripper joint 'j1' is also an arm joint");
   expect_refused(mock_request(text, {"j1"}, {0.0},
-                              MockGripperBinding{"finger", std::nullopt}),
-                 "has no retained model projection");
-  expect_refused(mock_request(text, {"j1"}, {0.0},
                               MockGripperBinding{"finger", nan}),
                  "initial value for joint 'finger' is not finite");
   expect_refused(mock_request(text, {"j1"}, {0.0},
-                              MockGripperBinding{std::nullopt, std::nullopt},
-                              true),
+                              MockGripperBinding{std::nullopt, std::nullopt}),
                  "gripper binding has no model-backed source joint");
-  expect_refused(mock_request(text, {"j1"}, {0.0}, std::nullopt, true),
-                 "the deployment has no gripper binding");
   expect_refused(
       ControllerRobotDescriptionRequest{
-          text, {"j1"}, MockControllerLane{"", {0.0}, std::nullopt, false}},
-      "no hardware component name");
-  expect_refused(
-      ControllerRobotDescriptionRequest{
-          text, {"j1"}, IsaacControllerLane{"Isaac", "", "/state", {0.0}}},
-      "no hardware component name or topics");
-  expect_refused(
-      ControllerRobotDescriptionRequest{
-          text, {"j1", "j2"}, IsaacControllerLane{"Isaac", "/c", "/s", {0.0}}},
-      "the Isaac profile has 1 initial joint positions for 2 arm joints");
+          text, {"j1"},
+          Ros2ControlLane{"", "mock_components/GenericSystem", {}, {"position"}, {0.0}, {}}},
+      "no name, plugin or joint command interface");
+  // Hardware that reports measured state takes no initial values.
+  const auto measured = generate_controller_robot_description(ControllerRobotDescriptionRequest{
+      text, {"j1"},
+      Ros2ControlLane{"Real", "vendor/Plugin", {{"robot_ip", "R10.0.0.1"}},
+                      {"position", "velocity"}, {}, {}}});
+  EXPECT_EQ(measured.find("initial_value"), std::string::npos);
+  EXPECT_NE(measured.find("<command_interface name=\"velocity\"/>"), std::string::npos);
   expect_refused(mock_request("<robot><joint name=\"j1\" type=\"revolute\">",
                               {"j1"}, {0.0}),
                  "not well-formed XML");
@@ -633,74 +479,13 @@ TEST(ControllerRobotDescription, GripperOnlyMockRefusesInventedOrInvalidState) {
   expect_refused(mock_request(text, {}, {},
                              MockGripperBinding{"finger_mimic", 0.02}),
                  "is a mimic follower");
-  expect_refused(mock_request(text, {}, {},
-                             MockGripperBinding{"finger", std::nullopt}),
-                 "has no retained model projection");
   expect_refused(mock_request(
                      text, {}, {},
                      MockGripperBinding{
                          "finger", std::numeric_limits<double>::quiet_NaN()}),
                  "is not finite");
-  expect_refused(ControllerRobotDescriptionRequest{
-                     text, {},
-                     IsaacControllerLane{"Isaac", "/cmd", "/state", {}}},
-                 "names no arm joint");
 }
 
-TEST(ControllerRobotDescription, NoOutputRetainsJointValidationAndRefusesNoArmWriter) {
-  const std::string text = kSynthetic;
-  const auto no_output = [&](std::optional<MockGripperBinding> gripper,
-                             std::vector<std::string> arm = {"j1"},
-                             std::vector<double> initial = {0.0}) {
-    auto request = mock_request(text, arm, std::move(initial), std::move(gripper), true);
-    std::get<MockControllerLane>(request.lane).gripper_output_mode =
-        manyforge::core::GripperOutputMode::kNone;
-    return request;
-  };
-  expect_refused(no_output(std::nullopt), "model-backed gripper binding");
-  expect_refused(no_output(MockGripperBinding{std::nullopt, std::nullopt}),
-                 "model-backed gripper binding");
-  expect_refused(no_output(MockGripperBinding{"finger", std::nullopt}, {}, {}),
-                 "requires an arm");
-  expect_refused(no_output(MockGripperBinding{"missing", std::nullopt}),
-                 "is not a joint of the model");
-  expect_refused(no_output(MockGripperBinding{"fixed_tool", std::nullopt}), "is a fixed joint");
-  expect_refused(no_output(MockGripperBinding{"finger_mimic", std::nullopt}), "is a mimic follower");
-  expect_refused(no_output(MockGripperBinding{"j1", std::nullopt}), "is also an arm joint");
-  expect_refused(no_output(MockGripperBinding{
-                     "finger", std::numeric_limits<double>::quiet_NaN()}), "is not finite");
-  auto unknown = no_output(MockGripperBinding{"finger", std::nullopt});
-  std::get<MockControllerLane>(unknown.lane).gripper_output_mode =
-      static_cast<manyforge::core::GripperOutputMode>(99);
-  expect_refused(unknown, "invalid gripper output mode");
-}
-
-TEST(ControllerRobotDescription, NoOutputIsaacValidatesModelWithoutAddingInterfaces) {
-  const std::string text = kSynthetic;
-  ControllerRobotDescriptionRequest request{
-      text, {"j1", "j2"},
-      IsaacControllerLane{"Isaac", "/cmd", "/state", {0.5, -0.25}}};
-  const auto original = generate_controller_robot_description(request);
-  request.gripper_without_control_interfaces = MockGripperBinding{"finger", std::nullopt};
-  const auto generated = generate_controller_robot_description(request);
-  EXPECT_EQ(generated, original);
-  expect_model_unchanged(text, generated, "Isaac", 3U);
-  expect_hardware(parse(generated).children.back(), "Isaac",
-                  "topic_based_ros2_control/TopicBasedSystem",
-                  {{"joint_commands_topic", "/cmd"}, {"joint_states_topic", "/state"},
-                   {"trigger_joint_command_threshold", "-1"}, {"sum_wrapped_joint_states", "false"}},
-                  {{"j1", 0.5}, {"j2", -0.25}});
-  for (const auto* joint : {"missing", "fixed_tool", "finger_mimic", "j1"}) {
-    request.gripper_without_control_interfaces = MockGripperBinding{joint, std::nullopt};
-    EXPECT_THROW(static_cast<void>(generate_controller_robot_description(request)),
-                 ControllerRobotDescriptionError) << joint;
-  }
-  request.gripper_without_control_interfaces = MockGripperBinding{std::nullopt, std::nullopt};
-  expect_refused(request, "no model-backed source joint");
-  request.gripper_without_control_interfaces = MockGripperBinding{
-      "finger", std::numeric_limits<double>::infinity()};
-  expect_refused(request, "is not finite");
-}
 
 TEST(ControllerRobotDescription, JointNamesComeOnlyFromTheBindingSourceJoints) {
   using manyforge::core::ResourceId;
@@ -715,193 +500,6 @@ TEST(ControllerRobotDescription, JointNamesComeOnlyFromTheBindingSourceJoints) {
   resources[1].source_joint_name.reset();
   EXPECT_THROW((void)controller_joint_names_from_binding(resources),
                ControllerRobotDescriptionError);
-}
-
-// ---------------------------------------------------------------------------
-// Isaac: equivalence with today's stored, launch-formatted descriptions.
-
-[[nodiscard]] std::map<std::string, std::string> launch_default_values() {
-  // isaac_topic_based_control.launch.py argument defaults (no caller
-  // overrides them), formatted as the launch does (".17g").
-  return {{"joint_commands_topic", "/isaac_joint_commands"},
-          {"joint_states_topic", "/isaac_joint_states"},
-          {"trigger_joint_command_threshold", g17(-1.0)},
-          {"sum_wrapped_joint_states", "false"},
-          {"shoulder_pan_initial", g17(2.63422544)},
-          {"shoulder_lift_initial", g17(-0.875980752)},
-          {"elbow_initial", g17(1.551074106)},
-          {"wrist_1_initial", g17(-2.29231544)},
-          {"wrist_2_initial", g17(-1.560498884)},
-          {"wrist_3_initial", g17(-2.038544566)},
-          {"joint1_initial", g17(0.0)},
-          {"joint2_initial", g17(0.0)},
-          {"joint3_initial", g17(1.57)},
-          {"joint4_initial", g17(0.0)},
-          {"joint5_initial", g17(0.0)},
-          {"joint6_initial", g17(0.0)}};
-}
-
-// The retired stored Isaac files' hardware sections (Track 2 retirement of
-// manyforge_ros_bringup/urdf/isaac_{lite6,ur10e}_topic_based.ros2_control.urdf,
-// sha256 e1da8f69... and 944e5589...), as the Isaac launch formatted them: the
-// generated section must stay equal in meaning.
-constexpr const char *kRetiredIsaacLite6Section = R"(<robot name="retired">
-  <ros2_control name="IsaacLite6TopicBasedSystem" type="system">
-    <hardware>
-      <plugin>topic_based_ros2_control/TopicBasedSystem</plugin>
-      <param name="joint_commands_topic">{joint_commands_topic}</param>
-      <param name="joint_states_topic">{joint_states_topic}</param>
-      <param name="trigger_joint_command_threshold">{trigger_joint_command_threshold}</param>
-      <param name="sum_wrapped_joint_states">{sum_wrapped_joint_states}</param>
-    </hardware>
-    <joint name="joint1">
-      <command_interface name="position" />
-      <state_interface name="position">
-        <param name="initial_value">{joint1_initial}</param>
-      </state_interface>
-      <state_interface name="velocity" />
-    </joint>
-    <joint name="joint2">
-      <command_interface name="position" />
-      <state_interface name="position">
-        <param name="initial_value">{joint2_initial}</param>
-      </state_interface>
-      <state_interface name="velocity" />
-    </joint>
-    <joint name="joint3">
-      <command_interface name="position" />
-      <state_interface name="position">
-        <param name="initial_value">{joint3_initial}</param>
-      </state_interface>
-      <state_interface name="velocity" />
-    </joint>
-    <joint name="joint4">
-      <command_interface name="position" />
-      <state_interface name="position">
-        <param name="initial_value">{joint4_initial}</param>
-      </state_interface>
-      <state_interface name="velocity" />
-    </joint>
-    <joint name="joint5">
-      <command_interface name="position" />
-      <state_interface name="position">
-        <param name="initial_value">{joint5_initial}</param>
-      </state_interface>
-      <state_interface name="velocity" />
-    </joint>
-    <joint name="joint6">
-      <command_interface name="position" />
-      <state_interface name="position">
-        <param name="initial_value">{joint6_initial}</param>
-      </state_interface>
-      <state_interface name="velocity" />
-    </joint>
-  </ros2_control>
-</robot>)";
-
-constexpr const char *kRetiredIsaacUr10eSection = R"(<robot name="retired">
-  <ros2_control name="IsaacUR10eTopicBasedSystem" type="system">
-    <hardware>
-      <plugin>topic_based_ros2_control/TopicBasedSystem</plugin>
-      <param name="joint_commands_topic">{joint_commands_topic}</param>
-      <param name="joint_states_topic">{joint_states_topic}</param>
-      <param name="trigger_joint_command_threshold">{trigger_joint_command_threshold}</param>
-      <param name="sum_wrapped_joint_states">{sum_wrapped_joint_states}</param>
-    </hardware>
-    <joint name="shoulder_pan_joint">
-      <command_interface name="position"/>
-      <state_interface name="position"><param name="initial_value">{shoulder_pan_initial}</param></state_interface>
-      <state_interface name="velocity"/>
-    </joint>
-    <joint name="shoulder_lift_joint">
-      <command_interface name="position"/>
-      <state_interface name="position"><param name="initial_value">{shoulder_lift_initial}</param></state_interface>
-      <state_interface name="velocity"/>
-    </joint>
-    <joint name="elbow_joint">
-      <command_interface name="position"/>
-      <state_interface name="position"><param name="initial_value">{elbow_initial}</param></state_interface>
-      <state_interface name="velocity"/>
-    </joint>
-    <joint name="wrist_1_joint">
-      <command_interface name="position"/>
-      <state_interface name="position"><param name="initial_value">{wrist_1_initial}</param></state_interface>
-      <state_interface name="velocity"/>
-    </joint>
-    <joint name="wrist_2_joint">
-      <command_interface name="position"/>
-      <state_interface name="position"><param name="initial_value">{wrist_2_initial}</param></state_interface>
-      <state_interface name="velocity"/>
-    </joint>
-    <joint name="wrist_3_joint">
-      <command_interface name="position"/>
-      <state_interface name="position"><param name="initial_value">{wrist_3_initial}</param></state_interface>
-      <state_interface name="velocity"/>
-    </joint>
-  </ros2_control>
-</robot>)";
-
-TEST(ControllerRobotDescription, IsaacLite6FormEqualsTheRetiredLaunchDescription) {
-  const auto model_text = read_repository_file(
-      "manyforge_example_models/models/lite6_lite_gripper/lite6_lite_gripper.urdf");
-  const auto retired =
-      parse(format_template(kRetiredIsaacLite6Section, launch_default_values()));
-  const auto generated = parse(generate_controller_robot_description(
-      ControllerRobotDescriptionRequest{
-          model_text,
-          {"joint1", "joint2", "joint3", "joint4", "joint5", "joint6"},
-          IsaacControllerLane{"IsaacLite6TopicBasedSystem",
-                              "/isaac_joint_commands", "/isaac_joint_states",
-                              {0.0, 0.0, 1.57, 0.0, 0.0, 0.0}}}));
-  ASSERT_EQ(retired.all("ros2_control").size(), 1U);
-  ASSERT_EQ(generated.all("ros2_control").size(), 1U);
-  EXPECT_EQ(canonical(*generated.all("ros2_control").front()),
-            canonical(*retired.all("ros2_control").front()));
-  // The rest of the description is the model itself.
-  EXPECT_EQ(model_children(generated), model_children(parse(model_text)));
-  EXPECT_EQ(generated.attribute("name"), "lite6_lite_gripper");
-}
-
-TEST(ControllerRobotDescription, IsaacUr10eFormDiffersFromTheRetiredFileOnlyInModelParts) {
-  const auto model_text = read_repository_file(
-      "manyforge_example_models/models/ur10e_robotiq_2f_140/"
-      "ur10e_robotiq_2f_140.urdf");
-  const std::vector<std::string> arm{"shoulder_pan_joint", "shoulder_lift_joint",
-                                     "elbow_joint",        "wrist_1_joint",
-                                     "wrist_2_joint",      "wrist_3_joint"};
-  const auto retired =
-      parse(format_template(kRetiredIsaacUr10eSection, launch_default_values()));
-  const auto generated = parse(generate_controller_robot_description(
-      ControllerRobotDescriptionRequest{
-          model_text, arm,
-          IsaacControllerLane{"IsaacUR10eTopicBasedSystem",
-                              "/isaac_joint_commands", "/isaac_joint_states",
-                              {2.63422544, -0.875980752, 1.551074106,
-                               -2.29231544, -1.560498884, -2.038544566}}}));
-  // The hardware section is identical.
-  ASSERT_EQ(generated.all("ros2_control").size(), 1U);
-  EXPECT_EQ(canonical(*generated.all("ros2_control").front()),
-            canonical(*retired.all("ros2_control").front()));
-  // Everything else comes from the model (accepted Q69 change): the official
-  // UR10e limits replace the retired hand-written 3.15/3.2 rad/s placeholders.
-  EXPECT_EQ(model_children(generated), model_children(parse(model_text)));
-  const std::map<std::string, std::string> velocity{
-      {"shoulder_pan_joint", "2.0943951023931953"},
-      {"shoulder_lift_joint", "2.0943951023931953"},
-      {"elbow_joint", "3.141592653589793"},
-      {"wrist_1_joint", "3.141592653589793"},
-      {"wrist_2_joint", "3.141592653589793"},
-      {"wrist_3_joint", "3.141592653589793"}};
-  for (const auto &name : arm) {
-    SCOPED_TRACE(name);
-    const Node *joint = nullptr;
-    for (const auto *candidate : generated.all("joint")) {
-      if (candidate->attribute("name") == name) joint = candidate;
-    }
-    ASSERT_NE(joint, nullptr);
-    EXPECT_EQ(joint->all("limit").front()->attribute("velocity"),
-              velocity.at(name));
-  }
 }
 
 } // namespace

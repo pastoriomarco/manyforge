@@ -15,7 +15,7 @@ order:** when two rules have the same specificity, the later file wins.
 | `shared/buttons.css` | `primary-action`, `danger-button`, `quiet-button`, `text-button`, `icon-button`, `segmented-control`, `button-row`. |
 | `shared/panels.css` | Generic panel chrome (`.panel`, `.panel-header`, `.panel-state`, `.panel-intro`). It comes before the surfaces, because surface classes on the same element refine it (for example `.viewer-header`). |
 | `shared/status.css` | Status pills, readiness dots, inline error text. |
-| `shared/notices.css` | Shared message looks: `notice` (box), `inline-message` (text) and `hint`, with `severity-info`, `severity-warning` and `severity-error`. |
+| `shared/notices.css` | Shared message looks: `notice` (box), `inline-message` (text) and `hint`, with `severity-info`, `severity-warning` and `severity-error`; `run-end` with `tone-warning` and `tone-error` for a run's end reason. |
 | `shared/menus.css` | The right-click menu (`CanvasContextMenu`). |
 | `surfaces/*.css` | One file per surface family: layout and the few looks that belong only to that surface. |
 

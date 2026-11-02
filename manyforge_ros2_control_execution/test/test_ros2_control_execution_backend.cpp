@@ -3,6 +3,7 @@
 #include <manyforge_ros2_control_execution/selected_ros_endpoint_facts.hpp>
 #include <sensor_msgs/msg/joint_state.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -25,10 +26,6 @@ namespace manyforge::ros2_control_execution {
 // action server. Normal sends, acceptance and positive ACK use the real client.
 class JtcExecutionPortTestPeer {
 public:
-  template <typename ReadEndpoints>
-  static void refresh_endpoint_facts(SelectedRosEndpointFacts &facts, ReadEndpoints &&read) {
-    facts.RefreshWith(std::forward<ReadEndpoints>(read));
-  }
   static void receive_state(Ros2ControlExecutionBackend& port,
       const control_msgs::msg::JointTrajectoryControllerState& message) {
     Ros2ControlExecutionBackend::ReceiveState(port.state_, message);
@@ -374,7 +371,10 @@ TEST(JtcExecutionPort, EndpointFactsNameSecondPublisherAndRestartOverlap) {
     return !observed;
   })) << "initial publisher: " << describe();
   const auto topic = rig.config(1).state_topic;
-  auto second = rig.resources.node()->create_publisher<
+  // A second instance's publisher, on its own unspun node (see
+  // EndpointFactsCountZeroOneAndTwoPublishers).
+  Ros2TransportResources peer("endpoint_second_instance", "", 1);
+  auto second = peer.node()->create_publisher<
       control_msgs::msg::JointTrajectoryControllerState>(topic, rclcpp::QoS(10));
   ASSERT_TRUE(wait_until([&] {
     rig.adapter->RefreshEndpointFacts();
@@ -406,12 +406,9 @@ TEST(JtcExecutionPort, EndpointGraphFindsIncompatibleQosPublisherWithoutMatchedC
   ASSERT_TRUE(wait_until([&] {
     rig.adapter->RefreshEndpointFacts();
     const auto error = rig.adapter->ReadEndpointDiagnostic();
-    return error && error->code == "duplicate_component_instance" &&
-           error->details.at("evidence_kind") == "ros_publisher_endpoints";
+    return error && error->code == "duplicate_component_instance";
   }));
-  const auto error = rig.adapter->ReadEndpointDiagnostic();
-  ASSERT_TRUE(error);
-  EXPECT_NE(error->details.at("first_endpoint"), error->details.at("second_endpoint"));
+  EXPECT_EQ(rig.adapter->ReadEndpointDiagnostic()->details.at("endpoint_count"), "2");
   EXPECT_EQ(rig.goal_count(), 0U);
 }
 
@@ -428,276 +425,95 @@ TEST(JtcExecutionPort, EndpointFactsDoNotCountSharedJointStatePublishers) {
   EXPECT_EQ(rig.goal_count(), 0U);
 }
 
-TEST(JtcExecutionPort, EndpointFactsRetainUnsettledReadErrorsWithoutEffects) {
+TEST(JtcExecutionPort, EndpointFactsReportGraphReadFailureAsNotEstablished) {
   Rig rig;
-  SelectedRosEndpointFacts invalid(rig.resources.node(), "invalid topic name",
-      "control_msgs/msg/JointTrajectoryControllerState");
-  ASSERT_TRUE(wait_until([&] {
-    invalid.Refresh();
-    const auto error = invalid.ReadError();
-    return error && error->details.at("graph_reason") ==
-                        "selected_endpoint_graph_read_failed";
-  }));
+  SelectedRosEndpointFacts invalid(rig.resources.node(), "invalid topic name");
+  invalid.Refresh();
   const auto error = invalid.ReadError();
   ASSERT_TRUE(error);
   EXPECT_EQ(error->code, "component_instance_graph_unsettled");
-  EXPECT_EQ(error->details.at("graph_reason"), "selected_endpoint_graph_read_failed");
-  EXPECT_EQ(invalid.ReadError(), error);
+  EXPECT_FALSE(error->details.at("cause").empty());
   EXPECT_EQ(rig.goal_count(), 0U);
 }
 
-TEST(JtcExecutionPort, EndpointCacheReadsDoNotConsumeAnUnsettledEdge) {
-  Rig rig;
-  SelectedRosEndpointFacts facts(rig.resources.node(), rig.config(1).state_topic,
-      "control_msgs/msg/JointTrajectoryControllerState");
-  ASSERT_TRUE(wait_until([&] {
-    facts.Refresh();
-    return !facts.ReadError();
-  }));
-  // This is the existing SDK matched-edge input; cached reads must not
-  // acknowledge it or manufacture a stable observation.
-  facts.ObserveMatchedCount(1);
-  for (int read = 0; read < 3; ++read) {
-    const auto error = facts.ReadError();
-    ASSERT_TRUE(error);
-    EXPECT_EQ(error->code, "component_instance_graph_unsettled");
-  }
-  ASSERT_TRUE(wait_until([&] {
-    facts.Refresh();
-    return !facts.ReadError();
-  }));
-  EXPECT_EQ(rig.goal_count(), 0U);
-}
-
-// Endpoint identity freshness: a domain-wide graph event is not a change of
-// the selected endpoint; only its publisher GID set or matched count is.
-using JointStatePublisher = rclcpp::Publisher<sensor_msgs::msg::JointState>;
-constexpr const char *kJointStateType = "sensor_msgs/msg/JointState";
-
-std::vector<std::array<std::uint8_t, RMW_GID_STORAGE_SIZE>>
-publisher_gids(const rclcpp::Node::SharedPtr &node, const std::string &topic) {
-  std::vector<std::array<std::uint8_t, RMW_GID_STORAGE_SIZE>> gids;
-  for (const auto &endpoint : node->get_publishers_info_by_topic(topic))
-    gids.push_back(endpoint.endpoint_gid());
-  return gids;
-}
-std::optional<std::string> graph_reason(const SelectedRosEndpointFacts &facts) {
+// EPC-1: the selected topic's publisher count alone decides: 0 is not
+// established, 1 is clean, 2+ is a duplicate instance.
+std::optional<std::string> endpoint_code(SelectedRosEndpointFacts &facts) {
+  facts.Refresh();
   const auto error = facts.ReadError();
-  if (!error)
-    return std::nullopt;
-  if (error->code != "component_instance_graph_unsettled")
-    return error->code;
-  return error->details.at("graph_reason");
+  return error ? std::optional<std::string>(error->code) : std::nullopt;
 }
-// Establishes publisher A, then replaces it by B (same count) in the graph
-// without any Refresh observing the gap.
-struct ReplacedPublisher {
-  std::shared_ptr<JointStatePublisher> b;
-  ReplacedPublisher(const rclcpp::Node::SharedPtr &node,
-                    SelectedRosEndpointFacts &facts, const std::string &topic) {
-    auto a = node->create_publisher<sensor_msgs::msg::JointState>(topic, 10);
-    EXPECT_TRUE(wait_until([&] {
-      facts.Refresh();
-      return !facts.ReadError();
-    }));
-    const auto old_gids = publisher_gids(node, topic);
-    b = node->create_publisher<sensor_msgs::msg::JointState>(topic, 10);
-    a.reset();
-    EXPECT_TRUE(wait_until([&] {
-      const auto gids = publisher_gids(node, topic);
-      return gids.size() == 1U && gids != old_gids;
-    }));
-  }
-};
 
-TEST(JtcExecutionPort, EndpointFactsDetectSameCountPublisherReplacement) {
+TEST(JtcExecutionPort, EndpointFactsCountZeroOneAndTwoPublishers) {
   Rig rig;
   const auto node = rig.resources.node();
-  const std::string topic = "/endpoint_freshness_replacement";
-  SelectedRosEndpointFacts facts(node, topic, kJointStateType);
-  ReplacedPublisher replaced(node, facts, topic);
-  // Every capture of B, stable or not, is reported changed before it settles.
-  facts.Refresh();
-  EXPECT_EQ(graph_reason(facts), "selected_endpoint_graph_changed");
-  ASSERT_TRUE(wait_until([&] {
-    facts.Refresh();
-    return !facts.ReadError();
-  }));
-  EXPECT_EQ(rig.goal_count(), 0U);
-}
-
-// Inject the existing graph/count input after the REAL endpoint read, before
-// commit. No threads or scheduler timing decide whether the capture raced.
-void expect_inflight_endpoint_change_uncommitted(bool matched_revision) {
-  Rig rig;
-  const auto node = rig.resources.node();
-  const std::string topic = matched_revision ? "/endpoint_freshness_revision_capture"
-                                           : "/endpoint_freshness_graph_event_capture";
-  SelectedRosEndpointFacts facts(node, topic, kJointStateType);
-  ReplacedPublisher replaced(node, facts, topic);
-  int reads = 0;
-  JtcExecutionPortTestPeer::refresh_endpoint_facts(facts, [&](const auto &current_node) {
-    auto endpoints = current_node->get_publishers_info_by_topic(topic);
-    ++reads;
-    if (matched_revision)
-      facts.ObserveMatchedCount(1);
-    else
-      current_node->get_node_graph_interface()->notify_graph_change();
-    return endpoints;
-  });
-  EXPECT_EQ(reads, 1);
-  EXPECT_EQ(graph_reason(facts), "selected_endpoint_graph_changed");
-  // A clean capture still sees B as new: the raced capture did not commit B.
-  facts.Refresh();
-  EXPECT_EQ(graph_reason(facts), "selected_endpoint_graph_changed");
-  ASSERT_TRUE(wait_until([&] {
-    facts.Refresh();
-    return !facts.ReadError();
-  }));
-  EXPECT_EQ(rig.goal_count(), 0U);
-}
-
-TEST(JtcExecutionPort, EndpointFactsGraphEventDuringCaptureLeavesIdentityUncommitted) {
-  expect_inflight_endpoint_change_uncommitted(false);
-}
-
-TEST(JtcExecutionPort, EndpointFactsRevisionInflightLeavesIdentityUncommitted) {
-  expect_inflight_endpoint_change_uncommitted(true);
-}
-
-TEST(JtcExecutionPort, EndpointFactsUnrelatedEdgeThenStableRefreshReadsUnchanged) {
-  Rig rig;
-  const auto node = rig.resources.node();
-  const std::string topic = "/endpoint_freshness_unrelated";
-  auto publisher = node->create_publisher<sensor_msgs::msg::JointState>(topic, 10);
-  SelectedRosEndpointFacts facts(node, topic, kJointStateType);
-  ASSERT_TRUE(wait_until([&] {
-    facts.Refresh();
-    return !facts.ReadError();
-  }));
-  // Real unrelated graph churn settles to unchanged with identical GIDs.
-  auto unrelated = node->create_publisher<sensor_msgs::msg::JointState>(
-      "/endpoint_freshness_unrelated_other", 10);
-  ASSERT_TRUE(wait_until([&] {
-    facts.Refresh();
-    return !facts.ReadError();
-  }));
-  // A pending generic edge is unsettled, never unchanged, until an NRT
-  // refresh proves the selected endpoint unchanged (Prepare's order).
-  node->get_node_graph_interface()->notify_graph_change();
-  EXPECT_EQ(graph_reason(facts), "selected_endpoint_graph_changed");
-  EXPECT_EQ(graph_reason(facts), "selected_endpoint_graph_changed");
-  ASSERT_TRUE(wait_until([&] {
-    facts.Refresh();
-    return !facts.ReadError();
-  }));
-  EXPECT_EQ(rig.goal_count(), 0U);
-}
-
-TEST(JtcExecutionPort, EndpointFactsEdgeAfterRefreshBeforeReadErrorReadsUnsettled) {
-  Rig rig;
-  const auto node = rig.resources.node();
-  const std::string topic = "/endpoint_freshness_edge_after_refresh";
-  auto publisher = node->create_publisher<sensor_msgs::msg::JointState>(topic, 10);
-  SelectedRosEndpointFacts facts(node, topic, kJointStateType);
-  ASSERT_TRUE(wait_until([&] {
-    facts.Refresh();
-    return !facts.ReadError();
-  }));
-  facts.Refresh();
-  node->get_node_graph_interface()->notify_graph_change();
-  EXPECT_EQ(graph_reason(facts), "selected_endpoint_graph_changed");
-  EXPECT_EQ(rig.goal_count(), 0U);
-}
-
-TEST(JtcExecutionPort, EndpointFactsKeepAddedMissingAndWrongTypeFailClosed) {
-  Rig rig;
-  const auto node = rig.resources.node();
-  const std::string topic = "/endpoint_freshness_fail_closed";
-  SelectedRosEndpointFacts facts(node, topic, kJointStateType);
-  // Missing: no publisher was ever established.
-  facts.Refresh();
-  EXPECT_TRUE(graph_reason(facts));
-  auto first = node->create_publisher<sensor_msgs::msg::JointState>(topic, 10);
-  ASSERT_TRUE(wait_until([&] {
-    facts.Refresh();
-    return !facts.ReadError();
-  }));
-  // Added: a second publisher is a conflicting endpoint.
-  auto second = node->create_publisher<sensor_msgs::msg::JointState>(topic, 10);
-  ASSERT_TRUE(wait_until([&] {
-    facts.Refresh();
-    const auto error = facts.ReadError();
-    return error && error->code == "duplicate_component_instance";
-  }));
-  // Removed: with no publisher left the role is not established.
+  const std::string topic = "/endpoint_count_rule";
+  SelectedRosEndpointFacts facts(node, topic);
+  // Before any Refresh and with no publisher: not established.
+  ASSERT_TRUE(facts.ReadError());
+  EXPECT_EQ(facts.ReadError()->code, "component_instance_graph_unsettled");
+  EXPECT_EQ(endpoint_code(facts), "component_instance_graph_unsettled");
+  EXPECT_EQ(facts.ReadError()->details.at("endpoint_count"), "0");
+  // The publishers live on another, unspun node: a publisher on the spinning
+  // rig node stays in the graph until its executor wakes up again.
+  Ros2TransportResources peer("endpoint_count_peer", "", 1);
+  auto first = peer.node()->create_publisher<sensor_msgs::msg::JointState>(topic, 10);
+  ASSERT_TRUE(wait_until([&] { return !endpoint_code(facts); }));
+  auto second = peer.node()->create_publisher<sensor_msgs::msg::JointState>(topic, 10);
+  ASSERT_TRUE(wait_until(
+      [&] { return endpoint_code(facts) == "duplicate_component_instance"; }));
+  EXPECT_EQ(facts.ReadError()->details.at("topic"), topic);
+  EXPECT_EQ(facts.ReadError()->details.at("endpoint_count"), "2");
   second.reset();
+  ASSERT_TRUE(wait_until([&] { return !endpoint_code(facts); }));
   first.reset();
-  ASSERT_TRUE(wait_until([&] {
-    // Local publisher removal is not always followed by an SDK graph event
-    // (pre-existing, see EndpointFactsNameSecondPublisherAndRestartOverlap);
-    // a synthetic edge only triggers the re-read.
-    node->get_node_graph_interface()->notify_graph_change();
-    facts.Refresh();
-    return graph_reason(facts) == "selected_endpoint_not_established";
-  }));
-  // Wrong type: an endpoint of another type never establishes the role.
-  auto wrong = node->create_publisher<control_msgs::msg::JointTrajectoryControllerState>(
-      topic, 10);
-  ASSERT_TRUE(wait_until([&] {
-    return publisher_gids(node, topic).size() == 1U;
-  }));
-  for (int capture = 0; capture < 3; ++capture) {
-    facts.Refresh();
-    EXPECT_TRUE(facts.ReadError());
-  }
-  ASSERT_TRUE(wait_until([&] {
-    facts.Refresh();
-    return graph_reason(facts) == "selected_endpoint_not_established";
-  }));
+  ASSERT_TRUE(wait_until(
+      [&] { return endpoint_code(facts) == "component_instance_graph_unsettled"; }));
   EXPECT_EQ(rig.goal_count(), 0U);
 }
 
-TEST(JtcExecutionPort, EndpointFactsZeroGidAndReadFailureRemainCachedAndFailClosed) {
+TEST(JtcExecutionPort, EndpointFactsMatchedCountAboveOneIsADuplicate) {
   Rig rig;
   const auto node = rig.resources.node();
-  const std::string topic = "/endpoint_freshness_zero_gid_read_failure";
+  const std::string topic = "/endpoint_count_matched";
   auto publisher = node->create_publisher<sensor_msgs::msg::JointState>(topic, 10);
-  SelectedRosEndpointFacts facts(node, topic, kJointStateType);
-  ASSERT_TRUE(wait_until([&] {
-    facts.Refresh();
-    return !facts.ReadError();
-  }));
-  for (const bool read_failure : {false, true}) {
-    SCOPED_TRACE(read_failure ? "read failure" : "zero GID");
-    int reads = 0;
+  SelectedRosEndpointFacts facts(node, topic);
+  ASSERT_TRUE(wait_until([&] { return !endpoint_code(facts); }));
+  facts.ObserveMatchedCount(2);
+  EXPECT_EQ(facts.ReadError()->code, "duplicate_component_instance");
+  facts.ObserveMatchedCount(1);
+  EXPECT_FALSE(facts.ReadError());
+  EXPECT_EQ(rig.goal_count(), 0U);
+}
+
+TEST(JtcExecutionPort, EndpointFactsIgnoreUnrelatedNodesStartingAndStopping) {
+  Rig rig;
+  const auto node = rig.resources.node();
+  const std::string topic = "/endpoint_count_unrelated";
+  auto publisher = node->create_publisher<sensor_msgs::msg::JointState>(topic, 10);
+  SelectedRosEndpointFacts facts(node, topic);
+  ASSERT_TRUE(wait_until([&] { return !endpoint_code(facts); }));
+  const auto seen = [&](const std::string &name) {
+    const auto names = node->get_node_names();
+    return std::find(names.begin(), names.end(), "/" + name) != names.end();
+  };
+  for (int cycle = 0; cycle < 3; ++cycle) {
+    const auto name = "endpoint_count_unrelated_" + std::to_string(cycle);
+    auto unrelated = std::make_unique<Ros2TransportResources>(name, "", 1);
+    auto other = unrelated->node()->create_publisher<sensor_msgs::msg::JointState>(
+        "/endpoint_count_unrelated_other", 10);
     ASSERT_TRUE(wait_until([&] {
-      node->get_node_graph_interface()->notify_graph_change();
-      JtcExecutionPortTestPeer::refresh_endpoint_facts(facts, [&](const auto &current_node) {
-        auto endpoints = current_node->get_publishers_info_by_topic(topic);
-        ++reads;
-        if (read_failure)
-          throw std::runtime_error("injected endpoint read failure");
-        endpoints.at(0).endpoint_gid().fill(0);
-        return endpoints;
-      });
-      return graph_reason(facts) == (read_failure ? "selected_endpoint_graph_read_failed"
-                                                : "selected_endpoint_not_established");
+      EXPECT_FALSE(endpoint_code(facts));
+      return seen(name);
     }));
-    const auto captured_reads = reads;
-    const auto error = facts.ReadError();
-    ASSERT_TRUE(error);
-    if (read_failure) {
-      EXPECT_EQ(error->details.at("cause"), "injected endpoint read failure");
-    }
-    for (int read = 0; read < 3; ++read)
-      EXPECT_TRUE(facts.ReadError());
-    EXPECT_EQ(reads, captured_reads);
-    node->get_node_graph_interface()->notify_graph_change();
+    EXPECT_FALSE(endpoint_code(facts));
+    other.reset();
+    unrelated.reset();
     ASSERT_TRUE(wait_until([&] {
-      facts.Refresh();
-      return !facts.ReadError();
+      EXPECT_FALSE(endpoint_code(facts));
+      return !seen(name);
     }));
+    EXPECT_FALSE(endpoint_code(facts));
   }
   EXPECT_EQ(rig.goal_count(), 0U);
 }

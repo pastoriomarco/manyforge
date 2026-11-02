@@ -6,7 +6,7 @@
 #include <vector>
 
 #include <manyforge_core/execution_port_participant.hpp>
-#include <manyforge_roboplan/retained_native_runtime.hpp>
+#include <manyforge_roboplan/retained_execution_host.hpp>
 #include <manyforge_roboplan/retained_ros2_control_runtime_handle.hpp>
 #include <manyforge_ros2_control_execution/ros2_gripper_command_backend.hpp>
 
@@ -35,15 +35,13 @@ struct RetainedRos2ControlBackendConfig final {
   /// Managed first installation starts the executor only after fenced
   /// ownership.
   bool defer_ros_start{false};
-  /// Exact successor computed from the owned predecessor before retirement.
-  /// Absent on ordinary startup; never derived from caller counters here.
-  std::optional<core::SelectedControllerOccurrenceDTO> successor_occurrence;
   /// Actual owner of the same clock passed to the factory callback. Required
   /// for a measured lane; retained by the existing backend handle through
   /// transport teardown. Never substitute a borrowed shared-pointer alias.
   std::shared_ptr<core::IClock> measured_receiver_clock;
   /// Constructor-only acquisition of the native host's compatible ROS context.
-  /// Absent for standalone callers, which retain private context ownership.
+  /// Absent only for focused test callers, which retain private context
+  /// ownership.
   ros2_control_execution::Ros2TransportResources::ContextProvider ros_context_provider{};
 };
 
@@ -62,7 +60,7 @@ retained_ros2_control_gripper_state_config(
 
 /// Construct a single-use retained runtime backend factory: the shared ROS
 /// transport, the arm's JTC adapter for the initial binding epoch and the Core
-/// participant over it, and the gripper adapter, all owned by `runtime_handle`
+/// participant over it, all owned by `runtime_handle`
 /// and joined to the retained Kernel and state publication.
 [[nodiscard]] RetainedRuntimeBackendFactory
 make_retained_ros2_control_backend_factory(

@@ -1,0 +1,194 @@
+name: cpp-unit
+
+# ROS-free C++ packages, Release, built and tested on the runner with ccache,
+# configured as scripts/test-all.sh cpp does (its headless leg needs the ROS
+# image). manyforge_core is built once and its ctest cases run in 4 shards.
+# Deployment's own tests need the expression binding; they run under
+# ASan/UBSan in the heavy tier and in local-ci. The nightly schedule runs this
+# on dev and seeds the ccache that pushes and PRs restore.
+on:
+  pull_request:
+    paths:
+      - "manyforge_core/**"
+      - "manyforge_content_identity/**"
+      - "manyforge_persistence/**"
+      - "manyforge_scene/**"
+      - "manyforge_component_manager/**"
+      - "manyforge_deployment/**"
+      - "manyforge_behavior/**"
+      - "manyforge_example_nodes/**"
+      - "manyforge_example_models/**"
+      - ".github/workflows/cpp-unit.yml"
+  push:
+    branches: [main, dev]
+    paths:
+      - "manyforge_core/**"
+      - "manyforge_content_identity/**"
+      - "manyforge_persistence/**"
+      - "manyforge_scene/**"
+      - "manyforge_component_manager/**"
+      - "manyforge_deployment/**"
+      - "manyforge_behavior/**"
+      - "manyforge_example_nodes/**"
+      - "manyforge_example_models/**"
+      - ".github/workflows/cpp-unit.yml"
+  schedule:
+    - cron: "30 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  CCACHE_BASEDIR: ${{ github.workspace }}
+  CCACHE_MAXSIZE: 1G
+  CMAKE_C_COMPILER_LAUNCHER: ccache
+  CMAKE_CXX_COMPILER_LAUNCHER: ccache
+  CMAKE_BUILD_PARALLEL_LEVEL: "4"
+
+jobs:
+  core-build:
+    name: C++ manyforge_core build (Release)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'schedule' && 'dev' || '' }}
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build ccache pkg-config libgtest-dev libgmock-dev \
+            libsqlite3-dev libssl-dev libexpat1-dev zlib1g-dev libyaml-dev \
+            libdouble-conversion-dev libutf8proc-dev
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ccache-cpp-manyforge_core-${{ github.run_id }}
+          restore-keys: ccache-cpp-manyforge_core-
+      - name: Configure and build
+        run: |
+          cmake -S manyforge_core -B build/manyforge_core -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
+            -DMANYFORGE_GTEST_TIMEOUT_SECONDS=60
+          cmake --build build/manyforge_core
+          ccache --show-stats
+      - name: Save ccache
+        if: ${{ !cancelled() && github.event_name != 'pull_request' }}
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ccache-cpp-manyforge_core-${{ github.run_id }}
+      # Test binaries, CTest files and discovered gtest lists; no objects.
+      - name: Pack the test tree
+        run: |
+          tar -C build --exclude='*.o' --exclude='*.a' --exclude='.ninja_*' \
+            -cf - manyforge_core | zstd -T0 -3 -o core-tests.tar.zst
+          ls -lh core-tests.tar.zst
+      - uses: actions/upload-artifact@v4
+        with:
+          name: core-tests
+          path: core-tests.tar.zst
+          compression-level: 0
+          retention-days: 1
+
+  core-test:
+    name: C++ manyforge_core tests (shard ${{ matrix.shard }}/4)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: core-build
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      # Same checkout path as the build: CTest files hold absolute paths and
+      # some tests read their inputs from the source tree.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'schedule' && 'dev' || '' }}
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build ccache pkg-config libgtest-dev libgmock-dev \
+            libsqlite3-dev libssl-dev libexpat1-dev zlib1g-dev libyaml-dev \
+            libdouble-conversion-dev libutf8proc-dev
+      - uses: actions/download-artifact@v4
+        with:
+          name: core-tests
+      - name: Unpack the test tree
+        run: mkdir -p build && zstd -dc core-tests.tar.zst | tar -C build -xf -
+      # Every 4th test from the shard's index; each shard runs serially.
+      - name: Test shard ${{ matrix.shard }}
+        run: |
+          ctest --test-dir build/manyforge_core --output-on-failure \
+            --no-tests=error --timeout 60 -I "${{ matrix.shard }},,4"
+
+  packages:
+    name: C++ ${{ matrix.package }} (Release)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - package: manyforge_content_identity
+            testing: -DMANYFORGE_CONTENT_IDENTITY_BUILD_TESTING=ON
+          - package: manyforge_persistence
+            testing: -DMANYFORGE_PERSISTENCE_BUILD_TESTING=ON
+          - package: manyforge_scene
+            testing: -DBUILD_TESTING=ON -DMANYFORGE_SCENE_GTEST_TIMEOUT_SECONDS=60
+          - package: manyforge_component_manager
+            testing: -DBUILD_TESTING=ON -DMANYFORGE_GTEST_TIMEOUT_SECONDS=60
+    env:
+      BUILD: build/${{ matrix.package }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'schedule' && 'dev' || '' }}
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build ccache pkg-config libgtest-dev libgmock-dev \
+            libsqlite3-dev libssl-dev libexpat1-dev zlib1g-dev libyaml-dev \
+            libdouble-conversion-dev libutf8proc-dev
+      # Configure-time generators and model preparation import manyforge_behavior.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: .github/workflows/cpp-unit.yml
+      - name: Install Python dependencies (dev-image pins)
+        run: python -m pip install pyyaml==6.0.3 rfc8785==0.1.4 py_trees==2.4.0
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ccache-cpp-${{ matrix.package }}-${{ github.run_id }}
+          restore-keys: ccache-cpp-${{ matrix.package }}-
+      - name: Configure and build
+        env:
+          TESTING_ARGS: ${{ matrix.testing }}
+        run: |
+          # shellcheck disable=SC2086
+          cmake -S "${{ matrix.package }}" -B "$BUILD" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release $TESTING_ARGS
+          cmake --build "$BUILD"
+          ccache --show-stats
+      - name: Save ccache
+        if: ${{ !cancelled() && github.event_name != 'pull_request' }}
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ccache-cpp-${{ matrix.package }}-${{ github.run_id }}
+      - name: Test
+        run: ctest --test-dir "$BUILD" --output-on-failure --no-tests=error --timeout 60

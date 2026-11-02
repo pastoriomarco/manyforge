@@ -47,8 +47,6 @@ inline constexpr char kDigestB[] =
       {},
       {},
       std::nullopt,
-      std::nullopt,
-      std::nullopt,
       20,
       std::nullopt});
   EXPECT_TRUE(reduced.ok());
@@ -70,26 +68,22 @@ inline constexpr char kDigestB[] =
                                      std::nullopt},
       StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kPending, std::nullopt,
                                      std::nullopt},
-      StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kNotApplicable, std::nullopt,
-                                     std::nullopt},
       StopCertificateRefDTO{certificate.stop_certificate_id, certificate.stop_certificate_revision,
-                            certificate.stop_id, certificate.stop_generation},
-      std::nullopt,
-      std::nullopt};
+                            certificate.stop_id, certificate.stop_generation}};
 }
 
 TEST(StopTerminalStateTest, ValidatesExactTerminalStatusCertificateJoin) {
   const auto certificate = Certificate();
   const auto status = Status();
   EXPECT_FALSE(stop_status_field_error(status).has_value());
-  EXPECT_FALSE(stop_terminal_projection_field_error(status, certificate, std::nullopt).has_value());
+  EXPECT_FALSE(stop_terminal_projection_field_error(status, certificate).has_value());
 }
 
 TEST(StopTerminalStateTest, RejectsConflictingTerminalOutcomeAndProjectionPresence) {
   const auto certificate = Certificate();
   auto status = Status();
   status.state = StopStatusStateDTO::kPartial;
-  EXPECT_EQ(stop_terminal_projection_field_error(status, certificate, std::nullopt),
+  EXPECT_EQ(stop_terminal_projection_field_error(status, certificate),
             "stop_terminal_projection_outcome_invalid");
 
   status = Status();
@@ -101,26 +95,23 @@ TEST(StopTerminalStateTest, RejectsConflictingTerminalOutcomeAndProjectionPresen
 
 TEST(StopTerminalStateTest, TerminalStatusRestRebuildsTheExactStatus) {
   // Lean Stop record: a terminal row stores only the status rest; the rest of
-  // the status is rebuilt from the certificate and latch. The reducer fixtures
-  // (test_stop_terminal_reducer) cover partial, failed, latched, surveilled,
-  // escalated and predecessor-merge statuses.
+  // the status is rebuilt from the certificate. The reducer fixtures
+  // (test_stop_terminal_reducer) cover partial, failed, escalated and
+  // predecessor-merge statuses.
   const auto certificate = Certificate();
   const auto status = Status();
-  ASSERT_FALSE(stop_terminal_projection_field_error(status, certificate, std::nullopt).has_value());
+  ASSERT_FALSE(stop_terminal_projection_field_error(status, certificate).has_value());
   const auto rest = TerminalStopStatusRest(status);
   EXPECT_EQ(rest.accepted, status.accepted);
   EXPECT_EQ(rest.current_stages, status.current_stages);
   EXPECT_EQ(rest.acceptance_projection, status.acceptance_projection);
   EXPECT_EQ(rest.terminal_projection.state, StopDurableProjectionStateDTO::kPending);
-  EXPECT_EQ(rest.surveillance_projection, status.surveillance_projection);
-  EXPECT_EQ(rest.surveillance, status.surveillance);
-  EXPECT_EQ(TerminalStopStatusFromCertificate(rest, certificate, std::nullopt), status);
+  EXPECT_EQ(TerminalStopStatusFromCertificate(rest, certificate), status);
 
   auto recorded = status;
   recorded.terminal_projection = StopDurableProjectionStatusDTO{
       StopDurableProjectionStateDTO::kRecorded, std::nullopt, std::nullopt};
-  EXPECT_EQ(TerminalStopStatusFromCertificate(TerminalStopStatusRest(recorded), certificate,
-                                              std::nullopt),
+  EXPECT_EQ(TerminalStopStatusFromCertificate(TerminalStopStatusRest(recorded), certificate),
             recorded);
 }
 

@@ -89,9 +89,11 @@ Only `completed` carries a response; only `failed` carries a closed
 `{code,message}` error.
 
 A completed response is exactly
-`manyforge.assistant.provider_response.v1`. It echoes attribution and mode,
-records the narrowed `catalogHash`, text, completed `toolCalls`, warnings,
-Draft provenance, clarification flag, exit reason, and bounded turn count.
+`manyforge.assistant.provider_response.v1`. It echoes attribution and
+`assistantMode`, and records the narrowed `catalogHash`, the model's `message`
+text, completed `toolCalls`, `warnings`, `requiresReview`, `mutated`,
+`draftMutated`, `needsClarification`, `exitReason`, and the bounded
+`turnCount`.
 
 The same `requestId` and identical content is idempotent while its bounded
 record is retained. Reusing an ID with different content is a conflict. Clients

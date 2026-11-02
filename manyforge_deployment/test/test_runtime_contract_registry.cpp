@@ -8,7 +8,6 @@
 
 #include <manyforge_core/runtime_contract_manifest_codec.hpp>
 #include <manyforge_core/types/capability_definition.hpp>
-#include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/runtime_contract_capability_declarations.hpp>
 #include <manyforge_deployment/runtime_contract_registry.hpp>
@@ -17,9 +16,6 @@
 namespace manyforge::deployment {
 namespace {
 
-// DX753: archived identities test refusal without restoring Native admission APIs.
-constexpr std::string_view kRetiredNativeImplementationId = "manyforge.native_execution_host";
-constexpr std::string_view kRetiredNativeProductContractId = "manyforge.native_execution_runtime_unit";
 
 TEST(RuntimeContractRegistry, OldSealedRosProfileRefusesWithRecompileGuidance) {
   const auto &contracts = runtime_contract_declaration_registry().contracts();
@@ -128,21 +124,14 @@ TEST(RuntimeContractRegistry,
     }
   };
 
-  const auto native = std::find_if(
-      registry.contracts().begin(), registry.contracts().end(),
-      [](const auto &row) {
-        return row.offer().runtime_implementation_id.value() ==
-               kRetiredNativeImplementationId;
-      });
   const auto ros2_control = std::find_if(
       registry.contracts().begin(), registry.contracts().end(),
       [](const auto &row) {
         return row.offer().runtime_implementation_id.value() ==
                ros2_control_execution_runtime_contract::kImplementationId;
       });
-  EXPECT_EQ(native, registry.contracts().end());
   ASSERT_NE(ros2_control, registry.contracts().end());
-  check_offer(ros2_control->offer(), 42U);
+  check_offer(ros2_control->offer(), 39U);
   const auto has_operation_scale = [](const auto &offer) {
     return std::any_of(offer.provided_capabilities.begin(),
                        offer.provided_capabilities.end(), [](const auto &ref) {
@@ -199,19 +188,6 @@ TEST(RuntimeContractRegistry,
   EXPECT_EQ(refused.error().details.at("reason"), "required_capability_missing");
   EXPECT_EQ(refused.error().details.at("capability_id"),
             services.front().capability_id.value());
-}
-
-TEST(RuntimeContractRegistry, RetiredNativeProductIsUnavailableBeforeAdmission) {
-  const auto &contracts = runtime_contract_declaration_registry().contracts();
-  EXPECT_EQ(std::find_if(contracts.begin(), contracts.end(), [](const auto &row) {
-              return row.runtime_profile_id().value() ==
-                     "manyforge.native_execution_runtime";
-            }), contracts.end());
-  EXPECT_THROW(static_cast<void>(detail::require_runtime_contract(
-      core::RuntimeProfileId("manyforge.native_execution_runtime"),
-      core::RuntimeProfileRevision("sha256:0000000000000000000000000000000000000000000000000000000000000000"),
-      core::ProductContractId(std::string(kRetiredNativeProductContractId)),
-      core::ProductContractRevision("sha256:0000000000000000000000000000000000000000000000000000000000000000"))), RetainedBundleError);
 }
 
 TEST(RuntimeContractRegistry,

@@ -1,12 +1,9 @@
 # UR10e + Robotiq 2F-140 Example Model
 
-> **Current boundary:** the static files and provenance remain valid reference
-> assets, but no Isaac or native product lane is currently available. Keeping
-> the bundle self-contained does not qualify a viewer, planner, or simulator
-> integration.
-
-This preview model bundle was vendored into `manyforge_example_models` to make
-the captured ManyForge Isaac/preview path self-contained.
+This bundle has no `component.yaml` and isn't placed in a Deployment: it is
+the source of the split models `../ur10e` (the arm) and `../robotiq_2f_140` (the
+tool), which are placed as separate components with the tool mounted on the
+arm's `flange`. It holds their meshes, licenses and upstream sources.
 
 Contents:
 - `ur10e_robotiq_2f_140.urdf`
@@ -26,10 +23,7 @@ intact. The SRDF's non-standard `<gripper>` element is an HPP Manipulation
 extension carrying clearance and grasp-pose metadata; repository history
 shows no ManyForge or RoboPlan owner that consumed it. The `.structural.srdf`
 sibling is mechanically checked to be the exact original minus that one
-extension. The original source bytes and metadata remain available for an
-explicit future adapter decision; I2 does not promote consumer-specific
-extensions into its portable structural IR or claim them as previously
-working behavior.
+extension. ManyForge doesn't use either extension.
 
 Provenance:
 - Universal Robots UR10e meshes were copied from the official
@@ -40,6 +34,3 @@ Provenance:
 Licensing:
 - See `licenses/Universal_Robots_ROS2_Description.LICENSE`
 - See `licenses/ros2_robotiq_gripper.LICENSE`
-
-This bundle is a preview/demo enabler, not yet a long-term model packaging
-architecture for ManyForge.

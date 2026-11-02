@@ -45,22 +45,10 @@ class AdmissionJournal final : public IOperationJournal {
       const EmergencyStopAffectedStateSnapshotDTO&) noexcept override {
     return {};
   }
-  StopForensicProjectionResultDTO RecordStopTerminal(
-      const RequestOwnerEpoch&, const StopStatusDTO&, const StopCertificateDTO&,
-      const std::optional<StopFaultLatchDTO>&) noexcept override {
+  StopForensicProjectionResultDTO RecordStopTerminal(const RequestOwnerEpoch&,
+                                                     const StopStatusDTO&,
+                                                     const StopCertificateDTO&) noexcept override {
     return {};
-  }
-  StopForensicProjectionResultDTO RecordStopSurveillanceCheckpoint(
-      const RequestOwnerEpoch&, const StopPostTerminalSurveillanceDTO&, const StopFaultLatchDTO&,
-      std::int64_t) noexcept override {
-    return {};
-  }
-  Result<std::uint64_t> RecordStopFaultCleared(const RequestOwnerEpoch&,
-                                               const StopFaultRecoveryIntentDTO&,
-                                               const StopFaultRecoveryResultDTO&,
-                                               const StopFaultLatchDTO&,
-                                               const StopStatusDTO&) override {
-    return Result<std::uint64_t>::Err(ErrorCode::kInternalError);
   }
   Result<std::uint64_t> CloseOwnerEpoch(const RequestOwnerEpoch&, std::int64_t) override {
     return Result<std::uint64_t>::Ok(++sequence);
@@ -154,8 +142,6 @@ CellAdmissionOwnerRoleDTO Role(CellAdmissionClaimKindDTO kind) {
       return CellAdmissionOwnerRoleDTO::kAuthoringOwner;
     case CellAdmissionClaimKindDTO::kManagerApply:
       return CellAdmissionOwnerRoleDTO::kManager;
-    case CellAdmissionClaimKindDTO::kComponentLifecycle:
-      return CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner;
     case CellAdmissionClaimKindDTO::kAuthoredScene:
       return CellAdmissionOwnerRoleDTO::kAuthoredSceneOwner;
     case CellAdmissionClaimKindDTO::kManualOperation:
@@ -229,7 +215,6 @@ ManagerLivenessRequiredSetDTO EmptyLivenessSet() {
 KernelCellAdmissionOwner Owner(FixedClock& clock, AdmissionJournal& journal,
                                std::size_t capacity = 16U,
                                CellAdmissionProgramNodeValidator program_node_validator = {},
-                               std::function<bool()> stop_fault_active = {},
                                CellAdmissionProgramResetStatusSource reset_status_source = {}) {
   return KernelCellAdmissionOwner(
       RequestOwnerEpoch("kernel.1"), capacity, clock, journal, {}, AdmissionGeneration(0U),
@@ -240,45 +225,7 @@ KernelCellAdmissionOwner Owner(FixedClock& clock, AdmissionJournal& journal,
             {reconcile.current_owner_epochs, {}});
       },
       {}, {}, EmptyLivenessSet(), CellAdmissionClaimGeneration(0U),
-      std::move(program_node_validator), std::move(stop_fault_active), std::move(reset_status_source));
-}
-
-TEST(KernelCellAdmissionOwner,
-     StopFaultPreservesReplayAndAllResponsesStayClosedUntilPublishedClear) {
-  FixedClock clock;
-  AdmissionJournal journal;
-  bool fault = false;
-  auto owner = Owner(clock, journal, 16U, {}, [&] { return fault; });
-  ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).value().authoring_allowed);
-  const auto intent = Intent(CellAdmissionClaimKindDTO::kComponentLifecycle,
-                             owner.GetAuthoringAdmission().admission_generation);
-  const auto accepted = owner.AcquireCellAdmissionClaim(intent);
-  ASSERT_TRUE(accepted.ok());
-  fault = true;
-  EXPECT_EQ(owner.AcquireCellAdmissionClaim(intent).value(), accepted.value());
-  EXPECT_FALSE(owner.UpdateCellAdmissionReadiness(Ready()).value().authoring_allowed);
-  EXPECT_FALSE(
-      owner.ReleaseCellAdmissionClaim(Release(accepted.value())).value().authoring_allowed);
-  auto fresh = Intent(CellAdmissionClaimKindDTO::kAuthoringMutation,
-                      owner.GetAuthoringAdmission().admission_generation, "fresh");
-  EXPECT_EQ(owner.AcquireCellAdmissionClaim(fresh).error().details.at("reason"),
-            "active_stop_fault_requires_recovery");
-  const auto before = owner.GetAuthoringAdmission().admission_generation;
-  ASSERT_TRUE(owner.RefreshStopFaultAdmission().ok());
-  EXPECT_GT(owner.GetAuthoringAdmission().admission_generation.value(), before.value());
-  fault = false;
-  journal.fail_generation = true;
-  EXPECT_FALSE(owner.RefreshStopFaultAdmission().ok());
-  EXPECT_FALSE(owner.GetAuthoringAdmission().authoring_allowed);
-  EXPECT_FALSE(owner.UpdateCellAdmissionReadiness(Ready()).value().authoring_allowed);
-  journal.fail_generation = false;
-  ASSERT_TRUE(owner.RefreshStopFaultAdmission().ok());
-  EXPECT_TRUE(owner.GetAuthoringAdmission().authoring_allowed);
-  // `fresh` still names the pre-clear generation: only the generation moved,
-  // so the cleared fault admits it.
-  EXPECT_NE(fresh.expected_admission_generation,
-            owner.GetAuthoringAdmission().admission_generation);
-  EXPECT_TRUE(owner.AcquireCellAdmissionClaim(fresh).ok());
+      std::move(program_node_validator), std::move(reset_status_source));
 }
 
 // A4: the expected admission generation is claim evidence only. A Disable
@@ -287,12 +234,11 @@ TEST(KernelCellAdmissionOwner,
 TEST(KernelCellAdmissionOwner, OldGenerationAfterDisableIsAcceptedOnCurrentFacts) {
   FixedClock clock;
   AdmissionJournal journal;
-  bool fault = false;
-  auto owner = Owner(clock, journal, 16U, {}, [&] { return fault; });
+  auto owner = Owner(clock, journal);
   ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).value().authoring_allowed);
   const auto observed = owner.GetAuthoringAdmission().admission_generation;
   const auto disable = owner.AcquireCellAdmissionClaim(
-      Intent(CellAdmissionClaimKindDTO::kComponentLifecycle, observed, "disable"));
+      Intent(CellAdmissionClaimKindDTO::kAuthoringMutation, observed, "disable"));
   ASSERT_TRUE(disable.ok());
   ASSERT_TRUE(owner.ReleaseCellAdmissionClaim(Release(disable.value())).ok());
   // Manager publishes the reduced required set after the Disable.
@@ -331,168 +277,6 @@ TEST(KernelCellAdmissionOwner, OldGenerationAfterDisableIsAcceptedOnCurrentFacts
     }
     ASSERT_TRUE(owner.ReleaseCellAdmissionClaim(Release(accepted.value())).ok());
   }
-
-  // A latched Stop fault still refuses, with an old or the current generation.
-  fault = true;
-  ASSERT_TRUE(owner.RefreshStopFaultAdmission().ok());
-  for (const auto generation : {observed, owner.GetAuthoringAdmission().admission_generation}) {
-    const auto refused = owner.AcquireCellAdmissionClaim(
-        Intent(CellAdmissionClaimKindDTO::kProgramCycle, generation, "run.faulted"));
-    ASSERT_FALSE(refused.ok());
-    EXPECT_EQ(refused.error().details.at("reason"), "active_stop_fault_requires_recovery");
-  }
-}
-
-KernelCellAdmissionOwner ScopedOwner(FixedClock& clock, AdmissionJournal& journal,
-                                     std::function<StopFaultAdmissionScope()> scope,
-                                     CellAdmissionProgramResetStatusSource reset_source = {}) {
-  return KernelCellAdmissionOwner(
-      RequestOwnerEpoch("kernel.1"), 16U, clock, journal, {}, AdmissionGeneration(0U),
-      [](const auto&, const auto&) { return Result<void>::Ok(); },
-      [](const auto&, const auto&) { return Result<void>::Ok(); },
-      [](const auto&, const auto&, const auto& reconcile) {
-        return Result<CellAdmissionReconcileValidationDTO>::Ok(
-            {reconcile.current_owner_epochs, {}});
-      },
-      {}, {}, EmptyLivenessSet(), CellAdmissionClaimGeneration(0U), {},
-      [scope] {
-        const auto current = scope();
-        return current == StopFaultAdmissionScope::kCell ||
-               current == StopFaultAdmissionScope::kClosing;
-      },
-      std::move(reset_source), {}, scope);
-}
-
-// D6 (a): Close of a latched Scenario admits only its motion-free steps; once
-// Close replaced the Scenario, the carried latch refuses only motion claims.
-TEST(KernelCellAdmissionOwner, StopFaultCloseAdmitsMotionFreeStepsAndCarriedLatchRefusesMotion) {
-  FixedClock clock;
-  AdmissionJournal journal;
-  auto scope = StopFaultAdmissionScope::kNone;
-  auto owner = ScopedOwner(clock, journal, [&] { return scope; });
-  ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).value().authoring_allowed);
-  const auto generation = [&] { return owner.GetAuthoringAdmission().admission_generation; };
-  const auto reason = [&](const CellAdmissionClaimIntentDTO& intent) {
-    const auto refused = owner.AcquireCellAdmissionClaim(intent);
-    return refused.ok() ? std::string("admitted") : refused.error().details.at("reason");
-  };
-  scope = StopFaultAdmissionScope::kCell;
-  ASSERT_TRUE(owner.RefreshStopFaultAdmission().ok());
-  EXPECT_FALSE(owner.GetAuthoringAdmission().authoring_allowed);
-  EXPECT_EQ(reason(Intent(CellAdmissionClaimKindDTO::kComponentLifecycle, generation(), "cell.disable")),
-            "active_stop_fault_requires_recovery");
-
-  EXPECT_FALSE(owner.AuthoringClosedOnlyByClosing());
-  // Close retired the latched Scenario's targets: authoring stays closed
-  // (Draft edits and ordinary preparation are refused as before, SX-366);
-  // the closing scope is its only blocker (SX-370).
-  scope = StopFaultAdmissionScope::kClosing;
-  EXPECT_FALSE(owner.GetAuthoringAdmission().authoring_allowed);
-  EXPECT_TRUE(owner.AuthoringClosedOnlyByClosing());
-  EXPECT_EQ(reason(Intent(CellAdmissionClaimKindDTO::kAuthoringMutation, generation(), "closing.edit")),
-            "active_stop_fault_requires_recovery");
-  EXPECT_EQ(reason(Intent(CellAdmissionClaimKindDTO::kProgramCycle, generation(), "closing.run")),
-            "active_stop_fault_requires_recovery");
-  // A concurrent ordinary Prepare/Enable is refused; only the Kernel-verified
-  // Disable (AcquireCloseDisableLifecycleClaim) is one of Close's steps.
-  EXPECT_EQ(reason(Intent(CellAdmissionClaimKindDTO::kComponentLifecycle, generation(), "closing.enable")),
-            "active_stop_fault_requires_recovery");
-  const auto disable = owner.AcquireCloseDisableLifecycleClaim(
-      Intent(CellAdmissionClaimKindDTO::kComponentLifecycle, generation(), "closing.disable"));
-  ASSERT_TRUE(disable.ok()) << disable.error().message;
-  // Closing plus an unrelated blocker (a held claim): not closing-only.
-  EXPECT_FALSE(owner.AuthoringClosedOnlyByClosing());
-  ASSERT_TRUE(owner.ReleaseCellAdmissionClaim(Release(disable.value())).ok());
-  // Once the empty Apply replaced the latched product, the latch is carried:
-  // authoring opens at once (Load), while every motion claim stays refused.
-  scope = StopFaultAdmissionScope::kCarried;
-  EXPECT_TRUE(owner.GetAuthoringAdmission().authoring_allowed);
-  EXPECT_EQ(reason(Intent(CellAdmissionClaimKindDTO::kProgramCycle, generation(), "carried.run")),
-            "active_stop_fault_requires_recovery");
-  const auto edit = owner.AcquireCellAdmissionClaim(
-      Intent(CellAdmissionClaimKindDTO::kAuthoringMutation, generation(), "carried.edit"));
-  ASSERT_TRUE(edit.ok()) << edit.error().message;
-  ASSERT_TRUE(owner.ReleaseCellAdmissionClaim(Release(edit.value())).ok());
-  ASSERT_TRUE(owner.RefreshStopFaultAdmission().ok());
-  EXPECT_TRUE(owner.GetAuthoringAdmission().authoring_allowed);
-  EXPECT_EQ(reason(Intent(CellAdmissionClaimKindDTO::kProgramCycle, generation(), "carried.run.2")),
-            "active_stop_fault_requires_recovery");
-
-  // Only the empty (component-free) Apply of a closing Scenario is admitted
-  // under its latch; a non-empty Apply is refused before its validator runs.
-  scope = StopFaultAdmissionScope::kClosing;
-  ASSERT_TRUE(owner.RefreshStopFaultAdmission().ok());
-  std::vector<std::string> validated;
-  const auto validator = [&](const CellAdmissionClaimIntentDTO& checked, auto, const auto&,
-                             const auto&) {
-    validated.push_back(checked.request_id.value());
-    return Result<void>::Ok();
-  };
-  auto full_apply = Intent(CellAdmissionClaimKindDTO::kManagerApply, generation(), "closing.full");
-  full_apply.owner_epoch = EmptyLivenessSet().manager_owner_epoch;
-  const auto full = owner.AcquireConfigurationApplyClaim(full_apply, validator, false);
-  ASSERT_FALSE(full.ok());
-  EXPECT_EQ(full.error().details.at("reason"), "active_stop_fault_requires_recovery");
-  auto empty_apply = Intent(CellAdmissionClaimKindDTO::kManagerApply, generation(), "closing.apply");
-  empty_apply.owner_epoch = EmptyLivenessSet().manager_owner_epoch;
-  const auto applied = owner.AcquireConfigurationApplyClaim(empty_apply, validator, true);
-  ASSERT_TRUE(applied.ok()) << applied.error().message;
-  EXPECT_EQ(validated, std::vector<std::string>{"closing.apply"});
-}
-
-// D6 (SX-322): while Close runs, the latch exemptions (Apply bring-up, CCLC
-// route recovery, selected bring-up, CCLC intervention) no longer pass; the
-// canonical-empty Apply needs none of them.
-TEST(KernelCellAdmissionOwner, StopFaultClosingRefusesEveryLatchExemptionPath) {
-  FixedClock clock;
-  AdmissionJournal journal;
-  auto scope = StopFaultAdmissionScope::kClosing;
-  auto owner = ScopedOwner(clock, journal, [&] { return scope; });
-  ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).ok());
-  ASSERT_TRUE(owner.RefreshStopFaultAdmission().ok());
-  const auto generation = [&] { return owner.GetAuthoringAdmission().admission_generation; };
-  const auto ok_offer = [](const auto&, const auto&) { return Result<void>::Ok(); };
-  const auto refused = [](const Result<CellAdmissionClaimDTO>& result) {
-    const auto reason = result.ok() ? std::string("admitted")
-                                    : result.error().code + "/" +
-                                          (result.error().details.contains("reason")
-                                               ? result.error().details.at("reason")
-                                               : std::string());
-    EXPECT_EQ(reason, "authoring_not_ready/active_stop_fault_requires_recovery");
-    return reason == "authoring_not_ready/active_stop_fault_requires_recovery";
-  };
-  const auto cclc = [&](std::string transaction, std::string request, bool selected = false) {
-    auto intent = Intent(CellAdmissionClaimKindDTO::kInterventionOrRecovery, generation(),
-                         std::move(request));
-    intent.owner_role = CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner;
-    intent.owner_transaction_id = std::move(transaction);
-    intent.scope.configurations = {{ControlDomainId("arm.domain"),
-                                    ActiveControlConfigurationId("arm.configuration"),
-                                    ActiveControlConfigurationGeneration(1U)}};
-    if (selected) intent.scope.resources = {ResourceId("arm")};
-    // As the CCLC composes it: the evidence names the claim's own owner.
-    intent.intervention_evidence = CellAdmissionInterventionEvidenceDTO{
-        intent.owner_role, intent.owner_epoch, intent.owner_transaction_id,
-        intent.request_payload_digest, std::nullopt};
-    return intent;
-  };
-
-  auto bring_up = Intent(CellAdmissionClaimKindDTO::kManagerApply, generation(), "closing.bring_up");
-  bring_up.owner_epoch = EmptyLivenessSet().manager_owner_epoch;
-  EXPECT_TRUE(refused(owner.AcquireApplyBringUpClaim(
-      bring_up, [](const auto&, const auto&, const auto&) { return Result<void>::Ok(); })));
-  EXPECT_TRUE(refused(owner.AcquireRouteRecoveryClaim(
-      cclc("route-selection.1", "closing.route"), ok_offer)));
-  EXPECT_TRUE(refused(owner.AcquireSelectedBringUpClaim(
-      cclc("selected-lifecycle.1", "closing.selected", true), ok_offer)));
-  EXPECT_TRUE(refused(owner.AcquireCellAdmissionClaim(
-      cclc("route-selection.2", "closing.cclc"))));
-
-  // The same CCLC intervention passes its latch exemption outside Close.
-  scope = StopFaultAdmissionScope::kCell;
-  const auto outside = owner.AcquireCellAdmissionClaim(cclc("route-selection.3", "cell.cclc"));
-  EXPECT_TRUE(outside.ok() || !outside.error().details.contains("reason") ||
-              outside.error().details.at("reason") != "active_stop_fault_requires_recovery");
 }
 
 TEST(KernelCellAdmissionOwner, ConfigurationApplyRetainsTerminalMarkersUntilFreshSuccess) {
@@ -564,7 +348,7 @@ TEST(KernelCellAdmissionOwner, ConfigurationApplyRetainsTerminalMarkersUntilFres
   EXPECT_TRUE(owner.GetAuthoringAdmission().authoring_allowed);
 }
 
-TEST(KernelCellAdmissionOwner, ConfigurationApplyCannotBypassForeignClaimsOrTrueStopFault) {
+TEST(KernelCellAdmissionOwner, ConfigurationApplyCannotBypassForeignClaims) {
   FixedClock clock;
   AdmissionJournal journal;
   auto owner = Owner(clock, journal);
@@ -582,12 +366,6 @@ TEST(KernelCellAdmissionOwner, ConfigurationApplyCannotBypassForeignClaimsOrTrue
     return Result<void>::Ok();
   };
   EXPECT_FALSE(owner.AcquireConfigurationApplyClaim(intent, validate).ok());
-  EXPECT_EQ(checked, 0);
-  bool fault = true;
-  auto faulted = Owner(clock, journal, 16U, {}, [&] { return fault; });
-  ASSERT_TRUE(faulted.UpdateCellAdmissionReadiness(Ready()).ok());
-  intent.expected_admission_generation = faulted.GetAuthoringAdmission().admission_generation;
-  EXPECT_FALSE(faulted.AcquireConfigurationApplyClaim(intent, validate).ok());
   EXPECT_EQ(checked, 0);
 }
 
@@ -607,160 +385,29 @@ TEST(KernelCellAdmissionOwner, ConfigurationApplyProvenWriteFailureDoesNotChange
   EXPECT_FALSE(owner.has_unresolved_claims());
 }
 
-TEST(KernelCellAdmissionOwner, ApplyBringUpRequiresPositivePrivatePlanAndKeepsFaultClosed) {
-  FixedClock clock;
-  AdmissionJournal journal;
-  auto owner = Owner(clock, journal, 16U, {}, [] { return true; });
-  ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).ok());
-  auto intent = Intent(CellAdmissionClaimKindDTO::kManagerApply,
-                       owner.GetAuthoringAdmission().admission_generation, "apply.bring-up");
-  intent.owner_epoch = EmptyLivenessSet().manager_owner_epoch;
-  intent.owner_transaction_id = "apply.bring-up.1";
-  EXPECT_FALSE(owner.AcquireCellAdmissionClaim(intent).ok());
-  EXPECT_FALSE(owner.AcquireApplyBringUpClaim(intent, {}).ok());
-  const auto before = journal.sequence.load();
-  EXPECT_FALSE(owner.AcquireApplyBringUpClaim(
-                        intent, [](const auto&, const auto&, const auto&) {
-                          return Result<void>::Err(ErrorCode::kInvalidRequest);
-                        })
-                   .ok());
-  EXPECT_EQ(journal.sequence.load(), before);
-
-  int validations = 0;
-  const CellAdmissionApplyBringUpValidator validate =
-      [&](const auto& checked, const auto& readiness, const auto& manager_epoch) {
-        ++validations;
-        EXPECT_EQ(checked, intent);
-        EXPECT_EQ(readiness, Ready());
-        EXPECT_EQ(manager_epoch, EmptyLivenessSet().manager_runtime_epoch);
-        return Result<void>::Ok();
-      };
-  const auto acquired = owner.AcquireApplyBringUpClaim(intent, validate);
-  ASSERT_TRUE(acquired.ok());
-  EXPECT_EQ(validations, 1);
-  EXPECT_FALSE(owner.GetAuthoringAdmission().authoring_allowed);
-  const auto replay = owner.AcquireApplyBringUpClaim(intent, validate);
-  ASSERT_TRUE(replay.ok());
-  EXPECT_EQ(replay.value(), acquired.value());
-  EXPECT_EQ(validations, 1);  // Replay observes the original claim, never a new effect.
-
-  auto competing = intent;
-  competing.request_id = RequestId("apply.bring-up.2");
-  competing.owner_transaction_id = "apply.bring-up.2";
-  competing.expected_admission_generation = owner.GetAuthoringAdmission().admission_generation;
-  EXPECT_FALSE(owner.AcquireApplyBringUpClaim(competing, validate).ok());
-  EXPECT_EQ(validations, 1);
-  const auto released = owner.ReleaseCellAdmissionClaim(Release(acquired.value()));
-  ASSERT_TRUE(released.ok());
-  EXPECT_FALSE(released.value().authoring_allowed);
-  competing.expected_admission_generation = owner.GetAuthoringAdmission().admission_generation;
-  EXPECT_FALSE(owner.AcquireCellAdmissionClaim(competing).ok());
-}
-
-TEST(KernelCellAdmissionOwner, ApplyBringUpKeepsOtherExclusionsAndRefusesForeignClaimShape) {
-  FixedClock clock;
-  AdmissionJournal journal;
-  auto owner = Owner(clock, journal);
-  ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).ok());
-  const CellAdmissionApplyBringUpValidator validate =
-      [](const auto&, const auto&, const auto&) { return Result<void>::Ok(); };
-  auto intent = Intent(CellAdmissionClaimKindDTO::kManagerApply,
-                       owner.GetAuthoringAdmission().admission_generation);
-  intent.owner_epoch = EmptyLivenessSet().manager_owner_epoch;
-  auto foreign = intent;
-  foreign.claim_kind = CellAdmissionClaimKindDTO::kAuthoringMutation;
-  foreign.owner_role = CellAdmissionOwnerRoleDTO::kAuthoringOwner;
-  EXPECT_FALSE(owner.AcquireApplyBringUpClaim(foreign, validate).ok());
-  auto scoped = intent;
-  scoped.scope.resources = {ResourceId("resource.1")};
-  EXPECT_FALSE(owner.AcquireApplyBringUpClaim(scoped, validate).ok());
-  ASSERT_TRUE(owner.SetRouteRecoveryPending(true).ok());
-  intent.expected_admission_generation = owner.GetAuthoringAdmission().admission_generation;
-  EXPECT_FALSE(owner.AcquireApplyBringUpClaim(intent, validate).ok());
-  ASSERT_TRUE(owner.SetRouteRecoveryPending(false).ok());
-  intent.expected_admission_generation = owner.GetAuthoringAdmission().admission_generation;
-  const auto ordinary = owner.AcquireCellAdmissionClaim(intent);
-  ASSERT_TRUE(ordinary.ok());
-  auto different = intent;
-  different.request_id = RequestId("different.apply");
-  different.expected_admission_generation = owner.GetAuthoringAdmission().admission_generation;
-  EXPECT_FALSE(owner.AcquireApplyBringUpClaim(different, validate).ok());
-}
-
-TEST(KernelCellAdmissionOwner, CleanApplyBringUpReleaseNeedsNoAdditionalReset) {
-  FixedClock clock;
-  AdmissionJournal journal;
-  auto owner = Owner(clock, journal);
-  ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).value().authoring_allowed);
-  auto intent = Intent(CellAdmissionClaimKindDTO::kManagerApply,
-                             owner.GetAuthoringAdmission().admission_generation);
-  intent.owner_epoch = EmptyLivenessSet().manager_owner_epoch;
-  const auto acquired = owner.AcquireApplyBringUpClaim(
-      intent, [](const auto&, const auto&, const auto&) { return Result<void>::Ok(); });
-  ASSERT_TRUE(acquired.ok());
-  EXPECT_FALSE(owner.GetAuthoringAdmission().authoring_allowed);
-  const auto released = owner.ReleaseCellAdmissionClaim(Release(acquired.value()));
-  ASSERT_TRUE(released.ok());
-  EXPECT_TRUE(released.value().authoring_allowed);
-}
-
-TEST(KernelCellAdmissionOwner, ApplyBringUpCannotWaiveCurrentProgramAndOwnerDependencies) {
-  for (unsigned scenario = 0U; scenario != 7U; ++scenario) {
-    SCOPED_TRACE(scenario);
-    FixedClock clock;
-    AdmissionJournal journal;
-    auto owner = Owner(clock, journal);
-    auto readiness = Ready();
-    if (scenario == 0U) readiness.required_component_status_current = false;
-    if (scenario == 1U) readiness.deployment_status_current = false;
-    if (scenario == 2U) readiness.program_cycle_status_current = false;
-    if (scenario == 3U) readiness.unresolved_owner_count = 1U;
-    if (scenario == 4U) readiness.unsettled_effect_count = 1U;
-    if (scenario == 5U) {
-      readiness.program_cycle_status->state = ProgramCycleStateDTO::kStarting;
-      readiness.program_cycle_status->program_run_id = ProgramRunId("run.pending");
-    }
-    ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(readiness).ok());
-    auto intent = Intent(CellAdmissionClaimKindDTO::kManagerApply,
-                               owner.GetAuthoringAdmission().admission_generation);
-    intent.owner_epoch = scenario == 6U ? RequestOwnerEpoch("foreign.manager")
-                                      : EmptyLivenessSet().manager_owner_epoch;
-    unsigned validations = 0U;
-    const auto result = owner.AcquireApplyBringUpClaim(intent, [&](const auto&, const auto&, const auto&) {
-      ++validations;
-      return Result<void>::Ok();
-    });
-    EXPECT_FALSE(result.ok());
-    EXPECT_EQ(validations, 0U);
-  }
-}
-
 TEST(KernelCellAdmissionOwner, RouteRecoveryBarrierSurvivesReadyUpdatesAndClaimSettlement) {
   FixedClock clock;
   AdmissionJournal journal;
   auto owner = Owner(clock, journal);
   ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).value().authoring_allowed);
-  const auto lifecycle = owner.AcquireCellAdmissionClaim(
-      Intent(CellAdmissionClaimKindDTO::kComponentLifecycle,
-             owner.GetAuthoringAdmission().admission_generation, "lifecycle"));
-  ASSERT_TRUE(lifecycle.ok());
+  const auto apply = owner.AcquireCellAdmissionClaim(
+      Intent(CellAdmissionClaimKindDTO::kManagerApply,
+             owner.GetAuthoringAdmission().admission_generation, "manager.apply"));
+  ASSERT_TRUE(apply.ok());
   EXPECT_TRUE(owner.has_unresolved_claims());
-  EXPECT_FALSE(
-      owner.has_unresolved_claims_except(CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner));
-  ASSERT_TRUE(owner.ReleaseCellAdmissionClaim(Release(lifecycle.value())).ok());
+  EXPECT_FALSE(owner.has_unresolved_claims_except(CellAdmissionOwnerRoleDTO::kManager));
+  ASSERT_TRUE(owner.ReleaseCellAdmissionClaim(Release(apply.value())).ok());
   auto authoring = owner.AcquireCellAdmissionClaim(
       Intent(CellAdmissionClaimKindDTO::kAuthoringMutation,
              owner.GetAuthoringAdmission().admission_generation, "apply"));
   ASSERT_TRUE(authoring.ok());
-  EXPECT_TRUE(
-      owner.has_unresolved_claims_except(CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner));
+  EXPECT_TRUE(owner.has_unresolved_claims_except(CellAdmissionOwnerRoleDTO::kManager));
   ASSERT_TRUE(owner.SetRouteRecoveryPending(true).ok());
   EXPECT_FALSE(
       owner.ReleaseCellAdmissionClaim(Release(authoring.value())).value().authoring_allowed);
   EXPECT_FALSE(owner.UpdateCellAdmissionReadiness(Ready()).value().authoring_allowed);
   for (auto kind :
        {CellAdmissionClaimKindDTO::kProgramCycle, CellAdmissionClaimKindDTO::kAuthoringMutation,
-        CellAdmissionClaimKindDTO::kComponentLifecycle,
         CellAdmissionClaimKindDTO::kManualOperation}) {
     const auto rejected = owner.AcquireCellAdmissionClaim(
         Intent(kind, owner.GetAuthoringAdmission().admission_generation));
@@ -786,40 +433,6 @@ TEST(KernelCellAdmissionOwner, RouteRecoveryBarrierSurvivesReadyUpdatesAndClaimS
   EXPECT_TRUE(owner.GetAuthoringAdmission().authoring_allowed);
 }
 
-TEST(KernelCellAdmissionOwner,
-     DisabledRequiredComponentCanBeEnabledOnlyFromWholeCellIdle) {
-  FixedClock clock;
-  AdmissionJournal journal;
-  auto owner = Owner(clock, journal);
-  auto readiness = Ready();
-  readiness.required_component_current_compatible_ready_converged = 1U;
-  ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(readiness).ok());
-  EXPECT_FALSE(owner.GetAuthoringAdmission().authoring_allowed);
-  const auto generation = owner.GetAuthoringAdmission().admission_generation;
-  EXPECT_FALSE(owner.AcquireCellAdmissionClaim(
-      Intent(CellAdmissionClaimKindDTO::kAuthoringMutation, generation)).ok());
-  const auto lifecycle = owner.AcquireCellAdmissionClaim(
-      Intent(CellAdmissionClaimKindDTO::kComponentLifecycle, generation));
-  ASSERT_TRUE(lifecycle.ok());
-  EXPECT_FALSE(owner.AcquireCellAdmissionClaim(
-      Intent(CellAdmissionClaimKindDTO::kProgramCycle,
-             owner.GetAuthoringAdmission().admission_generation)).ok());
-  ASSERT_TRUE(owner.ReleaseCellAdmissionClaim(Release(lifecycle.value())).ok());
-  readiness.program_cycle_status->state = ProgramCycleStateDTO::kRunning;
-  readiness.program_cycle_status->cycle_generation = 2U;
-  readiness.program_cycle_status->program_run_id = ProgramRunId("run.1");
-  readiness.program_cycle_status->cycle_claim_generation =
-      CellAdmissionClaimGeneration(1U);
-  ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(readiness).ok());
-  const auto busy = owner.AcquireCellAdmissionClaim(
-      Intent(CellAdmissionClaimKindDTO::kComponentLifecycle,
-             owner.GetAuthoringAdmission().admission_generation, "busy"));
-  ASSERT_FALSE(busy.ok());
-  // The refusal names what must settle, not only that the cell is busy.
-  EXPECT_EQ(busy.error().details.at("reason"),
-            "component_lifecycle_program_not_idle_after_reset");
-}
-
 TEST(KernelCellAdmissionOwner, ProgramChildrenReplayAfterHoldAndDrainBeforeReset) {
   FixedClock clock;
   AdmissionJournal journal;
@@ -830,7 +443,7 @@ TEST(KernelCellAdmissionOwner, ProgramChildrenReplayAfterHoldAndDrainBeforeReset
     ++checks;
     return held ? Result<void>::Err(ErrorDTO{"held", "selected node is held", {}})
                 : Result<void>::Ok();
-  }, {}, [&](const auto, const auto&, const auto&) {
+  }, [&](const auto, const auto&, const auto&) {
     return Result<ProgramCycleStatusDTO>::Ok(*ready.program_cycle_status);
   });
   ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(ready).ok());
@@ -858,19 +471,6 @@ TEST(KernelCellAdmissionOwner, ProgramChildrenReplayAfterHoldAndDrainBeforeReset
   EXPECT_FALSE(owner.GetAuthoringAdmission().authoring_allowed);
   EXPECT_EQ(owner.unsettled_program_child_nodes(parent.value().claim_generation),
             std::vector<std::string>{"attach"});
-  auto lifecycle = Intent(CellAdmissionClaimKindDTO::kComponentLifecycle,
-                          owner.GetAuthoringAdmission().admission_generation, "lifecycle.child");
-  lifecycle.program_node_evidence =
-      ProgramNodeAdmissionEvidenceDTO{RequestOwnerEpoch("program.owner"),
-                                      ProgramRunId("run.1"),
-                                      parent.value().claim_generation,
-                                      "enable",
-                                      "enable.attempt.1",
-                                      "cclc.lifecycle"};
-  const auto enabled = owner.AcquireCellAdmissionClaim(lifecycle);
-  ASSERT_FALSE(enabled.ok());
-  // Lifecycle is not a Program node: its evidence is rejected as invalid.
-  EXPECT_EQ(enabled.error().details.at("reason"), "program_node_evidence_invalid");
   held = true;
   const auto before = journal.sequence.load();
   ASSERT_EQ(owner.AcquireCellAdmissionClaim(child).value(), scene.value());
@@ -952,7 +552,7 @@ KernelCellAdmissionOwner LivenessOwner(FixedClock& clock, AdmissionJournal& jour
         return Result<CellAdmissionReconcileValidationDTO>::Ok(
             {reconcile.current_owner_epochs, {}});
       },
-      {}, {}, set, CellAdmissionClaimGeneration(0U), std::move(program_node_validator), {},
+      {}, {}, set, CellAdmissionClaimGeneration(0U), std::move(program_node_validator),
       std::move(reset_status_source));
 }
 
@@ -1256,7 +856,7 @@ TEST(KernelCellAdmissionOwner, ProgramResetSceneAuthorizationRequiresExactResett
   FixedClock clock;
   AdmissionJournal journal;
   auto resetting = Ready();
-  auto owner = Owner(clock, journal, 16U, {}, {}, [&](const auto, const auto&, const auto&) {
+  auto owner = Owner(clock, journal, 16U, {}, [&](const auto, const auto&, const auto&) {
     return Result<ProgramCycleStatusDTO>::Ok(*resetting.program_cycle_status);
   });
   ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).ok());
@@ -1322,7 +922,7 @@ TEST(KernelCellAdmissionOwner, SelectedIdleResetRequiresOriginalAcceptanceAndExc
   FixedClock clock;
   AdmissionJournal journal;
   auto ready = Ready();
-  auto owner = Owner(clock, journal, 16U, {}, {}, [&](const auto, const auto&, const auto&) {
+  auto owner = Owner(clock, journal, 16U, {}, [&](const auto, const auto&, const auto&) {
     return Result<ProgramCycleStatusDTO>::Ok(*ready.program_cycle_status);
   });
   ready.program_cycle_status->state = ProgramCycleStateDTO::kResetting;
@@ -1358,8 +958,7 @@ TEST(KernelCellAdmissionOwner, SelectedIdleResetRequiresOriginalAcceptanceAndExc
   stale.program_run_id = ProgramRunId("invented.run");
   EXPECT_FALSE(ValidateProgramResetSceneAuthorization(stale).ok());
   for (const auto kind : {CellAdmissionClaimKindDTO::kProgramCycle,
-                          CellAdmissionClaimKindDTO::kAuthoringMutation,
-                          CellAdmissionClaimKindDTO::kComponentLifecycle}) {
+                          CellAdmissionClaimKindDTO::kAuthoringMutation}) {
     EXPECT_FALSE(owner.AcquireCellAdmissionClaim(
         Intent(kind, owner.GetAuthoringAdmission().admission_generation, "concurrent")).ok());
   }
@@ -1449,7 +1048,7 @@ TEST(KernelCellAdmissionOwner, ExactResetJournalJoinsCurrentOwnerWithoutWaitingF
   actual.accepted_reset = AcceptedReset();
   unsigned reads = 0U;
   bool unavailable = false;
-  auto owner = Owner(clock, journal, 16U, {}, {},
+  auto owner = Owner(clock, journal, 16U, {},
       [&](const auto purpose, const auto&, const auto& claim) {
         ++reads;
         EXPECT_EQ(purpose == ProgramResetJournalReadPurpose::kAcquire, !claim.has_value());
@@ -1554,7 +1153,7 @@ TEST(KernelCellAdmissionOwner, PreparedResetJournalProofCannotSurviveAdmissionGe
   auto actual = *Ready().program_cycle_status;
   actual.state = ProgramCycleStateDTO::kResetting;
   actual.accepted_reset = AcceptedReset();
-  auto owner = Owner(clock, journal, 16U, {}, {}, [&](const auto, const auto&, const auto&) {
+  auto owner = Owner(clock, journal, 16U, {}, [&](const auto, const auto&, const auto&) {
     return Result<ProgramCycleStatusDTO>::Ok(actual);
   });
   ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).ok());
@@ -1598,7 +1197,7 @@ TEST(KernelCellAdmissionOwner, ResettingReconciledParentAlsoRejectsFreshChildren
                                  {{parent, {}, settlement}}, AdmissionGeneration(3U),
                                  [](const auto&, const auto&) { return Result<void>::Ok(); }, {},
                                  {}, {}, {{CellAdmissionOwnerRoleDTO::kProgramRunner, successor}},
-                                 EmptyLivenessSet(), CellAdmissionClaimGeneration(0U), {}, {},
+                                 EmptyLivenessSet(), CellAdmissionClaimGeneration(0U), {},
                                  [&](const auto, const auto&, const auto&) {
                                    return Result<ProgramCycleStatusDTO>::Ok(*resetting.program_cycle_status);
                                  });
@@ -1848,8 +1447,8 @@ TEST(KernelCellAdmissionOwner, ManagerLivenessRequiredSetIsBoundedAndCanonical) 
 TEST(KernelCellAdmissionOwner, ClosedFreshMatrixAndReplayReleaseFences) {
   constexpr CellAdmissionClaimKindDTO kinds[] = {
       CellAdmissionClaimKindDTO::kProgramCycle,  CellAdmissionClaimKindDTO::kAuthoringMutation,
-      CellAdmissionClaimKindDTO::kManagerApply,  CellAdmissionClaimKindDTO::kComponentLifecycle,
-      CellAdmissionClaimKindDTO::kAuthoredScene, CellAdmissionClaimKindDTO::kManualOperation};
+      CellAdmissionClaimKindDTO::kManagerApply,  CellAdmissionClaimKindDTO::kAuthoredScene,
+      CellAdmissionClaimKindDTO::kManualOperation};
   for (const auto kind : kinds) {
     FixedClock clock;
     AdmissionJournal journal;
@@ -1931,167 +1530,6 @@ TEST(KernelCellAdmissionOwner, InterventionCoexistsOnlyWithExactParentCycle) {
           .error()
           .code,
       "authoring_not_ready");
-}
-
-CellAdmissionClaimIntentDTO RouteRecoveryIntent(AdmissionGeneration generation) {
-  auto intent = Intent(CellAdmissionClaimKindDTO::kInterventionOrRecovery, generation);
-  intent.owner_role = CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner;
-  intent.owner_transaction_id = "route-selection.recovery.1";
-  intent.scope.configurations = {{ControlDomainId("arm"), ActiveControlConfigurationId("saved"),
-                                  ActiveControlConfigurationGeneration(4U)}};
-  intent.intervention_evidence = CellAdmissionInterventionEvidenceDTO{
-      intent.owner_role, intent.owner_epoch, intent.owner_transaction_id,
-      intent.request_payload_digest, std::nullopt};
-  return intent;
-}
-
-TEST(KernelCellAdmissionOwner, CCLCRouteRecoveryRequiresExactOwnerOfferAndOneConfiguration) {
-  const auto intent = RouteRecoveryIntent(AdmissionGeneration(1U));
-  ASSERT_TRUE(ValidateCellAdmissionClaimIntent(intent).ok());
-  for (int change = 0; change < 10; ++change) {
-    auto bad = intent;
-    auto& evidence = *bad.intervention_evidence;
-    if (change == 0) evidence.offering_owner_role = CellAdmissionOwnerRoleDTO::kProgramRunner;
-    if (change == 1) evidence.offering_owner_epoch = RequestOwnerEpoch("foreign");
-    if (change == 2) evidence.offer_transaction_id = "route-selection.foreign";
-    if (change == 3) evidence.offer_digest = Digest('b');
-    if (change == 4)
-      evidence.parent_program_cycle_claim_generation = CellAdmissionClaimGeneration(1U);
-    if (change == 5) bad.scope.configurations.clear();
-    if (change == 6)
-      bad.scope.configurations.push_back({ControlDomainId("other"),
-                                          ActiveControlConfigurationId("other"),
-                                          ActiveControlConfigurationGeneration(1U)});
-    if (change == 7) bad.scope.resources = {ResourceId("arm.joint")};
-    if (change == 8) bad.claim_kind = CellAdmissionClaimKindDTO::kComponentLifecycle;
-    if (change == 9) {
-      bad.owner_transaction_id = "lifecycle.1";
-      evidence.offer_transaction_id = bad.owner_transaction_id;
-    }
-    EXPECT_FALSE(ValidateCellAdmissionClaimIntent(bad).ok()) << change;
-  }
-}
-
-CellAdmissionClaimIntentDTO SelectedBringUpIntent(AdmissionGeneration generation) {
-  auto intent = RouteRecoveryIntent(generation);
-  intent.owner_transaction_id = "selected-lifecycle.1";
-  intent.scope.resources = {ResourceId("arm.joint"), ResourceId("gripper.position")};
-  intent.scope.configurations.push_back({ControlDomainId("gripper"), ActiveControlConfigurationId("tool.saved"),
-                                        ActiveControlConfigurationGeneration(2U)});
-  intent.intervention_evidence->offer_transaction_id = intent.owner_transaction_id;
-  return intent;
-}
-
-TEST(KernelCellAdmissionOwner, SelectedBringUpRequiresExactPrivateValidatorAndPhysicalScope) {
-  FixedClock clock;
-  AdmissionJournal journal;
-  auto owner = Owner(clock, journal);
-  auto intent = SelectedBringUpIntent(owner.GetAuthoringAdmission().admission_generation);
-  ASSERT_TRUE(ValidateCellAdmissionClaimIntent(intent).ok());
-  EXPECT_FALSE(owner.AcquireSelectedBringUpClaim(intent, {}).ok());
-  EXPECT_FALSE(
-      owner
-          .AcquireRouteRecoveryClaim(
-              intent,
-              [](const auto&, const auto&) {
-                ADD_FAILURE()
-                    << "observation-only route recovery cannot validate a selected effect offer";
-                return Result<void>::Ok();
-              })
-          .ok());
-  // An input-only provider component has no resources or configurations;
-  // the CCLC status and the Kernel check the closure per domain.
-  auto provider_only = intent;
-  provider_only.scope = {};
-  EXPECT_TRUE(ValidateCellAdmissionClaimIntent(provider_only).ok());
-  for (int change = 2; change < 5; ++change) {
-    auto invalid = intent;
-    if (change == 2) invalid.intervention_evidence->offer_digest = Digest('b');
-    if (change == 3)
-      invalid.intervention_evidence->offering_owner_epoch = RequestOwnerEpoch("foreign");
-    if (change == 4)
-      invalid.intervention_evidence->parent_program_cycle_claim_generation =
-          CellAdmissionClaimGeneration(1U);
-    EXPECT_FALSE(ValidateCellAdmissionClaimIntent(invalid).ok()) << change;
-  }
-  unsigned validated = 0;
-  const auto rejected = owner.AcquireSelectedBringUpClaim(intent, [&](const auto&, const auto&) {
-    ++validated;
-    return Result<void>::Err(ErrorDTO{"selected_not_current", "predecessor changed", {}});
-  });
-  EXPECT_FALSE(rejected.ok());
-  EXPECT_EQ(validated, 1U);
-  EXPECT_EQ(journal.sequence.load(), 0U);
-  const auto acquired =
-      owner.AcquireSelectedBringUpClaim(intent, [&](const auto& offered, const auto& parent) {
-        ++validated;
-        EXPECT_EQ(offered, intent);
-        EXPECT_FALSE(parent);
-        return Result<void>::Ok();
-      });
-  ASSERT_TRUE(acquired.ok()) << acquired.error().message;
-  EXPECT_EQ(validated, 2U);
-  EXPECT_EQ(journal.sequence.load(), 1U);
-  const auto replay = owner.AcquireSelectedBringUpClaim(intent, [&](const auto&, const auto&) {
-    ADD_FAILURE() << "exact replay must observe existing authority rather than retry an effect";
-    return Result<void>::Err(ErrorCode::kInternalError);
-  });
-  ASSERT_TRUE(replay.ok());
-  EXPECT_EQ(replay.value(), acquired.value());
-  EXPECT_EQ(journal.sequence.load(), 1U);
-  EXPECT_FALSE(owner.GetAuthoringAdmission().authoring_allowed);
-}
-
-TEST(KernelCellAdmissionOwner, CCLCRouteRecoveryDoesNotGrantOrdinaryReadiness) {
-  FixedClock clock;
-  AdmissionJournal journal;
-  bool current_offer = false;
-  unsigned checks = 0;
-  KernelCellAdmissionOwner owner{
-      RequestOwnerEpoch("kernel.1"),
-      16U,
-      clock,
-      journal,
-      {},
-      AdmissionGeneration(0U),
-      [&](const auto& intent, const auto& parent) {
-        ++checks;
-        return current_offer && !parent &&
-                       intent == RouteRecoveryIntent(intent.expected_admission_generation)
-                   ? Result<void>::Ok()
-                   : Result<void>::Err(ErrorCode::kInvalidStateTransition);
-      },
-      [](const auto&, const auto&) { return Result<void>::Ok(); }};
-  ASSERT_FALSE(owner.GetAuthoringAdmission().authoring_allowed);
-  const auto intent = RouteRecoveryIntent(owner.GetAuthoringAdmission().admission_generation);
-  EXPECT_FALSE(owner.AcquireCellAdmissionClaim(intent).ok());
-  current_offer = true;
-  auto foreign = intent;
-  foreign.scope.configurations.front().active_configuration_id =
-      ActiveControlConfigurationId("foreign");
-  EXPECT_FALSE(owner.AcquireCellAdmissionClaim(foreign).ok());
-  const auto acquired = owner.AcquireCellAdmissionClaim(intent);
-  ASSERT_TRUE(acquired.ok()) << acquired.error().message;
-  EXPECT_EQ(acquired.value().intent, intent);
-  EXPECT_EQ(checks, 3U);
-  EXPECT_EQ(owner.AcquireCellAdmissionClaim(intent).value(), acquired.value());
-  EXPECT_EQ(checks, 3U);
-  EXPECT_FALSE(owner.GetAuthoringAdmission().authoring_allowed);
-  EXPECT_FALSE(owner
-                   .AcquireCellAdmissionClaim(
-                       Intent(CellAdmissionClaimKindDTO::kComponentLifecycle,
-                              owner.GetAuthoringAdmission().admission_generation, "ordinary"))
-                   .ok());
-  EXPECT_TRUE(owner.ReleaseCellAdmissionClaim(Release(acquired.value())).ok());
-  EXPECT_FALSE(owner.GetAuthoringAdmission().authoring_allowed);
-
-  AdmissionJournal closed_journal;
-  KernelCellAdmissionOwner closed{
-      RequestOwnerEpoch("kernel.closed"), 16U, clock, closed_journal, {}};
-  EXPECT_FALSE(closed
-                   .AcquireCellAdmissionClaim(
-                       RouteRecoveryIntent(closed.GetAuthoringAdmission().admission_generation))
-                   .ok());
 }
 
 TEST(KernelCellAdmissionOwner, HeldManualEvidenceCannotImpersonateAnotherOwnerOrParent) {
@@ -2236,32 +1674,6 @@ TEST(KernelCellAdmissionOwner, RunAndAuthoringRaceHasOneWinner) {
   run.join();
   author.join();
   EXPECT_EQ(accepted.load(), 1);
-}
-
-TEST(KernelCellAdmissionOwner, LifecycleVersusProgramOrManualClaimHasOneWinner) {
-  for (const auto competing_kind : {CellAdmissionClaimKindDTO::kProgramCycle,
-                                    CellAdmissionClaimKindDTO::kManualOperation}) {
-    FixedClock clock;
-    AdmissionJournal journal;
-    auto owner = Owner(clock, journal);
-    ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).ok());
-    const auto generation = owner.GetAuthoringAdmission().admission_generation;
-    std::barrier start(3);
-    std::atomic<int> accepted{};
-    const auto acquire = [&](CellAdmissionClaimKindDTO kind, const char* request) {
-      start.arrive_and_wait();
-      if (owner.AcquireCellAdmissionClaim(Intent(kind, generation, request)).ok()) {
-        ++accepted;
-      }
-    };
-    std::thread lifecycle(acquire, CellAdmissionClaimKindDTO::kComponentLifecycle,
-                          "request.lifecycle");
-    std::thread competing(acquire, competing_kind, "request.competing");
-    start.arrive_and_wait();
-    lifecycle.join();
-    competing.join();
-    EXPECT_EQ(accepted.load(), 1) << static_cast<int>(competing_kind);
-  }
 }
 
 TEST(KernelCellAdmissionOwner, CapacityAndForeignOrStaleReleaseFailClosed) {

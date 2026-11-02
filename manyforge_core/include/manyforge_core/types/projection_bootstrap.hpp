@@ -141,7 +141,7 @@ struct ProjectionBootstrapIntentDTO final {
   BootstrapGeneration bootstrap_generation;
   CellId cell_id;
   RetainedBundleDTO canonical_empty_retained_bundle;
-  std::vector<ProjectionNativeRuntimeBindingDTO> native_runtime_bindings;
+  std::vector<ProjectionExecutionHostBindingDTO> execution_host_bindings;
 
   [[nodiscard]] bool valid() const noexcept {
     if (bootstrap_id.empty() || !bootstrap_generation.nonzero() ||
@@ -150,15 +150,15 @@ struct ProjectionBootstrapIntentDTO final {
         canonical_empty_retained_bundle.cell_graph.cell_id != cell_id) {
       return false;
     }
-    for (std::size_t index = 0U; index < native_runtime_bindings.size();
+    for (std::size_t index = 0U; index < execution_host_bindings.size();
          ++index) {
-      const auto& binding = native_runtime_bindings[index];
+      const auto& binding = execution_host_bindings[index];
       if (!binding.valid()) {
         return false;
       }
       if (index != 0U &&
           !CanonicalProjectionNativeBindingLess(
-              native_runtime_bindings[index - 1U], binding)) {
+              execution_host_bindings[index - 1U], binding)) {
         return false;
       }
     }
@@ -198,14 +198,14 @@ struct ProjectionBootstrapRebuildRequestDTO final {
 struct NativeProjectionBootstrapRebuildDTO final {
   BootstrapId bootstrap_id;
   BootstrapGeneration bootstrap_generation;
-  ProjectionNativeRuntimeBindingDTO native_runtime_binding;
+  ProjectionExecutionHostBindingDTO execution_host_binding;
   ProjectionRevisionDTO canonical_empty_target;
   RetainedProductDTO planning_collision_model;
   LogicalSceneSnapshotRoot initialized_logical_scene;
 
   [[nodiscard]] bool valid() const noexcept {
     return !bootstrap_id.empty() && bootstrap_generation.nonzero() &&
-           native_runtime_binding.valid() && canonical_empty_target.valid() &&
+           execution_host_binding.valid() && canonical_empty_target.valid() &&
            planning_collision_model.product_kind ==
                RetainedProductKind::kPlanningCollisionModel &&
            !planning_collision_model.product_id.empty() &&
@@ -220,12 +220,12 @@ struct NativeProjectionBootstrapRebuildDTO final {
 struct NativeProjectionBootstrapStatusQueryDTO final {
   BootstrapId bootstrap_id;
   BootstrapGeneration bootstrap_generation;
-  ProjectionNativeRuntimeBindingDTO native_runtime_binding;
+  ProjectionExecutionHostBindingDTO execution_host_binding;
   ProjectionRevisionDTO canonical_empty_target;
 
   [[nodiscard]] bool valid() const noexcept {
     return !bootstrap_id.empty() && bootstrap_generation.nonzero() &&
-           native_runtime_binding.valid() && canonical_empty_target.valid();
+           execution_host_binding.valid() && canonical_empty_target.valid();
   }
 };
 
@@ -238,7 +238,7 @@ enum class NativeProjectionBootstrapRebuildState {
 struct NativeProjectionBootstrapRebuildResultDTO final {
   BootstrapId bootstrap_id;
   BootstrapGeneration bootstrap_generation;
-  ProjectionNativeRuntimeBindingDTO native_runtime_binding;
+  ProjectionExecutionHostBindingDTO execution_host_binding;
   ProjectionRevisionDTO canonical_empty_target;
   RetainedProductDTO planning_collision_model;
   LogicalSceneSnapshotRoot initialized_logical_scene;
@@ -251,7 +251,7 @@ struct NativeProjectionBootstrapRebuildResultDTO final {
 
   [[nodiscard]] bool presence_valid() const noexcept {
     if (bootstrap_id.empty() || !bootstrap_generation.nonzero() ||
-        !native_runtime_binding.valid() || !canonical_empty_target.valid() ||
+        !execution_host_binding.valid() || !canonical_empty_target.valid() ||
         planning_collision_model.product_id.empty() ||
         planning_collision_model.product_kind !=
             RetainedProductKind::kPlanningCollisionModel ||
@@ -261,7 +261,7 @@ struct NativeProjectionBootstrapRebuildResultDTO final {
             {canonical_empty_target.scene_revision,
              initialized_logical_scene.shared()->cell_id}) ||
         !resulting_health.valid() ||
-        resulting_health.native_runtime_binding != native_runtime_binding ||
+        resulting_health.execution_host_binding != execution_host_binding ||
         (native_projection_generation.has_value() &&
          *native_projection_generation == 0U) ||
         (projection_content_digest.has_value() &&
@@ -299,7 +299,7 @@ enum class NativeProjectionBootstrapStatusState {
 struct NativeProjectionBootstrapStatusDTO final {
   BootstrapId bootstrap_id;
   BootstrapGeneration bootstrap_generation;
-  ProjectionNativeRuntimeBindingDTO native_runtime_binding;
+  ProjectionExecutionHostBindingDTO execution_host_binding;
   ProjectionRevisionDTO canonical_empty_target;
   NativeProjectionBootstrapStatusState state;
   std::optional<ProjectionRevisionDTO> acknowledged_target;
@@ -310,9 +310,9 @@ struct NativeProjectionBootstrapStatusDTO final {
 
   [[nodiscard]] bool presence_valid() const noexcept {
     if (bootstrap_id.empty() || !bootstrap_generation.nonzero() ||
-        !native_runtime_binding.valid() || !canonical_empty_target.valid() ||
+        !execution_host_binding.valid() || !canonical_empty_target.valid() ||
         !resulting_health.valid() ||
-        resulting_health.native_runtime_binding != native_runtime_binding ||
+        resulting_health.execution_host_binding != execution_host_binding ||
         (native_projection_generation.has_value() &&
          *native_projection_generation == 0U) ||
         (projection_content_digest.has_value() &&
@@ -375,9 +375,9 @@ struct ProjectionBootstrapEvidenceDTO final {
           result.bootstrap_id != bootstrap_id ||
           result.bootstrap_generation != bootstrap_generation ||
           result.canonical_empty_target != canonical_empty_target ||
-          result.native_runtime_binding !=
+          result.execution_host_binding !=
               candidate_aggregate_health.native_projection_health[index]
-                  .native_runtime_binding ||
+                  .execution_host_binding ||
           (result.state != NativeProjectionBootstrapRebuildState::kRebuilt &&
            result.state !=
                NativeProjectionBootstrapRebuildState::kAlreadyExact)) {
@@ -385,8 +385,8 @@ struct ProjectionBootstrapEvidenceDTO final {
       }
       if (index != 0U &&
           !CanonicalProjectionNativeBindingLess(
-              rebuild_results[index - 1U].native_runtime_binding,
-              result.native_runtime_binding)) {
+              rebuild_results[index - 1U].execution_host_binding,
+              result.execution_host_binding)) {
         return false;
       }
     }
@@ -568,8 +568,8 @@ struct ProjectionBootstrapStatusDTO final {
       if (index != 0U &&
           !CanonicalProjectionNativeBindingLess(
               native_rebuild_observations[index - 1U]
-                  .native_runtime_binding,
-              observation.native_runtime_binding)) {
+                  .execution_host_binding,
+              observation.execution_host_binding)) {
         return false;
       }
     }

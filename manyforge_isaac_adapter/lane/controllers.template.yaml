@@ -1,0 +1,40 @@
+# Isaac lane controllers template (CONTRACTS §12; expanded by the generic
+# generator, see manyforge_roboplan/launch_contribution.hpp) of an arm without
+# a vendor adapter (UR10e); a vendor's model (`vendor` in its row) runs the
+# vendor's controllers instead. The values are the Isaac files that ran live
+# before v2, made joint generic: `goal` comes from the model row's arrival_tolerance_rad,
+# `goal_time` from its goal_time_s, and `max_deceleration_on_cancel` from the
+# Deployment's operator Stop profile, as on every ros2_control lane.
+/**/controller_manager:
+  ros__parameters:
+    update_rate: 100
+    enforce_command_limits: false
+    hardware_components_initial_state:
+      shutdown_on_initial_state_failure: true
+
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+
+    __controller__:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+/**/__controller__:
+  ros__parameters:
+    joints: [__joint__]
+    command_interfaces:
+      - position
+    state_interfaces:
+      - position
+      - velocity
+    state_publish_rate: 100.0
+    action_monitor_rate: 20.0
+    allow_partial_joints_goal: false
+    interpolation_method: splines
+    interpolate_from_desired_state: true
+    allow_trajectory_replacement: false
+    set_last_command_interface_value_as_state_on_activation: true
+    constraints:
+      decelerate_on_cancel: true
+      stopped_velocity_tolerance: 0.2
+      goal_time: 0.0
+      __joint__: {trajectory: 0.2, max_deceleration_on_cancel: null}

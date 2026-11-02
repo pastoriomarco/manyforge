@@ -7,6 +7,7 @@
   background: var(--mf-bg-neutral-46);
 }
 
+.component-dot.status-ok,
 .component-dot.status-ready,
 .component-dot.status-healthy {
   background: var(--mf-bg-success-57);
@@ -60,6 +61,19 @@
   border-color: var(--mf-border-warning-41);
   color: var(--mf-text-warning-84);
   background: var(--mf-bg-warning-20);
+}
+
+.status-pill-error {
+  border-color: var(--mf-border-danger-41);
+  color: var(--mf-text-danger-83);
+  background: var(--mf-bg-danger-21);
+}
+
+/* Deactivated: out of the cell, no state of its own. */
+.status-pill-off {
+  border-style: dashed;
+  color: var(--mf-text-neutral-57);
+  background: transparent;
 }
 
 .stability-stable {

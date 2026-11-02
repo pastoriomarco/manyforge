@@ -79,7 +79,7 @@ class ProgramRunnerLivenessReceiver:
         self._on_reconciliation = on_reconciliation
         self._cycle_status = cycle_status
         self._clock = monotonic_ns
-        # BB key publication budget check (contract 52), run on the watchdog.
+        # Starts pending BB key sources (BBK-1 (a)), run on the watchdog.
         self._publication_check = publication_check
         self._started_ns = self._clock()
         self._lock = RLock()
@@ -426,7 +426,8 @@ class ProgramRunnerLivenessReceiver:
         return True
 
     def check_publication(self) -> None:
-        """Run the BB publication budget check (watchdog; also used by tests)."""
+        """Start the BB key sources still pending (rule catalog unknown or
+        source not ready yet) at this liveness observation."""
 
         check = self._publication_check
         if check is None:
@@ -434,7 +435,7 @@ class ProgramRunnerLivenessReceiver:
         try:
             check()
         except Exception:
-            _LOGGER.exception("BB key publication budget check failed")
+            _LOGGER.exception("pending BB key source start failed")
 
     def status(self) -> dict[str, Any]:
         now = self._clock()

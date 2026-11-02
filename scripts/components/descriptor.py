@@ -1,7 +1,12 @@
 """Component descriptors: one `component.yaml` per component folder.
 
 A descriptor (`api_version: manyforge.component_package.v1`) describes one
-robot, tool or I/O device as data. Its field names are the planned component
+robot, tool, I/O device, machine or sensor as data. A machine (`kind: machine`) is an
+owner with member slots `{role, model}` and lane rows naming their adapter
+(`lanes.real: {adapter}`; plan, "Machines: owners and members"); a machine's own I/O bank is an `io_device` in model form (signals
+once plus `lanes.real {adapter, bank}`); a sensor (`kind: sensor`, e.g. a
+point-cloud source) names its sensor type and its one adapter row
+(`adapter_row: {adapter}`); it has no lane. Its field names are the planned component
 package manifest's, so packages can adopt the file unchanged. Versions are
 `MAJOR.MINOR.PATCH`; nothing here pins a digest.
 
@@ -10,11 +15,13 @@ What reads a descriptor today:
 - `manyforge component check <folder>`: the descriptor against its own URDF
   and SRDF and, for a robot or a tool, against the rows Apply reads (the
   model family row and component profile rows of the maintained description,
-  the Mock controller row, the generated catalog files). With `--scenario`, a
+  the generated catalog files) and its lane rows (`lanes.<lane>`, CONTRACTS
+  §12) against their files. With `--scenario`, a
   Scenario's components of that robot or tool; a tool's must be mounted on a
   free robot `flange`.
 - `manyforge component register <folder>`: writes those rows from a robot or
-  tool descriptor.
+  tool descriptor; a machine, a model-form I/O device or a sensor is listed
+  in the description's `component_models`.
 - `manyforge component new <kind> <id>`: a folder from the templates.
 - `manyforge component list` / `list_components()`: the curated components,
   each checked; read-only. `runtime.modelFamilyId` joins a robot or tool to
@@ -39,12 +46,11 @@ from typing import Any
 
 import yaml
 
-from scripts.components import mock_controller_profiles
 
 API_VERSION = "manyforge.component_package.v1"
 LIST_SCHEMA = "manyforge.component_list.v1"
 DESCRIPTOR = "component.yaml"
-KINDS = ("robot", "tool", "io_device")
+KINDS = ("robot", "tool", "io_device", "simulator", "machine", "sensor")
 # Curated roots. A robot or tool sits beside its model files, under the
 # `package://` root the runtime resolves; I/O devices sit in components/<kind>/.
 ROBOT_ROOT = "manyforge_example_models/models"
@@ -56,10 +62,6 @@ DESCRIPTION = (
 )
 COMPONENT_TYPES = "manyforge_deployment/resources/maintained/catalog/component_type"
 MODEL_ASSETS = "manyforge_deployment/resources/maintained/model_assets"
-RUNTIME_SCHEMA = (
-    "manyforge_deployment/resources/closed_schema/value/"
-    "manyforge.value_schema.runtime.ros2_control_execution.v1.yaml"
-)
 # The profile row an I/O device component of a Deployment selects.
 IO_DEVICE_PROFILE = "io_device_v0"
 
@@ -68,13 +70,22 @@ _COMMON_OPTIONAL = ("provenance",)
 _KIND_FIELDS = {
     "robot": (
         ("model", "roles", "tcps", "limits", "lanes"),
-        ("tcp_speed_check", "defaults"),
+        ("defaults",),
     ),
     "tool": (("model", "mount", "tcps"), ("roles", "gripper", "lanes")),
-    "io_device": (("signals",), ()),
+    # Provider form (a separate device, each signal names its provider) or
+    # model form (a machine's own I/O bank: `lanes.real {adapter, bank}`).
+    "io_device": (("signals",), ("lanes",)),
+    # A machine (owner) with its member slots and its own lane rows.
+    "machine": (("default_owner_id", "members", "lanes"), ()),
+    # A simulator (CONTRACTS §14) is a component with its lane rows only.
+    "simulator": (("lanes",), ()),
+    # A sensor: its sensor type and its one adapter row (it has no lane).
+    "sensor": (("sensor", "adapter_row"), ()),
 }
+# The sensor types a `kind: sensor` model may name.
+SENSOR_TYPES = ("pointcloud",)
 REQUIRED_FRAME_ROLES = ("base", "flange")
-TCP_SPEED_CHECKS = ("active_tcp", "active_tcp_and_flange")
 GRIPPER_ACTUATIONS = ("pneumatic", "position_commanded")
 INSTANCE_CARDINALITIES = ("multiple_per_cell", "one_per_cell")
 # Closed lists in code: the I/O provider profiles the runtime schema accepts
@@ -85,37 +96,25 @@ IO_PROVIDER_PROFILES = {
         "mock",
         "ros2_control_gpio",
         "ros_bool",
-        "ur_io_states",
-        "xarm_digital",
     ),
-    "output": ("mock_output", "ros2_control_gpio", "ros_set_bool", "ur_set_io", "xarm_digital"),
+    "output": ("mock_output", "ros2_control_gpio", "ros_set_bool"),
 }
+# A model-form I/O bank's real row: its vendor family and which bank it is.
+IO_BANKS = ("controller", "tool")
+# The description's list of model-free component models the compiler reads
+# without a URDF: machines, model-form I/O devices and sensors.
+COMPONENT_MODELS = "component_models"
 _INPUT_ONLY_FIELDS = ("freshness", "transition_capability", "update_mode")
-# Lane -> the selector a component profile row's ros2_control_runtime carries.
-_LANE_SELECTORS = (("mock", "mock_profile"), ("isaac", "isaac_profile"), ("real", "real_profile"))
+# The lanes a model may declare (`lanes.<lane>`, a Deployment component's
+# `lane`). Each row names its adapter, which reads its own keys (CONTRACTS §12).
+LANES = ("mock", "isaac", "real")
+_LANE_ROW_REQUIRED = ("adapter", "controller")
+# The Mock lane adapter (manyforge_ros2_control_execution/lane/): its row
+# names the model's own controllers file.
+MOCK_ADAPTER = "mock"
 # Family row `source` fields a descriptor decides; the others (historical
 # paths, projection kinds) are kept as they are on an existing row.
 _DERIVED_SOURCE = ("accepted_package_uri_prefix", "resource_root", "srdf_path", "urdf_path")
-# A pneumatic tool's lane-free profile (D4): its gripper row fields a
-# descriptor decides; the others (description, auxiliary frames, output mode,
-# timeouts) are kept as they are on an existing row.
-_DERIVED_GRIPPER = (
-    "actuation_kind",
-    "attach_frame",
-    "closed_state_ref",
-    "command_duration_s",
-    "command_target_id",
-    "controllable_component_id",
-    "mount_frame",
-    "open_state_ref",
-    "tcp_frame",
-    "touch_links",
-)
-_PNEUMATIC_SOURCE_FIELDS = {
-    "component_streams": "maintainer_decision.CP9.component_stream_defaults",
-    "gripper_target_configurations": "grippers",
-}
-
 _ID = re.compile(r"[a-z][a-z0-9_]{0,63}\.[a-z][a-z0-9_]{0,127}")
 _PORTABLE_ID = re.compile(r"[a-z][a-z0-9_]{0,127}")
 _VERSION = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
@@ -424,53 +423,97 @@ def _validate_gripper(f: _Fields, value: Any) -> None:
         f.names(gripper["touch_links"], "gripper.touch_links")
 
 
-def _validate_lanes(f: _Fields, data: dict[str, Any], joints: dict[str, Any],
-                    robot: bool) -> None:
-    """`lanes.mock.controllers`: a robot's row moves the arm, a tool's only its gripper."""
-    lanes = f.mapping(data["lanes"], "lanes", ("mock",)) if "lanes" in data else None
-    mock = None
-    if lanes is not None and "mock" in lanes:
-        mock = f.mapping(lanes["mock"], "lanes.mock", ("controllers",))
-    if mock is None or "controllers" not in mock:
+def _validate_lanes(f: _Fields, data: dict[str, Any], robot: bool,
+                    simulator: bool = False) -> None:
+    """`lanes.<lane>` rows (CONTRACTS §12): every row names its adapter and,
+    but a simulator's, its controller (the arm's, or a tool's gripper
+    controller); a robot's row its `arrival_tolerance_rad`, a tool's none. The
+    other keys are the adapter's."""
+    lanes = f.mapping(data["lanes"], "lanes", (), LANES) if "lanes" in data else None
+    required = ("adapter",) if simulator else _LANE_ROW_REQUIRED
+    for lane, row in sorted((lanes or {}).items()):
+        path = f"lanes.{lane}"
+        if f.mapping(row, path, required, open_keys=True) is None:
+            continue
+        for key in required:
+            if key in row:
+                f.portable(row[key], f"{path}.{key}")
+        if robot and "arrival_tolerance_rad" not in row:
+            f.fail(path, "a robot's row needs arrival_tolerance_rad (every arm joint's "
+                   "JTC goal)", "component_lane_invalid")
+        if not robot and not simulator and "arrival_tolerance_rad" in row:
+            f.fail(f"{path}.arrival_tolerance_rad", "a tool's row has none; the robot's "
+                   "row moves the arm", "component_lane_invalid")
+        for key in ("arrival_tolerance_rad", "goal_time_s"):
+            if key in row:
+                f.number(row[key], f"{path}.{key}")
+        if "controllers_file" in row:
+            f.file(row["controllers_file"], f"{path}.controllers_file")
+        if "vendor" in row:
+            f.portable(row["vendor"], f"{path}.vendor")
+        if row.get("adapter") == MOCK_ADAPTER and "controllers_file" not in row \
+                and "vendor" not in row:
+            f.fail(path, "a Mock row needs a vendor or a controllers_file (the Mock lane "
+                   "has no controllers of its own)", "component_lane_invalid")
+
+
+def _validate_simulator(f: _Fields, data: dict[str, Any]) -> None:
+    _validate_lanes(f, data, robot=False, simulator=True)
+
+
+def _validate_sensor(f: _Fields, data: dict[str, Any]) -> None:
+    """A sensor type and one adapter row naming its adapter, the same on every
+    lane (its other keys are the adapter's)."""
+    if "sensor" in data and data["sensor"] not in SENSOR_TYPES:
+        f.fail("sensor", f"must be one of {', '.join(SENSOR_TYPES)}, got {data['sensor']!r}")
+    if "adapter_row" in data:
+        row = f.mapping(data["adapter_row"], "adapter_row", ("adapter",), open_keys=True)
+        if row is not None and "adapter" in row:
+            f.portable(row["adapter"], "adapter_row.adapter")
+
+
+def _validate_machine(f: _Fields, data: dict[str, Any]) -> None:
+    """Member slots `{role, model}` and lane rows naming their adapter; no
+    row on a lane: the owner gets the host's passive adapter. Every member may
+    be deactivated on every lane (AUD-5b revised)."""
+    _validate_machine_members(f, data)
+    if "lanes" in data:
+        lanes = f.mapping(data["lanes"], "lanes", (), LANES)
+        for lane, row in sorted((lanes or {}).items()):
+            path = f"lanes.{lane}"
+            if f.mapping(row, path, ("adapter",), open_keys=True) is None:
+                continue
+            if "adapter" in row:
+                f.portable(row["adapter"], f"{path}.adapter")
+
+
+def _validate_machine_members(f: _Fields, data: dict[str, Any]) -> None:
+    """The member slots `{role, model}`, each role once."""
+    roles: set[str] = set()
+    # The owner's component id when a machine is added (members:
+    # `<owner_id>_<role>`); editable in the Deployment.
+    if "default_owner_id" in data:
+        f.portable(data["default_owner_id"], "default_owner_id")
+    if "members" not in data:
         return
-    controllers = mock["controllers"]
-    if isinstance(controllers, dict) and "mock_profile" in controllers:
-        f.fail(
-            "lanes.mock.controllers.mock_profile",
-            "is not authored: the Mock profile id is the id's name part",
-        )
+    members = data["members"]
+    if not isinstance(members, list) or not members:
+        f.fail("members", "must be a non-empty list of member slots")
         return
-    if not isinstance(data.get("id"), str) or not _ID.fullmatch(data["id"]):
-        return
-    try:
-        row = mock_row(data)
-    except mock_controller_profiles.MockControllerProfileError as error:
-        f.fail("", str(error), "component_lane_invalid")
-        return
-    if robot and row.arm_controller is None:
-        f.fail(
-            "lanes.mock.controllers.arm_controller",
-            "a robot row needs arm_controller",
-            "component_lane_invalid",
-        )
-    if not robot and row.arm_controller is not None:
-        f.fail(
-            "lanes.mock.controllers.arm_controller",
-            "a tool row has no arm_controller; the robot's row moves the arm",
-            "component_lane_invalid",
-        )
-    if "fingers" in joints and row.gripper_controller is None:
-        f.fail(
-            "lanes.mock.controllers",
-            "roles.joints has a 'fingers' role, so the row needs gripper_controller",
-            "component_lane_invalid",
-        )
-    if "fingers" not in joints and row.gripper_controller is not None:
-        f.fail(
-            "lanes.mock.controllers",
-            "roles.joints has no 'fingers' role; remove gripper_controller",
-            "component_lane_invalid",
-        )
+    for index, value in enumerate(members):
+        path = f"members[{index}]"
+        member = f.mapping(value, path, ("role", "model"))
+        if member is None:
+            continue
+        role = member.get("role")
+        if "role" in member and f.portable(role, f"{path}.role"):
+            if role in roles:
+                f.fail(f"{path}.role", f"{role!r} appears more than once")
+            roles.add(role)
+        if "model" in member and (
+            not isinstance(member["model"], str) or not _ID.fullmatch(member["model"])
+        ):
+            f.fail(f"{path}.model", f"must be a <vendor>.<name> model id, got {member['model']!r}")
 
 
 def _validate_robot(f: _Fields, data: dict[str, Any]) -> None:
@@ -480,9 +523,6 @@ def _validate_robot(f: _Fields, data: dict[str, Any]) -> None:
     roles = _validate_roles(f, data["roles"], robot=True) if "roles" in data else {}
     if "tcps" in data:
         _validate_tcps(f, data["tcps"], _frame_roles(data))
-    check = data.get("tcp_speed_check", "active_tcp_and_flange")
-    if check not in TCP_SPEED_CHECKS:
-        f.fail("tcp_speed_check", f"must be one of {', '.join(TCP_SPEED_CHECKS)}, got {check!r}")
     limit = None
     limits = (
         f.mapping(data["limits"], "limits", ("max_tcp_linear_speed_mps",))
@@ -493,7 +533,7 @@ def _validate_robot(f: _Fields, data: dict[str, Any]) -> None:
         if f.number(limits["max_tcp_linear_speed_mps"], "limits.max_tcp_linear_speed_mps"):
             limit = limits["max_tcp_linear_speed_mps"]
     joints = roles.get("joints") if isinstance(roles.get("joints"), dict) else {}
-    _validate_lanes(f, data, joints, robot=True)
+    _validate_lanes(f, data, robot=True)
     if "defaults" in data:
         defaults = f.mapping(
             data["defaults"],
@@ -534,7 +574,7 @@ def _validate_tool(f: _Fields, data: dict[str, Any]) -> None:
         _validate_model(f, data["model"], robot=False)
     roles = _validate_roles(f, data["roles"], robot=False) if "roles" in data else {}
     joints = roles.get("joints") if isinstance(roles.get("joints"), dict) else {}
-    _validate_lanes(f, data, joints, robot=False)
+    _validate_lanes(f, data, robot=False)
     mount = f.mapping(data["mount"], "mount", ("frame",)) if "mount" in data else None
     if mount is not None and "frame" in mount:
         f.text(mount["frame"], "mount.frame")
@@ -544,7 +584,37 @@ def _validate_tool(f: _Fields, data: dict[str, Any]) -> None:
         _validate_gripper(f, data["gripper"])
 
 
+def _signal_name(f: _Fields, value: Any, path: str) -> bool:
+    """A device's own signal name (e.g. CI0, TO1): letters, digits and `_`."""
+    if isinstance(value, str) and re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,127}", value):
+        return True
+    f.fail(path, f"must be a signal name ([A-Za-z][A-Za-z0-9_]*), got {value!r}")
+    return False
+
+
+def is_io_model_form(data: dict[str, Any]) -> bool:
+    """An `io_device` descriptor in model form (a machine's own I/O bank)."""
+    return data.get("kind") == "io_device" and "lanes" in data
+
+
 def _validate_io(f: _Fields, data: dict[str, Any]) -> None:
+    # Model form: a machine's own I/O bank, its provider per lane (real: the
+    # vendor family and bank; mock and isaac: the host's Mock I/O).
+    model_form = "lanes" in data
+    if model_form:
+        lanes = f.mapping(data["lanes"], "lanes", ("real",))
+        # `input_maximum_age_ms`: the inputs' freshness budget (sample age).
+        row = f.mapping(lanes["real"], "lanes.real",
+                        ("adapter", "bank", "input_maximum_age_ms")) if (
+            lanes is not None and "real" in lanes) else None
+        if row is not None:
+            if "adapter" in row:
+                f.portable(row["adapter"], "lanes.real.adapter")
+            if "input_maximum_age_ms" in row:
+                f.number(row["input_maximum_age_ms"], "lanes.real.input_maximum_age_ms")
+            if "bank" in row and row["bank"] not in IO_BANKS:
+                f.fail("lanes.real.bank", f"must be one of {', '.join(IO_BANKS)}, "
+                       f"got {row['bank']!r}")
     if "signals" not in data:
         return
     signals = data["signals"]
@@ -558,20 +628,24 @@ def _validate_io(f: _Fields, data: dict[str, Any]) -> None:
         if direction not in ("input", "output"):
             f.fail(f"{path}.direction", f"must be input or output, got {direction!r}")
             continue
-        extra = _INPUT_ONLY_FIELDS if direction == "input" else ()
+        extra = _INPUT_ONLY_FIELDS if direction == "input" and not model_form else ()
+        provider = () if model_form else ("provider",)
         signal = f.mapping(
-            value, path, ("signal_name", "direction", "value_type", "provider", *extra)
+            value, path, ("signal_name", "direction", "value_type", *provider, *extra)
         )
         if signal is None:
             continue
         name = signal.get("signal_name")
-        if "signal_name" in signal and f.portable(name, f"{path}.signal_name"):
+        if "signal_name" in signal and (
+            f.portable(name, f"{path}.signal_name") if not model_form
+            else _signal_name(f, name, f"{path}.signal_name")
+        ):
             if name in seen:
                 f.fail(f"{path}.signal_name", f"{name!r} appears more than once")
             seen.add(name)
         if "value_type" in signal and signal["value_type"] != "bool":
             f.fail(f"{path}.value_type", f"must be bool, got {signal['value_type']!r}")
-        if "provider" in signal:
+        if "provider" in signal and not model_form:
             provider = f.mapping(
                 signal["provider"], f"{path}.provider", ("profile",), open_keys=True
             )
@@ -614,7 +688,9 @@ def validate(data: Any, report: Report, label: str) -> bool:
         provenance = f.mapping(data["provenance"], "provenance", open_keys=True) or {}
         for key, value in provenance.items():
             f.text(value, f"provenance.{key}")
-    {"robot": _validate_robot, "tool": _validate_tool, "io_device": _validate_io}[kind](
+    {"robot": _validate_robot, "tool": _validate_tool, "io_device": _validate_io,
+     "simulator": _validate_simulator, "machine": _validate_machine,
+     "sensor": _validate_sensor}[kind](
         f, data
     )
     return len(report.errors) == before
@@ -639,19 +715,6 @@ def load_descriptor(root: Path, folder: Path, report: Report) -> Descriptor | No
     if not isinstance(data, dict):
         return None
     return Descriptor(folder=folder, label=label, data=data, text=text)
-
-
-def mock_row(data: dict[str, Any]) -> mock_controller_profiles.MockControllerProfile:
-    """A robot's or tool's Mock controller row; raises MockControllerProfileError."""
-    name = data["id"].split(".", 1)[1]
-    controllers = data["lanes"]["mock"]["controllers"]
-    if not isinstance(controllers, dict):
-        raise mock_controller_profiles.MockControllerProfileError(
-            "lanes.mock.controllers must be a mapping"
-        )
-    return mock_controller_profiles.parse_row(
-        {"mock_profile": name, **controllers}, "lanes.mock.controllers"
-    )
 
 
 # --- model files ----------------------------------------------------------
@@ -934,82 +997,14 @@ def family_row(root: Path, descriptor: Descriptor) -> dict[str, Any] | None:
         # generator assumes: a tool's `tcp`; a robot's `tcp`, else `flange`.
         **({} if tcps == [_assumed_default_tcp(descriptor.kind, frames)]
            else {"tcp_frame_role_ids": tcps}),
+        # The model the family's components select by its `id` (lanes and all).
+        "component_descriptor": f"{relative}/{DESCRIPTOR}",
     }
 
 
 def _assumed_default_tcp(kind: str, frames: dict[str, str]) -> str:
     """The default TCP the generator assumes for a family row without `tcp_frame_role_ids`."""
     return "tcp" if kind == "tool" or "tcp" in frames else "flange"
-
-
-def mock_profile_row(name: str) -> dict[str, Any]:
-    """The minimal component profile row that selects the robot's or tool's Mock row."""
-    return {
-        "runtime_restoration_profile_id": f"{name}_mock_commanded_v0",
-        "model_family_id": name,
-        "ros2_control_runtime": {"mock_profile": name},
-        "source_fields": {},
-        "stop_profiles": {},
-        "acceptance_obligations": [],
-    }
-
-
-def _is_pneumatic(descriptor: Descriptor) -> bool:
-    gripper = descriptor.data.get("gripper") or {}
-    return descriptor.kind == "tool" and gripper.get("actuation") == "pneumatic"
-
-
-def _lane_free(runtime: dict[str, Any]) -> bool:
-    return not any(selector in runtime for _lane, selector in _LANE_SELECTORS)
-
-
-def pneumatic_gripper_row(descriptor: Descriptor) -> dict[str, Any]:
-    """A pneumatic tool's default gripper row: no output until a Scenario wires
-    its `pneumatic_io` I/O components and sets `output_mode: commanded`."""
-    data = descriptor.data
-    gripper = data["gripper"]
-    return {
-        "actuation_kind": "pneumatic",
-        "attach_frame": gripper["attach_frame"],
-        "auxiliary_frames": [],
-        "closed_state_ref": gripper["states"]["closed"],
-        "command_duration_s": gripper["command_duration_s"],
-        "command_target_id": "gripper",
-        "controllable_component_id": descriptor.name,
-        "description": f"{data['title']}; its valve and sensor are the pneumatic_io I/O "
-        "components (no output until they are wired).",
-        "mount_frame": data["mount"]["frame"],
-        "open_state_ref": gripper["states"]["open"],
-        "output_mode": "none",
-        "tcp_frame": data["tcps"][0]["frame"],
-        "touch_links": list(gripper["touch_links"]),
-    }
-
-
-def pneumatic_profile_row(descriptor: Descriptor) -> dict[str, Any]:
-    """A pneumatic tool's lane-free component profile row `<name>_pneumatic_v0` (D4)."""
-    name = descriptor.name
-    return {
-        "runtime_restoration_profile_id": f"{name}_pneumatic_v0",
-        "model_family_id": name,
-        "source_fields": dict(_PNEUMATIC_SOURCE_FIELDS),
-        "ros2_control_runtime": {
-            "component_streams": [],
-            "gripper_target_configurations": [pneumatic_gripper_row(descriptor)],
-        },
-        "stop_profiles": {},
-        "acceptance_obligations": [],
-    }
-
-
-def _gripper_differences(row: dict[str, Any], expected: dict[str, Any]) -> list[str]:
-    """The descriptor-decided fields of a gripper row that differ; touch links as a set."""
-
-    def value(source: dict[str, Any], key: str) -> Any:
-        found = source.get(key)
-        return sorted(found) if key == "touch_links" and isinstance(found, list) else found
-
-    return [key for key in _DERIVED_GRIPPER if value(row, key) != value(expected, key)]
 
 
 def _semantic_roles(semantics: Any) -> tuple[Any, ...]:
@@ -1044,6 +1039,8 @@ def _family_differences(existing: dict[str, Any], expected: dict[str, Any]) -> l
         differing.append("semantics")
     if existing.get("tcp_frame_role_ids") != expected.get("tcp_frame_role_ids"):
         differing.append("tcp_frame_role_ids")
+    if existing.get("component_descriptor") != expected["component_descriptor"]:
+        differing.append("component_descriptor")
     source = existing.get("source", {})
     differing += [
         f"source.{key}" for key in _DERIVED_SOURCE if source.get(key) != expected["source"][key]
@@ -1085,27 +1082,6 @@ def _family_mesh_source_errors(root: Path, descriptor: Descriptor,
     return errors
 
 
-def _schema_mock_enum(root: Path) -> set[str] | None:
-    """The closed schema's `mock_profile` enum, or None when it has none."""
-
-    def find(value: Any) -> set[str] | None:
-        if isinstance(value, dict):
-            if value.get("field_id") == "mock_profile":
-                for constraint in value["value_schema"].get("constraints", []):
-                    if constraint.get("kind") == "enum":
-                        return set(constraint["values"])
-                return None
-            value = list(value.values())
-        if isinstance(value, list):
-            for item in value:
-                found = find(item)
-                if found is not None:
-                    return found
-        return None
-
-    return find(yaml.safe_load((root / RUNTIME_SCHEMA).read_text(encoding="utf-8")))
-
-
 def _read_description(root: Path, report: Report) -> dict[str, Any] | None:
     try:
         return json.loads((root / DESCRIPTION).read_text(encoding="utf-8"))
@@ -1116,10 +1092,11 @@ def _read_description(root: Path, report: Report) -> dict[str, Any] | None:
 
 def check_registration(
     root: Path, descriptor: Descriptor, report: Report
-) -> dict[str, dict[str, Any]]:
-    """The rows Apply reads agree with a robot or tool descriptor.
+) -> set[str]:
+    """The family row Apply reads agrees with a robot or tool descriptor.
 
-    Returns the model family's component profile rows: id -> `ros2_control_runtime`.
+    Returns the model ids a Deployment component selects (`component_profile_id`):
+    the descriptor's `id`; none when the row is missing or stale.
     """
     name = descriptor.name
     expected = family_row(root, descriptor)
@@ -1127,10 +1104,10 @@ def check_registration(
         report.error("component_not_registered", descriptor.label,
                      f"the folder is outside the workspace {root}; a {descriptor.kind} runs "
                      f"from {ROBOT_ROOT}/<name>/ today")
-        return {}
+        return set()
     description = _read_description(root, report)
     if description is None:
-        return {}
+        return set()
     hint = f"run `manyforge component register {_display(root, descriptor.folder)}`"
     before = len(report.errors)
     family = next(
@@ -1151,61 +1128,15 @@ def check_registration(
             report.error("component_registration_stale", DESCRIPTION,
                          f"model family row {name!r} differs from {DESCRIPTOR} in "
                          f"{', '.join(differing)}; {hint}")
-    profiles = {
-        row["runtime_restoration_profile_id"]: row["ros2_control_runtime"]
-        for row in description.get("runtime_restoration_profiles", [])
-        if row.get("model_family_id") == name and "ros2_control_runtime" in row
-    }
-    mock = {
-        profile_id: runtime["mock_profile"]
-        for profile_id, runtime in profiles.items()
-        if "mock_profile" in runtime
-    }
     agreed = ["model family row"]
-    if "lanes" in descriptor.data:
-        if name not in mock.values():
-            report.error("component_not_registered", DESCRIPTION,
-                         f"no component profile row of {name!r} selects mock_profile "
-                         f"{name!r}; {hint}")
-        for profile_id, mock_profile in sorted(mock.items()):
-            if mock_profile != name:
-                report.error("component_registration_stale", DESCRIPTION,
-                             f"profile {profile_id} selects mock_profile {mock_profile!r}, "
-                             f"but the {descriptor.kind}'s Mock row is {name!r}")
-        rows_path = mock_controller_profiles.DEFAULT_PATH
-        try:
-            rows = {row.mock_profile: row
-                    for row in mock_controller_profiles.load(root / rows_path)}
-        except (OSError, mock_controller_profiles.MockControllerProfileError) as error:
-            report.error("component_lane_invalid", rows_path, _one_line(error))
-            rows = None
-        if rows is not None:
-            row = rows.get(name)
-            if row is None:
-                report.error("component_not_registered", rows_path,
-                             f"has no Mock controller row {name!r}; {hint}")
-            elif row != mock_row(descriptor.data):
-                report.error("component_registration_stale", rows_path,
-                             f"Mock controller row {name!r} differs from "
-                             f"lanes.mock.controllers; {hint}")
-        agreed.append(f"Mock profiles {sorted(mock)} and Mock controller row")
-    if _is_pneumatic(descriptor):
-        lane_free = sorted(
-            profile_id for profile_id, runtime in profiles.items() if _lane_free(runtime)
-        )
-        if not lane_free:
-            report.error("component_not_registered", DESCRIPTION,
-                         f"has no lane-free component profile row of {name!r} (a pneumatic "
-                         f"tool's {name}_pneumatic_v0); {hint}")
-        expected_gripper = pneumatic_gripper_row(descriptor)
-        for profile_id in lane_free:
-            for row in profiles[profile_id].get("gripper_target_configurations", []):
-                differing = _gripper_differences(row, expected_gripper)
-                if differing:
-                    report.error("component_registration_stale", DESCRIPTION,
-                                 f"profile {profile_id} gripper row differs from "
-                                 f"{DESCRIPTOR} in {', '.join(differing)}; {hint}")
-        agreed.append(f"lane-free profiles {lane_free}")
+    lanes = descriptor.data.get("lanes", {})
+    for lane, row in sorted(lanes.items()):
+        controllers = row.get("controllers_file")
+        if controllers is not None and not (descriptor.folder / controllers).is_file():
+            report.error("component_lane_invalid", f"{descriptor.label}: lanes.{lane}",
+                         f"controllers_file {controllers!r} is not a file in the folder")
+    if lanes:
+        agreed.append(f"lane rows {sorted(lanes)}")
     for generated in (
         expected["catalog_source"],
         f"{COMPONENT_TYPES}/{name}.component.json",
@@ -1214,14 +1145,70 @@ def check_registration(
         if not (root / generated).is_file():
             report.error("component_generated_missing", generated,
                          f"is missing; generate it ({GUIDE}, step 6)")
-    enum = _schema_mock_enum(root) if "lanes" in descriptor.data else None
-    if enum is not None and name not in enum:
-        report.error("component_schema_refuses", RUNTIME_SCHEMA,
-                     f"the mock_profile enum does not list {name!r}; Apply refuses it until "
-                     f"the id is added there ({GUIDE}, step 7)")
+    if len(report.errors) != before:
+        return set()
+    report.note(f"{descriptor.id}: {', '.join(agreed)} agree with the descriptor")
+    return {descriptor.id}
+
+
+def _descriptor_path(root: Path, descriptor: Descriptor) -> str | None:
+    """The descriptor's workspace-relative path, as `component_models` lists it."""
+    folder = _relative(root, descriptor.folder)
+    return None if folder is None else f"{folder}/{DESCRIPTOR}"
+
+
+def check_component_model_registration(
+    root: Path, descriptor: Descriptor, report: Report
+) -> None:
+    """A machine, a model-form I/O device or a sensor is listed in the
+    description's `component_models`, which the compiler reads without a URDF."""
+    path = _descriptor_path(root, descriptor)
+    if path is None:
+        report.error("component_not_registered", descriptor.label,
+                     f"the folder is outside the workspace {root}")
+        return
+    description = _read_description(root, report)
+    if description is None:
+        return
+    if path not in description.get(COMPONENT_MODELS, []):
+        report.error("component_not_registered", DESCRIPTION,
+                     f"{COMPONENT_MODELS} does not list {path}; run "
+                     f"`manyforge component register {_display(root, descriptor.folder)}`")
+        return
+    report.note(f"{descriptor.id}: listed in {COMPONENT_MODELS}")
+
+
+def _curated_models(root: Path) -> dict[str, dict[str, Any]]:
+    """Every curated descriptor by id (shape only, no checks)."""
+    result: dict[str, dict[str, Any]] = {}
+    for folder in component_folders(root):
+        try:
+            data = yaml.safe_load((folder / DESCRIPTOR).read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError):
+            continue
+        if isinstance(data, dict) and isinstance(data.get("id"), str):
+            result.setdefault(data["id"], data)
+    return result
+
+
+def check_machine_members(root: Path, descriptor: Descriptor, report: Report) -> None:
+    """Every member slot names a curated model a member can be: a robot or a
+    model-form I/O device."""
+    models = _curated_models(root)
+    before = len(report.errors)
+    for index, member in enumerate(descriptor.data["members"]):
+        where = f"{descriptor.label}: members[{index}].model"
+        model = models.get(member["model"])
+        if model is None:
+            report.error("component_manifest_invalid", where,
+                         f"{member['model']!r} is not a curated component")
+        elif model.get("kind") != "robot" and not is_io_model_form(model):
+            report.error("component_manifest_invalid", where,
+                         f"{member['model']!r} is a {model.get('kind')}; a member is a "
+                         "robot or a model-form io_device")
     if len(report.errors) == before:
-        report.note(f"{descriptor.id}: {', '.join(agreed)} agree with the descriptor")
-    return profiles
+        report.note(f"{descriptor.id}: {len(descriptor.data['members'])} member slot(s) "
+                    "name curated models")
 
 
 def _scenario_file(scenario: Path, name: str, report: Report) -> dict[str, Any] | None:
@@ -1254,7 +1241,7 @@ def check_scenario(
     scenario: Path,
     descriptor: Descriptor,
     model: Model,
-    mock: dict[str, str],
+    models: set[str],
     report: Report,
 ) -> None:
     """This robot's components in one Scenario's deployment.yaml."""
@@ -1264,12 +1251,13 @@ def check_scenario(
     components = [
         component
         for component in deployment.get("components", [])
-        if component.get("component_profile_id") in mock
+        if component.get("component_profile_id") in models
     ]
     if not components:
         report.error("component_scenario_mismatch", str(scenario),
-                     f"no component selects a Mock profile of {descriptor.id} ({sorted(mock)})")
+                     f"no component selects the model {descriptor.id}")
         return
+    lanes = descriptor.data.get("lanes", {})
     roles = descriptor.data["roles"]
     arm = list(roles["joints"]["arm_joints"])
     fingers = roles["joints"].get("fingers")
@@ -1284,10 +1272,13 @@ def check_scenario(
 
         configuration = component.get("configuration", {})
         runtime = configuration.get("runtime_configuration", {})
-        expected_profile = mock[component["component_profile_id"]]
-        if runtime.get("mock_profile") != expected_profile:
-            fail(f"runtime_configuration.mock_profile must be {expected_profile!r}, "
-                 "as its profile row")
+        # A member runs on its owner's lane (CONTRACTS §16).
+        owner = next((row for row in deployment.get("components", [])
+                      if "owner" in component
+                      and row.get("component_id") == component["owner"]), component)
+        if owner.get("lane") not in lanes:
+            fail(f"lane {owner.get('lane')!r} is not a lane of {descriptor.id} "
+                 f"({sorted(lanes)})", "component_lane_invalid")
         initial = runtime.get("initial_joint_positions_rad", [])
         if len(initial) != len(arm):
             fail(f"initial_joint_positions_rad has {len(initial)} values for {len(arm)} "
@@ -1326,6 +1317,22 @@ def check_scenario(
     if len(report.errors) == before:
         report.note(f"{scenario.name}: {len(components)} component(s) of {descriptor.id} agree "
                     "with the descriptor")
+
+
+def _model_families(root: Path, description: dict[str, Any]) -> dict[str, str]:
+    """Model id (a descriptor's `id`) -> its model family id."""
+    families: dict[str, str] = {}
+    for row in description.get("model_families", []):
+        path = row.get("component_descriptor") if isinstance(row, dict) else None
+        if not isinstance(path, str):
+            continue
+        try:
+            data = yaml.safe_load((root / path).read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError):
+            continue
+        if isinstance(data, dict) and isinstance(data.get("id"), str):
+            families[data["id"]] = row["model_family_id"]
+    return families
 
 
 def _attachment_interfaces(root: Path, family: str | None) -> set[str]:
@@ -1371,7 +1378,7 @@ def check_tool_scenario(
     scenario: Path,
     descriptor: Descriptor,
     model: Model,
-    profiles: dict[str, dict[str, Any]],
+    models: set[str],
     report: Report,
 ) -> None:
     """This tool's components in one Scenario: each mounted on a free robot `flange`.
@@ -1387,17 +1394,14 @@ def check_tool_scenario(
     all_components = deployment.get("components", [])
     components = [
         component for component in all_components
-        if component.get("component_profile_id") in profiles
+        if component.get("component_profile_id") in models
     ]
     if not components:
         report.error("component_scenario_mismatch", str(scenario),
-                     f"no component selects a profile of {descriptor.id} ({sorted(profiles)})")
+                     f"no component selects the model {descriptor.id}")
         return
     description = _read_description(root, report) or {}
-    family_of = {
-        row.get("runtime_restoration_profile_id"): row.get("model_family_id")
-        for row in description.get("runtime_restoration_profiles", [])
-    }
+    family_of = _model_families(root, description)
     model_families = {
         row.get("model_family_id"): row
         for row in description.get("model_families", [])
@@ -1454,7 +1458,6 @@ def check_tool_scenario(
                     fail(f"the flange of {parent_id!r} is not free: it carries "
                          f"{sorted(map(str, on_flange))}", "component_attachment_invalid")
         runtime = component.get("configuration", {}).get("runtime_configuration", {})
-        profile = profiles[component["component_profile_id"]]
         family = family_of.get(component["component_profile_id"])
         family_row = model_families.get(family)
         registered_source = family_row.get("source") if isinstance(family_row, dict) else None
@@ -1503,13 +1506,14 @@ def check_tool_scenario(
                     package_path = _scenario_source_path(roots.get(package), scenario)
                     if package_path != Path(os.path.abspath(root / package)):
                         fail(f"model_source.package_roots.{package} must resolve to its registered package path")
-        for _lane, selector in _LANE_SELECTORS:
-            if runtime.get(selector) != profile.get(selector):
-                fail(f"runtime_configuration.{selector} must be {profile.get(selector)!r}, "
-                     "as its profile row")
+        # A pneumatic tool may name no lane: it runs no controller (D4).
+        lane_free = "lane" not in component and (gripper or {}).get("actuation") == "pneumatic"
+        if not lane_free and component.get("lane") not in descriptor.data.get("lanes", {}):
+            fail(f"lane {component.get('lane')!r} is not a lane of {descriptor.id}",
+                 "component_lane_invalid")
         streams = sorted(row.get("stream_id") for row in runtime.get("component_streams", []))
         # A lane-free (pneumatic) tool runs no controller, so it has no streams.
-        expected_streams = [] if _lane_free(profile) else ["gripper_feedback", "measured_joints"]
+        expected_streams = [] if lane_free else ["gripper_feedback", "measured_joints"]
         if streams != expected_streams:
             fail(f"component_streams must declare exactly {expected_streams}, got {streams}")
         grippers = runtime.get("gripper_target_configurations", [])
@@ -1556,20 +1560,19 @@ def check(
                     "from the robot's datasheet; checking it is your responsibility, and "
                     "ManyForge enforces whatever value is entered")
     if model is not None:
-        profiles = check_registration(root, descriptor, report)
+        models = check_registration(root, descriptor, report)
         if descriptor.kind == "robot":
-            mock = {
-                profile_id: runtime["mock_profile"]
-                for profile_id, runtime in profiles.items()
-                if runtime.get("mock_profile") == descriptor.name
-            }
-            if scenario is not None and mock:
-                check_scenario(scenario, descriptor, model, mock, report)
-        elif scenario is not None and profiles:
-            check_tool_scenario(root, scenario, descriptor, model, profiles, report)
-    elif descriptor.kind == "io_device" and scenario is not None:
+            if scenario is not None and models:
+                check_scenario(scenario, descriptor, model, models, report)
+        elif scenario is not None and models:
+            check_tool_scenario(root, scenario, descriptor, model, models, report)
+    elif descriptor.kind in ("io_device", "machine", "sensor") and scenario is not None:
         report.error("component_manifest_invalid", str(scenario),
                      "--scenario checks a robot's or a tool's components only")
+    if descriptor.kind == "machine":
+        check_machine_members(root, descriptor, report)
+    if descriptor.kind in ("machine", "sensor") or is_io_model_form(descriptor.data):
+        check_component_model_registration(root, descriptor, report)
     if descriptor.kind == "io_device" and not report.errors:
         report.note(f"{descriptor.id}: {len(descriptor.data['signals'])} signal(s)")
     return report, descriptor
@@ -1583,9 +1586,9 @@ def new_component(
 ) -> tuple[Report, Path | None]:
     """A component folder from `components/templates/<kind>/`."""
     report = Report()
-    if kind not in KINDS:
+    if kind not in KINDS or kind in ("simulator", "sensor"):
         report.error("component_manifest_invalid", "kind",
-                     f"must be one of {', '.join(KINDS)}, got {kind!r}")
+                     f"must be one of robot, tool, io_device, machine, got {kind!r}")
     if not _ID.fullmatch(component_id):
         report.error("component_manifest_invalid", "id",
                      "must be <vendor>.<name>, each a lower-case portable id "
@@ -1618,40 +1621,6 @@ def new_component(
     report.note(f"created {shown}/{DESCRIPTOR}; fill it in ({GUIDE}), then run "
                 f"`manyforge component check {shown}`")
     return report, folder
-
-
-def _mock_row_text(row: mock_controller_profiles.MockControllerProfile) -> str:
-    lines = [
-        f"  - mock_profile: {row.mock_profile}",
-        f"    template: {row.template}",
-        f"    hardware_component_name: {row.hardware_component_name}",
-    ]
-    if row.arm_controller is not None:
-        lines.append(f"    arm_controller: {row.arm_controller}")
-    if row.vendor_joint_constraints is not None:
-        (trajectory,) = row.vendor_joint_constraints
-        lines.append(f'    vendor_joint_constraints: {{trajectory: "{trajectory}"}}')
-    if row.gripper_controller is not None:
-        lines.append(f"    gripper_controller: {row.gripper_controller}")
-    lines.append(f"    hard_stop_completion_timeout_s: {row.hard_stop_completion_timeout_s!r}")
-    lines.append(f"    gripper_result_timeout_s: {row.gripper_result_timeout_s!r}")
-    if row.arrival_tolerance_rad is not None:
-        lines.append(f"    arrival_tolerance_rad: {row.arrival_tolerance_rad!r}")
-    return "\n".join(lines) + "\n"
-
-
-def _with_mock_row(text: str, row: mock_controller_profiles.MockControllerProfile) -> str:
-    """The rows file with this row replaced in place, or appended; comments kept."""
-    lines = text.splitlines(keepends=True)
-    head = f"  - mock_profile: {row.mock_profile}"
-    start = next((index for index, line in enumerate(lines) if line.rstrip() == head), None)
-    block = _mock_row_text(row)
-    if start is None:
-        return text + ("" if text.endswith("\n") else "\n") + block
-    end = start + 1
-    while end < len(lines) and lines[end].startswith("    "):
-        end += 1
-    return "".join(lines[:start]) + block + "".join(lines[end:])
 
 
 def _json_value_text(value: Any, indent: int, element: bool = False) -> str:
@@ -1705,14 +1674,46 @@ def _with_json_row(text: str, key: str, id_key: str, row: dict[str, Any]) -> str
     return text[:end] + ",\n    " + row_text + text[end:]
 
 
+def _register_component_model(
+    root: Path, descriptor: Descriptor, report: Report
+) -> tuple[Report, list[str]]:
+    """List a machine's, a model-form I/O device's or a sensor's descriptor in
+    the description's sorted `component_models` (after `api_version`)."""
+    path = _descriptor_path(root, descriptor)
+    if path is None:
+        report.error("component_not_registered", descriptor.label,
+                     f"the folder is outside the workspace {root}")
+        return report, []
+    target = root / DESCRIPTION
+    text = target.read_text(encoding="utf-8")
+    listed = json.loads(text).get(COMPONENT_MODELS)
+    if listed is not None and path in listed:
+        return report, []
+    paths = sorted([*(listed or []), path])
+    row_text = "[\n" + ",\n".join(f"    {json.dumps(item)}" for item in paths) + "\n  ]"
+    if listed is None:
+        anchor = '"model_families": ['
+        index = text.index(anchor)
+        text = text[:index] + f'"{COMPONENT_MODELS}": {row_text},\n  ' + text[index:]
+    else:
+        start = text.index(f'"{COMPONENT_MODELS}": [')
+        end = text.index("]", start) + 1
+        text = text[:start] + f'"{COMPONENT_MODELS}": {row_text}' + text[end:]
+    target.write_text(text, encoding="utf-8")
+    return report, [f"{DESCRIPTION}: {COMPONENT_MODELS} entry {path}"]
+
+
 def register(root: Path, folder: Path) -> tuple[Report, list[str]]:
-    """Write a robot's or tool's rows: its model family row, its component
-    profile rows (Mock, and a pneumatic tool's lane-free one) and its Mock
-    controller row. Writes nothing when the rows already match."""
+    """Write a robot's or tool's model family row, naming its descriptor
+    (`component_descriptor`); list a machine, a model-form I/O device or a
+    sensor in `component_models`. Lane rows stay in the descriptor, which the runtime
+    reads. Writes nothing when the row already matches."""
     report = Report()
     descriptor = load_descriptor(root, folder, report)
     if descriptor is None or report.errors:
         return report, []
+    if descriptor.kind in ("machine", "sensor") or is_io_model_form(descriptor.data):
+        return _register_component_model(root, descriptor, report)
     if descriptor.kind not in ("robot", "tool"):
         report.note(f"{descriptor.id}: a {descriptor.kind} descriptor has no rows to register")
         return report, []
@@ -1725,7 +1726,6 @@ def register(root: Path, folder: Path) -> tuple[Report, list[str]]:
     if report.errors:
         return report, []
     name = descriptor.name
-    lanes = "lanes" in descriptor.data
     written: list[str] = []
     path = root / DESCRIPTION
     text = path.read_text(encoding="utf-8")
@@ -1744,77 +1744,42 @@ def register(root: Path, folder: Path) -> tuple[Report, list[str]]:
     if existing is None or _family_differences(existing, expected):
         updated = _with_json_row(updated, "model_families", "model_family_id", expected)
         written.append(f"{DESCRIPTION}: model family row {name}")
-    added: list[dict[str, Any]] = []
-    family_profiles = [
-        row for row in description["runtime_restoration_profiles"]
-        if row.get("model_family_id") == name and "ros2_control_runtime" in row
-    ]
-    if lanes and not any(
-        row["ros2_control_runtime"].get("mock_profile") == name for row in family_profiles
-    ):
-        added.append(mock_profile_row(name))
-    if _is_pneumatic(descriptor):
-        lane_free = [row for row in family_profiles if _lane_free(row["ros2_control_runtime"])]
-        if not lane_free:
-            added.append(pneumatic_profile_row(descriptor))
-        expected_gripper = pneumatic_gripper_row(descriptor)
-        for profile in lane_free:
-            stale = False
-            for row in profile["ros2_control_runtime"].get("gripper_target_configurations", []):
-                differing = _gripper_differences(row, expected_gripper)
-                row.update({key: expected_gripper[key] for key in differing})
-                stale = stale or bool(differing)
-            if stale:
-                updated = _with_json_row(updated, "runtime_restoration_profiles",
-                                         "runtime_restoration_profile_id", profile)
-                written.append(f"{DESCRIPTION}: component profile row "
-                               f"{profile['runtime_restoration_profile_id']}")
-    for row in added:
-        updated = _with_json_row(updated, "runtime_restoration_profiles",
-                                 "runtime_restoration_profile_id", row)
-        written.append(f"{DESCRIPTION}: component profile row "
-                       f"{row['runtime_restoration_profile_id']}")
     if updated != text:
         path.write_text(updated, encoding="utf-8")
-    if not lanes:
-        return report, written
-    rows_path = root / mock_controller_profiles.DEFAULT_PATH
-    rows = {row.mock_profile: row for row in mock_controller_profiles.load(rows_path)}
-    row = mock_row(descriptor.data)
-    if rows.get(name) != row:
-        rows_path.write_text(_with_mock_row(rows_path.read_text(encoding="utf-8"), row),
-                             encoding="utf-8")
-        written.append(f"{mock_controller_profiles.DEFAULT_PATH}: Mock controller row {name}")
     return report, written
 
 
 # --- the curated list -----------------------------------------------------
 
 
-def _runtime(description: dict[str, Any] | None, data: dict[str, Any]) -> dict[str, Any]:
-    """What a Deployment component of this descriptor selects today."""
+def _runtime(data: dict[str, Any]) -> dict[str, Any]:
+    """What a Deployment component of this descriptor selects: its model id
+    (`component_profile_id`) and one of its lanes; a pneumatic tool may name
+    none (`lane_free`, D4)."""
     component_id = data.get("id")
+    if is_io_model_form(data):
+        # Only a machine member: its model is its profile.
+        return {"componentProfileId": component_id}
     if data.get("kind") == "io_device":
         return {"componentProfileId": IO_DEVICE_PROFILE}
+    if data.get("kind") == "machine":
+        return {"componentProfileId": component_id}
+    if data.get("kind") == "sensor":
+        # One adapter on every lane.
+        return {"componentProfileId": component_id, "lanes": sorted(LANES)}
     if (
         data.get("kind") not in ("robot", "tool")
         or not isinstance(component_id, str)
         or not _ID.fullmatch(component_id)
     ):
         return {}
-    name = component_id.split(".", 1)[1]
-    lanes: dict[str, list[str]] = {}
-    for row in (description or {}).get("runtime_restoration_profiles", []):
-        if row.get("model_family_id") != name or "ros2_control_runtime" not in row:
-            continue
-        runtime = row["ros2_control_runtime"]
-        # A pneumatic tool's lane-free profile serves every lane (D4).
-        found = [lane for lane, selector in _LANE_SELECTORS if selector in runtime]
-        for lane in found or ["lane_free"]:
-            lanes.setdefault(lane, []).append(row["runtime_restoration_profile_id"])
+    lanes = sorted(data.get("lanes") or {})
+    if data.get("kind") == "tool" and (data.get("gripper") or {}).get("actuation") == "pneumatic":
+        lanes = sorted([*lanes, "lane_free"])
     return {
-        "modelFamilyId": name,
-        "componentProfileIds": {lane: sorted(ids) for lane, ids in sorted(lanes.items())},
+        "modelFamilyId": component_id.split(".", 1)[1],
+        "componentProfileId": component_id,
+        "lanes": lanes,
     }
 
 
@@ -1828,17 +1793,36 @@ def component_folders(root: Path) -> list[Path]:
     return folders
 
 
+def _machine_runtime(data: dict[str, Any], models: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """A machine runs on its arm member's lanes; its members."""
+    members = [m for m in data.get("members") or [] if isinstance(m, dict)]
+    arm = next((m for m in members
+                if (models.get(m.get("model")) or {}).get("kind") == "robot"), None)
+    lanes = sorted((models.get(arm["model"]) or {}).get("lanes") or {}) if arm else []
+    return {
+        "componentProfileId": data.get("id"),
+        "lanes": lanes,
+        "members": [{"role": m.get("role"), "modelId": m.get("model")} for m in members],
+    }
+
+
 def list_components(root: Path) -> dict[str, Any]:
     """The read-only list of curated components, each checked as by `check`.
 
     A component with errors is listed with them and is not addable. Two
     folders with the same id and version but different bytes are both in
     error; with the same bytes the second is left out. A robot is addable
-    with a Mock profile, a tool with a Mock or lane-free profile.
+    with a Mock lane, a tool with a Mock lane or lane-free, a machine when its
+    arm has a Mock lane, a sensor always (it has no lane); a
+    machine's member model (its arm robot, a
+    model-form I/O device) only as a machine member (AUD-5).
     """
-    description = _read_description(root, Report())
     entries: list[dict[str, Any]] = []
     seen: dict[tuple[str, str], tuple[str, dict[str, Any], str]] = {}
+    models = _curated_models(root)
+    member_models = {member.get("model") for model in models.values()
+                     if model.get("kind") == "machine"
+                     for member in model.get("members") or [] if isinstance(member, dict)}
     for folder in component_folders(root):
         report, descriptor = check(root, folder)
         data = descriptor.data if descriptor is not None else {}
@@ -1860,15 +1844,19 @@ def list_components(root: Path) -> dict[str, Any]:
             "title": data.get("title"),
             "path": path,
             "descriptor": data or None,
-            "runtime": _runtime(description, data),
+            "runtime": (_machine_runtime(data, models) if data.get("kind") == "machine"
+                        else _runtime(data)),
             "addable": False,
             "errors": [error.as_dict() for error in report.errors],
         }
         if descriptor is not None and not report.errors:
-            lanes = entry["runtime"].get("componentProfileIds", {})
+            lanes = entry["runtime"].get("lanes", [])
             entry["addable"] = (
-                descriptor.kind == "io_device"
-                or (descriptor.kind == "robot" and "mock" in lanes)
+                (descriptor.kind == "io_device" and not is_io_model_form(data))
+                or descriptor.kind in ("simulator", "sensor")
+                or (descriptor.kind == "machine" and "mock" in lanes)
+                or (descriptor.kind == "robot" and "mock" in lanes
+                    and descriptor.id not in member_models)
                 or (descriptor.kind == "tool" and ("mock" in lanes or "lane_free" in lanes))
             )
         if descriptor is not None:

@@ -54,7 +54,7 @@ protected:
               root,
               d::test::
                   make_lite6_ros2_control_shared_consumer_retention_fixture(
-                      {}, 1U, false, true))
+                      {}, 1U, true))
               .bundle;
     } else {
       // Out-of-order authored IDs cross the real normalizer, qualifier,
@@ -62,9 +62,9 @@ protected:
       const auto rules = d::parse_strict_json_model_yaml(R"([
         {"rule_id":"zeta","condition":{"compare":{"operand":{"signal":{
           "controllable_component_id":"device.io","signal_name":"ready"}},
-          "op":"==","value":false}},"scope":"all_motion"},
+          "op":"==","value":false}},"scope":"all_motion","on_trip":"stop","after_stop":"hold","active_at_start":true},
         {"rule_id":"alpha","condition":{"compare":{"operand":{"key":"ready"},
-          "op":"==","value":true}},"scope":"everything"}])")
+          "op":"==","value":true}},"scope":"everything","on_trip":"stop","after_stop":"hold","active_at_start":true}])")
                              .root();
       bundle = d::test::materialize_boolean_io_retained_fixture(
                    root, true, false, false, false, false, &rules)
@@ -73,22 +73,19 @@ protected:
   }
   void BuildPureKeyRules() {
     const auto configuration = d::parse_strict_json_model_yaml(R"({
-      "interrupt_sources":[],"interrupt_policies":[],
       "interrupt_rules":[
         {"rule_id":"zeta","condition":{"compare":{"operand":{"key":"ready"},
-          "op":"==","value":false}},"scope":"all_motion"},
+          "op":"==","value":false}},"scope":"all_motion","on_trip":"stop","after_stop":"hold","active_at_start":true},
         {"rule_id":"alpha","condition":{"not":{"compare":{"operand":{"key":"ready"},
-          "op":"==","value":true}}},"scope":"everything"}],
-      "interrupt_config":{"queue_depth":8,"cancel_validation_timeout_ns":1000,
-        "motion_scope_arm_timeout_ns":1000,"supervisory_poll_rate_hz":10}})")
+          "op":"==","value":true}}},"scope":"everything","on_trip":"stop","after_stop":"hold","active_at_start":true}]})")
                                    .root();
     bundle = d::test::materialize_lite6_retained_consumer_fixture_from(
         root, d::test::make_lite6_controllable_retention_fixture(
-                  false, false, 1U, false, true, {}, false, true, "resource",
-                  true, {}, {}, true, false, false, std::nullopt, false,
+                  false, false, 1U, {}, false, true, "resource",
+                  true, {}, {}, false, false, std::nullopt,
                   d::test::kLite6ArmTargetId, std::nullopt, std::nullopt, {}, true,
                   {}, "manyforge.provider.ros2_control", false, true,
-                  nullptr, nullptr, true, false, "pneumatic", std::nullopt,
+                  nullptr, nullptr, true, "pneumatic", std::nullopt,
                   "commanded", nullptr, &configuration))
                  .bundle;
   }

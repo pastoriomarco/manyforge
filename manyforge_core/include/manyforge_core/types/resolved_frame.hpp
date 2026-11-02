@@ -55,4 +55,13 @@ using ResolvedFrameDTO =
       frame);
 }
 
+/// Portable role of a resolved frame; empty for a cell frame.
+[[nodiscard]] inline std::string frame_role_id(const ResolvedFrameDTO& frame) {
+  if (const auto* component = std::get_if<ResolvedComponentModelFrameDTO>(&frame))
+    return component->frame_role_id.value();
+  if (const auto* passive = std::get_if<ResolvedPassiveModelFrameDTO>(&frame))
+    return passive->frame_role_id.value();
+  return {};
+}
+
 }  // namespace manyforge::core

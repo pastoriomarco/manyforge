@@ -1,17 +1,20 @@
--- ManyForge I4 durable active-bundle publication store, version 1.
+-- ManyForge I4 durable active-bundle publication store, version 2.
 --
 -- This schema has exactly one public-pointer owner. Immutable receipts retain
 -- exact replay and independent generation-bound reread evidence; the singleton
 -- head is the only mutable active alias. It is deliberately separate from the
--- Component Manager foundation journal/CAS fixture.
+-- Component Manager foundation journal/CAS fixture. The receipt inventory is
+-- bounded by eviction: a full store deletes its oldest receipt before the next
+-- publication (version 2), so receipts form one contiguous generation window
+-- ending at the head. The head receipt itself can never be deleted.
 
 PRAGMA application_id = 1296449872;
-PRAGMA user_version = 1;
+PRAGMA user_version = 2;
 
 CREATE TABLE IF NOT EXISTS publication_store_metadata (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     schema_id TEXT NOT NULL,
-    schema_version INTEGER NOT NULL CHECK (schema_version = 1),
+    schema_version INTEGER NOT NULL CHECK (schema_version = 2),
     schema_artifact_digest TEXT NOT NULL,
     cell_id TEXT NOT NULL,
     maximum_receipts INTEGER NOT NULL
@@ -136,8 +139,11 @@ END;
 
 CREATE TRIGGER IF NOT EXISTS active_bundle_publication_receipts_no_delete
 BEFORE DELETE ON active_bundle_publication_receipts
+WHEN OLD.publication_generation >= (
+    SELECT publication_generation FROM active_bundle_publication_head
+)
 BEGIN
-    SELECT RAISE(ABORT, 'active_bundle_publication_receipts rows are immutable');
+    SELECT RAISE(ABORT, 'the active-bundle publication head receipt cannot be deleted');
 END;
 
 CREATE TRIGGER IF NOT EXISTS active_bundle_publication_head_no_delete

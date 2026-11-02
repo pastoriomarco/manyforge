@@ -19,9 +19,6 @@ inline constexpr double kExecutionDrainTimeoutS =
 const char* stop_mode_string(MotionInterruptStopMode mode);
 const char* stop_command_source_string(MotionInterruptStopCommandSource source);
 
-bool is_classified_stop_intervention(
-    const std::map<std::string, std::string>& details);
-
 bool drain_execution_handle_bounded(ExecutionHandle& handle);
 ErrorDTO operator_intervention_error(ErrorCode code,
                                      std::string message,

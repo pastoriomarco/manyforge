@@ -250,8 +250,10 @@ int run() {
     if (counter < 0) {
       fail("fake worker could not open its generation counter");
     }
-    constexpr char kGeneration = 'g';
-    const auto written = ::write(counter, &kGeneration, 1U);
+    // One letter per generation, from its planner seed (0x1234 -> 'g').
+    const char generation = static_cast<char>(
+        'a' + input.candidate_config.rng_seed.value_or(0U) % 26U);
+    const auto written = ::write(counter, &generation, 1U);
     const auto close_result = ::close(counter);
     if (written != 1 || close_result != 0) {
       fail("fake worker could not record its generation");

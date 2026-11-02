@@ -1,7 +1,12 @@
 # UF850 + xArm Gripper
 
-Self-contained, generation-time-expanded ManyForge model. The runtime does
-not depend on ROS, Xacro, MoveIt, `uf_ros_lib`, or xarm_ros2.
+Self-contained, generation-time-expanded ManyForge model. Loading it needs
+no ROS, Xacro, MoveIt, `uf_ros_lib`, or xarm_ros2.
+
+This bundle has no `component.yaml` and isn't placed in a Deployment: it is
+the source of the split models `../uf850` (the arm) and `../xarm_gripper` (the
+tool), which are placed as separate components with the tool mounted on the
+arm's `flange`. It holds their meshes, licenses and upstream sources.
 
 The arm, standard xArm gripper, physical parameters, kinematics, MoveIt joint
 limits and meshes come from `https://github.com/pastoriomarco/xarm_ros2`,

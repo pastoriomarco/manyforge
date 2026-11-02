@@ -23,7 +23,8 @@ void register_command_schema_bindings(py::module_& module) {
   py::enum_<CommandCallerOptionValueKind>(
       module, "CommandCallerOptionValueKind")
       .value("kNonnegativeDurationSeconds",
-             CommandCallerOptionValueKind::kNonnegativeDurationSeconds);
+             CommandCallerOptionValueKind::kNonnegativeDurationSeconds)
+      .value("kBool", CommandCallerOptionValueKind::kBool);
   py::enum_<CommandCompletionRule>(module, "CommandCompletionRule")
       .value("kGoalFencedTargetReached",
              CommandCompletionRule::kGoalFencedTargetReached);

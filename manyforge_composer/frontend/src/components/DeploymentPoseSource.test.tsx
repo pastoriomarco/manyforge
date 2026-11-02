@@ -141,7 +141,7 @@ describe('Deployment pose sources', () => {
   it('keeps a pose source out of the robot sections and edits its own configuration', async () => {
     const mounted = await mount([arm, poseSource]);
     try {
-      // The native runtime section lists the arm only.
+      // The execution host section lists the arm only.
       const units = mounted.all((props) => props.className === 'deployment-runtime-unit')
         .map((props) => ((props.children as Array<{ props?: { children?: Array<{ props?: { children?: unknown } }> } }>)[0]
           ?.props?.children?.[0]?.props?.children));

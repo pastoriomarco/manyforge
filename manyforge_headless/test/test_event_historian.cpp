@@ -1618,16 +1618,13 @@ TEST(EventHistorian, AlarmLifecycleEnvelopeRetainsOwnerCallerAndSubject) {
   for (const auto *definition :
        {"manyforge.runtime.program_runner_loss",
         "manyforge.runtime.operation_journal_write_fault",
-        "manyforge.runtime.kernel_internal_fault",
-        "manyforge.motion.stop_fault"}) {
+        "manyforge.runtime.kernel_internal_fault"}) {
     fact.definition_id = definition;
     for (const auto *type :
          {"alarm_raised", "alarm_acknowledged", "alarm_returned"}) {
       fact.event_type = type;
       const auto lifecycle = MakeAlarmLifecycleHistorianEvent(fact);
-      const bool new_fault_raised =
-          std::string_view(type) == "alarm_raised" &&
-          std::string_view(definition) != "manyforge.motion.stop_fault";
+      const bool new_fault_raised = std::string_view(type) == "alarm_raised";
       EXPECT_EQ(lifecycle.severity, new_fault_raised ? "ERROR" : "INFO")
           << definition << " " << type;
     }

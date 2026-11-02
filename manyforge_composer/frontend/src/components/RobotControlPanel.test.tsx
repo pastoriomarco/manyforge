@@ -145,7 +145,6 @@ const controller = vi.hoisted(() => ({
         unavailableReason: null,
         expectedStopGeneration: 0,
         latestTerminal: null,
-        fault: null,
       },
     },
     phase: 'ready',
@@ -159,7 +158,7 @@ const controller = vi.hoisted(() => ({
     motionSettings: { velocityScale: 1, accelerationScale: 1, tcpLinearSpeedMps: 0.1,
       tcpAngularSpeedRadS: 0.5, tcpLinearAccelerationMps2: 0.5, tcpAngularAccelerationRadS2: 2.5,
       cartesianTranslationToleranceM: 0.005, cartesianRotationToleranceRad: 0.05,
-      cartesianMaxBlendDeviationRad: 0.01, clearanceM: null, jointLimits: {} },
+      clearanceM: null, jointLimits: {} },
     generation: 1,
     intent: {},
     preview: {
@@ -179,14 +178,6 @@ const controller = vi.hoisted(() => ({
   runtimeScaleDraft: 1,
   runtimeScalePending: false,
   runtimeScaleError: null,
-  stopFaultRecoveryPending: false,
-  stopFaultRecoveryInProgress: false,
-  stopFaultRecoveryAbortPending: false,
-  cellRecoverBlockedReason: null,
-  setCellRecoverBlockedReason: vi.fn(),
-  stopFaultRecoveryError: null,
-  componentIncidents: [],
-  componentIncidentsUnavailableReason: null,
   motionTargets: [] as Array<Record<string, unknown>>,
   gripperTargets: [] as Array<Record<string, unknown>>,
   selectRobot: vi.fn(),
@@ -203,8 +194,6 @@ const controller = vi.hoisted(() => ({
   revert: vi.fn(),
   stop: vi.fn(),
   fullStop: vi.fn(),
-  recoverStopFault: vi.fn(),
-  abortRecoverStopFault: vi.fn(),
   reset: vi.fn(),
   setRuntimeScale: vi.fn(),
   retry: vi.fn(),
@@ -631,11 +620,10 @@ describe('RobotControlPanel layout', () => {
       expect(markup).toContain('Vel. (%)');
       expect(markup).toContain('Acc. (%)');
       expect(markup).toContain('TCP Sp. (m/s)');
-      expect(markup).toContain('<summary title="Cartesian path fidelity, smoothing and optional tighter per-joint limits.">Advanced</summary>');
+      expect(markup).toContain('<summary title="Cartesian path fidelity and optional tighter per-joint limits.">Advanced</summary>');
       expect(markup).toContain('Lin. Tol. (m)');
-      expect(markup).toContain('Blend (rad)');
+      expect(markup).not.toContain('Blend');
       expect(markup).toContain('aria-label="Manual Cartesian linear path tolerance (m)"');
-      expect(markup).toContain('aria-label="Manual Maximum Cartesian joint-path blend deviation (rad); zero disables blending"');
     } finally {
       state.mode = previousMode;
     }
@@ -678,22 +666,6 @@ describe('RobotControlPanel layout', () => {
     markup = renderToStaticMarkup(<RobotControlPanel enabled />);
     expect(markup).not.toContain('Reset operation required.');
 
-    state.phase = 'ready';
-    state.operation = null;
-  });
-
-  it('requires an explicit per-output acknowledgement before a Reset of an unknown-acceptance output', () => {
-    const state = controller.state as unknown as Record<string, unknown>;
-    state.phase = 'completed';
-    state.operation = {
-      operationId: 'operation-io', operationRevision: 2, resident: true, state: 'failed', progress: 1,
-      activeStopId: null, activeStopGeneration: null, terminalError: 'acceptance unknown',
-      controllableComponentId: 'station', commandTargetId: 'io', outputEvidence: 'acceptance_unknown',
-    };
-    const markup = renderToStaticMarkup(<RobotControlPanel enabled />);
-    expect(markup).toContain('A write already queued in the remote device may still act.');
-    expect(markup).toContain('aria-label="Acknowledge station · io (operation-io)"');
-    expect(markup).toMatch(/disabled=""[^>]*aria-label="Reset operation" title="Confirm each output with unknown acceptance first."/);
     state.phase = 'ready';
     state.operation = null;
   });

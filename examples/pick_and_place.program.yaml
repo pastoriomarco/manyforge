@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: pick_and_place_demo
-program_revision: sha256:d9cfa755dda58cbc0f33b266e09bbeffa80b8d8c8a4bfaa55b5c39b1ba0ff0a2
+program_revision: sha256:4957202661013f282df3b08857fa6a88d10071425fc3f9905a0fd41c486dc3b8
 program_profile: composable-cell-v1
 name: pick_and_place_demo
 description: Pick-and-place demo for the UR5 source model. It preserves the original approach, pick, retreat,
@@ -40,9 +40,6 @@ target_roles:
       parameters: {}
       disposition: required
     - capability_id: planning.motion.pose_goal
-      parameters: {}
-      disposition: required
-    - capability_id: planning.profile.balanced
       parameters: {}
       disposition: required
     - capability_id: planning.trajectory.time_parameterized

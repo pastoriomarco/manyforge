@@ -161,12 +161,11 @@ public:
   std::optional<core::OperatorAlarmAttentionSnapshotDTO> attention;
 };
 
-Value AttentionMember(std::string gate, Value::Array resources,
-                      std::string subject_kind, std::string subject_id) {
+Value AttentionMember(Value::Array resources, std::string subject_kind,
+                      std::string subject_id) {
   return Value(Value::Object{
       {"activation_id", Value("activation.1")},
       {"condition_id", Value("condition.1")},
-      {"gate", Value(std::move(gate))},
       {"record_revision", Value(2.0)},
       {"subject",
        Value(Value::Object{{"resource_ids", Value(std::move(resources))},
@@ -219,8 +218,7 @@ TEST(CellAdmissionCommandCodec,
   RecordingKernel kernel;
   const auto decoded = TryDecodeCellAdmissionCommand(ci::canonical_json(
       Envelope(std::string(cm::kPublishOperatorAlarmAttentionCommand),
-               Attention(AttentionMember("condition_interlock",
-                                         {Value("robot.joint_1")}, "operation",
+               Attention(AttentionMember({Value("robot.joint_1")}, "operation",
                                          "operation.1")))));
   ASSERT_TRUE(decoded.has_value());
   const auto response = cm::DispatchKernelCellAdmissionRpc(kernel, *decoded);
@@ -230,8 +228,6 @@ TEST(CellAdmissionCommandCodec,
   EXPECT_EQ(kernel.attention->owner_incarnation_us, 42U);
   EXPECT_EQ(kernel.attention->generation, 5U);
   ASSERT_EQ(kernel.attention->members.size(), 1U);
-  EXPECT_EQ(kernel.attention->members.front().gate,
-            core::OperatorAlarmAttentionGateDTO::kConditionInterlock);
   EXPECT_EQ(kernel.attention->members.front().resource_ids,
             std::vector<core::ResourceId>{core::ResourceId("robot.joint_1")});
   ASSERT_TRUE(kernel.attention->active_configuration.has_value());
@@ -242,8 +238,7 @@ TEST(CellAdmissionCommandCodec,
   // Before the owner observed a configuration it publishes null.
   const auto unobserved = TryDecodeCellAdmissionCommand(ci::canonical_json(
       Envelope(std::string(cm::kPublishOperatorAlarmAttentionCommand),
-               Attention(AttentionMember("acknowledgement",
-                                         {Value("robot.joint_1")}, "operation",
+               Attention(AttentionMember({Value("robot.joint_1")}, "operation",
                                          "operation.1"),
                          Value(nullptr)))));
   ASSERT_TRUE(unobserved.has_value());
@@ -259,12 +254,15 @@ TEST(CellAdmissionCommandCodec,
   // The Manager-child binary channel never forwards this publication.
   EXPECT_THROW(static_cast<void>(cm::EncodeKernelCellAdmissionRpcRequest(*decoded)),
                std::exception);
-  // Closed shape: an unknown gate is rejected before the Kernel sees it.
+  // Closed shape: an extra member field (e.g. the deleted `gate`) is rejected
+  // before the Kernel sees it.
+  auto extra = AttentionMember({Value("robot.joint_1")}, "operation", "operation.1");
+  auto extra_fields = extra.as_object();
+  extra_fields.emplace(extra_fields.begin() + 2, "gate", Value("acknowledgement"));
   EXPECT_THROW(
       static_cast<void>(TryDecodeCellAdmissionCommand(ci::canonical_json(
           Envelope(std::string(cm::kPublishOperatorAlarmAttentionCommand),
-                   Attention(AttentionMember("advisory", {Value("robot.joint_1")},
-                                             "operation", "operation.1")))))),
+                   Attention(Value(std::move(extra_fields))))))),
       std::exception);
 }
 

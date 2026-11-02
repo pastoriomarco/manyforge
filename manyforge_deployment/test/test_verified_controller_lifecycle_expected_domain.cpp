@@ -8,6 +8,7 @@
 #include <type_traits>
 #include <unistd.h>
 
+#include "gripper_only_retention_fixture.hpp"
 #include "lite6_retained_consumer_fixture.hpp"
 
 namespace manyforge::deployment {
@@ -191,12 +192,8 @@ TEST(
       if (kind == "position_commanded" && mode == "none")
         continue;
       ScopedTrustedRoot root;
-      const auto fixture = test::make_lite6_controllable_retention_fixture(
-          false, false, 1U, true, true, {}, false, true, "resource", true, {},
-          {}, true, true, true, std::nullopt, false, test::kLite6ArmTargetId,
-          std::nullopt, std::nullopt, {}, true, {},
-          "manyforge.provider.ros2_control", true, true, nullptr, nullptr,
-          false, false, kind, 0.25, mode);
+      const auto fixture =
+          test::make_lite_gripper_only_retention_fixture({}, kind, 0.25, mode, true);
       const auto retained =
           test::materialize_lite6_retained_consumer_fixture_from(root.path(),
                                                                  fixture);

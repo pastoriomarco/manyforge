@@ -4,6 +4,7 @@
 #include <sqlite3.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <barrier>
 #include <chrono>
@@ -77,7 +78,7 @@ using core::ProjectionBootstrapPrerequisiteState;
 using core::ProjectionBootstrapRebuildRequestDTO;
 using core::ProjectionBootstrapStatusQueryDTO;
 using core::ProjectionBootstrapStatusState;
-using core::ProjectionNativeRuntimeBindingDTO;
+using core::ProjectionExecutionHostBindingDTO;
 using core::ProjectionRevisionDTO;
 using core::RequestOwnerEpoch;
 using core::Result;
@@ -114,22 +115,10 @@ public:
       const core::EmergencyStopAffectedStateSnapshotDTO &) noexcept override {
     return {};
   }
-  core::StopForensicProjectionResultDTO RecordStopTerminal(
-      const RequestOwnerEpoch &, const core::StopStatusDTO &,
-      const core::StopCertificateDTO &,
-      const std::optional<core::StopFaultLatchDTO> &) noexcept override {
+  core::StopForensicProjectionResultDTO
+  RecordStopTerminal(const RequestOwnerEpoch &, const core::StopStatusDTO &,
+                     const core::StopCertificateDTO &) noexcept override {
     return {};
-  }
-  core::StopForensicProjectionResultDTO RecordStopSurveillanceCheckpoint(
-      const RequestOwnerEpoch &, const core::StopPostTerminalSurveillanceDTO &,
-      const core::StopFaultLatchDTO &, std::int64_t) noexcept override {
-    return {};
-  }
-  Result<std::uint64_t> RecordStopFaultCleared(
-      const RequestOwnerEpoch &, const core::StopFaultRecoveryIntentDTO &,
-      const core::StopFaultRecoveryResultDTO &, const core::StopFaultLatchDTO &,
-      const core::StopStatusDTO &) override {
-    return Result<std::uint64_t>::Err(core::ErrorCode::kInternalError);
   }
   Result<std::uint64_t> CloseOwnerEpoch(const RequestOwnerEpoch &,
                                         std::int64_t) override {
@@ -1014,7 +1003,7 @@ TEST(CanonicalEmptySceneOwner, NonzeroNativeBootstrapIsExplicitlyUnavailable) {
   LogicalSceneOwner owner(directory.path() / "logical-scene.sqlite3",
                                  admission, publication_reader);
   auto intent = Intent(admission);
-  intent.native_runtime_bindings.push_back(ProjectionNativeRuntimeBindingDTO{
+  intent.execution_host_bindings.push_back(ProjectionExecutionHostBindingDTO{
       core::CapabilityProviderBindingId("binding"),
       core::CapabilityProviderBindingRevision("binding-revision"),
       core::RuntimeUnitId("runtime"),
@@ -2399,7 +2388,7 @@ public:
   enum class Mode { kCommit, kRollbackProven, kUncertain, kMalformed };
 
   explicit FakePlannerSceneProjection(std::string identity)
-      : FakePlannerSceneProjection(ProjectionNativeRuntimeBindingDTO{
+      : FakePlannerSceneProjection(ProjectionExecutionHostBindingDTO{
             core::CapabilityProviderBindingId("provider-" + identity),
             core::CapabilityProviderBindingRevision("binding-revision-" +
                                                     identity),
@@ -2408,7 +2397,7 @@ public:
         }) {}
 
   explicit FakePlannerSceneProjection(
-      ProjectionNativeRuntimeBindingDTO binding)
+      ProjectionExecutionHostBindingDTO binding)
       : binding_(std::move(binding)),
         health_{binding_,
                 1U,
@@ -2454,7 +2443,7 @@ public:
   rebuild_requests() const noexcept {
     return rebuild_requests_;
   }
-  [[nodiscard]] const ProjectionNativeRuntimeBindingDTO &binding() const
+  [[nodiscard]] const ProjectionExecutionHostBindingDTO &binding() const
       noexcept {
     return binding_;
   }
@@ -2507,7 +2496,7 @@ public:
   }
 
   void AcceptNextRebuildAs(
-      ProjectionNativeRuntimeBindingDTO resulting_binding) {
+      ProjectionExecutionHostBindingDTO resulting_binding) {
     accepted_rebuild_binding_ = std::move(resulting_binding);
   }
 
@@ -2742,7 +2731,7 @@ public:
   core::ProjectionCommitResultDTO
   RebuildProjection(const core::NativeProjectionRebuildDTO &request) override {
     if (!request.valid() ||
-        request.expected_native_runtime_binding != binding_) {
+        request.expected_execution_host_binding != binding_) {
       throw std::invalid_argument(
           "test native projection rebuild request is foreign");
     }
@@ -2769,7 +2758,7 @@ public:
     }
     if (accepted_rebuild_binding_.has_value()) {
       auto accepted_health = health_;
-      accepted_health.native_runtime_binding = *accepted_rebuild_binding_;
+      accepted_health.execution_host_binding = *accepted_rebuild_binding_;
       accepted_health.state = core::ProjectionHealthState::kRebuilding;
       accepted_health.active_projection_revision = std::nullopt;
       accepted_health.error = std::nullopt;
@@ -2826,14 +2815,14 @@ public:
 
 
 private:
-  ProjectionNativeRuntimeBindingDTO binding_;
+  ProjectionExecutionHostBindingDTO binding_;
   Mode mode_{Mode::kCommit};
   core::ProjectionHealthDTO health_;
   bool throw_after_next_rebuild_effect_{};
   bool reject_next_rebuild_without_effect_{};
   std::barrier<> *rebuild_entered_{nullptr};
   std::barrier<> *rebuild_release_{nullptr};
-  std::optional<ProjectionNativeRuntimeBindingDTO>
+  std::optional<ProjectionExecutionHostBindingDTO>
       accepted_rebuild_binding_;
   std::size_t calls_{};
   std::size_t rebuild_calls_{};
@@ -2871,7 +2860,7 @@ TEST(CanonicalEmptySceneOwner, DefaultProjectionHealthSelectorRefusesConflicting
   projection.Reset(selected, FakePlannerSceneProjection::Mode::kCommit);
   const auto exact = projection.ProjectionHealth();
   const auto observed_exact = default_health(selected);
-  EXPECT_EQ(observed_exact.native_runtime_binding, exact.native_runtime_binding);
+  EXPECT_EQ(observed_exact.execution_host_binding, exact.execution_host_binding);
   EXPECT_EQ(observed_exact.source_sequence, exact.source_sequence);
   EXPECT_EQ(observed_exact.state, exact.state);
   EXPECT_EQ(observed_exact.active_projection_revision, exact.active_projection_revision);
@@ -2994,7 +2983,7 @@ public:
 
   core::Result<std::shared_ptr<core::IPlannerSceneProjection>>
   ResolveProjection(
-      const ProjectionNativeRuntimeBindingDTO &binding) const override {
+      const ProjectionExecutionHostBindingDTO &binding) const override {
     const auto found = std::find_if(
         projections_.begin(), projections_.end(),
         [&binding](const FakePlannerSceneProjection *projection) {
@@ -3014,15 +3003,15 @@ private:
   std::vector<FakePlannerSceneProjection *> projections_;
 };
 
-[[nodiscard]] std::vector<ProjectionNativeRuntimeBindingDTO>
-NativeRuntimeBindings(const core::RetainedBundleDTO &bundle,
+[[nodiscard]] std::vector<ProjectionExecutionHostBindingDTO>
+ExecutionHostBindings(const core::RetainedBundleDTO &bundle,
                       const std::string_view epoch_prefix) {
   std::set<core::RuntimeUnitId> declared_runtime_units;
   for (const auto &runtime_unit : bundle.cell_graph.runtime_units) {
     declared_runtime_units.insert(runtime_unit.runtime_unit_id);
   }
 
-  std::vector<ProjectionNativeRuntimeBindingDTO> result;
+  std::vector<ProjectionExecutionHostBindingDTO> result;
   for (const auto &binding : bundle.capability_provider_bindings) {
     if (!core::RequiresNativeSceneProjection(
             binding.capability_id,
@@ -3070,7 +3059,7 @@ using OwnedFakePlannerSceneProjections =
     std::vector<std::unique_ptr<FakePlannerSceneProjection>>;
 
 [[nodiscard]] OwnedFakePlannerSceneProjections MakeFakeProjections(
-    const std::vector<ProjectionNativeRuntimeBindingDTO> &bindings) {
+    const std::vector<ProjectionExecutionHostBindingDTO> &bindings) {
   OwnedFakePlannerSceneProjections projections;
   projections.reserve(bindings.size());
   for (const auto &binding : bindings) {
@@ -3104,7 +3093,7 @@ void ResetProjections(
     ControlledPublicationReader &publication_reader,
     const deployment::CanonicalEmptyRetainedBundleAdmission &admission,
     const deployment::RetainedBundle &candidate,
-    const std::vector<ProjectionNativeRuntimeBindingDTO> &native_bindings,
+    const std::vector<ProjectionExecutionHostBindingDTO> &native_bindings,
     std::string apply_id = "apply-native-candidate") {
   const auto accepted =
       FinalizeCanonicalBootstrap(owner, publication_reader, admission);
@@ -3260,13 +3249,15 @@ deployment::CanonicalEmptyRetainedBundleAdmission PrepareAdoptionAdmission(
 
 deployment::test::DurableLite6RetainedConsumerFixture AdoptionProduct(
     const std::filesystem::path &package_root, const CellId &cell_id,
-    const char lifecycle_digest_digit) {
+    const char revision_digit) {
+  // The digit selects a distinct sealed product through the arm's initial
+  // joint position; the lifecycle offers are the same for both.
   return deployment::test::materialize_lite6_retained_consumer_fixture_from(
       package_root,
       deployment::test::make_lite6_controllable_retention_fixture(
-          false, false, 1U, false, true, cell_id.value(), false, true,
-          "resource", true, Digest(lifecycle_digest_digit).value(), {}, true,
-          false, false, std::nullopt, false,
+          false, false, 1U, cell_id.value(), false, true,
+          "resource", true, Digest(revision_digit).value(), {},
+          false, false, 0.1 * static_cast<double>(revision_digit - '0'),
           deployment::test::kLite6ArmTargetId, std::nullopt, std::nullopt, {},
           true, {}, "manyforge.provider.ros2_control", false, true));
 }
@@ -3298,10 +3289,10 @@ struct SceneProductAdoptionFixture final {
       AdoptionProduct(package_root, admission.cell_id(), '1')};
   deployment::test::DurableLite6RetainedConsumerFixture candidate{
       AdoptionProduct(package_root, admission.cell_id(), '2')};
-  std::vector<ProjectionNativeRuntimeBindingDTO> predecessor_bindings{
-      NativeRuntimeBindings(predecessor.bundle->value(), "predecessor")};
-  std::vector<ProjectionNativeRuntimeBindingDTO> candidate_bindings{
-      NativeRuntimeBindings(candidate.bundle->value(), "candidate")};
+  std::vector<ProjectionExecutionHostBindingDTO> predecessor_bindings{
+      ExecutionHostBindings(predecessor.bundle->value(), "predecessor")};
+  std::vector<ProjectionExecutionHostBindingDTO> candidate_bindings{
+      ExecutionHostBindings(candidate.bundle->value(), "candidate")};
   OwnedFakePlannerSceneProjections predecessor_projections{MakeFakeProjections(predecessor_bindings)};
   OwnedFakePlannerSceneProjections candidate_projections{MakeFakeProjections(candidate_bindings)};
   FakePlannerSceneProjectionResolver resolver{ProjectionClients(predecessor_projections)};
@@ -3488,7 +3479,7 @@ TEST(CanonicalEmptySceneOwner, ActualManagedFenceIssuesBorrowedAdoptionViewWitho
       gate.shared_admission_mutex());
   gate.BindResourceTable(table);
   const ManagedKernelApplyFenceOwnerConfig config{
-      state_root / "kernel-fence.sqlite", state_root, fixture.package_root, fixture.admission.cell_id(),
+      state_root / "kernel-fence.sqlite", state_root, fixture.admission.cell_id(),
       core::RuntimeUnitId("execution-host"), core::RuntimeEpoch("host.1"), RequestOwnerEpoch("kernel.1"),
       [] { return std::int64_t{1000}; }};
   ManagedKernelApplyFenceOwner fence(config, gate);
@@ -3612,14 +3603,14 @@ void VerifyProductAdoptionPreservesObjectsAttachmentsAndLogicalIdentity(
       projection->ObserveRevisionQueries();
     }
     fixture.PrepareCandidateClients();
-    ASSERT_GE(request.native_runtime_bindings.size(), 2U);
+    ASSERT_GE(request.execution_host_bindings.size(), 2U);
     const auto staged = fixture.owner->StageOriginalManagerProductAdoption(request, fixture.fence, fixture.fence.OriginalAttemptQuery());
-    ASSERT_EQ(staged.size(), request.native_runtime_bindings.size());
+    ASSERT_EQ(staged.size(), request.execution_host_bindings.size());
     const ProjectionRevisionDTO target{
         request.candidate_retained_bundle.retained_bundle_id,
         request.candidate_retained_bundle.cell_graph.graph_revision, snapshot->revision};
     for (std::size_t index = 0U; index < staged.size(); ++index) {
-      EXPECT_EQ(staged[index].native_runtime_binding, request.native_runtime_bindings[index]);
+      EXPECT_EQ(staged[index].execution_host_binding, request.execution_host_bindings[index]);
       EXPECT_TRUE(staged[index].healthy_for_target(target));
       EXPECT_EQ(fixture.candidate_projections[index]->last_health_revision(), std::optional{target});
       const auto &rebuilds = fixture.candidate_projections[index]->rebuild_requests();
@@ -3641,9 +3632,9 @@ void VerifyProductAdoptionPreservesObjectsAttachmentsAndLogicalIdentity(
     }
     for (const auto &row : public_health.native_projection_health) {
       EXPECT_TRUE(row.healthy_for_target(active));
-      EXPECT_TRUE(std::find(request.native_runtime_bindings.begin(),
-                            request.native_runtime_bindings.end(), row.native_runtime_binding) ==
-                  request.native_runtime_bindings.end());
+      EXPECT_TRUE(std::find(request.execution_host_bindings.begin(),
+                            request.execution_host_bindings.end(), row.execution_host_binding) ==
+                  request.execution_host_bindings.end());
     }
     // Even a locally valid private-candidate preview cannot select staged
     // projections through the ordinary current Scene API.
@@ -3772,7 +3763,7 @@ TEST(CanonicalEmptySceneOwner,
   const ProjectionRevisionDTO staged_target{
       request.candidate_retained_bundle.retained_bundle_id,
       request.candidate_retained_bundle.cell_graph.graph_revision, at_stage.scene_revision};
-  ASSERT_EQ(staged.size(), request.native_runtime_bindings.size());
+  ASSERT_EQ(staged.size(), request.execution_host_bindings.size());
   for (const auto &row : staged) {
     EXPECT_TRUE(row.healthy_for_target(staged_target));
   }
@@ -3885,13 +3876,13 @@ TEST(CanonicalEmptySceneOwner,
   const auto request = fixture.CaptureRequest();
   fixture.QualifyCandidate(request);
   auto altered = request;
-  altered.native_runtime_bindings.pop_back();
+  altered.execution_host_bindings.pop_back();
   EXPECT_THROW(fixture.Begin(altered), LogicalSceneOwnerConflictError);
-  ASSERT_GE(request.native_runtime_bindings.size(), 2U);
+  ASSERT_GE(request.execution_host_bindings.size(), 2U);
   altered = request;
-  altered.native_runtime_bindings.back() = altered.native_runtime_bindings.front();
-  altered.native_runtime_bindings.back().runtime_epoch = core::RuntimeEpoch("zz-duplicate-epoch");
-  std::sort(altered.native_runtime_bindings.begin(), altered.native_runtime_bindings.end(), core::CanonicalProjectionNativeBindingLess);
+  altered.execution_host_bindings.back() = altered.execution_host_bindings.front();
+  altered.execution_host_bindings.back().runtime_epoch = core::RuntimeEpoch("zz-duplicate-epoch");
+  std::sort(altered.execution_host_bindings.begin(), altered.execution_host_bindings.end(), core::CanonicalProjectionNativeBindingLess);
   EXPECT_THROW(fixture.Begin(altered), LogicalSceneOwnerConflictError);
   fixture.candidate_projections.front()->Reset(request.expected_active_projection_revision, FakePlannerSceneProjection::Mode::kCommit);
   EXPECT_THROW(fixture.Begin(request), LogicalSceneOwnerConflictError);
@@ -4056,7 +4047,7 @@ TEST(CanonicalEmptySceneOwner,
                 fixture.predecessor.bundle->value().retained_bundle_id);
       EXPECT_EQ(request.candidate_retained_bundle.cell_graph.graph_revision,
                 fixture.predecessor.bundle->value().cell_graph.graph_revision);
-      EXPECT_EQ(request.native_runtime_bindings, fixture.predecessor_bindings);
+      EXPECT_EQ(request.execution_host_bindings, fixture.predecessor_bindings);
     } else {
       fixture.PrepareCandidateClients();
     }
@@ -4074,7 +4065,7 @@ TEST(CanonicalEmptySceneOwner,
     const auto observed = fixture.owner->ReadOriginalManagerConfigurationAdoptionProjectionHealth(
         request, fixture.fence, attempt);
     ASSERT_FALSE(staged.empty());
-    ASSERT_EQ(staged.size(), request.native_runtime_bindings.size());
+    ASSERT_EQ(staged.size(), request.execution_host_bindings.size());
     ASSERT_EQ(observed.size(), staged.size());
     const ProjectionRevisionDTO target{request.candidate_retained_bundle.retained_bundle_id,
         request.candidate_retained_bundle.cell_graph.graph_revision, request.expected_snapshot_identity.revision};
@@ -4246,7 +4237,7 @@ TEST(CanonicalEmptySceneOwner,
   std::uint64_t publication_generation = 2U;
   const auto adopt = [&](const std::string &id,
                          const core::RetainedBundleDTO &bundle,
-                         const std::vector<ProjectionNativeRuntimeBindingDTO> &bindings) {
+                         const std::vector<ProjectionExecutionHostBindingDTO> &bindings) {
     const core::ApplyFenceOwnerDTO manager{ApplyId(id), ApplyGeneration(1U)};
     const auto claim = fixture.cell_admission.AcquireCellAdmissionClaim(
         {core::CellAdmissionClaimKindDTO::kManagerApply,
@@ -4344,7 +4335,7 @@ TEST(CanonicalEmptySceneOwner, ConfigurationAdoptionRefusesForeignClaimIntentFen
     case 5U: NameForeignScene(request); break;
     case 6U: fixture.cell_admission.ProveHeldClaimHadNoEffect(); break;
     case 7U: request.candidate_retained_bundle.cell_graph.graph_revision = GraphRevision("foreign-candidate"); break;
-    case 8U: request.native_runtime_bindings.pop_back(); break;
+    case 8U: request.execution_host_bindings.pop_back(); break;
     }
     const auto stage = [&] {
       return fixture.owner->StageOriginalManagerConfigurationAdoption(
@@ -4457,7 +4448,7 @@ TEST(CanonicalEmptySceneOwner, LegacyQualifiedProductAdoptionStillRefusesAnEqual
     SceneProductAdoptionFixture fixture(original_manager);
     auto request = fixture.CaptureRequest();
     request.candidate_retained_bundle = fixture.predecessor.bundle->value();
-    request.native_runtime_bindings = fixture.predecessor_bindings;
+    request.execution_host_bindings = fixture.predecessor_bindings;
     const auto bytes = EncodeLogicalSceneSnapshot(*fixture.owner->LogicalSnapshot());
     bool refused = false;
     try {
@@ -4493,7 +4484,7 @@ TEST(CanonicalEmptySceneOwner,
   const ProjectionRevisionDTO target{request.candidate_retained_bundle.retained_bundle_id,
       request.candidate_retained_bundle.cell_graph.graph_revision,
       request.expected_snapshot_identity.revision};
-  ASSERT_EQ(staged.size(), request.native_runtime_bindings.size());
+  ASSERT_EQ(staged.size(), request.execution_host_bindings.size());
   ASSERT_EQ(observed.size(), staged.size());
   for (const auto &row : observed) {
     EXPECT_TRUE(row.healthy_for_target(target));
@@ -4640,9 +4631,9 @@ TEST(CanonicalEmptySceneOwner,
     projection->ObserveRevisionQueries();
   }
   fixture.PrepareCandidateClients();
-  fixture.candidate_projections.front()->AcceptNextRebuildAs(request.native_runtime_bindings.front());
+  fixture.candidate_projections.front()->AcceptNextRebuildAs(request.execution_host_bindings.front());
   const auto staged = fixture.owner->StageOriginalManagerProductAdoption(request, fixture.fence, fixture.fence.OriginalAttemptQuery());
-  ASSERT_EQ(staged.size(), request.native_runtime_bindings.size());
+  ASSERT_EQ(staged.size(), request.execution_host_bindings.size());
   EXPECT_EQ(staged.front().state, core::ProjectionHealthState::kRebuilding);
   EXPECT_THROW(fixture.Begin(request), LogicalSceneOwnerConflictError);
   const auto pending = fixture.owner->ReadOriginalManagerProductAdoptionProjectionHealth(request, fixture.fence, fixture.fence.OriginalAttemptQuery());
@@ -4727,7 +4718,7 @@ TEST(CanonicalEmptySceneOwner,
   NameForeignScene(foreign);
   EXPECT_THROW(fixture.Begin(foreign), LogicalSceneOwnerConflictError);
   foreign = request;
-  foreign.native_runtime_bindings.pop_back();
+  foreign.execution_host_bindings.pop_back();
   EXPECT_THROW(fixture.Begin(foreign), LogicalSceneOwnerConflictError);
   fixture.candidate_projections.front()->Reset(
       request.expected_active_projection_revision, FakePlannerSceneProjection::Mode::kCommit);
@@ -4864,9 +4855,9 @@ TEST(CanonicalEmptySceneOwner,
       "target_graph_revision,target_scene_id,target_scene_revision_id,target_scene_content_hash,authoritative_snapshot_json,"
       "native_binding_count,repaired_transaction_sequence) VALUES(2,'legacy-maintenance',1," +
       columns(request.expected_active_projection_revision) + "," + columns(target) + "," +
-      quote(EncodeLogicalSceneSnapshot(*snapshot)) + "," + std::to_string(request.native_runtime_bindings.size()) + ",NULL);";
-  for (std::size_t index = 0U; index < request.native_runtime_bindings.size(); ++index) {
-    const auto &binding = request.native_runtime_bindings[index];
+      quote(EncodeLogicalSceneSnapshot(*snapshot)) + "," + std::to_string(request.execution_host_bindings.size()) + ",NULL);";
+  for (std::size_t index = 0U; index < request.execution_host_bindings.size(); ++index) {
+    const auto &binding = request.execution_host_bindings[index];
     sql += "INSERT INTO logical_scene_maintenance_initialization_bindings("
            "initialization_sequence,binding_ordinal,provider_binding_id,provider_binding_revision,runtime_unit_id,runtime_epoch) "
            "VALUES(2," + std::to_string(index) + "," + quote(binding.provider_binding_id.value()) + "," +
@@ -4944,7 +4935,7 @@ TEST(CanonicalEmptySceneOwner,
   const auto candidate = deployment::test::
       materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell(
           package_root, admission.cell_id().value());
-  const auto bindings = NativeRuntimeBindings(candidate.bundle->value(),
+  const auto bindings = ExecutionHostBindings(candidate.bundle->value(),
                                                "runtime-initial-baseline");
   auto projections = MakeFakeProjections(bindings);
   FakePlannerSceneProjectionResolver resolver(ProjectionClients(projections));
@@ -5105,6 +5096,166 @@ TEST(CanonicalEmptySceneOwner,
             empty_installed.target_projection_revision.scene_revision);
 }
 
+// The maintenance-initialization history is bounded by eviction: once it is
+// full, each new Apply evicts the oldest initialization no reader still needs
+// (here, after folding the replayed completions and the resident Scene
+// transactions into the history checkpoint), so no Apply is ever refused.
+TEST(CanonicalEmptySceneOwner,
+     MaintenanceInitializationHistoryEvictsOldestSettledAtItsBound) {
+  TemporaryDirectory directory("scene-maintenance-eviction");
+  const auto package_root = directory.path() / "packages";
+  CopyCanonicalEmptyPackage(package_root);
+  const auto admission = LoadAdmission(package_root);
+  const auto candidate = deployment::test::
+      materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell(
+          package_root, admission.cell_id().value());
+  const auto bindings = ExecutionHostBindings(candidate.bundle->value(),
+                                              "runtime-maintenance-eviction");
+  auto projections = MakeFakeProjections(bindings);
+  FakePlannerSceneProjectionResolver resolver(ProjectionClients(projections));
+  ControlledPublicationReader publication_reader;
+  deployment::FilesystemVerifiedRetainedBundleSource bundle_source(package_root);
+  TestCellAdmissionPort cell_admission;
+  const auto database_path = directory.path() / "logical-scene.sqlite3";
+  const auto history = [&] {
+    sqlite3 *raw = nullptr;
+    Require(sqlite3_open_v2(database_path.c_str(), &raw, SQLITE_OPEN_READONLY,
+                            nullptr) == SQLITE_OK,
+            "cannot open the test store");
+    sqlite3_stmt *statement = nullptr;
+    Require(sqlite3_prepare_v2(
+                raw,
+                "SELECT count(*),min(initialization_sequence),"
+                "max(initialization_sequence),"
+                "(SELECT count(*) FROM "
+                "logical_scene_maintenance_initialization_bindings),"
+                "(SELECT count(*) FROM "
+                "logical_scene_maintenance_initialization_results),"
+                "(SELECT count(*) FROM logical_scene_initial_baseline_requests) "
+                "FROM logical_scene_maintenance_initialization_intents",
+                -1, &statement, nullptr) == SQLITE_OK &&
+                sqlite3_step(statement) == SQLITE_ROW,
+            "cannot read the maintenance history");
+    std::array<std::int64_t, 6> result{};
+    for (int column = 0; column < 6; ++column) {
+      result[static_cast<std::size_t>(column)] =
+          sqlite3_column_int64(statement, column);
+    }
+    sqlite3_finalize(statement);
+    sqlite3_close(raw);
+    return result;
+  };
+  const auto apply_id = [](const std::size_t index) {
+    return ApplyId("apply-maintenance-eviction-" + std::to_string(index));
+  };
+  const std::size_t total = kMaximumMaintenanceInitializations + 8U;
+  const auto last_completed = apply_id(total - 1U);
+  const auto unsettled = apply_id(total);
+  {
+    LogicalSceneOwner owner(database_path, admission, publication_reader,
+                            bundle_source, resolver, cell_admission);
+    auto current =
+        FinalizeCanonicalBootstrap(owner, publication_reader, admission)
+            .canonical_empty_target;
+    for (std::size_t index = 0U; index < total; ++index) {
+      if (index % 40U == 20U) {
+        // Resident Scene transactions interleave with the Applies; the fold
+        // at the bound compacts them, and later commits still succeed.
+        const auto authored = owner.Commit(AddBoxRequest(
+            current, admission.cell_id(),
+            "scene-request-eviction-" + std::to_string(index)));
+        ASSERT_TRUE(authored.success)
+            << index << " "
+            << (authored.error.has_value() ? authored.error->message : "");
+        current = *authored.committed_projection_revision;
+      }
+      const core::ProjectionMaintenanceInitializationRequestDTO request{
+          apply_id(index), ApplyGeneration(1U), current,
+          candidate.bundle->value(), bindings, {}};
+      const auto initialized = owner.BeginMaintenanceInitialization(request);
+      ASSERT_EQ(initialized.state,
+                core::ProjectionMaintenanceInitializationState::kInitialized)
+          << index;
+      const auto installed = owner.InstallInitialScene(request);
+      ASSERT_TRUE(installed.ready_for_publication()) << index;
+      const core::ActiveBundlePublicationReceiptDTO receipt{
+          core::ActiveBundlePublicationRequestDTO{
+              core::NamedApplyPublicationTransactionDTO{
+                  request.apply_id, request.apply_generation},
+              installed.target_projection_revision,
+              installed.target_projection_revision.retained_bundle_id,
+              installed.target_projection_revision.graph_revision,
+              ActiveBundlePublicationGeneration(index + 1U), Digest('d')},
+          ActiveBundlePublicationGeneration(index + 2U), Digest('f')};
+      publication_reader.SetCurrent(receipt);
+      const auto completed = owner.CompleteMaintenanceInitialization({
+          request.apply_id, request.apply_generation,
+          installed.target_projection_revision,
+          installed.authoritative_snapshot_identity, receipt});
+      ASSERT_EQ(completed.state,
+                core::ProjectionMaintenanceInitializationState::kCompleted)
+          << index;
+      current = completed.target_projection_revision;
+      EXPECT_LE(history()[0],
+                static_cast<std::int64_t>(kMaximumMaintenanceInitializations));
+    }
+    const auto bound =
+        static_cast<std::int64_t>(kMaximumMaintenanceInitializations);
+    const auto binding_count = static_cast<std::int64_t>(bindings.size());
+    auto rows = history();
+    EXPECT_EQ(rows[0], bound);
+    EXPECT_EQ(rows[1], 9);
+    EXPECT_EQ(rows[2], static_cast<std::int64_t>(total));
+    EXPECT_EQ(rows[3], bound * binding_count);
+    EXPECT_EQ(rows[4], bound);
+    EXPECT_EQ(rows[5], bound);
+    EXPECT_FALSE(owner.ReadMaintenanceInitialization({apply_id(0U),
+                                                      ApplyGeneration(1U)})
+                     .has_value());
+    EXPECT_EQ(owner.ReadMaintenanceInitialization({last_completed,
+                                                   ApplyGeneration(1U)})
+                  .value()
+                  .state,
+              core::ProjectionMaintenanceInitializationState::kCompleted);
+
+    // An unsettled (initialized, uncompleted) Apply is admitted at the bound
+    // and survives as the latest initialization.
+    const core::ProjectionMaintenanceInitializationRequestDTO pending{
+        unsettled, ApplyGeneration(1U), current, candidate.bundle->value(),
+        bindings, {}};
+    ASSERT_EQ(owner.BeginMaintenanceInitialization(pending).state,
+              core::ProjectionMaintenanceInitializationState::kInitialized);
+    rows = history();
+    EXPECT_EQ(rows[0], bound);
+    EXPECT_EQ(rows[1], 10);
+    EXPECT_EQ(rows[2], static_cast<std::int64_t>(total + 1U));
+    EXPECT_EQ(owner.ReadMaintenanceInitialization({unsettled,
+                                                   ApplyGeneration(1U)})
+                  .value()
+                  .state,
+              core::ProjectionMaintenanceInitializationState::kInitialized);
+    owner.Close();
+  }
+
+  // The evicted, folded store reopens, replays and validates; reopen settles
+  // the pending Apply as interrupted.
+  LogicalSceneOwner restarted(database_path, admission, publication_reader,
+                              bundle_source, resolver, cell_admission);
+  EXPECT_NO_THROW(static_cast<void>(restarted.VerifyIntegrity()));
+  EXPECT_EQ(history()[0],
+            static_cast<std::int64_t>(kMaximumMaintenanceInitializations));
+  EXPECT_EQ(restarted.ReadMaintenanceInitialization({unsettled,
+                                                     ApplyGeneration(1U)})
+                .value()
+                .state,
+            core::ProjectionMaintenanceInitializationState::kInterrupted);
+  EXPECT_EQ(restarted.ReadMaintenanceInitialization({last_completed,
+                                                     ApplyGeneration(1U)})
+                .value()
+                .state,
+            core::ProjectionMaintenanceInitializationState::kCompleted);
+}
+
 TEST(CanonicalEmptySceneOwner,
      UnresolvableCandidateFrameCannotPublishInitialScene) {
   TemporaryDirectory directory("scene-initial-frame-rejection");
@@ -5114,7 +5265,7 @@ TEST(CanonicalEmptySceneOwner,
   const auto candidate = deployment::test::
       materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell(
           package_root, admission.cell_id().value());
-  const auto bindings = NativeRuntimeBindings(candidate.bundle->value(),
+  const auto bindings = ExecutionHostBindings(candidate.bundle->value(),
                                                "runtime-initial-frame");
   auto projections = MakeFakeProjections(bindings);
   for (auto &projection : projections) {
@@ -5171,7 +5322,7 @@ TEST(CanonicalEmptySceneOwner,
   const auto candidate = deployment::test::
       materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell(
           package_root, admission.cell_id().value());
-  const auto bindings = NativeRuntimeBindings(candidate.bundle->value(),
+  const auto bindings = ExecutionHostBindings(candidate.bundle->value(),
                                                "runtime-initial-interrupted");
   auto projections = MakeFakeProjections(bindings);
   FakePlannerSceneProjectionResolver resolver(ProjectionClients(projections));
@@ -5232,7 +5383,7 @@ TEST(CanonicalEmptySceneOwner,
   const auto candidate = deployment::test::
       materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell(
           package_root, admission.cell_id().value());
-  const auto bindings = NativeRuntimeBindings(
+  const auto bindings = ExecutionHostBindings(
       candidate.bundle->value(), "runtime-epoch-maintenance-duplicate");
   auto projections = MakeFakeProjections(bindings);
   auto clients = ProjectionClients(projections);
@@ -5279,7 +5430,7 @@ TEST(CanonicalEmptySceneOwner,
   const auto candidate = deployment::test::
       materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell(
           package_root, admission.cell_id().value());
-  const auto bindings = NativeRuntimeBindings(
+  const auto bindings = ExecutionHostBindings(
       candidate.bundle->value(), "runtime-epoch-partial-replay");
   auto projections = MakeFakeProjections(bindings);
   ASSERT_GE(projections.size(), 2U);
@@ -5324,7 +5475,7 @@ TEST(CanonicalEmptySceneOwner,
   const auto candidate = deployment::test::
       materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell(
           package_root, admission.cell_id().value());
-  const auto bindings = NativeRuntimeBindings(
+  const auto bindings = ExecutionHostBindings(
       candidate.bundle->value(), "runtime-epoch-maintenance-responsive");
   auto projections = MakeFakeProjections(bindings);
   auto clients = ProjectionClients(projections);
@@ -5376,7 +5527,7 @@ TEST(CanonicalEmptySceneOwner,
   const auto candidate = deployment::test::
       materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell(
           package_root, admission.cell_id().value());
-  const auto bindings = NativeRuntimeBindings(
+  const auto bindings = ExecutionHostBindings(
       candidate.bundle->value(), "runtime-epoch-maintenance-interrupted");
   auto projections = MakeFakeProjections(bindings);
   auto clients = ProjectionClients(projections);
@@ -5447,7 +5598,7 @@ TEST(CanonicalEmptySceneOwner,
   const auto candidate = deployment::test::
       materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell(
           package_root, admission.cell_id().value());
-  const auto native_bindings = NativeRuntimeBindings(
+  const auto native_bindings = ExecutionHostBindings(
       candidate.bundle->value(), "runtime-epoch-frame-resolution");
 
   ControlledPublicationReader publication_reader;
@@ -5838,7 +5989,7 @@ TEST(CanonicalEmptySceneOwner,
   const auto candidate = deployment::test::
       materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell(
           package_root, admission.cell_id().value());
-  const auto native_bindings = NativeRuntimeBindings(
+  const auto native_bindings = ExecutionHostBindings(
       candidate.bundle->value(), "runtime-epoch-frame-owner-only");
 
   ControlledPublicationReader publication_reader;
@@ -5915,7 +6066,7 @@ TEST(CanonicalEmptySceneOwner,
   };
   const auto make = [&](const std::string &provider, const std::string &unit) {
     auto projection = std::make_shared<FakePlannerSceneProjection>(
-        ProjectionNativeRuntimeBindingDTO{
+        ProjectionExecutionHostBindingDTO{
             core::CapabilityProviderBindingId("provider-" + provider),
             core::CapabilityProviderBindingRevision("binding-revision"),
             core::RuntimeUnitId(unit), core::RuntimeEpoch("epoch-" + unit)});
@@ -6010,7 +6161,7 @@ TEST(CanonicalEmptySceneOwner,
   const auto candidate = deployment::test::
       materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell(
           package_root, admission.cell_id().value());
-  const auto native_bindings = NativeRuntimeBindings(
+  const auto native_bindings = ExecutionHostBindings(
       candidate.bundle->value(), "runtime-epoch-policy-resolution");
   ControlledPublicationReader publication_reader;
   deployment::FilesystemVerifiedRetainedBundleSource bundle_source(package_root);
@@ -6595,12 +6746,12 @@ TEST(CanonicalEmptySceneOwner,
   const auto candidate = deployment::test::
       materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell(
           package_root, admission.cell_id().value());
-  const auto native_bindings = NativeRuntimeBindings(
+  const auto native_bindings = ExecutionHostBindings(
       candidate.bundle->value(), "runtime-epoch-scene-projection");
   const auto two_robot_candidate = deployment::test::
       materialize_two_lite6_same_type_ros2_control_motion_retained_consumer_fixture_for_cell(
           package_root, admission.cell_id().value());
-  const auto two_robot_native_bindings = NativeRuntimeBindings(
+  const auto two_robot_native_bindings = ExecutionHostBindings(
       two_robot_candidate.bundle->value(),
       "runtime-epoch-scene-projection-partial");
   ASSERT_EQ(two_robot_native_bindings.size(), 2U * native_bindings.size());
@@ -6844,7 +6995,7 @@ TEST(CanonicalEmptySceneOwner,
     const auto candidate = deployment::test::
         materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell(
             package_root, native_admission.cell_id().value());
-    const auto native_bindings = NativeRuntimeBindings(
+    const auto native_bindings = ExecutionHostBindings(
         candidate.bundle->value(), "runtime-epoch-scene-recovery");
     TemporaryDirectory directory("scene-native-recovery");
     const auto database_path = directory.path() / "logical-scene.sqlite3";
@@ -6915,7 +7066,7 @@ public:
         candidate_(deployment::test::
                        materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell(
                            package_root_, admission_.cell_id().value())),
-        bindings_(NativeRuntimeBindings(candidate_.bundle->value(),
+        bindings_(ExecutionHostBindings(candidate_.bundle->value(),
                                         "runtime-epoch-provider-freshness")),
         projections_(MakeFakeProjections(bindings_)),
         resolver_(ProjectionClients(projections_)),
@@ -7007,7 +7158,7 @@ private:
   std::filesystem::path package_root_;
   deployment::CanonicalEmptyRetainedBundleAdmission admission_;
   deployment::test::DurableLite6RetainedConsumerFixture candidate_;
-  std::vector<ProjectionNativeRuntimeBindingDTO> bindings_;
+  std::vector<ProjectionExecutionHostBindingDTO> bindings_;
   OwnedFakePlannerSceneProjections projections_;
   FakePlannerSceneProjectionResolver resolver_;
   ControlledPublicationReader publication_reader_;
@@ -7344,7 +7495,7 @@ TEST(CanonicalEmptySceneOwner,
   const auto candidate = deployment::test::
       materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell(
           package_root, admission.cell_id().value());
-  const auto bindings = NativeRuntimeBindings(
+  const auto bindings = ExecutionHostBindings(
       candidate.bundle->value(), "runtime-epoch-program-compaction");
   auto projections = MakeFakeProjections(bindings);
   FakePlannerSceneProjectionResolver resolver(ProjectionClients(projections));

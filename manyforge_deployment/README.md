@@ -168,7 +168,7 @@ manyforge_deployment_revision --check --input examples/example.deployment.yaml
 The update path seals graph-owned nested revisions, capability-provider-binding
 revisions, and the enclosing `deployment_revision`, then independently verifies
 the pretty JSON source before replacing it atomically. It supplies the exact
-build-owned native runtime profile only when the graph selects that profile.
+build-owned execution host profile only when the graph selects that profile.
 It does not qualify catalog referents, compile retained products, or admit a
 deployment to runtime.
 

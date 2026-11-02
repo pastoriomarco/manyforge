@@ -27,9 +27,9 @@ const core::ManagerLivenessPolicyDTO& manager_liveness_policy() {
           kManagerLivenessPolicyId)),
       core::RuntimePolicyRevision(contract_revision(
           "manager-liveness-policy",
-          "retained-native-v1;heartbeat-period-ns=250000000;"
+          "retained-v1;heartbeat-period-ns=250000000;"
           "expiry-timeout-ns=1000000000;"
-          "local-safe=manyforge.native_execution.manager_loss_safe")),
+          "local-safe=manyforge.execution_host.manager_loss_safe")),
       250'000'000,
       1'000'000'000,
       core::ProductContractId(std::string(

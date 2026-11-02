@@ -23,14 +23,18 @@ Use the operator launcher when you need one of these:
 ManyForge Stops are not safety-rated. The software Stop is not an emergency
 stop; a robot installation needs its own safety system.
 
+Real robots: this launcher has no site-settings option, so robot addresses
+can't be configured here. Use the workbench and follow
+[Real robot setup](REAL_ROBOT_SETUP.md).
+
 ## Profiles
 
 | Profile | Where the stack runs | Requirements |
 |---|---|---|
 | `isaac` | In a container on a remote runtime host, started over SSH through `scripts/compose-dev.sh` in operator mode. Isaac Sim runs on its own host; ManyForge attaches to it. | Docker on the runtime host; the `manyforge-ros-lyrical-full` image (ROS 2 Lyrical) built there; SSH key login. No ROS install on either host. |
-| `native` | As host processes on the machine that runs the command. | **A host ROS 2 install** matching the build, a host build of ManyForge, and systemd journald. |
+| `standard` | As host processes on the machine that runs the command. | **A host ROS 2 install** matching the build, a host build of ManyForge, and systemd journald. |
 
-The `native` profile needs ROS on the host: the Manager starts the ROS
+The `standard` profile needs ROS on the host: the Manager starts the ROS
 execution host and controllers as host processes. If you do not want ROS on
 the host, use the workbench or the `isaac` profile.
 
@@ -114,7 +118,7 @@ manyforge-operator [--state-root DIR] [--instance-id ID] [--json] {start,status,
 
 - `--state-root`: where launch records live (default
   `.manyforge-var/operator` under the current directory).
-- `--instance-id`: one launch instance (default `native`). Use the same
+- `--instance-id`: one launch instance (default `workbench`). Use the same
   value for `status` and `stop`.
 - `--json`: print one `manyforge.operator_command_result.v1` JSON object.
 
@@ -197,7 +201,7 @@ the remote source again. The container carries the labels
 `stop` exports evidence as described in the workbench guide, then removes the
 container.
 
-### `native` profile
+### `standard` profile
 
 Requires a host ROS 2 install (see [Profiles](#profiles)). Run in a shell where
 that ROS environment is sourced and where `manyforge_headless_api`,
@@ -205,8 +209,8 @@ that ROS environment is sourced and where `manyforge_headless_api`,
 `manyforge_assistant_bridge` import from `python3`.
 
 ```bash
-manyforge-operator --state-root "$STATE_ROOT" --instance-id native --json \
-  start --profile native --source-root "$MANYFORGE_ROOT" \
+manyforge-operator --state-root "$STATE_ROOT" --instance-id workbench --json \
+  start --profile standard --source-root "$MANYFORGE_ROOT" \
   --manager-executable "$BUILD/manyforge_manager_daemon" \
   --install-root "$PACKAGE_ROOT" \
   --node-catalog-path "$MANYFORGE_ROOT/manyforge_behavior/resources/node_catalog.yaml" \
@@ -252,89 +256,21 @@ Open `http://<advertised-host>:9000/` once `start` or `status` reports
 `ready`. The Composer flow is the same as with the workbench:
 
 1. **Load Scenario** to open a Scenario, or **New** to open the empty
-   Untitled Scenario. Both close the current Scenario first; the result loads
-   as a Draft. Close can proceed with a latched Stop fault when the required
-   effects and teardown are confirmed: it acknowledges open component
-   incidents (recorded in History), disables eligible components without a
-   recovery and stops their processes; a faulted component is only
-   process-stopped. If a Disable fails, Close reads the component's current
-   state: a component left declared, disabled or faulted is process-stopped
-   and Close continues, while one still prepared, active or degraded refuses
-   Close with the reason (Force close stays available). An unknown output or
-   operation effect, or another unresolved condition, refuses Close.
-   Composer's Close first detaches every carried part at its current pose. An
-   API client that closes a Scenario itself must do the same, in order: Reset,
-   detach, then Close. The server refuses Close with
-   `scenario_close_attachment_present` while a part is still attached (see
-   `POST /api/activation-preparations` in the REST reference). Close keeps an
-   open cell Stop fault; **Recover cell** cannot clear that latch while Close
-   is in progress (component acknowledgements in the same press may still
-   happen). After Close, load a Scenario with the robots the fault names,
-   then press **Recover cell** when its reported conditions, including any
-   required rest proof, are satisfied (right after Load it may report that
-   the configuration is not installed yet; press again shortly). No robot
-   moves until then.
-
-   **Close and Recover cell.** They never run together. While **Recover
-   cell** runs, Close (also the Close that New and Load start) is disabled
-   with the reason, and the server refuses Close with
-   `recover_cell_in_progress`; while Close runs, **Recover cell** is disabled.
-   A Recover cell that does not finish can be stopped with **Abort Recover
-   cell** in the Errors panel: no later step starts, the step in progress
-   finishes or fails within its own limit, and the result lists what was done
-   (incidents acknowledged, whether the cell latch was cleared, the re-enable
-   steps per robot) and which robots were not enabled again. Close is then
-   allowed again; press **Recover cell** again to finish the recovery.
-
-   **Force close.** When Close is refused because an outcome is uncertain
-   and nothing in the cell can resolve it (for example an output whose I/O
-   device cannot be disabled and enabled again), or because a component whose
-   Disable failed is still engaged, the New or Load dialog offers **Force
-   close…**. It asks for one confirmation that lists its
-   risks, then:
-   - sends a cell **Full Stop** and waits until the Kernel confirms it. If
-     the Full Stop is not confirmed, Force close stops there with
-     `scenario_force_close_stop_unconfirmed` (`details.reason`) and changes
-     nothing else; stopping a driver process does not stop motion;
-   - retires the lifecycle targets;
-   - moves every stuck or uncertain operation into history, marked
-     `cell_force_closed_by_operator` (state intervention required, kept in
-     the Kernel journal, so a restart finds them settled, not as orphan
-     resources), and writes one History row
-     (`scenario_force_closed`) naming each operation and each output left
-     in an unknown state. If an operation's closure had an unknown outcome,
-     the cell-wide motion block it left is cleared too (the row says
-     `motion_block_cleared`); robots still need the ordinary Prepare and
-     Enable. Resources an earlier restart left as orphans are freed too,
-     their operations are kept settled in the journal, and the motion block
-     they left ends. Force close arms only after a confirmed contained Full
-     Stop; a pending predecessor Stop must settle through that existing path;
-   - runs the ordinary Reset and detaches carried objects at their current
-     pose, while the robots' processes still run. Before each detach,
-     Composer uses the latest Scene owner identity it has observed; the Scene
-     checks that identity on every detach. If the Scene restarts during Force
-     close, the remaining parts are detached and Force close completes
-     without another press.
-     If a detach is refused (for example the robot's process is already
-     dead), the part stays attached in the Scene and Force close continues
-     without the "part still attached" check;
-   - retires every component: incidents acknowledged, Disable where
-     possible, then each process stopped. A process Stop whose outcome is
-     unknown stops Force close ("Restart the workbench");
-   - then runs the empty Apply and continues with the New or Load.
-
-   Force close never commands an output: an output, valve or gripper keeps
-   whatever physical state it has, and a write already queued in a remote
-   device may still act. Check them physically before the next Run. An open
-   cell Stop fault is kept, so no robot moves until **Recover cell**, as
-   after Close. API clients use `POST /api/execution/force-close` (steps `stop`,
-   then `close_operations`, in the order above, and `end` on every exit; see
-   the REST reference).
+   Untitled Scenario. New empties the cell (Apply of the empty Untitled
+   Scenario); Load is New, then Apply of the file. New always works: a
+   finished or stopped Program run is Reset first, every component of the
+   current cell is disabled and its processes are stopped, and the Scene is
+   initialized. A loaded Scenario's components come back prepared, not
+   enabled. The result loads as a Draft. Robots and physically held parts
+   may remain; account for them before using the next cell.
 2. Review the Draft. **Discard** drops unapplied changes; **Revert** returns
    to the saved files.
-3. **Apply** makes the Draft the running configuration.
-4. Start the Program with **Run**; use **Stop**, **Resume** and **Reset** as
-   needed.
+3. **Apply** makes the Draft the running configuration; affected components
+   come back prepared.
+4. **Execute** starts the Program (or **Activate and execute**, which prepares
+   and enables every active component first). Every Program starts held:
+   press **Run** on its motion groups; use **Stop**, **Resume**, **Halt** and
+   **Reset** as needed.
 5. **Save Scenario** or **Save Scenario as** to keep your changes. The
    Untitled Scenario is read-only: **Save Scenario** is disabled for it and
    **Save Scenario as** names and places it, then continues in the saved
@@ -342,7 +278,7 @@ Open `http://<advertised-host>:9000/` once `start` or `status` reports
 
 Where Scenarios can be loaded and saved depends on the profile:
 
-- `native`: Composer can read the checkout's `examples/`, the package root and
+- `standard`: Composer can read the checkout's `examples/`, the package root and
   the instance workspace
   `$STATE_ROOT/$INSTANCE_ID/state/composer-authoring/program-workspace`. Only
   that workspace is writable, so use **Save Scenario as** into it. It survives
@@ -372,7 +308,7 @@ owns. Repeating `stop` on a stopped instance reports `already_stopped`.
 | `source_dirty`, `source_identity_mismatch` | Use a clean checkout; for `isaac`, the same commit on both hosts. |
 | `package_aggregate_mismatch`, `package_aggregate_unavailable` | Recompute the digest of the exact package root; do not edit the root. |
 | `port_occupied` | Free 9000, 9010, 9011 or 8100. Ports cannot be remapped. |
-| `journald_unavailable` | `native` needs `systemd-cat` and the journald socket. |
+| `journald_unavailable` | `standard` needs `systemd-cat` and the journald socket. |
 | `readiness_timeout`, `isaac_readiness_timeout`, `runtime_container_unready` | Read the logs (`journalctl` or `docker logs <container-id>`). |
 | `runtime_host_unavailable`, `remote_protocol_invalid` | SSH or the runtime host failed. Absence cannot be proved; restore the host, then run `status`. |
 | `container_identity_mismatch` | Another container has that name. It is not adopted. |

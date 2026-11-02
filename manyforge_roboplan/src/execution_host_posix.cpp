@@ -89,11 +89,6 @@ CommandSocket::CommandSocket(const std::filesystem::path &run_root,
     if (!descriptor_) {
       FailErrno("create execution command socket");
     }
-    const int send_buffer_bytes = static_cast<int>(kMaximumResponseBytes);
-    if (::setsockopt(descriptor_.get(), SOL_SOCKET, SO_SNDBUF,
-                     &send_buffer_bytes, sizeof(send_buffer_bytes)) != 0) {
-      FailErrno("set execution command response buffer");
-    }
     sockaddr_un address{};
     address.sun_family = AF_UNIX;
     std::memcpy(address.sun_path, spelling.c_str(), spelling.size() + 1U);
@@ -164,7 +159,7 @@ void HandleStopSignal(int) {
 }
 
 [[noreturn]] void Fail(std::string detail) {
-  throw std::runtime_error("Native execution host: " + std::move(detail));
+  throw std::runtime_error("Execution host: " + std::move(detail));
 }
 
 [[noreturn]] void FailErrno(std::string_view context) {
@@ -178,17 +173,19 @@ void Require(bool condition, std::string detail) {
   }
 }
 
-[[nodiscard]] std::filesystem::path
-ExistingDirectory(std::filesystem::path path, std::string_view label) {
-  Require(!path.empty(), std::string(label) + " cannot be empty");
-  std::error_code error;
-  const auto status = std::filesystem::symlink_status(path, error);
-  Require(!error && !std::filesystem::is_symlink(status) &&
-              std::filesystem::is_directory(status),
-          std::string(label) + " must be an existing non-symlink directory");
-  auto absolute = std::filesystem::absolute(path, error);
-  Require(!error, std::string(label) + " cannot be resolved");
-  return absolute.lexically_normal();
+std::size_t AtomicResponseCapacity(const int client) {
+  const int requested = static_cast<int>(kMaximumResponseBytes);
+  int configured = 0;
+  socklen_t configured_size = sizeof(configured);
+  if (::setsockopt(client, SOL_SOCKET, SO_SNDBUF, &requested,
+                   sizeof(requested)) != 0 ||
+      ::getsockopt(client, SOL_SOCKET, SO_SNDBUF, &configured,
+                   &configured_size) != 0) {
+    FailErrno("configure execution command response buffer");
+  }
+  // Linux refuses a unix datagram longer than the send buffer minus 32 bytes.
+  return std::min(kMaximumResponseBytes,
+                  static_cast<std::size_t>(std::max(configured - 32, 0)));
 }
 
 [[nodiscard]] std::filesystem::path
@@ -722,88 +719,6 @@ ExchangeManagerCommand(const std::filesystem::path &manager_run_root,
           "Manager scene response is not the canonical supported contract");
   static_cast<void>(Boolean(parsed.root(), "ok"));
   return parsed.root();
-}
-
-[[nodiscard]] HostConfig ParseArguments(int argc, char **argv) {
-  HostConfig config;
-  std::set<std::string> seen;
-  for (int index = 1; index < argc; index += 2) {
-    Require(index + 1 < argc, "every option requires one value");
-    const std::string option(argv[index]);
-    const std::string value(argv[index + 1]);
-    Require(seen.insert(option).second, "duplicate option " + option);
-    if (option == "--package-root") {
-      config.package_root = value;
-    } else if (option == "--manager-state-root") {
-      config.manager_state_root = value;
-    } else if (option == "--execution-state-root") {
-      config.execution_state_root = value;
-    } else if (option == "--execution-run-root") {
-      config.execution_run_root = value;
-    } else if (option == "--program-binding-id") {
-      config.program_binding_id = value;
-    } else if (option == "--motion-target-role-id") {
-      config.motion_target_role_id = value;
-    } else if (option == "--gripper-target-role-id") {
-      config.gripper_target_role_id = value;
-    } else if (option == "--candidate-worker") {
-      config.candidate_worker = value;
-    } else if (option == "--cell-id") {
-      config.cell_id = value;
-    } else {
-      Fail("unknown option " + option);
-    }
-  }
-  const auto has = [&](const std::string_view option) {
-    return seen.contains(std::string(option));
-  };
-  Require(has("--package-root") && has("--manager-state-root") &&
-              has("--execution-state-root") &&
-              has("--execution-run-root") && has("--program-binding-id") &&
-              has("--candidate-worker") && has("--cell-id") &&
-              (has("--motion-target-role-id") ||
-               has("--gripper-target-role-id")) &&
-              seen.size() <= 9U,
-          "package, Manager state, execution state/run, Program Binding, "
-          "candidate worker, cell, and at least one supported target role "
-          "are required");
-  config.package_root =
-      ExistingDirectory(std::move(config.package_root), "package root");
-  config.manager_state_root = ExistingPrivateDirectory(
-      std::move(config.manager_state_root), "Manager state root");
-  config.execution_state_root = ExistingPrivateDirectory(
-      std::move(config.execution_state_root), "execution state root");
-  config.execution_run_root = ExistingPrivateDirectory(
-      std::move(config.execution_run_root), "execution run root");
-  RequireDisjointDirectories(config.manager_state_root,
-                             config.execution_state_root,
-                             "standalone durable state capabilities");
-  RequireDisjointDirectories(
-      config.manager_state_root, config.execution_run_root,
-      "standalone Manager-state/execution-run capabilities");
-  RequireDisjointDirectories(config.execution_state_root,
-                             config.execution_run_root,
-                             "standalone execution state/run capabilities");
-  RequireDisjointDirectories(config.package_root, config.manager_state_root,
-                             "standalone install/Manager-state capabilities");
-  RequireDisjointDirectories(config.package_root, config.execution_state_root,
-                             "standalone install/execution-state capabilities");
-  RequireDisjointDirectories(config.package_root, config.execution_run_root,
-                             "standalone install/execution-run capabilities");
-  config.candidate_worker = ExistingRegularFile(
-      std::move(config.candidate_worker), "candidate worker", true);
-  Require(!config.cell_id.empty() &&
-              config.cell_id.size() <= kMaximumIdentityBytes &&
-              !config.program_binding_id.empty() &&
-              config.program_binding_id.size() <= kMaximumIdentityBytes &&
-              (config.motion_target_role_id.empty() ||
-               config.motion_target_role_id.size() <=
-                   kMaximumIdentityBytes) &&
-              (config.gripper_target_role_id.empty() ||
-               config.gripper_target_role_id.size() <=
-                   kMaximumIdentityBytes),
-          "host identities must be bounded and non-empty");
-  return config;
 }
 
 void InstallSignalHandlers() {

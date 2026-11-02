@@ -17,8 +17,10 @@ import httpx
 from fastapi import FastAPI
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.concurrency import run_in_threadpool
+from starlette.convertors import PathConvertor
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+from starlette.routing import Route
 from starlette.types import Receive, Scope, Send
 from manyforge_headless_api.control_protocol import is_stop_command
 
@@ -103,16 +105,33 @@ TOOL_ROUTES: dict[str, dict[str, tuple[str, str]]] = {
         "add_components": ("POST", "/api/deployment/draft/components"),
         "stop_policy": ("POST", "/api/deployment/draft/controlled-stop"),
         "motion_limit": ("POST", "/api/deployment/draft/motion-target-limit"),
-        "preview": ("POST", "/api/deployment/draft/preview"),
-        "apply": ("POST", "/api/deployment/draft/apply"),
+        "preview": ("POST", "/api/deployment/preview"),
+        "apply": ("POST", "/api/deployment/apply"),
+        "effective": ("GET", "/api/deployment/effective"),
         "save": ("POST", "/api/deployment/save"),
         "save_as": ("POST", "/api/deployment/save-as"),
         "discard": ("POST", "/api/deployment/discard"),
+        "revert_preview": ("POST", "/api/deployment/revert/preview"),
         "revert": ("POST", "/api/deployment/revert"),
         "manager": ("GET", "/api/manager/status"),
         "graph": ("GET", "/api/manager/graph"),
-        "lifecycle": ("POST", "/api/cclc/lifecycle/requests"),
-        "route": ("POST", "/api/cclc/routes/requests"),
+    },
+    # CONTRACTS §11: the same server-side Load and New as the GUI.
+    "manyforge_scenario": {
+        "load": ("POST", "/api/scenario/load"),
+        "new": ("POST", "/api/scenario/new"),
+    },
+    # CONTRACTS §1, §2, §5, §7, §10.
+    "manyforge_components": {
+        "list": ("GET", "/api/components"),
+        "action": ("POST", "/api/components/{component_id}/actions"),
+        "group_action": ("POST", "/api/components/actions"),
+        "cell_latch": ("GET", "/api/cell/latch"),
+        "readiness": ("GET", "/api/program/readiness"),
+    },
+    "manyforge_io": {
+        "list": ("GET", "/api/io"),
+        "set": ("POST", "/api/io/{signal_id}/set"),
     },
     "manyforge_kernel": {
         "identity": ("GET", "/api/execution/identity"),
@@ -303,7 +322,19 @@ class ComposerMcpAdapter:
         from mcp.server.transport_security import TransportSecuritySettings
 
         self._app = app
-        server = Server("ManyForge", version="0.1.0")
+        # The real routes' `{name:path}` parameters (e.g. a member signal
+        # `<member_id>/<signal>` in `/api/io/{signal_id:path}/set`): their
+        # values hold `/`, and each segment is checked as a path component.
+        self._multi_segment = {
+            route.path_format: {
+                key
+                for key, convertor in route.param_convertors.items()
+                if isinstance(convertor, PathConvertor)
+            }
+            for route in app.routes
+            if isinstance(route, Route)
+        }
+        server = Server("ManyForge", version="0.2.0")
         contracts = [types.Tool.model_validate(value) for value in tool_contracts(app)]
 
         @server.list_tools()
@@ -396,11 +427,13 @@ class ComposerMcpAdapter:
         expected = set(re.findall(r"\{([^{}]+)\}", path))
         if set(args.path) != expected:
             raise ValueError("path fields do not match this action")
+        multi_segment = self._multi_segment.get(path, set())
         for key, value in args.path.items():
-            if (
-                len(value) > 512
-                or value in {".", ".."}
-                or re.fullmatch(r"[A-Za-z0-9_.:-]+", value) is None
+            segments = value.split("/") if key in multi_segment else [value]
+            if len(value) > 512 or any(
+                segment in {".", ".."}
+                or re.fullmatch(r"[A-Za-z0-9_.:-]+", segment) is None
+                for segment in segments
             ):
                 raise ValueError("invalid path component")
             path = path.replace("{" + key + "}", value)

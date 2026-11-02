@@ -4,7 +4,6 @@
 #include <manyforge_deployment/build_manifest.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
 #include <memory>
-#include <optional>
 #include <stdexcept>
 #include <string_view>
 #include <utility>
@@ -67,144 +66,10 @@ materialize_lite6_composer_assistant_retained_consumer_fixture(
 }
 
 [[nodiscard]] inline DurableLite6RetainedConsumerFixture
-materialize_lite6_arm_gripper_aggregate_retained_consumer_fixture(
-    const std::filesystem::path& package_root) {
-  return materialize_lite6_retained_consumer_fixture_from(
-      package_root, make_lite6_arm_gripper_aggregate_retention_fixture());
-}
-
-[[nodiscard]] inline DurableLite6RetainedConsumerFixture
-materialize_lite6_native_motion_retained_consumer_fixture(
-    const std::filesystem::path& package_root) {
-  return materialize_lite6_retained_consumer_fixture_from(
-      package_root, make_lite6_native_motion_retention_fixture());
-}
-
-[[nodiscard]] inline DurableLite6RetainedConsumerFixture
-materialize_lite6_native_motion_retained_consumer_fixture_for_cell(
-    const std::filesystem::path& package_root, std::string_view cell_id) {
-  return materialize_lite6_retained_consumer_fixture_from(
-      package_root,
-      make_lite6_native_motion_retention_fixture_for_cell(cell_id));
-}
-
-[[nodiscard]] inline DurableLite6RetainedConsumerFixture
-materialize_two_lite6_same_type_native_motion_retained_consumer_fixture_for_cell(
-    const std::filesystem::path& package_root, std::string_view cell_id) {
-  return materialize_lite6_retained_consumer_fixture_from(
-      package_root,
-      make_two_lite6_same_type_native_motion_retention_fixture_for_cell(
-          cell_id));
-}
-
-[[nodiscard]] inline DurableLite6RetainedConsumerFixture
-materialize_lite6_native_motion_arm_gripper_retained_consumer_fixture(
-    const std::filesystem::path& package_root) {
-  return materialize_lite6_retained_consumer_fixture_from(
-      package_root, make_lite6_native_motion_arm_gripper_aggregate_retention_fixture());
-}
-
-[[nodiscard]] inline DurableLite6RetainedConsumerFixture
 materialize_lite6_stop_capable_ros_motion_retained_consumer_fixture(
     const std::filesystem::path &package_root) {
   return materialize_lite6_retained_consumer_fixture_from(
       package_root, make_lite6_stop_qualified_ros_motion_retention_fixture());
-}
-
-[[nodiscard]] inline DurableLite6RetainedConsumerFixture
-materialize_lite6_stop_capable_native_motion_retained_consumer_fixture(
-    const std::filesystem::path& package_root) {
-  return materialize_lite6_retained_consumer_fixture_from(
-      package_root,
-      make_lite6_stop_qualified_native_motion_retention_fixture());
-}
-
-[[nodiscard]] inline DurableLite6RetainedConsumerFixture
-materialize_lite6_native_arm_only_cclc_product_retained_consumer_fixture(
-    const std::filesystem::path& package_root,
-    std::string_view arm_lifecycle_semantic_digest) {
-  return materialize_lite6_retained_consumer_fixture_from(
-      package_root, make_lite6_native_arm_only_cclc_product_retention_fixture(
-                        arm_lifecycle_semantic_digest));
-}
-
-[[nodiscard]] inline DurableLite6RetainedConsumerFixture
-materialize_lite6_ros2_control_arm_only_cclc_product_retained_consumer_fixture(
-    const std::filesystem::path& package_root,
-    std::string_view lifecycle_semantic_digest) {
-  return materialize_lite6_retained_consumer_fixture_from(
-      package_root, make_lite6_ros2_control_arm_only_cclc_product_retention_fixture(
-                        lifecycle_semantic_digest));
-}
-
-[[nodiscard]] inline DurableLite6RetainedConsumerFixture
-materialize_lite6_ros2_control_cclc_product_retained_consumer_fixture(
-    const std::filesystem::path& package_root,
-    std::string_view lifecycle_semantic_digest,
-    bool gripper_feedback = false,
-    std::optional<double> initial_joint1_position_rad = std::nullopt) {
-  return materialize_lite6_retained_consumer_fixture_from(
-      package_root, make_lite6_ros2_control_cclc_product_retention_fixture(
-                        lifecycle_semantic_digest, gripper_feedback,
-                        initial_joint1_position_rad));
-}
-
-[[nodiscard]] inline DurableLite6RetainedConsumerFixture
-materialize_lite6_native_cclc_product_retained_consumer_fixture(
-    const std::filesystem::path& package_root, std::string_view arm_lifecycle_semantic_digest,
-    std::string_view gripper_lifecycle_semantic_digest, bool gripper_feedback = false,
-    std::optional<double> initial_joint1_position_rad = std::nullopt) {
-  return materialize_lite6_retained_consumer_fixture_from(
-      package_root,
-      make_lite6_native_cclc_product_retention_fixture(
-          arm_lifecycle_semantic_digest, gripper_lifecycle_semantic_digest,
-          gripper_feedback, initial_joint1_position_rad));
-}
-
-[[nodiscard]] inline DurableLite6RetainedConsumerFixture
-materialize_lite6_ros2_control_gripper_only_cclc_product_retained_consumer_fixture(
-    const std::filesystem::path& package_root, std::string_view lifecycle_semantic_digest) {
-  return materialize_lite6_retained_consumer_fixture_from(
-      package_root, make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture(
-                        lifecycle_semantic_digest));
-}
-
-/// DX796 H2: explicit actual pneumatic producer input, preserving the separate
-/// position/archival helpers and every existing caller's default selection.
-[[nodiscard]] inline DurableLite6RetainedConsumerFixture
-materialize_lite6_ros2_control_pneumatic_gripper_retained_consumer_fixture(
-    const std::filesystem::path &package_root,
-    std::string_view lifecycle_semantic_digest,
-    core::GripperOutputMode output_mode, double dwell_s) {
-  if (output_mode == core::GripperOutputMode::kNone) {
-    return materialize_lite6_retained_consumer_fixture_from(
-        package_root, make_lite6_ros2_control_no_output_gripper_retention_fixture(
-                          lifecycle_semantic_digest, dwell_s));
-  }
-  if (output_mode != core::GripperOutputMode::kCommanded)
-    throw std::logic_error("pneumatic fixture output mode is unsupported");
-  return materialize_lite6_retained_consumer_fixture_from(
-      package_root, make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture(
-                        lifecycle_semantic_digest, "pneumatic", dwell_s, nullptr,
-                        "commanded"));
-}
-
-[[nodiscard]] inline DurableLite6RetainedConsumerFixture
-materialize_lite6_ros2_control_scalar_peer_retained_consumer_fixture(
-    const std::filesystem::path &package_root,
-    std::string_view lifecycle_semantic_digest, bool arm_root = false) {
-  return materialize_lite6_retained_consumer_fixture_from(
-      package_root, make_lite6_ros2_control_scalar_peer_retention_fixture(
-                        lifecycle_semantic_digest, arm_root));
-}
-
-[[nodiscard]] inline DurableLite6RetainedConsumerFixture
-materialize_lite6_native_gripper_only_cclc_product_retained_consumer_fixture(
-    const std::filesystem::path& package_root, std::string_view arm_lifecycle_semantic_digest,
-    std::string_view gripper_lifecycle_semantic_digest) {
-  return materialize_lite6_retained_consumer_fixture_from(
-      package_root, make_lite6_native_gripper_only_cclc_product_retention_fixture(
-                        arm_lifecycle_semantic_digest, gripper_lifecycle_semantic_digest));
 }
 
 [[nodiscard]] inline DurableLite6RetainedConsumerFixture
@@ -215,48 +80,34 @@ materialize_lite6_ros2_control_retained_consumer_fixture(
 }
 
 [[nodiscard]] inline DurableLite6RetainedConsumerFixture
-materialize_lite6_ros2_control_arm_gripper_aggregate_retained_consumer_fixture(
-    const std::filesystem::path& package_root) {
-  return materialize_lite6_retained_consumer_fixture_from(
-      package_root, make_lite6_ros2_control_shared_consumer_retention_fixture({}, 1U, true));
-}
-
-[[nodiscard]] inline DurableLite6RetainedConsumerFixture
-materialize_lite6_ros2_control_motion_arm_gripper_retained_consumer_fixture(
-    const std::filesystem::path& package_root) {
-  return materialize_lite6_retained_consumer_fixture_from(
-      package_root, make_lite6_ros2_control_shared_consumer_retention_fixture({}, 1U, true, true));
-}
-
-[[nodiscard]] inline DurableLite6RetainedConsumerFixture
 materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell(
     const std::filesystem::path& package_root, std::string_view cell_id) {
   return materialize_lite6_retained_consumer_fixture_from(
-      package_root, make_lite6_ros2_control_shared_consumer_retention_fixture(cell_id, 1U, false, false));
+      package_root, make_lite6_ros2_control_shared_consumer_retention_fixture(cell_id, 1U, false));
 }
 
 [[nodiscard]] inline DurableLite6RetainedConsumerFixture
 materialize_two_lite6_same_type_ros2_control_motion_retained_consumer_fixture_for_cell(
     const std::filesystem::path& package_root, std::string_view cell_id) {
   return materialize_lite6_retained_consumer_fixture_from(
-      package_root, make_lite6_ros2_control_shared_consumer_retention_fixture(cell_id, 2U, false, false));
+      package_root, make_lite6_ros2_control_shared_consumer_retention_fixture(cell_id, 2U, false));
 }
 
 [[nodiscard]] inline DurableLite6RetainedConsumerFixture
 materialize_lite6_ros2_control_observed_retained_consumer_fixture(
-    const std::filesystem::path &package_root, bool aggregate_gripper = false) {
+    const std::filesystem::path &package_root) {
   return materialize_lite6_retained_consumer_fixture_from(
-      package_root, make_lite6_ros2_control_observed_consumer_retention_fixture(aggregate_gripper));
+      package_root, make_lite6_ros2_control_observed_consumer_retention_fixture());
 }
 
 [[nodiscard]] inline DurableLite6RetainedConsumerFixture
 materialize_lite6_ros2_control_observed_endpoint_retained_consumer_fixture(
-    const std::filesystem::path &package_root, bool aggregate_gripper = false,
+    const std::filesystem::path &package_root,
     bool shared_arm_endpoint_bodies = false) {
   return materialize_lite6_retained_consumer_fixture_from(
       package_root,
       make_lite6_ros2_control_observed_endpoint_consumer_retention_fixture(
-          aggregate_gripper, shared_arm_endpoint_bodies));
+          shared_arm_endpoint_bodies));
 }
 
 }  // namespace manyforge::deployment::test

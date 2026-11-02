@@ -6,7 +6,6 @@
 #include <manyforge_core/types/execution_result.hpp>
 #include <manyforge_core/types/execution_status.hpp>
 #include <manyforge_core/types/gripper.hpp>
-#include <manyforge_core/types/io_output_recovery.hpp>
 #include <manyforge_core/types/kernel_event.hpp>
 #include <manyforge_core/types/participant_stop_stage.hpp>
 #include <manyforge_core/types/recovery.hpp>
@@ -151,11 +150,10 @@ class IResolvedParticipantExecutionEngine {
                                      std::uint64_t expected_generation) = 0;
 
   /// Participant-local Reset after Kernel admission. Physical implementations
-  /// preserve their original gripper dispatch; output requires typed authority.
-  virtual Result<void> reset_capability_command(
-      const std::string& target, std::uint64_t command_id, std::uint64_t generation,
-      const std::optional<IoOutputResetAuthorityDTO>& output_authority = std::nullopt) {
-    if (output_authority) return Result<void>::Err(ErrorCode::kUnsupportedCapability);
+  /// preserve their original gripper dispatch.
+  virtual Result<void> reset_capability_command(const std::string& target,
+                                                std::uint64_t command_id,
+                                                std::uint64_t generation) {
     return reset_gripper(target, command_id, generation);
   }
 

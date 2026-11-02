@@ -2,7 +2,6 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_core/ports/iexecution_port.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
@@ -26,19 +25,10 @@ namespace manyforge::core {
 
 inline constexpr std::size_t kMaxLifecycleExpectedDomains = 256U;
 inline constexpr std::size_t kMaxLifecycleResolvedDomains = 256U;
-inline constexpr std::size_t kMaxLifecycleDisableDomainUnion = 512U;
 inline constexpr std::size_t kMaxLifecycleExpectedBindings = 4096U;
 inline constexpr std::size_t kMaxLifecycleResolvedBindings = 4096U;
-inline constexpr std::size_t kMaxLifecycleStatusBindingUnion = 8192U;
 inline constexpr std::size_t kMaxLifecycleFacts = 256U;
-inline constexpr std::size_t kMaxLifecycleAttemptsPerDomain = 64U;
-/// V-B2: substeps one transition action reports, and feedback events one
-/// domain status retains.
-inline constexpr std::size_t kMaxLifecycleSubsteps = 64U;
-inline constexpr std::size_t kMaxLifecycleSubstepEvents = 64U;
-inline constexpr std::size_t kMaxLifecycleAttemptsPerStatus = 4096U;
 inline constexpr std::size_t kMaxLifecycleCurrentResources = 4096U;
-inline constexpr std::size_t kMaxLifecycleCancelledOperations = 4096U;
 inline constexpr std::size_t kMaxLifecycleIdentityBytes = 128U;
 inline constexpr std::size_t kMaxLifecycleRequestLabelBytes = 256U;
 inline constexpr std::size_t kMaxLifecycleErrorCodeBytes = 128U;
@@ -53,21 +43,9 @@ inline constexpr std::size_t kMaxLifecycleErrorDetailKeyBytes = 64U;
 inline constexpr std::size_t kMaxLifecycleErrorDetailValueBytes = 256U;
 inline constexpr std::size_t kMaxLifecycleKinematicSourceProjections = 4096U;
 inline constexpr std::size_t kMaxLifecycleKinematicContributingBindings = 8192U;
-inline constexpr std::size_t kMaxLifecycleReasonBytes = 1024U;
 inline constexpr std::size_t kMaxLifecycleFactTokenBytes = 128U;
-inline constexpr std::size_t kMaxLifecycleCatalogPlans = 6U;
-inline constexpr std::size_t kMaxLifecycleTransitionsPerPlan = 64U;
-inline constexpr std::size_t kMaxLifecycleTransitionsPerCatalog = 256U;
-inline constexpr std::size_t kMaxLifecyclePredicateFacts = 256U;
 inline constexpr std::size_t kMaxLifecycleProviderOccurrences = 256U;
 inline constexpr std::int64_t kMaxLifecycleTransactionTimeoutNs = 3'600'000'000'000LL;
-
-enum class ComponentLifecycleIntentKindDTO : std::uint8_t {
-  kPrepare = 0,
-  kEnable,
-  kDisable,
-  kRecover,
-};
 
 enum class ComponentLifecycleStateDTO : std::uint8_t {
   kUndeclared = 0,
@@ -78,11 +56,6 @@ enum class ComponentLifecycleStateDTO : std::uint8_t {
   kFaulted,
   kDisabling,
   kDisabled,
-};
-
-enum class ComponentLifecycleRequestedStatePresenceDTO : std::uint8_t {
-  kUnresolved = 0,
-  kResolved,
 };
 
 enum class ExpectedActiveControlConfigurationPresenceDTO : std::uint8_t {
@@ -96,62 +69,6 @@ enum class LifecycleFactValueKindDTO : std::uint8_t {
   kInteger,
   kToken,
 };
-
-/// V-B2 (V2-4): the result of one lifecycle transition and of each substep
-/// the adapter ran. CCLC never classifies partial or uncertain effects; an
-/// adapter's own distinctions survive only in the typed error.
-enum class LifecycleTransitionOutcomeDTO : std::uint8_t {
-  kSucceeded = 0,
-  kFailed,
-  kConnectionLost,
-};
-
-enum class LifecyclePostconditionResultDTO : std::uint8_t {
-  kSatisfied = 0,
-  kNotSatisfied,
-  kInconclusive,
-};
-
-enum class ComponentLifecycleDomainActionStateDTO : std::uint8_t {
-  kReserved = 0,
-  kNotStarted,
-  kExecuting,
-  kVerifying,
-  kSucceeded,
-  kFailed,
-};
-
-enum class ComponentLifecycleTransactionPhaseDTO : std::uint8_t {
-  kAccepted = 0,
-  kAcquiringDomains,
-  kContaining,
-  kExecuting,
-  kVerifying,
-  /// Only a stopped Apply bring-up (with `reconciliation_required`, VB2-O4).
-  kOutcomeUnknown,
-  kSucceeded,
-  kFailed,
-};
-
-enum class ComponentLifecycleTerminalResultDTO : std::uint8_t {
-  kSucceeded = 0,
-  kFailed,
-  kConnectionLost,
-};
-
-[[nodiscard]] constexpr std::string_view to_string(ComponentLifecycleIntentKindDTO value) noexcept {
-  switch (value) {
-    case ComponentLifecycleIntentKindDTO::kPrepare:
-      return "prepare";
-    case ComponentLifecycleIntentKindDTO::kEnable:
-      return "enable";
-    case ComponentLifecycleIntentKindDTO::kDisable:
-      return "disable";
-    case ComponentLifecycleIntentKindDTO::kRecover:
-      return "recover";
-  }
-  return {};
-}
 
 [[nodiscard]] constexpr std::string_view to_string(ComponentLifecycleStateDTO value) noexcept {
   switch (value) {
@@ -175,81 +92,6 @@ enum class ComponentLifecycleTerminalResultDTO : std::uint8_t {
   return {};
 }
 
-/// V-B2: the one adapter action CCLC dispatches per transition and domain.
-[[nodiscard]] inline LifecyclePrimitiveId LifecycleTransitionActionId(
-    ComponentLifecycleIntentKindDTO intent) {
-  return LifecyclePrimitiveId("transition." + std::string(to_string(intent)));
-}
-
-/// The intent of a transition action id; nothing for any other id.
-[[nodiscard]] inline std::optional<ComponentLifecycleIntentKindDTO> LifecycleTransitionIntent(
-    const LifecyclePrimitiveId& action) {
-  for (const auto intent :
-       {ComponentLifecycleIntentKindDTO::kPrepare, ComponentLifecycleIntentKindDTO::kEnable,
-        ComponentLifecycleIntentKindDTO::kDisable, ComponentLifecycleIntentKindDTO::kRecover}) {
-    if (action == LifecycleTransitionActionId(intent)) return intent;
-  }
-  return std::nullopt;
-}
-
-/// Typed warning: a component's current state could not be read from fresh
-/// fault-free domain observations and was recorded or read as Declared.
-inline constexpr std::string_view kComponentLifecycleStateReconstructedCode =
-    "component_lifecycle_state_reconstructed";
-
-/// A domain's observed state when it is fault-free and at rest (declared,
-/// disabled, prepared, active); otherwise nothing.
-[[nodiscard]] constexpr std::optional<ComponentLifecycleStateDTO> RestingLifecycleState(
-    std::optional<ComponentLifecycleStateDTO> observed) noexcept {
-  if (observed == ComponentLifecycleStateDTO::kDeclared ||
-      observed == ComponentLifecycleStateDTO::kDisabled ||
-      observed == ComponentLifecycleStateDTO::kPrepared ||
-      observed == ComponentLifecycleStateDTO::kActive) {
-    return observed;
-  }
-  return std::nullopt;
-}
-
-struct SettledComponentLifecycleStateDTO final {
-  ComponentLifecycleStateDTO state;
-  /// Some domain had no fresh fault-free observation and counted as Declared.
-  bool reconstructed;
-};
-
-/// The component state its observed domain states settle at: the least
-/// advanced (declared < disabled < prepared < active), all-Active as Prepared
-/// so a settled failure or a reconstruction never makes it command-ready.
-[[nodiscard]] inline SettledComponentLifecycleStateDTO SettleObservedComponentLifecycleState(
-    const std::vector<std::optional<ComponentLifecycleStateDTO>>& observed) noexcept {
-  const auto rank = [](ComponentLifecycleStateDTO state) {
-    return state == ComponentLifecycleStateDTO::kDeclared   ? 0
-           : state == ComponentLifecycleStateDTO::kDisabled ? 1
-           : state == ComponentLifecycleStateDTO::kPrepared ? 2
-                                                            : 3;
-  };
-  SettledComponentLifecycleStateDTO settled{ComponentLifecycleStateDTO::kActive, observed.empty()};
-  for (const auto& domain : observed) {
-    const auto resting = RestingLifecycleState(domain);
-    settled.reconstructed = settled.reconstructed || !resting;
-    const auto state = resting.value_or(ComponentLifecycleStateDTO::kDeclared);
-    if (rank(state) < rank(settled.state)) settled.state = state;
-  }
-  if (settled.reconstructed) settled.state = ComponentLifecycleStateDTO::kDeclared;
-  if (settled.state == ComponentLifecycleStateDTO::kActive)
-    settled.state = ComponentLifecycleStateDTO::kPrepared;
-  return settled;
-}
-
-struct ComponentLifecycleRequestedStateDTO final {
-  ComponentLifecycleRequestedStatePresenceDTO presence;
-  std::optional<ComponentLifecycleStateDTO> state;
-
-  [[nodiscard]] bool locally_valid() const noexcept;
-
-  friend bool operator==(const ComponentLifecycleRequestedStateDTO&,
-                         const ComponentLifecycleRequestedStateDTO&) = default;
-};
-
 struct ExpectedActiveControlConfigurationDTO final {
   ExpectedActiveControlConfigurationPresenceDTO presence;
   std::optional<ActiveControlConfigurationId> active_control_configuration_id;
@@ -272,140 +114,6 @@ struct ExpectedControlBindingRevisionDTO final {
                          const ExpectedControlBindingRevisionDTO&) = default;
 };
 
-struct ExpectedControllerDomainScopeDTO final {
-  ControllerTopologyId controller_topology_id;
-  TopologyRevision topology_revision;
-  ExpectedActiveControlConfigurationDTO expected_active_control_configuration;
-  std::vector<ExpectedControlBindingRevisionDTO> expected_control_bindings;
-  friend bool operator==(const ExpectedControllerDomainScopeDTO&,
-                         const ExpectedControllerDomainScopeDTO&) = default;
-};
-
-struct ExpectedProviderDomainScopeDTO final {
-  ProviderControlDomainDTO provider;
-  ExpectedActiveControlConfigurationDTO expected_active_control_configuration;
-  friend bool operator==(const ExpectedProviderDomainScopeDTO&,
-                         const ExpectedProviderDomainScopeDTO&) = default;
-};
-
-struct ExpectedControlDomainRevisionDTO final {
-  ControlDomainId control_domain_id;
-  ControlDomainRevision control_domain_revision;
-  std::variant<ExpectedControllerDomainScopeDTO, ExpectedProviderDomainScopeDTO> payload;
-
-  ExpectedControlDomainRevisionDTO(ControlDomainId id, ControlDomainRevision revision,
-                                   ControllerTopologyId topology,
-                                   TopologyRevision topology_revision,
-                                   ExpectedActiveControlConfigurationDTO configuration,
-                                   std::vector<ExpectedControlBindingRevisionDTO> bindings)
-      : control_domain_id(std::move(id)),
-        control_domain_revision(std::move(revision)),
-        payload(ExpectedControllerDomainScopeDTO{std::move(topology), std::move(topology_revision),
-                                                 std::move(configuration), std::move(bindings)}) {}
-  ExpectedControlDomainRevisionDTO(ControlDomainId id, ControlDomainRevision revision,
-                                   ExpectedProviderDomainScopeDTO provider)
-      : control_domain_id(std::move(id)),
-        control_domain_revision(std::move(revision)),
-        payload(std::move(provider)) {}
-
-  [[nodiscard]] ExpectedControllerDomainScopeDTO& controller() {
-    return std::get<ExpectedControllerDomainScopeDTO>(payload);
-  }
-  [[nodiscard]] const ExpectedControllerDomainScopeDTO& controller() const {
-    return std::get<ExpectedControllerDomainScopeDTO>(payload);
-  }
-  [[nodiscard]] const ExpectedProviderDomainScopeDTO* provider() const noexcept {
-    return std::get_if<ExpectedProviderDomainScopeDTO>(&payload);
-  }
-  [[nodiscard]] const std::vector<ExpectedControlBindingRevisionDTO>& control_bindings()
-      const noexcept {
-    static const std::vector<ExpectedControlBindingRevisionDTO> none;
-    if (const auto* physical = std::get_if<ExpectedControllerDomainScopeDTO>(&payload))
-      return physical->expected_control_bindings;
-    return none;
-  }
-  [[nodiscard]] const ExpectedActiveControlConfigurationDTO& expected_configuration()
-      const noexcept {
-    if (const auto* physical = std::get_if<ExpectedControllerDomainScopeDTO>(&payload))
-      return physical->expected_active_control_configuration;
-    return std::get<ExpectedProviderDomainScopeDTO>(payload).expected_active_control_configuration;
-  }
-
-  [[nodiscard]] bool locally_valid() const noexcept;
-
-  friend bool operator==(const ExpectedControlDomainRevisionDTO&,
-                         const ExpectedControlDomainRevisionDTO&) = default;
-};
-
-/// Actual predecessor qualified by the original CCLC owner from a verified
-/// snapshot. It does not create or replace a durable journal watermark.
-struct ApplyComponentQualifiedPredecessorDTO final {
-  ComponentLifecycleGeneration generation;
-  ContentDigest snapshot_digest;
-
-  [[nodiscard]] bool locally_valid() const noexcept;
-  friend bool operator==(const ApplyComponentQualifiedPredecessorDTO&,
-                         const ApplyComponentQualifiedPredecessorDTO&) = default;
-};
-
-/// Owner-read Q97 generation prediction. This value grants no authority;
-/// delegated acceptance rechecks every field against the durable journal.
-struct ApplyComponentGenerationSelectionDTO final {
-  std::optional<ComponentLifecycleGeneration> predecessor_generation;
-  ComponentLifecycleGeneration candidate_generation;
-  std::uint64_t prior_reservation_generation{};
-  std::optional<ApplyComponentQualifiedPredecessorDTO> owner_qualified_predecessor{};
-
-  [[nodiscard]] bool locally_valid() const noexcept;
-  friend bool operator==(const ApplyComponentGenerationSelectionDTO&,
-                         const ApplyComponentGenerationSelectionDTO&) = default;
-};
-
-/// The existing operator Recover bound to one still-open incident for Close.
-/// This grants no ordinary recovery fallback or vendor effect.
-struct CloseComponentIncidentRecoveryDTO final {
-  std::string expected_incident_id;
-
-  friend bool operator==(const CloseComponentIncidentRecoveryDTO&,
-                         const CloseComponentIncidentRecoveryDTO&) = default;
-};
-
-struct ComponentLifecycleIntentDTO final {
-  PublicRequestContextDTO request_context;
-  ControllableComponentId controllable_component_id;
-  ComponentLifecycleIntentKindDTO intent;
-  GraphRevision expected_graph_revision;
-  ComponentLifecycleGeneration expected_component_lifecycle_generation;
-  std::vector<ExpectedControlDomainRevisionDTO> expected_control_domains;
-  std::optional<std::string> reason;
-  RequestAttributionDTO attribution{};
-  AdmissionGeneration expected_admission_generation{1U};
-  std::optional<ProgramNodeAdmissionEvidenceDTO> program_node_evidence{};
-  std::optional<ApplyComponentGenerationSelectionDTO> apply_generation_selection{};
-  std::optional<CloseComponentIncidentRecoveryDTO> close_incident_recovery{};
-
-  [[nodiscard]] bool locally_valid() const noexcept;
-  [[nodiscard]] bool replay_equal(const ComponentLifecycleIntentDTO& other) const noexcept;
-
-  friend bool operator==(const ComponentLifecycleIntentDTO&,
-                         const ComponentLifecycleIntentDTO&) = default;
-};
-
-struct ComponentLifecycleAcceptedDTO final {
-  RequestId request_id;
-  RequestReplayStatusDTO replay_status;
-  LifecycleTransactionId lifecycle_transaction_id;
-  LifecycleTransactionGeneration lifecycle_transaction_generation;
-  ComponentLifecycleGeneration component_lifecycle_generation;
-  std::int64_t accepted_at_ns;
-  std::int64_t timeout_duration_ns;
-
-  [[nodiscard]] bool locally_valid() const noexcept;
-
-  friend bool operator==(const ComponentLifecycleAcceptedDTO&,
-                         const ComponentLifecycleAcceptedDTO&) = default;
-};
-
 struct LifecycleFactValueDTO final {
   LifecycleFactValueKindDTO kind;
   std::optional<bool> boolean_value;
@@ -424,127 +132,6 @@ struct LifecycleFactDTO final {
   [[nodiscard]] bool locally_valid() const noexcept;
 
   friend bool operator==(const LifecycleFactDTO&, const LifecycleFactDTO&) = default;
-};
-
-/// Pure projection of one exact provider's existing normalized health facts.
-/// This value grants no admission and carries no execution transaction,
-/// synthetic observation generation, source timestamp, or mutable state owner.
-struct LifecycleDomainHealthDTO final {
-  ComponentLifecycleStateDTO observed_state;
-  std::vector<LifecycleFactDTO> facts;
-  std::optional<ErrorDTO> diagnostic;
-  /// Presentation only: absent means the producer has not stated applicability.
-  std::optional<bool> has_activation_step{};
-
-  [[nodiscard]] bool locally_valid() const noexcept;
-
-  friend bool operator==(const LifecycleDomainHealthDTO&,
-                         const LifecycleDomainHealthDTO&) = default;
-};
-
-/// Product-owned projection over the same maintained source as lifecycle
-/// observation. Implementations must not advance observation/bookkeeping,
-/// acquire authority, perform lifecycle effects, or manufacture a sample.
-using LifecycleDomainHealthProjection =
-    std::function<Result<LifecycleDomainHealthDTO>(std::int64_t now_ns)>;
-
-struct LifecycleFactPredicateDTO final {
-  LifecycleFactId lifecycle_fact_id;
-  LifecycleFactValueDTO expected_value;
-
-  [[nodiscard]] bool locally_valid() const noexcept;
-
-  friend bool operator==(const LifecycleFactPredicateDTO&,
-                         const LifecycleFactPredicateDTO&) = default;
-};
-
-struct LifecyclePredicateDTO final {
-  std::vector<ComponentLifecycleStateDTO> allowed_states;
-  std::vector<LifecycleFactPredicateDTO> fact_predicates;
-
-  [[nodiscard]] bool locally_valid() const noexcept;
-
-  friend bool operator==(const LifecyclePredicateDTO&, const LifecyclePredicateDTO&) = default;
-};
-
-struct BrandLifecycleObservationDTO;
-
-/// Deterministically evaluate one closed lifecycle predicate against one exact
-/// normalized observation. Invalid inputs fail closed as inconclusive; this
-/// operation performs no I/O or clock reads.
-[[nodiscard]] LifecyclePostconditionResultDTO EvaluateLifecyclePredicate(
-    const LifecyclePredicateDTO& predicate,
-    const BrandLifecycleObservationDTO& observation) noexcept;
-
-[[nodiscard]] LifecyclePostconditionResultDTO EvaluateLifecyclePredicate(
-    const LifecyclePredicateDTO& predicate,
-    const LifecycleDomainHealthDTO& health) noexcept;
-
-struct LifecyclePrimitiveTransitionDTO final {
-  LifecyclePrimitiveId lifecycle_primitive_id;
-  LifecyclePredicateDTO eligibility_predicate;
-  LifecyclePredicateDTO postcondition_predicate;
-
-  [[nodiscard]] bool locally_valid() const noexcept;
-
-  friend bool operator==(const LifecyclePrimitiveTransitionDTO&,
-                         const LifecyclePrimitiveTransitionDTO&) = default;
-};
-
-struct DeviceConfiguredLifecycleLimitDTO final {
-  friend bool operator==(DeviceConfiguredLifecycleLimitDTO,
-                         DeviceConfiguredLifecycleLimitDTO) = default;
-};
-
-using LifecyclePlanTimeoutPolicyDTO = std::variant<std::int64_t, DeviceConfiguredLifecycleLimitDTO>;
-
-/// Provider contract: a Recover plan whose `requested_postcondition` admits
-/// only the resting states `declared`/`disabled` asserts that the
-/// postcondition implies nothing is engaged (no hardware, controller or
-/// output active). ManyForge relies on this to treat such a `declared` domain
-/// as already Disabled; providers that cannot guarantee it must allow another
-/// state or omit such a plan.
-struct LifecycleIntentPlanDTO final {
-  ComponentLifecycleIntentKindDTO intent;
-  ComponentLifecycleStateDTO requested_state;
-  std::optional<LifecyclePredicateDTO> recover_target_eligibility;
-  LifecyclePredicateDTO requested_postcondition;
-  LifecyclePlanTimeoutPolicyDTO timeout_policy;
-  std::vector<LifecyclePrimitiveTransitionDTO> transitions;
-
-  [[nodiscard]] bool locally_valid() const noexcept;
-
-  friend bool operator==(const LifecycleIntentPlanDTO&, const LifecycleIntentPlanDTO&) = default;
-};
-
-struct BrandLifecyclePlanCatalogDTO final {
-  ProviderManifestId provider_manifest_id;
-  ProviderManifestRevision provider_manifest_revision;
-  ContentDigest catalog_digest;
-  std::vector<LifecycleIntentPlanDTO> plans;
-
-  [[nodiscard]] bool locally_valid() const noexcept;
-
-  friend bool operator==(const BrandLifecyclePlanCatalogDTO&,
-                         const BrandLifecyclePlanCatalogDTO&) = default;
-};
-
-struct BrandLifecycleObservationQueryDTO final {
-  LifecycleTransactionId lifecycle_transaction_id;
-  LifecycleTransactionGeneration lifecycle_transaction_generation;
-  ControllableComponentId controllable_component_id;
-  ControlDomainId control_domain_id;
-  ControlDomainRevision control_domain_revision;
-  ProviderInstanceId provider_instance_id;
-  ProviderManifestId provider_manifest_id;
-  ProviderManifestRevision provider_manifest_revision;
-  RuntimeUnitId provider_runtime_unit_id;
-  RuntimeEpoch provider_runtime_epoch;
-
-  [[nodiscard]] bool locally_valid() const noexcept;
-
-  friend bool operator==(const BrandLifecycleObservationQueryDTO&,
-                         const BrandLifecycleObservationQueryDTO&) = default;
 };
 
 struct BrandLifecycleObservationDTO final {
@@ -571,116 +158,10 @@ struct BrandLifecycleObservationDTO final {
   std::shared_ptr<const content_identity::CanonicalValue> diagnostic_snapshot{};
 
   [[nodiscard]] bool locally_valid() const noexcept;
-  [[nodiscard]] bool matches(const BrandLifecycleObservationQueryDTO& query) const noexcept;
 
   friend bool operator==(const BrandLifecycleObservationDTO&,
                          const BrandLifecycleObservationDTO&) = default;
 };
-
-/// V-B2: one transition action (`transition.<intent>`) for one domain. The
-/// adapter runs its own substeps within `remaining_duration_ns`; a Recover
-/// carries the target CCLC chose in `requested_state`.
-struct BrandLifecyclePrimitiveIntentDTO final {
-  LifecycleTransactionId lifecycle_transaction_id;
-  LifecycleTransactionGeneration lifecycle_transaction_generation;
-  ControllableComponentId controllable_component_id;
-  ControlDomainId control_domain_id;
-  ControlDomainRevision control_domain_revision;
-  ProviderInstanceId provider_instance_id;
-  ProviderManifestId provider_manifest_id;
-  ProviderManifestRevision provider_manifest_revision;
-  RuntimeUnitId provider_runtime_unit_id;
-  RuntimeEpoch provider_runtime_epoch;
-  LifecyclePrimitiveId lifecycle_primitive_id;
-  LifecyclePrimitiveAttemptId lifecycle_primitive_attempt_id;
-  std::uint64_t expected_observation_generation;
-  std::int64_t remaining_duration_ns;
-  ComponentLifecycleStateDTO requested_state;
-
-  [[nodiscard]] bool locally_valid() const noexcept;
-
-  friend bool operator==(const BrandLifecyclePrimitiveIntentDTO&,
-                         const BrandLifecyclePrimitiveIntentDTO&) = default;
-};
-
-/// One substep the adapter ran, for the record only: CCLC never interprets
-/// the list. `within` names the enclosing substep of a nested one.
-struct LifecycleSubstepResultDTO final {
-  LifecyclePrimitiveId substep_id;
-  std::optional<LifecyclePrimitiveId> within;
-  LifecycleTransitionOutcomeDTO outcome;
-  std::int64_t started_at_ns;
-  std::int64_t finished_at_ns;
-  std::optional<ErrorDTO> error;
-
-  [[nodiscard]] bool locally_valid() const noexcept;
-
-  friend bool operator==(const LifecycleSubstepResultDTO&,
-                         const LifecycleSubstepResultDTO&) = default;
-};
-
-/// Feedback while a transition runs: a substep started or finished.
-struct LifecycleSubstepEventDTO final {
-  enum class Phase : std::uint8_t { kStarted = 0, kFinished };
-
-  LifecyclePrimitiveAttemptId attempt_id;
-  LifecyclePrimitiveId substep_id;
-  std::optional<LifecyclePrimitiveId> within;
-  Phase phase;
-  std::int64_t at_ns;
-  std::optional<LifecycleTransitionOutcomeDTO> outcome;  // finished only
-  std::optional<std::string> error_code;                 // finished only
-
-  [[nodiscard]] bool locally_valid() const noexcept;
-
-  friend bool operator==(const LifecycleSubstepEventDTO&,
-                         const LifecycleSubstepEventDTO&) = default;
-};
-
-struct BrandLifecyclePrimitiveResultDTO final {
-  LifecycleTransactionId lifecycle_transaction_id;
-  LifecycleTransactionGeneration lifecycle_transaction_generation;
-  ControllableComponentId controllable_component_id;
-  ControlDomainId control_domain_id;
-  ControlDomainRevision control_domain_revision;
-  ProviderInstanceId provider_instance_id;
-  ProviderManifestId provider_manifest_id;
-  ProviderManifestRevision provider_manifest_revision;
-  RuntimeUnitId provider_runtime_unit_id;
-  RuntimeEpoch provider_runtime_epoch;
-  LifecyclePrimitiveId lifecycle_primitive_id;
-  LifecyclePrimitiveAttemptId lifecycle_primitive_attempt_id;
-  std::uint64_t expected_observation_generation;
-  LifecycleTransitionOutcomeDTO outcome;
-  /// Required unless `outcome` is succeeded.
-  std::optional<ErrorDTO> error;
-  std::vector<LifecycleSubstepResultDTO> substeps{};
-
-  [[nodiscard]] bool locally_valid() const noexcept;
-  [[nodiscard]] bool matches(const BrandLifecyclePrimitiveIntentDTO& intent) const noexcept;
-
-  friend bool operator==(const BrandLifecyclePrimitiveResultDTO&,
-                         const BrandLifecyclePrimitiveResultDTO&) = default;
-};
-
-/// L3 at transition level: what CCLC observed before dispatch and after the
-/// transition (its verification on success, one fresh Observe after a
-/// dispatched failure).
-struct LifecycleTransitionObservationDTO final {
-  ComponentLifecycleStateDTO observed_state;
-  std::vector<LifecycleFactDTO> facts;
-  std::uint64_t observation_generation;
-  std::uint64_t source_sequence;
-  std::int64_t at_ns;
-
-  [[nodiscard]] bool locally_valid() const noexcept;
-
-  friend bool operator==(const LifecycleTransitionObservationDTO&,
-                         const LifecycleTransitionObservationDTO&) = default;
-};
-
-[[nodiscard]] LifecycleTransitionObservationDTO RecordLifecycleTransitionObservation(
-    const BrandLifecycleObservationDTO& observation);
 
 struct ProviderDomainActiveConfigurationDTO final {
   ActiveControlConfigurationId active_control_configuration_id;
@@ -802,31 +283,6 @@ struct ComponentLifecycleCurrentSnapshotDTO final {
                          const ComponentLifecycleCurrentSnapshotDTO&) = default;
 };
 
-/// Owner-local controller occurrence transferred only by selected bring-up.
-/// CCLC's component watermark is deliberately not mirrored here. Zero is a
-/// real domain floor before its first observation, not a ready observation.
-struct SelectedDomainOccurrenceDTO final {
-  ControlDomainId control_domain_id;
-  std::uint64_t observation_generation{};
-  friend bool operator==(const SelectedDomainOccurrenceDTO&,
-                         const SelectedDomainOccurrenceDTO&) = default;
-};
-
-struct SelectedControllerOccurrenceDTO final {
-  std::optional<ExecutionBindingEpoch> arm_binding_epoch;
-  std::vector<SelectedDomainOccurrenceDTO> domains;
-  [[nodiscard]] bool locally_valid() const noexcept;
-  friend bool operator==(const SelectedControllerOccurrenceDTO&,
-                         const SelectedControllerOccurrenceDTO&) = default;
-};
-
-/// Pure successor construction from the exact owned predecessor, before any
-/// retirement. Continuing domains advance; new domains use first generation
-/// one; removed domains are absent. It grants no effect or publication right.
-[[nodiscard]] Result<SelectedControllerOccurrenceDTO> ComputeSelectedControllerSuccessorOccurrence(
-    const SelectedControllerOccurrenceDTO& predecessor,
-    const std::vector<ControlDomainId>& candidate_domains, bool candidate_has_arm);
-
 inline constexpr std::string_view kComponentLifecycleCurrentSnapshotIdentityDomain =
     "component-lifecycle-current-snapshot";
 inline constexpr std::string_view kComponentLifecycleCurrentSnapshotApiVersion =
@@ -842,115 +298,5 @@ inline constexpr std::string_view kComponentLifecycleCurrentSnapshotApiVersion =
 /// digest.  This is the common readback boundary for production composition.
 [[nodiscard]] Result<void> VerifyComponentLifecycleCurrentSnapshot(
     const ComponentLifecycleCurrentSnapshotDTO& snapshot);
-
-struct ComponentLifecycleDomainStatusDTO final {
-  ControlDomainId control_domain_id;
-  std::optional<ExpectedControlDomainRevisionDTO> expected_domain;
-  std::optional<ResolvedLifecycleControlDomainScopeDTO> current_scope;
-  std::optional<ResolvedLifecycleProviderOccurrenceDTO> resolved_provider_occurrence;
-  std::optional<ComponentLifecycleStateDTO> previous_state;
-  std::optional<ComponentLifecycleStateDTO> current_state;
-  ComponentLifecycleRequestedStateDTO requested_state;
-  ComponentLifecycleDomainActionStateDTO action_state;
-  std::vector<BrandLifecyclePrimitiveResultDTO> primitive_attempts;
-  std::optional<ErrorDTO> error;
-  /// Append-only feedback of the running transition action.
-  std::vector<LifecycleSubstepEventDTO> substep_events{};
-  std::optional<LifecycleTransitionObservationDTO> observed_before{};
-  std::optional<LifecycleTransitionObservationDTO> observed_after{};
-
-  [[nodiscard]] bool locally_valid() const noexcept;
-
-  friend bool operator==(const ComponentLifecycleDomainStatusDTO&,
-                         const ComponentLifecycleDomainStatusDTO&) = default;
-};
-
-/// Durable selected bring-up evidence is observation/reconciliation data.
-/// Shape validation never grants qualification, dispatch, or replay authority.
-struct SelectedComponentBringUpEvidenceDTO final {
-  ContentDigest offer_digest;
-  ContentDigest predecessor_snapshot_digest;
-  std::string incident_id;
-  StopId containment_stop_id;
-  StopGeneration containment_stop_generation;
-  ProjectionRevisionDTO candidate_projection_revision;
-  ContentDigest candidate_retained_bundle_digest;
-  std::uint64_t candidate_retained_bundle_bytes;  // Byte count, never bundle payload.
-  SelectedControllerOccurrenceDTO predecessor_occurrence;
-  SelectedControllerOccurrenceDTO successor_occurrence;
-  CellAdmissionClaimDTO selected_claim;
-  ConfigurationFenceAcceptedDTO accepted_fence;
-  ContentDigest original_request_payload_digest;
-
-  friend bool operator==(const SelectedComponentBringUpEvidenceDTO&,
-                         const SelectedComponentBringUpEvidenceDTO&) = default;
-};
-
-/// Real contained predecessor facts, absent for ordinary initial activation.
-struct ApplyComponentBringUpRecoveryEvidenceDTO final {
-  ContentDigest predecessor_snapshot_digest;
-  std::string incident_id;
-  StopId containment_stop_id;
-  StopGeneration containment_stop_generation;
-
-  friend bool operator==(const ApplyComponentBringUpRecoveryEvidenceDTO&,
-                         const ApplyComponentBringUpRecoveryEvidenceDTO&) = default;
-};
-
-/// Observation of one Q91 component operation under the existing Apply
-/// parent's exclusion. It is not an independent child Kernel claim. The
-/// full Manager plan stays in Manager; the original request identity is sealed
-/// separately. Restoring this value never recreates a continuation.
-struct ApplyComponentBringUpEvidenceDTO final {
-  ApplyComponentBringUpAuthorityDTO parent_authority;
-  ConfigurationFenceScopeDTO selected_scope;
-  ContentDigest original_request_payload_digest;
-  ProjectionRevisionDTO candidate_projection_revision;
-  ContentDigest candidate_retained_bundle_digest;
-  std::uint64_t candidate_retained_bundle_bytes{};
-  RuntimeUnitEpochBindingDTO original_execution_host;
-  std::optional<ApplyComponentBringUpRecoveryEvidenceDTO> recovery;
-  std::optional<SelectedControllerOccurrenceDTO> predecessor_occurrence;
-  /// Transfer lower bound, not a device observation or proof of readiness.
-  std::optional<SelectedControllerOccurrenceDTO> successor_occurrence_floor;
-
-  friend bool operator==(const ApplyComponentBringUpEvidenceDTO&,
-                         const ApplyComponentBringUpEvidenceDTO&) = default;
-};
-
-struct ComponentLifecycleStatusDTO final {
-  ComponentLifecycleAcceptedDTO acceptance;
-  ComponentLifecycleIntentDTO accepted_intent;
-  std::uint64_t status_sequence;
-  RequestOwnerEpoch status_owner_epoch;
-  std::optional<ComponentLifecycleStateDTO> previous_state;
-  std::optional<ComponentLifecycleStateDTO> current_state;
-  ComponentLifecycleRequestedStateDTO requested_state;
-  ComponentLifecycleTransactionPhaseDTO phase;
-  std::vector<ComponentLifecycleDomainStatusDTO> domains;
-  bool reconciliation_required;
-  std::optional<ComponentLifecycleTerminalResultDTO> terminal_result;
-  std::optional<ErrorDTO> error;
-  std::int64_t accepted_at_ns;
-  std::int64_t latest_updated_at_ns;
-  std::int64_t remaining_duration_ns;
-  std::optional<SelectedComponentBringUpEvidenceDTO> selected_bring_up{};
-  std::optional<ApplyComponentBringUpEvidenceDTO> apply_bring_up{};
-
-  [[nodiscard]] bool locally_valid() const noexcept;
-
-  friend bool operator==(const ComponentLifecycleStatusDTO&,
-                         const ComponentLifecycleStatusDTO&) = default;
-};
-
-[[nodiscard]] bool ExpectedDomainMatchesResolvedScope(
-    const ExpectedControlDomainRevisionDTO& expected,
-    const ResolvedLifecycleControlDomainScopeDTO& current) noexcept;
-
-/// Same sealed domain/provider proof without claiming configuration presence.
-/// Apply uses this while an actual installation may add its configuration.
-[[nodiscard]] bool ExpectedDomainProofMatchesResolvedScope(
-    const ExpectedControlDomainRevisionDTO& expected,
-    const ResolvedLifecycleControlDomainScopeDTO& current) noexcept;
 
 }  // namespace manyforge::core

@@ -16,7 +16,6 @@
 
 #include <algorithm>
 #include <iostream>
-#include <manyforge_core/types/projection_common.hpp>
 #include <mutex>
 #include <set>
 #include <utility>
@@ -44,19 +43,6 @@ bool portable_channel(std::string_view value) {
          });
 }
 
-bool valid_identity(const core::IoOutputCommandIdentityDTO &identity) {
-  const auto &command = identity.command;
-  return !command.operation_id.empty() &&
-         command.operation_revision.nonzero() &&
-         !command.participant_id.empty() &&
-         !command.command_id.empty() &&
-         command.command_generation.nonzero() &&
-         identity.component_lifecycle_generation.nonzero() &&
-         core::IsExactLowercaseSha256Digest(
-             identity.prepared_contract_digest.value()) &&
-         identity.provider.locally_valid();
-}
-
 } // namespace
 
 struct MockBooleanOutputProvider::State final {
@@ -71,11 +57,6 @@ struct MockBooleanOutputProvider::State final {
     core::IoSignalId signal_id;
     std::size_t gate;
   };
-  struct Record final {
-    core::IoOutputWriteRequestDTO request;
-    core::IoOutputObservationDTO observation;
-  };
-
   struct AliasTable final {
     std::vector<Gate> gates;
     std::vector<Alias> aliases;
@@ -152,7 +133,6 @@ struct MockBooleanOutputProvider::State final {
   std::vector<Gate> gates;
   std::vector<Alias> aliases;
   std::optional<bool> model;
-  std::optional<Record> record;
   std::function<void(bool, core::TimePoint)> model_observer;
   bool retired = false;
 };
@@ -183,100 +163,34 @@ MockBooleanOutputProvider::MockBooleanOutputProvider(
     : state_(std::move(state)) {}
 MockBooleanOutputProvider::~MockBooleanOutputProvider() = default;
 
-core::IoOutputEvidence
-MockBooleanOutputProvider::StrongestOutputEvidence() const noexcept {
-  return core::IoOutputEvidence::kSourceAccepted;
-}
-
-core::Result<core::IoOutputObservationDTO>
-MockBooleanOutputProvider::SubmitOutput(
-    const core::IoOutputWriteRequestDTO &request) {
-  using Reply = core::Result<core::IoOutputObservationDTO>;
+SetOutputResult MockBooleanOutputProvider::WriteOutput(const core::IoSignalId &signal,
+                                                      const bool value) {
+  const auto failed = [](std::string code, std::string message) {
+    return SetOutputResult{core::ActionOutcome::kFailed,
+                           core::ActionError{std::move(code), std::move(message),
+                                             std::nullopt, std::nullopt}};
+  };
   std::shared_ptr<const void> driver_pin;
   std::lock_guard lock(state_->mutex);
-  if (state_->record) {
-    if (state_->record->request == request)
-      return Reply::Ok(state_->record->observation);
-    return reject<core::IoOutputObservationDTO>(
-        state_->record->request.identity == request.identity
-            ? "io_output_request_conflict"
-            : "io_output_correlation_busy",
-        "Existing command owner must retire its exact output correlation");
-  }
-  if (!valid_identity(request.identity))
-    return reject<core::IoOutputObservationDTO>(
-        "io_output_identity_invalid",
-        "Output requires its actual committed identity");
-  const auto alias = std::find_if(
-      state_->aliases.begin(), state_->aliases.end(),
-      [&](const auto &row) { return row.signal_id == request.signal_id; });
-  if (alias == state_->aliases.end() ||
-      state_->gates[alias->gate].provider != request.identity.provider)
-    return reject<core::IoOutputObservationDTO>(
-        "io_output_provider_mismatch",
-        "Output alias does not name its configured occurrence");
-  driver_pin = state_->gates[alias->gate].actual_driver_owner.lock();
-  std::optional<core::ErrorDTO> refusal;
-  if (state_->retired || !driver_pin || !state_->gates[alias->gate].accepting) {
-    refusal =
-        core::ErrorDTO{"io_output_not_submitted",
-                       "Mock output provider occurrence is disabled or retired",
-                       {{"reason", "io_output_driver_disabled"}}};
-  }
-  // Allocate/copy the whole retained correlation before checking the actual
-  // acceptance instant or changing the model. A lost return after the write
-  // leaves the exact accepted fact queryable; retired IDs need no second
-  // ledger.
-  state_->record.emplace(
-      State::Record{request,
-                    {request.identity, core::IoOutputEvidence::kNotSubmitted, 0,
-                     std::move(refusal)}});
-  const auto now = state_->clock.now();
-  state_->record->observation.trusted_received_at_ns = now;
-  if (state_->record->observation.error)
-    return Reply::Ok(state_->record->observation);
-  if (request.absolute_deadline_ns) {
-    state_->record->observation.error = core::ErrorDTO{
-        "io_output_not_submitted",
-        "Immediate Mock output does not accept a timed completion policy",
-        {{"reason", "io_output_completion_policy_mismatch"}}};
-    return Reply::Ok(state_->record->observation);
-  }
-  state_->model = request.value;
-  state_->record->observation.evidence =
-      core::IoOutputEvidence::kSourceAccepted;
+  const auto alias = std::find_if(state_->aliases.begin(), state_->aliases.end(),
+                                  [&](const auto &row) { return row.signal_id == signal; });
+  if (alias == state_->aliases.end())
+    return failed("io_signal_unknown", "'" + signal.name + "' is not an output of this channel");
+  const auto &gate = state_->gates[alias->gate];
+  driver_pin = gate.actual_driver_owner.lock();
+  if (state_->retired || !driver_pin || !gate.accepting)
+    return failed("io_output_not_submitted",
+                  "the output's I/O component is not enabled; nothing was sent");
+  state_->model = value;
   if (state_->model_observer) {
     try {
-      state_->model_observer(request.value, now);
+      state_->model_observer(value, state_->clock.now());
     } catch (...) {
-      // Output acceptance is already settled; a failed synthetic echo must
-      // not be rewritten into a fabricated no-effect output result.
+      // The write is accepted; a failed synthetic echo doesn't undo it.
       std::cerr << "Mock I/O echo could not be scheduled\n";
     }
   }
-  return Reply::Ok(state_->record->observation);
-}
-
-core::Result<core::IoOutputObservationDTO>
-MockBooleanOutputProvider::ObserveOutputResult(
-    const core::IoOutputCommandIdentityDTO &identity) const {
-  std::lock_guard lock(state_->mutex);
-  if (!state_->record || state_->record->request.identity != identity)
-    return reject<core::IoOutputObservationDTO>(
-        "io_output_correlation_unavailable",
-        "No retained evidence for this exact output command");
-  return core::Result<core::IoOutputObservationDTO>::Ok(
-      state_->record->observation);
-}
-
-core::Result<void> MockBooleanOutputProvider::RetireOutput(
-    const core::IoOutputCommandIdentityDTO &identity) {
-  std::lock_guard lock(state_->mutex);
-  if (state_->record && state_->record->request.identity != identity)
-    return reject<void>("io_output_correlation_mismatch",
-                        "Retirement cannot clear another command");
-  state_->record.reset();
-  return core::Result<void>::Ok();
+  return {core::ActionOutcome::kSucceeded, std::nullopt};
 }
 
 core::Result<void> MockBooleanOutputProvider::Pause(

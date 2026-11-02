@@ -28,19 +28,18 @@ roles:
     arm_collision: [<TODO>]       # arm links
 tcps:                             # the first is the default TCP; each id is its name
   - {id: flange, frame: <TODO>}   # usually the flange link
-tcp_speed_check: active_tcp_and_flange
 limits:
   max_tcp_linear_speed_mps: <TODO vendor TCP speed limit in m/s, from the datasheet>
 lanes:
-  mock:
-    controllers:
-      template: ufactory          # ufactory (xArm 5/6/7, Lite 6, UF850) or ur
-      hardware_component_name: <TODO>   # e.g. MockAcmeR6System
-      arm_controller: <TODO>            # the vendor controller file's arm controller
-      vendor_joint_constraints: {trajectory: "1.0"}  # ufactory only; copy from the vendor file
-      hard_stop_completion_timeout_s: 1.5
-      gripper_result_timeout_s: 5.0
-      arrival_tolerance_rad: 0.01       # Mock arrival: every arm joint's JTC goal
+  mock:                           # Mock lane adapter (manyforge_ros2_control_execution/lane/)
+    adapter: mock
+    controller: <TODO>              # the arm's JointTrajectoryController, e.g. acme_r6_traj_controller
+    arrival_tolerance_rad: 0.01     # Mock arrival: every arm joint's JTC goal
+    controllers_file: mock_controllers.yaml   # in this folder; fill in from the vendor's controller file
+    # A model of a vendor with an adapter (xArm) names it instead of the file:
+    # `vendor: xarm` and `vendor_model: <model>` (its controllers, as on the real lane).
+    hard_stop_completion_timeout_s: 1.5
+    gripper_result_timeout_s: 5.0
 defaults:
   initial_joint_positions_rad: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]  # one per arm joint
   maximum_tcp_linear_speed_mps: 0.15

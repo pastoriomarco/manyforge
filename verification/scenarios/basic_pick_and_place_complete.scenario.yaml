@@ -1,7 +1,7 @@
 scenario_id: basic_pick_and_place_complete
 description: End-to-end baseline qualification for the standard pick-and-place application.
-program: examples/pick_and_place.program.yaml
-deployment: examples/pick_and_place.deployment.yaml
+# Program, Deployment and assignment come from the Scenario folder.
+scenario: examples/mock_ur5_pick_and_place.scenario
 timeouts:
   scenario_s: 60
   poll_interval_ms: 50

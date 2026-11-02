@@ -20,7 +20,7 @@ import { sceneOwnerFacts } from './sceneAuthoring';
 const CELL = 'c1_build_authority_cell';
 const BUNDLE = 'sha256:9a6355d1b1ee8f2b79f8176739e267634fccf770aecf4dc3a4c63f9552911c9d';
 const GRAPH = 'sha256:5b83362c6824f7f99d345196cd2cbfe591a476049df87438629ecc95f25fce95';
-const ARM_MODEL_REVISION = 'sha256:7a1c756e854600a56cbb1cfbe81b6f92ec2a07e288128205c9fefc2dc0101f80';
+const ARM_MODEL_REVISION = 'sha256:4d5eac92cf13634032aa1a55621458c0d5b429038c5cbcdec60abc1fc73dc344';
 const TOOL_MODEL_REVISION = 'sha256:0eddbd7507080aa8bd3c2fcb71663efd00f346cd535d642b9bc78a54329f8562';
 const BASE_LINK = 'mf1_link_d1e7fbc98bf3e16e7f995f230627f6415449c6fde92b92489856e0b52d659c0d';
 const TOOL0_LINK = 'mf1_link_b38adee212db65935dc7358d86b459c57897a27664f7bbbe8d86661642591f89';

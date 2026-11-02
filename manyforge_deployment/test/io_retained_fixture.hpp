@@ -1,8 +1,7 @@
 #pragma once
 
 #include "lite6_retained_consumer_fixture.hpp"
-#include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
-#include <manyforge_core/io_provider_lifecycle_catalog.hpp>
+#include <algorithm>
 #include <manyforge_deployment/io_provider_domain.hpp>
 
 namespace manyforge::deployment::test {
@@ -16,7 +15,7 @@ materialize_boolean_io_retained_fixture(
     bool include_output = false, bool ros_output = false,
     bool second_output = false, bool shared_output_channel = false,
     const CanonicalValue *interrupt_rules = nullptr,
-    std::string_view output_profile = {}) {
+    std::string_view output_profile = {}, bool controller_owned_output = false) {
   namespace fixture = lite6_controllable_fixture_detail;
   if ((!include_input && !include_output) || (ros_output && !include_output) ||
       (second_output && !include_output) ||
@@ -24,12 +23,12 @@ materialize_boolean_io_retained_fixture(
     throw std::logic_error(
         "I/O fixture needs an actual selected signal profile");
   if ((!output_profile.empty() && !include_output) ||
-      (!output_profile.empty() && output_profile != "ur_set_io" &&
+      (!output_profile.empty() && output_profile != "component_adapter" &&
        output_profile != "ros2_control_gpio"))
     throw std::logic_error("I/O fixture output profile is unsupported");
   auto carrier = make_lite6_controllable_retention_fixture(
-      false, false, 0U, false, true, "io.cell", false, false, "resource", false,
-      {}, {}, true);
+      false, false, 0U, "io.cell", false, false, "resource", false,
+      {}, {});
   const auto runtime = *carrier.ros2_control_execution_runtime_profile;
   const auto runtime_key = runtime.reference().content_addressed_store_key;
   std::vector<Lite6InputArtifact> artifacts;
@@ -157,44 +156,6 @@ materialize_boolean_io_retained_fixture(
       "catalog://component_type/fixture.boolean_io", type_bytes, type));
   records.push_back(type.reference());
 
-  std::vector<QualifiedCommandSchema> command_schemas;
-  if (include_output) {
-    const auto schema = core::builtin_io_signal_write_command_schema();
-    const auto &compatible = schema.compatible_capabilities.front();
-    const auto bytes = canonical_json(CanonicalValue(CanonicalValue::Object{
-        {"api_version", CanonicalValue(std::string(
-                            core::kIoSignalWriteCommandSchemaApiVersion))},
-        {"command_schema_id", CanonicalValue(schema.command_schema_id.value())},
-        {"command_schema_revision",
-         CanonicalValue(schema.command_schema_revision.value())},
-        {"compatible_capabilities",
-         CanonicalValue(
-             CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
-                 {"capability_id",
-                  CanonicalValue(compatible.capability_id.value())},
-                 {"capability_definition_revision",
-                  CanonicalValue(
-                      compatible.capability_definition_revision.value())}})})},
-        {"command_value",
-         CanonicalValue(CanonicalValue::Object{
-             {"value_kind", CanonicalValue("io_signal_write")}})}}));
-    const core::ContentDigest digest(sha256_digest(bytes));
-    const core::ContentAddressedStoreKey key(
-        fixture::catalog_key("command_schema", digest.value()));
-    const core::CommandSchemaCatalogRecordRefDTO reference{
-        schema.command_schema_id,
-        schema.command_schema_revision,
-        core::SchemaId(std::string(core::kCommandSchemaApiVersion)),
-        fixture::schema_revision_for(core::CatalogRecordKind::kCommandSchema),
-        digest,
-        key};
-    auto qualified = resolve_and_qualify_command_schema(reference, key, bytes);
-    artifacts.push_back(fixture::catalog_artifact(
-        "catalog://command_schema/io.signal_write_boolean", bytes, qualified));
-    records.push_back(qualified.reference());
-    command_schemas.push_back(std::move(qualified));
-  }
-
   CanonicalValue::Array offers;
   for (const auto &capability : capabilities) {
     auto offer = CanonicalValue::Object{
@@ -207,13 +168,6 @@ materialize_boolean_io_retained_fixture(
                        fixture::text_array({"io_signal_service"}));
     offers.emplace_back(std::move(offer));
   }
-  const auto plans = core::MakeIoProviderLifecyclePlans();
-  if (!plans.ok())
-    throw std::logic_error("I/O fixture lifecycle plans are invalid");
-  const auto semantic = core::ComputeBrandLifecyclePlanCatalogSemanticDigest(
-      core::ProviderManifestId("manyforge.provider.io_signals"), plans.value());
-  if (!semantic.ok())
-    throw std::logic_error("I/O fixture lifecycle semantic anchor is invalid");
   const auto manifest_bytes = fixture::revisioned_document(
       CanonicalValue(CanonicalValue::Object{
           {"api_version",
@@ -221,14 +175,7 @@ materialize_boolean_io_retained_fixture(
           {"provider_manifest_id",
            CanonicalValue("manyforge.provider.io_signals")},
           {"offered_capabilities", CanonicalValue(std::move(offers))},
-          {"provider_contracts", CanonicalValue(CanonicalValue::Array{})},
-          {"lifecycle_plan_catalog",
-           CanonicalValue(CanonicalValue::Object{
-               {"catalog_api_version",
-                CanonicalValue(
-                    std::string(core::kBrandLifecyclePlanCatalogApiVersion))},
-               {"semantic_digest",
-                CanonicalValue(semantic.value().value())}})}}),
+          {"provider_contracts", CanonicalValue(CanonicalValue::Array{})}}),
       "catalog-record-revision/provider_manifest",
       core::kProviderManifestApiVersion, "provider_manifest_revision");
   const core::ContentDigest manifest_digest(sha256_digest(manifest_bytes));
@@ -283,11 +230,10 @@ materialize_boolean_io_retained_fixture(
         auto selected = output.as_object();
         for (auto &[key, value] : selected)
           if (key == "provider") {
-            if (output_profile == "ur_set_io")
+            if (output_profile == "component_adapter")
               value = CanonicalValue(CanonicalValue::Object{
-                  {"profile", CanonicalValue("ur_set_io")},
-                  {"service", CanonicalValue("/io_device/set_io")},
-                  {"pin", CanonicalValue(3.0)}});
+                  {"profile", CanonicalValue("component_adapter")},
+                  {"bank", CanonicalValue("controller")}});
             else
               value = CanonicalValue(CanonicalValue::Object{
                   {"profile", CanonicalValue("ros2_control_gpio")},
@@ -296,6 +242,13 @@ materialize_boolean_io_retained_fixture(
                   {"interface_name", CanonicalValue("lamp")}});
           }
         output = CanonicalValue(std::move(selected));
+      }
+      if (controller_owned_output) {
+        auto owned = output.as_object();
+        owned.emplace(std::find_if(owned.begin(), owned.end(),
+                                   [](const auto &entry) { return entry.first > "controller_owned"; }),
+                      "controller_owned", CanonicalValue(true));
+        output = CanonicalValue(std::move(owned));
       }
       if (second_output) {
         auto other = output.as_object();
@@ -414,13 +367,6 @@ materialize_boolean_io_retained_fixture(
             {"stop_stage_parameters", CanonicalValue(CanonicalValue::Array{})},
             {"commissioned_stop_interfaces",
              CanonicalValue(CanonicalValue::Array{})},
-            {"interrupt_sources", CanonicalValue(CanonicalValue::Array{})},
-            {"interrupt_policies", CanonicalValue(CanonicalValue::Array{})},
-            {"interrupt_config",
-             parse_strict_json_model_yaml(R"({"queue_depth":8,
-          "cancel_validation_timeout_ns":1000,"motion_scope_arm_timeout_ns":1000,
-          "supervisory_poll_rate_hz":10})")
-                 .root()},
             {"interrupt_rules", *interrupt_rules}}));
     source = CanonicalValue(std::move(fields));
   }
@@ -481,7 +427,7 @@ materialize_boolean_io_retained_fixture(
       deployment.graph(), {}, std::vector<QualifiedComponentType>{type});
   const auto overlay = select_site_overlay_for_deployment({}, {}, nullptr);
   const auto applicability = qualify_cell_applicability(
-      composition, deployment.applicability_inputs(), runtimes, command_schemas,
+      composition, deployment.applicability_inputs(), runtimes, {},
       capabilities, {}, {}, std::vector<QualifiedProviderManifest>{manifest},
       {}, {}, {}, overlay);
   carrier.qualified = qualify_deployment_for_retention(

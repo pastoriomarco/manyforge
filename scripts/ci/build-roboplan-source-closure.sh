@@ -1,17 +1,24 @@
 #!/usr/bin/env bash
 # Build exact ProxSuite, TOPPRA, and RoboPlan sources without network fallback.
+#
+# ProxSuite is configured with the exact jrl-cmakemodules source and without
+# serialization, so the closure needs no cereal. RoboPlan takes nanoflann from
+# its exact source and uses its bundled tl::expected header; TinyXML2 is the
+# caller's private static build passed in the RoboPlan CMake arguments.
 
 set -euo pipefail
 
-if (( $# < 3 )); then
-    echo "usage: build-roboplan-source-closure.sh PROXSUITE_SOURCE TOPPRA_SOURCE ROBOPLAN_SOURCE [ROBOPLAN_CMAKE_ARG ...]" >&2
+if (( $# < 5 )); then
+    echo "usage: build-roboplan-source-closure.sh PROXSUITE_SOURCE JRL_CMAKEMODULES_SOURCE TOPPRA_SOURCE NANOFLANN_SOURCE ROBOPLAN_SOURCE [ROBOPLAN_CMAKE_ARG ...]" >&2
     exit 2
 fi
 
 PROXSUITE_SOURCE="$1"
-TOPPRA_SOURCE="$2"
-ROBOPLAN_SOURCE="$3"
-shift 3
+JRL_CMAKEMODULES_SOURCE="$2"
+TOPPRA_SOURCE="$3"
+NANOFLANN_SOURCE="$4"
+ROBOPLAN_SOURCE="$5"
+shift 5
 
 canonical_source() {
     local label="$1"
@@ -24,7 +31,9 @@ canonical_source() {
 }
 
 PROXSUITE_SOURCE="$(canonical_source ProxSuite "$PROXSUITE_SOURCE")"
+JRL_CMAKEMODULES_SOURCE="$(canonical_source jrl-cmakemodules "$JRL_CMAKEMODULES_SOURCE")"
 TOPPRA_SOURCE="$(canonical_source TOPPRA "$TOPPRA_SOURCE")"
+NANOFLANN_SOURCE="$(canonical_source nanoflann "$NANOFLANN_SOURCE")"
 ROBOPLAN_SOURCE="$(canonical_source RoboPlan "$ROBOPLAN_SOURCE")"
 
 SOURCE_LEDGER="${ROBOPLAN_SOURCE_LEDGER:-}"
@@ -43,10 +52,11 @@ if [[ "$ALLOW_STRIPPED_GIT" != "0" && "$ALLOW_STRIPPED_GIT" != "1" ]]; then
     echo "ROBOPLAN_ALLOW_STRIPPED_GIT must be 0 or 1" >&2
     exit 2
 fi
-PROXSUITE_SOURCE_ID="${PROXSUITE_SOURCE_ID:-proxsuite_0_7_3_candidate_dependency}"
-PROXSUITE_CMAKE_MODULE_SOURCE_ID="${PROXSUITE_CMAKE_MODULE_SOURCE_ID:-proxsuite_cmake_module_candidate_dependency}"
+PROXSUITE_SOURCE_ID="${PROXSUITE_SOURCE_ID:-proxsuite_0_8_2_dependency}"
+JRL_CMAKEMODULES_SOURCE_ID="${JRL_CMAKEMODULES_SOURCE_ID:-jrl_cmakemodules_2_3_0_dependency}"
 TOPPRA_SOURCE_ID="${TOPPRA_SOURCE_ID:-toppra_0_6_10_ua1_dependency}"
-ROBOPLAN_SOURCE_ID="${ROBOPLAN_SOURCE_ID:-roboplan_0_7_0_ua1_foundation}"
+NANOFLANN_SOURCE_ID="${NANOFLANN_SOURCE_ID:-nanoflann_2_0_1_dependency}"
+ROBOPLAN_SOURCE_ID="${ROBOPLAN_SOURCE_ID:-roboplan_0_8_0_foundation}"
 verifier_git_args=()
 if [[ "$ALLOW_STRIPPED_GIT" == "1" ]]; then
     verifier_git_args+=(--allow-stripped-git)
@@ -55,11 +65,13 @@ python3 "$SOURCE_VERIFIER" --ledger "$SOURCE_LEDGER" \
     --source-id "$PROXSUITE_SOURCE_ID" --root "$PROXSUITE_SOURCE" \
     --content-kind build "${verifier_git_args[@]}"
 python3 "$SOURCE_VERIFIER" --ledger "$SOURCE_LEDGER" \
-    --source-id "$PROXSUITE_CMAKE_MODULE_SOURCE_ID" \
-    --root "${PROXSUITE_SOURCE}/cmake-module" --content-kind build \
-    "${verifier_git_args[@]}"
+    --source-id "$JRL_CMAKEMODULES_SOURCE_ID" --root "$JRL_CMAKEMODULES_SOURCE" \
+    --content-kind build "${verifier_git_args[@]}"
 python3 "$SOURCE_VERIFIER" --ledger "$SOURCE_LEDGER" \
     --source-id "$TOPPRA_SOURCE_ID" --root "$TOPPRA_SOURCE" \
+    --content-kind build "${verifier_git_args[@]}"
+python3 "$SOURCE_VERIFIER" --ledger "$SOURCE_LEDGER" \
+    --source-id "$NANOFLANN_SOURCE_ID" --root "$NANOFLANN_SOURCE" \
     --content-kind build "${verifier_git_args[@]}"
 if [[ "$ALLOW_DEVELOPMENT_SOURCE" == "0" ]]; then
     python3 "$SOURCE_VERIFIER" --ledger "$SOURCE_LEDGER" \
@@ -75,6 +87,10 @@ if [[ ! -f "${PROXSUITE_SOURCE}/CMakeLists.txt" ]]; then
 fi
 if [[ ! -f "${TOPPRA_SOURCE}/cpp/CMakeLists.txt" ]]; then
     echo "TOPPRA source is missing cpp/CMakeLists.txt" >&2
+    exit 2
+fi
+if [[ ! -f "${NANOFLANN_SOURCE}/include/nanoflann.hpp" ]]; then
+    echo "nanoflann source is missing include/nanoflann.hpp" >&2
     exit 2
 fi
 
@@ -95,7 +111,8 @@ fi
 BUILD_ROOT="$(realpath -m -- "$BUILD_ROOT")"
 INSTALL_ROOT="$(realpath -m -- "$INSTALL_ROOT")"
 for output_root in "$BUILD_ROOT" "$INSTALL_ROOT"; do
-    for source_root in "$PROXSUITE_SOURCE" "$TOPPRA_SOURCE" "$ROBOPLAN_SOURCE"; do
+    for source_root in "$PROXSUITE_SOURCE" "$JRL_CMAKEMODULES_SOURCE" "$TOPPRA_SOURCE" \
+        "$NANOFLANN_SOURCE" "$ROBOPLAN_SOURCE"; do
         case "${output_root}/" in
             "${source_root}/"*)
                 echo "closure output must remain outside every source root: ${output_root}" >&2
@@ -125,9 +142,11 @@ printf '[RoboPlan closure] configure ProxSuite\n'
 cmake -S "$PROXSUITE_SOURCE" -B "$proxsuite_build" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="$proxsuite_install" \
+    -DJRL_CMAKEMODULES_SOURCE_DIR="$JRL_CMAKEMODULES_SOURCE" \
     -DBUILD_TESTING=OFF \
     -DBUILD_PYTHON_INTERFACE=OFF \
     -DBUILD_WITH_VECTORIZATION_SUPPORT=OFF \
+    -DPROXSUITE_BUILD_WITH_SERIALIZATION=OFF \
     -DFETCHCONTENT_FULLY_DISCONNECTED=ON \
     -DFETCHCONTENT_UPDATES_DISCONNECTED=ON
 printf '[RoboPlan closure] build ProxSuite\n'
@@ -189,7 +208,10 @@ env "${stack_environment[@]}" \
     "$ROBOPLAN_SOURCE" \
     "$@" \
     -DFETCHCONTENT_FULLY_DISCONNECTED=ON \
-    -DFETCHCONTENT_UPDATES_DISCONNECTED=ON
+    -DFETCHCONTENT_UPDATES_DISCONNECTED=ON \
+    -DFETCHCONTENT_SOURCE_DIR_NANOFLANN="$NANOFLANN_SOURCE" \
+    -DCMAKE_DISABLE_FIND_PACKAGE_nanoflann=ON \
+    -DCMAKE_DISABLE_FIND_PACKAGE_tl-expected=ON
 
 proxsuite_cache="${BUILD_ROOT}/roboplan/roboplan_oink/CMakeCache.txt"
 toppra_cache="${BUILD_ROOT}/roboplan/roboplan_toppra/CMakeCache.txt"

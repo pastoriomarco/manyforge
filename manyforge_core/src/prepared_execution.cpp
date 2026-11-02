@@ -72,14 +72,13 @@ template <typename Available, typename Selected, typename Matches>
 
 [[nodiscard]] bool participant_identity_shape(
     const PreparedOperationParticipantDTO& participant) noexcept {
-  return participant.provider() == nullptr && participant.binding_identity.controller() != nullptr &&
-         digest(participant.prepared_contract_digest) && identity(participant.operation_id) &&
+  return digest(participant.prepared_contract_digest) && identity(participant.operation_id) &&
          counter(participant.operation_revision) && identity(participant.participant_id) &&
          identity(participant.controllable_component_id) &&
          identity(participant.command_target_id) && identity(participant.capability_id) &&
          identity(participant.binding_identity.control_domain_id) && identity(participant.binding_identity.control_domain_revision) &&
-         identity(participant.binding_identity.controller()->control_binding_id) &&
-         identity(participant.binding_identity.controller()->control_binding_revision) &&
+         identity(participant.binding_identity.controller.control_binding_id) &&
+         identity(participant.binding_identity.controller.control_binding_revision) &&
          identity(participant.controller().active_control_configuration_id) &&
          counter(participant.controller().active_control_configuration_generation) &&
          capability_provider_pair_valid(
@@ -125,7 +124,6 @@ template <typename Available, typename Selected, typename Matches>
 [[nodiscard]] bool prepare_identity_matches(
     const PrepareParticipantResultDTO& result,
     const PreparedOperationParticipantDTO& participant) noexcept {
-  if (participant.provider() || !participant.binding_identity.controller()) return false;
   const auto expected_provider_id =
       participant.controller().capability_provider
           ? std::optional(participant.controller().capability_provider->capability_provider_binding_id)
@@ -142,8 +140,8 @@ template <typename Available, typename Selected, typename Matches>
          result.capability_id == participant.capability_id &&
          result.control_domain_id == participant.binding_identity.control_domain_id &&
          result.control_domain_revision == participant.binding_identity.control_domain_revision &&
-         result.control_binding_id == participant.binding_identity.controller()->control_binding_id &&
-         result.control_binding_revision == participant.binding_identity.controller()->control_binding_revision &&
+         result.control_binding_id == participant.binding_identity.controller.control_binding_id &&
+         result.control_binding_revision == participant.binding_identity.controller.control_binding_revision &&
          result.active_control_configuration_id == participant.controller().active_control_configuration_id &&
          result.active_control_configuration_generation ==
              participant.controller().active_control_configuration_generation &&
@@ -160,7 +158,6 @@ template <typename Available, typename Selected, typename Matches>
     const ExecutionBackendStatusDTO& status, const PreparedOperationParticipantDTO& participant,
     const ControllerGoalId& controller_goal_id,
     ControllerGoalGeneration controller_goal_generation) noexcept {
-  if (participant.provider() || !participant.binding_identity.controller()) return false;
   return status.operation_id == participant.operation_id &&
          status.operation_revision == participant.operation_revision &&
          status.participant_id == participant.participant_id &&
@@ -169,8 +166,8 @@ template <typename Available, typename Selected, typename Matches>
          status.capability_id == participant.capability_id &&
          status.control_domain_id == participant.binding_identity.control_domain_id &&
          status.control_domain_revision == participant.binding_identity.control_domain_revision &&
-         status.control_binding_id == participant.binding_identity.controller()->control_binding_id &&
-         status.control_binding_revision == participant.binding_identity.controller()->control_binding_revision &&
+         status.control_binding_id == participant.binding_identity.controller.control_binding_id &&
+         status.control_binding_revision == participant.binding_identity.controller.control_binding_revision &&
          status.controller_topology_id == participant.controller().controller_topology_id &&
          status.topology_revision == participant.controller().topology_revision &&
          status.control_route_id == participant.controller().control_route_id &&
@@ -264,9 +261,9 @@ std::optional<std::string_view> prepared_participant_backend_binding_field_error
     return "prepared_participant_backend_control_domain_id_mismatch";
   if (participant.binding_identity.control_domain_revision != path.control_domain_revision)
     return "prepared_participant_backend_control_domain_revision_mismatch";
-  if (participant.binding_identity.controller()->control_binding_id != path.control_binding_id)
+  if (participant.binding_identity.controller.control_binding_id != path.control_binding_id)
     return "prepared_participant_backend_control_binding_id_mismatch";
-  if (participant.binding_identity.controller()->control_binding_revision != path.control_binding_revision)
+  if (participant.binding_identity.controller.control_binding_revision != path.control_binding_revision)
     return "prepared_participant_backend_control_binding_revision_mismatch";
   if (participant.controller().control_interface_contract_id != path.control_interface_contract_id)
     return "prepared_participant_backend_interface_contract_id_mismatch";
@@ -350,9 +347,9 @@ prepared_participant_backend_physical_binding_field_error(
     return "prepared_participant_backend_control_domain_id_mismatch";
   if (participant.binding_identity.control_domain_revision != path.control_domain_revision)
     return "prepared_participant_backend_control_domain_revision_mismatch";
-  if (participant.binding_identity.controller()->control_binding_id != path.control_binding_id)
+  if (participant.binding_identity.controller.control_binding_id != path.control_binding_id)
     return "prepared_participant_backend_control_binding_id_mismatch";
-  if (participant.binding_identity.controller()->control_binding_revision != path.control_binding_revision)
+  if (participant.binding_identity.controller.control_binding_revision != path.control_binding_revision)
     return "prepared_participant_backend_control_binding_revision_mismatch";
   if (participant.controller().control_interface_contract_id != path.control_interface_contract_id)
     return "prepared_participant_backend_interface_contract_id_mismatch";
@@ -421,8 +418,6 @@ std::optional<std::string_view> prepare_participant_result_field_error(
 Result<PrepareParticipantResultDTO> MakePrepareParticipantResult(
     const PreparedOperationParticipantDTO& participant, PrepareParticipantResultStateDTO state,
     std::optional<ErrorDTO> error) {
-  if (participant.provider() || !participant.binding_identity.controller())
-    return Result<PrepareParticipantResultDTO>::Err(invalid_projection("prepared_controller_authority_required"));
   const auto provider_id =
       participant.controller().capability_provider
           ? std::optional(participant.controller().capability_provider->capability_provider_binding_id)
@@ -439,8 +434,8 @@ Result<PrepareParticipantResultDTO> MakePrepareParticipantResult(
                                      participant.capability_id,
                                      participant.binding_identity.control_domain_id,
                                      participant.binding_identity.control_domain_revision,
-                                     participant.binding_identity.controller()->control_binding_id,
-                                     participant.binding_identity.controller()->control_binding_revision,
+                                     participant.binding_identity.controller.control_binding_id,
+                                     participant.binding_identity.controller.control_binding_revision,
                                      participant.controller().active_control_configuration_id,
                                      participant.controller().active_control_configuration_generation,
                                      provider_id,
@@ -522,8 +517,6 @@ Result<ExecutionBackendStatusDTO> MakeExecutionBackendStatus(
     ControllerGoalGeneration controller_goal_generation, ExecutionBackendStateDTO state,
     double accepted_trajectory_time_s, double progress, std::uint64_t source_sequence,
     std::int64_t receiver_local_receipt_timestamp_ns, std::optional<ErrorDTO> error) {
-  if (participant.provider() || !participant.binding_identity.controller())
-    return Result<ExecutionBackendStatusDTO>::Err(invalid_projection("prepared_controller_authority_required"));
   ExecutionBackendStatusDTO status{participant.operation_id,
                                    participant.operation_revision,
                                    participant.participant_id,
@@ -532,8 +525,8 @@ Result<ExecutionBackendStatusDTO> MakeExecutionBackendStatus(
                                    participant.capability_id,
                                    participant.binding_identity.control_domain_id,
                                    participant.binding_identity.control_domain_revision,
-                                   participant.binding_identity.controller()->control_binding_id,
-                                   participant.binding_identity.controller()->control_binding_revision,
+                                   participant.binding_identity.controller.control_binding_id,
+                                   participant.binding_identity.controller.control_binding_revision,
                                    participant.controller().controller_topology_id,
                                    participant.controller().topology_revision,
                                    participant.controller().control_route_id,

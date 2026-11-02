@@ -114,16 +114,9 @@ export interface ManualControlMotionDescriptor {
     presetReferenceTimeS: number;
     jointLimits: Array<{
       sourceJointName: string;
-      source: 'off' | 'override' | 'imported' | 'preset';
+      source: 'off' | 'override' | 'preset';
       maximumRadS3: number | null;
       presetRadS3: number | null;
-      imported: {
-        maximumRadS3: number;
-        enabled: boolean;
-        machineRequired: boolean;
-        sourceId: string;
-        sourceDigest: string;
-      } | null;
     }>;
   } | null;
   operationalLimit: {
@@ -291,82 +284,6 @@ export interface StopCertificateReference {
   stopGeneration: number;
 }
 
-/** The identity-fenced facts required to clear a cell stop-fault latch. */
-export interface StopFaultRecoveryOffer {
-  latchId: string;
-  latchGeneration: number;
-  recoveryAssessmentRevision: number;
-  recoveryStatus:
-    | 'waiting_for_observation'
-    | 'waiting_for_quiescence'
-    | 'waiting_for_configuration'
-    | 'waiting_for_external_reconciliation'
-    | 'waiting_for_durable_record'
-    | 'ready'
-    | 'recovery_pending';
-  cellId: string;
-  retainedBundleId: string;
-  graphRevision: string;
-  stopCertificate: StopCertificateReference | null;
-  configurationExpectations: Array<{
-    controlDomainId: string;
-    activeControlConfigurationId: string;
-    activeControlConfigurationGeneration: number;
-  }>;
-  /** Why recovery is unavailable (certified latch without a proof); null otherwise. */
-  recoveryUnavailableReason: string | null;
-}
-
-/** The one typed result of Recover cell (Headless `POST /api/execution/cell-recover`). */
-export interface CellRecoverResult {
-  outcome: 'done' | 'not_recovered';
-  acknowledgedIncidents: Array<{
-    controllableComponentId: string;
-    incidentId: string;
-    causeClass: string;
-  }>;
-  latchCleared: boolean;
-  /** Components whose ordinary Recover CCLC accepted (cause released after a first press). */
-  recoveredComponents: string[];
-  /** The owner's typed reason when not recovered; null when done. */
-  reason: { code: string; message: string; details: Record<string, string> } | null;
-}
-
-/**
- * The exact selector of one latched global rule's recovery offer (SX-2206),
- * kept in its wire form so the clear command sends it back unchanged.
- */
-export interface GlobalRuleRecoverySelector {
-  context: {
-    owner_epoch: string;
-    /** Canonical uint64 decimal text. */
-    catalog_generation: string;
-    active_publication_generation: number;
-    bundle: string;
-    graph: string;
-  };
-  rule_id: string;
-  /** Canonical uint64 decimal text. */
-  expected_rule_registration_id: string;
-}
-
-/** One actually latched global rule offered for operator recovery (contracts 78/86). */
-export interface GlobalRuleRecoveryOffer {
-  selector: GlobalRuleRecoverySelector;
-  /** Null while unknown (a source not fresh). */
-  currentCondition: boolean | null;
-  postLatchDisposition: 'auto_clear_on_signal_release' | 'await_operator_ack';
-  latchCause: 'condition' | 'source_loss';
-}
-
-/** The owner's result of one global-rule latch clear request. */
-export interface GlobalRuleRecoveryResult {
-  accepted: boolean;
-  replayStatus: string | null;
-  ruleState: 'clear' | 'tripped' | 'latched' | null;
-  error: string | null;
-}
-
 export interface CellStopStageSummary {
   operationId: string;
   participantId: string;
@@ -378,15 +295,6 @@ export interface CellStopStageSummary {
   substitutionReason: string | null;
 }
 
-export type StopFaultTrigger =
-  | 'scope_promotion'
-  | 'escalated'
-  | 'partial'
-  | 'failed_uncontained'
-  | 'physical_rest_unproven'
-  | 'persistence_degraded'
-  | 'post_reserve_fence_failed';
-
 export interface CellStopActionStatus {
   available: boolean;
   unavailableReason: string | null;
@@ -397,26 +305,6 @@ export interface CellStopActionStatus {
     escalated: boolean;
     hardStopFloorUsed: boolean;
     executedStages: CellStopStageSummary[];
-  } | null;
-  fault: {
-    latchId: string;
-    latchGeneration: number;
-    state: 'latched' | 'recovery_pending' | 'cleared';
-    /** The primary (highest-priority) cause. */
-    trigger: StopFaultTrigger;
-    /** Every distinct cause latched on this Stop, in first-seen order. */
-    observedTriggers: StopFaultTrigger[];
-    recoveryStatus:
-      | 'waiting_for_observation'
-      | 'waiting_for_quiescence'
-      | 'waiting_for_configuration'
-      | 'waiting_for_external_reconciliation'
-      | 'waiting_for_durable_record'
-      | 'ready'
-      | 'recovery_pending'
-      | 'cleared';
-    reasonCode: string;
-    certificate: StopCertificateReference | null;
   } | null;
 }
 
@@ -482,12 +370,13 @@ export type DirectControlMotionSpec =
       waypoints: Pose3Value[];
       max_translation_step_m: number;
       max_rotation_step_rad: number;
-      speed_mode: 'bounded';
+      speed_mode?: 'constant_speed' | 'time_optimal';
       max_angular_speed_rad_s: number;
       max_linear_acceleration_mps2: number;
       max_angular_acceleration_rad_s2: number;
       fallback_policy: 'fail_closed';
-      max_blend_deviation_rad: number;
+      /** One per waypoint; 0 keeps the corner exact. */
+      blend_radii_m: number[];
     };
 
 export interface MotionParticipantPayload {
@@ -510,7 +399,6 @@ export interface MotionParticipantPayload {
     execution_timeout_s: number;
   };
   cache_mode: 'default';
-  planning_profile: 'first_feasible' | 'balanced' | 'quality_bounded';
   target_mode: 'absolute';
   target_reference: null;
   offset_reference: null;
@@ -673,14 +561,6 @@ export type OperationStateName =
   | 'intervention_required'
   | 'cancelled_pre_dispatch';
 
-/** Correlated source facts of an output write (contract 53), never its effect. */
-export type OutputEvidence =
-  | 'not_submitted'
-  | 'submitted'
-  | 'source_accepted'
-  | 'source_rejected'
-  | 'acceptance_unknown';
-
 export interface OperationObservation {
   operationId: string;
   operationRevision: number;
@@ -695,8 +575,6 @@ export interface OperationObservation {
   targetRoleId?: string;
   controllableComponentId?: string;
   commandTargetId?: string;
-  /** Present only when the participant reports output evidence. */
-  outputEvidence?: OutputEvidence;
 }
 
 export type RuntimeScaleApplicationState =

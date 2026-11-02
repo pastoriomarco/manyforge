@@ -38,7 +38,6 @@ from manyforge_behavior.orchestration_ports import (
     FrameTransformError,
     NodeAttemptIdentity,
     OwnerInvocationHeldError,
-    OwnerInvocationGatedError,
     OwnerInvocationRefusedByPriorityError,
     OwnerNodeInputs,
     OwnerTaskObservationUnavailableError,
@@ -60,6 +59,9 @@ from manyforge_behavior.production_ports import (
     program_motion_participant,
 )
 
+# The Runner's execution transport timeout handed to owner task nodes.
+_TRANSPORT_TIMEOUT_S = 30.0
+
 
 _DIGEST_A = "sha256:" + "a" * 64
 _DIGEST_B = "sha256:" + "b" * 64
@@ -79,7 +81,9 @@ class _Transport:
         self.stop_status_reads = 0
         self.stop_states: dict[str, str] = {}
         self.stop_generations: dict[str, int] = {}
-        self.stop_fault_offer: Mapping[str, Any] | None = None
+        self.rule_activations: list[tuple[str, bool]] = []
+        self.outside_clears: list[tuple[str, str]] = []
+        self.output_writes: list[tuple[str, Any]] = []
         self.released_scope_stops: list[tuple[str, str, int]] = []
         self.identity_reads = 0
         self.owner_epoch = "kernel.epoch.7"
@@ -193,13 +197,18 @@ class _Transport:
             },
         }
 
-    def stop_fault(self):
-        return {
-            "ok": True,
-            "command": "get_stop_fault",
-            "stop_fault": deepcopy(self.stop_fault_offer),
-            "global_rule_recovery_offers": [],
-        }
+    def set_rule_active(self, rule_id: str, active: bool):
+        self.rule_activations.append((rule_id, active))
+        return {"ok": True, "command": "set_rule_active"}
+
+    def clear_outside_change(self, component_id: str, signal_name: str):
+        self.outside_clears.append((component_id, signal_name))
+        return {"ok": True, "command": "clear_outside_change"}
+
+    def set_io_output(self, signal_id: str, value: Any, *, origin: str):
+        assert origin == "program"
+        self.output_writes.append((signal_id, value))
+        return {"ok": True, "command": "set_io_output", "result": {"outcome": "succeeded"}}
 
 
 class _LostAcceptanceReplyTransport(_Transport):
@@ -338,7 +347,6 @@ def test_recovery_node_submits_only_the_authored_current_offer_once(accepted, in
         "assessment_revision": 7,
         "control_command_epoch": "epoch.8",
         "execution_id": "execution.9",
-        "latch_id": "latch.1",
         "stop_certificate_id": "certificate.1",
         "stop_owner_generation": 2,
         "allowed_actions": ["acknowledge_and_continue", "replan_from_stopped_state"],
@@ -405,7 +413,6 @@ def test_recovery_node_submits_only_the_authored_current_offer_once(accepted, in
         "expected_assessment_revision": 7,
         "expected_control_command_epoch": "epoch.8",
         "expected_execution_id": "execution.9",
-        "expected_latch_id": "latch.1",
         "expected_stop_certificate_id": "certificate.1",
         "expected_stop_owner_generation": 2,
         "reason": "Program recovery node",
@@ -661,7 +668,7 @@ def _context() -> ProgramRunPortContext:
     return ProgramRunPortContext(
         program_run_id="program-run.1",
         applied_record_digest="sha256:" + "9" * 64,
-        scenario_id="lite6_pick_and_place",
+        scenario_id="mock_lite6_pick_and_place",
         source_document_digest=_DIGEST_A,
         program_id="lite6_program",
         program_revision=_DIGEST_A,
@@ -781,7 +788,6 @@ def _motion_inputs() -> OwnerNodeInputs:
                 "type": "frame_role",
                 "frame_role_id": "base",
             },
-            "planning_profile": "balanced",
             "velocity_scale": 0.4,
             "acceleration_scale": 0.4,
             "max_tcp_linear_speed_mps": None,
@@ -956,7 +962,7 @@ def _absolute_inputs(node_id: str, frames: list[Any]) -> OwnerNodeInputs:
             max_linear_acceleration_mps2=0.5,
             max_angular_acceleration_rad_s2=2.5,
             fallback_policy="fail_closed",
-            max_blend_deviation_rad=0.01,
+            blend_radius_m=0.01,
         )
     return OwnerNodeInputs(parameters=parameters)
 
@@ -1044,6 +1050,48 @@ def test_goal_frames_the_owner_cannot_take_fail_before_submission(
         port.operations.start(node_id, _identity(), inputs)
 
     assert transport.submissions == []
+
+
+def test_cartesian_blend_radii_take_the_waypoint_override_else_the_node_default() -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    inputs = _absolute_inputs("motion.follow_cartesian_path", [None, None, None])
+    path = [dict(waypoint) for waypoint in inputs.parameters["path"]]
+    path[1]["blend_radius_m"] = 0.03
+    path[2]["blend_radius_m"] = 0.0
+    inputs = OwnerNodeInputs(parameters={**inputs.parameters, "path": path})
+
+    port.operations.start("motion.follow_cartesian_path", _identity(), inputs)
+
+    motion = transport.submissions[0]["participants"][0]["payload"]["motion"]
+    assert motion["blend_radii_m"] == [0.01, 0.03, 0.0]
+    assert all("blend_radius_m" not in waypoint for waypoint in motion["waypoints"])
+
+
+@pytest.mark.parametrize("timing", [None, "constant_speed", "time_optimal"])
+def test_cartesian_speed_mode_is_sent_only_when_the_node_sets_cartesian_timing(
+    timing,
+) -> None:
+    # CT-1: absent cartesian_timing keeps the Deployment's timing.
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    inputs = _absolute_inputs("motion.follow_cartesian_path", [None, None])
+    if timing is not None:
+        inputs = OwnerNodeInputs(parameters={**inputs.parameters, "cartesian_timing": timing})
+
+    port.operations.start("motion.follow_cartesian_path", _identity(), inputs)
+
+    motion = transport.submissions[0]["participants"][0]["payload"]["motion"]
+    assert motion.get("speed_mode") == timing
+    assert ("speed_mode" in motion) is (timing is not None)
+
+
+def test_pick_place_cartesian_phases_keep_exact_corners_and_deployment_timing() -> None:
+    motion = NativeKernelProgramPort._cartesian_motion(({"a": 1}, {"b": 2}, {"c": 3}))
+    assert motion["blend_radii_m"] == [0.0, 0.0, 0.0]
+    assert "speed_mode" not in motion
 
 
 @pytest.mark.parametrize("clearance_m", [None, 0.0, 0.0005])
@@ -1213,7 +1261,12 @@ def test_partial_stop_reset_requires_resident_operations_to_be_reset_first() -> 
     assert not [control for control in transport.controls if control[0] == "reset"]
 
 
-def test_partial_stop_reset_accepts_exact_generation_after_intervention_is_retired() -> None:
+@pytest.mark.parametrize("stop_state", ["partial", "failed"])
+def test_uncontained_stop_reset_accepts_exact_generation_after_intervention_is_retired(
+    stop_state: str,
+) -> None:
+    # R3: the cell latch blocks execution after a partial or failed Stop, so
+    # Reset completes; only the Resume fence release needs a succeeded Stop.
     transport = _Transport()
     port = NativeKernelProgramPort(KernelClient(transport))
     port.bind(_context())
@@ -1224,7 +1277,9 @@ def test_partial_stop_reset_accepts_exact_generation_after_intervention_is_retir
         {"state": "intervention_required", "operation_revision": 4}
     )
     port.scope.request_stop("program-run.1", "stop.partial", "Reset containment")
-    transport.stop_states["scope-stop-1"] = "partial"
+    transport.stop_states["scope-stop-1"] = stop_state
+    with pytest.raises(ProductionPortError, match="cannot be released before settlement"):
+        port.scope.release_stop("program-run.1")
 
     reset = port.scope.reset("program-run.1")
 
@@ -1271,22 +1326,6 @@ def test_partial_stop_reset_keeps_intervention_task_and_fence_on_nonquiescent_re
     assert port._task(started.task_id).task_id == started.task_id
     assert port.scope.capture_stop("program-run.1") == ("scope-stop-1", 1)
     assert not transport.released_scope_stops
-
-
-def test_partial_stop_reset_refuses_active_fault_and_unknown_fault_observation() -> None:
-    for fault_offer in ({"latch": {"latch_id": "stop-fault.1"}}, "missing-read"):
-        transport = _Transport()
-        port = NativeKernelProgramPort(KernelClient(transport))
-        port.bind(_context())
-        port.scope.request_stop("program-run.1", "stop.partial", "Reset containment")
-        transport.stop_states["scope-stop-1"] = "partial"
-        if fault_offer == "missing-read":
-            transport.stop_fault = lambda: {"ok": True, "command": "get_stop_fault"}
-        else:
-            transport.stop_fault_offer = fault_offer
-
-        with pytest.raises(ProductionPortError, match="Stop fault"):
-            port.scope.reset("program-run.1")
 
 
 def test_partial_stop_does_not_reconcile_unknown_admission() -> None:
@@ -2546,7 +2585,7 @@ def test_pneumatic_held_result_drains_without_successor_retry_or_resend(
     })
 
     def action(instance):
-        return OwnerTaskAdapter(
+        return OwnerTaskAdapter(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
             name=instance,
             node_id="gripper.command_position",
             node_instance_id=instance,
@@ -2783,7 +2822,7 @@ def test_unadmitted_pneumatic_command_remains_held_without_a_send() -> None:
     port.bind(_context())
     state = OperatorMotionStopState({"command": ()})
     state.publish(OperatorMotionStopSnapshot(1, frozenset({"command"})))
-    command = OwnerTaskAdapter(
+    command = OwnerTaskAdapter(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
         name="command", node_id="gripper.command_position", node_instance_id="command",
         port=port.operations, parameters=dict(_gripper_inputs().parameters), value_sources={},
         attempt_source=SimpleNamespace(begin=lambda node: _identity(node)),
@@ -2920,7 +2959,7 @@ def _pick_inputs(*, policy: str = "pause_for_operator") -> OwnerNodeInputs:
                     "orientation_rpy_max_deg": [0.0, 0.0, 0.0],
                 },
             },
-            "planning_profile": "first_feasible",
+            "planner": {"optimize": "best_of_n", "n": 3},
             "motion_options": {},
             "tool_position": {"kind": "linear_m", "value_m": 0.0},
             "tool_max_effort": {
@@ -3141,13 +3180,7 @@ def test_pick_no_feasible_candidate_preserves_authored_policy_and_diagnostics() 
     ]
 
 
-@pytest.mark.parametrize(
-    "recovery_class",
-    ["ordinary_operator_stop", "stop_fault_intervention"],
-)
-def test_native_motion_stop_projects_exact_operator_recovery_policy(
-    recovery_class: str,
-) -> None:
+def test_native_motion_stop_projects_exact_operator_recovery_policy() -> None:
     transport = _Transport()
     port = _motion_test_port(transport)
     port.bind(_context())
@@ -3170,7 +3203,7 @@ def test_native_motion_stop_projects_exact_operator_recovery_policy(
         "operation_revision": operation["operation_revision"],
         "participants": [{"operation_participant_id": "participant.1"}],
         "recovery_assessment": {
-            "recovery_class": recovery_class,
+            "recovery_class": "ordinary_operator_stop",
         },
         "stop_generation": 2,
         "stop_id": "stop.1",
@@ -3274,7 +3307,6 @@ def test_accepted_native_motion_recovery_releases_the_obsolete_task() -> None:
             "assessment_revision": 3,
             "control_command_epoch": "control.epoch.1",
             "execution_id": "execution.1",
-            "latch_id": "",
             "stop_certificate_id": "certificate.1",
             "stop_owner_generation": 1,
         },
@@ -5105,7 +5137,7 @@ def _contact_pose_inputs() -> OwnerNodeInputs:
         contact_policy_id="pick.contact",
         contact_scene_resource_id="part.7",
         max_tcp_linear_speed_mps=0.2,
-        planning_profile="quality_bounded",
+        planner={"search": "rrt", "max_nodes": None},
         cache_mode="disable",
     )
     return OwnerNodeInputs(parameters=parameters)
@@ -5378,6 +5410,22 @@ def test_idle_scene_restoration_reuses_the_exact_applied_program_convergence() -
     port.release(context.program_run_id)
 
 
+@pytest.mark.parametrize("wait", [None, False, True])
+def test_gripper_command_passes_wait_for_duration_as_bool_option(wait):
+    transport = _preset_transport(kind="linear_m")
+    port = NativeKernelProgramPort(KernelClient(transport)); port.bind(_context())
+    parameters = dict(_gripper_inputs().parameters)
+    parameters["command_duration_s"] = 0.4
+    if wait is not None:
+        parameters["wait_for_duration"] = wait
+    port.operations.start("gripper.command_position", _identity(), OwnerNodeInputs(parameters=parameters))
+    payload = transport.submissions[0]["participants"][0]["payload"]
+    assert payload["caller_options"] == [
+        {"option_id": "command_duration_s", "value_s": 0.4},
+        *([{"option_id": "wait_for_duration", "value_bool": True}] if wait else []),
+    ]
+
+
 @pytest.mark.parametrize("kind", ["position_commanded", "pneumatic"])
 @pytest.mark.parametrize("authored", [None, 0.0, 0.4])
 def test_gripper_attempt_captures_typed_default_and_override_once(kind, authored):
@@ -5562,6 +5610,7 @@ def _prepared_held_behavior():
     parameters = dict(_gripper_inputs().parameters); parameters.pop("command_duration_s")
     node = GripperCommandAdapter(name="command",node_id="gripper.command_position",node_instance_id="command",
         port=port.operations,owner_port_name="kernel_operations",parameters=parameters,value_sources={},
+        transport_timeout_s=_TRANSPORT_TIMEOUT_S,
         attempt_source=SimpleNamespace(begin=begin),input_resolver=SimpleNamespace(snapshot=lambda **kw:SimpleNamespace(parameters=kw["parameters"],blackboard={})),
         operator_stop_state=state,operator_stop_hold_scope="command",program_clock=clock)
     held = OperatorMotionStopPolicy(child=node,node_instance_id="command",stop_state=state)
@@ -5731,7 +5780,6 @@ def _stopped_motion_for_recovery(*, lost_replies: int = 0):
             "assessment_revision": 3,
             "control_command_epoch": "control.epoch.1",
             "execution_id": "execution.1",
-            "latch_id": "",
             "stop_certificate_id": "certificate.1",
             "stop_owner_generation": 1,
         },
@@ -6026,6 +6074,7 @@ def _takeover(**overrides: Any) -> dict[str, Any]:
         "decided_at_ns": 123,
         "elapsed_since_acceptance_ns": 40_500_000,
         "preparation_budget_ns": 30_000_000,
+        "planning_budget_ns": 24_000_000,
         "stop_certificate": None,
     }
     fact.update(overrides)
@@ -6067,6 +6116,9 @@ def test_a_motion_takeover_is_read_from_the_newcomer_operation_state_exactly() -
         _takeover(preparation_budget_ns=2**63),
         _takeover(decided_at_ns=-1),
         _takeover(preparation_budget_ns=0),
+        _takeover(planning_budget_ns=-1),
+        _takeover(planning_budget_ns="24"),
+        {key: value for key, value in _takeover().items() if key != "planning_budget_ns"},
         _takeover(decided_at_ns=1.5),
         _takeover(cause={"message": "no code"}),
         _takeover(incumbent_operation_id=""),
@@ -6114,7 +6166,9 @@ def test_a_newcomer_refused_by_priority_names_the_winner() -> None:
     assert port._tasks == {}
 
 
-def test_a_gate_refusal_is_a_typed_wait_naming_its_rule() -> None:
+def test_a_rule_holds_refusal_is_the_kernels_own_admission_refusal() -> None:
+    """CONTRACTS §8: no "Motion waits"; the node fails at once with it."""
+
     transport = _Transport()
     port = NativeKernelProgramPort(KernelClient(transport))
     port.bind(_context())
@@ -6124,19 +6178,84 @@ def test_a_gate_refusal_is_a_typed_wait_naming_its_rule() -> None:
         return {
             "ok": False,
             "error": {
-                "code": "invalid_state_transition",
-                "message": "Global interrupt rule curtain is active",
-                "details": {"reason": "global_interrupt_gated", "rule_id": "curtain"},
+                "code": "rule_holds",
+                "message": "Rule curtain holds its scope (its condition holds)",
+                "details": {"rule_id": "curtain"},
             },
         }
 
     transport.submit = refuse
-    with pytest.raises(OwnerInvocationGatedError) as raised:
-        port.operations.start("motion.move_to_pose", _identity("motion-gated"), _motion_inputs())
-    assert raised.value.rule_id == "curtain"
-    # The Kernel's own refusal is kept for the timeout failure.
-    assert raised.value.refusal.details == {"reason": "global_interrupt_gated", "rule_id": "curtain"}
+    with pytest.raises(KernelOperationAdmissionRejectedError) as raised:
+        port.operations.start("motion.move_to_pose", _identity("motion-held"), _motion_inputs())
+    assert raised.value.code == "rule_holds"
+    assert raised.value.details == {"rule_id": "curtain"}
     assert port._tasks == {}
+
+
+def test_rules_set_active_is_one_immediate_kernel_call() -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_context())
+    result = port.queries.invoke("rules.set_active", _identity("rule"), OwnerNodeInputs(
+        parameters={"rule_id": "curtain", "active": True}))
+    assert result.succeeded
+    assert transport.rule_activations == [("curtain", True)]
+
+    def unknown(rule_id, active):
+        raise KernelOperationAdmissionRejectedError(
+            "rule_unknown", f"Rule {rule_id} is not in the Deployment", {"rule_id": rule_id})
+
+    transport.set_rule_active = unknown
+    refused = port.queries.invoke("rules.set_active", _identity("rule.2"), OwnerNodeInputs(
+        parameters={"rule_id": "missing", "active": False}))
+    # A tree outcome, never a fault: the node fails with the Kernel's code.
+    assert not refused.succeeded
+    assert refused.reason_code == "rule_unknown"
+    assert "missing" in refused.message
+
+
+def test_clear_outside_change_names_the_bound_output_and_writes_nothing() -> None:
+    transport = _Transport()
+    port = NativeKernelProgramPort(KernelClient(transport))
+    port.bind(_pneumatic_context())
+    result = port.queries.invoke("io.clear_outside_change", _identity("clear"), OwnerNodeInputs(
+        parameters={"target_role": "io.a", "resource_role": "valve.a"}))
+    assert result.succeeded
+    assert transport.outside_clears == [("io.2", "valve.a")]
+    assert transport.submissions == []
+    # Only an output has the flag: an input is refused before any call.
+    refused = port.queries.invoke("io.clear_outside_change", _identity("clear.2"), OwnerNodeInputs(
+        parameters={"target_role": "io.c", "resource_role": "part"}))
+    assert not refused.succeeded
+    assert refused.reason_code == "io_signal_direction_mismatch"
+    assert transport.outside_clears == [("io.2", "valve.a")]
+
+
+def test_changed_outside_is_read_like_any_fresh_input_signal() -> None:
+    queries: list[dict] = []
+
+    class QueryTransport(_Transport):
+        def query_target(self, query):
+            queries.append(dict(query))
+            return {"ok": True, "target_observation": {
+                **query, "schema_version": "manyforge.target_observation.v1",
+                "value": {"value": True, "quality": "fresh", "signal_name": "valve.a.changed_outside",
+                          "source_id": "core.changed_outside.io.2.valve.a",
+                          "source_epoch": "core", "source_sequence": 2}}}
+
+    port = NativeKernelProgramPort(KernelClient(QueryTransport()))
+    port.bind(_pneumatic_context())
+    result = port.queries.invoke("io.check_input", _identity("outside"), OwnerNodeInputs(
+        parameters={"target_role": "io.a", "resource_role": "valve.a.changed_outside",
+                    "expected_value": True}))
+    assert result.succeeded
+    assert queries[0]["resource_role_id"] == "valve.a.changed_outside"
+    # An input has no changed_outside signal: its base is not an output.
+    refused = port.queries.invoke("io.check_input", _identity("outside.2"), OwnerNodeInputs(
+        parameters={"target_role": "io.c", "resource_role": "part.changed_outside",
+                    "expected_value": True}))
+    assert not refused.succeeded
+    assert refused.reason_code == "io_signal_direction_mismatch"
 
 
 def test_a_failed_operation_carries_its_own_failure_facts() -> None:
@@ -6376,8 +6495,7 @@ def _pneumatic_context():
             "controllable_component_id": component, "command_target_id": "io.command",
             "capability_bindings": [{
                 "capability_id": "io.gpio.set_output" if direction == "output" else "io.gpio.get_input",
-                "command_schema": ({"command_schema_id": "io.signal_write", "command_schema_revision": _DIGEST_E}
-                                   if direction == "output" else None),
+                "command_schema": None,
             }],
             "signal_role_bindings": [{
                 "resource_role_id": resource, "signal_name": resource, "value_type": "bool",
@@ -6410,18 +6528,18 @@ def test_pneumatic_plan_uses_endpoint_and_false_before_true(position_request, ex
     assert transport.submissions == []
 
 
-def test_pneumatic_output_steps_have_distinct_kernel_request_ids():
+def test_pneumatic_valve_rows_write_their_signal_ids_without_kernel_operations():
     transport = _preset_transport(kind="linear_m")
     port = NativeKernelProgramPort(KernelClient(transport))
     port.bind(_pneumatic_context())
-    identity = _identity()
-    for step, role in enumerate(("io.a", "io.b")):
-        port.operations.start_pneumatic_output(identity, OwnerNodeInputs({
-            "target_role": role, "resource_role": "valve.a" if step == 0 else "valve.b", "value": False,
-        }), step)
-    assert len({row["request_context"]["request_id"] for row in transport.submissions}) == 2
-    assert all(row["participants"][0]["execution_scope"]["node_attempt_id"] == identity.node_attempt_id
-               for row in transport.submissions)
+    for role, resource in (("io.a", "valve.a"), ("io.b", "valve.b")):
+        result = port.queries.invoke("io.set_output", _identity(), OwnerNodeInputs({
+            "target_role": role, "resource_role": resource, "value": False,
+        }))
+        assert result.succeeded
+    # The captured target role resolves to the component id and signal name.
+    assert transport.output_writes == [("io.2/valve.a", False), ("io.1/valve.b", False)]
+    assert transport.submissions == []
 
 
 
@@ -6992,3 +7110,11 @@ def test_motion_terminal_waits_when_confirmed_tcp_cannot_be_applied(
     assert port.operations.observe(started.task_id).state is expected_state
     assert applied == [("program-run.1", "robot.1", rows)]
     assert len(transport.submissions) == 1
+
+
+def test_motion_planner_override_carries_only_its_set_members() -> None:
+    # Absent keeps the Deployment planner block; set members override it.
+    from manyforge_behavior.production_ports import _planner_override
+
+    assert _planner_override({"search": "rrt", "n": None}) == {"search": "rrt"}
+    assert _planner_override({}) == {}

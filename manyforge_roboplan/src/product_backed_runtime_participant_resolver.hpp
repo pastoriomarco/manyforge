@@ -59,7 +59,7 @@ struct ResolvedTargetObservation final {
 ///
 /// Programs and generated Program Bindings are loaded by the identities in
 /// each bounded operation request. The resolved semantic binding must remain
-/// inside an already-composed physical participant or exact logical output;
+/// inside an already-composed physical participant;
 /// this object performs no repository enumeration, latest selection, or backend
 /// discovery.
 class ProductBackedRuntimeParticipantResolver final {

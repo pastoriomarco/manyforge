@@ -1,5 +1,4 @@
-import type { ActivationSequenceObservation, CCLCController } from './useCCLC';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 
 import { ApiError, api, apiErrorCode, type PersistentKeyValuesFence } from '../api/client';
 import { errorMessage } from '../state/structuralResource';
@@ -21,10 +20,8 @@ import type {
   StructuredError,
 } from '../types/api';
 import type { ComposerHeadlessState } from '../types/headless';
-import {
-  type MotionAttentionBlock,
-  motionAttentionBlock as evaluateMotionAttention,
-} from '../state/operatorAlarmMotionAttention';
+import type { CellLatch, CellState, RunReadiness } from '../types/components';
+import { useActivateExecute } from './useActivateExecute';
 import {
   browserStableIdentity,
   CommandDeliveryUnconfirmedError,
@@ -190,11 +187,18 @@ interface ProgramRuntimeState {
   errorRefusal: StructuredError | null;
 }
 
-/** Commands that start or resume Program progression or motion. */
-const DRAFT_GATED_COMMANDS: ReadonlySet<string> = new Set([
-  'program_run', 'program_motion_start', 'program_motion_resume',
-  'program_resume_full_stop',
-]);
+/**
+ * Runner commands whose per-command allowance the GUI reads (CONTRACTS §10):
+ * Stop, Halt, Reset, runtime scale and blackboard writes, and the Runner's own
+ * Run gate beside RunReadiness (as in M7).
+ */
+export type RunnerCommandKind =
+  | 'program_run'
+  | 'program_reset'
+  | 'program_full_stop'
+  | 'program_motion_stop'
+  | 'runtime_scale'
+  | 'program_runtime_blackboard_write';
 
 const INITIAL_STATE: ProgramRuntimeState = {
   applied: null,
@@ -227,54 +231,6 @@ function currentScenarioKey(value: CurrentScenarioResponse | null): string {
         scenario.programRevision,
         scenario.programBindingId,
       ].join(':')}`;
-}
-
-/** GUI-owned Execute facts. An absent projection is unknown, not a change. */
-export type ExecuteIdentityValue = string | number | boolean | undefined;
-export type ExecuteIdentity = readonly ExecuteIdentityValue[];
-
-export function executeIdentity(
-  enabled: boolean,
-  applied: AppliedProgramSelection | null,
-  currentScenario: CurrentScenarioResponse | null,
-  snapshot: ComposerHeadlessState | null,
-  workspace: ProgramWorkspaceResponse | null,
-  deploymentPending: boolean,
-): ExecuteIdentity {
-  const scenario = currentScenario?.currentScenario;
-  const scenarioIdentity: ExecuteIdentityValue[] = scenario == null
-    ? [applied?.recordDigest, undefined, undefined]
-    : [applied?.recordDigest, scenario.scenarioId, scenario.sourceDocumentDigest];
-  const draftIdentity: ExecuteIdentityValue[] = workspace === null
-    ? [undefined, undefined, undefined, undefined]
-    : [workspace.draft.draftId, workspace.draft.draftRevision,
-      workspace.draft.programRevision ?? 'no-program-revision', workspace.draft.programLoaded];
-  const cycleIdentity: ExecuteIdentityValue[] = snapshot === null
-    ? [undefined, undefined, undefined]
-    : [snapshot.programCycle.programRunId ?? 'no-program-run',
-      snapshot.programCycle.cycleGeneration, snapshot.programCycle.state];
-  const deploymentDraftIdentity: ExecuteIdentityValue[] = snapshot === null
-    ? [undefined, undefined]
-    : [snapshot.authoringWorkspace.deploymentDraftId, snapshot.authoringWorkspace.deploymentDraftRevision];
-  return [
-    enabled,
-    ...scenarioIdentity,
-    ...draftIdentity,
-    ...cycleIdentity,
-    ...deploymentDraftIdentity,
-    snapshot === null ? undefined : JSON.stringify(snapshot.authoringWorkspaceContainment),
-    deploymentPending,
-  ];
-}
-
-export function bindExecuteIdentity(
-  bound: ExecuteIdentity,
-  current: ExecuteIdentity,
-): ExecuteIdentity | null {
-  if (bound.length !== current.length) return null;
-  if (bound.some((value, index) => value !== undefined
-    && current[index] !== undefined && value !== current[index])) return null;
-  return bound.map((value, index) => value ?? current[index]);
 }
 
 /** The exact Applied Program selection a view shows ('none' when absent). */
@@ -402,41 +358,17 @@ export function programPendingAfterProjection(
   return pending;
 }
 
-export const PROGRAM_RESET_READINESS_MESSAGE = 'Reset done, waiting for cell ready…';
-
-export function programResetReadinessMessage(snapshot: ComposerHeadlessState | null): string | null {
-  const cycle = snapshot?.programCycle;
-  // Only successful Reset publication advances the durable cycle generation.
-  return cycle !== undefined && cycle.cycleGeneration > 1
-    && cycle.state === 'idle_after_reset'
-    && cycle.programRunId === null && cycle.cycleClaimGeneration === null
-    && cycle.terminalOrSettlementReference === null && cycle.failure === null
-    && snapshot?.authoringAdmission.authoringAllowed === false
-    ? PROGRAM_RESET_READINESS_MESSAGE : null;
-}
-
+/**
+ * The Execute request for the Applied Program. Whether Execute is allowed is
+ * the backend's `RunReadiness` (CONTRACTS §10); this only names what runs.
+ */
 export function buildProgramStartRequest(
   applied: AppliedProgramSelection | null,
-  runnerAvailable: boolean,
-  pending: ProgramRuntimeState['pending'],
-  snapshot: ComposerHeadlessState | null,
   workspace: ProgramWorkspaceResponse | null,
   requestOwnerEpoch: string,
   requestId: string,
-  /** The Deployment Draft is not the applied one: Execute waits, as for the Program. */
-  deploymentPending = false,
 ): Record<string, JsonValue> | null {
-  if (
-    applied === null || !runnerAvailable || pending !== null || deploymentPending
-    || snapshot === null || !snapshot.authoringAdmission.authoringAllowed
-    || snapshot.programCycle.state !== 'idle_after_reset'
-    || workspace === null
-    || workspace.draft.draftId !== snapshot.authoringWorkspace.programDraftId
-    || workspace.draft.draftRevision
-      !== snapshot.authoringWorkspace.programDraftRevision
-    || !workspace.draft.programLoaded
-    || workspace.draft.programRevision !== applied.programRevision
-  ) return null;
+  if (applied === null || workspace === null || workspace.draft.programRevision == null) return null;
   return {
     request_id: requestId,
     request_owner_epoch: requestOwnerEpoch,
@@ -472,8 +404,6 @@ export interface ProgramResetOptions {
 export interface ProgramResetCallOptions extends ProgramResetOptions {
   correlationId?: string;
   expected?: ProgramResetExpectation;
-  /** D6: Scenario Close's Reset ends the run but never clears the cell Stop fault. */
-  keepStopFault?: boolean;
 }
 
 /** What one Reset call established; never settlement on its own. */
@@ -490,7 +420,7 @@ export function buildProgramResetRequest(
   requestOwnerEpoch: string,
   requestId: string,
   correlationId: string = requestId,
-  options: ProgramResetOptions & { keepStopFault?: boolean } = {},
+  options: ProgramResetOptions = {},
 ): Record<string, JsonValue> | null {
   const cycle = snapshot?.programCycle;
   const allowed = cycle?.allowedCommands.some(
@@ -521,9 +451,6 @@ export function buildProgramResetRequest(
     settlement_evidence_digest: cycle.terminalOrSettlementReference,
     reload_initial_scene: selected.reloadInitialScene ?? false,
     reset_robot_position: selected.resetRobotPosition ?? false,
-    // A retained Reset continues with its own accepted keep_stop_fault (D6).
-    ...((retainedReset !== null ? retainedReset.keepStopFault === true : options.keepStopFault === true)
-      ? { keep_stop_fault: true } : {}),
   };
 }
 
@@ -653,15 +580,26 @@ export function persistentValuesFence(
   return { program_run_id: current.programRunId, expected_run_revision: run.runRevision };
 }
 
+const subscribeNothing = () => () => undefined;
+const EMPTY_CELL_STATE: CellState = { components: null, latch: null, io: null, readiness: null };
+const noCellState = () => EMPTY_CELL_STATE;
+
 export function useProgramRuntime(
   enabled: boolean,
   snapshot: ComposerHeadlessState | null = null,
   workspace: ProgramWorkspaceResponse | null = null,
   controlSource: HeadlessStateSource | null = null,
   deploymentPending = false,
-  cclc?: CCLCController,
 ) {
   const [state, setState] = useState<ProgramRuntimeState>(INITIAL_STATE);
+  // The backend's run readiness and cell latch (CONTRACTS §5, §10), pushed on /ws/control.
+  const cellState = useSyncExternalStore(
+    controlSource?.subscribeCellState ?? subscribeNothing,
+    controlSource?.getCellState ?? noCellState,
+    controlSource?.getCellState ?? noCellState,
+  );
+  const readiness: RunReadiness | null = cellState.readiness;
+  const cellLatch: CellLatch | null = cellState.latch;
   const mounted = useRef(true);
   const pendingProgramRequest = useRef<string | null>(null);
   const refreshing = useRef(false);
@@ -1088,10 +1026,9 @@ export function useProgramRuntime(
   const ordinaryRun = useCallback(async () => {
     const requestId = identity('program-run-start');
     const request = buildProgramStartRequest(
-      state.applied, state.runnerAvailable, state.pending, snapshot, workspace,
-      callerEpoch.current, requestId, deploymentPending,
+      state.applied, workspace, callerEpoch.current, requestId,
     );
-    if (request === null) return;
+    if (request === null || state.pending !== null) return;
     if (controlSource === null) return;
     beginProgramCommand('run', requestId);
     try {
@@ -1104,9 +1041,8 @@ export function useProgramRuntime(
       );
     }
   }, [
-    beginProgramCommand, controlSource, deploymentPending,
-    recordCommandFailure, snapshot,
-    state.applied, state.pending, state.runnerAvailable, workspace,
+    beginProgramCommand, controlSource, recordCommandFailure,
+    state.applied, state.pending, workspace,
   ]);
 
   /**
@@ -1213,8 +1149,9 @@ export function useProgramRuntime(
           program_run_id: state.run.capture.programRunId,
           expected_owner_epoch: state.run.ownerEpoch,
           group_ids: groupIds,
+          // Run/Resume is fenced on run id, owner epoch and selection
+          // revision; tree ticks move the run revision without changing it.
           ...((start || resume) && controls !== null ? {
-            expected_run_revision: controls.runRevision,
             expected_selection_revision: controls.executionSelections.selectionRevision,
           } : {}),
           reason: `operator ${pending}`,
@@ -1357,34 +1294,35 @@ export function useProgramRuntime(
       );
       if (
         groupScaleInFlight.current !== inFlight
-        || groupScaleStatusRef.current.get(row.groupId) !== status
         || groupScaleScopeFenceRef.current.get(row.groupId) !== scopeFence
         || groupScaleStopActiveRef.current.has(row.groupId)
       ) return;
       const accepted = parseRuntimeScaleControlAccepted(receipt.result);
-      const nextStatus = acceptedRuntimeScaleStatus(
-        status,
-        accepted,
-        commandRequestId,
-        scale,
+      // A re-read may have replaced the status while this command was in
+      // flight; keep whichever owner generation is newer.
+      const nextStatus = mergeRuntimeScaleStatus(
+        groupScaleStatusRef.current.get(row.groupId) ?? null,
+        acceptedRuntimeScaleStatus(status, accepted, commandRequestId, scale),
       );
       groupScaleStatusRef.current.set(row.groupId, nextStatus);
       groupScaleScopeFenceRef.current.set(row.groupId, scopeFence);
+      // A value queued during this command keeps the slider where the drag is.
+      const queued = groupScaleQueue.current.get(row.groupId);
       setGroupRuntimeScales((current) => ({
         ...current,
         [row.groupId]: current[row.groupId] === undefined
           ? {
             selector: row.runtimeScaleSelector,
             status: nextStatus,
-            draft: accepted.requestedScale,
-            pending: false,
+            draft: queued ?? accepted.requestedScale,
+            pending: queued !== undefined,
             error: null,
           }
           : {
             ...current[row.groupId],
             status: nextStatus,
-            draft: accepted.requestedScale,
-            pending: false,
+            draft: queued ?? accepted.requestedScale,
+            pending: queued !== undefined,
             error: null,
           },
       }));
@@ -1399,16 +1337,20 @@ export function useProgramRuntime(
             ? {
               selector: row.runtimeScaleSelector,
               status,
-              draft: scale,
+              draft: status.requestedScale,
               pending: false,
               error: errorMessage(reason, 'Group velocity could not be updated.'),
             }
             : {
               ...current[row.groupId],
+              draft: status.requestedScale,
               pending: false,
               error: errorMessage(reason, 'Group velocity could not be updated.'),
             },
         }));
+        // A refusal (e.g. a stale generation after an overlapping scope
+        // changed the same setting) means this row's status is outdated.
+        setGroupScaleRefreshSequence((current) => current + 1);
       }
     } finally {
       if (groupScaleInFlight.current === inFlight) {
@@ -1494,13 +1436,10 @@ export function useProgramRuntime(
         }));
       }
     }));
+    // Only cancel this read. Identity changes clear the queue above and Stops
+    // clear it below; a refresh must not drop the value of a drag in progress.
     return () => {
       cancelled = true;
-      scaleQueue.clear();
-      if (groupScaleTimer.current !== null) {
-        window.clearTimeout(groupScaleTimer.current);
-        groupScaleTimer.current = null;
-      }
     };
   }, [
     clearGroupScaleQueue,
@@ -1822,186 +1761,40 @@ export function useProgramRuntime(
   const cycleState = snapshot?.programCycle?.state ?? null;
   const cycleFailure = snapshot?.programCycle?.failure ?? null;
   const resetRobotPositionAvailability = snapshot?.programCycle?.resetRobotPosition ?? null;
-  const commandAllowed = useCallback((commandKind: string): boolean => (
-    !(DRAFT_GATED_COMMANDS.has(commandKind) && draftUnappliedReason !== null)
-    && (commandKind !== 'program_run' || buildProgramStartRequest(
-      state.applied, state.runnerAvailable, state.pending, snapshot, workspace,
-      callerEpoch.current, 'availability-check', deploymentPending,
-    ) !== null)
-    && (snapshot?.programCycle.allowedCommands.some(
+  const runnerAllows = useCallback((commandKind: RunnerCommandKind): boolean => (
+    snapshot?.programCycle.allowedCommands.some(
       (command) => command.commandKind === commandKind && command.allowed,
-    ) ?? false)
-  ), [deploymentPending, draftUnappliedReason, snapshot, state.applied, state.pending, state.runnerAvailable, workspace]);
-  /** Why a command is currently not allowed (unapplied Draft, then the
-   * backend's reason), if any. */
-  const commandDisabledReason = useCallback((commandKind: string): string | null => (
-    (DRAFT_GATED_COMMANDS.has(commandKind) ? draftUnappliedReason : null)
-    ?? snapshot?.programCycle.allowedCommands.find(
+    ) ?? false
+  ), [snapshot]);
+  /** The Runner's reason a command is currently not allowed, if any. */
+  const runnerRefusal = useCallback((commandKind: RunnerCommandKind): string | null => (
+    snapshot?.programCycle.allowedCommands.find(
       (command) => command.commandKind === commandKind,
     )?.disabledReason
-    ?? (commandKind === 'program_run' ? programResetReadinessMessage(snapshot) : null)
-  ), [draftUnappliedReason, snapshot]);
+    ?? null
+  ), [snapshot]);
 
-  const [activationOffer, setActivationOffer] = useState<ActivationSequenceObservation | null>(null);
-  const activationComponentHealth: CCLCController['componentHealth'] = cclc?.componentHealth ?? {};
-  const activationProgress = cclc?.activationProgress ?? null;
-  const [activationPending, setActivationPending] = useState(false);
-  const [activationWaiting, setActivationWaiting] = useState(false);
-  const executeFlow = useRef<{
-    identity: ExecuteIdentity; applied: AppliedProgramSelection | null;
-    observation: ActivationSequenceObservation | null;
-    phase: 'reading' | 'offered' | 'activating' | 'waiting'; abort: AbortController;
-  } | null>(null);
-  // Only GUI-owned Scenario, Draft and Runner-cycle facts are bound. Missing
-  // projections stay unknown until a later read supplies a value.
-  const currentExecuteIdentity = executeIdentity(
-    enabled, state.applied, state.currentScenario, snapshot, workspace, deploymentPending,
-  );
-  const executeIdentityKey = JSON.stringify(currentExecuteIdentity);
-  const executeAllowed = commandAllowed('program_run');
-  const latestExecute = useRef({ identity: currentExecuteIdentity, cclc, ordinaryRun,
-    allowed: executeAllowed, applied: state.applied });
-  latestExecute.current = { identity: currentExecuteIdentity, cclc, ordinaryRun,
-    allowed: executeAllowed, applied: state.applied };
-  const finishExecuteFlow = useCallback((message?: string) => {
-    const flow = executeFlow.current;
-    executeFlow.current = null;
-    flow?.abort.abort();
-    if (flow?.phase === 'activating') latestExecute.current.cclc?.cancelActivation();
-    setActivationOffer(null);
-    setActivationPending(false);
-    setActivationWaiting(false);
-    if (message !== undefined) {
-      setState((current) => ({ ...current, error: message, errorRefusal: null, failureNoticeKey: null }));
-    }
-  }, []);
-  const cancelActivationExecute = useCallback(() => finishExecuteFlow(), [finishExecuteFlow]);
-  useEffect(() => () => {
-    const flow = executeFlow.current;
-    executeFlow.current = null;
-    flow?.abort.abort();
-    if (flow?.phase === 'activating') latestExecute.current.cclc?.cancelActivation();
-  }, []);
-  useEffect(() => {
-    const flow = executeFlow.current;
-    if (flow === null) return;
-    const bound = bindExecuteIdentity(flow.identity, latestExecute.current.identity);
-    if (bound === null) {
-      finishExecuteFlow('Execute stopped: the Scenario, Draft or Runner cycle changed.');
-      return;
-    }
-    flow.identity = bound;
-    if (flow.phase === 'waiting' && latestExecute.current.allowed) {
-      // Consume before dispatch. This uses the latest ordinary builder and a new
-      // request identity; a refusal is displayed once with no recursive offer.
-      finishExecuteFlow();
-      void latestExecute.current.ordinaryRun();
-    }
-  }, [executeIdentityKey, executeAllowed, activationWaiting, finishExecuteFlow]);
-  const run = useCallback(async () => {
-    if (executeFlow.current !== null) return;
-    if (cclc === undefined) { await ordinaryRun(); return; }
-    if (!latestExecute.current.allowed) return;
-    const flow = { identity: latestExecute.current.identity,
-      applied: latestExecute.current.applied,
-      observation: null as ActivationSequenceObservation | null,
-      phase: 'reading' as 'reading' | 'offered' | 'activating' | 'waiting', abort: new AbortController() };
-    executeFlow.current = flow;
-    setActivationPending(true);
-    try {
-      const observation = await cclc.readActivationSequence(flow.abort.signal, 'execute');
-      if (executeFlow.current !== flow) return;
-      const bound = bindExecuteIdentity(flow.identity, latestExecute.current.identity);
-      if (bound === null) {
-        finishExecuteFlow('Execute stopped: the Scenario, Draft or Runner cycle changed.');
-        return;
-      }
-      flow.identity = bound;
-      const applied = flow.applied;
-      if (applied === null || observation.components.some((component) => (
-        component.retainedBundleId !== applied.retainedBundleId || component.graphRevision !== applied.graphRevision
-      ))) throw new Error('Execute stopped: components do not match the Applied Program configuration.');
-      flow.observation = observation;
-      if (observation.components.some((component) => component.lifecycleState !== 'active')) {
-        flow.phase = 'offered';
-        setActivationOffer(observation);
-        setActivationPending(false);
-      } else {
-        finishExecuteFlow();
-        if (latestExecute.current.allowed) await latestExecute.current.ordinaryRun();
-      }
-    } catch (reason) {
-      if (executeFlow.current === flow) finishExecuteFlow(errorMessage(reason, 'Component activation state is unavailable.'));
-    }
-  }, [cclc, finishExecuteFlow, ordinaryRun]);
-  const confirmActivationExecute = useCallback(async () => {
-    const flow = executeFlow.current;
-    if (flow === null || flow.phase !== 'offered' || flow.observation === null) return;
-    const bound = bindExecuteIdentity(flow.identity, latestExecute.current.identity);
-    if (latestExecute.current.cclc === undefined || bound === null) {
-      finishExecuteFlow('Execute stopped: the Scenario, Draft or Runner cycle changed.');
-      return;
-    }
-    flow.identity = bound;
-    const controller = latestExecute.current.cclc;
-    flow.phase = 'activating';
-    setActivationPending(true);
-    try {
-      const succeeded = await controller.activateSequence(
-        flow.observation.identity,
-        flow.observation.activationOrder,
-      );
-      if (executeFlow.current !== flow) return;
-      const settledIdentity = bindExecuteIdentity(flow.identity, latestExecute.current.identity);
-      if (settledIdentity === null) {
-        finishExecuteFlow('Execute stopped: the Scenario, Draft or Runner cycle changed.');
-        return;
-      }
-      flow.identity = settledIdentity;
-      if (!succeeded) {
-        finishExecuteFlow('Activation stopped; Execute was not sent. See component lifecycle details.');
-        return;
-      }
-      flow.phase = 'waiting';
-      setActivationWaiting(true);
-    } catch (reason) {
-      if (executeFlow.current === flow) finishExecuteFlow(errorMessage(reason, 'Activation outcome is unknown.'));
-    }
-  }, [finishExecuteFlow]);
-
-  const alarms = snapshot?.alarms ?? null;
-  const activeConfiguration = snapshot?.runtime?.activeConfiguration ?? null;
-  /** Operator-alarm attention that refuses Program motion on the exact
-   * resources an operation reserves (spec 450 §5.2), from the owner's
-   * control-state alarm projection and the Kernel's held copy of it for the
-   * active configuration. Never applied to manual Robot Control. */
-  const motionAttentionBlock = useCallback(
-    (resourceIds: readonly string[]): MotionAttentionBlock | null => (
-      evaluateMotionAttention(alarms, resourceIds, activeConfiguration)
-    ),
-    [alarms, activeConfiguration],
-  );
+  // Execute is the ordinary run request; the backend's readiness gates it.
+  const run = ordinaryRun;
+  // Blocked only by components not enabled: Execute offers to activate them first.
+  const activation = useActivateExecute(cellState.components, readiness, ordinaryRun,
+    snapshot?.executionControlStatus?.cellStopAction.expectedStopGeneration ?? null);
 
   return useMemo(() => ({
     state,
     cycleState,
     cycleFailure,
     resetRobotPositionAvailability,
-    commandAllowed,
-    commandDisabledReason,
-    motionAttentionBlock,
+    runnerAllows,
+    runnerRefusal,
+    readiness,
+    cellLatch,
     draftUnappliedReason,
     active,
     refresh,
     dismissError,
-    activationOffer,
-    activationComponentHealth,
-    activationProgress,
-    activationPending,
-    activationWaiting,
-    confirmActivationExecute,
-    cancelActivationExecute,
     run,
+    activation,
     startMotion,
     stopMotion,
     resumeMotion,
@@ -2017,26 +1810,21 @@ export function useProgramRuntime(
     stageManualResult,
   }), [
     active,
-    activationOffer,
-    activationComponentHealth,
-    activationProgress,
-    activationPending,
-    activationWaiting,
-    confirmActivationExecute,
-    cancelActivationExecute,
     applyRecoveryAction,
     dismissError,
     cycleFailure,
     cycleState,
     resetRobotPositionAvailability,
-    commandAllowed,
-    commandDisabledReason,
-    motionAttentionBlock,
+    runnerAllows,
+    runnerRefusal,
+    readiness,
+    cellLatch,
     draftUnappliedReason,
     persistentValues,
     refresh,
     reset,
     run,
+    activation,
     startMotion,
     stopMotion,
     resumeMotion,

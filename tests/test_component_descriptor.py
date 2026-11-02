@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from scripts.components import cli, descriptor, mock_controller_profiles
+from scripts.components import cli, descriptor
 
 ROOT = Path(__file__).resolve().parents[1]
 ROBOTS = {
@@ -43,13 +43,9 @@ def _codes(report: descriptor.Report) -> list[str]:
 
 
 def _workspace(tmp_path: Path, *families: str) -> Path:
-    """A minimal workspace: the rows, the schema, the templates and some robots."""
+    """A minimal workspace: the rows, the templates and some robots."""
     root = tmp_path / "ws"
-    files = [
-        descriptor.DESCRIPTION,
-        mock_controller_profiles.DEFAULT_PATH,
-        descriptor.RUNTIME_SCHEMA,
-    ]
+    files = [descriptor.DESCRIPTION]
     for family in families:
         files += [
             f"{descriptor.MODEL_ASSETS}/{family}.model_asset.json",
@@ -75,17 +71,12 @@ def _workspace(tmp_path: Path, *families: str) -> Path:
 
 
 def _drop_family_rows(path: Path, family: str) -> None:
-    """Cut a family's model family row and profile rows out of the description
-    text; every other byte stays (register writes only the rows it changes)."""
+    """Cut a family's model family row out of the description text; every
+    other byte stays (register writes only the rows it changes)."""
     text = path.read_text(encoding="utf-8")
-    data = json.loads(text)
     decoder = json.JSONDecoder()
     for key, id_key, ids in (
         ("model_families", "model_family_id", {family}),
-        ("runtime_restoration_profiles", "runtime_restoration_profile_id", {
-            row["runtime_restoration_profile_id"] for row in data["runtime_restoration_profiles"]
-            if row.get("model_family_id") == family
-        }),
     ):
         index = text.index(f'"{key}": [') + len(f'"{key}": [')
         while True:
@@ -148,34 +139,27 @@ def _scenario(root: Path, family: str, speed: float = 0.15) -> Path:
     scenario.mkdir()
     robot = yaml.safe_load((_robot(family) / descriptor.DESCRIPTOR).read_text(encoding="utf-8"))
     joints = robot["roles"]["joints"]["arm_joints"]
-    description = json.loads((ROOT / descriptor.DESCRIPTION).read_text(encoding="utf-8"))
-    profile_id = next(
-        row["runtime_restoration_profile_id"]
-        for row in description["runtime_restoration_profiles"]
-        if row.get("model_family_id") == family
-        and row.get("ros2_control_runtime", {}).get("mock_profile") == family
-    )
     deployment = {
         "components": [{
             "component_id": f"{family}_robot",
-            "component_profile_id": profile_id,
+            "component_profile_id": ROBOTS[family],
+            "lane": "mock",
             "configuration": {
                 "runtime_configuration": {
-                    "mock_profile": family,
                     "initial_joint_positions_rad": [0.0] * len(joints),
                     "component_streams": [{"stream_id": "measured_joints"}],
                 },
                 "default_fault_stop_profile": {
                     "per_joint_max_deceleration_rad_s2": {joint: 1.0 for joint in joints},
                 },
-                "target_settings": {
-                    "arm": {
-                        "controlled_stop": {
-                            "per_joint_limits": [{"source_joint_name": joint}
-                                                  for joint in joints],
-                        },
-                        "maximum_tcp_linear_speed_mps": speed,
+            },
+            "target_settings": {
+                "arm": {
+                    "controlled_stop": {
+                        "per_joint_limits": [{"source_joint_name": joint}
+                                              for joint in joints],
                     },
+                    "maximum_tcp_linear_speed_mps": speed,
                 },
             },
         }],
@@ -191,47 +175,52 @@ def test_arm_only_scenario_matches_robot_descriptor(tmp_path: Path, family: str)
     assert report.errors == []
 
 
+def test_machine_arm_scenario_takes_its_owners_lane(tmp_path: Path) -> None:
+    # A member names no lane: it runs on its owner's (CONTRACTS §16).
+    root = _workspace(tmp_path, "lite6")
+    scenario = _scenario(tmp_path, "lite6")
+    path = scenario / "deployment.yaml"
+    deployment = yaml.safe_load(path.read_text(encoding="utf-8"))
+    arm = deployment["components"][0]
+    del arm["lane"]
+    arm.update(owner="lite6", role="arm")
+    owner = {"component_id": "lite6", "component_profile_id": "ufactory.lite6_machine",
+             "configuration": {}, "lane": "mock"}
+    deployment["components"].insert(0, owner)
+    path.write_text(yaml.safe_dump(deployment), encoding="utf-8")
+    assert descriptor.check(root, _robot("lite6", root), scenario)[0].errors == []
+    owner["lane"] = "plc"
+    path.write_text(yaml.safe_dump(deployment), encoding="utf-8")
+    assert "component_lane_invalid" in _codes(descriptor.check(root, _robot("lite6", root),
+                                                               scenario)[0])
+
+
 @pytest.mark.parametrize("family", ROBOTS)
 def test_register_on_a_curated_robot_writes_nothing(tmp_path: Path, family: str) -> None:
     root = _workspace(tmp_path, family)
-    before = {
-        path: (root / path).read_bytes()
-        for path in (descriptor.DESCRIPTION, mock_controller_profiles.DEFAULT_PATH)
-    }
+    before = {path: (root / path).read_bytes() for path in (descriptor.DESCRIPTION,)}
     report, written = descriptor.register(root, _robot(family, root))
     assert report.errors == [] and written == []
     assert {path: (root / path).read_bytes() for path in before} == before
 
 
-def test_register_writes_the_shipped_rows_from_the_descriptor(tmp_path: Path) -> None:
-    # Remove UF850's rows, register its arm-only descriptor: the maintained description
-    # comes back byte for byte, and the Mock row comes back (appended).
+def test_register_writes_the_shipped_family_row_from_the_descriptor(tmp_path: Path) -> None:
+    # Remove UF850's family row, register its descriptor: the row comes back
+    # byte for byte. Its lane rows stay in the descriptor (no profile or
+    # controller rows are written).
     root = _workspace(tmp_path, "uf850")
     description_path = root / descriptor.DESCRIPTION
-    original = description_path.read_text(encoding="utf-8")
+    original = json.loads(description_path.read_text(encoding="utf-8"))["model_families"]
     _drop_family_rows(description_path, "uf850")
-    assert '"uf850_mock_commanded_v0"' not in description_path.read_text(encoding="utf-8")
-    rows_path = root / mock_controller_profiles.DEFAULT_PATH
-    rows_text = rows_path.read_text(encoding="utf-8")
-    shipped_rows = mock_controller_profiles.load(rows_path)
-    lines = rows_text.splitlines(keepends=True)
-    start = next(i for i, line in enumerate(lines) if line == "  - mock_profile: uf850\n")
-    end = next((i for i in range(start + 1, len(lines))
-                if lines[i].startswith("  - mock_profile:")), len(lines))
-    block = "".join(lines[start:end])
-    rows_path.write_text(rows_text.replace(block, ""), encoding="utf-8")
 
     report, _loaded = descriptor.check(root, _robot("uf850", root))
     assert "component_not_registered" in _codes(report)
 
     report, written = descriptor.register(root, _robot("uf850", root))
     assert report.errors == []
-    assert len(written) == 3
-    assert description_path.read_text(encoding="utf-8") == original
-    assert rows_path.read_text(encoding="utf-8").endswith(block)
-    assert sorted(mock_controller_profiles.load(rows_path), key=repr) == sorted(
-        shipped_rows, key=repr
-    )
+    assert written == [f"{descriptor.DESCRIPTION}: model family row uf850"]
+    families = json.loads(description_path.read_text(encoding="utf-8"))["model_families"]
+    assert families == original
     report, _loaded = descriptor.check(root, _robot("uf850", root))
     assert report.errors == []
 
@@ -253,23 +242,65 @@ def test_check_and_register_agree_that_a_reordered_row_matches(tmp_path: Path) -
     assert path.read_bytes() == reordered
 
 
-def test_register_replaces_a_changed_mock_row_in_place(tmp_path: Path) -> None:
-    root = _workspace(tmp_path, "lite6")
-    folder = _robot("lite6", root)
-    _edit(folder, lambda data: data["lanes"]["mock"]["controllers"].update(
-        hard_stop_completion_timeout_s=2.5))
+def test_mock_row_needs_its_controllers_file(tmp_path: Path) -> None:
+    root = _workspace(tmp_path, "ur10e")
+    folder = _robot("ur10e", root)
+    (folder / "mock_controllers.yaml").unlink()
     report, _loaded = descriptor.check(root, folder)
-    assert _codes(report) == ["component_registration_stale"]
-    report, written = descriptor.register(root, folder)
-    assert report.errors == []
-    assert written == [f"{mock_controller_profiles.DEFAULT_PATH}: Mock controller row "
-                       "lite6"]
-    rows_text = (root / mock_controller_profiles.DEFAULT_PATH).read_text(encoding="utf-8")
-    assert rows_text.startswith("# Mock lane controller rows")
-    assert rows_text.index("mock_profile: lite6") < rows_text.index(
-        "mock_profile: uf850")
-    assert "    hard_stop_completion_timeout_s: 2.5\n" in rows_text
-    assert descriptor.check(root, folder)[0].errors == []
+    assert _codes(report) == ["component_lane_invalid"]
+    assert "controllers_file 'mock_controllers.yaml' is not a file" in report.errors[0].message
+
+
+def test_curated_mock_rows_name_their_adapter_and_controllers() -> None:
+    for name in (*ROBOTS, *TOOLS):
+        folder = _robot(name)
+        data = yaml.safe_load((folder / descriptor.DESCRIPTOR).read_text(encoding="utf-8"))
+        row = data["lanes"]["mock"]
+        assert row["adapter"] == "mock"
+        assert ("arrival_tolerance_rad" in row) == (name in ROBOTS)
+        if "vendor" in row:
+            continue
+        controllers = yaml.safe_load((folder / row["controllers_file"]).read_text())
+        assert "/**/controller_manager" in controllers and "/**/__controller__" in controllers
+
+
+def test_ufactory_arms_run_the_xarm_controllers_on_mock_and_isaac() -> None:
+    # Plan "Vendor driver configuration": the vendor base plus ManyForge's
+    # additions on every lane; no copied per-model controllers file.
+    for name in ("lite6", "uf850"):
+        lanes = yaml.safe_load((_robot(name) / descriptor.DESCRIPTOR).read_text())["lanes"]
+        for lane in ("mock", "isaac"):
+            if lane not in lanes:
+                continue
+            row = lanes[lane]
+            assert row["vendor"] == "xarm" and "controllers_file" not in row, (name, lane)
+            assert row["vendor_model"] == lanes["real"]["vendor_model"]
+            assert row["controller"] == lanes["real"]["controller"]
+        assert not (_robot(name) / "mock_controllers.yaml").exists()
+
+
+def test_mock_row_of_a_vendor_model_needs_no_controllers_file(tmp_path: Path) -> None:
+    root = _workspace(tmp_path, "lite6")
+    report, _loaded = descriptor.check(root, _robot("lite6", root))
+    assert "component_lane_invalid" not in _codes(report)
+
+
+def test_ur_mock_controllers_keep_the_ur_values() -> None:
+    controllers = yaml.safe_load((_robot("ur10e") / "mock_controllers.yaml").read_text())
+    manager = controllers["/**/controller_manager"]["ros__parameters"]
+    controller = controllers["/**/__controller__"]["ros__parameters"]
+    assert manager["update_rate"] == 100
+    assert controller["state_publish_rate"] == 100.0
+    assert controller["constraints"] == {
+        "goal_time": 0.0, "stopped_velocity_tolerance": 0.2, "decelerate_on_cancel": True,
+        "__joint__": {"trajectory": 0.2, "max_deceleration_on_cancel": None}}
+
+
+def test_gripper_mock_controllers_use_stock_defaults() -> None:
+    controllers = yaml.safe_load((_tool("lite_gripper") / "mock_controllers.yaml").read_text())
+    assert controllers["/**/__controller__"]["ros__parameters"] == {
+        "joint": "__gripper_joint__", "goal_tolerance": 0.01,
+        "stall_velocity_threshold": 0.001, "stall_timeout": 1.0, "allow_stalling": False}
 
 
 # --- clear errors ---------------------------------------------------------
@@ -291,25 +322,30 @@ def _set(path: str, value):
 @pytest.mark.parametrize(
     ("change", "code", "text"),
     [
-        (_set("roles.frames.flange", "link_tcpx"), "component_role_unknown_link",
+        # The TCP named like the frame role stays on its link (else the TCP check fires).
+        (lambda data: (_set("roles.frames.flange", "link_tcpx")(data),
+                       _set("tcps.0.frame", "link_tcpx")(data)),
+         "component_role_unknown_link",
          "roles.frames.flange: link 'link_tcpx' is not in lite6.urdf"),
         (_set("roles.joints.arm_joints", ["joint_eef", "joint2", "joint3", "joint4",
                                          "joint5", "joint6"]),
          "component_joint_invalid", "joint 'joint_eef' is fixed, not a commanded joint"),
         (_set("roles.groups.arm", "lite7"), "component_group_unknown",
          "group 'lite7' is not in lite6.srdf"),
-        (_set("lanes.mock.controllers.arm_controller", "not a name"),
-         "component_lane_invalid", "arm_controller must be one ROS name token"),
-        (_set("lanes.mock.controllers.template", "kuka"), "component_lane_invalid",
-         "template must be one of"),
+        (_set("lanes.mock.controller", "not a name"),
+         "component_manifest_invalid", "lanes.mock.controller: must be a lower-case portable id"),
+        (_set("lanes.mock.arrival_tolerance_rad", None), "component_lane_invalid",
+         "a robot's row needs arrival_tolerance_rad"),
+        (_set("lanes.mock.vendor", None), "component_lane_invalid",
+         "a Mock row needs a vendor or a controllers_file"),
+        (_set("lanes.kuka", {"adapter": "kuka", "controller": "c"}),
+         "component_manifest_invalid", "lanes: has unknown fields kuka"),
         (_set("extra", 1), "component_manifest_invalid", "has unknown fields extra"),
         (_set("version", "1.0"), "component_manifest_invalid", "MAJOR.MINOR.PATCH"),
         (_set("id", "Lite6"), "component_manifest_invalid", "must be <vendor>.<name>"),
         (_set("limits", None), "component_manifest_invalid", "is missing limits"),
-        (_set("tcps.0.frame", "link_tcpx"), "component_role_unknown_link",
+        (_set("tcps", [{"id": "tool", "frame": "link_tcpx"}]), "component_role_unknown_link",
          "tcps[0].frame: link 'link_tcpx' is not in lite6.urdf"),
-        (_set("tcp_speed_check", "flange_only"), "component_manifest_invalid",
-         "must be one of active_tcp, active_tcp_and_flange"),
         (_set("defaults.initial_joint_positions_rad", [0.0] * 5),
          "component_joint_count_mismatch", "has 5 values for 6 arm joints"),
         (_set("defaults.maximum_tcp_linear_speed_mps", 0.9), "component_limit_exceeded",
@@ -376,57 +412,30 @@ def test_io_signals_are_checked(tmp_path: Path) -> None:
 # --- tools: register and mount -------------------------------------------
 
 
-def _remove_rows(root: Path, family: str) -> str:
-    """Drop a family's rows; return the Mock controller row block removed."""
+def _remove_rows(root: Path, family: str) -> None:
+    """Drop a family's rows from the maintained description."""
     _drop_family_rows(root / descriptor.DESCRIPTION, family)
-    rows_path = root / mock_controller_profiles.DEFAULT_PATH
-    lines = rows_path.read_text(encoding="utf-8").splitlines(keepends=True)
-    start = next(i for i, line in enumerate(lines) if line == f"  - mock_profile: {family}\n")
-    end = next((i for i in range(start + 1, len(lines))
-                if lines[i].startswith("  - mock_profile:")), len(lines))
-    block = "".join(lines[start:end])
-    rows_path.write_text("".join(lines[:start] + lines[end:]), encoding="utf-8")
-    return block
 
 
 @pytest.mark.parametrize("name", TOOLS)
 def test_register_on_a_curated_tool_writes_nothing(tmp_path: Path, name: str) -> None:
     root = _workspace(tmp_path, name)
-    before = {
-        path: (root / path).read_bytes()
-        for path in (descriptor.DESCRIPTION, mock_controller_profiles.DEFAULT_PATH)
-    }
+    before = {path: (root / path).read_bytes() for path in (descriptor.DESCRIPTION,)}
     report, written = descriptor.register(root, _tool(name, root))
     assert report.errors == [] and written == []
     assert {path: (root / path).read_bytes() for path in before} == before
 
 
-def test_register_writes_the_shipped_tool_rows_from_the_descriptor(tmp_path: Path) -> None:
-    # The xArm gripper's rows are exactly what its descriptor registers: the
-    # family row, the minimal Mock profile row and the gripper-only Mock row.
+def test_register_writes_the_shipped_tool_family_row(tmp_path: Path) -> None:
     root = _workspace(tmp_path, "xarm_gripper")
-    original = (root / descriptor.DESCRIPTION).read_text(encoding="utf-8")
-    rows_path = root / mock_controller_profiles.DEFAULT_PATH
-    shipped_rows = mock_controller_profiles.load(rows_path)
-    block = _remove_rows(root, "xarm_gripper")
-    assert "arm_controller" not in block
-
+    original = json.loads((root / descriptor.DESCRIPTION).read_text())["model_families"]
+    _remove_rows(root, "xarm_gripper")
     report, _loaded = descriptor.check(root, _tool("xarm_gripper", root))
     assert "component_not_registered" in _codes(report)
-
     report, written = descriptor.register(root, _tool("xarm_gripper", root))
     assert report.errors == []
-    assert written == [
-        f"{descriptor.DESCRIPTION}: model family row xarm_gripper",
-        f"{descriptor.DESCRIPTION}: component profile row xarm_gripper_mock_commanded_v0",
-        f"{mock_controller_profiles.DEFAULT_PATH}: Mock controller row xarm_gripper",
-    ]
-    assert (root / descriptor.DESCRIPTION).read_text(encoding="utf-8") == original
-    assert rows_path.read_text(encoding="utf-8").endswith(block)
-    assert sorted(mock_controller_profiles.load(rows_path), key=repr) == sorted(
-        shipped_rows, key=repr
-    )
-    assert descriptor.check(root, _tool("xarm_gripper", root))[0].errors == []
+    assert written == [f"{descriptor.DESCRIPTION}: model family row xarm_gripper"]
+    assert json.loads((root / descriptor.DESCRIPTION).read_text())["model_families"] == original
     report, written = descriptor.register(root, _tool("xarm_gripper", root))
     assert report.errors == [] and written == []
 
@@ -446,96 +455,13 @@ def test_the_sources_checker_accepts_what_register_writes(tmp_path: Path) -> Non
     checker.validate(root / descriptor.DESCRIPTION, ROOT)
 
 
-def test_register_writes_a_pneumatic_tool_its_lane_free_profile(tmp_path: Path) -> None:
-    root = _workspace(tmp_path, "lite_gripper")
-    folder = _tool("lite_gripper", root)
-    path = root / descriptor.DESCRIPTION
-    data = json.loads(path.read_text(encoding="utf-8"))
-    data["runtime_restoration_profiles"] = [
-        row for row in data["runtime_restoration_profiles"]
-        if row["runtime_restoration_profile_id"] != "lite_gripper_pneumatic_v0"
-    ]
-    path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-    report, _loaded = descriptor.check(root, folder)
-    assert _codes(report) == ["component_not_registered"]
-    assert "lite_gripper_pneumatic_v0" in report.errors[0].message
-
-    report, written = descriptor.register(root, folder)
-    assert report.errors == []
-    assert written == [
-        f"{descriptor.DESCRIPTION}: component profile row lite_gripper_pneumatic_v0"
-    ]
-    rows = {
-        row["runtime_restoration_profile_id"]: row
-        for row in json.loads(path.read_text(encoding="utf-8"))["runtime_restoration_profiles"]
-    }
-    row = rows["lite_gripper_pneumatic_v0"]
-    assert row["model_family_id"] == "lite_gripper"
-    assert row["stop_profiles"] == {} and row["acceptance_obligations"] == []
-    runtime = row["ros2_control_runtime"]
-    assert set(runtime) == {"component_streams", "gripper_target_configurations"}
-    assert runtime["component_streams"] == []
-    [gripper] = runtime["gripper_target_configurations"]
-    assert gripper["controllable_component_id"] == "lite_gripper"
-    assert gripper["command_target_id"] == "gripper"
-    assert gripper["actuation_kind"] == "pneumatic" and gripper["output_mode"] == "none"
-    assert gripper["mount_frame"] == "lite_gripper_mount"
-    assert gripper["tcp_frame"] == gripper["attach_frame"] == "link_tcp"
-    assert gripper["command_duration_s"] == 0.8
-    assert "pneumatic_io" not in gripper
-    assert descriptor.check(root, folder)[0].errors == []
-    assert descriptor.register(root, folder)[1] == []
-
-
-def test_register_updates_only_the_derived_fields_of_a_lane_free_row(tmp_path: Path) -> None:
-    root = _workspace(tmp_path, "lite_gripper")
-    folder = _tool("lite_gripper", root)
-
-    def pneumatic_row() -> dict:
-        rows = json.loads((root / descriptor.DESCRIPTION).read_text(encoding="utf-8"))
-        return next(
-            row for row in rows["runtime_restoration_profiles"]
-            if row["runtime_restoration_profile_id"] == "lite_gripper_pneumatic_v0"
-        )["ros2_control_runtime"]["gripper_target_configurations"][0]
-
-    before = pneumatic_row()
-    original = (root / descriptor.DESCRIPTION).read_text(encoding="utf-8")
-    _edit(folder, _set("gripper.command_duration_s", 1.2))
-    report, _loaded = descriptor.check(root, folder)
-    assert _codes(report) == ["component_registration_stale"]
-    assert "lite_gripper_pneumatic_v0 gripper row differs" in report.errors[0].message
-    assert "command_duration_s" in report.errors[0].message
-    report, written = descriptor.register(root, folder)
-    assert report.errors == []
-    assert written == [
-        f"{descriptor.DESCRIPTION}: component profile row lite_gripper_pneumatic_v0"
-    ]
-    after = pneumatic_row()
-    assert after == {**before, "command_duration_s": 1.2}
-    # Only that row is rewritten: the rest of the description keeps its bytes.
-    profile = next(
-        row for row in json.loads(
-            (root / descriptor.DESCRIPTION).read_text(encoding="utf-8")
-        )["runtime_restoration_profiles"]
-        if row["runtime_restoration_profile_id"] == "lite_gripper_pneumatic_v0"
-    )
-    assert (root / descriptor.DESCRIPTION).read_text(encoding="utf-8") == (
-        descriptor._with_json_row(original, "runtime_restoration_profiles",
-                                  "runtime_restoration_profile_id", profile)
-    )
-    assert descriptor.check(root, folder)[0].errors == []
-    assert descriptor.register(root, folder)[1] == []
-
-
 @pytest.mark.parametrize(
     ("change", "code", "text"),
     [
-        (lambda data: data["lanes"]["mock"]["controllers"].update(
-            arm_controller="lite6_traj_controller",
-            vendor_joint_constraints={"trajectory": "1.0"}, arrival_tolerance_rad=0.01),
-         "component_lane_invalid", "a tool row has no arm_controller"),
-        (_set("lanes.mock.controllers.gripper_controller", None),
-         "component_lane_invalid", "names no controller"),
+        (_set("lanes.mock.arrival_tolerance_rad", 0.01),
+         "component_lane_invalid", "a tool's row has none"),
+        (_set("lanes.mock.controller", None),
+         "component_manifest_invalid", "lanes.mock: is missing controller"),
         (_set("gripper.command_duration_s", None), "component_manifest_invalid",
          "a pneumatic gripper needs command_duration_s"),
         (_set("gripper.touch_links", None), "component_manifest_invalid",
@@ -568,29 +494,22 @@ def test_new_tool_check_and_register(tmp_path: Path) -> None:
     template = yaml.safe_load((folder / descriptor.DESCRIPTOR).read_text(encoding="utf-8"))
     assert template["kind"] == "tool" and template["id"] == "acme.clamp"
     assert template["model"] == {"urdf": "clamp.urdf", "srdf": "clamp.srdf"}
-    assert "arm_controller" not in template["lanes"]["mock"]["controllers"]
+    assert "arrival_tolerance_rad" not in template["lanes"]["mock"]
     source = _tool("lite_gripper", root)
     for suffix in ("urdf", "srdf"):
         shutil.copy(source / f"lite_gripper.{suffix}", folder / f"clamp.{suffix}")
     filled = yaml.safe_load((source / descriptor.DESCRIPTOR).read_text(encoding="utf-8"))
     filled.update(id="acme.clamp", title="Acme clamp",
                   model={"urdf": "clamp.urdf", "srdf": "clamp.srdf"})
-    filled["lanes"]["mock"]["controllers"]["hardware_component_name"] = "MockClampSystem"
+    shutil.copy(source / "mock_controllers.yaml", folder / "mock_controllers.yaml")
     (folder / descriptor.DESCRIPTOR).write_text(yaml.safe_dump(filled, sort_keys=False),
                                                 encoding="utf-8")
     report, _loaded = descriptor.check(root, folder)
-    assert set(_codes(report)) == {
-        "component_not_registered", "component_generated_missing", "component_schema_refuses"
-    }
+    assert set(_codes(report)) == {"component_not_registered", "component_generated_missing"}
 
     report, written = descriptor.register(root, folder)
     assert report.errors == []
-    assert written == [
-        f"{descriptor.DESCRIPTION}: model family row clamp",
-        f"{descriptor.DESCRIPTION}: component profile row clamp_mock_commanded_v0",
-        f"{descriptor.DESCRIPTION}: component profile row clamp_pneumatic_v0",
-        f"{mock_controller_profiles.DEFAULT_PATH}: Mock controller row clamp",
-    ]
+    assert written == [f"{descriptor.DESCRIPTION}: model family row clamp"]
     description = json.loads((root / descriptor.DESCRIPTION).read_text(encoding="utf-8"))
     family = next(row for row in description["model_families"]
                   if row["model_family_id"] == "clamp")
@@ -603,12 +522,8 @@ def test_new_tool_check_and_register(tmp_path: Path) -> None:
         "fingers"]
     assert family["source"]["urdf_path"] == f"{descriptor.ROBOT_ROOT}/clamp/clamp.urdf"
     assert family["source"]["resource_root"] == f"{descriptor.ROBOT_ROOT}/lite6_lite_gripper"
-    rows = {row.mock_profile: row
-            for row in mock_controller_profiles.load(root / mock_controller_profiles.DEFAULT_PATH)}
-    assert rows["clamp"].arm_controller is None
-    assert rows["clamp"].gripper_controller == "lite_gripper_controller"
     report, _loaded = descriptor.check(root, folder)
-    assert set(_codes(report)) == {"component_generated_missing", "component_schema_refuses"}
+    assert set(_codes(report)) == {"component_generated_missing"}
     assert descriptor.register(root, folder)[1] == []
 
 
@@ -642,10 +557,7 @@ def test_tool_tcps_keep_their_ids_and_the_first_is_the_default(tmp_path: Path) -
                               {"id": "tip", "frame": "lite_gripper_base_link"}])
     report, written = descriptor.register(root, folder)
     assert report.errors == []
-    assert written == [
-        f"{descriptor.DESCRIPTION}: model family row cup",
-        f"{descriptor.DESCRIPTION}: component profile row cup_pneumatic_v0",
-    ]
+    assert written == [f"{descriptor.DESCRIPTION}: model family row cup"]
     family = _family(root, "cup")
     assert {row["frame_role_id"]: row["source_link_name"]
             for row in family["semantics"]["frame_role_bindings"]} == {
@@ -653,15 +565,6 @@ def test_tool_tcps_keep_their_ids_and_the_first_is_the_default(tmp_path: Path) -
         "tip": "lite_gripper_base_link"}
     assert family["semantics"]["root_frame_role_id"] == "mount"
     assert family["tcp_frame_role_ids"] == ["cup_center", "tip"]
-    # The pneumatic gripper row keeps the default TCP's frame.
-    profile = next(
-        row for row in json.loads(
-            (root / descriptor.DESCRIPTION).read_text(encoding="utf-8")
-        )["runtime_restoration_profiles"]
-        if row["runtime_restoration_profile_id"] == "cup_pneumatic_v0"
-    )
-    (gripper,) = profile["ros2_control_runtime"]["gripper_target_configurations"]
-    assert gripper["tcp_frame"] == "link_tcp"
 
 
 def test_tool_tcps_check_and_register_round_trip(tmp_path: Path) -> None:
@@ -681,11 +584,7 @@ def test_tool_tcps_check_and_register_round_trip(tmp_path: Path) -> None:
     assert any("tcp_frame_role_ids" in error.message for error in report.errors)
     report, written = descriptor.register(root, folder)
     assert report.errors == []
-    # The pneumatic gripper row follows the new default TCP's frame.
-    assert written == [
-        f"{descriptor.DESCRIPTION}: model family row cup",
-        f"{descriptor.DESCRIPTION}: component profile row cup_pneumatic_v0",
-    ]
+    assert written == [f"{descriptor.DESCRIPTION}: model family row cup"]
     assert _family(root, "cup")["tcp_frame_role_ids"] == ["tip", "cup_center"]
     report, _loaded = descriptor.check(root, folder)
     assert set(_codes(report)) == {"component_generated_missing"}
@@ -709,7 +608,9 @@ def test_a_single_tcp_tool_registers_as_before(tmp_path: Path) -> None:
     family = _family(root, "cup")
     assert "tcp_frame_role_ids" not in family
     assert sorted(family) == [
-        "catalog_source", "model_asset_id", "model_family_id", "semantics", "source"]
+        "catalog_source", "component_descriptor", "model_asset_id", "model_family_id",
+        "semantics", "source"]
+    assert family["component_descriptor"] == f"{descriptor.ROBOT_ROOT}/cup/{descriptor.DESCRIPTOR}"
     assert {row["frame_role_id"]: row["source_link_name"]
             for row in family["semantics"]["frame_role_bindings"]} == {
         "mount": "lite_gripper_mount", "tcp": "link_tcp"}
@@ -805,22 +706,29 @@ def _tool_component(deployment: dict) -> dict:
                 if row["component_id"] == "lite_gripper")
 
 
-def _mounted_scenario(tmp_path: Path, profile_id: str = "lite_gripper_pneumatic_v0",
+# The lite_gripper runtime configuration of a curated Scenario per lane: none
+# is the lane-free (pneumatic) tool, unwired.
+_TOOL_RUNTIME_SOURCES = {
+    None: "examples/real_lite6_arm_observation.scenario/deployment.yaml",
+    "mock": "examples/mock_lite6_pick_and_place.scenario/deployment.yaml",
+}
+
+
+def _mounted_scenario(tmp_path: Path, lane: str | None = None,
                       change=None, tool_role: str = "lite_gripper") -> Path:
     """lite6_robot (Mock) with lite_gripper mounted on its flange, and an I/O device."""
     scenario = _scenario(tmp_path / "ws" / "examples", "lite6")
     path = scenario / "deployment.yaml"
     deployment = yaml.safe_load(path.read_text(encoding="utf-8"))
-    profile = next(
-        row for row in json.loads(
-            (ROOT / descriptor.DESCRIPTION).read_text(encoding="utf-8")
-        )["runtime_restoration_profiles"]
-        if row["runtime_restoration_profile_id"] == profile_id
-    )
+    curated = json.loads((ROOT / _TOOL_RUNTIME_SOURCES[lane]).read_text(encoding="utf-8"))
+    runtime = next(
+        row for row in curated["components"] if row["component_id"] == "lite_gripper"
+    )["configuration"]["runtime_configuration"]
     deployment["components"] += [
         {
             "component_id": "lite_gripper",
-            "component_profile_id": profile_id,
+            "component_profile_id": "ufactory.lite_gripper",
+            **({} if lane is None else {"lane": lane}),
             "model_source": {
                 "urdf": {"project_path": "../../manyforge_example_models/models/lite_gripper/lite_gripper.urdf"},
                 "srdf": {"project_path": "../../manyforge_example_models/models/lite_gripper/lite_gripper.srdf"},
@@ -829,7 +737,7 @@ def _mounted_scenario(tmp_path: Path, profile_id: str = "lite_gripper_pneumatic_
                 },
             },
             "configuration": {
-                "runtime_configuration": copy.deepcopy(profile["ros2_control_runtime"]),
+                "runtime_configuration": copy.deepcopy(runtime),
                 "runtime_kind": "ros2_control",
             },
             "target_settings": {},
@@ -854,12 +762,10 @@ def _mounted_scenario(tmp_path: Path, profile_id: str = "lite_gripper_pneumatic_
     return scenario
 
 
-@pytest.mark.parametrize(
-    "profile_id", ["lite_gripper_pneumatic_v0", "lite_gripper_mock_commanded_v0"]
-)
-def test_mounted_tool_scenario_matches_robot_and_tool(tmp_path: Path, profile_id: str) -> None:
+@pytest.mark.parametrize("lane", [None, "mock"])
+def test_mounted_tool_scenario_matches_robot_and_tool(tmp_path: Path, lane: str | None) -> None:
     root = _workspace(tmp_path, "lite6", "lite_gripper")
-    scenario = _mounted_scenario(tmp_path, profile_id)
+    scenario = _mounted_scenario(tmp_path, lane)
     report, _loaded = descriptor.check(root, _tool("lite_gripper", root), scenario)
     assert report.errors == []
     assert any("mounted and agree" in note for note in report.notes)
@@ -975,8 +881,6 @@ def _tool_gripper(key: str, value):
         (_tool_runtime("component_streams", [{"stream_id": "measured_joints"}]),
          "lite_gripper", "component_scenario_mismatch",
          "component_streams must declare exactly []"),
-        (_tool_runtime("mock_profile", "lite_gripper"), "lite_gripper",
-         "component_scenario_mismatch", "runtime_configuration.mock_profile must be None"),
         (_tool_runtime("gripper_target_configurations", []), "lite_gripper",
          "component_scenario_mismatch", "gripper_target_configurations is empty"),
         (_tool_gripper("mount_frame", "link_eef"), "lite_gripper",
@@ -1005,7 +909,7 @@ def test_tool_scenario_without_the_tool(tmp_path: Path) -> None:
         root, _tool("lite_gripper", root), _scenario(tmp_path, "lite6")
     )
     assert _codes(report) == ["component_scenario_mismatch"]
-    assert "no component selects a profile of ufactory.lite_gripper" in (
+    assert "no component selects the model ufactory.lite_gripper" in (
         report.errors[0].message
     )
 
@@ -1013,7 +917,8 @@ def test_tool_scenario_without_the_tool(tmp_path: Path) -> None:
 # --- new ------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("kind", descriptor.KINDS)
+@pytest.mark.parametrize("kind", [kind for kind in descriptor.KINDS
+                                  if kind not in ("simulator", "sensor")])
 def test_new_scaffolds_a_folder_from_the_template(tmp_path: Path, kind: str) -> None:
     root = _workspace(tmp_path)
     report, folder = descriptor.new_component(root, kind, "acme.r6")
@@ -1066,30 +971,26 @@ def test_curated_list() -> None:
     assert set(ROBOTS.values()) | set(TOOLS.values()) | {
         "manyforge.mock_pneumatic_gripper_io"
     } <= set(entries)
+    # A UFACTORY arm is placed only as its machine's member (AUD-5).
     lite6 = entries["ufactory.lite6"]
-    assert lite6["kind"] == "robot" and lite6["addable"] and lite6["errors"] == []
+    assert lite6["kind"] == "robot" and not lite6["addable"] and lite6["errors"] == []
     assert lite6["path"] == "manyforge_example_models/models/lite6"
     assert lite6["descriptor"]["limits"] == {"max_tcp_linear_speed_mps": 0.5}
     assert lite6["runtime"] == {
         "modelFamilyId": "lite6",
-        "componentProfileIds": {
-            "isaac": ["lite6_isaac_commanded_v0"],
-            "mock": ["lite6_mock_commanded_v0"],
-            "real": ["lite6_real_measured_v0"],
-        },
+        "componentProfileId": "ufactory.lite6",
+        "lanes": ["isaac", "mock", "real"],
     }
     uf850 = entries["ufactory.uf850"]
-    assert uf850["addable"] and uf850["errors"] == []
+    assert not uf850["addable"] and uf850["errors"] == []
+    assert entries["universal_robots.ur10e"]["addable"]
     for tool_id in TOOLS.values():
         assert entries[tool_id]["kind"] == "tool"
         assert entries[tool_id]["addable"] and entries[tool_id]["errors"] == []
     assert entries["ufactory.lite_gripper"]["runtime"] == {
         "modelFamilyId": "lite_gripper",
-        "componentProfileIds": {
-            "isaac": ["lite_gripper_isaac_commanded_v0"],
-            "lane_free": ["lite_gripper_pneumatic_v0"],
-            "mock": ["lite_gripper_mock_commanded_v0"],
-        },
+        "componentProfileId": "ufactory.lite_gripper",
+        "lanes": ["isaac", "lane_free", "mock"],
     }
     io = entries["manyforge.mock_pneumatic_gripper_io"]
     assert io["addable"] and io["runtime"] == {"componentProfileId": "io_device_v0"}
@@ -1150,3 +1051,148 @@ def test_command_line(tmp_path: Path, capsys) -> None:
     assert cli.main(["--workspace-root", str(tools), "register",
                      str(_tool("lite_gripper", tools))]) == 0
     assert "nothing written" in capsys.readouterr().out
+
+
+# --- machines and model-form I/O devices (plan, "Machines: owners and members")
+
+
+MACHINES = {
+    "ufactory.lite6_machine": ("ufactory.lite6", "ufactory.lite6_controller_io",
+                               "ufactory.lite6_tool_io"),
+    "ufactory.uf850_machine": ("ufactory.uf850", "ufactory.uf850_controller_io",
+                               "ufactory.uf850_tool_io"),
+}
+
+
+@pytest.mark.parametrize("machine", sorted(MACHINES))
+def test_curated_machines_and_their_io_members_pass(machine: str) -> None:
+    report, loaded = descriptor.check(ROOT, ROOT / "components/machine" / machine)
+    assert report.errors == [] and loaded is not None and loaded.kind == "machine"
+    members = [(m["role"], m["model"]) for m in loaded.data["members"]]
+    arm, controller_io, tool_io = MACHINES[machine]
+    assert members == [("arm", arm), ("controller_io", controller_io), ("tool_io", tool_io)]
+    # AUD-5b revised: no member is required; no Mock or Isaac row.
+    assert loaded.data["lanes"] == {"real": {"adapter": "xarm"}}
+    for model in (controller_io, tool_io):
+        report, io = descriptor.check(ROOT, ROOT / "components/io_device" / model)
+        assert report.errors == [] and io is not None and descriptor.is_io_model_form(io.data)
+        assert io.data["lanes"]["real"]["adapter"] == "xarm"
+        assert io.data["lanes"]["real"]["input_maximum_age_ms"] == 100
+
+
+def test_robot_models_declare_no_io_rows() -> None:
+    for family in ("lite6", "uf850"):
+        data = yaml.safe_load((_robot(family) / descriptor.DESCRIPTOR).read_text())
+        assert "io" not in data["lanes"]["real"]
+
+
+def test_model_form_io_device_refuses_providers_and_unknown_banks(tmp_path: Path) -> None:
+    folder = tmp_path / "io"
+    shutil.copytree(ROOT / "components/io_device/ufactory.lite6_tool_io", folder)
+    _edit(folder, lambda data: data["signals"][0].update(provider={"profile": "mock"}))
+    _edit(folder, lambda data: data["lanes"]["real"].update(bank="box"))
+    _edit(folder, lambda data: data["lanes"]["real"].update(input_maximum_age_ms=0))
+    lines = [error.line() for error in descriptor.check(ROOT, folder)[0].errors]
+    assert any("signals[0]: has unknown fields provider" in line for line in lines)
+    assert any("lanes.real.bank: must be one of controller, tool" in line for line in lines)
+    assert any("lanes.real.input_maximum_age_ms: must be a positive number" in line
+               for line in lines)
+
+
+def test_machine_members_name_curated_member_models(tmp_path: Path) -> None:
+    root = _workspace(tmp_path)
+    folder = root / "components/machine/acme.cell"
+    shutil.copytree(ROOT / "components/machine/ufactory.lite6_machine", folder)
+    _edit(folder, _set("id", "acme.cell"))
+    report, _loaded = descriptor.check(root, folder)
+    lines = [error.line() for error in report.errors]
+    # No curated member models in this workspace, and not registered yet.
+    assert any("'ufactory.lite6' is not a curated component" in line for line in lines)
+    assert any("component_not_registered" in line for line in lines)
+
+
+def test_machine_member_slots_take_only_role_and_model(tmp_path: Path) -> None:
+    folder = tmp_path / "machine"
+    shutil.copytree(ROOT / "components/machine/ufactory.lite6_machine", folder)
+    _edit(folder, lambda data: data["members"][0].update(required=True))
+    lines = [error.line() for error in descriptor.check(ROOT, folder)[0].errors]
+    assert any("members[0]: has unknown fields required" in line for line in lines)
+
+
+def test_register_lists_a_machine_in_component_models(tmp_path: Path) -> None:
+    root = _workspace(tmp_path)
+    folder = root / "components/machine/acme.cell"
+    shutil.copytree(ROOT / "components/machine/ufactory.lite6_machine", folder)
+    _edit(folder, _set("id", "acme.cell"))
+    report, written = descriptor.register(root, folder)
+    listed = json.loads((root / descriptor.DESCRIPTION).read_text())["component_models"]
+    assert report.errors == [] and written
+    assert "components/machine/acme.cell/component.yaml" in listed and listed == sorted(listed)
+    assert descriptor.register(root, folder)[1] == []
+
+
+def test_curated_list_offers_machines_not_their_io_members() -> None:
+    entries = {entry["id"]: entry for entry in descriptor.list_components(ROOT)["components"]}
+    lite6 = entries["ufactory.lite6_machine"]
+    assert lite6["kind"] == "machine" and lite6["addable"] and lite6["errors"] == []
+    assert lite6["runtime"]["lanes"] == ["isaac", "mock", "real"]
+    assert lite6["runtime"]["members"] == [
+        {"role": "arm", "modelId": "ufactory.lite6"},
+        {"role": "controller_io", "modelId": "ufactory.lite6_controller_io"},
+        {"role": "tool_io", "modelId": "ufactory.lite6_tool_io"},
+    ]
+    io = entries["ufactory.lite6_controller_io"]
+    assert not io["addable"] and io["runtime"] == {"componentProfileId": "ufactory.lite6_controller_io"}
+
+
+# --- sensors (a point-cloud source, decision AUD-9) -------------------------
+
+POINTCLOUD = ROOT / "components/sensor/manyforge.pointcloud_source"
+
+
+def test_curated_pointcloud_source_passes_and_is_listed() -> None:
+    report, loaded = descriptor.check(ROOT, POINTCLOUD)
+    assert report.errors == [] and loaded is not None and loaded.kind == "sensor"
+    assert loaded.data["sensor"] == "pointcloud"
+    # One adapter on every lane (PC-1): no lane rows, no frame default.
+    assert "lanes" not in loaded.data
+    assert loaded.data["adapter_row"] == {"adapter": "pointcloud", "stream_budget_s": 1.0}
+    entry = next(entry for entry in descriptor.list_components(ROOT)["components"]
+                 if entry["id"] == "manyforge.pointcloud_source")
+    assert entry["kind"] == "sensor" and entry["addable"] and entry["errors"] == []
+    assert entry["runtime"] == {"componentProfileId": "manyforge.pointcloud_source",
+                                "lanes": ["isaac", "mock", "real"]}
+
+
+def test_sensor_refuses_unknown_type_and_rows_without_adapter(tmp_path: Path) -> None:
+    folder = tmp_path / "sensor"
+    shutil.copytree(POINTCLOUD, folder)
+    _edit(folder, _set("sensor", "lidar"))
+    _edit(folder, lambda data: data["adapter_row"].pop("adapter"))
+    lines = [error.line() for error in descriptor.check(ROOT, folder)[0].errors]
+    assert any("sensor: must be one of pointcloud" in line for line in lines)
+    assert any("adapter_row" in line and "adapter" in line for line in lines)
+
+
+def test_sensor_refuses_lane_rows(tmp_path: Path) -> None:
+    folder = tmp_path / "sensor"
+    shutil.copytree(POINTCLOUD, folder)
+    _edit(folder, _set("lanes", {"real": {"adapter": "pointcloud"}}))
+    lines = [error.line() for error in descriptor.check(ROOT, folder)[0].errors]
+    assert any("unknown fields lanes" in line for line in lines)
+
+
+def test_register_lists_a_sensor_in_component_models(tmp_path: Path) -> None:
+    root = _workspace(tmp_path)
+    folder = root / "components/sensor/acme.cloud"
+    shutil.copytree(POINTCLOUD, folder)
+    _edit(folder, _set("id", "acme.cloud"))
+    report, written = descriptor.register(root, folder)
+    listed = json.loads((root / descriptor.DESCRIPTION).read_text())["component_models"]
+    assert report.errors == [] and written
+    assert "components/sensor/acme.cloud/component.yaml" in listed and listed == sorted(listed)
+
+
+def test_new_refuses_a_sensor(tmp_path: Path) -> None:
+    report, folder = descriptor.new_component(_workspace(tmp_path), "sensor", "acme.cloud")
+    assert folder is None and _codes(report) == ["component_manifest_invalid"]

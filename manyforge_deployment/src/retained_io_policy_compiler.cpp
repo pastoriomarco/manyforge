@@ -127,16 +127,7 @@ compile_retained_io_policies(const ProgramBindingContract *program,
             "interrupt_policy_configuration");
     if (!configuration)
       return Reply::Ok(std::move(projection));
-    for (const std::string_view name :
-         {"interrupt_sources", "interrupt_policies"})
-      if (!member(*configuration, name).as_array().empty())
-        return Reply::Err(
-            {"unsupported_capability",
-             "Legacy interrupt declarations are not installed",
-             {{"reason", "legacy_interrupt_policy_runtime_unsupported"}}});
-    const auto *rules = configuration->find_object_member("interrupt_rules");
-    if (!rules)
-      return Reply::Ok(std::move(projection));
+    const auto &rules = member(*configuration, "interrupt_rules");
     const auto signals =
         ResolveCompiledIoSignalCatalog(retained_bundle.value().cell_graph);
     if (!signals.ok())
@@ -148,7 +139,7 @@ compile_retained_io_policies(const ProgramBindingContract *program,
                       program->blackboard_key_declarations())
                 : std::span<const core::ProgramBlackboardKeyDeclarationDTO>{};
     std::map<std::string, core::IoConditionValueKind> referenced;
-    for (const auto &rule : rules->as_array()) {
+    for (const auto &rule : rules.as_array()) {
       auto condition = detail::compile_authored_deployment_io_condition(
           member(rule, "condition"), declarations, signals.value(),
           program == nullptr);
@@ -206,51 +197,25 @@ compile_retained_io_policies(const ProgramBindingContract *program,
             binding->program_binding_id(), groups,
             group_subjects(groups, *program, *binding, retained_bundle, rule_id)};
       }
-      // on_trip (sealed by the codec, default gate) selects the existing
-      // mechanisms: gate = scoped Stop, always latch while the condition is
-      // true (upfront refusal), auto release on clear; full_stop = cell Full
-      // Stop, idle per idle_behaviour, operator release; notify only projects
-      // the condition state.
-      bool full_stop = false;
-      bool notify = false;
-      if (const auto *value = rule.find_object_member("on_trip")) {
-        if (value->as_string() == "full_stop")
-          full_stop = true;
-        else if (value->as_string() == "notify")
-          notify = true;
-        else if (value->as_string() != "gate")
-          throw std::invalid_argument("global_interrupt_on_trip_invalid");
-      }
-      std::optional<core::IoRuleIdleBehaviourDTO> idle;
-      if (!full_stop && !notify)
-        idle = core::IoRuleIdleBehaviourDTO::kLatch;
-      if (const auto *value = rule.find_object_member("idle_behaviour")) {
-        if (!full_stop)
-          throw std::invalid_argument("global_interrupt_idle_requires_full_stop");
-        if (value->as_string() == "latch")
-          idle = core::IoRuleIdleBehaviourDTO::kLatch;
-        else if (value->as_string() == "ignore")
-          idle = core::IoRuleIdleBehaviourDTO::kIgnore;
-        else
-          throw std::invalid_argument("global_interrupt_idle_invalid");
-      }
+      // CONTRACTS §8, sealed by the retained codec: on_trip and
+      // active_at_start are always present, after_stop exactly with stop.
+      const bool stop = member(rule, "on_trip").as_string() == "stop";
+      const auto *after_stop = rule.find_object_member("after_stop");
       std::optional<core::StopEscalationStageId> entry;
-      if (const auto *value = rule.find_object_member("stop_entry_stage_id")) {
-        if (notify)
-          throw std::invalid_argument("global_interrupt_stop_entry_forbidden_with_notify");
+      if (const auto *value = rule.find_object_member("stop_entry_stage_id"))
         entry.emplace(value->as_string());
-      }
-      const auto latch_release =
-          full_stop ? core::InterruptPostLatchDisposition::kAwaitOperatorAck
-                    : core::InterruptPostLatchDisposition::kAutoClearOnSignalRelease;
       projection.activation_policies.push_back(
           {core::InterruptPolicyId(member(rule, "rule_id").as_string()),
            std::move(condition.value().condition),
            std::move(condition.value().required_signal_sources),
-           std::move(selection), idle,
+           std::move(selection),
            static_cast<int>(member(rule, "priority").as_number()), entry,
-           latch_release,
-           std::move(condition.value().waiting_for_program_keys), full_stop, notify});
+           std::move(condition.value().waiting_for_program_keys),
+           stop ? core::IoRuleOnTripDTO::kStop : core::IoRuleOnTripDTO::kNotify,
+           after_stop && after_stop->as_string() == "fail_node"
+               ? core::IoRuleAfterStopDTO::kFailNode
+               : core::IoRuleAfterStopDTO::kHold,
+           member(rule, "active_at_start").as_bool()});
     }
     for (const auto &[name, kind] : referenced)
       projection.referenced_deployment_blackboard_keys.push_back({name, kind});

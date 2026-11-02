@@ -71,7 +71,6 @@ export interface ManualMotionSettings {
   tcpAngularAccelerationRadS2: number;
   cartesianTranslationToleranceM: number;
   cartesianRotationToleranceRad: number;
-  cartesianMaxBlendDeviationRad: number;
   /** Collision clearance (m) for manual moves; null keeps the Deployment's. */
   clearanceM: number | null;
   jointLimits: Record<string, {
@@ -82,7 +81,6 @@ export interface ManualMotionSettings {
 
 export interface ManualCartesianDefaults {
   translationToleranceM: number;
-  maxBlendDeviationRad: number;
 }
 
 /**
@@ -95,12 +93,11 @@ export function appliedCartesianDefaults(
 ): ManualCartesianDefaults {
   return applied ?? {
     translationToleranceM: DEFAULT_MANUAL_MOTION_SETTINGS.cartesianTranslationToleranceM,
-    maxBlendDeviationRad: DEFAULT_MANUAL_MOTION_SETTINGS.cartesianMaxBlendDeviationRad,
   };
 }
 
 /**
- * Tolerance and blend are defaults, not limits: the operator may set any
+ * The tolerance is a default, not a limit: the operator may set any
  * valid value for a manual move. When the Program default itself changes
  * (Apply), the manual value takes it.
  */
@@ -117,7 +114,6 @@ const DEFAULT_MANUAL_MOTION_SETTINGS: ManualMotionSettings = {
   tcpAngularAccelerationRadS2: 2.5,
   cartesianTranslationToleranceM: 0.005,
   cartesianRotationToleranceRad: 0.05,
-  cartesianMaxBlendDeviationRad: 0.01,
   clearanceM: null,
   jointLimits: {},
 };
@@ -491,18 +487,16 @@ function positionsAreValid(
 export const MAX_CLEARANCE_M = 0.05;
 
 function motionSettingsAreValid(status: ExecutionOwnerStatus, settings: ManualMotionSettings): boolean {
-  const { jointLimits, cartesianMaxBlendDeviationRad, clearanceM, ...positiveValues } = settings;
+  const { jointLimits, clearanceM, ...positiveValues } = settings;
   const clearanceValid = clearanceM === null
     || (Number.isFinite(clearanceM) && clearanceM >= 0 && clearanceM <= MAX_CLEARANCE_M);
   // Motion-only limits apply only when a motion target is selected.
   const descriptor = status.directControl?.targetDescriptor;
   if (descriptor === undefined) {
     return Object.values(positiveValues).every((value) => Number.isFinite(value) && value > 0)
-      && Number.isFinite(cartesianMaxBlendDeviationRad) && cartesianMaxBlendDeviationRad >= 0
       && clearanceValid;
   }
   return Object.values(positiveValues).every((value) => Number.isFinite(value) && value > 0)
-    && Number.isFinite(cartesianMaxBlendDeviationRad) && cartesianMaxBlendDeviationRad >= 0
     && clearanceValid
     && settings.velocityScale <= 1 && settings.accelerationScale <= 1
     && Object.entries(jointLimits).every(([name, limit]) => {
@@ -525,8 +519,6 @@ function initialMotionSettings(
     ...DEFAULT_MANUAL_MOTION_SETTINGS,
     cartesianTranslationToleranceM: cartesianDefaults?.translationToleranceM
       ?? DEFAULT_MANUAL_MOTION_SETTINGS.cartesianTranslationToleranceM,
-    cartesianMaxBlendDeviationRad: cartesianDefaults?.maxBlendDeviationRad
-      ?? DEFAULT_MANUAL_MOTION_SETTINGS.cartesianMaxBlendDeviationRad,
     tcpLinearSpeedMps: Math.min(DEFAULT_MANUAL_MOTION_SETTINGS.tcpLinearSpeedMps,
       status.directControl?.targetDescriptor.operationalLimit?.maximumTcpLinearSpeedMps ?? Infinity),
   };
@@ -1007,16 +999,9 @@ export function robotControlReducer(
           previous?.translationToleranceM ?? null,
           action.defaults.translationToleranceM,
         ),
-        cartesianMaxBlendDeviationRad: followCartesianDefault(
-          state.motionSettings.cartesianMaxBlendDeviationRad,
-          previous?.maxBlendDeviationRad ?? null,
-          action.defaults.maxBlendDeviationRad,
-        ),
       };
       const unchanged = motionSettings.cartesianTranslationToleranceM
-          === state.motionSettings.cartesianTranslationToleranceM
-        && motionSettings.cartesianMaxBlendDeviationRad
-          === state.motionSettings.cartesianMaxBlendDeviationRad;
+          === state.motionSettings.cartesianTranslationToleranceM;
       if (unchanged) return { ...state, cartesianDefaults: action.defaults };
       if (!motionSettingsAreValid(selectedStatusForState(state)!, motionSettings)) return state;
       return robotControlHasLocalDraft(state)
@@ -1554,7 +1539,6 @@ function buildMotionIntent(
       execution_timeout_s: 10,
     },
     cache_mode: 'default',
-    planning_profile: 'balanced',
     target_mode: 'absolute',
     target_reference: null,
     offset_reference: null,
@@ -1659,12 +1643,12 @@ export function buildCartesianMotionIntent(
     ],
     max_translation_step_m: 0.005,
     max_rotation_step_rad: 0.05,
-    speed_mode: 'bounded',
     max_angular_speed_rad_s: settings.tcpAngularSpeedRadS,
     max_linear_acceleration_mps2: settings.tcpLinearAccelerationMps2,
     max_angular_acceleration_rad_s2: settings.tcpAngularAccelerationRadS2,
     fallback_policy: 'fail_closed',
-    max_blend_deviation_rad: settings.cartesianMaxBlendDeviationRad,
+    // Exact corners; timing follows the Deployment's cartesian_timing.
+    blend_radii_m: [0, 0],
   }, requestId, settings);
 }
 

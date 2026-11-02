@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import re
@@ -14,9 +13,7 @@ from pydantic import (
     AfterValidator,
     BaseModel,
     ConfigDict,
-    Discriminator,
     Field,
-    Tag,
     WithJsonSchema,
     field_validator,
     field_serializer,
@@ -606,38 +603,9 @@ class PreparedScenarioOrigin(StrictRequest):
         )
 
 
-class PreparedSealedCanonicalEmptyOrigin(StrictRequest):
-    kind: Literal["sealed_canonical_empty"]
-    cell_id: str
-    deployment_artifact_id: str
-    deployment_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
-    retained_bundle_id: Annotated[str, Field(pattern=SHA256_PATTERN)]
-    graph_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
-    admission_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
-
-    @field_validator("cell_id", "deployment_artifact_id")
-    @classmethod
-    def validate_identity(cls, value: str, info) -> str:
-        return _bounded_nfc(value, label=info.field_name, maximum_bytes=128)
-
-
 PreparedActivationOrigin = Annotated[
-    PreparedScenarioOrigin | PreparedSealedCanonicalEmptyOrigin,
-    Field(discriminator="kind"),
+    PreparedScenarioOrigin, Field(discriminator="kind")
 ]
-
-
-class CanonicalEmptyActivationPreparationRequest(StrictRequest):
-    origin: PreparedSealedCanonicalEmptyOrigin
-    request_owner_epoch: str
-    expected_admission_generation: Annotated[
-        int, Field(ge=1, le=9_007_199_254_740_991)
-    ]
-
-    @field_validator("request_owner_epoch")
-    @classmethod
-    def validate_owner(cls, value: str) -> str:
-        return _bounded_nfc(value, label="request_owner_epoch", maximum_bytes=128)
 
 
 class ManagerApplyPreparedActivation(StrictRequest):
@@ -719,23 +687,6 @@ class ManagerApplyPreparedActivation(StrictRequest):
                 raise ValueError("no_program requires no Program identity")
         elif self.program_id is None or self.program_revision is None:
             raise ValueError("selected Program requires its identity and revision")
-        if isinstance(self.origin, PreparedSealedCanonicalEmptyOrigin):
-            if self.program_outcome != {"kind": "no_program"} or any(
-                getattr(self.origin, field) != getattr(self, field)
-                for field in (
-                    "deployment_artifact_id", "deployment_revision",
-                    "retained_bundle_id", "graph_revision",
-                )
-            ):
-                raise ValueError("sealed empty origin requires its exact no-Program candidate")
-            capture = {
-                "schema_version": "manyforge.sealed_canonical_empty_capture.v1",
-                "origin": self.origin.model_dump(mode="json"),
-            }
-            if self.captured_input_digest != "sha256:" + hashlib.sha256(
-                rfc8785.dumps(capture)
-            ).hexdigest():
-                raise ValueError("sealed empty capture does not match its origin")
         return self
 
 
@@ -882,9 +833,12 @@ class ProgramSelectionStopRequest(ProgramRunStopRequest):
 
 
 class ProgramSelectionResumeRequest(ProgramSelectionStopRequest):
-    """Reassess and release one selection of the exact current Program run."""
+    """Reassess and release one selection of the exact current Program run.
 
-    expected_run_revision: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
+    Fenced on run id, owner epoch and selection revision only: tree ticks
+    raise the run revision without changing what Run/Resume releases.
+    """
+
     expected_selection_revision: Annotated[int, Field(ge=0, le=9_007_199_254_740_991)]
 
 
@@ -895,16 +849,6 @@ class ProgramSelectionStartRequest(ProgramSelectionResumeRequest):
 class ProgramCycleResetRequest(ExecutionControlAttributionRequest):
     reload_initial_scene: bool = False
     reset_robot_position: bool = False
-    # D6: a public option that only ever keeps the cell Stop fault (the
-    # conservative side). Scenario Close sets it; ordinary Reset (False)
-    # reconciles the fault as before.
-    keep_stop_fault: bool = Field(
-        default=False,
-        description=(
-            "End the run without clearing the cell Stop fault; Recover cell "
-            "clears it later. Scenario Close sets it. It can only keep the fault."
-        ),
-    )
     program_run_id: str | None
     expected_owner_epoch: str
     expected_cycle_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
@@ -2258,6 +2202,18 @@ class MotionTimeoutsRequest(StrictRequest):
     execution_timeout_s: Annotated[float, Field(gt=0, allow_inf_nan=False)]
 
 
+class MotionPlannerRequest(StrictRequest):
+    """A motion's planner override; unset members take the Deployment's."""
+
+    search: Literal["rrt", "rrt_connect"] | None = None
+    optimize: Literal["first", "rrt_star", "best_of_n"] | None = None
+    n: Annotated[int | None, Field(ge=2, le=32)] = None
+    collision_check_step_rad: Annotated[
+        float | None, Field(gt=0, le=0.2, allow_inf_nan=False)
+    ] = None
+    max_nodes: Annotated[int | None, Field(ge=100, le=1_000_000)] = None
+
+
 class JointDynamicsLimitRequest(StrictRequest):
     max_velocity_rad_s: Annotated[float | None, Field(gt=0, allow_inf_nan=False)] = None
     max_acceleration_rad_s2: Annotated[
@@ -2306,14 +2262,31 @@ class CartesianPathRequest(StrictRequest):
     waypoints: Annotated[list[Pose3Request], Field(min_length=1, max_length=4096)]
     max_translation_step_m: Annotated[float, Field(gt=0, allow_inf_nan=False)]
     max_rotation_step_rad: Annotated[float, Field(gt=0, allow_inf_nan=False)]
-    speed_mode: Literal["bounded"]
+    # Absent means the Deployment's cartesian_timing.
+    speed_mode: Literal["constant_speed", "time_optimal"] | None = None
     max_angular_speed_rad_s: Annotated[float, Field(gt=0, allow_inf_nan=False)]
     max_linear_acceleration_mps2: Annotated[float, Field(gt=0, allow_inf_nan=False)]
     max_angular_acceleration_rad_s2: Annotated[float, Field(gt=0, allow_inf_nan=False)]
     fallback_policy: Literal["fail_closed", "allow_joint_space_fallback"]
-    max_blend_deviation_rad: Annotated[
-        float, Field(ge=0, allow_inf_nan=False)
-    ] = 0.01
+    # Corner blend radius (m) per waypoint; 0 keeps an exact corner. The
+    # first and last entries are unused by the planner.
+    blend_radii_m: Annotated[
+        list[Annotated[float, Field(ge=0, allow_inf_nan=False)]],
+        Field(min_length=1, max_length=4096),
+    ]
+
+    @model_validator(mode="after")
+    def validate_blend_radii(self) -> "CartesianPathRequest":
+        if len(self.blend_radii_m) != len(self.waypoints):
+            raise ValueError("blend_radii_m needs exactly one entry per waypoint")
+        return self
+
+    @model_serializer(mode="wrap")
+    def serialize_cartesian_path(self, handler) -> dict[str, Any]:
+        result = handler(self)
+        if self.speed_mode is None:
+            result.pop("speed_mode", None)
+        return result
 
 
 MotionSpecRequest = Annotated[
@@ -2626,32 +2599,23 @@ class GripperPositionCommandValueRequest(StrictRequest):
         return self
 
 
-class IoSignalWriteCommandValueRequest(StrictRequest):
-    """One typed boolean output write (contract 53); no provider/readback data."""
+class CommandDurationOptionRequest(StrictRequest):
+    option_id: str
+    value_s: Annotated[float, Field(ge=0, allow_inf_nan=False)]
 
-    kind: Literal["io_signal_write"]
-    resource_role_id: str
-    value: bool
-
-    @field_validator("resource_role_id")
+    @field_validator("option_id")
     @classmethod
-    def validate_resource_role_id(cls, value: str) -> str:
+    def validate_option_id(cls, value: str) -> str:
         return _bounded_nfc(
             value,
-            label="resource_role_id",
+            label="option_id",
             maximum_bytes=MAX_IDENTITY_BYTES,
         )
 
 
-CapabilityCommandValueRequest = Annotated[
-    GripperPositionCommandValueRequest | IoSignalWriteCommandValueRequest,
-    Field(discriminator="kind"),
-]
-
-
-class CommandDurationOptionRequest(StrictRequest):
+class CommandFlagOptionRequest(StrictRequest):
     option_id: str
-    value_s: Annotated[float, Field(ge=0, allow_inf_nan=False)]
+    value_bool: bool
 
     @field_validator("option_id")
     @classmethod
@@ -2667,30 +2631,13 @@ class CapabilityCommandParticipantRequest(StrictRequest):
     kind: Literal["capability_command"]
     command_schema_id: str
     command_schema_revision: str
-    command_value: CapabilityCommandValueRequest
-    # Gripper commands carry the caller's positive deadline. An
-    # io_signal_write omits it: the Kernel resolves the sealed provider/device
-    # acknowledgement policy (contract 65).
-    completion_timeout_s: Annotated[float, Field(gt=0, allow_inf_nan=False)] | None = None
-    caller_options: Annotated[list[CommandDurationOptionRequest], Field(max_length=64)]
-
-    @model_serializer(mode="wrap")
-    def serialize_omitted_timeout(self, handler):
-        payload = handler(self)
-        if payload.get("completion_timeout_s") is None:
-            payload.pop("completion_timeout_s", None)
-        return payload
-
-    @model_validator(mode="after")
-    def require_timeout_owner(self) -> "CapabilityCommandParticipantRequest":
-        io_write = isinstance(self.command_value, IoSignalWriteCommandValueRequest)
-        if io_write and self.completion_timeout_s is not None:
-            raise ValueError(
-                "io_signal_write omits completion_timeout_s; the provider policy owns it"
-            )
-        if not io_write and self.completion_timeout_s is None:
-            raise ValueError("completion_timeout_s is required for this command")
-        return self
+    command_value: GripperPositionCommandValueRequest
+    # The caller's positive deadline.
+    completion_timeout_s: Annotated[float, Field(gt=0, allow_inf_nan=False)]
+    caller_options: Annotated[
+        list[CommandDurationOptionRequest | CommandFlagOptionRequest],
+        Field(max_length=64),
+    ]
 
     @field_validator("command_schema_id", "command_schema_revision")
     @classmethod
@@ -2888,7 +2835,6 @@ class MotionParticipantRequest(StrictRequest):
     speed_profile: MotionSpeedProfileRequest
     timeouts: MotionTimeoutsRequest
     cache_mode: Literal["default", "disable"]
-    planning_profile: Literal["first_feasible", "balanced", "quality_bounded"]
     target_mode: Literal["absolute", "relative"]
     target_reference: MotionReferenceRequest | None = None
     offset_reference: MotionReferenceRequest | None = None
@@ -2906,6 +2852,8 @@ class MotionParticipantRequest(StrictRequest):
     clearance_m: Annotated[
         float | None, Field(ge=0, le=0.05, allow_inf_nan=False)
     ] = None
+    # Planner override for this move; absent means the Deployment planner.
+    planner: MotionPlannerRequest | None = None
 
     @model_serializer(mode="wrap")
     def serialize_motion(self, handler) -> dict[str, Any]:
@@ -3309,11 +3257,7 @@ def _validate_pick_place_operations(
         raise ValueError("pick/place approach must be a motion operation")
     if not isinstance(descend.participants[0].payload, MotionParticipantRequest):
         raise ValueError("pick/place descend must be a motion operation")
-    if not isinstance(
-        tool.participants[0].payload, CapabilityCommandParticipantRequest
-    ) or not isinstance(
-        tool.participants[0].payload.command_value, GripperPositionCommandValueRequest
-    ):
+    if not isinstance(tool.participants[0].payload, CapabilityCommandParticipantRequest):
         raise ValueError("pick/place tool phase must be a gripper capability command")
     if not isinstance(retreat.participants[0].payload, MotionParticipantRequest):
         raise ValueError("pick/place retreat must be a motion operation")
@@ -3469,58 +3413,8 @@ class OperationControlRequest(StrictRequest):
         return _bounded_nfc(value, label="reason", maximum_bytes=MAX_REASON_BYTES)
 
 
-class UncertainOutputAcknowledgementRequest(StrictRequest):
-    """One retained acceptance_unknown output the operator acknowledged."""
-
-    operation_id: str
-    operation_revision: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
-
-    @field_validator("operation_id")
-    @classmethod
-    def validate_operation_id(cls, value: str) -> str:
-        return _bounded_nfc(
-            value, label="operation_id", maximum_bytes=MAX_IDENTITY_BYTES
-        )
-
-
 class OperationResetRequest(OperationControlRequest):
-    """Targeted operation Reset (contract 66).
-
-    ``acknowledged_uncertain_outputs`` lists only this operation's own retained
-    acceptance_unknown output(s) the operator explicitly acknowledged ("a write
-    already queued in the remote device may still act"); sorted and unique.
-    Omitted when absent, so an ordinary Reset keeps its exact wire bytes. The
-    owner refuses a Reset that would release an unlisted unknown output.
-    """
-
-    acknowledged_uncertain_outputs: (
-        Annotated[
-            list[UncertainOutputAcknowledgementRequest],
-            Field(min_length=1, max_length=64),
-        ]
-        | None
-    ) = None
-
-    @model_validator(mode="after")
-    def validate_acknowledged_outputs(self) -> "OperationResetRequest":
-        rows = self.acknowledged_uncertain_outputs
-        if rows is None:
-            return self
-        keys = [(row.operation_id, row.operation_revision) for row in rows]
-        if any(row.operation_id != self.operation_id for row in rows):
-            raise ValueError(
-                "acknowledged_uncertain_outputs must name only this operation"
-            )
-        if keys != sorted(set(keys)):
-            raise ValueError("acknowledged_uncertain_outputs must be sorted and unique")
-        return self
-
-    @model_serializer(mode="wrap")
-    def serialize_omitted_acknowledgement(self, handler):
-        payload = handler(self)
-        if payload.get("acknowledged_uncertain_outputs") is None:
-            payload.pop("acknowledged_uncertain_outputs", None)
-        return payload
+    """Targeted operation Reset (contract 66)."""
 
 
 class OperationRecoveryActionRequest(StrictRequest):
@@ -3541,7 +3435,6 @@ class OperationRecoveryActionRequest(StrictRequest):
         int, Field(ge=0, le=9_007_199_254_740_991)
     ]
     expected_execution_id: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
-    expected_latch_id: str = ""
     expected_stop_certificate_id: str = ""
     expected_stop_owner_generation: Annotated[
         int, Field(ge=0, le=9_007_199_254_740_991)
@@ -3551,7 +3444,6 @@ class OperationRecoveryActionRequest(StrictRequest):
     @field_validator(
         "request_id",
         "principal_id",
-        "expected_latch_id",
         "expected_stop_certificate_id",
         "reason",
     )
@@ -3754,218 +3646,6 @@ class FullStopIntentRequest(StrictRequest):
         return self
 
 
-class StopFaultRecoveryConfigurationExpectationRequest(StrictRequest):
-    control_domain_id: str
-    active_control_configuration_id: str
-    active_control_configuration_generation: Annotated[
-        int, Field(ge=1, le=9_007_199_254_740_991)
-    ]
-
-    @field_validator("control_domain_id", "active_control_configuration_id")
-    @classmethod
-    def validate_identity(cls, value: str, info) -> str:
-        return _bounded_nfc(
-            value,
-            label=info.field_name,
-            maximum_bytes=MAX_STOP_IDENTITY_BYTES,
-        )
-
-
-class StopFaultRecoveryIntentRequest(StrictRequest):
-    request_context: CallerAttributionRequest
-    expected_latch_id: str
-    expected_latch_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
-    expected_recovery_assessment_revision: Annotated[
-        int, Field(ge=1, le=9_007_199_254_740_991)
-    ]
-    expected_stop_certificate_id: str
-    expected_stop_certificate_revision: Annotated[
-        int, Field(ge=1, le=9_007_199_254_740_991)
-    ]
-    expected_cell_id: str
-    expected_retained_bundle_id: str
-    expected_graph_revision: str
-    configuration_expectations: Annotated[
-        list[StopFaultRecoveryConfigurationExpectationRequest],
-        Field(min_length=1, max_length=MAX_STOP_SELECTOR_TARGETS),
-    ]
-    reason: str | None = None
-
-    @field_validator(
-        "expected_latch_id",
-        "expected_stop_certificate_id",
-        "expected_cell_id",
-        "expected_retained_bundle_id",
-        "expected_graph_revision",
-    )
-    @classmethod
-    def validate_identity(cls, value: str, info) -> str:
-        return _bounded_nfc(
-            value,
-            label=info.field_name,
-            maximum_bytes=MAX_STOP_IDENTITY_BYTES,
-        )
-
-    @field_validator("reason")
-    @classmethod
-    def validate_reason(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        return _bounded_nfc(value, label="reason", maximum_bytes=MAX_STOP_REASON_BYTES)
-
-    @model_validator(mode="after")
-    def validate_expectations(self) -> StopFaultRecoveryIntentRequest:
-        domains = [row.control_domain_id for row in self.configuration_expectations]
-        if domains != sorted(domains) or len(set(domains)) != len(domains):
-            raise ValueError(
-                "Stop fault-recovery configuration expectations must be sorted and unique"
-            )
-        _bounded_nfc(
-            self.request_context.request_id,
-            label="request_id",
-            maximum_bytes=MAX_STOP_IDENTITY_BYTES,
-        )
-        _bounded_nfc(
-            self.request_context.request_owner_epoch,
-            label="request_owner_epoch",
-            maximum_bytes=MAX_STOP_IDENTITY_BYTES,
-        )
-        return self
-
-
-class CellRecoverRequestContext(StrictRequest):
-    """Caller identity only: Recover cell reads every fence server-side."""
-
-    request_id: str
-    source_label: str
-    correlation_id: str | None = None
-
-    @field_validator("request_id", "source_label")
-    @classmethod
-    def validate_identity(cls, value: str, info) -> str:
-        return _bounded_nfc(
-            value, label=info.field_name, maximum_bytes=MAX_STOP_IDENTITY_BYTES
-        )
-
-    @field_validator("correlation_id")
-    @classmethod
-    def validate_correlation(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        return _bounded_nfc(
-            value, label="correlation_id", maximum_bytes=MAX_STOP_IDENTITY_BYTES
-        )
-
-
-class CellRecoverRequest(StrictRequest):
-    """One operator Recover cell: incidents, then the current Stop-fault latch."""
-
-    request_context: CellRecoverRequestContext
-    # M6 (item 36): the open incident IDs the operator was shown. An open
-    # incident not listed refuses the press `cclc_incident_changed` before any
-    # step; absent: today's press (every open incident is acknowledged).
-    expected_incident_ids: Annotated[
-        list[Annotated[str, Field(min_length=1, max_length=128)]],
-        Field(max_length=256),
-    ] | None = None
-    # M6 (RECTIME): an automatic resend after an HTTP timeout. It only reads
-    # the replay ledger and never starts a press: an unknown request ID (a
-    # Headless restart or an evicted result) is answered, not run.
-    replay_only: bool = False
-
-
-class CellRecoverAbortRequest(StrictRequest):
-    """SX-679: the operator's abort of the running Recover cell press."""
-
-    request_context: CellRecoverRequestContext
-
-
-class GlobalIoRuleRecoveryContext(StrictRequest):
-    """The exact global-rule catalog context of one recovery offer (SX-2206)."""
-
-    owner_epoch: str
-    catalog_generation: str
-    active_publication_generation: Annotated[
-        int, Field(ge=1, le=9_007_199_254_740_991)
-    ]
-    bundle: str
-    graph: str
-
-    @field_validator("owner_epoch", "bundle", "graph")
-    @classmethod
-    def validate_identity(cls, value: str, info) -> str:
-        return _bounded_nfc(
-            value, label=info.field_name, maximum_bytes=MAX_STOP_IDENTITY_BYTES
-        )
-
-    @field_validator("catalog_generation")
-    @classmethod
-    def validate_generation(cls, value: str) -> str:
-        return _uint64_text(value, label="catalog_generation", minimum=1)
-
-
-class GlobalIoRuleRecoverySelector(StrictRequest):
-    """The offer's selector, sent back unchanged by the recovery command."""
-
-    context: GlobalIoRuleRecoveryContext
-    rule_id: str
-    expected_rule_registration_id: str
-
-    @field_validator("rule_id")
-    @classmethod
-    def validate_rule_id(cls, value: str) -> str:
-        return _bounded_nfc(
-            value, label="rule_id", maximum_bytes=MAX_STOP_IDENTITY_BYTES
-        )
-
-    @field_validator("expected_rule_registration_id")
-    @classmethod
-    def validate_registration(cls, value: str) -> str:
-        return _uint64_text(
-            value, label="expected_rule_registration_id", minimum=1
-        )
-
-
-class GlobalIoRuleRecoveryIntentRequest(StrictRequest):
-    """The additive `global_io_rule` variant of recover_stop_fault (SX-2206)."""
-
-    kind: Literal["global_io_rule"]
-    request_context: CallerAttributionRequest
-    selector: GlobalIoRuleRecoverySelector
-    reason: str | None = None
-
-    @field_validator("reason")
-    @classmethod
-    def validate_reason(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        return _bounded_nfc(value, label="reason", maximum_bytes=MAX_STOP_REASON_BYTES)
-
-    @model_validator(mode="after")
-    def validate_context(self) -> GlobalIoRuleRecoveryIntentRequest:
-        for label in ("request_id", "request_owner_epoch"):
-            _bounded_nfc(
-                getattr(self.request_context, label),
-                label=label,
-                maximum_bytes=MAX_STOP_IDENTITY_BYTES,
-            )
-        return self
-
-
-def _stop_fault_recovery_kind(value: Any) -> str:
-    kind = value.get("kind") if isinstance(value, dict) else getattr(value, "kind", None)
-    # The original Stop/certificate request carries no `kind`; any present
-    # discriminator selects the closed global-rule variant (and must match it).
-    return "stop_fault" if kind is None else "global_io_rule"
-
-
-StopFaultRecoveryRequest = Annotated[
-    Annotated[StopFaultRecoveryIntentRequest, Tag("stop_fault")]
-    | Annotated[GlobalIoRuleRecoveryIntentRequest, Tag("global_io_rule")],
-    Discriminator(_stop_fault_recovery_kind),
-]
-
-
 class RuntimeScaleControlTargetRequest(StrictRequest):
     component_role_id: str
     target_role_id: str
@@ -4065,452 +3745,66 @@ class HistorianReconcileRequest(CallerAttributionRequest):
     ]
 
 
-class CCLCExpectedActiveConfigurationRequest(StrictRequest):
-    presence: Literal["absent", "present"]
-    active_control_configuration_id: str | None = None
-    active_control_configuration_generation: Annotated[
-        int | None, Field(ge=1, le=9_007_199_254_740_991)
-    ] = None
-
-    @field_validator("active_control_configuration_id")
-    @classmethod
-    def validate_identifier(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        return _bounded_nfc(
-            value,
-            label="active_control_configuration_id",
-            maximum_bytes=128,
-        )
-
-    @model_validator(mode="after")
-    def validate_presence(self) -> "CCLCExpectedActiveConfigurationRequest":
-        present = self.active_control_configuration_id is not None
-        if present != (self.active_control_configuration_generation is not None):
-            raise ValueError(
-                "active control configuration identity and generation must be paired"
-            )
-        if present != (self.presence == "present"):
-            raise ValueError(
-                "active control configuration fields do not match presence"
-            )
-        return self
+ComponentActionName = Literal[
+    "prepare", "enable", "disable", "recover", "reset_position", "power_off", "reboot", "sim_reset"
+]
 
 
-class CCLCControlBindingRequest(StrictRequest):
-    control_binding_id: str
-    control_binding_revision: str
-    control_route_id: str
+class ComponentActionRequest(StrictRequest):
+    """CONTRACTS §2 `POST /api/components/{component_id}/actions`."""
 
-    @field_validator(
-        "control_binding_id", "control_binding_revision", "control_route_id"
+    action: ComponentActionName
+
+
+class ComponentGroupActionRequest(StrictRequest):
+    """CONTRACTS §2 `POST /api/components/actions` (Enable all and groups):
+    the caller names the components (Enable all = every `prepared` member and
+    owner-less component; owners have no Enable, §16)."""
+
+    action: ComponentActionName
+    component_ids: list[Annotated[str, Field(min_length=1, max_length=256)]] = Field(
+        min_length=1, max_length=256
     )
-    @classmethod
-    def validate_identity(cls, value: str, info) -> str:
-        return _bounded_nfc(
-            value,
-            label=info.field_name,
-            maximum_bytes=128,
-        )
 
 
-class CCLCExpectedControlDomainRequest(StrictRequest):
-    """Expected controller domain; `kind` is required (no kindless legacy shape)."""
+# History keeps the first 2 KiB of each text (``activity_history``).
+_ActivityText = Annotated[str, Field(max_length=16384)]
 
-    kind: Literal["controller"]
-    control_domain_id: str
-    control_domain_revision: str
-    controller_topology_id: str
-    topology_revision: str
-    expected_active_control_configuration: CCLCExpectedActiveConfigurationRequest
-    expected_control_bindings: Annotated[
-        list[CCLCControlBindingRequest], Field(min_length=1, max_length=4_096)
+
+class ActivityErrorRequest(StrictRequest):
+    """A typed error of an Apply or one of its component rows."""
+
+    code: Annotated[str, Field(min_length=1, max_length=256)]
+    message: _ActivityText | None = None
+    vendor_code: _ActivityText | None = None
+    vendor_text: _ActivityText | None = None
+
+
+class ApplyOutcomeComponentRequest(StrictRequest):
+    """One ApplyResult component row (CONTRACTS §11)."""
+
+    component_id: Annotated[str, Field(min_length=1, max_length=256)]
+    disposition: Annotated[str, Field(min_length=1, max_length=256)] | None = None
+    lifecycle_after: Annotated[str, Field(min_length=1, max_length=256)] | None = None
+    error: ActivityErrorRequest | None = None
+
+
+class ApplyOutcomeRequest(StrictRequest):
+    """`POST /api/execution/history/apply-outcomes`: one Load, New, Apply or
+    Revert terminal, recorded once in History by the Composer that ran it."""
+
+    apply_kind: Literal[
+        "scenario_load", "scenario_new", "deployment_apply", "deployment_revert",
+        "program_apply", "program_revert",
     ]
-
-    @field_validator(
-        "control_domain_id",
-        "control_domain_revision",
-        "controller_topology_id",
-        "topology_revision",
+    outcome: Literal["succeeded", "accepted", "failed", "refused"]
+    error: ActivityErrorRequest | None = None
+    components: list[ApplyOutcomeComponentRequest] = Field(
+        default_factory=list, max_length=256
     )
-    @classmethod
-    def validate_identity(cls, value: str, info) -> str:
-        return _bounded_nfc(
-            value,
-            label=info.field_name,
-            maximum_bytes=128,
-        )
-
-    @model_validator(mode="after")
-    def validate_binding_order(self) -> "CCLCExpectedControlDomainRequest":
-        identifiers = [
-            item.control_binding_id for item in self.expected_control_bindings
-        ]
-        if identifiers != sorted(identifiers) or len(identifiers) != len(
-            set(identifiers)
-        ):
-            raise ValueError(
-                "expected_control_bindings must be strictly ordered by binding ID"
-            )
-        return self
 
 
-class CCLCProviderControlDomainRequest(StrictRequest):
-    """Existing Core provider-domain proof, echoed verbatim from the component snapshot."""
+class SetOutputRequest(StrictRequest):
+    """CONTRACTS §7 `POST /api/io/{signal_id}/set` body."""
 
-    controllable_component_id: str
-    provider_runtime_unit_id: str
-    provider_instance_id: str
-    provider_manifest_id: str
-    provider_manifest_revision: Annotated[str, Field(pattern=SHA256_PATTERN)]
-    lifecycle_plan_catalog_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
-    signal_configuration_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
-    signal_names: Annotated[list[str], Field(min_length=1, max_length=4_096)]
-    lifecycle_command_timeout_ns: Annotated[int, Field(ge=1, le=3_600_000_000_000)]
-
-    @field_validator(
-        "controllable_component_id",
-        "provider_runtime_unit_id",
-        "provider_instance_id",
-        "provider_manifest_id",
-    )
-    @classmethod
-    def validate_identity(cls, value: str, info) -> str:
-        return _bounded_nfc(value, label=info.field_name, maximum_bytes=128)
-
-    @field_validator("signal_names")
-    @classmethod
-    def validate_signal_names(cls, value: list[str]) -> list[str]:
-        if any(not name or len(name.encode("utf-8")) > 128 for name in value) or any(
-            left >= right for left, right in zip(value, value[1:])
-        ):
-            raise ValueError("signal_names must be canonical bounded non-empty names")
-        return value
-
-
-class CCLCExpectedProviderDomainRequest(StrictRequest):
-    """Existing Core expected provider domain: no topology, bindings or routes."""
-
-    kind: Literal["io_provider"]
-    control_domain_id: str
-    control_domain_revision: str
-    provider: CCLCProviderControlDomainRequest
-    expected_active_control_configuration: CCLCExpectedActiveConfigurationRequest
-
-    @field_validator("control_domain_id", "control_domain_revision")
-    @classmethod
-    def validate_identity(cls, value: str, info) -> str:
-        return _bounded_nfc(value, label=info.field_name, maximum_bytes=128)
-
-
-class CloseIncidentRecoveryRequest(StrictRequest):
-    expected_incident_id: str
-
-    @field_validator("expected_incident_id")
-    @classmethod
-    def validate_incident_id(cls, value: str) -> str:
-        return _bounded_nfc(value, label="expected_incident_id", maximum_bytes=128)
-
-
-class BoundedPublicRequestContext(CallerAttributionRequest):
-    @model_serializer(mode="wrap")
-    def serialize_optional_correlation(self, handler):
-        payload = handler(self)
-        if self.correlation_id is None:
-            payload.pop("correlation_id", None)
-        return payload
-
-    @field_validator("request_id", "request_owner_epoch")
-    @classmethod
-    def validate_owner_identity(cls, value: str, info) -> str:
-        return _bounded_nfc(value, label=info.field_name, maximum_bytes=128)
-
-
-class ComponentProcessStopRequest(StrictRequest):
-    request_context: BoundedPublicRequestContext
-    predecessor_projection_revision: ProjectionRevisionRequest
-    expected_predecessor_publication_generation: Annotated[int, Field(ge=1, le=MAXIMUM_SAFE_INTEGER)]
-    expected_predecessor_public_pointer_digest: Annotated[str, Field(pattern=SHA256_PATTERN)]
-    runtime_unit_id: str
-    runtime_epoch: str
-    manager_runtime_epoch: str
-    controllable_component_id: str
-    launch_identity: str
-    leader_pid: Annotated[int, Field(ge=1, le=2_147_483_647)]
-
-    @field_validator("runtime_unit_id", "runtime_epoch", "manager_runtime_epoch",
-                     "controllable_component_id")
-    @classmethod
-    def validate_identity(cls, value: str, info) -> str:
-        return _bounded_nfc(value, label=info.field_name, maximum_bytes=128)
-
-    @field_validator("launch_identity")
-    @classmethod
-    def validate_launch_identity(cls, value: str) -> str:
-        # Reuse the native RPC packet ceiling; complete packet limits still apply.
-        return _bounded_nfc(value, label="launch_identity", maximum_bytes=256 * 1024)
-
-
-class ComponentProcessStopBody(StrictRequest):
-    request: ComponentProcessStopRequest
-
-
-class ComponentProcessDrainReceipt(StrictRequest):
-    leader_pid: Annotated[int, Field(ge=1, le=2_147_483_647)]
-    controllable_component_id: str
-    launch_identity: str
-    observed_utc: str
-
-    @field_validator("controllable_component_id", "observed_utc")
-    @classmethod
-    def validate_identity(cls, value: str, info) -> str:
-        return _bounded_nfc(value, label=info.field_name, maximum_bytes=128)
-
-    @field_validator("launch_identity")
-    @classmethod
-    def validate_launch_identity(cls, value: str) -> str:
-        # Reuse the native RPC packet ceiling; complete packet limits still apply.
-        return _bounded_nfc(value, label="launch_identity", maximum_bytes=256 * 1024)
-
-
-class ComponentProcessStopResult(StrictRequest):
-    request: ComponentProcessStopRequest
-    state: Literal["not_requested", "pending", "unknown", "drained"]
-    receipt: ComponentProcessDrainReceipt | None
-    error: dict[str, Any] | None
-
-    @model_validator(mode="after")
-    def validate_drain(self) -> "ComponentProcessStopResult":
-        if self.state == "drained":
-            if self.receipt is None or self.error is not None:
-                raise ValueError("drained requires its exact receipt and no error")
-            if (self.receipt.leader_pid != self.request.leader_pid
-                    or self.receipt.controllable_component_id != self.request.controllable_component_id
-                    or self.receipt.launch_identity != self.request.launch_identity):
-                raise ValueError("drain receipt does not match the exact launch request")
-        elif self.receipt is not None:
-            raise ValueError("only drained may carry a drain receipt")
-        if self.error is not None and (
-                set(self.error) != {"code", "message", "details"}
-                or not isinstance(self.error["code"], str) or not self.error["code"]
-                or not isinstance(self.error["message"], str) or not self.error["message"]
-                or not isinstance(self.error["details"], dict)
-                or len(self.error["details"]) > 4096
-                or any(not isinstance(key, str) or not isinstance(value, str)
-                       for key, value in self.error["details"].items())):
-            raise ValueError("process Stop error must be an exact ErrorDTO")
-        return self
-
-
-class ComponentLifecycleRequest(StrictRequest):
-    request_context: CallerAttributionRequest
-    controllable_component_id: str
-    intent: Literal["prepare", "enable", "disable", "recover"]
-    expected_graph_revision: str
-    expected_component_lifecycle_generation: Annotated[
-        int, Field(ge=1, le=9_007_199_254_740_991)
-    ]
-    # Discriminated on the required `kind` value; a kindless row or the
-    # superseded `kind: "provider"` is refused.
-    expected_control_domains: Annotated[
-        list[Annotated[
-            CCLCExpectedControlDomainRequest | CCLCExpectedProviderDomainRequest,
-            Field(discriminator="kind"),
-        ]],
-        Field(min_length=1, max_length=256),
-    ]
-    reason: str | None = None
-    close_incident_recovery: CloseIncidentRecoveryRequest | None = None
-    # M6: false never acknowledges an open incident or stream latch; CCLC
-    # refuses `cclc_incident_open` instead. Absent: today's operator Recover.
-    acknowledge_incident: bool | None = None
-    # M6 (item 36): the operator's Recover acknowledges only this open
-    # incident; another one is refused `cclc_incident_changed` (409, no
-    # effect). None open (item 26): an ordinary Recover. Absent: today's Recover.
-    expected_incident_id: str | None = None
-    confirmed: bool
-    expected_admission_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
-    program_node_evidence: ProgramNodeAdmissionEvidenceRequest | None = None
-
-    @field_validator("controllable_component_id", "expected_graph_revision")
-    @classmethod
-    def validate_identity(cls, value: str, info) -> str:
-        return _bounded_nfc(
-            value,
-            label=info.field_name,
-            maximum_bytes=128,
-        )
-
-    @field_validator("reason")
-    @classmethod
-    def validate_reason(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        return _bounded_nfc(value, label="reason", maximum_bytes=1_024)
-
-    @field_validator("expected_incident_id")
-    @classmethod
-    def validate_expected_incident(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        return _bounded_nfc(value, label="expected_incident_id", maximum_bytes=128)
-
-    @model_validator(mode="after")
-    def validate_domain_order(self) -> "ComponentLifecycleRequest":
-        if self.close_incident_recovery is not None and (
-                self.intent != "recover" or self.reason != "cell closed by operator"):
-            raise ValueError("Close incident recovery requires explicit Recover and its exact reason")
-        if self.expected_incident_id is not None and (
-                self.intent != "recover"
-                or self.acknowledge_incident is False
-                or self.close_incident_recovery is not None):
-            raise ValueError(
-                "expected_incident_id belongs to an ordinary Recover that acknowledges an incident"
-            )
-        if self.program_node_evidence is not None:
-            raise ValueError(
-                "component lifecycle mutations are unsupported as Program nodes; "
-                "use the explicit idle-time component-management API"
-            )
-        identifiers = [item.control_domain_id for item in self.expected_control_domains]
-        if identifiers != sorted(identifiers) or len(identifiers) != len(
-            set(identifiers)
-        ):
-            raise ValueError(
-                "expected_control_domains must be strictly ordered by domain ID"
-            )
-        if (
-            sum(
-                len(item.expected_control_bindings)
-                for item in self.expected_control_domains
-                if isinstance(item, CCLCExpectedControlDomainRequest)
-            )
-            > 4_096
-        ):
-            raise ValueError("expected control bindings exceed the aggregate bound")
-        return self
-
-
-class CCLCDesiredControlBindingRequest(StrictRequest):
-    control_binding_id: str
-    control_binding_revision: str
-    control_route_id: str
-
-    @field_validator(
-        "control_binding_id", "control_binding_revision", "control_route_id"
-    )
-    @classmethod
-    def validate_identity(cls, value: str, info) -> str:
-        return _bounded_nfc(
-            value,
-            label=info.field_name,
-            maximum_bytes=256,
-        )
-
-
-class CCLCDesiredControlConfigurationRequest(StrictRequest):
-    control_domain_id: str
-    control_domain_revision: str
-    controller_topology_id: str
-    topology_revision: str
-    activation_set_id: str
-    binding_routes: Annotated[
-        list[CCLCDesiredControlBindingRequest],
-        Field(min_length=1, max_length=4_096),
-    ]
-
-    @field_validator(
-        "control_domain_id",
-        "control_domain_revision",
-        "controller_topology_id",
-        "topology_revision",
-        "activation_set_id",
-    )
-    @classmethod
-    def validate_identity(cls, value: str, info) -> str:
-        return _bounded_nfc(
-            value,
-            label=info.field_name,
-            maximum_bytes=256,
-        )
-
-    @model_validator(mode="after")
-    def validate_binding_order(self) -> "CCLCDesiredControlConfigurationRequest":
-        keys = [
-            (
-                item.control_binding_id,
-                item.control_binding_revision,
-                item.control_route_id,
-            )
-            for item in self.binding_routes
-        ]
-        binding_ids = [item.control_binding_id for item in self.binding_routes]
-        if keys != sorted(keys) or len(binding_ids) != len(set(binding_ids)):
-            raise ValueError("binding_routes must be canonical with unique binding IDs")
-        return self
-
-
-class CCLCRouteComponentExpectationRequest(StrictRequest):
-    controllable_component_id: str
-    expected_component_lifecycle_generation: Annotated[
-        int, Field(ge=1, le=9_007_199_254_740_991)
-    ]
-    expected_component_lifecycle_state: Literal["prepared", "active"]
-
-    @field_validator("controllable_component_id")
-    @classmethod
-    def validate_component_id(cls, value: str) -> str:
-        return _bounded_nfc(
-            value,
-            label="controllable_component_id",
-            maximum_bytes=256,
-        )
-
-
-class RouteSelectionRequestResultQuery(StrictRequest):
-    request_context: CallerAttributionRequest
-    expected_admission_generation: Annotated[
-        int | None, Field(ge=1, le=9_007_199_254_740_991)
-    ] = None
-    program_node_evidence: ProgramNodeAdmissionEvidenceRequest | None = None
-    expected_retained_bundle_id: str
-    expected_graph_revision: str
-    desired_configuration: CCLCDesiredControlConfigurationRequest
-    expected_active_control_configuration: CCLCExpectedActiveConfigurationRequest
-    component_expectations: Annotated[
-        list[CCLCRouteComponentExpectationRequest],
-        Field(min_length=1, max_length=4_096),
-    ]
-    confirmed: bool = False
-
-    @field_validator("expected_retained_bundle_id", "expected_graph_revision")
-    @classmethod
-    def validate_identity(cls, value: str, info) -> str:
-        return _bounded_nfc(
-            value,
-            label=info.field_name,
-            maximum_bytes=256,
-        )
-
-    @model_validator(mode="after")
-    def validate_component_order(self) -> "RouteSelectionRequestResultQuery":
-        identifiers = [
-            item.controllable_component_id for item in self.component_expectations
-        ]
-        if identifiers != sorted(identifiers) or len(identifiers) != len(
-            set(identifiers)
-        ):
-            raise ValueError(
-                "component_expectations must be strictly ordered by component ID"
-            )
-        if self.program_node_evidence is not None:
-            raise ValueError(
-                "route selection is unsupported as a Program node; use the "
-                "explicit idle-time control-domain API"
-            )
-        return self
-
-
-class RouteSelectionRequest(RouteSelectionRequestResultQuery):
-    expected_admission_generation: Annotated[int, Field(ge=1, le=9_007_199_254_740_991)]
-    confirmed: bool
+    value: bool | int | float

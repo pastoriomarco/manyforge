@@ -1,27 +1,21 @@
 import { useEffect, useState } from 'react';
 import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
+import { streamLabel } from '../state/componentPresentation';
 import type { JsonValue } from '../types/api';
-import type { CCLCStreamRecovery, CCLCStreamSeverity } from '../types/cclc';
-import { streamLabel } from '../state/componentStreamHealthPresentation';
 import type { FocusedEditorScope } from './DeploymentFocusedEditor';
 
-const SEVERITIES: readonly CCLCStreamSeverity[] = ['fault', 'blocking', 'warning'];
-const RECOVERIES: readonly CCLCStreamRecovery[] = ['ack', 'auto'];
-/** Mirrors the host's pose-source stream declaration (one stream per binding). */
-const POSE_SOURCE_STREAM_DEFAULTS = { severity: 'warning', recovery: 'auto' } as const;
 /** Mirrors the host's AI model component stream declaration (`endpoint`, 10 s). */
-const AI_MODEL_STREAM: DeclaredStream = {
-  streamId: 'endpoint', budgetNs: 10_000_000_000, severity: 'warning', recovery: 'auto',
-};
+const AI_MODEL_STREAM: DeclaredStream = { streamId: 'endpoint', budgetNs: 10_000_000_000 };
+/** IO-1: an I/O device's ROS inputs; declared by the host only with a budget row. */
+const IO_INPUTS_STREAM: DeclaredStream = { streamId: 'inputs', budgetNs: null };
+const ROS_INPUT_PROFILES = new Set(['ros_bool', 'ros2_control_gpio']);
 
 type Row = Record<string, JsonValue>;
-type OverrideField = 'budget_ns' | 'severity' | 'recovery';
 
 interface DeclaredStream {
   streamId: string;
-  budgetNs: number;
-  severity: CCLCStreamSeverity;
-  recovery: CCLCStreamRecovery;
+  /** Null: no stream unless a Deployment row sets its budget. */
+  budgetNs: number | null;
 }
 
 interface ComponentStreams {
@@ -87,7 +81,7 @@ const poseStreamId = (objectId: string, policyId: string) => (
 function authoredPoseStreams(runtime: Row, componentId: string, links: Row[]): DeclaredStream[] {
   const budgetNs = finite(runtime.stream_budget_ns);
   if (budgetNs === null) return [];
-  const stream = (streamId: string) => ({ streamId, budgetNs, ...POSE_SOURCE_STREAM_DEFAULTS });
+  const stream = (streamId: string) => ({ streamId, budgetNs });
   const objects = links.filter((link) => link.source_id === componentId)
     .flatMap((link) => (typeof link.scene_resource_id === 'string'
       ? [stream(poseStreamId(link.scene_resource_id, 'scene'))] : []));
@@ -100,27 +94,27 @@ function authoredPoseStreams(runtime: Row, componentId: string, links: Row[]): D
   return [...objects, ...overlays];
 }
 
-/** One component's declared streams: ROS `component_streams` rows, one per pose binding. */
+/**
+ * One component's declared streams: ROS `component_streams` rows, one per pose
+ * binding, and an I/O device's `inputs` when it has ROS inputs.
+ */
 function declaredStreams(runtime: Row, componentId: string, links: Row[] = []): DeclaredStream[] {
   const own = (row: Row) => row.controllable_component_id === componentId;
   const profile = rows(runtime.component_streams).filter(own).flatMap((row) => {
     const streamId = row.stream_id;
     const budgetNs = finite(row.budget_ns);
-    return typeof streamId === 'string' && budgetNs !== null
-      && SEVERITIES.includes(row.severity as CCLCStreamSeverity)
-      && RECOVERIES.includes(row.recovery as CCLCStreamRecovery)
-      ? [{ streamId, budgetNs, severity: row.severity as CCLCStreamSeverity,
-        recovery: row.recovery as CCLCStreamRecovery }]
-      : [];
+    return typeof streamId === 'string' && budgetNs !== null ? [{ streamId, budgetNs }] : [];
   });
   const poses = rows(runtime.pose_sources).filter(own).flatMap(poseSourceBindings).flatMap(
     (binding) => (binding.lifetimeNs === null ? [] : [{
       streamId: poseStreamId(binding.objectId, binding.policyId),
       budgetNs: binding.lifetimeNs,
-      ...POSE_SOURCE_STREAM_DEFAULTS,
     }]));
   const aiModels = rows(runtime.ai_models).filter(own).map(() => AI_MODEL_STREAM);
-  return [...profile, ...poses, ...aiModels, ...authoredPoseStreams(runtime, componentId, links)];
+  const ioInputs = rows(runtime.io_signals).some((row) => own(row) && row.direction === 'input'
+    && ROS_INPUT_PROFILES.has(String(object(row.provider)?.profile)));
+  return [...profile, ...poses, ...aiModels, ...authoredPoseStreams(runtime, componentId, links),
+    ...(ioInputs ? [IO_INPUTS_STREAM] : [])];
 }
 
 /** Every Deployment component (intent) or every component id found in unit rows (graph). */
@@ -202,8 +196,8 @@ function BudgetOverride({ label, value, placeholder, disabled, onCommit }: {
 }
 
 /**
- * CP9 component streams: each component's declared streams with their profile
- * defaults, and the Deployment `policies.component_streams` overrides. One
+ * Component streams: each component's declared streams with their freshness
+ * budget, and the Deployment `policies.component_streams` budget overrides. One
  * component's page shows only its streams; the cell settings only the
  * overrides whose stream no component declares.
  */
@@ -231,15 +225,15 @@ export function ComponentStreamsSection({ controller, scope = 'all' }: {
     else delete updated.component_streams;
     return controller.mutate(['policies'], 'set', updated);
   };
-  const save = async (componentId: string, streamId: string, field: OverrideField, value: JsonValue | null) => {
+  const save = async (componentId: string, streamId: string, value: number | null) => {
     const isRow = (row: Row) => row.controllable_component_id === componentId && row.stream_id === streamId;
     const row: Row = { ...(overrides.find(isRow)
       ?? { controllable_component_id: componentId, stream_id: streamId }) };
-    if (value === null) delete row[field];
-    else row[field] = value;
+    if (value === null) delete row.budget_ns;
+    else row.budget_ns = value;
     const next = overrides.filter((candidate) => !isRow(candidate));
-    // A row needs at least one override besides its identity.
-    if ('budget_ns' in row || 'severity' in row || 'recovery' in row) next.push(row);
+    // A row needs its budget besides its identity.
+    if ('budget_ns' in row) next.push(row);
     next.sort((a, b) => (
       compare(String(a.controllable_component_id), String(b.controllable_component_id))
       || compare(String(a.stream_id), String(b.stream_id))
@@ -259,37 +253,18 @@ export function ComponentStreamsSection({ controller, scope = 'all' }: {
               const override = overrides.find((row) => (
                 row.controllable_component_id === componentId && row.stream_id === stream.streamId));
               const budgetNs = finite(override?.budget_ns);
+              const fallback = stream.budgetNs === null ? 'off' : milliseconds(stream.budgetNs);
               return (
                 <fieldset key={stream.streamId} className="deployment-focused-form-grid">
                   <legend>{label}</legend>
                   <p className="muted">
-                    {`Default: ${milliseconds(stream.budgetNs)} · ${stream.severity} · ${stream.recovery}`}
+                    {`Default: ${fallback}`}
                   </p>
                   <BudgetOverride label={`${label} budget override for ${componentId}`}
                     value={budgetNs === null ? null : budgetNs / 1e6}
-                    placeholder={`${milliseconds(stream.budgetNs)} (default)`} disabled={disabled}
-                    onCommit={(ms) => save(componentId, stream.streamId, 'budget_ns',
+                    placeholder={`${fallback} (default)`} disabled={disabled}
+                    onCommit={(ms) => save(componentId, stream.streamId,
                       ms === null ? null : Math.max(1, Math.round(ms * 1e6)))} />
-                  <label className="deployment-focused-field">
-                    <span>Severity</span>
-                    <select aria-label={`${label} severity override for ${componentId}`} disabled={disabled}
-                      value={typeof override?.severity === 'string' ? override.severity : ''}
-                      onChange={(event) => { void save(componentId, stream.streamId, 'severity',
-                        event.target.value || null); }}>
-                      <option value="">{`Default (${stream.severity})`}</option>
-                      {SEVERITIES.map((value) => <option key={value} value={value}>{value}</option>)}
-                    </select>
-                  </label>
-                  <label className="deployment-focused-field">
-                    <span>Recovery</span>
-                    <select aria-label={`${label} recovery override for ${componentId}`} disabled={disabled}
-                      value={typeof override?.recovery === 'string' ? override.recovery : ''}
-                      onChange={(event) => { void save(componentId, stream.streamId, 'recovery',
-                        event.target.value || null); }}>
-                      <option value="">{`Default (${stream.recovery})`}</option>
-                      {RECOVERIES.map((value) => <option key={value} value={value}>{value}</option>)}
-                    </select>
-                  </label>
                 </fieldset>
               );
             })}
@@ -302,11 +277,7 @@ export function ComponentStreamsSection({ controller, scope = 'all' }: {
               const componentId = String(row.controllable_component_id);
               const streamId = String(row.stream_id);
               const budgetNs = finite(row.budget_ns);
-              const values = [
-                ...(budgetNs === null ? [] : [`budget ${milliseconds(budgetNs)}`]),
-                ...(typeof row.severity === 'string' ? [`severity ${row.severity}`] : []),
-                ...(typeof row.recovery === 'string' ? [`recovery ${row.recovery}`] : []),
-              ];
+              const values = budgetNs === null ? [] : [`budget ${milliseconds(budgetNs)}`];
               return (
                 <div key={key(componentId, streamId)}>
                   <p>{`${componentId} · ${streamId}: ${values.join(' · ') || 'no values'}`}</p>
@@ -320,7 +291,7 @@ export function ComponentStreamsSection({ controller, scope = 'all' }: {
             })}
           </section>
         )}
-        <p className="field-help">Defaults come from the component profile; overrides are Deployment rows (blank or Default keeps the default). Fault opens an incident (Full Stop), blocking holds new motion, warning only shows. Ack latches until Recover; auto clears when the stream is live again (a fault incident then closes by itself; nothing resumes).</p>
+        <p className="field-help">Defaults come from the component profile; an override is a Deployment row (blank keeps the default). A stream older than its budget is stale. What that means depends on the component: a robot's or an I/O device's own stream going stale is a fault (an I/O device's Inputs have no budget unless you set one, since change-only inputs may stay silent; losing every sender of its inputs is always its fault); a pose source's, camera's or AI model's only shows as stale and keeps Program conditions from reading it. In a simulator lane a simulated robot's or tool's stale stream is not a fault: the component keeps its state (an enabled robot stays enabled) with the reason "Simulation not playing", and a new command on it stops the run (as the operator's Stop) until the simulation plays and the operator presses Run.</p>
       </div>
     </details>
   );

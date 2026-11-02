@@ -34,7 +34,8 @@ FAILURE_DETAIL_KEYS: Final = (
     "source_kind",
     "source_reference",
     # Required ErrorDTO details a run may surface.
-    "latch_id",
+    "rule_id",
+    "component_id",
     "retryable",
     "required_action",
 )
@@ -74,17 +75,6 @@ def _bounded_value(value: object) -> object:
         return _bounded_text(value)
     # Nested objects, arrays and any other value are not carried.
     return _OMITTED
-
-
-def output_may_have_acted(output_evidence: object) -> bool:
-    """I/O output family (contract 53): the write's effect is unresolved.
-
-    Only ``acceptance_unknown`` leaves it open whether the source acted; the
-    other evidence values are settled facts. Other families keep their own
-    value sets and helpers (spec 210 naming glossary).
-    """
-
-    return output_evidence == "acceptance_unknown"
 
 
 def bounded_failure_details(details: object) -> Mapping[str, Any] | None:

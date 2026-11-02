@@ -334,6 +334,7 @@ class ExecutableProgramRun:
         ports: NodeAdapterPorts,
         program_clock: ProgramClock | None = None,
         motion_attention: Callable[[str, str], None] | None = None,
+        transport_timeout_s: float | None = None,
         project_path: str | None = None,
     ) -> None:
         # ``project_path``: the Applied Scenario project folder that scopes
@@ -437,6 +438,9 @@ class ExecutableProgramRun:
         capture_topology(program.tree)
         self._scope_node_ids = tuple(sorted(node_children))
         self._scope_identity: tuple[str, str, int] | None = None
+        # AUD-6: the global rule whose `hold` holds this run, from the latest
+        # Kernel scope read (None once Resume releases it); the run end names it.
+        self._stopped_by_rule_id: str | None = None
         # The run's one Program clock. Its owner freezes it while the run is
         # halted; waits, the timer and held-time measurement all read it, so
         # a hold that spans a Halt is never subtracted twice.
@@ -445,6 +449,8 @@ class ExecutableProgramRun:
         if motion_attention is not None and not callable(motion_attention):
             raise TypeError("motion_attention must be callable")
         self._motion_attention = motion_attention
+        # The Runner's execution transport timeout, for owner task nodes.
+        self._transport_timeout_s = transport_timeout_s
         self._node_history_events: list[dict[str, Any]] = []
         self._operator_stop_state = OperatorMotionStopState(
             node_children,
@@ -521,6 +527,7 @@ class ExecutableProgramRun:
                 program_clock=self._program_clock,
                 motion_attention=self._motion_attention,
                 audit_sink=self._record_node_history_event,
+                transport_timeout_s=self._transport_timeout_s,
             ),
         )
         if isinstance(built, OwnerTaskAdapter):
@@ -727,6 +734,26 @@ class ExecutableProgramRun:
                 adapter = self._task_adapters.get(node_id)
                 if isinstance(adapter, MotionTaskAdapter):
                     adapter.restart_retry_series()
+
+    def simulation_stop_nodes(self) -> frozenset[str]:
+        """SIM-1: nodes refused with `simulation_not_playing` whose operator
+        Stop the run owner hasn't sent yet."""
+
+        with self._lock:
+            return frozenset(
+                node_id
+                for node_id, adapter in self._task_adapters.items()
+                if adapter.simulation_stop_pending
+            )
+
+    def note_simulation_stops(self, node_ids: frozenset[str]) -> None:
+        """The operator Stop for these nodes' simulation holds was accepted."""
+
+        with self._lock:
+            for node_id in node_ids:
+                adapter = self._task_adapters.get(node_id)
+                if adapter is not None:
+                    adapter.simulation_stop_sent()
 
     def node_motion_groups(self, node_instance_id: str) -> tuple[str, ...]:
         """The named execution groups containing this node, or ``("all",)``
@@ -946,6 +973,12 @@ class ExecutableProgramRun:
             or not 0 <= scope["selection_revision"] <= 2**53 - 1
         ):
             raise ProgramRuntimeError("operator Stop projection changed its capture")
+        rule_id = scope.get("rule_id")
+        self._stopped_by_rule_id = (
+            rule_id
+            if scope.get("stopped_by") == "rule" and isinstance(rule_id, str) and rule_id
+            else None
+        )
         release_block_reason = scope.get("selection_release_block_reason")
         if release_block_reason is not None and (
             not isinstance(release_block_reason, str)
@@ -1042,6 +1075,11 @@ class ExecutableProgramRun:
                 and getattr(node, "has_active_task", False)
                 for node in self._tree.root.iterate()
             )
+
+    @property
+    def stopped_by_rule_id(self) -> str | None:
+        """The rule whose `hold` holds this run, from the latest scope read."""
+        return self._stopped_by_rule_id
 
     def refresh_operator_stop_scope(self) -> None:
         """Refresh scheduling only, never issue or release physical containment."""

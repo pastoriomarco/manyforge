@@ -1,6 +1,6 @@
 -- ManyForge UI6-I logical-scene history and withdrawal schema, version 7.
 --
--- Version 4 owns durable scene transactions and version 5 owns native-runtime
+-- Version 4 owns durable scene transactions and version 5 owns execution-host
 -- recovery.  This overlay adds one bounded checkpoint/control row.  A
 -- quiescent compaction retains the exact current immutable scene, advances an
 -- opaque request-owner epoch, and removes only history already represented by
@@ -23,8 +23,8 @@ CREATE TABLE IF NOT EXISTS logical_scene_bounded_history_migrations (
     maximum_resident_scene_transactions INTEGER NOT NULL CHECK (
         maximum_resident_scene_transactions = 256
     ),
-    maximum_retained_native_recoveries INTEGER NOT NULL CHECK (
-        maximum_retained_native_recoveries = 2
+    maximum_retained_recoveries INTEGER NOT NULL CHECK (
+        maximum_retained_recoveries = 2
     ),
     FOREIGN KEY (singleton)
         REFERENCES logical_scene_store_metadata (singleton)
@@ -119,7 +119,7 @@ INSERT INTO logical_scene_history_state(
 SELECT
     1,
     coalesce(max(recovery_generation), 0)
-FROM logical_scene_native_runtime_recovery_intents;
+FROM logical_scene_execution_host_recovery_intents;
 
 -- Version 5 used its retained-row bound as the recovery-generation bound.
 -- Rebuild only this four-table family so retained rows stay bounded while the
@@ -129,14 +129,14 @@ CREATE TEMP TABLE manyforge_native_recovery_keep (
 ) STRICT;
 INSERT OR IGNORE INTO manyforge_native_recovery_keep(recovery_generation)
 SELECT max(recovery_generation)
-FROM logical_scene_native_runtime_recovery_completions
+FROM logical_scene_execution_host_recovery_completions
 HAVING max(recovery_generation) IS NOT NULL;
 INSERT OR IGNORE INTO manyforge_native_recovery_keep(recovery_generation)
 SELECT max(recovery_generation)
-FROM logical_scene_native_runtime_recovery_intents
+FROM logical_scene_execution_host_recovery_intents
 WHERE recovery_generation NOT IN (
     SELECT recovery_generation
-    FROM logical_scene_native_runtime_recovery_completions
+    FROM logical_scene_execution_host_recovery_completions
 )
 HAVING max(recovery_generation) IS NOT NULL;
 
@@ -144,48 +144,48 @@ CREATE TEMP TABLE manyforge_native_recovery_intents AS
 SELECT recovery_generation,structural_lineage_generation,
        target_retained_bundle_id,target_graph_revision,target_scene_id,
        target_scene_revision_id,target_scene_content_hash,native_binding_count
-FROM logical_scene_native_runtime_recovery_intents
+FROM logical_scene_execution_host_recovery_intents
 WHERE recovery_generation IN (
     SELECT recovery_generation FROM manyforge_native_recovery_keep
 );
 CREATE TEMP TABLE manyforge_native_recovery_bindings AS
 SELECT recovery_generation,binding_ordinal,provider_binding_id,
        provider_binding_revision,runtime_unit_id,runtime_epoch
-FROM logical_scene_native_runtime_recovery_bindings
+FROM logical_scene_execution_host_recovery_bindings
 WHERE recovery_generation IN (
     SELECT recovery_generation FROM manyforge_native_recovery_keep
 );
 CREATE TEMP TABLE manyforge_native_recovery_results AS
 SELECT recovery_generation,binding_ordinal,source_sequence,
        native_projection_generation,projection_content_digest
-FROM logical_scene_native_runtime_recovery_results
+FROM logical_scene_execution_host_recovery_results
 WHERE recovery_generation IN (
     SELECT recovery_generation FROM manyforge_native_recovery_keep
 );
 CREATE TEMP TABLE manyforge_native_recovery_completions AS
 SELECT recovery_generation,result_count
-FROM logical_scene_native_runtime_recovery_completions
+FROM logical_scene_execution_host_recovery_completions
 WHERE recovery_generation IN (
     SELECT recovery_generation FROM manyforge_native_recovery_keep
 );
 
-DROP TRIGGER logical_scene_native_runtime_recovery_completions_no_update;
-DROP TRIGGER logical_scene_native_runtime_recovery_completions_no_delete;
-DROP TRIGGER logical_scene_native_runtime_recovery_results_no_update;
-DROP TRIGGER logical_scene_native_runtime_recovery_results_no_delete;
-DROP TRIGGER logical_scene_native_runtime_recovery_bindings_no_update;
-DROP TRIGGER logical_scene_native_runtime_recovery_bindings_no_delete;
-DROP TRIGGER logical_scene_native_runtime_recovery_intents_no_update;
-DROP TRIGGER logical_scene_native_runtime_recovery_intents_no_delete;
+DROP TRIGGER logical_scene_execution_host_recovery_completions_no_update;
+DROP TRIGGER logical_scene_execution_host_recovery_completions_no_delete;
+DROP TRIGGER logical_scene_execution_host_recovery_results_no_update;
+DROP TRIGGER logical_scene_execution_host_recovery_results_no_delete;
+DROP TRIGGER logical_scene_execution_host_recovery_bindings_no_update;
+DROP TRIGGER logical_scene_execution_host_recovery_bindings_no_delete;
+DROP TRIGGER logical_scene_execution_host_recovery_intents_no_update;
+DROP TRIGGER logical_scene_execution_host_recovery_intents_no_delete;
 
 UPDATE logical_scene_history_state SET compaction_in_progress = 1
 WHERE singleton = 1;
-DROP TABLE logical_scene_native_runtime_recovery_results;
-DROP TABLE logical_scene_native_runtime_recovery_completions;
-DROP TABLE logical_scene_native_runtime_recovery_bindings;
-DROP TABLE logical_scene_native_runtime_recovery_intents;
+DROP TABLE logical_scene_execution_host_recovery_results;
+DROP TABLE logical_scene_execution_host_recovery_completions;
+DROP TABLE logical_scene_execution_host_recovery_bindings;
+DROP TABLE logical_scene_execution_host_recovery_intents;
 
-CREATE TABLE logical_scene_native_runtime_recovery_intents (
+CREATE TABLE logical_scene_execution_host_recovery_intents (
     recovery_generation INTEGER PRIMARY KEY CHECK (
         recovery_generation > 0
         AND recovery_generation <= 9007199254740991
@@ -214,7 +214,7 @@ CREATE TABLE logical_scene_native_runtime_recovery_intents (
         REFERENCES logical_scene_named_apply_stages (lineage_generation)
 ) STRICT;
 
-CREATE TABLE logical_scene_native_runtime_recovery_bindings (
+CREATE TABLE logical_scene_execution_host_recovery_bindings (
     recovery_generation INTEGER NOT NULL,
     binding_ordinal INTEGER NOT NULL CHECK (
         binding_ordinal >= 0 AND binding_ordinal < 256
@@ -225,12 +225,12 @@ CREATE TABLE logical_scene_native_runtime_recovery_bindings (
     runtime_epoch TEXT NOT NULL,
     PRIMARY KEY (recovery_generation, binding_ordinal),
     FOREIGN KEY (recovery_generation)
-        REFERENCES logical_scene_native_runtime_recovery_intents (
+        REFERENCES logical_scene_execution_host_recovery_intents (
             recovery_generation
         )
 ) WITHOUT ROWID, STRICT;
 
-CREATE TABLE logical_scene_native_runtime_recovery_results (
+CREATE TABLE logical_scene_execution_host_recovery_results (
     recovery_generation INTEGER NOT NULL,
     binding_ordinal INTEGER NOT NULL CHECK (
         binding_ordinal >= 0 AND binding_ordinal < 256
@@ -249,23 +249,23 @@ CREATE TABLE logical_scene_native_runtime_recovery_results (
     ),
     PRIMARY KEY (recovery_generation, binding_ordinal),
     FOREIGN KEY (recovery_generation, binding_ordinal)
-        REFERENCES logical_scene_native_runtime_recovery_bindings (
+        REFERENCES logical_scene_execution_host_recovery_bindings (
             recovery_generation, binding_ordinal
         )
 ) WITHOUT ROWID, STRICT;
 
-CREATE TABLE logical_scene_native_runtime_recovery_completions (
+CREATE TABLE logical_scene_execution_host_recovery_completions (
     recovery_generation INTEGER PRIMARY KEY,
     result_count INTEGER NOT NULL CHECK (
         result_count > 0 AND result_count <= 256
     ),
     FOREIGN KEY (recovery_generation)
-        REFERENCES logical_scene_native_runtime_recovery_intents (
+        REFERENCES logical_scene_execution_host_recovery_intents (
             recovery_generation
         )
 ) STRICT;
 
-INSERT INTO logical_scene_native_runtime_recovery_intents(
+INSERT INTO logical_scene_execution_host_recovery_intents(
     recovery_generation,structural_lineage_generation,
     target_retained_bundle_id,target_graph_revision,target_scene_id,
     target_scene_revision_id,target_scene_content_hash,native_binding_count,
@@ -276,32 +276,32 @@ SELECT recovery_generation,structural_lineage_generation,
        target_scene_revision_id,target_scene_content_hash,native_binding_count,
        NULL
 FROM manyforge_native_recovery_intents;
-INSERT INTO logical_scene_native_runtime_recovery_bindings
+INSERT INTO logical_scene_execution_host_recovery_bindings
 SELECT * FROM manyforge_native_recovery_bindings;
-INSERT INTO logical_scene_native_runtime_recovery_results
+INSERT INTO logical_scene_execution_host_recovery_results
 SELECT * FROM manyforge_native_recovery_results;
-INSERT INTO logical_scene_native_runtime_recovery_completions
+INSERT INTO logical_scene_execution_host_recovery_completions
 SELECT * FROM manyforge_native_recovery_completions;
 
-CREATE TRIGGER logical_scene_native_runtime_recovery_intents_no_update
-BEFORE UPDATE ON logical_scene_native_runtime_recovery_intents
+CREATE TRIGGER logical_scene_execution_host_recovery_intents_no_update
+BEFORE UPDATE ON logical_scene_execution_host_recovery_intents
 BEGIN
-    SELECT RAISE(ABORT, 'logical_scene_native_runtime_recovery_intents is immutable');
+    SELECT RAISE(ABORT, 'logical_scene_execution_host_recovery_intents is immutable');
 END;
-CREATE TRIGGER logical_scene_native_runtime_recovery_bindings_no_update
-BEFORE UPDATE ON logical_scene_native_runtime_recovery_bindings
+CREATE TRIGGER logical_scene_execution_host_recovery_bindings_no_update
+BEFORE UPDATE ON logical_scene_execution_host_recovery_bindings
 BEGIN
-    SELECT RAISE(ABORT, 'logical_scene_native_runtime_recovery_bindings is immutable');
+    SELECT RAISE(ABORT, 'logical_scene_execution_host_recovery_bindings is immutable');
 END;
-CREATE TRIGGER logical_scene_native_runtime_recovery_results_no_update
-BEFORE UPDATE ON logical_scene_native_runtime_recovery_results
+CREATE TRIGGER logical_scene_execution_host_recovery_results_no_update
+BEFORE UPDATE ON logical_scene_execution_host_recovery_results
 BEGIN
-    SELECT RAISE(ABORT, 'logical_scene_native_runtime_recovery_results is immutable');
+    SELECT RAISE(ABORT, 'logical_scene_execution_host_recovery_results is immutable');
 END;
-CREATE TRIGGER logical_scene_native_runtime_recovery_completions_no_update
-BEFORE UPDATE ON logical_scene_native_runtime_recovery_completions
+CREATE TRIGGER logical_scene_execution_host_recovery_completions_no_update
+BEFORE UPDATE ON logical_scene_execution_host_recovery_completions
 BEGIN
-    SELECT RAISE(ABORT, 'logical_scene_native_runtime_recovery_completions is immutable');
+    SELECT RAISE(ABORT, 'logical_scene_execution_host_recovery_completions is immutable');
 END;
 
 UPDATE logical_scene_history_state SET compaction_in_progress = 0
@@ -360,40 +360,40 @@ BEGIN
     SELECT RAISE(ABORT, 'logical_scene_owner_events is immutable');
 END;
 
-DROP TRIGGER IF EXISTS logical_scene_native_runtime_recovery_intents_no_delete;
-CREATE TRIGGER logical_scene_native_runtime_recovery_intents_no_delete
-BEFORE DELETE ON logical_scene_native_runtime_recovery_intents
+DROP TRIGGER IF EXISTS logical_scene_execution_host_recovery_intents_no_delete;
+CREATE TRIGGER logical_scene_execution_host_recovery_intents_no_delete
+BEFORE DELETE ON logical_scene_execution_host_recovery_intents
 WHEN (SELECT compaction_in_progress FROM logical_scene_history_state
       WHERE singleton = 1) != 1
 BEGIN
-    SELECT RAISE(ABORT, 'logical_scene_native_runtime_recovery_intents is immutable');
+    SELECT RAISE(ABORT, 'logical_scene_execution_host_recovery_intents is immutable');
 END;
 
-DROP TRIGGER IF EXISTS logical_scene_native_runtime_recovery_bindings_no_delete;
-CREATE TRIGGER logical_scene_native_runtime_recovery_bindings_no_delete
-BEFORE DELETE ON logical_scene_native_runtime_recovery_bindings
+DROP TRIGGER IF EXISTS logical_scene_execution_host_recovery_bindings_no_delete;
+CREATE TRIGGER logical_scene_execution_host_recovery_bindings_no_delete
+BEFORE DELETE ON logical_scene_execution_host_recovery_bindings
 WHEN (SELECT compaction_in_progress FROM logical_scene_history_state
       WHERE singleton = 1) != 1
 BEGIN
-    SELECT RAISE(ABORT, 'logical_scene_native_runtime_recovery_bindings is immutable');
+    SELECT RAISE(ABORT, 'logical_scene_execution_host_recovery_bindings is immutable');
 END;
 
-DROP TRIGGER IF EXISTS logical_scene_native_runtime_recovery_results_no_delete;
-CREATE TRIGGER logical_scene_native_runtime_recovery_results_no_delete
-BEFORE DELETE ON logical_scene_native_runtime_recovery_results
+DROP TRIGGER IF EXISTS logical_scene_execution_host_recovery_results_no_delete;
+CREATE TRIGGER logical_scene_execution_host_recovery_results_no_delete
+BEFORE DELETE ON logical_scene_execution_host_recovery_results
 WHEN (SELECT compaction_in_progress FROM logical_scene_history_state
       WHERE singleton = 1) != 1
 BEGIN
-    SELECT RAISE(ABORT, 'logical_scene_native_runtime_recovery_results is immutable');
+    SELECT RAISE(ABORT, 'logical_scene_execution_host_recovery_results is immutable');
 END;
 
-DROP TRIGGER IF EXISTS logical_scene_native_runtime_recovery_completions_no_delete;
-CREATE TRIGGER logical_scene_native_runtime_recovery_completions_no_delete
-BEFORE DELETE ON logical_scene_native_runtime_recovery_completions
+DROP TRIGGER IF EXISTS logical_scene_execution_host_recovery_completions_no_delete;
+CREATE TRIGGER logical_scene_execution_host_recovery_completions_no_delete
+BEFORE DELETE ON logical_scene_execution_host_recovery_completions
 WHEN (SELECT compaction_in_progress FROM logical_scene_history_state
       WHERE singleton = 1) != 1
 BEGIN
-    SELECT RAISE(ABORT, 'logical_scene_native_runtime_recovery_completions is immutable');
+    SELECT RAISE(ABORT, 'logical_scene_execution_host_recovery_completions is immutable');
 END;
 
 CREATE TRIGGER IF NOT EXISTS logical_scene_bounded_history_migrations_no_update

@@ -1,6 +1,6 @@
 # Component descriptor (docs/authoring/ADDING_A_COMPONENT.md): the Mock I/O of
 # a pneumatic gripper, a valve output and a grasp sensor that echoes it, as in
-# examples/lite6_pneumatic_mock.scenario.
+# examples/mock_lite6_pneumatic_pick_and_place.scenario.
 api_version: manyforge.component_package.v1
 kind: io_device
 id: manyforge.mock_pneumatic_gripper_io

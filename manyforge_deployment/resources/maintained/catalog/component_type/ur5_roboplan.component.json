@@ -57,18 +57,6 @@
           "capability_id": "planning.motion.pose_goal"
         },
         {
-          "capability_definition_revision": "sha256:14c53dad299a42d6604eac14240d015e22a4bc1adb363fb252111e62a2d2ad90",
-          "capability_id": "planning.profile.balanced"
-        },
-        {
-          "capability_definition_revision": "sha256:e0f578ef9af205b3c7c184fb1124ffb4fe3c35874b5e993358b43a2dc43d2674",
-          "capability_id": "planning.profile.first_feasible"
-        },
-        {
-          "capability_definition_revision": "sha256:7f570672270455207d5fb8eb210cd1dd22a99d7909421cf0dc8036c32e4beffb",
-          "capability_id": "planning.profile.quality_bounded"
-        },
-        {
           "capability_definition_revision": "sha256:1fde55ff59f977844d1e42a115df0e66305953803e7f2830fec4821e3cd36385",
           "capability_id": "planning.trajectory.time_parameterized"
         },
@@ -136,7 +124,7 @@
     "model_role_id": "arm_model"
   },
   "component_type_id": "ur5_roboplan.component",
-  "component_type_revision": "sha256:127ba62571dbcab0bb1184f26536f0ddf9bf3c22b3af019b9869e824cbd31a4b",
+  "component_type_revision": "sha256:5c32c3527379a4300c2432937f0b42bb0c76e503384d680e27d9b3aabf40e968",
   "model_mounts": [],
   "model_roles": [
     {

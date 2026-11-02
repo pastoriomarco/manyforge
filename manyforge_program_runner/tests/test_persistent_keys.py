@@ -49,9 +49,11 @@ def _declaration(
 class _Manager:
     """Committed Scenario Applies of one Manager publication history."""
 
-    def __init__(self, history: str = "h") -> None:
+    def __init__(self, history: str = "h", retain: int | None = None) -> None:
         self.history = history
         self.applies: dict[str, str] = {}
+        # Manager's journal keeps the newest `retain` committed Applies.
+        self.retain = retain
 
     def apply(
         self, project_path: str, *declarations: BlackboardKeyDeclaration
@@ -67,7 +69,9 @@ class _Manager:
             record_digest=digest,
             project_path=self.applies[digest],
             declarations={row.key: row for row in declarations},
-            committed_applies=dict(self.applies),
+            committed_applies=dict(
+                list(self.applies.items())[-(self.retain or len(self.applies)):]
+            ),
         )
 
 
@@ -275,6 +279,45 @@ def test_a_new_publication_history_keeps_rows_that_still_fit(tmp_path: Path) -> 
     # Faults named Applies of the previous history; its audit stays.
     assert register.unobserved_applies("/cells/a/cell.scenario") == ()
     assert [e["action"] for e in register.edits("/cells/a/cell.scenario")].count("fault") == 1
+
+
+def test_manager_eviction_continues_the_history(tmp_path: Path) -> None:
+    register = PersistentKeyRegister(tmp_path / "keys.json")
+    manager = _Manager(retain=4)
+    index = _declaration("index")
+    _reconciled(register, manager, "/cells/a/cell.scenario", index)
+    register.commit("/cells/a/cell.scenario", index, 7)
+    # Far more Applies than Manager retains, each observed: one history.
+    for _ in range(10):
+        result = register.reconcile(manager.apply("/cells/a/cell.scenario", index))
+        assert (result.outcome, result.history_changed, result.unobserved) == (
+            "reconciled", False, ()
+        )
+    assert register.restore("/cells/a/cell.scenario", {"index": index}) == {"index": 7}
+
+    # A retained Apply the register never observed is still the named fault ...
+    missed = manager.apply("/cells/b/cell.scenario")
+    result = register.reconcile(manager.apply("/cells/a/cell.scenario", index))
+    assert result.history_changed is False
+    assert result.unobserved == ((missed.record_digest, "/cells/b/cell.scenario"),)
+    assert register.unobserved_applies("/cells/b/cell.scenario") == (missed.record_digest,)
+    # ... until Manager evicts the Apply it names (its audit stays).
+    for _ in range(4):
+        register.reconcile(manager.apply("/cells/a/cell.scenario", index))
+    assert register.unobserved_applies("/cells/b/cell.scenario") == ()
+    assert [e["action"] for e in register.edits("/cells/b/cell.scenario")].count("fault") == 1
+    reopened = PersistentKeyRegister(register.path)
+    assert reopened.restore("/cells/a/cell.scenario", {"index": index}) == {"index": 7}
+
+    # A register that lagged until its last activation was evicted cannot
+    # follow the history: accepted as a new one, the retained Applies it
+    # never saw are named, and rows that fit stay.
+    for _ in range(5):
+        manager.apply("/cells/b/cell.scenario")
+    result = reopened.reconcile(manager.apply("/cells/a/cell.scenario", index))
+    assert result.history_changed is True
+    assert len(result.unobserved) == 3
+    assert reopened.restore("/cells/a/cell.scenario", {"index": index}) == {"index": 7}
 
 
 def test_nothing_is_restored_before_the_scenario_is_reconciled(tmp_path: Path) -> None:

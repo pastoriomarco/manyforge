@@ -1,9 +1,9 @@
 """Disposition of the former singleton native-Kernel benchmark corpus.
 
 The three historical cases at commit
-``08222188293df8e12f90dc72e204c21f22f92ea1`` remain the acceptance source and
-are restored by
-``manyforge_roboplan/test/test_native_execution_path.py::test_addressed_native_benchmark_preserves_historical_measurements``:
+``08222188293df8e12f90dc72e204c21f22f92ea1`` remain the acceptance source; their
+ROS port is not restored (its NOT_RUN placeholder went with the standalone
+execution host):
 
 * ``test_benchmark_single_plan`` uses the C++
   resource-addressed request and the selected native planning/execution route;

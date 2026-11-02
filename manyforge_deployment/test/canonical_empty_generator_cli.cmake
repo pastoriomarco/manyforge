@@ -71,18 +71,7 @@ if(NOT result EQUAL 0)
     "stdout=${output}; stderr=${error}")
 endif()
 
-file(MAKE_DIRECTORY "${MANYFORGE_TEST_ROOT}/native")
-expect_generator_failure("withdrawn native runtime profile option"
-  --output-root "${MANYFORGE_TEST_ROOT}/native"
-  --cell-id native_test_runtime --native-runtime-profile "${MANYFORGE_NATIVE_PROFILE}")
-
 file(MAKE_DIRECTORY "${MANYFORGE_TEST_ROOT}/ros")
-expect_generator_failure("ROS flag cannot select a native profile"
-  --output-root "${MANYFORGE_TEST_ROOT}/ros"
-  --cell-id ros_test_runtime --ros-runtime-profile "${MANYFORGE_NATIVE_PROFILE}")
-expect_generator_failure("withdrawn native flag cannot select a ROS profile"
-  --output-root "${MANYFORGE_TEST_ROOT}/native"
-  --cell-id native_test_runtime --native-runtime-profile "${MANYFORGE_ROS_PROFILE}")
 expect_generator_failure("invalid ROS runtime identity"
   --output-root "${MANYFORGE_TEST_ROOT}/ros"
   --cell-id "../foreign" --ros-runtime-profile "${MANYFORGE_ROS_PROFILE}")

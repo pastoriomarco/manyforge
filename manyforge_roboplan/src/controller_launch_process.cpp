@@ -41,9 +41,7 @@ namespace {
 
 constexpr std::string_view kRos2 = "ros2";
 constexpr std::string_view kBringupPackage = "manyforge_ros_bringup";
-constexpr std::string_view kMockLaunchFile = "mock_control.launch.py";
-constexpr std::string_view kIsaacLaunchFile =
-    "isaac_topic_based_control.launch.py";
+constexpr std::string_view kRos2ControlLaunchFile = "ros2_control.launch.py";
 constexpr std::string_view kIsaacGripperLaunchFile = "isaac_gripper.launch.py";
 constexpr std::string_view kSimulatedPlcLaunchFile = "sim_plc.launch.py";
 constexpr std::string_view kPoseSourceLaunchFile = "pose_source.launch.py";
@@ -55,16 +53,18 @@ constexpr std::string_view kAiModelLaunchFile = "ai_model.launch.py";
   // controller commands retain their existing SIGTERM policy.
   if (argv.size() >= 4U && argv[0] == kRos2 && argv[1] == "launch" &&
       argv[2] == kBringupPackage &&
-      ((command.lane == ControllerLaunchLane::kMock &&
-        argv[3] == kMockLaunchFile) ||
+      ((command.lane == ControllerLaunchLane::kRos2Control &&
+        argv[3] == kRos2ControlLaunchFile) ||
        (command.lane == ControllerLaunchLane::kIsaac &&
-        (argv[3] == kIsaacLaunchFile || argv[3] == kIsaacGripperLaunchFile)) ||
+        argv[3] == kIsaacGripperLaunchFile) ||
        (command.lane == ControllerLaunchLane::kSimulatedPlc &&
         argv[3] == kSimulatedPlcLaunchFile) ||
        (command.lane == ControllerLaunchLane::kPoseSource &&
         argv[3] == kPoseSourceLaunchFile) ||
        (command.lane == ControllerLaunchLane::kAiModel &&
-        argv[3] == kAiModelLaunchFile)))
+        argv[3] == kAiModelLaunchFile) ||
+       // A component process's launch file keeps SIGINT out of its tasks.
+       command.lane == ControllerLaunchLane::kComponent))
     return SIGINT;
   return SIGTERM;
 }
@@ -84,7 +84,7 @@ constexpr std::string_view kAiModelLaunchFile = "ai_model.launch.py";
 identity_of(const ControllerLaunchArtifacts &artifacts,
             const std::vector<std::string> &further) {
   std::ostringstream out;
-  out << (artifacts.lane == ControllerLaunchLane::kMock ? "mock" : "isaac")
+  out << (artifacts.lane == ControllerLaunchLane::kRos2Control ? "ros2_control" : "isaac")
       << '\n'
       << artifacts.controllable_component_id << '\n'
       << artifacts.controller_profile << '\n'
@@ -426,25 +426,24 @@ spawn_now(const std::vector<std::string> &argv,
 } // namespace
 
 ControllerLaunchCommand
-mock_controller_launch_command(const ControllerLaunchArtifacts &artifacts) {
-  require_artifacts(artifacts, ControllerLaunchLane::kMock);
+ros2_control_launch_command(const ControllerLaunchArtifacts &artifacts) {
+  require_artifacts(artifacts, ControllerLaunchLane::kRos2Control);
   if (artifacts.launch_arguments.empty()) {
-    fail("mock component '" + artifacts.controllable_component_id +
+    fail("component '" + artifacts.controllable_component_id +
          "' has no launch arguments");
   }
   ControllerLaunchCommand command;
   command.controllable_component_id = artifacts.controllable_component_id;
-  command.lane = ControllerLaunchLane::kMock;
+  command.lane = ControllerLaunchLane::kRos2Control;
   command.argv = {std::string(kRos2), "launch", std::string(kBringupPackage),
-                  std::string(kMockLaunchFile)};
+                  std::string(kRos2ControlLaunchFile)};
   std::set<std::string> names;
-  // The shared Mock/Real builder (CP8 step 2a): the hardware plugin and
-  // remappings, and the driver parameters' exact bytes, join the identity; a
-  // Mock component has none of them.
+  // The hardware plugin and remappings, and the driver parameters' exact
+  // bytes, join the identity.
   std::vector<std::string> hardware;
   for (const auto &argument : artifacts.launch_arguments) {
     if (!names.insert(argument_name(argument)).second) {
-      fail("mock launch argument repeated: " + argument);
+      fail("ros2_control launch argument repeated: " + argument);
     }
     if (argument.starts_with("hardware_")) hardware.push_back(argument);
     command.argv.push_back(argument);
@@ -461,55 +460,6 @@ mock_controller_launch_command(const ControllerLaunchArtifacts &artifacts) {
   command.gripper_controller_name = artifacts.gripper_controller_name;
   command.frame_prefix = artifacts.frame_prefix;
   command.controllers_yaml = artifacts.controllers_yaml;
-  command.keep_across_apply = true;
-  return command;
-}
-
-ControllerLaunchCommand
-isaac_controller_launch_command(const ControllerLaunchArtifacts &artifacts,
-                                const IsaacControllerLane &lane) {
-  require_artifacts(artifacts, ControllerLaunchLane::kIsaac);
-  if (lane.joint_commands_topic.empty() || lane.joint_states_topic.empty()) {
-    fail("Isaac lane facts have no joint topics");
-  }
-  std::vector<std::string> host_owned{
-      "robot_description_file:=" + artifacts.robot_description_file.string(),
-      "controllers_file:=" + artifacts.controllers_file.string(),
-      "isaac_profile:=" + artifacts.controller_profile,
-      "runtime_namespace:=" + artifacts.runtime_namespace,
-      "controller_manager_name:=" + std::string(kControllerManagerNodeName),
-      "arm_controller_name:=" + artifacts.arm_controller_name,
-      // The generated URDF's TopicBasedSystem was written from these lane
-      // facts; the launch only validates readiness on them, so they agree.
-      "joint_commands_topic:=" + lane.joint_commands_topic,
-      "joint_states_topic:=" + lane.joint_states_topic,
-  };
-  if (!artifacts.frame_prefix.empty()) {
-    host_owned.push_back("frame_prefix:=" + artifacts.frame_prefix);
-  }
-  ControllerLaunchCommand command;
-  command.controllable_component_id = artifacts.controllable_component_id;
-  command.lane = ControllerLaunchLane::kIsaac;
-  command.argv = {std::string(kRos2), "launch", std::string(kBringupPackage),
-                  std::string(kIsaacLaunchFile)};
-  std::set<std::string> names;
-  for (const auto &argument : host_owned) {
-    if (!names.insert(argument_name(argument)).second) {
-      fail("Isaac launch argument repeated: " + argument);
-    }
-    command.argv.push_back(argument);
-  }
-  command.identity = identity_of(artifacts, {});
-  command.robot_description_sha256 = artifacts.robot_description_sha256;
-  command.controllers_sha256 = artifacts.controllers_sha256;
-  command.controller_profile = artifacts.controller_profile;
-  command.runtime_namespace = artifacts.runtime_namespace;
-  command.arm_controller_name = artifacts.arm_controller_name;
-  command.gripper_controller_name = artifacts.gripper_controller_name;
-  command.frame_prefix = artifacts.frame_prefix;
-  command.controllers_yaml = artifacts.controllers_yaml;
-  // The inactive controller infrastructure stays attached across Apply when
-  // its exact generated configuration is unchanged.
   command.keep_across_apply = true;
   return command;
 }
@@ -564,7 +514,7 @@ isaac_gripper_launch_command(const ControllerLaunchArtifacts &artifacts,
   command.controller_profile = artifacts.controller_profile;
   command.runtime_namespace = artifacts.runtime_namespace;
   command.frame_prefix = artifacts.frame_prefix;
-  // As the arm's Isaac launch: an unchanged tool keeps its process across Apply.
+  // An unchanged tool keeps its process across Apply.
   command.keep_across_apply = true;
   return command;
 }
@@ -627,6 +577,7 @@ struct ControllerLaunchProcess::Output final {
   std::uint64_t tail_newlines{0U};
   bool producer_finished{false};
   bool wake_unavailable{false};
+  ControllerLaunchSpawnerTracker spawners;
   int wake_fd{-1};
   const std::string tag;
   const std::shared_ptr<ForwardingCounters> totals;
@@ -710,6 +661,7 @@ struct ControllerLaunchProcess::Output final {
     int descriptor = -1;
     {
       std::lock_guard lock(mutex);
+      spawners.observe(text);
       if (text.size() > kTailBytes) {
         auto begin = text.size() - kTailBytes;
         while (begin < text.size() &&
@@ -828,6 +780,38 @@ struct ControllerLaunchProcess::Output final {
     return {snapshot.dropped_forward_lines, snapshot.dropped_forward_bytes};
   }
 };
+
+void ControllerLaunchSpawnerTracker::observe(const std::string_view chunk) {
+  partial_.append(chunk);
+  std::size_t begin = 0U;
+  for (auto end = partial_.find('\n'); end != std::string::npos;
+       begin = end + 1U, end = partial_.find('\n', begin)) {
+    const std::string_view line(partial_.data() + begin, end - begin);
+    const auto open = line.find("[spawner-");
+    const auto close = open == std::string_view::npos ? open : line.find("]: ", open);
+    if (close == std::string_view::npos) continue;
+    const auto name = line.substr(open + 1U, close - open - 1U);
+    if (name.find(']') != std::string_view::npos) continue;  // a spawner's own log line
+    const auto event = line.substr(close + 3U);
+    if (event.starts_with("process started"))
+      started_.emplace(name);
+    else if (event.starts_with("process has finished") || event.starts_with("process has died"))
+      exited_.emplace(name);
+  }
+  partial_.erase(0U, begin);
+  // A line without its end within this bound is not a launch event.
+  if (partial_.size() > 4096U) partial_.clear();
+}
+
+bool ControllerLaunchSpawnerTracker::settled() const noexcept {
+  return !started_.empty() &&
+         std::includes(exited_.begin(), exited_.end(), started_.begin(), started_.end());
+}
+
+bool ControllerLaunchProcess::spawners_settled() const {
+  std::lock_guard lock(output_->mutex);
+  return output_->spawners.settled();
+}
 
 ControllerLaunchProcess::ControllerLaunchProcess(
     ControllerLaunchCommand command, const int pid,
@@ -989,7 +973,13 @@ void ControllerLaunchProcess::begin_stop(
   // A Background cleanup and aggregate shutdown share this exact first signal
   // time. Neither another caller nor another poll can extend the grace.
   if (group_owned_) {
-    stop_signal_sent_ = ::kill(-pid_, SIGINT) == 0;
+    // A running launch interrupts its own nodes, once each. Signalling its
+    // group too gives every node a second SIGINT, which can arrive after
+    // rclcpp's shutdown restored the default action: the node then dies
+    // before its DDS participant leaves, and its endpoints stay in the graph
+    // until the DDS lease ends (a replacement sees duplicate_component_instance).
+    // A leader already gone forwards nothing: its group gets the SIGINT.
+    stop_signal_sent_ = ::kill(exit_ ? -pid_ : pid_, SIGINT) == 0;
     stop_context_ = current_request_context_;
     stop_incident_id_ = last_incident_id_;
   }
@@ -1032,9 +1022,16 @@ bool ControllerLaunchProcess::poll_stop() noexcept {
         stop_kill_sent_ = ::kill(-pid_, SIGKILL) == 0;
       stop_escalated_ = true;
     }
-    // Preserve the original one scan after escalation, with no second grace.
-    if (!stop_scanned_drained_)
-      stop_scanned_drained_ = no_live_members();
+  }
+  // SIGKILL is delivered asynchronously: a member (e.g. a stopped or hung
+  // node) is still listed for a moment after it. Scanning once right after
+  // the kill left the group Unknown for good, and every later Apply then
+  // refused "old component group has not drained". Like the leader's reap
+  // below, the post-KILL drain is awaited (a kill can't be ignored).
+  if (owned && stop_escalated_ && !stop_scanned_drained_) {
+    if (!no_live_members())
+      return false;
+    stop_scanned_drained_ = true;
   }
   {
     std::lock_guard lock(mutex_);
@@ -1428,6 +1425,17 @@ ControllerLaunchSupervisor::ensure(const ControllerLaunchCommand &command,
     process->append_start_header();
     return {decision, std::move(process)};
   }
+}
+
+ControllerLaunchSupervisor::Ensured
+ControllerLaunchSupervisor::restart(const std::shared_ptr<ControllerLaunchProcess> &current,
+                                    std::string context) {
+  if (!current) fail("no controller launch to restart");
+  // The stopped occurrence is no longer running: `ensure` starts its command
+  // again (the artifacts root is the parent of its ROS_LOG_DIR).
+  current->stop(stop_grace_);
+  return ensure(current->command(), current->upstream_log_directory_.parent_path(),
+                std::move(context));
 }
 
 bool ControllerLaunchSupervisor::discard_candidate(

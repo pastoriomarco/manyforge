@@ -14,7 +14,7 @@ import {
 
 describe('Scenario name rule', () => {
   it('accepts one word of letters, digits, "_" and "-" starting with a letter or digit', () => {
-    for (const name of ['lite6_pick', 'Cell-2', '9cell', 'a', 'A', 'isaac-lite6-pick-place', 'x'.repeat(128)]) {
+    for (const name of ['lite6_pick', 'Cell-2', '9cell', 'a', 'A', 'sim_lite6_pick_and_place', 'x'.repeat(128)]) {
       expect(scenarioNameError(name)).toBeNull();
       expect(SCENARIO_NAME_PATTERN.test(name)).toBe(true);
     }
@@ -63,8 +63,8 @@ describe('Available Scenario labels', () => {
   });
 
   it('shows the Scenario name', () => {
-    expect(scenarioEntryLabel(entry('/r/examples/ur5_pick_and_place.scenario', 'ur5_pick_and_place')))
-      .toBe('ur5_pick_and_place');
+    expect(scenarioEntryLabel(entry('/r/examples/mock_ur5_pick_and_place.scenario', 'mock_ur5_pick_and_place')))
+      .toBe('mock_ur5_pick_and_place');
   });
 
   it('shows a refused folder by its whole folder name', () => {

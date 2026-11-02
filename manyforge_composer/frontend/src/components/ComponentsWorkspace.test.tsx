@@ -2,11 +2,11 @@ import { act } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import type { CCLCController } from '../hooks/useCCLC';
 import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
 import type { JsonValue } from '../types/api';
-import type { CCLCComponentSnapshot } from '../types/cclc';
+import type { ComponentState } from '../types/components';
 import type { ComponentProfileFacts } from '../types/componentCatalog';
+import { applyPreviewFixture } from '../test/applyPreview';
 import { reactPropsHost } from '../test/reactPropsHost';
 import { ComponentsWorkspace } from './ComponentsWorkspace';
 import { DeploymentFocusedEditor } from './DeploymentFocusedEditor';
@@ -78,69 +78,22 @@ function deploymentController(components: JsonValue[], appliedIds: string[]) {
   } as unknown as DeploymentWorkspaceController;
 }
 
-function armSnapshot(): CCLCComponentSnapshot {
-  return {
-    controllableComponentId: 'arm',
-    lifecycleGeneration: 4,
-    lifecycleState: 'active',
-    retainedBundleId: 'bundle.1',
-    publicationGeneration: 1, activePublicPointerDigest: 'pointer.1',
-    graphRevision: 'graph.1',
-    domains: [],
-    providers: [],
-    lifecycleTarget: null,
-    lifecycleProgress: null,
-    readiness: { requestOwnerEpoch: 'owner.1', evaluatedAtNs: 100, nextIntent: null, requestedState: null,
-      ready: true, error: null, measuredState: { required: false, available: null, error: null },
-      providerOccurrences: [{
-        providerOccurrence: { controlDomainId: 'domain.arm', controlDomainRevision: 'revision.1',
-          lifecyclePlanCatalogDigest: 'catalog.1', providerInstanceId: 'provider.1',
-          providerManifestId: 'manifest.1', providerManifestRevision: 'revision.1',
-          providerRuntimeEpoch: 'epoch.1', providerRuntimeUnitId: 'unit.1' },
-        health: { observedState: 'active', diagnostic: null, facts: [
-          { lifecycleFactId: 'manyforge.vendor_code.error', value: { kind: 'token', tokenValue: 'C2' } },
-        ] },
-        decisionKind: null, error: null,
-      }] },
-  };
-}
-
-function cclcController(): CCLCController {
-  const snapshot = armSnapshot();
-  return {
-    controllableComponentId: 'arm',
-    snapshot,
-    routeTemplates: null,
-    transaction: null,
-    pendingTransaction: null,
-    pendingActivationRequest: null,
-    busy: false,
-    readUnavailableReason: null,
-    error: null,
-    setControllableComponentId: vi.fn(),
-    refresh: vi.fn(async () => {}),
-    reconcileTransaction: vi.fn(),
-    dismissError: vi.fn(),
-    activate: vi.fn(async () => {}),
-    deactivateComponents: vi.fn(),
-    activateSequence: vi.fn(async () => true),
-    readActivationSequence: vi.fn(),
-    cancelActivation: vi.fn(),
-    activationProgress: null,
-    activationRefusal: null, activationUnresolved: false,
-    componentHealth: { arm: { snapshot, error: null } },
-    submitLifecycle: vi.fn(),
-    submitRoute: vi.fn(),
-  };
-}
+const armState: ComponentState = {
+  component_id: 'arm',
+  lifecycle: 'fault',
+  fault: { code: 'fault_estop', message: 'C2', clearable: true, operator_action: 'enable',
+    vendor_code: 'C2', vendor_text: 'Emergency IO', since_ns: 1 },
+  activity: 'idle',
+  streams: [{ stream_id: 'joint_states', freshness: 'fresh', age_ns: 4_000_000 }],
+  capabilities: ['reset_position', 'io_manual_write'],
+  observed_at_ns: 2,
+};
 
 function props(overrides: Partial<Parameters<typeof ComponentsWorkspace>[0]> = {}) {
   return {
     enabled: true,
     controller: deploymentController([arm, device], ['arm']),
-    cclc: cclcController(),
-    lifecycleIds: ['arm'],
-    snapshot: null,
+    cellState: { components: [armState], latch: null, io: null, readiness: null },
     catalog: { catalog: null, error: null, reload: vi.fn() },
     sourceModel: { status: 'loading' } as const,
     motionDescriptors: [],
@@ -155,17 +108,19 @@ function props(overrides: Partial<Parameters<typeof ComponentsWorkspace>[0]> = {
 describe('Components section', () => {
   it('lists every component with its health and opens the selected component\'s page', () => {
     const html = renderToStaticMarkup(<ComponentsWorkspace {...props()} />);
-    // Left: Activate all, the list (Applied with health; Draft-only marked), Add component.
-    expect(html).toContain('Activate all');
-    expect(html).toContain('active · Ready');
+    // Left: Enable all, the list (Applied with state; Draft-only marked), Add component.
+    expect(html).toContain('Enable all');
+    expect(html).toContain('Fault · Emergency stop active');
     expect(html).toContain('Added in Draft · runs after Apply');
     expect(html).toContain('>Add component</button>');
     expect(html).toContain('Custom I/O device or AI model');
-    // Right: the page of the CCLC-selected component.
+    // Right: the first component's page with its state and actions.
     expect(html).toContain('id="component-page-title">arm</h3>');
-    expect(html).toContain('aria-label="Component lifecycle status"');
-    expect(html).toContain('Vendor status');
-    expect(html).toContain('C2');
+    expect(html).toContain('aria-label="arm status"');
+    expect(html).toContain('Vendor: C2 · Emergency IO');
+    expect(html).toContain('Operator action: Enable');
+    expect(html).toContain('>Reset position</button>');
+    expect(html).not.toContain('>io manual write</button>');
     expect(html).toContain('Open in Robot Control');
     // Its settings only: the robot's limits, not the I/O device or the cell settings.
     expect(html).toContain('arm settings');
@@ -175,7 +130,7 @@ describe('Components section', () => {
     expect(html).not.toContain('Global interrupt rules');
   });
 
-  it('opens a Draft-only component\'s page with its settings and I/O, leaving the lifecycle selection alone', async () => {
+  it('opens a Draft-only component\'s page with its settings and I/O', async () => {
     const current = props();
     const { host, find, all } = reactPropsHost();
     const { createRoot } = await import('react-dom/client');
@@ -188,8 +143,7 @@ describe('Components section', () => {
       const labels = all(() => true).map((candidate) => candidate['aria-label']);
       expect(labels).toContain('station_io lifecycle command time limit');
       expect(labels).toContain('Declared by this component');
-      // Not in Manager Applied: no lifecycle request, a link to Deployment Changes instead.
-      expect(current.cclc.setControllableComponentId).not.toHaveBeenCalled();
+      // Not in the cell yet: a link to Deployment Changes.
       await act(() => find((candidate) => candidate.type === 'button'
         && candidate.children === 'Review in Deployment Changes').onClick?.());
       expect(current.onOpenDeployment).toHaveBeenCalledExactlyOnceWith('changes');
@@ -209,7 +163,7 @@ describe('Components section', () => {
     } finally { await act(() => root.unmount()); }
   });
 
-  it('shows a mounted tool\'s model payload read-only, and 0 kg when the model defines none', () => {
+  it('shows a mounted tool\'s model payload read-only, and 0 kg when the model defines none', async () => {
     const hand = {
       component_id: 'hand',
       component_profile_id: 'hand_v0',
@@ -217,43 +171,58 @@ describe('Components section', () => {
       target_settings: {},
       configuration: { runtime_kind: 'ros2_control' },
     };
-    const controller = deploymentController([arm, hand], ['arm']);
+    const controller = deploymentController([{ ...arm, component_id: 'robot' }, hand], ['robot']);
     (controller.workspace!.draft.document as Record<string, JsonValue>).attachments = [{
-      parent: { component_id: 'arm', interface: 'flange' },
+      parent: { component_id: 'robot', interface: 'flange' },
       child: { component_id: 'hand', interface: 'mount' },
     }];
-    const cclc = cclcController();
-    cclc.controllableComponentId = 'hand';
-    const page = (facts: Pick<ComponentProfileFacts, 'payload'>) => renderToStaticMarkup(<ComponentsWorkspace {...props({
-      controller,
-      cclc,
-      catalog: {
+    // The list is one tree (robot, then its tool): open the tool's page.
+    const page = async (facts: Pick<ComponentProfileFacts, 'payload'>) => {
+      const { host, find, all } = reactPropsHost();
+      const { createRoot } = await import('react-dom/client');
+      const root = createRoot(host as unknown as Element);
+      await act(() => root.render(<ComponentsWorkspace {...props({
+        controller,
         catalog: {
-          schemaVersion: 'manyforge.composer_component_catalog.v1', projectRoot: null,
-          entries: [], profilesWithoutEntry: [],
-          componentProfiles: {
-            robot_native_v1: { tags: ['articulated-arm'], attachmentInterfaces: ['flange'], tcpTargets: [] },
-            hand_v0: { tags: ['tool'], attachmentInterfaces: [], tcpTargets: [], ...facts },
+          catalog: {
+            schemaVersion: 'manyforge.composer_component_catalog.v1', projectRoot: null,
+            entries: [], machines: [], profilesWithoutEntry: [],
+            componentProfiles: {
+              robot_native_v1: { tags: ['articulated-arm'], attachmentInterfaces: ['flange'], tcpTargets: [] },
+              hand_v0: { tags: ['tool'], attachmentInterfaces: [], tcpTargets: [], ...facts },
+            },
           },
+          error: null,
+          reload: vi.fn(),
         },
-        error: null,
-        reload: vi.fn(),
-      },
-    })} />);
+      })} />));
+      try {
+        await act(() => find((candidate) => candidate.type === 'button'
+          && String(candidate.title).includes('Added in Draft')).onClick?.());
+        const text = (value: unknown): string => Array.isArray(value)
+          ? value.map(text).join('') : typeof value === 'string' || typeof value === 'number' ? String(value) : '';
+        return {
+          title: text(find((candidate) => candidate.id === 'component-page-title').children),
+          texts: all((candidate) => candidate.children !== undefined).map((candidate) => text(candidate.children)),
+          payload: all((candidate) => candidate['aria-label'] === 'hand payload'),
+          controls: all((candidate) => candidate.onClick !== undefined || candidate.onChange !== undefined)
+            .map((candidate) => String(candidate['aria-label'] ?? candidate.title ?? '')),
+        };
+      } finally { await act(() => root.unmount()); }
+    };
 
-    const defined = page({ payload: { massKg: 0.6, centerOfMassM: [0, 0.01, 0.05] } });
-    expect(defined).toContain('id="component-page-title">hand → arm.flange</h3>');
-    expect(defined).toContain('aria-label="hand payload"');
-    expect(defined).toContain('<dt>Mass</dt><dd>0.6 kg</dd>');
-    expect(defined).toContain('0, 0.01, 0.05 m');
-    expect(defined).toContain('Defined by the component&#x27;s model');
-    // Read-only: no input or button inside the payload card.
-    const card = defined.slice(defined.indexOf('id="component-payload-title"'));
-    expect(card.slice(0, card.indexOf('</section>'))).not.toMatch(/<input|<button/);
+    const defined = await page({ payload: { massKg: 0.6, centerOfMassM: [0, 0.01, 0.05] } });
+    expect(defined.title).toBe('hand → robot.flange');
+    expect(defined.payload).toHaveLength(1);
+    expect(defined.texts).toContain('0.6 kg');
+    expect(defined.texts).toContain('0, 0.01, 0.05 m (in the tool\'s mount)');
+    expect(defined.texts.some((value) => value.startsWith('Defined by the component\'s model'))).toBe(true);
+    // Read-only: no control edits the payload.
+    expect(defined.controls.filter((label) => /payload|mass/i.test(label))).toEqual([]);
 
-    const none = page({});
-    expect(none).toContain('<dt>Mass</dt><dd>0 kg (the model defines none)</dd>');
-    expect(none).not.toContain('Centre of mass');
+    const none = await page({});
+    expect(none.texts).toContain('0 kg (the model defines none)');
+    expect(none.texts.some((value) => value.startsWith('Centre of mass'))).toBe(false);
   });
 
   it('warns on the robot\'s page while its flange tool has no TCP (B-run-1)', () => {
@@ -274,7 +243,7 @@ describe('Components section', () => {
       catalog: {
         catalog: {
           schemaVersion: 'manyforge.composer_component_catalog.v1', projectRoot: null,
-          entries: [], profilesWithoutEntry: [],
+          entries: [], machines: [], profilesWithoutEntry: [],
           componentProfiles: {
             robot_native_v1: { tags: ['articulated-arm'], attachmentInterfaces: ['flange'], tcpTargets: [] },
             bracket_v0: { tags: ['tool'], attachmentInterfaces: [], tcpTargets },
@@ -294,21 +263,122 @@ describe('Components section', () => {
     expect(renderToStaticMarkup(<ComponentsWorkspace {...props()} />)).not.toContain('component-payload-title');
   });
 
-  it('selects the page\'s component in CCLC when it has a lifecycle, but not during a request', async () => {
-    const cclc = cclcController();
-    cclc.controllableComponentId = 'other';
-    const current = props({ cclc, lifecycleIds: ['arm', 'other'] });
-    const { host } = reactPropsHost();
+  it('edits the base pose, lane and mount as Draft edits and previews before Apply', async () => {
+    const hand = {
+      component_id: 'hand', component_profile_id: 'hand_v0', lane: 'mock',
+      model_source: { urdf: { project_path: 'sources/hand.urdf' }, package_roots: {} },
+      target_settings: {}, configuration: { runtime_kind: 'ros2_control' },
+    };
+    const robot = { ...arm, component_id: 'robot', lane: 'mock' };
+    const second = { ...arm, component_id: 'second' };
+    const controller = deploymentController([robot, second, hand], ['robot']);
+    (controller.workspace!.draft.document as Record<string, JsonValue>).attachments = [{
+      parent: { component_id: 'robot', interface: 'flange' },
+      child: { component_id: 'hand', interface: 'mount' },
+      collision_exclusions: [{ child_link: 'finger', parent_link: 'link5' }],
+    }];
+    const preview = applyPreviewFixture([{ component_id: 'hand', disposition: 'replace' as const,
+      reasons: ['mount changed'], restarts: true }, { component_id: 'robot', disposition: 'retain' as const,
+      reasons: [], restarts: false }]);
+    Object.assign(controller, {
+      previewApply: vi.fn().mockResolvedValue(preview),
+      applyDraft: vi.fn().mockResolvedValue(preview),
+      documentUnavailableReason: null,
+    });
+    (controller.workspace as unknown as Record<string, unknown>).runAdmission = { ready: false, reason: 'differs' };
+    (controller.workspace!.draft as unknown as Record<string, unknown>).deploymentRevision = null;
+    (controller.workspace as unknown as Record<string, unknown>).saved = { differsFromApplied: true };
+    const current = props({
+      controller,
+      cellState: { components: [], latch: null, io: null, readiness: null },
+      catalog: {
+        catalog: {
+          schemaVersion: 'manyforge.composer_component_catalog.v1', projectRoot: null,
+          entries: [], machines: [], profilesWithoutEntry: [],
+          componentProfiles: {
+            robot_native_v1: { tags: ['articulated-arm'], attachmentInterfaces: ['flange'], tcpTargets: [],
+              lanes: ['isaac', 'mock', 'real'] },
+            hand_v0: { tags: ['tool'], attachmentInterfaces: [], tcpTargets: [], lanes: ['mock'] },
+          },
+        },
+        error: null,
+        reload: vi.fn(),
+      },
+    });
+    const { host, find } = reactPropsHost();
     const { createRoot } = await import('react-dom/client');
     const root = createRoot(host as unknown as Element);
+    await act(() => root.render(<ComponentsWorkspace {...current} />));
     try {
-      cclc.busy = true;
-      await act(() => root.render(<ComponentsWorkspace {...current} />));
-      expect(cclc.setControllableComponentId).not.toHaveBeenCalled();
-      cclc.busy = false;
-      await act(() => root.render(<ComponentsWorkspace {...current} cclc={{ ...cclc }} />));
-      // 'other' is not in the Draft: the first row's page (arm) is shown and selected.
-      expect(cclc.setControllableComponentId).toHaveBeenCalledWith('arm');
+      // The tool's page: mount, primary tool and collision exclusions.
+      await act(() => find((candidate) => String(candidate.className ?? '').includes('component-row')
+        && Array.isArray(candidate.children)
+        && candidate.children.some((child) => (child as { props?: { children?: unknown } })?.props?.children === 'hand'))
+        .onClick?.());
+      await act(() => find((candidate) => candidate['aria-label'] === 'hand mounted on')
+        .onChange?.({ target: { value: 'second' } }));
+      expect(controller.mutate).toHaveBeenLastCalledWith(['attachments'], 'set', [{
+        parent: { component_id: 'second', interface: 'flange' },
+        child: { component_id: 'hand', interface: 'mount' },
+      }]);
+      await act(() => find((candidate) => candidate['aria-label'] === 'hand primary tool')
+        .onChange?.({ target: { checked: true } }));
+      // A move drops the pairs (they name the old parent's links); a primary toggle keeps them.
+      expect(controller.mutate).toHaveBeenLastCalledWith(['attachments'], 'set', [{
+        parent: { component_id: 'robot', interface: 'flange' },
+        child: { component_id: 'hand', interface: 'mount' },
+        primary: true,
+        collision_exclusions: [{ child_link: 'finger', parent_link: 'link5' }],
+      }]);
+      const exclusions = () => find((candidate) => candidate.type === 'button'
+        && candidate.children === 'Update collision exclusions');
+      expect(exclusions().disabled).toBe(true);
+      await act(() => find((candidate) => candidate['aria-label'] === 'hand collision exclusions with parent')
+        .onChange?.({ target: { value: 'finger link5\npalm,link4\n\n finger  link6 ' } }));
+      await act(() => exclusions().onClick?.());
+      expect(controller.mutate).toHaveBeenLastCalledWith(['attachments'], 'set', [{
+        parent: { component_id: 'robot', interface: 'flange' },
+        child: { component_id: 'hand', interface: 'mount' },
+        collision_exclusions: [
+          { child_link: 'finger', parent_link: 'link5' },
+          { child_link: 'finger', parent_link: 'link6' },
+          { child_link: 'palm', parent_link: 'link4' },
+        ],
+      }]);
+      const calls = vi.mocked(controller.mutate).mock.calls.length;
+      await act(() => find((candidate) => candidate['aria-label'] === 'hand collision exclusions with parent')
+        .onChange?.({ target: { value: 'finger' } }));
+      await act(() => exclusions().onClick?.());
+      expect(vi.mocked(controller.mutate).mock.calls.length).toBe(calls);
+      expect(find((candidate) => candidate.role === 'alert').children)
+        .toBe('Each line must name two links: the tool link, then the parent link.');
+      // Preview shows the per-component impact; Apply goes through the confirmed Apply.
+      await act(() => find((candidate) => candidate.type === 'button' && candidate.children === 'Preview').onClick?.());
+      expect(controller.previewApply).toHaveBeenCalledOnce();
+      await act(() => find((candidate) => candidate.type === 'button' && candidate.children === 'Apply…').onClick?.());
+      expect(controller.applyDraft).toHaveBeenCalledOnce();
+      // The robot's page: lane among the model's lanes, base pose with orientation, Remove.
+      await act(() => find((candidate) => candidate.type === 'button' && candidate.title === 'Applied').onClick?.());
+      await act(() => find((candidate) => candidate['aria-label'] === 'robot lane')
+        .onChange?.({ target: { value: 'real' } }));
+      expect(controller.mutate).toHaveBeenLastCalledWith(['components', 0, 'lane'], 'set', 'real');
+      await act(() => find((candidate) => candidate['aria-label'] === 'robot base yaw')
+        .onChange?.({ target: { value: '90' } }));
+      await act(() => find((candidate) => candidate.type === 'button'
+        && candidate.children === 'Update base pose').onClick?.());
+      const [path, operation, pose] = vi.mocked(controller.mutate).mock.lastCall!;
+      expect(path).toEqual(['components', 0, 'root_pose_in_cell']);
+      expect(operation).toBe('set');
+      const { orientation_xyzw: xyzw } = pose as { orientation_xyzw: number[] };
+      expect(xyzw[2]).toBeCloseTo(Math.SQRT1_2);
+      expect(xyzw[3]).toBeCloseTo(Math.SQRT1_2);
+      await act(() => find((candidate) => candidate.type === 'button'
+        && candidate.children === 'Remove from Draft').onClick?.());
+      // Its attachment row goes first, then the component.
+      expect(vi.mocked(controller.mutate).mock.calls.slice(-2)).toEqual([
+        [['attachments'], 'set', []],
+        [['components', 0], 'remove'],
+      ]);
     } finally { await act(() => root.unmount()); }
   });
 });
@@ -332,7 +402,7 @@ describe('Focused editor scopes', () => {
     expect(deviceHtml).not.toContain('Motion takeover timing');
     const robotHtml = render({ componentId: 'arm' });
     expect(robotHtml).toContain('Robot model and target limits');
-    expect(robotHtml).toContain('Native runtime configuration');
+    expect(robotHtml).toContain('Execution host configuration');
     expect(robotHtml).not.toContain('<summary>I/O devices</summary>');
     expect(robotHtml).not.toContain('Global interrupt rules');
   });

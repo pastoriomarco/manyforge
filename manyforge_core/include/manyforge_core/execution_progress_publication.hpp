@@ -119,8 +119,30 @@ class ExecutionProgressPublication final {
                                               std::int64_t source_timestamp_ns,
                                               std::int64_t received_timestamp_ns,
                                               bool terminal) noexcept;
-  void begin_write() noexcept;
-  void end_write() noexcept;
+  struct Cursor {
+    std::uint64_t sequence = 0;
+    std::uint64_t execution_generation = 0;
+    std::int64_t trajectory_time_ns = 0;
+    std::int64_t source_timestamp_ns = 0;
+    std::int64_t received_timestamp_ns = 0;
+    bool valid = false;
+    bool terminal = false;
+  };
+  // One seqlock slot. The writer fills the slot readers are not directed to,
+  // then flips latest_slot_, so a reader overlapping one write still reads the
+  // previous complete cursor instead of failing closed.
+  struct Slot {
+    std::atomic<std::uint64_t> epoch{0};
+    std::atomic<std::uint64_t> sequence{0};
+    std::atomic<std::uint64_t> execution_generation{0};
+    std::atomic<std::int64_t> trajectory_time_ns{0};
+    std::atomic<std::int64_t> source_timestamp_ns{0};
+    std::atomic<std::int64_t> received_timestamp_ns{0};
+    std::atomic<bool> valid{false};
+    std::atomic<bool> terminal{false};
+  };
+  // Writer-only; requires writer_mutex_.
+  void store_locked() noexcept;
 
   const ExecutionProgressSourceKind source_kind_;
   const ExecutionProgressAuthorityProfile authority_profile_;
@@ -129,15 +151,10 @@ class ExecutionProgressPublication final {
 
   mutable std::mutex writer_mutex_;
   bool hazard_authority_claimed_ = false;
-  std::atomic<std::uint64_t> epoch_{0};
-  std::atomic<std::uint64_t> next_sequence_{1};
-  std::atomic<std::uint64_t> sequence_{0};
-  std::atomic<std::uint64_t> execution_generation_{0};
-  std::atomic<std::int64_t> trajectory_time_ns_{0};
-  std::atomic<std::int64_t> source_timestamp_ns_{0};
-  std::atomic<std::int64_t> received_timestamp_ns_{0};
-  std::atomic<bool> valid_{false};
-  std::atomic<bool> terminal_{false};
+  std::uint64_t next_sequence_ = 1;
+  Cursor current_;
+  Slot slots_[2];
+  std::atomic<unsigned> latest_slot_{0};
 };
 
 }  // namespace manyforge::core

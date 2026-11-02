@@ -203,7 +203,6 @@ build_manyforge_headless() {
     cmake "$WORKSPACE/manyforge_headless" -G "$BUILD_GENERATOR" -DCMAKE_BUILD_TYPE=Release \
         -DBUILD_TESTING=ON \
         -DMANYFORGE_CORE_BUILD_SQLITE_OPERATION_JOURNAL=ON \
-        -DMANYFORGE_CORE_BUILD_SQLITE_CCLC_JOURNAL=ON \
         -DMANYFORGE_HEADLESS_BUILD_PYTHON=ON \
         -Dpybind11_DIR="$pybind11_cmake_dir" \
         -DMANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST="$ros_execution_host" \
@@ -225,7 +224,6 @@ setup_expression_binding() {
         cmake -S "$WORKSPACE/manyforge_headless" -B "$build" -G "$BUILD_GENERATOR" \
             -DCMAKE_BUILD_TYPE=Release \
             -DMANYFORGE_CORE_BUILD_SQLITE_OPERATION_JOURNAL=ON \
-            -DMANYFORGE_CORE_BUILD_SQLITE_CCLC_JOURNAL=ON \
             -DMANYFORGE_HEADLESS_BUILD_PYTHON=ON \
             -Dpybind11_DIR="$pybind11_cmake_dir" 2>&1 | tail -3
     fi
@@ -393,9 +391,9 @@ build_headless_roboplan_producer_closure() {
         bash "$WORKSPACE/scripts/ros/build-ros2-control-runtime.sh" \
             --target manyforge_ros2_control_execution_host \
             --target manyforge_ros2_control_execution_host_pick_place_planning_fixture \
-            --target manyforge_ros2_control_execution_host_admission_fixture \
             --target manyforge_ros2_control_execution_host_projection_fixture \
             --target manyforge_roboplan_candidate_worker \
+            --target fake_process_candidate_worker \
             --topic-install "$ROS_INTEGRATION_TOPIC_INSTALL" \
             --data-overlay "$ROS_INTEGRATION_DATA_OVERLAY"; then
         echo -e "${RED}  FAIL: ROS producer closure build failed${NC}"
@@ -412,7 +410,6 @@ build_headless_roboplan_producer_closure() {
     for producer_input in \
         "$build/manyforge_ros2_control_execution_host" \
         "$build/manyforge_ros2_control_execution_host_pick_place_planning_fixture" \
-        "$build/manyforge_ros2_control_execution_host_admission_fixture" \
         "$build/ros_projection_host_fixture/manyforge_ros2_control_execution_host" \
         "$build/manyforge_roboplan_candidate_worker"; do
         if [[ ! -f "$producer_input" ]]; then
@@ -472,9 +469,12 @@ run_roboplan_tests() {
         return
     fi
     cd "$build"
+    # The execution host loads its adapter families from the build tree's
+    # ament prefix (CONTRACTS §6).
     if ! require_ctest_tests "manyforge_roboplan"; then
         FAIL=$((FAIL + 1))
-    elif ctest --output-on-failure --timeout "$CTEST_TEST_TIMEOUT_S"; then
+    elif AMENT_PREFIX_PATH="$build/ament_cmake_index:${AMENT_PREFIX_PATH:-}" \
+        ctest --output-on-failure --timeout "$CTEST_TEST_TIMEOUT_S"; then
         PASS=$((PASS + 1))
     else
         FAIL=$((FAIL + 1))
@@ -496,7 +496,8 @@ run_headless_cpp_tests() {
         FAIL=$((FAIL + 1))
     elif ! require_headless_runtime_packages "$build"; then
         FAIL=$((FAIL + 1))
-    elif ctest --output-on-failure --timeout "$CTEST_TEST_TIMEOUT_S"; then
+    elif AMENT_PREFIX_PATH="$BUILD_DIR/roboplan/ament_cmake_index:${AMENT_PREFIX_PATH:-}" \
+        ctest --output-on-failure --timeout "$CTEST_TEST_TIMEOUT_S"; then
         PASS=$((PASS + 1))
     else
         FAIL=$((FAIL + 1))
@@ -526,7 +527,8 @@ run_headless_python_tests() {
     fi
     # The UI6-I cell is a ros2_control mock cell: its process tests need the
     # ROS image and run in the `ros-e2e` suite, never here.
-    if MANYFORGE_MANAGER_DAEMON="$build/manyforge_manager_daemon" \
+    if AMENT_PREFIX_PATH="$BUILD_DIR/roboplan/ament_cmake_index:${AMENT_PREFIX_PATH:-}" \
+        MANYFORGE_MANAGER_DAEMON="$build/manyforge_manager_daemon" \
         MANYFORGE_CANONICAL_EMPTY_PACKAGE_ROOT="$build/canonical-empty-test-package" \
         MANYFORGE_ASSISTANT_NATIVE_PACKAGE_ROOT="$build/assistant-native-test-fixture/retained-package" \
         MANYFORGE_ASSISTANT_NATIVE_METADATA="$build/assistant-native-test-fixture/metadata.json" \
@@ -539,12 +541,14 @@ run_headless_python_tests() {
         MANYFORGE_EXAMPLE_SCENARIO_ROOT="$WORKSPACE/examples" \
         MANYFORGE_ROS2_CONTROL_EXECUTION_HOST="$BUILD_DIR/roboplan/manyforge_ros2_control_execution_host" \
         MANYFORGE_ROBOPLAN_CANDIDATE_WORKER="$BUILD_DIR/roboplan/manyforge_roboplan_candidate_worker" \
+        MANYFORGE_ROBOPLAN_FAKE_WORKER="$BUILD_DIR/roboplan/fake_process_candidate_worker" \
         pytest \
             manyforge_headless_api/tests/ \
             manyforge_headless_api/process_tests/ \
             manyforge_program_runner/tests/ \
             "${UI6I_ROS_PROCESS_TESTS[@]/#/--ignore=}" \
             -p no:cacheprovider \
+            -p no:launch_testing -p no:launch_ros \
             -v; then
         PASS=$((PASS + 1))
     else
@@ -605,6 +609,7 @@ run_python_tests() {
         tests/test_grouped_gtest_runner.py \
         tests/test_release_golden_workflow.py \
         tests/test_test_all_script_contract.py \
+        -p no:launch_testing -p no:launch_ros \
         -v; then
         PASS=$((PASS + 1))
     else
@@ -665,7 +670,9 @@ run_composer_backend_tests() {
         FAIL=$((FAIL + 1))
         return
     fi
-    if pytest manyforge_composer/tests/ -v; then
+    # The launch plugins install a non-propagating logger class, which hides
+    # Composer log records from caplog.
+    if pytest manyforge_composer/tests/ -p no:launch_testing -p no:launch_ros -v; then
         PASS=$((PASS + 1))
     else
         FAIL=$((FAIL + 1))
@@ -718,29 +725,24 @@ run_qualification_tests() {
 }
 
 run_deployment_composition_tests() {
-    section "Deployment CCLC and Stop-plan composition"
+    section "Deployment Stop-plan composition"
     local build="$BUILD_DIR/ua7wl-deployment-qualification"
     cmake -S "$WORKSPACE/verification/ua7wl_deployment" -B "$build" \
         -G "$BUILD_GENERATOR" -DCMAKE_BUILD_TYPE=Release \
         -DMANYFORGE_GTEST_TIMEOUT_SECONDS="$CTEST_TEST_TIMEOUT_S"
     cmake --build "$build" \
-        --target test_resolved_stop_base_plan_resolver test_cclc_runtime_composition \
+        --target test_resolved_stop_base_plan_resolver \
         --parallel "$BUILD_PARALLEL_LEVEL"
     cd "$build"
     if ! require_ctest_tests "Deployment composition" \
-        "ResolvedStopBasePlanResolverTest" "CCLCRuntimeComposition"; then
+        "ResolvedStopBasePlanResolverTest"; then
         FAIL=$((FAIL + 1))
     elif ctest --output-on-failure --timeout "$CTEST_TEST_TIMEOUT_S" \
-        -R 'ResolvedStopBasePlanResolverTest|CCLCRuntimeComposition'; then
+        -R 'ResolvedStopBasePlanResolverTest'; then
         PASS=$((PASS + 1))
     else
         FAIL=$((FAIL + 1))
     fi
-}
-
-run_qualification_native_tests() {
-    section "Native live-evaluation qualification matrix"
-    manyforge_fail_composable_cell_runtime_unavailable
 }
 
 run_qualification_soak_tests() {
@@ -839,7 +841,6 @@ run_ros_e2e_tests() {
             --target manyforge_ros2_control_execution_host \
             --target manyforge_roboplan_candidate_worker \
             --target manyforge_ros2_control_execution_host_pick_place_planning_fixture \
-            --target manyforge_ros2_control_execution_host_admission_fixture \
             --target manyforge_ros2_control_execution_host_projection_fixture \
             --topic-install "$ROS_INTEGRATION_TOPIC_INSTALL" \
             --data-overlay "$ROS_INTEGRATION_DATA_OVERLAY" || helper_status=$?
@@ -855,8 +856,7 @@ run_ros_e2e_tests() {
     if ! cmake -S "$WORKSPACE/manyforge_headless" -B "$headless" -G "$BUILD_GENERATOR" \
             -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
             -DMANYFORGE_CORE_BUILD_SQLITE_OPERATION_JOURNAL=ON \
-            -DMANYFORGE_CORE_BUILD_SQLITE_CCLC_JOURNAL=ON \
-            -DMANYFORGE_HEADLESS_BUILD_PYTHON=ON -Dpybind11_DIR="$pybind11_cmake_dir" \
+                -DMANYFORGE_HEADLESS_BUILD_PYTHON=ON -Dpybind11_DIR="$pybind11_cmake_dir" \
             -DMANYFORGE_HEADLESS_TEST_ROS_EXECUTION_HOST="$ros_build/manyforge_ros2_control_execution_host" \
             -DMANYFORGE_HEADLESS_GTEST_TIMEOUT_SECONDS="$CTEST_TEST_TIMEOUT_S" \
         || ! cmake --build "$headless" --parallel "$BUILD_PARALLEL_LEVEL"; then
@@ -888,8 +888,8 @@ import sys
 from pathlib import Path
 from ament_index_python.packages import get_package_share_directory
 share = Path(get_package_share_directory("manyforge_ros_bringup"))
-launch = share / "launch" / "mock_control.launch.py"
-source = Path(sys.argv[1]) / "manyforge_ros_bringup" / "launch" / "mock_control.launch.py"
+launch = share / "launch" / "ros2_control.launch.py"
+source = Path(sys.argv[1]) / "manyforge_ros_bringup" / "launch" / "ros2_control.launch.py"
 digest = lambda path: "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
 record = {"package_share_directory": str(share), "launch_file": str(launch),
           "resolved_launch_file": str(launch.resolve(strict=True)), "launch_sha256": digest(launch),
@@ -900,6 +900,9 @@ if record["launch_sha256"] != record["source_sha256"]:
     raise SystemExit("Actual sourced Mock launch differs from the current qualified source")
 PY_LAUNCH
          export MANYFORGE_MANAGER_ROS_LAUNCH_EVIDENCE="$evidence/controller-launch-input.json"
+         # The execution host loads its adapter families from the build
+         # tree's ament prefix (CONTRACTS §6).
+         export AMENT_PREFIX_PATH="$ros_build/ament_cmake_index:${AMENT_PREFIX_PATH:-}"
          setup_pythonpath
          export PYTHONPATH="$headless:$PYTHONPATH"
          export MANYFORGE_MANAGER_DAEMON="$headless/manyforge_manager_daemon" \
@@ -917,7 +920,10 @@ PY_LAUNCH
              > "$evidence/empty-ros-apply-ctest.log" 2>&1 || manager_apply_status=$?
          cat "$evidence/empty-ros-apply-ctest.log"
          printf '%s\n' "$manager_apply_status" > "$evidence/empty-ros-apply-ctest.status"
-         pytest "${UI6I_ROS_PROCESS_TESTS[@]}" -p no:cacheprovider -v ); then
+         # The run gets its own ROS domain (Fast DDS #6599, N16).
+         ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST \
+             "/opt/ros/${ROS_DISTRO:-lyrical}/lib/rmw_test_fixture_implementation/run_rmw_isolated" \
+             pytest "${UI6I_ROS_PROCESS_TESTS[@]}" -p no:cacheprovider -v ); then
         PASS=$((PASS + 1))
     else
         FAIL=$((FAIL + 1))
@@ -962,9 +968,6 @@ case "$FILTER" in
     qualification)
         run_qualification_tests
         ;;
-    qualification-native)
-        run_qualification_native_tests
-        ;;
     qualification-soak)
         run_qualification_soak_tests
         ;;
@@ -976,7 +979,6 @@ case "$FILTER" in
         ;;
     qualification-all)
         run_qualification_tests
-        run_qualification_native_tests
         run_qualification_soak_tests
         ;;
     integration)
@@ -996,7 +998,7 @@ case "$FILTER" in
         run_composer_frontend_tests
         ;;
     *)
-        echo "Usage: $0 [retained|cpp|headless|roboplan|bindings|python|composer|bridge|deployment-composition|qualification|qualification-native|qualification-soak|qualification-all|integration|ros|ros-e2e]"
+        echo "Usage: $0 [retained|cpp|headless|roboplan|bindings|python|composer|bridge|deployment-composition|qualification|qualification-soak|qualification-all|integration|ros|ros-e2e]"
         exit 1
         ;;
 esac

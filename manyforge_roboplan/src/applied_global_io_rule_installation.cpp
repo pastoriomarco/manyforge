@@ -156,11 +156,15 @@ core::Result<void> CommitAppliedGlobalIoRuleCatalog(
          selected->binding || selected->waiting->context != selected->context))
       return stale();
     const auto commit = [&] {
-      const auto result = restore
+      auto result = restore
           ? kernel.RestoreGlobalIoRuleCatalog(
                 selected->context, selected->catalog, selected->service,
                 selected->waiting)
           : kernel.ActivateGlobalIoRuleCatalog(selected->context, selected->service);
+      // CONTRACTS §8, §11: after an Apply (Load included) every rule returns
+      // to its `active_at_start`.
+      if (result.ok() && !restore)
+        result = kernel.reset_rule_activation();
       if (result.ok())
         AdoptCarriedObjectLostSignals(selected->runtime);
       if (result.ok() && selected->runtime)
@@ -228,11 +232,13 @@ core::Result<void> CommitAppliedGlobalIoRuleCatalog(
           selected->context.active_publication_generation ||
       current->origin_named_apply != selected->origin)
     return stale();
-  const auto result = restore
+  auto result = restore
       ? kernel.RestoreGlobalIoRuleCatalog(
             selected->context, selected->catalog, selected->service,
             selected->waiting)
       : kernel.ActivateGlobalIoRuleCatalog(selected->context, selected->service);
+  if (result.ok() && !restore)
+    result = kernel.reset_rule_activation();
   if (result.ok())
     AdoptCarriedObjectLostSignals(selected->runtime);
   if (result.ok() && selected->runtime)

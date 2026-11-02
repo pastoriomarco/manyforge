@@ -50,8 +50,7 @@ using content_identity::CanonicalValue;
                    std::move(message),
                    {{"reason", std::string(kOperatorAlarmStateUnavailableReason)},
                     {"availability", std::move(availability)},
-                    {"interlock_alarms", "[]"},
-                    {"unacknowledged_alarms", "[]"}}};
+                    {"interlock_alarms", "[]"}}};
   if (snapshot != nullptr) {
     refusal.details.emplace("owner_epoch", snapshot->owner_epoch);
     refusal.details.emplace("generation", std::to_string(snapshot->generation));
@@ -60,16 +59,6 @@ using content_identity::CanonicalValue;
 }
 
 }  // namespace
-
-std::string_view to_string(const OperatorAlarmAttentionGateDTO value) noexcept {
-  switch (value) {
-    case OperatorAlarmAttentionGateDTO::kConditionInterlock:
-      return "condition_interlock";
-    case OperatorAlarmAttentionGateDTO::kAcknowledgement:
-      return "acknowledgement";
-  }
-  return "acknowledgement";
-}
 
 Result<void> validate_operator_alarm_attention_snapshot(
     const OperatorAlarmAttentionSnapshotDTO& snapshot) {
@@ -148,35 +137,25 @@ std::optional<ErrorDTO> evaluate_operator_alarm_motion_attention(
   }
   const std::set<ResourceId> reserved(reserved_resources.begin(), reserved_resources.end());
   std::vector<const OperatorAlarmAttentionMemberDTO*> interlocks;
-  std::vector<const OperatorAlarmAttentionMemberDTO*> unacknowledged;
   for (const auto& member : snapshot.members) {
     const bool cell_global = member.subject_kind == "cell" &&
                              member.subject_id == cell_id.value() && member.resource_ids.empty();
     const bool intersects =
         std::any_of(member.resource_ids.begin(), member.resource_ids.end(),
                     [&](const ResourceId& resource) { return reserved.contains(resource); });
-    if (!cell_global && !intersects) continue;
-    (member.gate == OperatorAlarmAttentionGateDTO::kConditionInterlock ? interlocks
-                                                                       : unacknowledged)
-        .push_back(&member);
+    if (cell_global || intersects) interlocks.push_back(&member);
   }
-  if (interlocks.empty() && unacknowledged.empty()) return std::nullopt;
-  const bool interlock = !interlocks.empty();
-  const std::string reason(interlock ? kOperatorAlarmInterlockActiveReason
-                                     : kUnacknowledgedOperatorAlarmsReason);
+  if (interlocks.empty()) return std::nullopt;
+  const std::string reason(kOperatorAlarmInterlockActiveReason);
   bool truncated = false;
   auto interlock_alarms = membership_json(interlocks, truncated);
-  auto unacknowledged_alarms = membership_json(unacknowledged, truncated);
   ErrorDTO refusal{
       reason,
-      interlock ? "an active operator-alarm condition interlock gates this motion; resolve its "
-                  "cause"
-                : "unacknowledged operator alarms gate this motion; acknowledge them",
+      "an active operator-alarm condition interlock gates this motion; resolve its cause",
       {{"reason", reason},
        {"owner_epoch", snapshot.owner_epoch},
        {"generation", std::to_string(snapshot.generation)},
-       {"interlock_alarms", std::move(interlock_alarms)},
-       {"unacknowledged_alarms", std::move(unacknowledged_alarms)}}};
+       {"interlock_alarms", std::move(interlock_alarms)}}};
   if (truncated) refusal.details.emplace("alarm_membership_truncated", "true");
   return refusal;
 }

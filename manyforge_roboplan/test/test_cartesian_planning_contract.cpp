@@ -9,6 +9,7 @@
 #include <manyforge_roboplan/cartesian_planning_contract.hpp>
 #include <manyforge_roboplan/detail/cartesian_trajectory_contract.hpp>
 #include <memory>
+#include <random>
 #include <roboplan/core/scene.hpp>
 #include <roboplan/core/types.hpp>
 #include <string>
@@ -563,7 +564,7 @@ TEST(CartesianTrajectoryContractTest,
 
   const auto envelope =
       trajectory_detail::measure_cartesian_frame_dynamics_envelope(
-          request, &path, scene, trajectory, control);
+          request, path, scene, trajectory, control);
 
   ASSERT_TRUE(envelope.ok()) << envelope.error().message;
   ASSERT_TRUE(envelope.value().complete);
@@ -572,21 +573,12 @@ TEST(CartesianTrajectoryContractTest,
   constexpr double kExactPeakLinearSpeedMps = 1.875 * 0.1 * 9.0;
   EXPECT_GE(envelope.value().linear_speed_ratio * 10.0,
             kExactPeakLinearSpeedMps * 0.999);
-  const auto linear_only = trajectory_detail::measure_cartesian_frame_dynamics_envelope(
-      request, nullptr, scene, trajectory, control);
-  ASSERT_TRUE(linear_only.ok()) << linear_only.error().message;
-  ASSERT_TRUE(linear_only.value().complete);
-  EXPECT_GE(linear_only.value().linear_speed_ratio * 10.0,
-            kExactPeakLinearSpeedMps * 0.999);
-  EXPECT_DOUBLE_EQ(linear_only.value().angular_speed_ratio, 0.0);
-  EXPECT_DOUBLE_EQ(linear_only.value().linear_acceleration_ratio, 0.0);
-  EXPECT_DOUBLE_EQ(linear_only.value().angular_acceleration_ratio, 0.0);
 }
 
 TEST(CartesianTrajectoryDynamicsTest,
-     SpeedCheckFramesRetimeForTheFastestPointOnly) {
+     TcpSpeedCheckAndBoundUseTheActiveTcpOnly) {
   // A wrist rotation about the TCP: the TCP stays still, the flange 7 cm
-  // behind it moves (`tcp_speed_check: active_tcp_and_flange`).
+  // behind it moves. Only the active TCP is held under the limit.
   const std::string urdf = R"(
 <robot name="speed_check_points">
   <link name="base"/>
@@ -621,43 +613,201 @@ TEST(CartesianTrajectoryDynamicsTest,
   active_tcp.speed_profile.velocity_scale = 1.0;
   active_tcp.speed_profile.acceleration_scale = 1.0;
   active_tcp.speed_profile.max_tcp_linear_speed_mps = 0.1;
-  auto flange_only = active_tcp;
-  flange_only.compiled_tcp_frame = "flange";
-  auto with_flange = active_tcp;
-  with_flange.compiled_speed_frames = {"tcp", "flange"};
+  auto flange_as_tcp = active_tcp;
+  flange_as_tcp.compiled_tcp_frame = "flange";
 
+  // Samples of a wrist turn at 1.875 rad/s: 0.13125 m/s at the 7 cm flange.
   roboplan::JointTrajectory trajectory;
   trajectory.joint_names = group->joint_names;
-  trajectory.times = {0.0, 1.0};
-  trajectory.positions = {Eigen::VectorXd::Zero(1),
-                          Eigen::VectorXd::Constant(1, 1.0)};
-  trajectory.velocities = {Eigen::VectorXd::Zero(1),
-                           Eigen::VectorXd::Zero(1)};
-  trajectory.accelerations = trajectory.velocities;
+  for (const double time : {0.0, 0.25, 0.5}) {
+    trajectory.times.push_back(time);
+    trajectory.positions.push_back(Eigen::VectorXd::Constant(1, 1.875 * time));
+    trajectory.velocities.push_back(Eigen::VectorXd::Constant(1, 1.875));
+    trajectory.accelerations.push_back(Eigen::VectorXd::Zero(1));
+  }
+  const auto tcp = trajectory_detail::measure_tcp_sample_speed_ratio(
+      active_tcp, nullptr, scene, trajectory);
+  const auto flange = trajectory_detail::measure_tcp_sample_speed_ratio(
+      flange_as_tcp, nullptr, scene, trajectory);
+  ASSERT_TRUE(tcp.has_value());
+  ASSERT_TRUE(flange.has_value());
+  EXPECT_NEAR(*tcp, 0.0, 1e-12);  // the still TCP: no retime
+  // The moving flange is measured only when it is the active TCP.
+  EXPECT_NEAR(*flange, 1.875 * 0.07 / 0.1, 1e-9);
+
+  // The TOPP-RA bound: unbounded for the still TCP, 0.98 * 0.1 / 0.07 per
+  // unit joint tangent for the flange.
+  const auto tcp_bound = trajectory_detail::make_tcp_speed_path_velocity_bound(
+      active_tcp, nullptr, scene);
+  const auto flange_bound =
+      trajectory_detail::make_tcp_speed_path_velocity_bound(flange_as_tcp,
+                                                            nullptr, scene);
+  ASSERT_TRUE(tcp_bound.has_value());
+  ASSERT_TRUE(flange_bound.has_value());
+  const Eigen::VectorXd q = Eigen::VectorXd::Constant(1, 0.3);
+  const Eigen::VectorXd tangent = Eigen::VectorXd::Constant(1, 2.0);
+  EXPECT_TRUE(std::isinf((*tcp_bound)(q, tangent)));
+  EXPECT_NEAR((*flange_bound)(q, tangent),
+              trajectory_detail::kTcpSpeedTargetFraction * 0.1 / (0.07 * 2.0),
+              1e-9);
+
+  // A Cartesian path adds its angular limit: 0.98 * 0.5 / 2 rad per unit s.
+  CartesianPathDTO path;
+  path.max_angular_speed_rad_s = 0.5;
+  const auto angular_bound =
+      trajectory_detail::make_tcp_speed_path_velocity_bound(active_tcp, &path,
+                                                            scene);
+  ASSERT_TRUE(angular_bound.has_value());
+  EXPECT_NEAR((*angular_bound)(q, tangent),
+              trajectory_detail::kTcpSpeedTargetFraction * 0.5 / 2.0, 1e-9);
+  // The sample check takes the same angular limit: 1.875 rad/s over 0.5.
+  const auto angular = trajectory_detail::measure_tcp_sample_speed_ratio(
+      active_tcp, &path, scene, trajectory);
+  ASSERT_TRUE(angular.has_value());
+  EXPECT_NEAR(*angular, 1.875 / 0.5, 1e-9);
+}
+
+TEST(CartesianTrajectoryDynamicsTest,
+     TcpEnvelopeIsConservativeAndWithinTheResidualBudgetOnRandomCurves) {
+  // Planar 3R arm: the TCP speed has a closed form, so a dense reference
+  // checks the certified envelope independently of its refinement order.
+  const std::string urdf = R"(
+<robot name="planar_envelope_arm">
+  <link name="base"/>
+  <joint name="j1" type="revolute">
+    <parent link="base"/><child link="l1"/>
+    <axis xyz="0 0 1"/><limit lower="-6" upper="6" effort="1" velocity="4"/>
+  </joint>
+  <link name="l1"/>
+  <joint name="j2" type="revolute">
+    <parent link="l1"/><child link="l2"/><origin xyz="0.3 0 0"/>
+    <axis xyz="0 0 1"/><limit lower="-6" upper="6" effort="1" velocity="4"/>
+  </joint>
+  <link name="l2"/>
+  <joint name="j3" type="revolute">
+    <parent link="l2"/><child link="l3"/><origin xyz="0.25 0 0"/>
+    <axis xyz="0 0 1"/><limit lower="-6" upper="6" effort="1" velocity="4"/>
+  </joint>
+  <link name="l3"/>
+  <joint name="l3_to_tcp" type="fixed">
+    <parent link="l3"/><child link="tcp"/><origin xyz="0.1 0 0"/>
+  </joint>
+  <link name="tcp"/>
+</robot>)";
+  const std::string srdf = R"(
+<robot name="planar_envelope_arm">
+  <group name="arm">
+    <joint name="j1"/><joint name="j2"/><joint name="j3"/>
+  </group>
+</robot>)";
+  auto scene = std::make_shared<roboplan::Scene>(
+      "planar_envelope_arm", roboplan::loadUrdfSceneDescriptionFromXml(urdf));
+  const auto imported = scene->importSrdf(srdf);
+  ASSERT_TRUE(imported.has_value()) << imported.error();
+  const auto group = scene->getJointGroupInfo("arm");
+  ASSERT_TRUE(group.has_value()) << group.error();
+  ASSERT_EQ(group->joint_names,
+            (std::vector<std::string>{"j1", "j2", "j3"}));
+  constexpr std::array<double, 3> kLinkLengths{0.3, 0.25, 0.1};
+
+  // Exact TCP speed of the rest-free quintic piece at normalized time s.
+  const auto tcp_speed = [&](const roboplan::JointTrajectory &trajectory,
+                             std::size_t piece, double s) {
+    const double duration =
+        trajectory.times[piece + 1] - trajectory.times[piece];
+    double angle = 0.0;
+    double angle_rate = 0.0;
+    Eigen::Vector2d velocity = Eigen::Vector2d::Zero();
+    for (Eigen::Index joint = 0; joint < 3; ++joint) {
+      const double p0 = trajectory.positions[piece][joint];
+      const double v0 = trajectory.velocities[piece][joint] * duration;
+      const double a0 =
+          trajectory.accelerations[piece][joint] * duration * duration;
+      const double v1 = trajectory.velocities[piece + 1][joint] * duration;
+      const double a1 =
+          trajectory.accelerations[piece + 1][joint] * duration * duration;
+      const double d = trajectory.positions[piece + 1][joint] - p0;
+      const std::array<double, 6> c{
+          p0, v0, 0.5 * a0,
+          10.0 * d - 6.0 * v0 - 4.0 * v1 - 1.5 * a0 + 0.5 * a1,
+          -15.0 * d + 8.0 * v0 + 7.0 * v1 + 1.5 * a0 - a1,
+          6.0 * d - 3.0 * (v0 + v1) - 0.5 * a0 + 0.5 * a1};
+      angle += c[0] + s * (c[1] + s * (c[2] + s * (c[3] + s * (c[4] + s * c[5]))));
+      angle_rate += (c[1] + s * (2.0 * c[2] + s * (3.0 * c[3] +
+                     s * (4.0 * c[4] + s * 5.0 * c[5])))) / duration;
+      velocity += kLinkLengths[static_cast<std::size_t>(joint)] * angle_rate *
+                  Eigen::Vector2d(-std::sin(angle), std::cos(angle));
+    }
+    return velocity.norm();
+  };
+
+  std::mt19937 random(0x5eedU);
+  std::uniform_real_distribution<double> position(-1.5, 1.5);
+  std::uniform_real_distribution<double> velocity(-1.5, 1.5);
+  std::uniform_real_distribution<double> acceleration(-8.0, 8.0);
+  std::uniform_real_distribution<double> duration(0.005, 0.02);
   const CartesianPlanningControl control{[] { return false; },
                                          [] { return false; }};
-  const auto measure = [&](const auto &request) {
-    auto envelope = trajectory_detail::measure_cartesian_frame_dynamics_envelope(
-        request, nullptr, scene, trajectory, control);
-    EXPECT_TRUE(envelope.ok()) << envelope.error().message;
-    EXPECT_TRUE(envelope.value().complete);
-    return envelope.value();
-  };
-  const auto tcp = measure(active_tcp);
-  const auto flange = measure(flange_only);
-  const auto both = measure(with_flange);
-  // Rest-to-rest unit quintic: peak 1.875 rad/s, so 0.13125 m/s at 7 cm.
-  constexpr double kFlangePeakMps = 1.875 * 1.0 * 0.07;
-  EXPECT_LT(tcp.linear_speed_ratio, 1.0);  // active_tcp: no retime
-  EXPECT_GE(both.linear_speed_ratio * 0.1, kFlangePeakMps * 0.999);
-  EXPECT_GT(both.linear_speed_ratio, 1.0);  // and_flange: stretched
-  EXPECT_DOUBLE_EQ(both.linear_speed_ratio,
-                   std::max(tcp.linear_speed_ratio, flange.linear_speed_ratio));
-  EXPECT_EQ(both.interval_checks, tcp.interval_checks + flange.interval_checks);
-  // A frame set naming only the TCP is the TCP alone.
-  auto tcp_set = active_tcp;
-  tcp_set.compiled_speed_frames = {"tcp"};
-  EXPECT_DOUBLE_EQ(measure(tcp_set).linear_speed_ratio, tcp.linear_speed_ratio);
+  // Below, near and above the limit: the retime decision must follow the
+  // dense peak whenever it is outside the two-percent residual budget.
+  constexpr std::array<double, 4> kLimitOverPeak{0.5, 0.99, 1.03, 3.0};
+  for (std::size_t curve = 0; curve < 12U; ++curve) {
+    roboplan::JointTrajectory trajectory;
+    trajectory.joint_names = group->joint_names;
+    Eigen::VectorXd q(3);
+    q << position(random), position(random), position(random);
+    double time = 0.0;
+    const std::size_t knots = 20U + 5U * curve;
+    for (std::size_t knot = 0; knot < knots; ++knot) {
+      Eigen::VectorXd v(3);
+      Eigen::VectorXd a(3);
+      v << velocity(random), velocity(random), velocity(random);
+      a << acceleration(random), acceleration(random), acceleration(random);
+      trajectory.times.push_back(time);
+      trajectory.positions.push_back(q);
+      trajectory.velocities.push_back(v);
+      trajectory.accelerations.push_back(a);
+      const double step = duration(random);
+      time += step;
+      q += step * v;
+    }
+    double dense_peak = 0.0;
+    for (std::size_t piece = 0; piece + 1 < knots; ++piece) {
+      for (int sample = 0; sample <= 4000; ++sample) {
+        dense_peak = std::max(
+            dense_peak, tcp_speed(trajectory, piece, sample / 4000.0));
+      }
+    }
+    ASSERT_GT(dense_peak, 0.0);
+    const double limit = dense_peak * kLimitOverPeak[curve % 4U];
+    trajectory_detail::CartesianTrajectoryContractInput request;
+    request.compiled_group_name = "arm";
+    request.compiled_base_frame = "base";
+    request.compiled_tcp_frame = "tcp";
+    request.speed_profile.velocity_scale = 1.0;
+    request.speed_profile.acceleration_scale = 1.0;
+    request.speed_profile.max_tcp_linear_speed_mps = limit;
+    // Angular and acceleration limits far above this curve: only the linear
+    // speed envelope decides the refinement.
+    CartesianPathDTO path;
+    path.max_angular_speed_rad_s = 1e6;
+    path.max_linear_acceleration_mps2 = 1e6;
+    path.max_angular_acceleration_rad_s2 = 1e6;
+    const auto envelope =
+        trajectory_detail::measure_cartesian_frame_dynamics_envelope(
+            request, path, scene, trajectory, control);
+    ASSERT_TRUE(envelope.ok()) << envelope.error().message;
+    ASSERT_TRUE(envelope.value().complete);
+    const double certified = envelope.value().linear_speed_ratio * limit;
+    SCOPED_TRACE("curve " + std::to_string(curve));
+    // Conservative: never below the true peak.
+    EXPECT_GE(certified, dense_peak * (1.0 - 1e-12));
+    // Tight: at most two percent of the limit above the peak (the dense
+    // reference misses at most 0.1% of the peak between its samples).
+    EXPECT_LE(certified, dense_peak * 1.001 + 0.02 * limit);
+    EXPECT_EQ(envelope.value().linear_speed_ratio > 1.0,
+              kLimitOverPeak[curve % 4U] < 1.0);
+  }
 }
 
 TEST(CartesianBackendErrorMappingTest,

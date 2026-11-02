@@ -14,7 +14,7 @@ const endpointPair = {
   body_b: { kind: 'runtime_object', runtime_object_id: 'trial.probe_object' },
 };
 
-// The Trial E withdrawal: start in contact up to 2 mm, then separate.
+// The signal_moves withdrawal: start in contact up to 2 mm, then separate.
 const releasePolicy = {
   api_version: 'manyforge.contact_policy.v1',
   policy_id: 'withdrawal_contact_policy',

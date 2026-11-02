@@ -8,7 +8,9 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <stdexcept>
+#include <string_view>
 #include <string>
 #include <utility>
 #include <vector>
@@ -56,26 +58,15 @@ struct ControllerLaunchCommand final {
   std::optional<std::string> gripper_controller_name;
   std::string frame_prefix;
   std::string controllers_yaml;
-  /// Mock and Isaac keep their processes across Apply when their exact
+  /// ros2_control and Isaac launches keep their processes across Apply when their exact
   /// launch identity is unchanged (Q21, DX224.3).
   bool keep_across_apply{false};
 };
 
-/// The mock lane command: Track 2's `mock_control.launch.py` with the
-/// artifact's launch arguments (phase 2a contract, DX-175). Since CP8 step 2a
-/// it is the one builder of Mock and Real ros2_control components.
+/// The command of every ros2_control component (CONTRACTS §12):
+/// `ros2_control.launch.py` with the artifact's launch arguments.
 [[nodiscard]] ControllerLaunchCommand
-mock_controller_launch_command(const ControllerLaunchArtifacts &artifacts);
-
-/// The Isaac lane command: `isaac_topic_based_control.launch.py` with the
-/// host-owned arguments (generated files, profile, namespace, controller
-/// names, frame prefix and the lane's joint topics, taken from the same lane
-/// facts the generated URDF's hardware section was written from so the
-/// launch's readiness topics agree with it by construction). The user opens
-/// the Isaac scene; this process only attaches the ROS controller stack. A
-/// gripper bridge belongs to the tool component's own launch.
-[[nodiscard]] ControllerLaunchCommand isaac_controller_launch_command(
-    const ControllerLaunchArtifacts &artifacts, const IsaacControllerLane &lane);
+ros2_control_launch_command(const ControllerLaunchArtifacts &artifacts);
 
 /// The Isaac tool (gripper-only) command: `isaac_gripper.launch.py` with the
 /// tool's description, namespace and frame prefix and, for an action
@@ -186,6 +177,21 @@ struct ControllerLaunchOutputSnapshot final {
 /// `ros2 launch` tree; stopping signals the group. On parent death the canonical
 /// Mock/Isaac controller launch roles receive SIGINT, other roles SIGTERM
 /// (PR_SET_PDEATHSIG; starts happen on the supervisor's long-lived thread).
+/// A launch settles once every controller spawner it started has exited,
+/// as the launch itself reports each one ("[spawner-N]: process started",
+/// "process has finished cleanly" / "process has died"). Never settled
+/// before its first spawner started. Fed the launch's raw output in chunks.
+class ControllerLaunchSpawnerTracker final {
+public:
+  void observe(std::string_view chunk);
+  [[nodiscard]] bool settled() const noexcept;
+
+private:
+  std::string partial_;
+  std::set<std::string> started_;
+  std::set<std::string> exited_;
+};
+
 class ControllerLaunchProcess final {
 public:
   ~ControllerLaunchProcess();
@@ -193,6 +199,12 @@ public:
   ControllerLaunchProcess &operator=(const ControllerLaunchProcess &) = delete;
 
   [[nodiscard]] int pid() const noexcept { return pid_; }
+  /// When this occurrence started (the launch-settle bound counts from it).
+  [[nodiscard]] std::chrono::steady_clock::time_point started_at() const noexcept {
+    return started_at_;
+  }
+  /// See ControllerLaunchSpawnerTracker; read from the launch's own output.
+  [[nodiscard]] bool spawners_settled() const;
   [[nodiscard]] const ControllerLaunchCommand &command() const noexcept {
     return command_;
   }
@@ -215,7 +227,8 @@ public:
   [[nodiscard]] bool append_incident_correlation(const std::string &incident_id,
                                                  const std::string &context,
                                                  const std::string &summary);
-  /// SIGINT to the group, wait `grace`, then SIGKILL to the group; reaps.
+  /// SIGINT to the running leader (to the group once the leader is gone),
+  /// wait `grace`, then SIGKILL to the group; reaps.
   void stop(std::chrono::milliseconds grace) noexcept;
 
 private:
@@ -240,6 +253,7 @@ private:
 
   ControllerLaunchCommand command_;
   int pid_{-1};
+  std::chrono::steady_clock::time_point started_at_{std::chrono::steady_clock::now()};
   mutable std::mutex mutex_;
   /// Serializes the exact group retirement/reap without blocking scalar reads.
   std::mutex retirement_mutex_;
@@ -300,6 +314,13 @@ public:
   [[nodiscard]] Ensured ensure(const ControllerLaunchCommand &command,
                                const std::filesystem::path &artifacts_root,
                                std::string context = {});
+
+  /// CONTRACTS §6 driver restart: stop exactly `current` and start its
+  /// command again in its own artifacts root (a driver that doesn't
+  /// reconnect by itself, e.g. after a controller reboot). Throws
+  /// ControllerLaunchProcessError when the launch cannot be started.
+  [[nodiscard]] Ensured restart(const std::shared_ptr<ControllerLaunchProcess> &current,
+                                std::string context);
 
   /// Discard a candidate-owned launch only when it is still the exact
   /// current process. Borrowed kKeep receipts and superseded processes are

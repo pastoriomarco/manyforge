@@ -4,13 +4,26 @@ import { api } from '../api/client';
 import {
   ioSignalBindingsFromProgramBinding,
   type IoSignalBinding,
-  type IoSignalReading,
   type IoSignalSelector,
   type MockIoInputReceipt,
   type SystemSignalProjection,
 } from '../api/parsers/ioSignals';
 import type { HeadlessStateSource } from '../hooks/useHeadlessState';
+import {
+  ageText,
+  codedErrorText,
+  SIGNAL_SOURCE_LABELS,
+  signalValueText,
+} from '../state/componentPresentation';
 import type { JsonValue } from '../types/api';
+import {
+  CHANGED_OUTSIDE_SUFFIX,
+  ioSignalId,
+  type CellState,
+  type ComponentState,
+  type SetOutputResult,
+  type SignalSample,
+} from '../types/components';
 import {
   globalRuleStateText,
   globalRuleUnavailableText,
@@ -24,11 +37,7 @@ import {
   declaredIoSources,
   ioSourceKey,
   type DeclaredIoSource,
-  type IoLivenessMode,
 } from '../utils/ioSignalConfiguration';
-
-/** Display cadence while the panel is open; nothing polls when it is closed. */
-export const IO_PANEL_POLL_INTERVAL_MS = 500;
 
 /** One bound signal, addressed by its own Program binding. */
 export interface ToolIoSignal {
@@ -42,21 +51,21 @@ export interface ToolIoSignal {
   declared: DeclaredIoSource | null;
 }
 
-export interface ToolIoSignalState {
-  reading: IoSignalReading | null;
-  error: string | null;
+/** One manual output write: sent once; its outcome is shown, never resent. */
+export interface OutputWriteState {
+  value: boolean;
   sending: boolean;
-  /** The last Mock toggle receipt: model accepted vs delivered observation. */
-  receipt?: MockIoInputReceipt | null;
-  /**
-   * The latest reported source epoch: an unavailable (e.g. Disabled) Mock
-   * reading carries none, yet its model may still be set; the host fences a
-   * stale epoch.
-   */
-  lastSourceEpoch?: string | null;
+  result: SetOutputResult | null;
+  /** A refusal or transport failure of the request itself. */
+  error: string | null;
 }
 
-const EMPTY_STATE: ToolIoSignalState = { reading: null, error: null, sending: false };
+/** One Mock input toggle: the model receipt or its failure. */
+export interface MockInputState {
+  sending: boolean;
+  receipt: MockIoInputReceipt | null;
+  error: string | null;
+}
 
 /** What a Mock toggle did: model set, and whether that value reached the source. */
 function receiptText(receipt: MockIoInputReceipt): { text: string; warning: boolean } {
@@ -76,6 +85,22 @@ function receiptText(receipt: MockIoInputReceipt): { text: string; warning: bool
   return {
     warning: false,
     text: `${model}; not delivered now: the source is not publishing (e.g. Disabled). It is delivered when the source is enabled.`,
+  };
+}
+
+/** The outcome line of one manual output write (CONTRACTS §7). */
+function writeText(write: OutputWriteState): { text: string; severity: 'info' | 'warning' | 'error' } | null {
+  const value = write.value ? 'on' : 'off';
+  if (write.sending) return { text: `Writing ${value}…`, severity: 'info' };
+  if (write.error !== null) return { text: write.error, severity: 'error' };
+  if (write.result === null) return null;
+  if (write.result.outcome === 'succeeded') return { text: `Written: ${value}.`, severity: 'info' };
+  if (write.result.outcome === 'unknown') {
+    return { text: `Write ${value}: no response, the outcome is unknown. It is not resent.`, severity: 'warning' };
+  }
+  return {
+    text: write.result.error === undefined ? `Write ${value} failed.` : `Write ${value} failed: ${codedErrorText(write.result.error)}`,
+    severity: 'error',
   };
 }
 
@@ -118,24 +143,9 @@ function message(error: unknown): string {
   return error instanceof Error ? error.message : 'The request failed.';
 }
 
-function ageText(ns: number | null): string {
-  if (ns === null) return '—';
-  return ns < 1_000_000_000 ? `${Math.round(ns / 1_000_000)} ms` : `${(ns / 1_000_000_000).toFixed(1)} s`;
-}
-
-/**
- * The input's liveness: the owner's descriptor projection (SX-2194) when read,
- * else the declared source's mode; null when neither is known.
- */
-function livenessOf(signal: ToolIoSignal, reading: IoSignalReading | null): IoLivenessMode | null {
-  return reading?.liveness?.mode ?? signal.declared?.liveness ?? null;
-}
-
-function sourceText(signal: ToolIoSignal, reading: IoSignalReading | null): string {
-  const id = reading?.sourceId ?? signal.declared?.sourceId ?? 'unknown source';
-  if (signal.declared === null) return id;
-  const topic = signal.declared.topic === null ? '' : ` · ${signal.declared.topic}`;
-  return `${IO_SOURCE_PROFILE_LABELS[signal.declared.profile]} · ${id}${topic}`;
+function declaredSourceText(declared: DeclaredIoSource): string {
+  const topic = declared.topic === null ? '' : ` · ${declared.topic}`;
+  return `${IO_SOURCE_PROFILE_LABELS[declared.profile]} · ${declared.sourceId}${topic}`;
 }
 
 export interface ToolIoPanelViewProps {
@@ -143,9 +153,17 @@ export interface ToolIoPanelViewProps {
   signals: ToolIoSignal[];
   /** Generated owner signals, displayed from the target projection without requests. */
   systemSignals?: SystemSignalProjection[];
-  states: Record<string, ToolIoSignalState>;
-  /** Null when the declared sources cannot be shown (Draft differs from Applied). */
+  /** The pushed samples by `signal_id`; null until the first `io_signals` event. */
+  samples: ReadonlyMap<string, SignalSample> | null;
+  /** The cell latch blocks manual I/O (CONTRACTS §5). */
+  latched: boolean;
+  /** Motion is executing in the cell: manual output writes wait (§7). */
+  motionExecuting?: boolean;
+  writes: Readonly<Record<string, OutputWriteState>>;
+  mocks: Readonly<Record<string, MockInputState>>;
+  /** Null when the declared sources can be shown; else why not (Draft differs from Applied). */
   sourcesNotice: string | null;
+  onSetOutput: (signal: ToolIoSignal, value: boolean) => void;
   onSetMock: (signal: ToolIoSignal, value: boolean) => void;
   /**
    * The live global rule states (control-state shell); null while unknown,
@@ -159,7 +177,7 @@ export interface ToolIoPanelViewProps {
   globalRulesCurrent?: boolean;
 }
 
-/** Each global rule's live state; latched rules keep their recovery notice. */
+/** Each global rule's live state (CONTRACTS §8: inactive, clear, tripped, or can't watch). */
 export function GlobalRuleStatusSection({ rules, current = true }: {
   rules: readonly GlobalRuleStatus[] | null;
   current?: boolean;
@@ -179,7 +197,7 @@ export function GlobalRuleStatusSection({ rules, current = true }: {
             <div>
               <span className={`status-pill${!current ? ''
                 : rule.state === 'clear' ? ' status-pill-connected'
-                  : rule.state === 'tripped' || rule.state === 'latched' || rule.state === 'unknown' ? ' status-pill-danger' : ''}`}>
+                  : rule.state === 'tripped' || rule.state === 'unknown' ? ' status-pill-danger' : ''}`}>
                 {current ? globalRuleStateText(rule) : `last known: ${globalRuleStateText(rule)} (not current)`}
               </span>
               {unavailableText !== null && <>
@@ -209,14 +227,61 @@ export function ToolIoPanelView(props: ToolIoPanelViewProps) {
   );
 }
 
+const LATCH_REASON = codedErrorText({ code: 'cell_latched', message: 'The cell is latched.' });
+const EXECUTING_REASON = codedErrorText({
+  code: 'io_manual_write_motion_executing', message: 'Motion is executing.',
+});
+
+/**
+ * True while motion executes in the cell: an arm or gripper component is
+ * busy (§1, §7). An I/O component's own write, a sensor or an owner doesn't
+ * count.
+ */
+export function motionExecuting(components: readonly ComponentState[] | null,
+  motionComponentIds: ReadonlySet<string>): boolean {
+  return components?.some((component) => component.activity === 'busy'
+    && motionComponentIds.has(component.component_id)) ?? false;
+}
+
+/** Value, source and age of one pushed sample. */
+function SampleFacts({ sample, known }: { sample: SignalSample | undefined; known: boolean }) {
+  if (sample === undefined) {
+    return (
+      <div className="deployment-resolved-grid">
+        <span><small>Value</small><strong data-io-value>—</strong></span>
+        <span><small>Source</small><strong>{known ? 'no sample' : 'unavailable'}</strong></span>
+      </div>
+    );
+  }
+  return (
+    <div className="deployment-resolved-grid">
+      <span><small>Value</small><strong data-io-value>
+        {signalValueText(sample)}{sample.fresh ? '' : ' (stale)'}
+      </strong></span>
+      <span><small>Source</small><strong data-io-source={sample.source}>
+        {sample.source === 'outside'
+          ? <span className="status-pill status-pill-danger">{SIGNAL_SOURCE_LABELS.outside}</span>
+          : SIGNAL_SOURCE_LABELS[sample.source]}
+      </strong></span>
+      <span><small>Age</small><strong data-io-age>{ageText(sample.age_ns)}</strong></span>
+    </div>
+  );
+}
+
 function ToolIoSignalsView({
   unavailableReason,
   signals,
   systemSignals = [],
-  states,
+  samples,
+  latched,
+  motionExecuting: writesWait = false,
+  writes,
+  mocks,
   sourcesNotice,
+  onSetOutput,
   onSetMock,
 }: ToolIoPanelViewProps) {
+  const outputsBlocked = latched ? LATCH_REASON : writesWait ? EXECUTING_REASON : null;
   if (unavailableReason !== null) {
     return <p className="panel-state">{unavailableReason}</p>;
   }
@@ -228,90 +293,51 @@ function ToolIoSignalsView({
   return (
     <div className="dpanel" aria-label="Tool and I/O signals">
       {sourcesNotice !== null && <p className="hint">{sourcesNotice}</p>}
+      {outputsBlocked !== null && <p className="inline-message severity-warning" role="status">Outputs: {outputsBlocked}</p>}
       {components.map((controllableComponentId) => (
         <section className="runtime-control-section" key={controllableComponentId} aria-label={`${controllableComponentId} signals`}>
           <div className="runtime-control-heading"><strong>{controllableComponentId}</strong></div>
           {signals.filter((signal) => signal.controllableComponentId === controllableComponentId).map((signal) => {
             const key = toolIoSignalKey(signal);
-            const state = states[key] ?? EMPTY_STATE;
-            const { reading } = state;
-            const receipt = state.receipt ?? null;
+            const id = ioSignalId(signal.controllableComponentId, signal.signalName);
+            const sample = samples?.get(id);
+            const changedOutside = samples?.get(`${id}${CHANGED_OUTSIDE_SUFFIX}`);
             const output = signal.direction === 'output';
-            const mock = signal.declared?.profile === 'mock';
-            // A delivered reading is current; otherwise the accepted model value is.
-            const current = reading?.quality === 'fresh'
-              ? reading.value
-              : receipt?.modelValue ?? reading?.value ?? null;
-            const requested = current !== true;
-            const sourceEpoch = reading?.sourceEpoch ?? state.lastSourceEpoch ?? null;
-            const disabledReason = output
-              ? 'Outputs are not implemented.'
-              : !mock
-                ? signal.declared === null
-                  ? 'The declared source is unknown, so this input cannot be simulated.'
-                  : 'Only Mock inputs can be set; this is a real source.'
-                : sourceEpoch === null
-                  ? 'Waiting for the Mock source reading.'
-                  : state.sending ? 'Setting the Mock input…' : null;
+            const liveness = output ? null : signal.declared?.liveness ?? null;
             return (
               <div className="runtime-control-record" key={key} data-io-signal={signal.signalName}
-                data-io-quality={reading?.quality ?? 'pending'}>
+                data-io-fresh={sample === undefined ? 'pending' : String(sample.fresh)}>
                 <div className="runtime-control-heading">
                   <strong>{signal.signalName}</strong>
                   <small>{signal.targetId} · {signal.resourceRoleId} · {output ? 'output' : 'input'}</small>
                 </div>
-                {output ? (
-                  <p className="hint">Output: not implemented; it is not read or written.</p>
-                ) : (
-                  <div className="deployment-resolved-grid">
-                    <span><small>Value</small><strong data-io-value>
-                      {reading === null || reading.value === null ? '—' : String(reading.value)}
-                      {reading !== null && reading.value !== null && reading.quality !== 'fresh' ? ' (last reported)' : ''}
-                    </strong></span>
-                    <span><small>Quality</small><strong>
-                      <span className={`status-pill${reading?.quality === 'fresh'
-                        ? ' status-pill-connected'
-                        : reading === null ? '' : ' status-pill-danger'}`}>{reading?.quality ?? 'reading…'}</span>
-                    </strong></span>
-                    <span><small>Receipt age</small><strong>{ageText(reading?.receiptAgeNs ?? null)}</strong></span>
-                    <span><small>Source</small><strong>{sourceText(signal, reading)}</strong></span>
-                    {(() => {
-                      const liveness = livenessOf(signal, reading);
-                      return liveness === null ? null : (
-                        <span><small>Liveness</small><strong data-io-liveness={liveness}>
-                          {liveness === 'change_only'
-                            ? <span className="status-pill status-pill-danger">Liveness unproven</span>
-                            : IO_LIVENESS_LABELS[liveness]}
-                        </strong></span>
-                      );
-                    })()}
+                <SampleFacts sample={sample} known={samples !== null} />
+                {signal.declared !== null && (
+                  <p className="hint">Declared source: {declaredSourceText(signal.declared)}
+                    {liveness === null ? '' : ` · ${IO_LIVENESS_LABELS[liveness]}`}</p>
+                )}
+                {output && changedOutside !== undefined && (
+                  <div className="runtime-control-record" data-io-changed-outside={String(changedOutside.value === true)}>
+                    <div className="runtime-control-heading">
+                      <small>→ changed outside</small>
+                      {changedOutside.value === true
+                        ? <span className="status-pill status-pill-danger">changed outside ManyForge</span>
+                        : <span className="status-pill">no outside change</span>}
+                    </div>
                   </div>
                 )}
-                {!output && livenessOf(signal, reading) === 'change_only' && (
+                {liveness === 'change_only' && (
                   <p className="inline-message severity-warning" role="note">{IO_LIVENESS_UNPROVEN_WARNING}</p>
                 )}
-                {!output && (signal.declared?.profile === 'ur_io_states' || signal.declared?.profile === 'ros2_control_gpio') && (
+                {!output && signal.declared?.profile === 'ros2_control_gpio' && (
                   <p className="hint">{IO_DRIVER_FRESHNESS_NOTE}</p>
                 )}
-                {reading?.errorCode != null && <p className="hint">Source error: {reading.errorCode}</p>}
-                {receipt !== null && (() => {
-                  const outcome = receiptText(receipt);
-                  return (
-                    <p className={`inline-message ${outcome.warning ? 'severity-warning' : 'severity-info'}`}
-                      role="status" data-io-receipt={outcome.warning ? 'publication_error'
-                        : receipt.publishedCursor === null ? 'not_delivered' : 'delivered'}>{outcome.text}</p>
-                  );
-                })()}
-                {state.error !== null && <p className="inline-message severity-error" role="alert">{state.error}</p>}
-                {!output && (
-                  <div className="runtime-control-actions">
-                    <button type="button" disabled={disabledReason !== null} title={disabledReason ?? undefined}
-                      aria-label={`Set ${signal.signalName} ${requested ? 'true' : 'false'}`}
-                      onClick={() => onSetMock(signal, requested)}>
-                      Set {requested ? 'true' : 'false'}
-                    </button>
-                  </div>
-                )}
+                {output
+                  ? <OutputControls signal={signal} sample={sample} blockedReason={outputsBlocked}
+                      write={writes[key]} onSetOutput={onSetOutput} />
+                  : signal.declared?.profile === 'mock'
+                    ? <MockInputControls signal={signal} sample={sample} mock={mocks[key]} onSetMock={onSetMock} />
+                    : null}
               </div>
             );
           })}
@@ -345,9 +371,77 @@ function ToolIoSignalsView({
         </section>
       )}
       {signals.length > 0 && (
-        <p className="hint">Setting a Mock input simulates its source; it is not a hardware command and is allowed at any time.</p>
+        <p className="hint">Outputs can be written whenever no motion is executing; a write is sent once and never resent (the last write wins). Setting a Mock input simulates its source; it is not a hardware command.</p>
       )}
     </div>
+  );
+}
+
+/** Manual write of one output (CONTRACTS §7); controller-owned outputs are read-only. */
+function OutputControls({ signal, sample, blockedReason, write, onSetOutput }: {
+  signal: ToolIoSignal;
+  sample: SignalSample | undefined;
+  /** Why outputs can't be written now (latch, executing run), or null. */
+  blockedReason: string | null;
+  write: OutputWriteState | undefined;
+  onSetOutput: (signal: ToolIoSignal, value: boolean) => void;
+}) {
+  if (sample?.controller_owned === true) {
+    return <p className="hint" data-io-controller-owned>Read only: the robot controller owns this output (its function is set on the controller).</p>;
+  }
+  const disabledReason = blockedReason ?? (write?.sending === true ? 'A write is in flight.' : null);
+  const outcome = write === undefined ? null : writeText(write);
+  return (
+    <>
+      {outcome !== null && (
+        <p className={`inline-message severity-${outcome.severity}`}
+          role={outcome.severity === 'error' ? 'alert' : 'status'}
+          data-io-write={write?.sending ? 'sending' : write?.error !== null ? 'refused' : write?.result?.outcome}>
+          {outcome.text}
+        </p>
+      )}
+      <div className="runtime-control-actions">
+        {[true, false].map((value) => (
+          <button type="button" key={String(value)} disabled={disabledReason !== null}
+            title={disabledReason ?? undefined}
+            aria-label={`Write ${signal.signalName} ${value ? 'on' : 'off'}`}
+            onClick={() => onSetOutput(signal, value)}>
+            Set {value ? 'on' : 'off'}
+          </button>
+        ))}
+      </div>
+    </>
+  );
+}
+
+function MockInputControls({ signal, sample, mock, onSetMock }: {
+  signal: ToolIoSignal;
+  sample: SignalSample | undefined;
+  mock: MockInputState | undefined;
+  onSetMock: (signal: ToolIoSignal, value: boolean) => void;
+}) {
+  const requested = sample?.value !== true;
+  const receipt = mock?.receipt ?? null;
+  return (
+    <>
+      {receipt !== null && (() => {
+        const outcome = receiptText(receipt);
+        return (
+          <p className={`inline-message ${outcome.warning ? 'severity-warning' : 'severity-info'}`}
+            role="status" data-io-receipt={outcome.warning ? 'publication_error'
+              : receipt.publishedCursor === null ? 'not_delivered' : 'delivered'}>{outcome.text}</p>
+        );
+      })()}
+      {mock?.error != null && <p className="inline-message severity-error" role="alert">{mock.error}</p>}
+      <div className="runtime-control-actions">
+        <button type="button" disabled={mock?.sending === true}
+          title={mock?.sending === true ? 'Setting the Mock input…' : undefined}
+          aria-label={`Set ${signal.signalName} ${requested ? 'true' : 'false'}`}
+          onClick={() => onSetMock(signal, requested)}>
+          Set {requested ? 'true' : 'false'}
+        </button>
+      </div>
+    </>
   );
 }
 
@@ -401,7 +495,7 @@ function useDeploymentIoFacts(enabled: boolean, retainedBundleId: string | null)
 
 export interface ToolIoPanelProps {
   enabled: boolean;
-  /** The execution owner epoch the host fences reads by. */
+  /** The execution owner epoch the host fences Mock input writes by. */
   ownerEpoch: string | null;
   /** The running cell's retained bundle. */
   retainedBundleId: string | null;
@@ -412,18 +506,23 @@ export interface ToolIoPanelProps {
   ioSignalBindings?: IoSignalBinding[];
   /** The owner's generated read-only system signal projection. */
   systemSignals?: SystemSignalProjection[];
-  pollIntervalMs?: number;
-  /** The control-state source carrying the global rule states. */
+  /** The control-state source carrying the I/O samples, the latch and the rule states. */
   controlSource?: HeadlessStateSource | null;
+  /** The arm and gripper components (their direct-control targets' owners). */
+  motionComponentIds?: ReadonlySet<string>;
 }
 
 const subscribeNothing = () => () => undefined;
 const unknownRules = () => null;
 const rulesNotCurrent = () => false;
+const NO_CELL_STATE: CellState = { components: null, latch: null, io: null, readiness: null };
+const noCellState = () => NO_CELL_STATE;
+const NO_MOTION_COMPONENTS: ReadonlySet<string> = new Set();
 
 /**
- * Tool & I/O: reads every bound input at a display cadence while mounted
- * (the inspector body is mounted only while this panel is open).
+ * Tool & I/O: every bound signal's pushed sample (value, source, age), the
+ * `changed outside` mark of eligible outputs, manual output writes and Mock
+ * input toggles. Nothing polls (CONTRACTS §7).
  */
 export function ToolIoPanel({
   enabled,
@@ -431,10 +530,9 @@ export function ToolIoPanel({
   retainedBundleId,
   ioSignalBindings,
   systemSignals: ownerSystemSignals,
-  pollIntervalMs = IO_PANEL_POLL_INTERVAL_MS,
   controlSource,
+  motionComponentIds = NO_MOTION_COMPONENTS,
 }: ToolIoPanelProps) {
-  // Pushed with the control state: no request of its own.
   const globalRules = useSyncExternalStore(
     controlSource?.subscribeGlobalRules ?? subscribeNothing,
     controlSource?.getGlobalRules ?? unknownRules,
@@ -445,6 +543,13 @@ export function ToolIoPanel({
     controlSource?.getGlobalRulesCurrent ?? rulesNotCurrent,
     rulesNotCurrent,
   );
+  const cell = useSyncExternalStore(
+    controlSource?.subscribeCellState ?? subscribeNothing,
+    controlSource?.getCellState ?? noCellState,
+    noCellState,
+  );
+  const samples = useMemo(() => (cell.io === null ? null
+    : new Map(cell.io.map((sample) => [sample.signal_id, sample]))), [cell.io]);
   const facts = useDeploymentIoFacts(enabled && ownerEpoch !== null, retainedBundleId);
   const bindings = ioSignalBindings ?? facts.bindings;
   const systemSignals = enabled && ownerEpoch !== null && retainedBundleId !== null
@@ -457,67 +562,51 @@ export function ToolIoPanel({
       : bindings === null && systemSignals.length === 0
         ? 'No applied Program binding of the running cell names I/O signals yet.'
         : null;
-  const ready = unavailableReason === null;
   const signals = useMemo(() => toolIoSignals(bindings ?? [], facts.sources), [bindings, facts.sources]);
-  // Polling follows the bound selectors only (by value), so re-created rows
-  // or arriving source facts never restart it.
-  const inputsKey = JSON.stringify(toolIoSignals(bindings ?? [], null)
-    .filter((signal) => signal.direction === 'input'));
-  const inputs = useMemo(() => JSON.parse(inputsKey) as ToolIoSignal[], [inputsKey]);
-  const [states, setStates] = useState<Record<string, ToolIoSignalState>>({});
-  const patch = useCallback((key: string, next: Partial<ToolIoSignalState>) => {
-    setStates((current) => {
-      const previous = current[key] ?? EMPTY_STATE;
-      const lastSourceEpoch = next.reading?.sourceEpoch ?? previous.lastSourceEpoch ?? null;
-      return { ...current, [key]: { ...previous, ...next, lastSourceEpoch } };
-    });
+  const [writes, setWrites] = useState<Record<string, OutputWriteState>>({});
+  const [mocks, setMocks] = useState<Record<string, MockInputState>>({});
+
+  const setOutput = useCallback((signal: ToolIoSignal, value: boolean) => {
+    const key = toolIoSignalKey(signal);
+    setWrites((current) => ({ ...current, [key]: { value, sending: true, result: null, error: null } }));
+    // One request; an unknown outcome is shown, never resent.
+    api.io.setOutput(ioSignalId(signal.controllableComponentId, signal.signalName), value)
+      .then((result) => setWrites((current) => ({ ...current, [key]: { value, sending: false, result, error: null } })))
+      .catch((error: unknown) => setWrites((current) => ({
+        ...current, [key]: { value, sending: false, result: null, error: message(error) },
+      })));
   }, []);
 
-  useEffect(() => {
-    setStates({});
-    if (!ready || ownerEpoch === null || inputs.length === 0) return undefined;
-    const abort = new AbortController();
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    const poll = async () => {
-      if (typeof document === 'undefined' || document.visibilityState !== 'hidden') {
-        await Promise.all(inputs.map(async (signal) => {
-          try {
-            const reading = await api.execution.readIoSignal(selectorOf(ownerEpoch, signal), abort.signal);
-            if (!abort.signal.aborted) patch(toolIoSignalKey(signal), { reading, error: null });
-          } catch (error) {
-            if (!abort.signal.aborted) patch(toolIoSignalKey(signal), { error: message(error) });
-          }
-        }));
-      }
-      if (!abort.signal.aborted) timer = setTimeout(() => { void poll(); }, pollIntervalMs);
-    };
-    void poll();
-    return () => {
-      abort.abort();
-      if (timer !== null) clearTimeout(timer);
-    };
-  }, [inputs, ownerEpoch, patch, pollIntervalMs, ready]);
-
   const setMock = useCallback((signal: ToolIoSignal, value: boolean) => {
+    if (ownerEpoch === null) return;
     const key = toolIoSignalKey(signal);
-    const sourceEpoch = states[key]?.reading?.sourceEpoch ?? states[key]?.lastSourceEpoch ?? null;
-    if (ownerEpoch === null || sourceEpoch === null) return;
-    patch(key, { sending: true, error: null });
-    // One explicit request; an unknown outcome is shown and refreshed by the
-    // next read, never replayed. An accepted model whose source is not
-    // publishing (unavailable observation) is a receipt, not a failure.
-    api.execution.setMockIoInput(selectorOf(ownerEpoch, signal), sourceEpoch, value)
-      .then((receipt) => patch(key, { reading: receipt.reading, receipt, sending: false }))
-      .catch((error: unknown) => patch(key, { error: message(error), sending: false }));
-  }, [ownerEpoch, patch, states]);
+    const selector = selectorOf(ownerEpoch, signal);
+    setMocks((current) => ({ ...current, [key]: { sending: true, receipt: current[key]?.receipt ?? null, error: null } }));
+    // The Mock source fences its toggle by its current source epoch, read
+    // just before; one explicit toggle, never replayed.
+    api.execution.readIoSignal(selector)
+      .then((reading) => {
+        if (reading.sourceEpoch === null) throw new Error('The Mock source has not reported yet.');
+        return api.execution.setMockIoInput(selector, reading.sourceEpoch, value);
+      })
+      .then((receipt) => setMocks((current) => ({ ...current, [key]: { sending: false, receipt, error: null } })))
+      .catch((error: unknown) => setMocks((current) => ({
+        ...current, [key]: { sending: false, receipt: current[key]?.receipt ?? null, error: message(error) },
+      })));
+  }, [ownerEpoch]);
 
   return (
     <ToolIoPanelView
       unavailableReason={unavailableReason}
       signals={signals}
       systemSignals={systemSignals}
-      states={states}
+      samples={samples}
+      latched={cell.latch?.latched === true}
+      motionExecuting={motionExecuting(cell.components, motionComponentIds)}
+      writes={writes}
+      mocks={mocks}
       sourcesNotice={facts.notice}
+      onSetOutput={setOutput}
       onSetMock={setMock}
       globalRules={controlSource == null ? undefined : globalRules}
       globalRulesCurrent={globalRulesCurrent}

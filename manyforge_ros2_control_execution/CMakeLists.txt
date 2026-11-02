@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(manyforge_ros2_control_execution VERSION 0.1.0 LANGUAGES CXX)
+project(manyforge_ros2_control_execution VERSION 0.2.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -70,6 +70,14 @@ if(BUILD_TESTING)
   find_package(GTest QUIET)
   if(GTest_FOUND)
     include(GoogleTest)
+    # Each test process runs in its own ROS domain (Fast DDS #6599, N16);
+    # same launcher as manyforge_roboplan's tests.
+    find_program(MANYFORGE_RUN_RMW_ISOLATED run_rmw_isolated
+      PATHS ENV AMENT_PREFIX_PATH
+      PATH_SUFFIXES lib/rmw_test_fixture_implementation
+      NO_DEFAULT_PATH REQUIRED)
+    set(CMAKE_CROSSCOMPILING_EMULATOR
+      env ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST "${MANYFORGE_RUN_RMW_ISOLATED}")
     add_executable(test_ros2_control_execution_package
       test/test_package.cpp)
     target_link_libraries(test_ros2_control_execution_package PRIVATE

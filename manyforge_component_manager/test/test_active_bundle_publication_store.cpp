@@ -13,6 +13,7 @@
 #include <future>
 #include <iterator>
 #include <limits>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -818,6 +819,66 @@ TEST(ActiveBundlePublicationStoreReadOnly,
       ReadActiveBundlePublicationReadOnly(path, CellId("cell-a")).ok());
   EXPECT_EQ(ReadFileBytes(path), corrupt_database);
   EXPECT_EQ(ReadFileBytes(wal), corrupt_wal);
+}
+
+// R3: the receipt inventory is bounded by eviction, never refusal. Publishing
+// past the fixed limit keeps succeeding; the oldest receipts go, the head and
+// a contiguous window survive, an evicted generation still reads as stale,
+// and the store reopens and verifies.
+TEST(ActiveBundlePublicationStoreBound, PublishingPastTheLimitEvictsOldest) {
+  TemporaryDirectory directory;
+  const auto database = directory.path() / "publication.sqlite3";
+  constexpr auto kPublications =
+      static_cast<std::uint64_t>(kMaximumActiveBundlePublicationReceipts) + 8U;
+  std::optional<ActiveBundlePublicationReceiptDTO> last;
+  {
+    SqliteActiveBundlePublicationStore store(database, CellId{"cell-a"});
+    last = store.PublishActiveBundle(BootstrapRequest());
+    for (std::uint64_t generation = 2U; generation <= kPublications;
+         ++generation) {
+      last = store.PublishActiveBundle(ApplyRequest(
+          "apply-" + std::to_string(generation), generation - 1U));
+      ASSERT_EQ(last->publication_generation.value(), generation);
+    }
+    // Exact replay of the head transaction still replays.
+    EXPECT_EQ(store.PublishActiveBundle(ApplyRequest(
+                  "apply-" + std::to_string(kPublications),
+                  kPublications - 1U)),
+              *last);
+    // A replay of an evicted transaction cannot republish.
+    EXPECT_THROW(store.PublishActiveBundle(BootstrapRequest()),
+                 ActiveBundlePublicationConflictError);
+    const auto report = store.VerifyIntegrity();
+    EXPECT_EQ(report.receipt_count, kMaximumActiveBundlePublicationReceipts);
+    EXPECT_EQ(report.current_generation.value(), kPublications);
+    const auto head = store.ReadActiveBundlePublication(
+        ActiveBundlePublicationGeneration{kPublications});
+    ASSERT_TRUE(head.ok()) << head.error().message;
+    EXPECT_EQ(head.value(), *last);
+    const auto evicted =
+        store.ReadActiveBundlePublication(ActiveBundlePublicationGeneration{1U});
+    ASSERT_FALSE(evicted.ok());
+    EXPECT_EQ(evicted.error().code, "stale_generation");
+  }
+  SqliteActiveBundlePublicationStore reopened(database, CellId{"cell-a"});
+  EXPECT_EQ(reopened.VerifyIntegrity().receipt_count,
+            kMaximumActiveBundlePublicationReceipts);
+  const auto read_only =
+      ReadActiveBundlePublicationReadOnly(database, CellId{"cell-a"});
+  ASSERT_TRUE(read_only.ok());
+  EXPECT_EQ(read_only.value(), *last);
+  // The head receipt itself can never be deleted.
+  reopened.Close();
+  sqlite3* raw = nullptr;
+  ASSERT_EQ(sqlite3_open(database.string().c_str(), &raw), SQLITE_OK);
+  EXPECT_NE(sqlite3_exec(raw,
+                         ("DELETE FROM active_bundle_publication_receipts "
+                          "WHERE publication_generation=" +
+                          std::to_string(kPublications))
+                             .c_str(),
+                         nullptr, nullptr, nullptr),
+            SQLITE_OK);
+  ASSERT_EQ(sqlite3_close(raw), SQLITE_OK);
 }
 
 } // namespace

@@ -1221,7 +1221,7 @@ def test_endpoint_contact_policy_requires_qualified_tcp_at_authoring(node_kind, 
 
 
 def test_joint_goal_can_author_an_explicit_endpoint_withdrawal_policy() -> None:
-    authoring = load_strict_json_yaml(_ROOT / 'examples/r5_trial_e_signal.scenario/program.yaml')
+    authoring = load_strict_json_yaml(_ROOT / 'examples/mock_lite6_signal_moves.scenario/program.yaml')
     assert len(authoring['forest']) == 1
     document = {
         key: deepcopy(value) for key, value in authoring.items()
@@ -1239,7 +1239,7 @@ def test_joint_goal_can_author_an_explicit_endpoint_withdrawal_policy() -> None:
             break
         pending.extend(node.get('children', ()))
     else:
-        raise AssertionError('Trial E has no withdrawal move')
+        raise AssertionError('mock_lite6_signal_moves has no withdrawal move')
     program = Program.from_dict(_identified(document), _catalog())
     pending = [program.to_dict()['tree']]
     while pending:

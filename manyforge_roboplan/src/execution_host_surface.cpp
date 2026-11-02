@@ -1,5 +1,6 @@
 #include <manyforge_core/io_signal_descriptor.hpp>
 #include "execution_host_surface.hpp"
+#include "direct_control_manual_runs.hpp"
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
 #include <manyforge_ros2_control_execution/volatile_motion_trace.hpp>
 #endif
@@ -7,9 +8,8 @@
 #include "cell_admission_command_codec.hpp"
 #include "sealed_program_execution_capture.hpp"
 #include "host_io_signal_runtime.hpp"
-#include <manyforge_core/component_lifecycle_value_codec.hpp>
+#include <manyforge_roboplan/io_output_writer.hpp>
 #include <manyforge_core/tcp_selector_codec.hpp>
-#include <manyforge_core/types/lifecycle_cause.hpp>
 #include <manyforge_deployment/program_binding.hpp>
 #include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/io_signal_catalog.hpp>
@@ -37,6 +37,11 @@ namespace manyforge::roboplan_backend::host_detail {
 namespace {
 
 [[nodiscard]] bool IsQualifiedProviderOnlyView(const Composition &owner) {
+  // An adapter-only component (CONTRACTS §6, e.g. a sensor) has no physical
+  // observation either.
+  if (!owner.runtime && !owner.gripper_runtime && owner.component_adapter &&
+      !(owner.io_provider_drivers && !owner.io_provider_drivers->empty()))
+    return true;
   return !owner.runtime && !owner.gripper_runtime &&
          !owner.direct_control_motion_binding &&
          !owner.direct_control_gripper_binding && owner.bundle &&
@@ -246,7 +251,6 @@ ExecutionCommandSurface::ExecutionCommandSurface(
                                        owner_epoch_.value()),
         direct_control_gripper_program_run_id_("direct-control-gripper-" +
                                                owner_epoch_.value()),
-        direct_control_io_program_run_id_("direct-control-io-" + owner_epoch_.value()),
         composition_access_(composition_access),
         manager_liveness_admission_(manager_liveness_admission),
         host_lock_(run_root), command_socket_(run_root, kSocketFileName),
@@ -334,121 +338,6 @@ int ExecutionCommandSurface::Run(const std::stop_token stop_token) {
 
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
   [[nodiscard]] CanonicalValue
-  ExecutionCommandSurface::Ros2ControlLifecycleObservationValue(Composition &composition) const {
-    Require(composition.ros2_control_runtime_handle != nullptr &&
-                composition.runtime != nullptr &&
-                composition.runtime->clock != nullptr,
-            "ROS lifecycle status has no selected observer or clock");
-
-    std::vector<core::ControlDomainId> domain_ids;
-    domain_ids.reserve(2U);
-    std::vector<const core::RuntimeParticipantBinding *> bindings{
-        &*composition.direct_control_motion_binding};
-    if (composition.direct_control_gripper_binding.has_value())
-      bindings.push_back(&*composition.direct_control_gripper_binding);
-    for (const auto *binding : bindings) {
-      Require(binding->value().control_path.has_value(),
-              "ROS lifecycle status binding has no retained control path");
-      domain_ids.push_back(binding->value().control_path->control_domain_id);
-    }
-    std::sort(domain_ids.begin(), domain_ids.end());
-    domain_ids.erase(std::unique(domain_ids.begin(), domain_ids.end()),
-                     domain_ids.end());
-    Require(!domain_ids.empty(),
-            "ROS lifecycle status has no retained control domain");
-
-    const auto now_ns = composition.runtime->clock->now();
-    bool every_domain_ready = true;
-    CanonicalValue::Array domains;
-    domains.reserve(domain_ids.size());
-    for (const auto &domain_id : domain_ids) {
-      const auto sampled =
-          composition.ros2_control_runtime_handle->ReadLifecycleSnapshot(
-              domain_id, now_ns);
-      if (!sampled.ok()) {
-        Fail("ROS lifecycle status observation failed: " +
-             sampled.error().message);
-      }
-      const auto &observation = sampled.value();
-      Require(observation.locally_valid(),
-              "ROS lifecycle status observation is malformed");
-
-      std::optional<bool> controller_configuration_ready;
-      std::optional<bool> fault_present;
-      std::optional<bool> transport_ready;
-      std::optional<core::LifecycleBlockingCauseClassDTO> blocking_cause;
-      CanonicalValue::Array facts;
-      facts.reserve(observation.facts.size());
-      for (const auto &fact : observation.facts) {
-        // The standard cause-class token is reported beside, not inside, the
-        // retained boolean readiness facts of this status schema.
-        if (fact.lifecycle_fact_id.value() ==
-            core::kLifecycleBlockingCauseFactId) {
-          Require(fact.locally_valid() &&
-                      fact.value.kind ==
-                          core::LifecycleFactValueKindDTO::kToken &&
-                      fact.value.token_value.has_value() &&
-                      !blocking_cause.has_value(),
-                  "ROS lifecycle cause fact is not one exact token");
-          blocking_cause = core::parse_lifecycle_blocking_cause_class(
-              *fact.value.token_value);
-          Require(blocking_cause.has_value(),
-                  "ROS lifecycle cause fact names no known cause class");
-          continue;
-        }
-        Require(fact.locally_valid() &&
-                    fact.value.kind ==
-                        core::LifecycleFactValueKindDTO::kBoolean &&
-                    fact.value.boolean_value.has_value(),
-                "ROS lifecycle status fact is not one exact boolean");
-        const auto &fact_id = fact.lifecycle_fact_id.value();
-        const bool value = *fact.value.boolean_value;
-        if (fact_id == "external.controller_configuration_ready") {
-          controller_configuration_ready = value;
-        } else if (fact_id == "external.fault_present") {
-          fault_present = value;
-        } else if (fact_id == "external.transport_ready") {
-          transport_ready = value;
-        }
-        facts.emplace_back(CanonicalValue::Object{
-            {"lifecycle_fact_id", CanonicalValue(fact_id)},
-            {"value", CanonicalValue(value)},
-        });
-      }
-      Require(controller_configuration_ready.has_value() &&
-                  fault_present.has_value() && transport_ready.has_value(),
-              "ROS lifecycle status omits one retained readiness fact");
-      const bool ready = observation.component_state ==
-                             core::ComponentLifecycleStateDTO::kActive &&
-                         observation.exact_controller_configuration_active &&
-                         *controller_configuration_ready && !*fault_present &&
-                         *transport_ready;
-      every_domain_ready = every_domain_ready && ready;
-      domains.emplace_back(CanonicalValue::Object{
-          {"blocking_cause_class",
-           CanonicalValue(std::string(core::to_string(blocking_cause.value_or(
-               core::LifecycleBlockingCauseClassDTO::kUnknown))))},
-          {"component_lifecycle_state",
-           CanonicalValue(
-               std::string(core::to_string(observation.component_state)))},
-          {"control_domain_id", CanonicalValue(domain_id.value())},
-          {"exact_controller_configuration_active",
-           CanonicalValue(observation.exact_controller_configuration_active)},
-          {"facts", CanonicalValue(std::move(facts))},
-          {"ready", CanonicalValue(ready)},
-          {"source_generation",
-           CanonicalValue(static_cast<double>(observation.source_generation))},
-      });
-    }
-    return CanonicalValue(CanonicalValue::Object{
-        {"domains", CanonicalValue(std::move(domains))},
-        {"ready", CanonicalValue(every_domain_ready)},
-        {"schema_version",
-         CanonicalValue("manyforge.ros2_control_lifecycle_observation.v1")},
-    });
-  }
-
-[[nodiscard]] CanonicalValue
   ExecutionCommandSurface::Ros2ControlTransportDiagnosticValue(Composition &composition) const {
     Require(composition.ros2_control_runtime_handle != nullptr,
             "ROS transport diagnostics have no selected observer");
@@ -613,13 +502,10 @@ int ExecutionCommandSurface::Run(const std::stop_token stop_token) {
           motion ? (candidate.runtime != nullptr
                         ? candidate.runtime->motion_state_channel
                         : nullptr)
-                 : (candidate.runtime != nullptr
-                        ? candidate.runtime->gripper_state_channel
-                        : candidate.gripper_runtime != nullptr
-                              ? std::dynamic_pointer_cast<
-                                    RetainedObservedStateChannel>(
-                                    candidate.gripper_runtime->state_channel())
-                              : nullptr);
+                 : (candidate.gripper_runtime != nullptr
+                        ? std::dynamic_pointer_cast<RetainedObservedStateChannel>(
+                              candidate.gripper_runtime->state_channel())
+                        : nullptr);
       if (!channel) {
         refuse("observation_channel_missing");
         return;
@@ -724,8 +610,6 @@ int ExecutionCommandSurface::Run(const std::stop_token stop_token) {
   ExecutionCommandSurface::ReadCurrentGripperStatus(
       Composition &component,
       const core::RuntimeParticipantBinding &observation_binding) const {
-    if (component.runtime != nullptr)
-      return component.runtime->ReadGripperStatus(observation_binding);
     if (component.gripper_runtime == nullptr ||
         component.gripper_runtime->backend() == nullptr ||
         observation_binding.value().controllable_component_id !=
@@ -870,12 +754,27 @@ core::Result<core::IoSignalObservationDTO> ExecutionCommandSurface::ReadBoundIoS
   if (target == targets.end())
     return Reply::Err({"io_signal_unbound", "I/O query target role is not bound", {}});
   const auto &signals = target->signal_role_bindings;
+  // CONTRACTS §7: `<role>.changed_outside` names the core-held signal of the
+  // output bound to `<role>`.
+  const auto &role = query.io_signal_role->value();
+  const auto suffix = core::kChangedOutsideSignalSuffix;
+  const bool changed_outside =
+      role.size() > suffix.size() && role.ends_with(suffix);
+  const auto base_role =
+      changed_outside ? role.substr(0, role.size() - suffix.size()) : role;
   const auto signal =
       std::find_if(signals.begin(), signals.end(), [&](const auto &row) {
-        return row.resource_role_id == *query.io_signal_role;
+        return row.resource_role_id.value() == base_role;
       });
   if (signal == signals.end())
     return Reply::Err({"io_signal_unbound", "I/O query resource role is not a signal", {}});
+  if (changed_outside) {
+    if (signal->direction != core::IoSignalDirection::kOutput)
+      return Reply::Err({"io_signal_direction_mismatch",
+                        "changed_outside names an output signal", {}});
+    return composition.io_signal_service->ReadSignal(core::ChangedOutsideSignalId(
+        {target->controllable_component_id, signal->signal_name}));
+  }
   if (signal->direction != core::IoSignalDirection::kInput)
     return Reply::Err({"io_signal_direction_mismatch",
                       "I/O query requires a separately bound input signal", {}});
@@ -1231,8 +1130,8 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
     const auto &binding = observed_binding.value();
     const auto &resolved = owner->resolved;
     const auto &target = resolved.target.target_role();
-    const auto* gripper_backend = selected.runtime ? selected.runtime->gripper.get()
-        : selected.gripper_runtime ? selected.gripper_runtime->backend() : nullptr;
+    const auto* gripper_backend =
+        selected.gripper_runtime ? selected.gripper_runtime->backend() : nullptr;
     if (gripper_backend && gripper_backend->gripper_actuation_kind(binding.command_target_id.value()) ==
             core::GripperActuationKind::kPneumatic)
       return ErrorResponse("gripper_state_unavailable",
@@ -1338,8 +1237,7 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
         return ErrorResponse(pose.error().code, pose.error().message);
       value = PoseValue(pose.value());
     } else {
-      if ((selected.runtime == nullptr || !selected.runtime->gripper) &&
-          selected.gripper_runtime == nullptr)
+      if (selected.gripper_runtime == nullptr)
         return ErrorResponse("gripper_feedback_unavailable",
                              "target has no qualified gripper feedback");
       if (binding.resources.size() != 1U)
@@ -1579,9 +1477,7 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
             "direct-control gripper status has no exact scalar resource");
     const auto &resource = binding.resources.front();
     const bool model_backed = resource.source_joint_name.has_value();
-    const auto limits = composition.runtime != nullptr
-                            ? composition.runtime->gripper_position_limits
-                            : composition.gripper_runtime->position_limits();
+    const auto limits = composition.gripper_runtime->position_limits();
     Require(binding.command_schema.has_value() &&
                 model_backed == limits.has_value(),
             "direct-control gripper status crosses its retained binding");
@@ -1741,18 +1637,12 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
              motion.error().message);
       motion_state = motion.value().state;
     }
-    const auto gripper_channel = composition.runtime != nullptr
-                                     ? composition.runtime->gripper_state_channel
-                                     : composition.gripper_runtime->state_channel();
-    if (!composition.direct_control_gripper_binding.has_value()) {
-      Require(gripper_channel == nullptr,
-              "selected gripper observed-state channel has no binding");
+    if (!composition.direct_control_gripper_binding.has_value())
       return CurrentControlState{std::move(motion_state), std::nullopt};
-    }
+    const auto gripper_channel = composition.gripper_runtime->state_channel();
     Require(gripper_channel != nullptr,
             "selected gripper observed-state channel is absent");
-    const auto* gripper_backend = composition.runtime ? composition.runtime->gripper.get()
-        : composition.gripper_runtime->backend();
+    const auto* gripper_backend = composition.gripper_runtime->backend();
     Require(gripper_backend != nullptr, "selected gripper has no configured backend");
     if (gripper_backend->gripper_actuation_kind(
             composition.direct_control_gripper_binding->value().command_target_id.value()) ==
@@ -1767,9 +1657,7 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
         composition.direct_control_gripper_binding->value().resources.front();
     const bool component_local =
         !resource.source_joint_name.has_value() &&
-        (composition.runtime != nullptr
-             ? !composition.runtime->gripper_position_limits.has_value()
-             : !composition.gripper_runtime->position_limits().has_value());
+        !composition.gripper_runtime->position_limits().has_value();
     const auto missing_reason =
         gripper.ok() ? std::string{}
                      : (gripper.error().details.contains("reason")
@@ -1801,14 +1689,7 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
          CanonicalValue(
              static_cast<double>(composition.publication_generation.value()))},
         {"cell_id", CanonicalValue(bundle.value().cell_graph.cell_id.value())},
-        {"control_management_mode",
-         CanonicalValue(
-             composition.cclc_attached.load(std::memory_order_acquire)
-                 ? (composition.route_recovery_pending.load(
-                        std::memory_order_acquire)
-                        ? "pending"
-                        : "component_lifecycle")
-             : "pending")},
+        {"control_management_mode", CanonicalValue("component_lifecycle")},
         {"graph_revision",
          CanonicalValue(projection.graph_revision.value())},
         {"owner_epoch", CanonicalValue(owner_epoch_.value())},
@@ -1917,7 +1798,7 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
     for (const auto &[component_id, owner] : runtime_component_owners) {
       static_cast<void>(owner);
       Require(active_component_ids.contains(component_id),
-              "native runtime registry contains a component outside the active bundle");
+              "execution host registry contains a component outside the active bundle");
     }
 
     std::set<TargetKey> supported_target_keys;
@@ -2037,8 +1918,7 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
         append_target(DirectControlTargetValue(candidate), "motion");
       }
       if (candidate.direct_control_gripper_binding.has_value()) {
-        Require(candidate.runtime != nullptr ||
-                    candidate.gripper_runtime != nullptr,
+        Require(candidate.gripper_runtime != nullptr,
                 "native gripper target has no installed controller owner");
         append_target(DirectControlGripperTargetValue(candidate), "gripper");
       }
@@ -2096,30 +1976,16 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
                   }) == component.targets.end(),
               "native execution component has a duplicate addressed target");
 
+      // CONTRACTS §1: a component takes commands exactly while `enabled`.
       bool command_eligible = false;
-      CanonicalValue reason("component_command_not_eligible");
-      auto *kernel = component.owner == nullptr
-                         ? nullptr
-                         : component.owner->active_addressed_kernel();
-      if (kernel != nullptr) {
-        const auto readiness = kernel->component_command_readiness(component_id);
-        if (!readiness.ok()) {
-          const auto existing_reason = readiness.error().details.find("reason");
-          if (existing_reason != readiness.error().details.end() &&
-              !existing_reason->second.empty()) {
-            reason = CanonicalValue(existing_reason->second);
-          }
-        } else if (readiness.value().controllable_component_id == component_id &&
-                   readiness.value().component_lifecycle_generation.has_value()) {
-          command_eligible = readiness.value().command_eligible;
-          if (command_eligible) {
+      CanonicalValue reason("component_not_enabled");
+      if (composition_access_.component_runtime) {
+        for (const auto &state : composition_access_.component_runtime->Read().states)
+          if (state.component_id == component_id.value() &&
+              state.lifecycle == core::ComponentLifecycle::kEnabled) {
+            command_eligible = true;
             reason = CanonicalValue(nullptr);
           }
-        } else {
-          reason = CanonicalValue("component_command_not_eligible");
-        }
-      } else {
-        reason = CanonicalValue("component_readiness_kernel_missing");
       }
 
       CanonicalValue::Array targets;
@@ -2143,7 +2009,7 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
     CanonicalValue::Array io_bindings;
     std::vector<deployment::RetainedIoSignalConfiguration> io_catalog;
     if (!composition.direct_control_io_program_bindings.empty()) {
-      auto catalog = deployment::ResolveRetainedIoSignalCatalog(
+      auto catalog = deployment::ResolveCompiledIoSignalCatalog(
           composition.bundle->value().cell_graph);
       Require(catalog.ok(), "applied I/O source catalog is invalid");
       io_catalog = std::move(catalog.value());
@@ -2176,7 +2042,7 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
               {"resource_role_id", Member(signal, "resource_role_id")},
               {"source_kind", CanonicalValue(source->provider.profile)}});
         }
-        CanonicalValue::Object projected{
+        io_bindings.emplace_back(CanonicalValue::Object{
             {"program_binding_id",
              CanonicalValue(binding->program_binding_id().value())},
             {"target_role_id", Member(target, "target_role_id")},
@@ -2184,30 +2050,7 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
              Member(target, "controllable_component_id")},
             {"command_target_id", Member(target, "command_target_id")},
             {"signal_role_bindings", *signals},
-            {"signal_sources", CanonicalValue(std::move(sources))}};
-        const auto typed_target = std::find_if(binding->value().target_role_bindings.begin(),
-            binding->value().target_role_bindings.end(), [&](const auto &row) {
-              return row.target_role_id.value() == Text(target, "target_role_id");
-            });
-        Require(typed_target != binding->value().target_role_bindings.end(),
-                "direct I/O projection has no exact typed target");
-        const auto output = std::find_if(typed_target->capability_bindings.begin(),
-            typed_target->capability_bindings.end(), [](const auto &row) {
-              return row.capability_id.value() == "io.gpio.set_output";
-            });
-        if (output != typed_target->capability_bindings.end()) {
-          Require(output->command_schema.has_value(),
-                  "direct I/O output has no sealed command schema");
-          projected.emplace_back("output_command", CanonicalValue(CanonicalValue::Object{
-              {"program_id", CanonicalValue(binding->value().program_id.value())},
-              {"program_revision", CanonicalValue(binding->value().program_revision.value())},
-              {"program_run_id", CanonicalValue(direct_control_io_program_run_id_.value())},
-              {"component_role_id", CanonicalValue(typed_target->component_role_id.value())},
-              {"capability_id", CanonicalValue(output->capability_id.value())},
-              {"command_schema_id", CanonicalValue(output->command_schema->command_schema_id.value())},
-              {"command_schema_revision", CanonicalValue(output->command_schema->command_schema_revision.value())}}));
-        }
-        io_bindings.emplace_back(std::move(projected));
+            {"signal_sources", CanonicalValue(std::move(sources))}});
       }
     }
     std::sort(io_bindings.begin(), io_bindings.end(),
@@ -2281,10 +2124,9 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
     runtime_scale_control_value =
         RuntimeScaleControlStatusValue(runtime_scale_control.value());
   }
-  const auto manual_operations =
-      composition.active_addressed_kernel()->get_latest_run_operations(
-          {direct_control_program_run_id_,
-           direct_control_gripper_program_run_id_, direct_control_io_program_run_id_});
+  const auto manual_operations = CurrentDirectControlManualOperations(
+      composition, *composition.active_addressed_kernel(),
+      direct_control_program_run_id_, direct_control_gripper_program_run_id_);
   CanonicalValue::Array manual_operation_values;
   manual_operation_values.reserve(manual_operations.size());
   for (const auto &projection : manual_operations) {
@@ -2722,15 +2564,7 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
             sources.back().measured =
                 owner.runtime->TryReadMotionMeasuredSource();
         }
-        if (owner.direct_control_gripper_binding.has_value()) {
-          append_target(owner.runtime->gripper_state_channel,
-                        owner.controllable_component_id,
-                        owner.runtime->gripper->gripper_actuation_kind(
-                            owner.direct_control_gripper_binding->value().command_target_id.value()) ==
-                            core::GripperActuationKind::kPneumatic);
-        }
-        Require(owner.direct_control_motion_binding.has_value() ||
-                    owner.direct_control_gripper_binding.has_value(),
+        Require(owner.direct_control_motion_binding.has_value(),
                 "native component has no supported observed target");
         return;
       }
@@ -2957,65 +2791,141 @@ CanonicalValue ExecutionCommandSurface::IoWatchResponse(
     });
   }
 
-[[nodiscard]] CanonicalValue ExecutionCommandSurface::ReadStopFault(
-      core::ResourceAddressedExecutionKernel &addressed_kernel) const {
-    const auto offer = addressed_kernel.get_stop_fault_recovery_offer();
-    if (!offer.ok()) {
-      return CanonicalValue(CanonicalValue::Object{
-          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-          {"error", ErrorValue(offer.error())},
-          {"ok", CanonicalValue(false)},
-      });
+CanonicalValue::Object ExecutionCommandSurface::ComponentModelFields(
+    core::ResourceAddressedExecutionKernel &addressed_kernel, const ComponentModelRead read) const {
+  const bool control = read == ComponentModelRead::kControl;
+  CanonicalValue::Array components;
+  if (composition_access_.component_runtime)
+    for (const auto &state : composition_access_.component_runtime->Read().states)
+      components.emplace_back(ComponentStateValue(state));
+  // Signals need the selected product. The control read is served on the
+  // Stop control socket, so it never waits for an Apply holding the
+  // composition: while one does, no sample is reported (an Apply refuses a
+  // running cell). The state read waits, as its callers already do.
+  CanonicalValue::Array samples;
+  CanonicalValue::Array required;
+  // The Program's motion components: a rule hold blocks Execute/Resume only
+  // when its scope meets them (CONTRACTS §8, §10).
+  CanonicalValue::Array program_motion;
+  std::shared_lock composition_lock(composition_access_.mutex, std::defer_lock);
+  if (control)
+    static_cast<void>(composition_lock.try_lock());
+  else
+    composition_lock.lock();
+  if (composition_lock.owns_lock()) {
+    if (auto *product = composition_access_.product();
+        product != nullptr && product->io_signal_service && product->bundle) {
+      // System signals included: a Program may require one (carried_object_lost).
+      const auto catalog =
+          deployment::ResolveCompiledIoSignalCatalog(product->bundle->value().cell_graph);
+      Require(catalog.ok(), "the Applied I/O signal catalog cannot be read");
+      const auto add_sample = [&](const core::IoSignalId &signal_id) {
+        const auto observed = product->io_signal_service->ReadSignal(signal_id);
+        if (!observed.ok()) return;  // withdrawn: the sample is missing
+        samples.emplace_back(SignalSampleValue(core::ToSignalSample(observed.value()),
+                                               observed.value().descriptor, control));
+      };
+      for (const auto &row : catalog.value()) {
+        add_sample(row.descriptor.signal_id);
+        // CONTRACTS §7: the core-held `<output>.changed_outside` signal.
+        if (core::HoldsChangedOutside(row.descriptor))
+          add_sample(core::ChangedOutsideSignalId(row.descriptor.signal_id));
+      }
+      if (product->program_binding)
+        for (const auto &target : product->program_binding->value().target_role_bindings) {
+          if (target.robot_tcps)  // present exactly for a trajectory-execution target
+            program_motion.emplace_back(target.controllable_component_id.value());
+          for (const auto &signal : target.signal_role_bindings)
+            if (signal.direction == core::IoSignalDirection::kInput)
+              required.emplace_back(SignalIdText(
+                  core::IoSignalId{target.controllable_component_id, signal.signal_name}));
+        }
     }
-    const auto global_offers = addressed_kernel.ReadGlobalIoRuleRecoveryOffers();
-    if (!global_offers.ok())
-      return ErrorResponse(global_offers.error().code, global_offers.error().message,
-                           global_offers.error().details);
-    CanonicalValue::Array rows;
-    std::optional<core::InterruptPolicyId> previous;
-    for (const auto &actual : global_offers.value()) {
-      Require(actual.selector.context.owner_epoch == addressed_kernel.request_owner_epoch() &&
-                  (!previous || *previous < actual.selector.rule_id),
-              "global recovery offers differ from the actual owner/catalog order");
-      rows.emplace_back(GlobalIoRuleRecoveryOfferValue(actual));
-      previous = actual.selector.rule_id;
-    }
-    return CanonicalValue(CanonicalValue::Object{
-        {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-        {"command", CanonicalValue("get_stop_fault")},
-        {"ok", CanonicalValue(true)},
-        {"stop_fault", offer.value() ? StopFaultOfferValue(*offer.value())
-                                     : CanonicalValue(nullptr)},
-        {"global_rule_recovery_offers", CanonicalValue(std::move(rows))},
-    });
   }
+  CanonicalValue::Object fields{
+      {"cell_latch", CellLatchValue(addressed_kernel.get_cell_latch())},
+      {"component_states", CanonicalValue(std::move(components))},
+      {"rule_holds", RuleHoldsValue(addressed_kernel.ReadRuleHolds())},
+      // Kernel blocks of no component (internal fault, lost Manager), §10.
+      {"execution_blocks", RuleHoldsValue(addressed_kernel.ReadExecutionBlocks())}};
+  if (control) {
+    fields.emplace_back("required_signal_ids", CanonicalValue(std::move(required)));
+    fields.emplace_back("program_motion_component_ids",
+                        CanonicalValue(std::move(program_motion)));
+  }
+  fields.emplace_back("signal_samples", CanonicalValue(std::move(samples)));
+  return fields;
+}
 
-CanonicalValue ExecutionCommandSurface::RecoverGlobalIoRule(
-    const core::IoGlobalRuleRecoveryIntentDTO &intent,
-    core::ResourceAddressedExecutionKernel &owner) const {
-  if (!manager_liveness_admission_.Allows(
-          component_manager::detail::ManagerLivenessCommandClass::kEffectful))
-    return ErrorResponse("manager_liveness_not_current",
-                         "ordinary execution command requires an exact current "
-                         "unfenced Manager lease");
-  // Same actual product/callback lifetime lease as source processing. Core
-  // recovery may arm a fresh successor; its deadline must be observed even
-  // when no further input frame arrives after this successful operator action.
-  std::shared_lock composition_lock(composition_access_.mutex);
-  const auto result = owner.recover_global_io_rule(intent);
-  if (!result.ok())
-    return ErrorResponse(result.error().code, result.error().message,
-                         result.error().details);
-  if (result.value().accepted) {
-    const auto *current = composition_access_.product();
-    if (current && current->io_signal_runtime)
-      current->io_signal_runtime->RequestRuleEvidenceProcessing();
-  }
+CanonicalValue ExecutionCommandSurface::ReadComponentModelResponse(
+    core::ResourceAddressedExecutionKernel &addressed_kernel) const {
+  auto fields = ComponentModelFields(addressed_kernel, ComponentModelRead::kControl);
+  fields.emplace_back("api_version", CanonicalValue(std::string(kResponseApiVersion)));
+  fields.emplace_back("command", CanonicalValue("read_component_model"));
+  fields.emplace_back("ok", CanonicalValue(true));
+  return CanonicalValue(std::move(fields));
+}
+
+CanonicalValue ExecutionCommandSurface::ComponentActionResponse(const Command &command) const {
+  Require(command.component_id.has_value() && command.component_action.has_value(),
+          "component action command has no component or action");
+  if (!composition_access_.component_runtime)
+    return ErrorResponse("component_not_found", "The component is not in the cell",
+                         {{"component_id", *command.component_id}});
+  const auto accepted = composition_access_.component_runtime->Submit(
+      *command.component_id, *command.component_action);
+  if (!accepted.ok())
+    return ErrorResponse(accepted.error().code, accepted.error().message,
+                         accepted.error().details);
+  return CanonicalValue(CanonicalValue::Object{
+      {"accepted", CanonicalValue(CanonicalValue::Object{
+                       {"action", CanonicalValue(std::string(
+                                      core::to_string(accepted.value().action)))},
+                       {"component_id", CanonicalValue(*command.component_id)},
+                       {"started_at_ns", content_identity::nonnegative_int64_value(
+                                             accepted.value().started_at_ns)}})},
+      {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+      {"command", CanonicalValue("component_action")},
+      {"ok", CanonicalValue(true)}});
+}
+
+CanonicalValue ExecutionCommandSurface::SetIoOutputResponse(
+    const Command &command, core::ResourceAddressedExecutionKernel &addressed_kernel) const {
+  Require(command.io_output_signal.has_value(), "set I/O output command has no signal");
+  const auto &signal = *command.io_output_signal;
+  const auto &component_id = signal.controllable_component_id.value();
+  const auto admitted = addressed_kernel.admit_output_write(signal, command.io_output_manual);
+  if (!admitted.ok())
+    return ErrorResponse(admitted.error().code, admitted.error().message,
+                         admitted.error().details);
+  const auto adapter = composition_access_.component_runtime
+                           ? composition_access_.component_runtime->Adapter(component_id)
+                           : nullptr;
+  if (!adapter)
+    return ErrorResponse("component_not_found", "The component is not in the cell",
+                         {{"component_id", component_id}});
+  const auto capabilities = adapter->capabilities();
+  auto *const writer = dynamic_cast<IIoOutputWriter *>(adapter.get());
+  if (writer == nullptr ||
+      std::find(capabilities.begin(), capabilities.end(), core::Capability::kIoManualWrite) ==
+          capabilities.end())
+    return ErrorResponse("component_action_unsupported",
+                         "This component doesn't support writing its outputs",
+                         {{"component_id", component_id}, {"signal_name", signal.name}});
+  const auto written = writer->SetOutput(signal.name, command.io_output_value, {});
+  // Canonical objects list their keys in order.
+  CanonicalValue::Object result;
+  if (written.error)
+    result.emplace_back("error", CanonicalValue(CanonicalValue::Object{
+                                     {"code", CanonicalValue(written.error->code)},
+                                     {"message", CanonicalValue(written.error->message)}}));
+  result.emplace_back("outcome",
+                      CanonicalValue(std::string(core::to_string(written.outcome))));
   return CanonicalValue(CanonicalValue::Object{
       {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-      {"command", CanonicalValue("recover_stop_fault")},
+      {"command", CanonicalValue("set_io_output")},
       {"ok", CanonicalValue(true)},
-      {"result", GlobalIoRuleRecoveryResultValue(result.value())}});
+      {"result", CanonicalValue(std::move(result))}});
 }
 
 [[nodiscard]] CanonicalValue
@@ -3079,6 +2989,8 @@ ExecutionCommandSurface::EventsResponse(const Command &command) const {
       {"owner_epoch", CanonicalValue(actual_owner_epoch.value())},
       {"runtime_faults", RuntimeFaultsValue(owner)},
   };
+  for (auto &field : ComponentModelFields(owner, ComponentModelRead::kState))
+    metadata.push_back(std::move(field));
   const auto failure = [&](const core::ErrorDTO &error) {
     // Page diagnostics can contain arbitrary backend/exception text. Use the
     // same bounded canonical projection as the retained Kernel write fault.
@@ -3239,6 +3151,8 @@ ExecutionCommandSurface::EventStreamState() const {
   state.emplace_back("execution_owner_ready",
                      CanonicalValue(execution_owner_ready));
   state.emplace_back("runtime_faults", RuntimeFaultsValue(owner));
+  for (auto &field : ComponentModelFields(owner, ComponentModelRead::kState))
+    state.push_back(std::move(field));
   return {owner_epoch.value(), CanonicalValue(std::move(state))};
 }
 
@@ -3247,8 +3161,7 @@ CanonicalValue ExecutionCommandSurface::OperationProgressValue(
     const core::RequestOwnerEpoch &owner_epoch) const {
   CanonicalValue::Array operation_progress;
   for (const auto &operation : owner.get_resident_operations(
-           {direct_control_program_run_id_, direct_control_gripper_program_run_id_,
-            direct_control_io_program_run_id_})) {
+           {direct_control_program_run_id_, direct_control_gripper_program_run_id_})) {
     if (operation.state != core::OperationStateKind::kExecuting ||
         operation.participants.size() != 1U)
       continue;
@@ -3414,16 +3327,11 @@ CanonicalValue ExecutionCommandSurface::ExecuteLogicalProduct(
   const auto targets = CanonicalValue(CanonicalValue::Object{
       {"components", CanonicalValue(CanonicalValue::Array{})},
       {"schema_version", CanonicalValue("manyforge.execution_targets.v3")}});
-  CanonicalValue::Array manual_operations;
-  for (const auto &actual : StableKernel().get_latest_run_operations(
-           {direct_control_program_run_id_, direct_control_gripper_program_run_id_,
-            direct_control_io_program_run_id_}))
-    manual_operations.emplace_back(CanonicalValue::Object{
-        {"operation", OperationStateValue(actual.operation)},
-        {"resident", CanonicalValue(actual.resident)}});
+  // No direct-control target exists here, so no manual operation is this
+  // cell's: a run retained from the previous physical cell is not published.
   const auto control = CanonicalValue(CanonicalValue::Object{
       {"cell_stop_action", CellStopActionValue(StableKernel().cell_stop_action_projection())},
-      {"manual_operations", CanonicalValue(std::move(manual_operations))},
+      {"manual_operations", CanonicalValue(CanonicalValue::Array{})},
       {"observed_targets", CanonicalValue(CanonicalValue::Array{})},
       {"runtime_scale_control", CanonicalValue(nullptr)},
       {"schema_version", CanonicalValue("manyforge.execution_control_state.v6")}});
@@ -3536,93 +3444,6 @@ CanonicalValue ExecutionCommandSurface::ExecuteLogicalProduct(
     if (command.kind == CommandKind::kQueryOperation) {
       return QueryOperationResponse(*command.operation_query, composition);
     }
-    if (command.kind == CommandKind::kForceClose) {
-      // Item 37: the two Kernel steps of an operator Force close.
-      auto &kernel = *composition.active_addressed_kernel();
-      const bool arm = *command.force_close_step == "arm";
-      core::ForceCloseResultDTO closed;
-      if (arm) {
-        const auto armed = kernel.arm_force_close(*command.stop_generation);
-        if (!armed.ok()) {
-          return CanonicalValue(CanonicalValue::Object{
-              {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-              {"error", ErrorValue(armed.error())},
-              {"ok", CanonicalValue(false)},
-          });
-        }
-        closed.stop_generation = armed.value();
-      } else {
-        auto result = kernel.force_close_operations();
-        if (!result.ok()) {
-          return CanonicalValue(CanonicalValue::Object{
-              {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-              {"error", ErrorValue(result.error())},
-              {"ok", CanonicalValue(false)},
-          });
-        }
-        closed = std::move(result.value());
-      }
-      CanonicalValue::Array operations;
-      for (const auto &operation : closed.operations) {
-        CanonicalValue::Array targets;
-        for (const auto &target : operation.targets) {
-          targets.emplace_back(CanonicalValue::Object{
-              {"command_target_id", CanonicalValue(target.command_target_id.value())},
-              {"controllable_component_id",
-               CanonicalValue(target.controllable_component_id.value())},
-              {"output_unknown", CanonicalValue(target.output_unknown)},
-          });
-        }
-        operations.emplace_back(CanonicalValue::Object{
-            {"containment_uncertain", CanonicalValue(operation.containment_uncertain)},
-            {"operation_id", CanonicalValue(operation.operation_id.value())},
-            {"operation_revision", CanonicalValue(static_cast<double>(
-                                       operation.operation_revision.value()))},
-            {"state", CanonicalValue(std::string(StateName(operation.state)))},
-            {"targets", CanonicalValue(std::move(targets))},
-        });
-      }
-      CanonicalValue::Array orphans;
-      for (const auto &resource : closed.released_orphan_resources)
-        orphans.emplace_back(CanonicalValue(resource.value()));
-      return CanonicalValue(CanonicalValue::Object{
-          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-          {"command", CanonicalValue("force_close")},
-          {"ok", CanonicalValue(true)},
-          {"result",
-           CanonicalValue(CanonicalValue::Object{
-               {"motion_block_cleared", CanonicalValue(closed.motion_block_cleared)},
-               {"operations", CanonicalValue(std::move(operations))},
-               {"released_orphan_resources", CanonicalValue(std::move(orphans))},
-               {"step", CanonicalValue(*command.force_close_step)},
-               {"stop_generation", CanonicalValue(static_cast<double>(
-                                       closed.stop_generation.value()))},
-           })},
-      });
-    }
-    if (command.kind == CommandKind::kRecoverStopFault) {
-      if (command.global_io_rule_recovery)
-        return RecoverGlobalIoRule(*command.global_io_rule_recovery,
-                                   *composition.active_addressed_kernel());
-      Require(command.stop_fault_recovery.has_value(),
-              "Stop-fault recovery command has no complete intent");
-      const auto result =
-          composition.active_addressed_kernel()->recover_stop_fault(
-              *command.stop_fault_recovery);
-      if (!result.ok()) {
-        return CanonicalValue(CanonicalValue::Object{
-            {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-            {"error", ErrorValue(result.error())},
-            {"ok", CanonicalValue(false)},
-        });
-      }
-      return CanonicalValue(CanonicalValue::Object{
-          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
-          {"command", CanonicalValue("recover_stop_fault")},
-          {"ok", CanonicalValue(true)},
-          {"result", StopFaultRecoveryResultValue(result.value())},
-      });
-    }
     if (command.kind == CommandKind::kRead) {
       const auto projection =
           composition.active_addressed_kernel()
@@ -3722,9 +3543,9 @@ CanonicalValue ExecutionCommandSurface::ExecuteLogicalProduct(
           {"preview_receipt",
            CapabilityCommandPreviewReceiptValue(
                preview.value(), *command.operation, *command.operation_digest,
-               target_composition->runtime
-                   ? target_composition->runtime->gripper_position_limits
-                   : target_composition->gripper_runtime->position_limits(),
+               target_composition->gripper_runtime
+                   ? target_composition->gripper_runtime->position_limits()
+                   : std::optional<RetainedGripperPositionLimits>{},
                owner_epoch_)},
       });
     }
@@ -4103,14 +3924,17 @@ CanonicalValue ExecutionCommandSurface::ExecuteLogicalProduct(
       case CommandKind::kReleaseProgramRunStopFence:
       case CommandKind::kFullStop:
       case CommandKind::kMalformedStop:
-      case CommandKind::kGetStopFault:
-      case CommandKind::kRecoverStopFault:
+      case CommandKind::kReadComponentModel:
+      case CommandKind::kComponentAction:
+      case CommandKind::kSetRuleActive:
+      case CommandKind::kResetRuleActivation:
+      case CommandKind::kClearOutsideChange:
+      case CommandKind::kSetIoOutput:
       case CommandKind::kSetRuntimeScaleControl:
       case CommandKind::kSetOperationRuntimeScale:
       case CommandKind::kGetRuntimeScaleControl:
       case CommandKind::kPlanPick:
       case CommandKind::kPlanPlace:
-      case CommandKind::kForceClose:
       case CommandKind::kResolveAttachActiveTcp:
       case CommandKind::kReadActiveTcp:
       case CommandKind::kReadActiveTcpOrdered:
@@ -4150,91 +3974,13 @@ CanonicalValue ExecutionCommandSurface::ExecuteLogicalProduct(
 
 void ExecutionCommandSurface::RunReconciliationLane(std::stop_token stop_token) noexcept {
     try {
-      std::optional<core::TimePoint> last_recovery_observation;
-      std::optional<core::ErrorDTO> recovery_error;
       while (!stop_token.stop_requested()) {
-#if defined(MANYFORGE_ENABLE_FOCUSED_PICK_PLACE_PLANNING_FIXTURE)
-        const char *marker =
-            std::getenv("MANYFORGE_RECONCILIATION_TEST_MARKER");
-        const char *gate = std::getenv("MANYFORGE_RECONCILIATION_TEST_GATE");
-        if (marker != nullptr && marker[0] != '\0' && gate != nullptr &&
-            gate[0] != '\0') {
-          const int descriptor =
-              ::open(marker, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
-          if (descriptor >= 0) {
-            static_cast<void>(::close(descriptor));
-          }
-          while (!stop_token.stop_requested() && ::access(gate, F_OK) != 0) {
-            pollfd interruptible_wait{-1, 0, 0};
-            static_cast<void>(
-                ::poll(&interruptible_wait, 0, kReconcilePeriodMilliseconds));
-          }
-        }
-        const char *injected_failure =
-            std::getenv("MANYFORGE_RECONCILIATION_TEST_THROW");
-        if (!stop_token.stop_requested() && injected_failure != nullptr &&
-            injected_failure[0] != '\0') {
-          throw std::runtime_error(injected_failure);
-        }
-#endif
         {
           // This shared lifetime lock prevents Manager reconfiguration from
           // retiring a composition while its subordinate owners are in use.
           std::shared_lock lock(composition_access_.mutex);
           if (composition_access_.current != nullptr) {
             auto &composition = *composition_access_.current;
-#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
-            const auto now = composition.runtime ? composition.runtime->clock->now()
-                : composition.cell_runtime->clock()->now();
-#else
-            const auto cell_clock = composition.cell_runtime != nullptr
-                                        ? composition.cell_runtime->clock()
-                                    : composition.runtime != nullptr
-                                        ? composition.runtime->clock
-                                        : nullptr;
-            Require(cell_clock != nullptr,
-                    "native reconciliation has no stable cell clock");
-            const auto now = cell_clock->now();
-#endif
-            if (!last_recovery_observation ||
-                now < *last_recovery_observation ||
-                now - *last_recovery_observation >=
-                    kRecoveryObservationPeriodNs) {
-              last_recovery_observation = now;
-#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
-              const bool has_route_reconciler = composition.runtime
-                  ? static_cast<bool>(composition.runtime->reconcile_controller_routes)
-                  : static_cast<bool>(composition.cclc_cell_route_reconciler);
-              const auto routes = has_route_reconciler
-                  ? (composition.runtime ? composition.runtime->reconcile_controller_routes()
-                                         : composition.cclc_cell_route_reconciler())
-                  : core::Result<void>::Ok();
-#else
-              const bool has_route_reconciler =
-                  static_cast<bool>(composition.cclc_cell_route_reconciler) ||
-                  (composition.runtime != nullptr &&
-                   static_cast<bool>(
-                       composition.runtime->reconcile_controller_routes));
-              const auto routes =
-                  composition.cclc_cell_route_reconciler
-                      ? composition.cclc_cell_route_reconciler()
-                      : composition.runtime != nullptr &&
-                                composition.runtime->reconcile_controller_routes
-                            ? composition.runtime->reconcile_controller_routes()
-                            : core::Result<void>::Ok();
-#endif
-              if (has_route_reconciler && routes.ok()) {
-                composition.route_recovery_pending.store(false,
-                                                         std::memory_order_release);
-              }
-              const auto assessed =
-                  composition.active_addressed_kernel()
-                      ->refresh_stop_fault_recovery_assessment();
-              recovery_error = !routes.ok() ? std::optional(routes.error())
-                               : !assessed.ok()
-                                   ? std::optional(assessed.error())
-                                   : std::nullopt;
-            }
             auto error = [&]() -> std::optional<core::ErrorDTO> {
               const auto reconciled = composition.active_addressed_kernel()
                                           ->reconcile_subordinate_state();
@@ -4248,9 +3994,13 @@ void ExecutionCommandSurface::RunReconciliationLane(std::stop_token stop_token) 
               return std::nullopt;
             }();
             std::lock_guard error_lock(reconcile_error_mutex_);
-            last_reconcile_error_ = error ? std::move(error) : recovery_error;
+            last_reconcile_error_ = std::move(error);
           }
         }
+        // The host tick of the component runtime: every adapter is read and a
+        // change goes to the Kernel's cell latch and the publication.
+        if (composition_access_.component_runtime)
+          composition_access_.component_runtime->Refresh();
         pollfd interruptible_wait{-1, 0, 0};
         int waited = -1;
         do {
@@ -4479,8 +4229,12 @@ void ExecutionCommandSurface::HandleOneClient(const CommandSocket &socket, const
                               *command.carried_object_lost_set)
                     : command.kind == CommandKind::kReadStop
                         ? ReadStop(command, owner)
-                    : command.kind == CommandKind::kGetStopFault
-                        ? ReadStopFault(owner)
+                    : command.kind == CommandKind::kReadComponentModel
+                        ? ReadComponentModelResponse(owner)
+                    : command.kind == CommandKind::kComponentAction
+                        // CONTRACTS §2: always available, during a latch and
+                        // a run; never waits for planning or an Apply.
+                        ? ComponentActionResponse(command)
                         : ExecuteStop(command, owner);
               } else if (lane == CommandLane::kObservation &&
                          command.kind != CommandKind::kObservation &&
@@ -4497,25 +4251,48 @@ void ExecutionCommandSurface::HandleOneClient(const CommandSocket &socket, const
               } else if (IsStopLaneRead(command.kind)) {
                 response = ErrorResponse(
                     "execution_ordinary_command_unsupported",
-                    "Stop status and Stop-fault reads are served by the "
-                    "independent Stop control socket");
+                    "Stop status, the component model and component actions "
+                    "are served by the independent Stop control socket");
               } else if (command.kind == CommandKind::kReadVolatileMotionTrace) {
                 if (ordinary)
                   deferred.emplace(&scene_read_lane_, command);
                 else
-                  response = ReadVolatileMotionTrace(command);
+                  response = ReadVolatileMotionTrace(
+                      command, AtomicResponseCapacity(client.get()));
               } else if (command.kind == CommandKind::kEvents) {
                 response = EventsResponse(command);
-              } else if (command.kind == CommandKind::kRecoverStopFault &&
-                         command.global_io_rule_recovery) {
-                // Same operator cell-recovery command, exact global row
-                // selector. This owner exists even without a physical product.
-                response = RecoverGlobalIoRule(*command.global_io_rule_recovery,
-                                               StableKernel());
+              } else if (command.kind == CommandKind::kSetRuleActive ||
+                         command.kind == CommandKind::kResetRuleActivation ||
+                         command.kind == CommandKind::kClearOutsideChange) {
+                // Program node effects on core-held state; never a fault (R5).
+                auto &owner = StableKernel();
+                const auto result =
+                    command.kind == CommandKind::kSetRuleActive
+                        ? owner.set_rule_active(*command.rule_id, command.rule_active)
+                    : command.kind == CommandKind::kResetRuleActivation
+                        ? owner.reset_rule_activation()
+                        : owner.clear_outside_change(*command.outside_change_output);
+                response = !result.ok()
+                    ? ErrorResponse(result.error().code, result.error().message,
+                                    result.error().details)
+                    : CanonicalValue(CanonicalValue::Object{
+                          {"api_version", CanonicalValue(std::string(kResponseApiVersion))},
+                          {"command", CanonicalValue(std::string(
+                                          command.kind == CommandKind::kSetRuleActive
+                                              ? "set_rule_active"
+                                          : command.kind == CommandKind::kResetRuleActivation
+                                              ? "reset_rule_activation"
+                                              : "clear_outside_change"))},
+                          {"ok", CanonicalValue(true)}});
+              } else if (command.kind == CommandKind::kSetIoOutput) {
+                // CONTRACTS §7: allowed when idle and during a pause; the
+                // Kernel refuses it during a latch or a rule's hold.
+                response = SetIoOutputResponse(command, StableKernel());
               } else if (command.kind ==
                          CommandKind::kPublishProgramBlackboard) {
-                // ACK follows synchronous exact-Run source admission, never
-                // mere socket receipt or an enqueue awaiting later work.
+                // ACK follows synchronous exact-Run source admission and the
+                // rules' evaluation of the frame (BBK-1), never mere socket
+                // receipt or an enqueue awaiting later work.
                 response = ProgramBlackboardResponse(
                     *command.blackboard_publication, StableKernel());
               } else if (command.kind == CommandKind::kRegisterIoWatch ||
@@ -4599,7 +4376,7 @@ void ExecutionCommandSurface::SendResponse(
       const int client, const CanonicalValue &response,
       const std::optional<std::string> &cell_admission_command) const {
     auto bytes = content_identity::canonical_json(response);
-    if (bytes.empty() || bytes.size() > kMaximumResponseBytes) {
+    if (bytes.empty() || bytes.size() > AtomicResponseCapacity(client)) {
       const core::ErrorDTO error{
           "execution_command_response_oversized",
           "execution owner result exceeds the bounded private transport",
@@ -4649,9 +4426,8 @@ void ExecutionCommandSurface::SendResponse(
   ///   from Manager (ReadsManagerScene). One worker, FIFO.
   ///
   /// Cross-lane fences: Reset, recovery and Stop-fence release name the
-  /// exact operation revision, Stop id and generation, or Stop-fault latch
-  /// they act on, and their clients issue them only after reading that state
-  /// on the control socket. A stale name is refused (the Program owner also
+  /// exact operation revision, Stop id and generation they act on, and their
+  /// clients issue them only after reading that state on the control socket. A stale name is refused (the Program owner also
   /// refuses a cycle Reset while its Stop is not terminal); a Kernel Reset of
   /// a participant still stopping hard-stops it first, so no ordering of the
   /// two sockets lets Reset restart motion or release a newer Stop. Alarm
@@ -4718,14 +4494,20 @@ void ExecutionCommandSurface::SendResponse(
     }
   }
 
-CanonicalValue ExecutionCommandSurface::ReadVolatileMotionTrace(const Command &command) const {
+CanonicalValue ExecutionCommandSurface::ReadVolatileMotionTrace(
+    const Command &command, const std::size_t response_capacity) const {
 #if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+    // An inline trace travels in the one response packet: bound it by what
+    // that client socket carries atomically, less room for the envelope.
+    constexpr std::size_t kInlineTraceEnvelopeBytes = 256U;
     const auto trace = composition_access_.motion_trace;
     const auto *directory = std::getenv("MANYFORGE_MOTION_TRACE_DIR");
     const bool disk = directory && *directory;
     auto snapshot = trace
         ? disk ? trace->SnapshotFile(owner_epoch_, command.trace_allowance_bytes, directory)
-               : trace->Snapshot(owner_epoch_, command.trace_allowance_bytes)
+               : trace->Snapshot(owner_epoch_,
+                     std::min(command.trace_allowance_bytes,
+                              response_capacity - kInlineTraceEnvelopeBytes))
         : core::Result<CanonicalValue>::Err({"volatile_motion_trace_unavailable",
             "this execution host has no volatile trace collector", {}});
     return snapshot.ok()
@@ -4738,6 +4520,7 @@ CanonicalValue ExecutionCommandSurface::ReadVolatileMotionTrace(const Command &c
                         snapshot.error().details);
 #else
     (void)command;
+    (void)response_capacity;
     return ErrorResponse("volatile_motion_trace_unavailable",
         "this execution host has no ROS trajectory collector");
 #endif
@@ -4746,9 +4529,6 @@ CanonicalValue ExecutionCommandSurface::ReadVolatileMotionTrace(const Command &c
 [[nodiscard]] CanonicalValue
   ExecutionCommandSurface::DeferredResponse(const Command &command, const std::stop_token cancellation,
                    const std::stop_token lane_stop_token) {
-    // Diagnostic encoding and disk I/O never retain a composition or command lock.
-    if (command.kind == CommandKind::kReadVolatileMotionTrace)
-      return ReadVolatileMotionTrace(command);
     std::shared_lock composition_lock(composition_access_.mutex);
     if (composition_access_.product() == nullptr)
       return OwnerNotReadyResponse(command);
@@ -4799,9 +4579,16 @@ void ExecutionCommandSurface::RunDeferredLane(DeferredLane &lane,
       try {
         CanonicalValue response;
         try {
-          response = DeferredResponse(pending->command,
-                                      pending->cancellation.get_token(),
-                                      stop_token);
+          // Diagnostic encoding and disk I/O never retain a composition or
+          // command lock.
+          response =
+              pending->command.kind == CommandKind::kReadVolatileMotionTrace
+                  ? ReadVolatileMotionTrace(
+                        pending->command,
+                        AtomicResponseCapacity(pending->client.get()))
+                  : DeferredResponse(pending->command,
+                                     pending->cancellation.get_token(),
+                                     stop_token);
         } catch (const std::exception &error) {
           const auto failure = ExecutionCommandExceptionError(error);
           response = ErrorResponse(failure.code, failure.message,

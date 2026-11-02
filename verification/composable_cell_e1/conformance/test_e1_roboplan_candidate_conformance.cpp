@@ -214,19 +214,6 @@ class E1RoboPlanCandidateAdapter final : public IPlannerBackend {
                     "portable request does not match the retained model"),
               {}};
     }
-    if (request.planning_profile != PlanningProfileDTO::kFirstFeasible) {
-      const auto capability =
-          request.planning_profile == PlanningProfileDTO::kBalanced
-              ? "planning.profile.balanced"
-              : "planning.profile.quality_bounded";
-      return {std::nullopt,
-              ErrorDTO{kErrorUnsupportedCapability,
-                       "E1 qualifies only RoboPlan first-feasible semantics",
-                       {{"reason", "planner_capability_unsupported"},
-                        {"capability", capability}}},
-              {}};
-    }
-
     try {
       std::optional<roboplan::JointTrajectory> trajectory;
       if (const auto* goal =
@@ -390,8 +377,8 @@ class E1RoboPlanCandidateAdapter final : public IPlannerBackend {
     options.max_angular_speed = path.max_angular_speed_rad_s;
     options.max_linear_acceleration = path.max_linear_acceleration_mps2;
     options.max_angular_acceleration = path.max_angular_acceleration_rad_s2;
-    options.max_position_error = request.tolerances.translation_tol_m;
-    options.max_orientation_error = request.tolerances.rotation_tol_rad;
+    options.position_tolerance = request.tolerances.translation_tol_m;
+    options.orientation_tolerance = request.tolerances.rotation_tol_rad;
     options.velocity_scale = request.speed_profile.velocity_scale;
     options.acceleration_scale = request.speed_profile.acceleration_scale;
     roboplan::CartesianPathPlanner planner(scene_, options);
@@ -494,7 +481,7 @@ PlannerBackendConformanceInput make_candidate_input(
   PlannerBackendConformanceInput input;
   input.adapter_id = "planning.roboplan_0_6_e1_qualification";
   input.planner = &adapter;
-  input.capabilities = {true, true, true, true, false, false, true};
+  input.capabilities = {true, true, true, true};
   input.plan_cases =
       make_portable_planner_matrix(joint, pose, cartesian);
   input.forward_kinematics = [&adapter](const FkRequestDTO& request) {
@@ -534,7 +521,7 @@ TEST(E1RoboPlanCandidateConformance,
   const auto report =
       run_planner_backend_conformance(make_candidate_input(adapter));
   EXPECT_TRUE(report.passed()) << report.summary();
-  EXPECT_EQ(report.completed_cases.size(), 11U);
+  EXPECT_EQ(report.completed_cases.size(), 5U);
 }
 
 }  // namespace

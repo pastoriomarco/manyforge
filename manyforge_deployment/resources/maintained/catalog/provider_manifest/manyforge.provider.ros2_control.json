@@ -1,9 +1,5 @@
 {
   "api_version": "manyforge.provider_manifest.v1",
-  "lifecycle_plan_catalog": {
-    "catalog_api_version": "manyforge.brand_lifecycle_plan_catalog.v1",
-    "semantic_digest": "sha256:54f324571f97808d6ed86de3c5d9adf88314dd602e99aab82b022c5e2f3e1ff6"
-  },
   "offered_capabilities": [
     {
       "capability_definition_revision": "sha256:578cd871bc7248d18f1ccafe2659acb9d9ad35570c17b30758312d65b37fb4d1",
@@ -122,27 +118,6 @@
       ]
     },
     {
-      "capability_definition_revision": "sha256:14c53dad299a42d6604eac14240d015e22a4bc1adb363fb252111e62a2d2ad90",
-      "capability_id": "planning.profile.balanced",
-      "required_endpoint_role_ids": [
-        "planner_scene_projection"
-      ]
-    },
-    {
-      "capability_definition_revision": "sha256:e0f578ef9af205b3c7c184fb1124ffb4fe3c35874b5e993358b43a2dc43d2674",
-      "capability_id": "planning.profile.first_feasible",
-      "required_endpoint_role_ids": [
-        "planner_scene_projection"
-      ]
-    },
-    {
-      "capability_definition_revision": "sha256:7f570672270455207d5fb8eb210cd1dd22a99d7909421cf0dc8036c32e4beffb",
-      "capability_id": "planning.profile.quality_bounded",
-      "required_endpoint_role_ids": [
-        "planner_scene_projection"
-      ]
-    },
-    {
       "capability_definition_revision": "sha256:1fde55ff59f977844d1e42a115df0e66305953803e7f2830fec4821e3cd36385",
       "capability_id": "planning.trajectory.time_parameterized",
       "required_endpoint_role_ids": [
@@ -236,5 +211,5 @@
     }
   ],
   "provider_manifest_id": "manyforge.provider.ros2_control",
-  "provider_manifest_revision": "sha256:793864facd689af2b7dc553ff74a4f6b1a8e43e2acb05bf48c29e97055a93e32"
+  "provider_manifest_revision": "sha256:4d68d8a0b115285e9c612d1de92a826e4366bd5865ec2b70d13290f01ea1debf"
 }

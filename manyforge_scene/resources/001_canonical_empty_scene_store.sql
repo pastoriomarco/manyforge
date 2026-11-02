@@ -90,8 +90,8 @@ CREATE TABLE IF NOT EXISTS canonical_empty_scene_acceptance (
     carried_attachment_count INTEGER NOT NULL CHECK (
         carried_attachment_count = 0
     ),
-    native_runtime_binding_count INTEGER NOT NULL CHECK (
-        native_runtime_binding_count = 0
+    execution_host_binding_count INTEGER NOT NULL CHECK (
+        execution_host_binding_count = 0
     ),
     UNIQUE (bootstrap_id, bootstrap_generation),
     FOREIGN KEY (singleton)

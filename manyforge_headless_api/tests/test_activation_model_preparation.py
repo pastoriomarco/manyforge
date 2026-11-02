@@ -1,17 +1,18 @@
-"""Model-preparation projection and closure join for model-free components.
+"""Model-preparation projection and closure join.
 
-The maintained registry carries the approved model-free I/O profile
-``io_device_v0`` and pose-source profile ``pose_source_v0`` beside the
-physical ros2_control profiles. Python model
-preparation must skip it without fabricating a model family, while unknown or
-malformed physical rows and foreign captured sources stay refused.
+Each component names its model by the model descriptor's ``id``, read through
+its family's ``component_descriptor`` in the maintained registry; the
+model-free ids ``io_device_v0``, ``pose_source_v0`` and ``ai_model_v0`` are
+constants. Python model preparation skips model-free components without
+fabricating a model family, while unknown models, malformed family rows and
+foreign captured sources stay refused.
 """
 
 from __future__ import annotations
 
-import copy
 import json
 from pathlib import Path
+import shutil
 import subprocess
 from types import SimpleNamespace
 
@@ -31,83 +32,17 @@ _DESCRIPTION = Path(
     "manyforge_deployment/resources/maintained/maintained_deployment_sources.v1.json"
 )
 _DIGEST = "sha256:" + "1" * 64
-_IO_ROW = {
-    "runtime_restoration_profile_id": "io_device_v0",
-    "io_provider_runtime": {},
-    "source_fields": {},
-    "stop_profiles": {},
-    "acceptance_obligations": [],
-}
-_POSE_ROW = {
-    "runtime_restoration_profile_id": "pose_source_v0",
-    "pose_source_runtime": {},
-    "source_fields": {},
-    "stop_profiles": {},
-    "acceptance_obligations": [],
-}
-_AI_ROW = {
-    "runtime_restoration_profile_id": "ai_model_v0",
-    "ai_model_runtime": {},
-    "source_fields": {},
-    "stop_profiles": {},
-    "acceptance_obligations": [],
-}
-_MODEL_FREE_MARKERS = ("io_provider_runtime", "pose_source_runtime", "ai_model_runtime")
-_MOCK_PROFILE = "lite6_mock_commanded_v0"
+_MOCK_MODEL = "ufactory.lite6"
 _SOURCE_SCHEMA = "manyforge.activation_model_source_closure.v1"
 
 
-def _maintained(order: str) -> dict[str, object]:
-    """Load the maintained registry, preserving its row order.
-
-    ``maintained`` keeps the checked-in order (adding the exact I/O row at the
-    end only when this tree does not carry it yet); ``io_first`` moves the I/O
-    row to the front, as in the combined Track 2 registry.
-    """
-
-    root = json.loads((_ROOT / _DESCRIPTION).read_text(encoding="utf-8"))
-    rows = root["runtime_restoration_profiles"]
-    io_rows = [row for row in rows if "io_provider_runtime" in row]
-    if not io_rows:
-        io_rows = [copy.deepcopy(_IO_ROW)]
-        rows.extend(io_rows)
-    assert io_rows == [_IO_ROW]
-    assert [row for row in rows if "pose_source_runtime" in row] == [_POSE_ROW]
-    # The AI model row is added by the compiler change; append it when absent.
-    ai_rows = [row for row in rows if "ai_model_runtime" in row]
-    if not ai_rows:
-        ai_rows = [copy.deepcopy(_AI_ROW)]
-        rows.extend(ai_rows)
-    assert ai_rows == [_AI_ROW]
-    if order == "io_first":
-        rows.remove(_IO_ROW)
-        rows.insert(0, copy.deepcopy(_IO_ROW))
-    return root
+@pytest.fixture
+def registry() -> dict[str, object]:
+    return json.loads((_ROOT / _DESCRIPTION).read_text(encoding="utf-8"))
 
 
-@pytest.fixture(params=["maintained", "io_first"])
-def registry(request: pytest.FixtureRequest) -> dict[str, object]:
-    return _maintained(request.param)
-
-
-def _physical_row(root: dict[str, object]) -> dict[str, object]:
-    """Select the known Mock physical row by id, never by position."""
-
-    row = next(
-        row
-        for row in root["runtime_restoration_profiles"]
-        if row["runtime_restoration_profile_id"] == _MOCK_PROFILE
-    )
-    assert "io_provider_runtime" not in row and "model_family_id" in row
-    return row
-
-
-def _io_row(root: dict[str, object]) -> dict[str, object]:
-    return next(
-        row
-        for row in root["runtime_restoration_profiles"]
-        if "io_provider_runtime" in row
-    )
+def _lite6_row(root: dict[str, object]) -> dict[str, object]:
+    return next(row for row in root["model_families"] if row["model_family_id"] == "lite6")
 
 
 @pytest.fixture(autouse=True)
@@ -126,16 +61,25 @@ def _real_preparation_bodies() -> None:
 
 
 def _capability_root(tmp_path: Path, root: dict[str, object]) -> Path:
-    path = tmp_path / "capabilities" / _DESCRIPTION
+    """The registry plus every component model it names, under one root."""
+
+    capabilities = tmp_path / "capabilities"
+    path = capabilities / _DESCRIPTION
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps(root), encoding="utf-8")
-    return tmp_path / "capabilities"
+    descriptors = [row.get("component_descriptor") for row in root["model_families"]]
+    descriptors += root.get("component_models", [])
+    for descriptor in descriptors:
+        if isinstance(descriptor, str) and (_ROOT / descriptor).is_file():
+            (capabilities / descriptor).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(_ROOT / descriptor, capabilities / descriptor)
+    return capabilities
 
 
 def _mock_robot() -> dict[str, object]:
     return {
         "component_id": "robot",
-        "component_profile_id": _MOCK_PROFILE,
+        "component_profile_id": _MOCK_MODEL,
         "model_source": {"kind": "package"},
         "configuration": {"runtime_kind": "ros2_control"},
     }
@@ -178,14 +122,6 @@ def _ai_model() -> dict[str, object]:
     }
 
 
-def _pose_row(root: dict[str, object]) -> dict[str, object]:
-    return next(
-        row
-        for row in root["runtime_restoration_profiles"]
-        if "pose_source_runtime" in row
-    )
-
-
 def _source(component_id: str) -> dict[str, object]:
     return {"component_id": component_id, "entrypoints": {}, "resources": []}
 
@@ -211,11 +147,10 @@ def prepared_sources(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str]]:
     return calls
 
 
-def test_registry_with_model_free_io_profile_constructs_ros_only_preparer(
+def test_registry_maps_each_model_id_to_its_family_and_model_free_ids_to_kinds(
     registry: dict[str, object], tmp_path: Path
 ) -> None:
-    root = registry
-    capabilities = _capability_root(tmp_path, root)
+    capabilities = _capability_root(tmp_path, registry)
 
     profiles = _model_preparation_profiles(capabilities)
     preparer = ActivationPreparer(
@@ -229,18 +164,14 @@ def test_registry_with_model_free_io_profile_constructs_ros_only_preparer(
     assert profiles["io_device_v0"] == "io_provider"
     assert profiles["pose_source_v0"] == "pose_source"
     assert profiles["ai_model_v0"] == "ai_model"
-    assert profiles[_MOCK_PROFILE] == (
-        "lite6_lite_gripper",
+    assert profiles[_MOCK_MODEL] == (
+        "lite6",
         "package://manyforge_example_models/models/lite6_lite_gripper/",
     )
-    physical = [
-        row["runtime_restoration_profile_id"]
-        for row in root["runtime_restoration_profiles"]
-        if not any(marker in row for marker in _MODEL_FREE_MARKERS)
-    ]
-    assert physical and all(
-        isinstance(profiles[profile], tuple) for profile in physical
-    )
+    described = [row for row in registry["model_families"] if "component_descriptor" in row]
+    # Machines and model-form I/O members (`component_models`) have no model.
+    assert len(profiles) == len(described) + len(registry["component_models"]) + 3
+    assert described
     assert preparer._profiles == profiles
 
 
@@ -281,9 +212,9 @@ def test_mock_robot_plus_io_device_load_prepares_only_the_robot_model(
             program_role_assignment={"component_roles": [], "target_roles": []},
         )
 
-    assert prepared_sources == [("robot", "lite6_lite_gripper")]
+    assert prepared_sources == [("robot", "lite6")]
     assert observed["input"]["prepared_model_closure"]["components"] == [
-        {"component_id": "robot", "model_asset_id": "lite6_lite_gripper"}
+        {"component_id": "robot", "model_asset_id": "lite6"}
     ]
 
 
@@ -308,7 +239,7 @@ def test_closure_join_skips_only_the_model_free_io_component(
     # Typed profile map as the projection returns it: the I/O profile is
     # registered with its runtime kind (no model), never a fabricated family.
     profiles = {
-        _MOCK_PROFILE: ("lite6_lite_gripper", "package://example/"),
+        _MOCK_MODEL: ("lite6", "package://example/"),
         "io_device_v0": "io_provider",
     }
 
@@ -318,58 +249,63 @@ def test_closure_join_skips_only_the_model_free_io_component(
         profiles=profiles,
     )
 
-    assert prepared_sources == [("robot", "lite6_lite_gripper")]
+    assert prepared_sources == [("robot", "lite6")]
     assert [row["component_id"] for row in closure["components"]] == ["robot"]
 
 
-def test_unknown_physical_family_is_still_refused(
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda row: row.pop("model_asset_id"),
+        lambda row: row.__setitem__("model_asset_id", 7),
+        lambda row: row.__setitem__("source", {}),
+    ],
+    ids=["missing-asset", "non-string-asset", "missing-prefix"],
+)
+def test_malformed_family_row_is_refused(
+    registry: dict[str, object], tmp_path: Path, mutate
+) -> None:
+    mutate(_lite6_row(registry))
+
+    with pytest.raises(HeadlessApiError, match="families contain an invalid row"):
+        _model_preparation_profiles(_capability_root(tmp_path, registry))
+
+
+def test_a_missing_model_descriptor_is_refused(
     registry: dict[str, object], tmp_path: Path
 ) -> None:
-    root = registry
-    _physical_row(root)["model_family_id"] = "invented_family"
+    capabilities = _capability_root(tmp_path, registry)
+    (capabilities / _lite6_row(registry)["component_descriptor"]).unlink()
 
-    with pytest.raises(HeadlessApiError, match="runtime profiles contain an invalid row"):
-        _model_preparation_profiles(_capability_root(tmp_path, root))
+    with pytest.raises(HeadlessApiError, match="could not be loaded"):
+        _model_preparation_profiles(capabilities)
 
 
-@pytest.mark.parametrize(
-    "mutate",
-    [
-        lambda row: row.pop("model_family_id"),
-        lambda row: row.__setitem__("model_family_id", 7),
-        lambda row: row.__setitem__("model_family_id", ""),
-        lambda row: row.pop("runtime_restoration_profile_id"),
-    ],
-    ids=["missing-family", "non-string-family", "empty-family", "missing-id"],
-)
-def test_malformed_physical_row_is_still_refused(
-    registry: dict[str, object], tmp_path: Path, mutate
+def test_two_families_naming_one_model_are_refused(
+    registry: dict[str, object], tmp_path: Path
 ) -> None:
-    root = registry
-    mutate(_physical_row(root))
+    lite_gripper = next(
+        row for row in registry["model_families"] if row["model_family_id"] == "lite_gripper"
+    )
+    lite_gripper["component_descriptor"] = _lite6_row(registry)["component_descriptor"]
 
-    with pytest.raises(HeadlessApiError, match="runtime profiles contain an invalid row"):
-        _model_preparation_profiles(_capability_root(tmp_path, root))
+    with pytest.raises(HeadlessApiError, match="invalid or duplicate id"):
+        _model_preparation_profiles(_capability_root(tmp_path, registry))
 
 
-@pytest.mark.parametrize(
-    "mutate",
-    [
-        lambda row: row.__setitem__("model_family_id", "lite6_lite_gripper"),
-        lambda row: row.__setitem__("source_fields", {"x": "y"}),
-        lambda row: row.__setitem__("runtime_restoration_profile_id", "io_device_v1"),
-        lambda row: row.__setitem__("io_provider_runtime", {"extra": 1}),
-    ],
-    ids=["io-with-family", "io-with-fields", "io-renamed", "io-runtime-config"],
-)
-def test_only_the_exact_model_free_io_row_is_accepted(
-    registry: dict[str, object], tmp_path: Path, mutate
+def test_an_unknown_model_id_is_refused(
+    registry: dict[str, object],
+    tmp_path: Path, prepared_sources: list[tuple[str, str]]
 ) -> None:
-    root = registry
-    mutate(_io_row(root))
+    profiles = _model_preparation_profiles(_capability_root(tmp_path, registry))
+    robot = {**_mock_robot(), "component_profile_id": "lite6_mock_commanded_v0"}
 
-    with pytest.raises(HeadlessApiError, match="runtime profiles contain an invalid row"):
-        _model_preparation_profiles(_capability_root(tmp_path, root))
+    with pytest.raises(HeadlessApiError, match="do not match captured model profiles"):
+        _prepare_model_closure(
+            deployment={"components": [robot]},
+            model_source_closure=_closure("robot"),
+            profiles=profiles,
+        )
 
 
 def test_io_provider_component_with_a_model_source_is_refused(
@@ -456,7 +392,7 @@ def test_closure_join_skips_the_model_free_pose_source_component(
         profiles=profiles,
     )
 
-    assert prepared_sources == [("robot", "lite6_lite_gripper")]
+    assert prepared_sources == [("robot", "lite6")]
     assert [row["component_id"] for row in closure["components"]] == ["robot"]
 
 
@@ -489,22 +425,3 @@ def test_model_free_profile_requires_its_own_runtime_kind_and_no_model(
             model_source_closure=_closure(),
             profiles=profiles,
         )
-
-
-@pytest.mark.parametrize(
-    "mutate",
-    [
-        lambda row: row.__setitem__("model_family_id", "lite6_lite_gripper"),
-        lambda row: row.__setitem__("runtime_restoration_profile_id", "pose_source_v1"),
-        lambda row: row.__setitem__("pose_source_runtime", {"extra": 1}),
-    ],
-    ids=["pose-with-family", "pose-renamed", "pose-runtime-config"],
-)
-def test_only_the_exact_model_free_pose_source_row_is_accepted(
-    registry: dict[str, object], tmp_path: Path, mutate
-) -> None:
-    root = registry
-    mutate(_pose_row(root))
-
-    with pytest.raises(HeadlessApiError, match="runtime profiles contain an invalid row"):
-        _model_preparation_profiles(_capability_root(tmp_path, root))

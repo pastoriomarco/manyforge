@@ -1,0 +1,32 @@
+# Mock controllers of this robot (lanes.mock.controllers_file).
+# A controllers template (manyforge_ros2_control_execution/lane/README.md):
+# the generator names the manager, writes __controller__, the arm joints and,
+# per joint, the row's arrival tolerance as `goal` and the Deployment's
+# operator Stop deceleration. <TODO> copy the rates and the per-joint
+# trajectory constraint from the vendor's controller file.
+/**/controller_manager:
+  ros__parameters:
+    update_rate: 150
+    enforce_command_limits: false
+    hardware_components_initial_state:
+      shutdown_on_initial_state_failure: true
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+    __controller__:
+      type: joint_trajectory_controller/JointTrajectoryController
+
+/**/__controller__:
+  ros__parameters:
+    joints: [__joint__]
+    command_interfaces: [position]
+    state_interfaces: [position, velocity]
+    state_publish_rate: 25.0
+    action_monitor_rate: 20.0
+    interface_name: position
+    interpolate_from_desired_state: true
+    allow_trajectory_replacement: true
+    constraints:
+      goal_time: 0.5
+      stopped_velocity_tolerance: 0.0
+      decelerate_on_cancel: true
+      __joint__: {trajectory: 1.0, max_deceleration_on_cancel: null}

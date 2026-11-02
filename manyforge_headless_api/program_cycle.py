@@ -156,9 +156,7 @@ class _ProgramResetSelectorsDTO(BaseModel):
 
 
 class ProgramResetOptionsDTO(_ProgramResetSelectorsDTO):
-    # D6 (additive): the accepted Reset is Scenario Close's, which keeps the
-    # cell Stop fault; a continuation must carry the same value.
-    keep_stop_fault: bool = False
+    """The accepted Reset's options; a continuation must carry the same."""
 
 
 class AcceptedProgramResetDTO(_ProgramResetSelectorsDTO):
@@ -290,6 +288,8 @@ class ProgramCycleFrameDTO(ProgramCycleStatusDTO):
     recovery_offer: dict[str, Any] | None
     run: dict[str, Any] | None
     runtime_controls: dict[str, Any] | None
+    # CONTRACTS §9 ProgramRunEnd of the frame's run (None while it runs).
+    run_end: dict[str, Any] | None = None
 
     @model_validator(mode="after")
     def exact_projection_pairing(self) -> "ProgramCycleFrameDTO":

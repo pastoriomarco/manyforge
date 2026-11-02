@@ -89,11 +89,11 @@ describe('Deployment I/O devices', () => {
       await mounted.click('Add I/O device');
       expect(mounted.control('I/O device component id').value).toBe('io_device_1');
       expect(mounted.control('I/O device lifecycle command time limit').value).toBe('10');
-      // The first signal belongs to the device; every R5 source incl. robot-hosted UR / GPIO / xArm is offered (contract 84).
+      // The first signal belongs to the device; every R5 source incl. ros2_control GPIO is offered (contract 84); no UR profiles.
       expect(mounted.control('Signal 1 Component').readOnly).toBe(true);
       const profiles = (mounted.control('Signal 1 Source profile').children as Array<{ props: { value: string } }>)
         .map((option) => option.props.value);
-      expect(profiles).toEqual(['mock', 'ros_bool', 'ur_io_states', 'ros2_control_gpio', 'geometric_contact', 'xarm_digital']);
+      expect(profiles).toEqual(['mock', 'ros_bool', 'ros2_control_gpio', 'geometric_contact']);
       await mounted.click('Create I/O device');
       expect(mounted.controller.mutate).not.toHaveBeenCalled();
       expect(alerts(mounted.all).join()).toContain('signal name');
@@ -134,7 +134,7 @@ describe('Deployment I/O devices', () => {
         ['components', 1, 'configuration', 'runtime_configuration', 'io_provider_devices'], 'set',
         [{ controllable_component_id: 'station_io', lifecycle_command_timeout_s: 45 }],
       );
-      // The native runtime section lists the arm only; no frame or Stop field for the device.
+      // The execution host section lists the arm only; no frame or Stop field for the device.
       const units = mounted.all((props) => props.className === 'deployment-runtime-unit')
         .map((props) => ((props.children as Array<{ props?: { children?: Array<{ props?: { children?: unknown } }> } }>)[0]
           ?.props?.children?.[0]?.props?.children));
@@ -146,7 +146,7 @@ describe('Deployment I/O devices', () => {
     } finally { await mounted.unmount(); }
   });
 
-  it('keeps at least one signal on an I/O device and refuses xArm inputs there', async () => {
+  it('keeps at least one signal on an I/O device', async () => {
     const mounted = await mount([device]);
     try {
       await mounted.click('Remove signal');
@@ -170,23 +170,6 @@ describe('Deployment I/O devices', () => {
           provider: { profile: 'mock_output', channel: 'lamp' },
         }],
       );
-    } finally { await mounted.unmount(); }
-  });
-
-  it('refuses an authored xArm input row on an I/O device', async () => {
-    const xarm = {
-      ...signal, resource_role_id: 'tool_in', signal_name: 'tool_in', source_id: 'xarm_io', update_mode: 'sampled',
-      freshness: { mode: 'sample_age', maximum_age_ns: 100_000_000 },
-      provider: { profile: 'xarm_controller_input', topic: '/xarm/io', input_bit: 0 },
-    };
-    const withXarm = structuredClone(device) as typeof device;
-    (withXarm.configuration.runtime_configuration.io_signals as JsonValue[]).push(xarm);
-    const mounted = await mount([withXarm]);
-    try {
-      await mounted.type('part_present Initial value', 'true');
-      await mounted.click('Update I/O Draft');
-      expect(mounted.controller.mutate).not.toHaveBeenCalled();
-      expect(alerts(mounted.all).join()).toContain('xArm');
     } finally { await mounted.unmount(); }
   });
 });

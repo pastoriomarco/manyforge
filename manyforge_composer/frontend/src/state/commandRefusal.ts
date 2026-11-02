@@ -1,7 +1,6 @@
 import { ERROR_CATALOG } from '../api/errorCatalog.generated';
 import { parseApiErrorDto } from '../api/parsers/programRuntime';
 import type { StructuredError } from '../types/api';
-import { motionWaitRefusalMessage } from './motionWaitRefusal';
 import { operatorAlarmRefusalMessage } from './operatorAlarmRefusal';
 import { formatStructuredError } from './structuredError';
 
@@ -34,12 +33,26 @@ export function errorPresentation(error: StructuredError): ErrorPresentation {
   return { text: compact, detail: full === '' ? producerText : `${full} ${producerText}` };
 }
 
+/** CONTRACTS §8: a global rule holds its scope (details `rule_id`). */
+export const RULE_HOLDS = 'rule_holds';
+
+/** The operator text of a `rule_holds` refusal, naming the rule when known. */
+export function ruleHoldsMessage(ruleId: string | null): string {
+  const rule = ruleId === null ? 'A global interrupt rule' : `Global interrupt rule ${ruleId}`;
+  return `${rule} holds this scope: its condition still holds after its Stop, or it can't watch its signals. It clears by itself.`;
+}
+
+/** Classify the owner's typed code, never the rendered message. */
+export function isRuleHoldsRefusal(error: StructuredError | null | undefined): boolean {
+  return error?.code === RULE_HOLDS;
+}
+
 /**
  * The one operator text for an execution-command refusal, whichever path it
  * arrived on (HTTP error, REST receipt or WebSocket receipt). Display only: it
  * never changes the disposition or treats a refusal as no-effect.
  *
- * The specific guidance first (alarm attention, motion wait), otherwise the
+ * The specific guidance first (alarm attention, a holding rule), otherwise the
  * catalog presentation on one line (`compact: full producer message`), e.g.
  * `Too many retained requests: … cell-admission request rejected (Reason: claim_capacity_exhausted)`.
  * `withCode` keeps the receipt paths' `code: ` lead.
@@ -48,8 +61,9 @@ export function commandRefusalText(
   error: StructuredError,
   { withCode = false }: { withCode?: boolean } = {},
 ): string {
-  const guidance = operatorAlarmRefusalMessage(error.code, error.details)
-    ?? motionWaitRefusalMessage(error.code, error.details);
+  const ruleId = error.details?.rule_id;
+  const guidance = operatorAlarmRefusalMessage(error.code)
+    ?? (isRuleHoldsRefusal(error) ? ruleHoldsMessage(typeof ruleId === 'string' && ruleId !== '' ? ruleId : null) : null);
   if (guidance !== null) return guidance;
   const { text, detail } = errorPresentation(error);
   const line = detail === null ? text : `${text}: ${detail}`;

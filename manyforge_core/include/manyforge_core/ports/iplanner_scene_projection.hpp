@@ -144,7 +144,7 @@ public:
 
   [[nodiscard]] virtual Result<std::shared_ptr<IPlannerSceneProjection>>
   ResolveProjection(
-      const ProjectionNativeRuntimeBindingDTO &native_runtime_binding) const =
+      const ProjectionExecutionHostBindingDTO &execution_host_binding) const =
       0;
 };
 

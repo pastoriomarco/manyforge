@@ -21,7 +21,7 @@ if(MANYFORGE_COST_CURRENT)
     ${MANYFORGE_COST_SOURCE_ROOT}/manyforge_roboplan/include)
   target_sources(ui6h_collision_cost PRIVATE
     ${MANYFORGE_COST_SOURCE_ROOT}/manyforge_core/src/runtime_collision_monitor.cpp
-    ${MANYFORGE_COST_SOURCE_ROOT}/manyforge_roboplan/src/native_runtime_support.cpp)
+    ${MANYFORGE_COST_SOURCE_ROOT}/manyforge_roboplan/src/execution_host_support.cpp)
   find_package(GTest REQUIRED)
   add_executable(ui6h_collision_regression
     ${MANYFORGE_COST_SOURCE_ROOT}/tests/cpp/test_collision_engine_integration.cpp)

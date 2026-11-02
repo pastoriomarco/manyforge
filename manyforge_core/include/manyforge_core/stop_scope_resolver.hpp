@@ -45,10 +45,6 @@ struct StopScopeComponentSnapshotDTO final {
   ControllableComponentId controllable_component_id;
   ComponentLifecycleGeneration component_lifecycle_generation;
   std::vector<ResourceId> resources;
-  /// Exact subset of resources derived from sealed logical output bindings.
-  /// Those channels may be referenced by several component aliases; physical
-  /// resource membership retains its original unique-component invariant.
-  std::vector<ResourceId> logical_output_resources{};
 
   friend bool operator==(const StopScopeComponentSnapshotDTO&,
                          const StopScopeComponentSnapshotDTO&) = default;

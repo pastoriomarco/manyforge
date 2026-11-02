@@ -44,7 +44,6 @@ struct PreparedActivationMaterialization final {
     const std::vector<ActivationComponentProfile> &component_profiles,
     bool prepare_canonical_empty = false);
 
-int run_maintained_example_qualification(int argc, char **argv);
 
 } // namespace detail
 } // namespace manyforge::deployment

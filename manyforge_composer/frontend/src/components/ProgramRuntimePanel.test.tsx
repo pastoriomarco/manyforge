@@ -3,10 +3,9 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
-import type { CCLCComponentSnapshot } from '../types/cclc';
-import { PROGRAM_RESET_READINESS_MESSAGE } from '../hooks/useProgramRuntime';
 import type { RobotControlController } from '../hooks/useRobotControl';
 import type {
+  ProgramRunStatus,
   AutomaticRetryAuditEvent,
   TakeoverFallbackAuditEvent,
   CycleRecoveryOffer,
@@ -19,9 +18,6 @@ import type {
   RuntimeScaleControlStatus,
 } from '../types/robotControl';
 import { statusFixture } from '../testFixtures/robotControl';
-import { ACTIVE_CONFIGURATION, alarmSnapshot, gatingMember } from '../testFixtures/operatorAlarms';
-import { motionAttentionBlock } from '../state/operatorAlarmMotionAttention';
-import type { AlarmMotionAttentionMember } from '../types/headless';
 import { executionGroupScopes, executionGroupTargetLabels } from '../state/programExecutionGroups';
 import {
   deriveTransportGuidance,
@@ -33,9 +29,8 @@ import {
   takeoverFallbackText,
   ioSourceAuditText,
   ioSourceUnavailableNodes,
-  motionGateAuditText,
-  motionGateWaitNodes,
-  motionGateWaitText,
+  simulationHeldNodes,
+  simulationRefusalAuditText,
   recoveryClassLabel,
   resetKeptMessage,
   selectManualRecoveryTarget,
@@ -67,7 +62,6 @@ function ordinaryMotionStopOffer(): CycleRecoveryOffer {
     deploymentGeneration: 1,
     sceneAdmissionEpoch: 1,
     poseSourceApplyGeneration: 1,
-    latchId: null,
     stopId: 'stop.1',
     stopGeneration: 1,
     stopCertificateId: 'stop-certificate.1',
@@ -146,17 +140,7 @@ function robotController(): RobotControlController {
     runtimeScaleError: null,
     runtimeScaleDraft: 1,
     runtimeScalePending: false,
-    stopFaultRecoveryPending: false,
-    stopFaultRecoveryInProgress: false,
-    stopFaultRecoveryAbortPending: false,
-    cellRecoverBlockedReason: null,
-    setCellRecoverBlockedReason: vi.fn(),
-    stopFaultRecoveryError: null,
-    componentIncidents: [],
-    componentIncidentsUnavailableReason: null,
     resume: vi.fn(),
-    recoverStopFault: vi.fn(),
-    abortRecoverStopFault: vi.fn(),
     setRuntimeScale: vi.fn(),
     commitRuntimeScale: vi.fn(),
   } as unknown as RobotControlController;
@@ -194,9 +178,17 @@ function controller(
     state === 'succeeded' ? 'terminal_awaiting_reset' : 'running',
 ): ProgramRuntimeController {
   return {
-    commandAllowed: vi.fn(() => true),
-    commandDisabledReason: vi.fn(() => null),
-    motionAttentionBlock: vi.fn(() => null),
+    runnerAllows: vi.fn(() => true),
+    runnerRefusal: vi.fn(() => null),
+    // As the backend computes it (CONTRACTS §10): Execute only from an idle
+    // cycle, Resume for a run in progress (a held group or a halted run).
+    readiness: cycleState === 'idle_after_reset'
+      ? { can_execute: true, can_resume: false, motion_clear: true, blocked_reasons: [] }
+      : { can_execute: false,
+        can_resume: ['running', 'intervention_required', 'full_stopped'].includes(state),
+        motion_clear: true,
+        blocked_reasons: [{ code: 'run_in_progress', message: 'A run is in progress.' }] },
+    cellLatch: null,
     draftUnappliedReason: null,
     state: {
       currentScenario: null,
@@ -297,6 +289,7 @@ function controller(
         operationFailures: [],
         reason: null,
         message: '',
+        runEnd: null,
       },
       controls: null,
       nonExecutable: null,
@@ -319,14 +312,8 @@ function controller(
       .includes(state),
     refresh: vi.fn(),
     dismissError: vi.fn(),
-    activationOffer: null,
-    activationComponentHealth: {},
-    activationProgress: null,
-    activationPending: false,
-    activationWaiting: false,
-    confirmActivationExecute: vi.fn(async () => {}),
-    cancelActivationExecute: vi.fn(),
     run: vi.fn(),
+    activation: { available: false, flow: null, states: [], open: vi.fn(), confirm: vi.fn(), cancel: vi.fn() },
     stopMotion: vi.fn(),
     startMotion: vi.fn(),
     resumeMotion: vi.fn(),
@@ -344,7 +331,7 @@ function controller(
 }
 
 describe('Program runtime projection', () => {
-  it('shows the genuine origin of a no-Program publication', () => {
+  it('shows the Scenario origin of a no-Program publication', () => {
     const view = controller();
     view.state.applied = null;
     view.state.run = null;
@@ -355,28 +342,15 @@ describe('Program runtime projection', () => {
       programId: null,
       programRevision: null,
       origin: {
-        kind: 'sealed_canonical_empty',
-        cellId: 'empty-cell',
-        deploymentArtifactId: 'deployment',
-        deploymentRevision: `sha256:${'a'.repeat(64)}`,
-        retainedBundleId: `sha256:${'b'.repeat(64)}`,
-        graphRevision: `sha256:${'c'.repeat(64)}`,
-        admissionDigest: `sha256:${'d'.repeat(64)}`,
+        kind: 'scenario',
+        scenarioId: 'authored-cell',
+        sourceDocumentDigest: `sha256:${'e'.repeat(64)}`,
+        projectPath: '/projects/authored-cell.scenario',
       },
       message: null,
       unresolvedReferences: [],
       affectedNodes: [],
       affectedExecutionGroups: [],
-    };
-    const sealed = renderToStaticMarkup(<ProgramRuntimePanel enabled controller={view} />);
-    expect(sealed).toContain('empty-cell · no Program');
-    expect(sealed).not.toContain('cell-pick');
-
-    view.state.nonExecutable.origin = {
-      kind: 'scenario',
-      scenarioId: 'authored-cell',
-      sourceDocumentDigest: `sha256:${'e'.repeat(64)}`,
-      projectPath: '/projects/authored-cell.scenario',
     };
     expect(renderToStaticMarkup(<ProgramRuntimePanel enabled controller={view} />))
       .toContain('authored-cell · no Program');
@@ -420,16 +394,16 @@ describe('Program runtime projection', () => {
       facts: {
         nodeInstanceId: 'move', incumbentOperationId: 'op.1', path: 'ordinary_containment',
         code: 'takeover_preparation_late', message: 'late', failureStage: null,
-        preparationMs: 12.4, budgetMs: 30,
+        preparationMs: 12.4, budgetMs: 30, planningCapMs: 24,
       },
     };
     expect(takeoverFallbackText(fallback))
-      .toBe('Stop fallback on move · takeover preparation late (prep 12 of 30 ms)');
+      .toBe('Stop fallback on move · takeover preparation late (planning cap 24 ms · prep 12 of 30 ms)');
     expect(takeoverFallbackText({ eventRevision: 3, kind: 'program_node_retry', facts: {} })).toBeNull();
     expect(takeoverFallbackText({
       ...fallback,
       facts: { ...fallback.facts, code: null, message: null, failureStage: 'stop_planning' },
-    })).toBe('Stop fallback on move · during stop_planning (prep 12 of 30 ms)');
+    })).toBe('Stop fallback on move · during stop_planning (planning cap 24 ms · prep 12 of 30 ms)');
     const base = controller();
     type RuntimeControls = NonNullable<NonNullable<ProgramRuntimeController['state']['controls']>['runtimeControls']>;
     const withAudit: ProgramRuntimeController = {
@@ -443,26 +417,7 @@ describe('Program runtime projection', () => {
       },
     };
     expect(renderToStaticMarkup(<ProgramRuntimePanel enabled controller={withAudit} />))
-      .toContain('Stop fallback on move · takeover preparation late (prep 12 of 30 ms)');
-  });
-
-  it('shows a running motion node waiting for a gate rule as Motion waits, and both transitions as events', () => {
-    const gate = (eventRevision: number, waiting: boolean, node = 'move'): RuntimeControlAuditEvent => ({
-      eventRevision,
-      kind: waiting ? 'program_node_motion_gated' : 'program_node_motion_gate_released',
-      facts: { node_instance_id: node, node_attempt_id: `${node}.1`, rule_id: 'curtain' },
-    });
-    expect(motionGateAuditText(gate(2, true))).toBe('Motion of move waits for global interrupt rule curtain');
-    expect(motionGateAuditText(gate(3, false))).toBe('Global interrupt rule curtain cleared: motion of move admitted');
-    expect(motionGateAuditText({ eventRevision: 4, kind: 'program_node_retry', facts: {} })).toBeNull();
-    const running = { move: 'running', done: 'failure' } as const;
-    expect(motionGateWaitNodes([gate(2, true), gate(3, false)], running)).toEqual([]);
-    expect(motionGateWaitNodes([gate(2, true, 'done')], running)).toEqual([]);
-    const waits = motionGateWaitNodes([gate(2, false), gate(3, true)], running);
-    expect(waits).toEqual([{ waiting: true, nodeInstanceId: 'move', ruleId: 'curtain' }]);
-    expect(motionGateWaitText(waits[0])).toBe(
-      'move: Motion waits: global interrupt rule curtain is active. Motion is allowed again when its condition clears.',
-    );
+      .toContain('Stop fallback on move · takeover preparation late (planning cap 24 ms · prep 12 of 30 ms)');
   });
 
   it('shows a running io wait whose input source is unavailable in amber, and both transitions as events', () => {
@@ -502,6 +457,64 @@ describe('Program runtime projection', () => {
     );
     expect(recovered).not.toContain('Waiting on wait_part');
     expect(recovered).toContain('Input source available again for wait_part');
+  });
+
+  it('shows a node a simulation-not-playing refusal stopped as waiting for Run (SIM-1)', () => {
+    const refusal: RuntimeControlAuditEvent = {
+      eventRevision: 2,
+      kind: 'program_node_simulation_not_playing',
+      facts: { node_instance_id: 'move', code: 'simulation_not_playing', message: 'the simulation is not playing' },
+    };
+    expect(simulationRefusalAuditText(refusal)).toBe('Simulation not playing on move · stopped, waiting for Run');
+    expect(simulationRefusalAuditText({ eventRevision: 3, kind: 'program_node_retry', facts: {} })).toBeNull();
+    expect(simulationHeldNodes([refusal], { move: 'held' })).toEqual(['move']);
+    expect(simulationHeldNodes([refusal], { move: 'success' })).toEqual([]);
+
+    const base = controller();
+    type RuntimeControls = NonNullable<NonNullable<ProgramRuntimeController['state']['controls']>['runtimeControls']>;
+    const markup = renderToStaticMarkup(<ProgramRuntimePanel enabled controller={{
+      ...base,
+      state: {
+        ...base.state,
+        run: { ...base.state.run!, nodeStatuses: { root: 'running', move: 'held' } },
+        controls: {
+          ...ordinaryMotionStopControls(),
+          runtimeControls: { audit: [refusal] } as unknown as RuntimeControls,
+        },
+      },
+    }} />);
+    expect(markup).toContain('Waiting for Run on move: Simulation not playing. Play the simulation, then Run.');
+    expect(markup).toContain('Simulation not playing on move · stopped, waiting for Run');
+  });
+
+  it('drops the simulation line once that attempt\'s hold ended, even when a later attempt is held by an ordinary Stop', () => {
+    const event = (eventRevision: number, kind: string, attempt: string): RuntimeControlAuditEvent => ({
+      eventRevision, kind, facts: { node_instance_id: 'move', node_attempt_id: attempt },
+    });
+    const refused = event(2, 'program_node_simulation_not_playing', 'move.1');
+    const ended = event(3, 'program_node_simulation_hold_ended', 'move.1');
+    expect(simulationRefusalAuditText(ended)).toBe('Simulation hold ended on move');
+    // Run after play, then an ordinary operator Stop holds the next attempt.
+    expect(simulationHeldNodes([refused, ended], { move: 'held' })).toEqual([]);
+    // Refused again on the next attempt: shown for that attempt.
+    expect(simulationHeldNodes(
+      [refused, ended, event(4, 'program_node_simulation_not_playing', 'move.2')], { move: 'held' },
+    )).toEqual(['move']);
+
+    const base = controller();
+    type RuntimeControls = NonNullable<NonNullable<ProgramRuntimeController['state']['controls']>['runtimeControls']>;
+    const markup = renderToStaticMarkup(<ProgramRuntimePanel enabled controller={{
+      ...base,
+      state: {
+        ...base.state,
+        run: { ...base.state.run!, nodeStatuses: { root: 'running', move: 'held' } },
+        controls: {
+          ...ordinaryMotionStopControls(),
+          runtimeControls: { audit: [refused, ended] } as unknown as RuntimeControls,
+        },
+      },
+    }} />);
+    expect(markup).not.toContain('Waiting for Run on move: Simulation not playing');
   });
 
   it('shows the failed attempt in red before its retry, with the Kernel failure when there is one', () => {
@@ -580,8 +593,8 @@ describe('Program runtime projection', () => {
         { key: 'reply', type: 'model_response', access: 'write', persistence: 'run' },
       ],
     };
-    halted.commandAllowed = vi.fn((kind: string) => kind !== 'program_runtime_blackboard_write');
-    halted.commandDisabledReason = vi.fn(() => 'program_run_state_full_stopped');
+    halted.runnerAllows = vi.fn((kind: string) => kind !== 'program_runtime_blackboard_write');
+    halted.runnerRefusal = vi.fn(() => 'program_run_state_full_stopped');
     const markup = renderToStaticMarkup(
       <ProgramRuntimePanel enabled controller={halted} />,
     );
@@ -917,65 +930,9 @@ describe('Program runtime projection', () => {
     expect(render()).toMatch(
       /class="transport-group-resume"(?![^>]*disabled)[^>]*title="Retry move.1 and let all the Program&#x27;s motion continue."[^>]*>Retry<\/button>/,
     );
-  });
-
-  it('disables Resume and a motion-producing Retry from operator-alarm attention, naming the remedy', () => {
-    const withAlarms = (
-      program: ProgramRuntimeController,
-      members: AlarmMotionAttentionMember[],
-    ): ProgramRuntimeController => ({
-      ...program,
-      motionAttentionBlock: (resourceIds) => motionAttentionBlock(
-        alarmSnapshot(members), resourceIds, ACTIVE_CONFIGURATION,
-      ),
-    });
-    const stopped = controller('intervention_required');
-    const controls = ordinaryMotionStopControls();
-    controls.recoveryOffer = null;
-    stopped.state.controls = controls;
-    const render = (program: ProgramRuntimeController) => renderToStaticMarkup(
-      <ProgramTransportControls enabled program={program} robot={robotController()} />,
-    );
-
-    // Another robot's alarm leaves this selection's Resume available.
-    expect(render(withAlarms(stopped, [
-      gatingMember('other', 'active_unacknowledged', ['robot.2.joint_1']),
-    ]))).toMatch(/class="transport-group-resume"(?![^>]*disabled)[^>]*>Resume<\/button>/);
-    // An unacknowledged alarm on the selection's resources: acknowledge.
-    expect(render(withAlarms(stopped, [
-      gatingMember('arm', 'active_unacknowledged', ['robot.joint_1']),
-    ]))).toMatch(
-      /class="transport-group-resume"[^>]*disabled=""[^>]*title="Motion is blocked by unacknowledged alarms. Acknowledge them, then try again."[^>]*>Resume<\/button>/,
-    );
-    // A cell-global condition interlock: resolve the cause.
-    expect(render(withAlarms(stopped, [gatingMember('scope', 'active_acknowledged', [])]))).toMatch(
-      /class="transport-group-resume"[^>]*disabled=""[^>]*title="Motion is blocked by an active alarm condition. Resolve its cause; acknowledging the alarm does not release it."[^>]*>Resume<\/button>/,
-    );
-
-    // Retry is tested against the held operation's exact resources.
-    const paused = controller('intervention_required');
-    const failed = ordinaryMotionStopControls();
-    const offer = failed.recoveryOffer!;
-    offer.recoveryClass = 'operation_failure' as typeof offer.recoveryClass;
-    offer.nodeInstanceId = 'move.1';
-    offer.participants = [{ operation_participant_id: 'p1', resource_ids: ['robot.joint_1'] }];
-    offer.actions = [{
-      actionId: 'retry_motion_from_current_state',
-      requiresConfirmation: false,
-      performsBackendReset: false,
-      enabled: true,
-      disabledReasonCode: null,
-    }];
-    failed.recoveryHolds = [{ motionGroupIds: ['all'], interventionStopScope: 'all', offer }];
-    paused.state.controls = failed;
-    expect(render(withAlarms(paused, [
-      gatingMember('arm', 'returned_unacknowledged', ['robot.joint_1']),
-    ]))).toMatch(
-      /class="transport-group-resume"[^>]*disabled=""[^>]*title="Motion is blocked by unacknowledged alarms. Acknowledge them, then try again."[^>]*>Retry<\/button>/,
-    );
-    expect(render(withAlarms(paused, [
-      gatingMember('other', 'returned_unacknowledged', ['robot.2.joint_1']),
-    ]))).toMatch(/class="transport-group-resume"(?![^>]*disabled)[^>]*>Retry<\/button>/);
+    // Retry lets held motion continue: it needs motion_clear like Run/Resume.
+    paused.readiness = { ...paused.readiness!, motion_clear: false };
+    expect(render()).toMatch(/class="transport-group-resume"[^>]*disabled=""[^>]*>Retry<\/button>/);
   });
 
   it('labels a group with stopped and never-started work Resume', () => {
@@ -1056,10 +1013,8 @@ describe('Program runtime projection', () => {
       source.indexOf('const requestProgramHalt'),
     );
     // Not executing: reset at once. Executing: stop motion, then ask.
-    // confirmReset = the preference, or retained uncertain outputs (contract 66).
-    expect(source).toContain('const confirmReset = preferences.confirmReset || resetUncertain.length > 0;');
-    // The list also covers held Program-run operations (their recovery offers).
-    expect(source).toMatch(/programRunUncertainOutputs\(\[\s*\.\.\.\(program\.state\.controls\?\.recoveryHolds \?\? \[\]\)\.map\(\(hold\) => hold\.offer\),\s*program\.state\.controls\?\.recoveryOffer,/);
+    // confirmReset = the preference only: an unknown write shows on its output (CONTRACTS §7).
+    expect(source).toContain('const confirmReset = preferences.confirmReset;');
     expect(flow).toMatch(/if \(!executionActive\) \{\s*if \(endedReset && confirmReset\) setResetIntent\('confirm'\);\s*else void program\.reset\(\);/);
     expect(flow).toContain("setResetIntent(confirmReset ? 'stopping' : 'automatic');");
     expect(flow).toContain("await program.stopMotion(['all'])");
@@ -1094,7 +1049,8 @@ describe('Program runtime projection', () => {
     expect(source).toContain('disabled={!positionAvailable}');
     expect(source).toContain('void program.reset(resetSelectionApplied);');
     // An idle Reset with nothing selected would restore nothing.
-    expect(source).toContain('disabled={!canReset || (!motionSettled && !endedReset && !idleReset) || !uncertainApproved}');
+    // Never refused for an output with an unknown outcome (CONTRACTS §6).
+    expect(source).toContain('disabled={!canReset || (!motionSettled && !endedReset && !idleReset)}');
     // An idle Reset may restore nothing (contract 141).
     expect(source).not.toContain('resetNothingSelected');
     // The automatic (unconfirmed) running Reset keeps both options off.
@@ -1162,8 +1118,12 @@ describe('Program runtime projection', () => {
     const startingMarkup = renderToStaticMarkup(
       <ProgramTransportControls enabled program={starting} robot={robotController()} />,
     );
+    // The in-flight Execute shows its busy label; Reset names it.
     expect(startingMarkup).toMatch(
-      /class="transport-run transport-unique-control"[^>]*disabled=""[^>]*>Executing<\/button>/,
+      /class="transport-run transport-unique-control"[^>]*disabled=""[^>]*>Executing…<\/button>/,
+    );
+    expect(startingMarkup).toMatch(
+      /class="transport-reset transport-unique-control"[^>]*disabled=""[^>]*title="Execute is in progress."/,
     );
     expect(startingMarkup).toMatch(
       /class="danger-button transport-group-stop"[^>]*disabled=""[^>]*>Stop<\/button>/,
@@ -1287,22 +1247,30 @@ describe('Program runtime projection', () => {
     expect(markup).toMatch(/type="range"[^>]*disabled=/);
   });
 
-  it('blocks Program Resume for a resident manual operation in the other editor mode', () => {
+  it('gates group Resume on RunReadiness alone (CONTRACTS §10)', () => {
     const program = controller();
     program.state.controls = ordinaryMotionStopControls();
     const robot = robotController();
-    robot.currentStatus!.manualOperations = [{
-      programRunId: robot.currentStatus!.directControlGripper!.programRunId,
-      operationId: 'manual-gripper', operationRevision: 1, resident: true,
-      state: 'executing', progress: 0.5, activeStopId: null,
-      activeStopGeneration: null, terminalError: null,
-    }];
-    expect(robot.state.operation).toBeNull();
+    // A resident manual operation is the backend's blocked reason; the GUI
+    // keeps no gate of its own.
+    program.readiness = { can_execute: false, can_resume: false, motion_clear: false, blocked_reasons: [
+      { code: 'manual_operation_in_progress', message: 'A manual operation is in progress.' }] };
     const blocked = renderToStaticMarkup(<ProgramTransportControls enabled program={program} robot={robot} />);
     expect(blocked).toMatch(/class="transport-group-resume"[^>]*disabled=""/);
-    robot.currentStatus!.manualOperations[0].resident = false;
+    program.readiness = { can_execute: false, can_resume: true, motion_clear: true, blocked_reasons: [] };
     const released = renderToStaticMarkup(<ProgramTransportControls enabled program={program} robot={robot} />);
     expect(released).toMatch(/class="transport-group-resume"(?![^>]*disabled)/);
+    // §8: a rule hold gates the groups its scope meets, with its message.
+    program.readiness = { can_execute: false, can_resume: false, motion_clear: true, blocked_reasons: [
+      { code: 'rule_holds', message: 'Rule door holds its scope (its condition holds)', rule_id: 'door',
+        scope: 'everything' }] };
+    expect(renderToStaticMarkup(<ProgramTransportControls enabled program={program} robot={robot} />))
+      .toMatch(/class="transport-group-resume"[^>]*disabled=""[^>]*title="Rule door holds its scope \(its condition holds\)"/);
+    program.readiness = { can_execute: false, can_resume: true, motion_clear: true, blocked_reasons: [
+      { code: 'rule_holds', message: 'Rule door holds its scope', rule_id: 'door',
+        scope: 'execution_groups', component_ids: ['other_robot'] }] };
+    expect(renderToStaticMarkup(<ProgramTransportControls enabled program={program} robot={robot} />))
+      .toMatch(/class="transport-group-resume"(?![^>]*disabled)/);
   });
 
   it('does not delay Run while a coalesced velocity update is pending', () => {
@@ -1457,7 +1425,7 @@ describe('Program runtime projection', () => {
     };
     robot.state.status.manualOperations = [operation];
     const idle = controller('succeeded', 'idle_after_reset');
-    idle.commandAllowed = vi.fn(() => false);
+    idle.readiness = { can_execute: false, can_resume: false, motion_clear: true, blocked_reasons: [] };
     const openRecovery = vi.fn();
     const guidance = (enabled = true) => deriveTransportGuidance({
       enabled, program: idle, robot, motionActive: false,
@@ -1527,28 +1495,76 @@ describe('Program runtime projection', () => {
     expect(robot.selectMode).toHaveBeenCalledWith('joint');
   });
 
-  it('shows post-Reset waiting in the existing notice stack and preserves fault priority', () => {
+  it('enables Execute and Resume only from RunReadiness and shows every blocked reason', () => {
     const program = controller('succeeded', 'idle_after_reset');
-    program.commandAllowed = vi.fn(() => false);
-    program.commandDisabledReason = vi.fn(() => PROGRAM_RESET_READINESS_MESSAGE);
+    program.state.run = null;
+    program.state.controls = null;
     const robot = robotController();
-    const guidance = () => deriveTransportGuidance({
-      enabled: true, program, robot, motionActive: false,
-      onReviewProgramRecovery: vi.fn(),
-    });
-    expect(guidance()).toEqual([expect.objectContaining({
-      id: 'program.reset-readiness', severity: 'info', title: PROGRAM_RESET_READINESS_MESSAGE,
-    })]);
-    const markup = renderToStaticMarkup(<ProgramTransportControls
-      enabled program={program} robot={robot} onOpenRobotControls={vi.fn()} />);
+    const render = () => renderToStaticMarkup(<ProgramTransportControls
+      enabled program={program} robot={robot} />);
+    expect(render()).toMatch(/class="transport-run transport-unique-control"(?![^>]*disabled)[^>]*>Execute<\/button>/);
+    // As in M7, the Runner's own Run gate applies too (e.g. a failed scene preparation).
+    program.runnerAllows = vi.fn((kind: string) => kind !== 'program_run');
+    program.runnerRefusal = vi.fn(() => 'program_scene_preparation_failed');
+    expect(render()).toMatch(/class="transport-run transport-unique-control"[^>]*disabled=""[^>]*title="program scene preparation failed"/);
+    program.runnerAllows = vi.fn(() => true);
+    program.runnerRefusal = vi.fn(() => null);
+    // A run's motion running is shown by the run, not as a blocked reason.
+    program.readiness = { can_execute: false, can_resume: false, motion_clear: true, blocked_reasons: [
+      { code: 'run_in_progress', message: 'A run is in progress.' },
+      { code: 'program_motion_running', message: 'The run is not stopped.' },
+    ] };
+    expect(renderToStaticMarkup(<ProgramRuntimePanel enabled controller={program} />))
+      .not.toContain('Execute and Resume are blocked:');
+    program.readiness = {
+      can_execute: false,
+      can_resume: false,
+      motion_clear: false,
+      blocked_reasons: [
+        { code: 'component_not_enabled', message: 'not enabled', component_id: 'lite6_robot' },
+        { code: 'rule_holds', message: 'holds', rule_id: 'door' },
+      ],
+    };
+    const markup = render();
     expect(markup).toMatch(/class="transport-run transport-unique-control"[^>]*disabled=""/);
-    program.commandDisabledReason = vi.fn(() => null);
-    expect(guidance()).toEqual([]);
-    program.commandDisabledReason = vi.fn(() => PROGRAM_RESET_READINESS_MESSAGE);
-    program.cycleState = 'recovery_required';
-    program.cycleFailure = { code: 'program_scene_preparation_failed', message: 'Scene convergence failed' };
-    expect(guidance().map((notice) => notice.id)).toContain('recovery.program');
-    expect(guidance().map((notice) => notice.id)).not.toContain('program.reset-readiness');
+    expect(markup).toContain('lite6_robot: Component not enabled');
+    expect(markup).toContain('door: A rule holds this motion');
+    // The details list every reason, with the ids they name.
+    const details = renderToStaticMarkup(<ProgramRuntimePanel enabled controller={program} />);
+    expect(details).toContain('Execute and Resume are blocked:');
+    expect(details).toContain('<li>lite6_robot: Component not enabled</li>');
+    expect(details).toContain('<li>door: A rule holds this motion</li>');
+    // Unknown readiness is never treated as ready.
+    program.readiness = null;
+    expect(render()).toMatch(/class="transport-run transport-unique-control"[^>]*disabled=""[^>]*title="Execute readiness unavailable: the execution host&#x27;s state can&#x27;t be read."/);
+    // Resume after Halt follows can_resume.
+    const halted = controller('full_stopped');
+    halted.readiness = { can_execute: false, can_resume: false, motion_clear: true, blocked_reasons: [] };
+    const haltedMarkup = () => renderToStaticMarkup(<ProgramTransportControls
+      enabled program={halted} robot={robot} />);
+    expect(haltedMarkup()).toMatch(/class="transport-run transport-unique-control"[^>]*disabled=""/);
+    halted.readiness = { can_execute: false, can_resume: true, motion_clear: true, blocked_reasons: [] };
+    expect(haltedMarkup()).toMatch(/class="transport-run transport-unique-control"(?![^>]*disabled)[^>]*title="Resume the halted Program tree/);
+  });
+
+  it('offers "Activate components and execute?" only when components not enabled are the only blockers', () => {
+    const program = controller('succeeded', 'idle_after_reset');
+    program.state.run = null;
+    program.state.controls = null;
+    program.readiness = { can_execute: false, can_resume: false, motion_clear: false, blocked_reasons: [
+      { code: 'component_not_enabled', message: 'not enabled', component_id: 'lite6_robot' },
+    ] };
+    const robot = robotController();
+    const render = () => renderToStaticMarkup(<ProgramTransportControls enabled program={program} robot={robot} />);
+    // The hook says whether Activate clears every blocker (another blocker: disabled).
+    expect(render()).toMatch(/class="transport-run transport-unique-control"[^>]*disabled=""/);
+    program.activation = { ...program.activation, available: true };
+    expect(render()).toMatch(/class="transport-run transport-unique-control"(?![^>]*disabled)[^>]*title="Activate the components that are not enabled, then execute the Program once./);
+    expect(render()).not.toContain('Activate components and execute?');
+    program.activation = { ...program.activation, flow: { phase: 'offered', componentIds: ['lite6_robot'], failures: [] } };
+    const open = render();
+    expect(open).toContain('Activate components and execute?');
+    expect(open).toMatch(/class="transport-run transport-unique-control"[^>]*disabled=""/);
   });
 
   it('points Program faults to recovery and normal terminal runs to Reset', () => {
@@ -1583,6 +1599,34 @@ describe('Program runtime projection', () => {
     expect(guidance()).toEqual([expect.objectContaining({
       id: 'program.reset-required', severity: 'info', title: 'Program finished',
     })]);
+    // CONTRACTS §9: the run's end reason names why it ended.
+    const ended = (runEnd: NonNullable<ProgramRunStatus['runEnd']>) => {
+      program.state.run!.runEnd = runEnd;
+      return guidance()[0];
+    };
+    expect(ended({ end_reason: 'completed', details: {} }))
+      .toMatchObject({ id: 'program.reset-required', severity: 'info', title: 'Completed' });
+    expect(ended({ end_reason: 'failed', details: { node_instance_id: 'move',
+      error: { code: 'rule_holds', message: 'held' } } }))
+      .toMatchObject({ severity: 'warning', title: 'Ended by failure at move: A rule holds this motion' });
+    expect(ended({ end_reason: 'stopped', details: { stopped_by: 'rule', rule_id: 'door' } }))
+      .toMatchObject({ severity: 'warning', title: 'Stopped by rule door' });
+    expect(ended({ end_reason: 'stopped', details: { stopped_by: 'operator' } }))
+      .toMatchObject({ severity: 'warning', title: 'Stopped by the operator' });
+    expect(ended({ end_reason: 'cell_fault', details: { component_id: 'lite6_robot',
+      error: { code: 'fault_estop', message: 'e-stop' } } }))
+      .toMatchObject({ severity: 'error', title: 'Ended by a cell fault: lite6_robot (Emergency stop active)' });
+  });
+
+  it('shows the run end reason in the run status tile', () => {
+    const program = controller('failed', 'terminal_awaiting_reset');
+    program.state.run!.runEnd = { end_reason: 'cell_fault', details: { component_id: 'lite6_robot' } };
+    const markup = renderToStaticMarkup(<ProgramRuntimePanel enabled controller={program} />);
+    expect(markup).toContain('<strong class="run-end tone-error">Ended by a cell fault</strong>');
+    expect(markup).toContain('Ended by a cell fault: lite6_robot · ');
+    program.state.run!.runEnd = { end_reason: 'completed', details: {} };
+    expect(renderToStaticMarkup(<ProgramRuntimePanel enabled controller={program} />))
+      .toContain('<strong class="run-end tone-neutral">Completed</strong>');
   });
 
   it('names the held node failure and its details in the Program recovery notice', () => {
@@ -1620,173 +1664,38 @@ describe('Program runtime projection', () => {
     });
   });
 
-  it('surfaces a cell-wide latch but never treats a cleared historical latch as blocking', () => {
+  it('shows the cell latch as one error item with every cause and no recovery action (R1, R2)', () => {
     const robot = robotController();
-    robot.state.status = statusFixture();
-    robot.currentStatus = robot.state.status;
-    const fault = {
-      latchId: 'latch', latchGeneration: 1, state: 'latched' as const,
-      trigger: 'physical_rest_unproven' as const, recoveryStatus: 'waiting_for_observation' as const,
-      observedTriggers: ['physical_rest_unproven' as const],
-      reasonCode: 'physical_rest_unproven', certificate: null,
-    };
-    robot.state.status.cellStopAction.fault = fault;
+    robot.currentStatus = statusFixture();
+    const program = controller('succeeded', 'idle_after_reset');
     const guidance = () => deriveTransportGuidance({
-      enabled: true, program: controller(), robot, motionActive: false,
-      onReviewProgramRecovery: vi.fn(),
+      enabled: true, program, robot, motionActive: false,
+      onReviewProgramRecovery: vi.fn(), onReset: { run: vi.fn(), disabled: false },
     });
-    const [cell] = guidance();
-    expect(cell).toMatchObject({ id: 'recovery.cell', severity: 'error', title: 'Cell recovery required' });
-    expect(cell.message).toContain('waiting for observation');
-    expect(cell.actions?.[0]).toMatchObject({ label: 'Retry recovery', disabled: false });
-    robot.state.status.cellStopAction.fault = { ...fault, state: 'cleared' };
     expect(guidance()).toEqual([]);
-  });
-
-  it('shows open component incidents before Recover cell and keeps it available', () => {
-    const robot = robotController();
-    robot.state.status = statusFixture();
-    robot.currentStatus = robot.state.status;
-    robot.state.status.cellStopAction.fault = {
-      latchId: 'latch', latchGeneration: 1, state: 'latched' as const,
-      trigger: 'physical_rest_unproven' as const, recoveryStatus: 'waiting_for_configuration' as const,
-      observedTriggers: ['physical_rest_unproven' as const],
-      reasonCode: 'physical_rest_unproven', certificate: null,
+    program.cellLatch = {
+      latched: true,
+      causes: [
+        { component_id: 'lite6_robot', kind: 'fault', fault: {
+          code: 'fault_estop', message: 'e-stop', clearable: true, operator_action: 'enable', since_ns: 1 } },
+        { component_id: 'plc_io', kind: 'offline' },
+        { component_id: 'gripper', kind: 'activity_unknown' },
+      ],
     };
-    robot.componentIncidents = [{
-      controllableComponentId: 'component.arm',
-      incident: {
-        incidentId: 'incident.1',
-        causeClass: 'external_control',
-        vendorCodes: ['state=5', 'mode=2'],
-        detectedAtNs: 1_000,
-        summary: 'Robot moved from its own interface',
-        acknowledged: false,
-      },
-    }];
-    const [cell] = deriveTransportGuidance({
-      enabled: true, program: controller(), robot, motionActive: false,
-      onReviewProgramRecovery: vi.fn(),
+    const [latch] = guidance();
+    expect(latch).toMatchObject({
+      id: 'cell.latch', severity: 'error',
+      title: '3 errors require attention · lite6_robot: Emergency stop active',
     });
-    expect(cell.message).toContain(
-      'component.arm: Robot moved from its own interface · cause: robot moved '
-      + 'or changed mode from its own interface · vendor codes: state=5, mode=2.',
-    );
-    expect(cell.actions?.[0]).toMatchObject({ label: 'Recover cell', disabled: false });
-  });
-
-  it('makes each open incident one red item with its cause and Recover cell (ERRUI)', () => {
-    const robot = robotController();
-    robot.state.status = statusFixture();
-    robot.currentStatus = robot.state.status;
-    robot.state.status.cellStopAction.fault = {
-      latchId: 'latch', latchGeneration: 1, state: 'latched' as const,
-      trigger: 'physical_rest_unproven' as const, recoveryStatus: 'ready' as const,
-      observedTriggers: ['physical_rest_unproven' as const],
-      reasonCode: 'external_control', certificate: null,
-    };
-    robot.componentIncidents = [{
-      controllableComponentId: 'lite6_robot',
-      incident: {
-        incidentId: 'incident.1', causeClass: 'external_control', vendorCodes: [],
-        detectedAtNs: 1_000, acknowledged: false,
-        summary: 'Component lite6_robot was changed from the robot\'s own interface without a ManyForge request',
-      },
-    }];
-    const [cell] = deriveTransportGuidance({
-      enabled: true, program: controller('succeeded', 'idle_after_reset'), robot,
-      motionActive: false, onReviewProgramRecovery: vi.fn(),
-      onReset: { run: vi.fn(), disabled: false },
-    });
-    expect(cell).toMatchObject({
-      id: 'recovery.cell', severity: 'error', title: 'Open incident on lite6_robot',
-      alarmDefinitionIds: ['manyforge.motion.stop_fault'],
-      alarmSubjects: [{ definitionId: 'manyforge.runtime.component_lifecycle_fault', subjectId: 'lite6_robot' }],
-    });
-    expect(cell.message).toContain('lite6_robot: Component lite6_robot was changed from the robot');
-    expect(cell.message).toContain('Press Recover cell: it acknowledges the incident and recovers the cell.');
-    expect(cell.message).toContain('This clears the cause of the alarms shown here');
-    // No Program cycle is active: Recover cell is the only action.
-    expect(cell.actions?.map((action) => action.label)).toEqual(['Recover cell']);
-    cell.actions?.[0].run();
-    expect(robot.recoverStopFault).toHaveBeenCalledTimes(1);
-
-    // RECTIME: a press that outlived one HTTP call reads "in progress".
-    robot.stopFaultRecoveryPending = true;
-    robot.stopFaultRecoveryInProgress = true;
-    const [waiting] = deriveTransportGuidance({
-      enabled: true, program: controller('succeeded', 'idle_after_reset'), robot,
-      motionActive: false, onReviewProgramRecovery: vi.fn(),
-      onReset: { run: vi.fn(), disabled: false },
-    });
-    expect(waiting.actions?.map((action) => [action.label, action.disabled])).toEqual([
-      ['Recovering… (in progress)', true],
-    ]);
-  });
-
-  it('SX-679: offers Abort while Recover cell runs, and Recover cell waits while Close runs', () => {
-    const robot = robotController();
-    robot.state.status = statusFixture();
-    robot.currentStatus = robot.state.status;
-    robot.state.status.cellStopAction.fault = {
-      latchId: 'latch', latchGeneration: 1, state: 'latched' as const,
-      trigger: 'physical_rest_unproven' as const, recoveryStatus: 'ready' as const,
-      observedTriggers: ['physical_rest_unproven' as const],
-      reasonCode: 'external_control', certificate: null,
-    };
-    const derive = () => deriveTransportGuidance({
-      enabled: true, program: controller('succeeded', 'idle_after_reset'), robot,
-      motionActive: false, onReviewProgramRecovery: vi.fn(),
-    });
-    // Scenario Close runs: Recover cell is disabled, with the reason.
-    robot.cellRecoverBlockedReason = 'Scenario Close is in progress; Recover cell waits until it ends.';
-    const blocked = derive().find((notice) => notice.id === 'recovery.cell');
-    expect(blocked?.actions?.[0]).toMatchObject({
-      id: 'recover-cell', disabled: true, title: robot.cellRecoverBlockedReason,
-    });
-    expect(derive().some((notice) => notice.id === 'recovery.cell.running')).toBe(false);
-
-    // A press runs: Abort is offered and calls the controller.
-    robot.cellRecoverBlockedReason = null;
-    robot.stopFaultRecoveryPending = true;
-    const running = derive().find((notice) => notice.id === 'recovery.cell.running');
-    expect(running?.actions?.map((action) => [action.label, action.disabled])).toEqual([
-      ['Abort Recover cell', false],
-    ]);
-    running?.actions?.[0].run();
-    expect(robot.abortRecoverStopFault).toHaveBeenCalledTimes(1);
-    robot.stopFaultRecoveryAbortPending = true;
-    expect(derive().find((notice) => notice.id === 'recovery.cell.running')?.actions?.[0])
-      .toMatchObject({ label: 'Aborting…', disabled: true });
-  });
-
-  it('puts Reset before Recover cell while a Program cycle is active (ERRUI)', () => {
-    const robot = robotController();
-    robot.state.status = statusFixture();
-    robot.currentStatus = robot.state.status;
-    robot.state.status.cellStopAction.fault = {
-      latchId: 'latch', latchGeneration: 1, state: 'latched' as const,
-      trigger: 'physical_rest_unproven' as const, recoveryStatus: 'ready' as const,
-      observedTriggers: ['physical_rest_unproven' as const],
-      reasonCode: 'external_control', certificate: null,
-    };
-    robot.componentIncidents = [{
-      controllableComponentId: 'lite6_robot',
-      incident: {
-        incidentId: 'incident.1', causeClass: 'external_control', vendorCodes: [],
-        detectedAtNs: 1_000, acknowledged: false, summary: 'Robot moved from its own interface',
-      },
-    }];
-    const reset = vi.fn();
-    const [cell] = deriveTransportGuidance({
-      enabled: true, program: controller('running', 'running'), robot, motionActive: false,
-      onReviewProgramRecovery: vi.fn(), onReset: { run: reset, disabled: false },
-    });
-    expect(cell.message).toContain('A Program run is still active: Reset the Program first, then Recover cell.');
-    expect(cell.actions?.map((action) => action.id)).toEqual(['reset', 'recover-cell']);
-    cell.actions?.[0].run();
-    expect(reset).toHaveBeenCalledTimes(1);
-    expect(robot.recoverStopFault).not.toHaveBeenCalled();
+    expect(latch.message).toContain('plc_io: offline.');
+    expect(latch.message).toContain('gripper: can\'t report whether it is still moving.');
+    // No acknowledgement, no Recover cell: the latch clears by itself.
+    expect(latch.actions).toBeUndefined();
+    const details = renderToStaticMarkup(<ProgramTransportControls
+      enabled program={program} robot={robot} />);
+    expect(details).toMatch(/class="transport-run transport-unique-control"/);
+    program.cellLatch = { latched: false, causes: [] };
+    expect(guidance()).toEqual([]);
   });
 
   it('classifies live-view observation by what the operator can rely on', () => {
@@ -1840,19 +1749,14 @@ describe('Program runtime projection', () => {
     const program = controller('intervention_required', 'recovery_required');
     const robot = robotController();
     robot.state.status = statusFixture();
-    robot.state.status.cellStopAction.fault = {
-      latchId: 'latch', latchGeneration: 1, state: 'latched',
-      trigger: 'physical_rest_unproven', recoveryStatus: 'waiting_for_observation',
-      observedTriggers: ['physical_rest_unproven'],
-      reasonCode: 'physical_rest_unproven', certificate: null,
-    };
+    program.cellLatch = { latched: true, causes: [{ component_id: 'lite6_robot', kind: 'offline' }] };
     robot.currentStatus = null;
     const notices = deriveTransportGuidance({
       enabled: true, program, robot, motionActive: false,
       observationTransport: { phase: 'no_robot_loaded', message: 'No robot loaded' },
       onReviewProgramRecovery: vi.fn(),
     });
-    expect(notices.map((notice) => notice.id)).toEqual(['recovery.cell', 'recovery.program']);
+    expect(notices.map((notice) => notice.id)).toEqual(['cell.latch', 'recovery.program']);
     expect(notices.every((notice) => notice.severity === 'error')).toBe(true);
   });
 
@@ -2282,79 +2186,27 @@ describe('Per-hold Retry and Continue', () => {
     }
   });
 
-  it('offers an unconfirmed Stop hold its Continue as Acknowledge, confirmed first (item 11)', async () => {
-    const program = twoHolds();
-    const [left, right] = program.state.controls!.recoveryHolds;
-    for (const offer of [program.state.controls!.recoveryOffer!, left.offer]) {
-      offer.reason = {
-        ...offer.reason,
-        code: 'program_stop_settlement_unconfirmed',
-        message: 'Stop not confirmed: acknowledge to continue',
-      };
-    }
-    const markup = renderToStaticMarkup(
-      <ProgramTransportControls enabled program={program} robot={robotController()} />,
-    );
-    expect(markup).toMatch(
-      /class="danger-button transport-group-stop"(?![^>]*disabled)[^>]*title="Stop not confirmed: acknowledge to continue"[^>]*aria-label="Acknowledge left: Stop not confirmed for held node left.move"[^>]*>Acknowledge<\/button>/,
-    );
-    // Any other hold keeps its ordinary Continue.
-    expect(markup).toContain('aria-label="Continue right: fail held node right.move"');
-
-    const transport = await mountTransport(program);
-    try {
-      await transport.press((props) => props['aria-label']
-        === 'Acknowledge left: Stop not confirmed for held node left.move');
-      expect(transport.mounted((props) => props.id === 'program-continue-confirmation-title'
-        && props.children === 'Stop not confirmed: acknowledge to continue')).toBe(true);
-      expect(program.applyRecoveryAction).not.toHaveBeenCalled();
-      await transport.press((props) => props.className === 'danger-button' && props.children === 'Acknowledge');
-      // The existing Continue action, for this hold's own offer.
-      expect(program.applyRecoveryAction).toHaveBeenCalledExactlyOnceWith(left.offer, 'continue_with_failure');
-      expect(program.applyRecoveryAction).not.toHaveBeenCalledWith(right.offer, expect.anything());
-    } finally {
-      await transport.unmount();
-    }
-  });
-
-  /** Both holds reserve robot.joint_1; the alarm projection holds `members`. */
-  function heldWithAlarms(members: AlarmMotionAttentionMember[]): ProgramRuntimeController {
+  /** Both holds reserve robot.joint_1. */
+  function heldWithAlarms(): ProgramRuntimeController {
     const program = twoHolds();
     const controls = program.state.controls!;
     for (const offer of [controls.recoveryOffer!, ...controls.recoveryHolds.map((hold) => hold.offer)]) {
       offer.participants = [{ operation_participant_id: 'p1', resource_ids: ['robot.joint_1'] }];
     }
-    return {
-      ...program,
-      motionAttentionBlock: (resourceIds) => motionAttentionBlock(
-        alarmSnapshot(members), resourceIds, ACTIVE_CONFIGURATION,
-      ),
-    };
+    return program;
   }
 
-  it('disables Continue, like Retry, until the gating alarm is acknowledged', () => {
-    const render = (program: ProgramRuntimeController) => renderToStaticMarkup(
-      <ProgramTransportControls enabled program={program} robot={robotController()} />,
+  it('never gates Continue or Retry on alarm acknowledgement', () => {
+    const markup = renderToStaticMarkup(
+      <ProgramTransportControls enabled program={heldWithAlarms()} robot={robotController()} />,
     );
-    const blocked = render(heldWithAlarms([
-      gatingMember('arm', 'active_unacknowledged', ['robot.joint_1']),
-    ]));
-    const remedy = 'Motion is blocked by unacknowledged alarms. Acknowledge them, then try again.';
-    expect(blocked).toMatch(new RegExp(
-      `class="danger-button transport-group-stop"[^>]*disabled=""[^>]*title="${remedy}"[^>]*aria-label="Continue left`,
-    ));
-    expect(blocked).toMatch(new RegExp(
-      `class="transport-group-resume"[^>]*disabled=""[^>]*title="${remedy}"[^>]*>Retry</button>`,
-    ));
-    // Once acknowledged the record leaves the gating membership.
-    const acknowledged = render(heldWithAlarms([]));
-    expect(acknowledged).toMatch(
+    expect(markup).toMatch(
       /class="danger-button transport-group-stop"(?![^>]*disabled)[^>]*title="Continuing fails the node"[^>]*aria-label="Continue left/,
     );
   });
 
-  it('shows the Recovery block cause first, with the blocking alarm and each command\'s reason', () => {
-    const program = heldWithAlarms([]);
+  it('shows the Recovery block cause first, with each command\'s reason', () => {
+    const program = heldWithAlarms();
     program.cycleState = 'recovery_required';
     program.cycleFailure = { code: 'ik_failed', message: 'RoboPlan could not resolve the pose goal' };
     const command = (label: string, reason: string | null = null) => ({
@@ -2365,8 +2217,7 @@ describe('Per-hold Retry and Continue', () => {
         enabled
         controller={program}
         recovery={{
-          acknowledge: { busy: false, error: null, run: vi.fn() },
-          retry: command('Retry', 'Motion is blocked by unacknowledged alarms. Acknowledge them, then try again.'),
+          retry: command('Retry', 'Retry is unavailable: not allowed.'),
           continue: command('Continue'),
           reset: command('Reset'),
         }}
@@ -2379,12 +2230,9 @@ describe('Per-hold Retry and Continue', () => {
     expect(markup).toContain('class="runtime-control-section program-recovery-failed"');
     expect(markup).toMatch(/<h3 id="runtime-recovery-title">Recovery<\/h3>.*<p class="program-recovery-cause">RoboPlan could not resolve the pose goal<\/p>/);
     const order = [
-      'Acknowledge the alarm.',
-      'Retry and Continue are blocked until it is acknowledged.',
-      '>Acknowledge</button>',
       'Fix the cause.',
       'Apply then Resets the run',
-      '>Retry</button><span>Re-run the node.</span><span class="inline-message severity-error">Motion is blocked by unacknowledged alarms.',
+      '>Retry</button><span>Re-run the node.</span><span class="inline-message severity-error">Retry is unavailable: not allowed.',
       '>Continue</button><span>Fail the node; the Program tree handles the FAILURE.</span></div>',
       '>Reset</button><span>End the run.</span></div>',
       'Retry limit',
@@ -2392,18 +2240,13 @@ describe('Per-hold Retry and Continue', () => {
     ].map((text) => markup.indexOf(text));
     expect(order.every((index) => index >= 0)).toBe(true);
     expect([...order].sort((left, right) => left - right)).toEqual(order);
-    // Without a blocking alarm there is no acknowledgement step.
-    expect(renderToStaticMarkup(
-      <ProgramRuntimePanel enabled controller={program} recovery={{
-        acknowledge: null, retry: command('Retry'), continue: null, reset: command('Reset'),
-      }} />,
-    )).not.toContain('Acknowledge the alarm.');
+    expect(markup).not.toContain('Acknowledge');
   });
 
   it('takes a held failure\'s cause from its offer while the cycle is still running', () => {
     // The live hold shape: the run waits for intervention, the cycle has no failure.
     const render = (recoveryClass: string) => {
-      const program = heldWithAlarms([]);
+      const program = heldWithAlarms();
       program.cycleState = 'running';
       program.cycleFailure = null;
       const offer = program.state.controls!.recoveryOffer!;
@@ -2416,7 +2259,7 @@ describe('Per-hold Retry and Continue', () => {
       };
       const command = (label: string) => ({ label, enabled: true, reason: null, run: vi.fn() });
       return renderToStaticMarkup(<ProgramRuntimePanel enabled controller={program} recovery={{
-        acknowledge: null, retry: command('Retry'), continue: null, reset: command('Reset'),
+        retry: command('Retry'), continue: null, reset: command('Reset'),
       }} />);
     };
     const failed = render('failed_validation');
@@ -2431,22 +2274,7 @@ describe('Per-hold Retry and Continue', () => {
 
   it('runs the Recovery block commands through the Motion and Program panel handlers', async () => {
     vi.spyOn(api.execution, 'admittedSpeeds').mockReturnValue(new Promise(() => undefined));
-    const acknowledge = vi.spyOn(api.alarms, 'acknowledge').mockResolvedValue({});
-    const member = gatingMember('arm', 'active_unacknowledged', ['robot.joint_1']);
-    const blocked = heldWithAlarms([member]);
-    const transport = await mountTransport(blocked);
-    try {
-      await transport.press((props) => props['aria-label'] === 'Program run information');
-      await transport.press((props) => props.children === 'Acknowledge'
-        && String(props.title).startsWith('Acknowledge these exact'));
-      expect(acknowledge).toHaveBeenCalledExactlyOnceWith(member, 'alarm.epoch.1', expect.any(String));
-    } finally {
-      await transport.unmount();
-      vi.restoreAllMocks();
-    }
-
-    vi.spyOn(api.execution, 'admittedSpeeds').mockReturnValue(new Promise(() => undefined));
-    const program = heldWithAlarms([]);
+    const program = heldWithAlarms();
     const [left] = program.state.controls!.recoveryHolds;
     const open = await mountTransport(program);
     try {
@@ -2478,74 +2306,6 @@ describe('Per-hold Retry and Continue', () => {
       vi.restoreAllMocks();
     }
   });
-});
-
-function activationComponent(id: string): CCLCComponentSnapshot {
-  return { controllableComponentId: id, lifecycleState: 'declared', lifecycleGeneration: 1,
-    retainedBundleId: 'bundle', graphRevision: 'graph', publicationGeneration: 3,
-    activePublicPointerDigest: 'pointer.3', domains: [], providers: [], lifecycleTarget: null,
-    lifecycleProgress: null, readiness: { requestOwnerEpoch: 'cclc.1', evaluatedAtNs: 1,
-      nextIntent: 'prepare', requestedState: 'prepared', ready: false,
-      error: { code: 'component_lifecycle_transition_missing', message: 'No lifecycle transition is satisfied',
-        details: { reason: 'no_transition_satisfied' } }, providerOccurrences: [],
-      measuredState: { required: false, available: null, error: null } } };
-}
-
-describe('Execute activation live presentation', () => {
-  function activating() {
-    const program = controller();
-    const arm = activationComponent('lite6_robot');
-    const plc = activationComponent('plc_io');
-    program.activationOffer = {
-      identity: 'captured.confirmation',
-      activationOrder: { retainedBundleId: 'bundle', graphRevision: 'graph', componentIds: ['lite6_robot', 'plc_io'] },
-      components: [arm, plc],
-    };
-    program.activationPending = true;
-    program.activationComponentHealth = {
-      lite6_robot: { snapshot: { ...arm, lifecycleState: 'active', lifecycleGeneration: 3 }, error: null },
-      plc_io: { snapshot: plc, error: null },
-    };
-    program.activationProgress = 'plc_io: Not ready · [component_lifecycle_transition_missing] No lifecycle transition is satisfied · no_transition_satisfied';
-    return program;
-  }
-  function render(program: ProgramRuntimeController) {
-    return renderToStaticMarkup(<ProgramTransportControls enabled program={program} robot={robotController()} />);
-  }
-
-  it('shows the active arm and actual PLC wait while retaining the original confirmation', () => {
-    const program = activating();
-    const offer = structuredClone(program.activationOffer);
-    const markup = render(program);
-    expect(markup).toContain('lite6_robot (active)');
-    expect(markup).toContain('plc_io (declared)');
-    expect(markup).toContain(program.activationProgress!);
-    expect(program.activationOffer).toEqual(offer);
-    expect(program.run).not.toHaveBeenCalled();
-    expect(program.confirmActivationExecute).not.toHaveBeenCalled();
-    expect(program.cancelActivationExecute).not.toHaveBeenCalled();
-  });
-
-  it.each(['component', 'bundle', 'graph', 'publication', 'pointer', 'owner', 'missing', 'error'])(
-    'does not present %s health as current for the offered component', (mismatch) => {
-      const program = activating();
-      const health = program.activationComponentHealth.lite6_robot;
-      const current = health.snapshot!;
-      if (mismatch === 'component') current.controllableComponentId = 'other.robot';
-      if (mismatch === 'bundle') current.retainedBundleId = 'other.bundle';
-      if (mismatch === 'graph') current.graphRevision = 'other.graph';
-      if (mismatch === 'publication') current.publicationGeneration += 1;
-      if (mismatch === 'pointer') current.activePublicPointerDigest = 'other.pointer';
-      if (mismatch === 'owner') current.readiness = { ...current.readiness, requestOwnerEpoch: 'other.owner' };
-      if (mismatch === 'missing') delete program.activationComponentHealth.lite6_robot;
-      if (mismatch === 'error') { health.snapshot = null; health.error = 'Current component read failed'; }
-      const markup = render(program);
-      expect(markup).not.toContain('lite6_robot (active)');
-      expect(markup).not.toContain('lite6_robot (declared)');
-      expect(markup).toContain(mismatch === 'error' ? 'Current component read failed'
-        : 'Current component health has not been read.');
-    },
-  );
 });
 
 describe('Recovery class label', () => {
@@ -2819,6 +2579,8 @@ describe('Active TCP Resume confirmation', () => {
 describe('Active TCP confirmation for halted Program and ready group', () => {
   function markHalted(program: ProgramRuntimeController) {
     program.state.run!.state = 'full_stopped';
+    // The backend's readiness for a halted run (CONTRACTS §10).
+    program.readiness = { can_execute: false, can_resume: true, motion_clear: true, blocked_reasons: [] };
     for (const group of program.state.controls!.executionSelections.groups) {
       group.state = 'unavailable';
       group.ordinaryHeldNodeCount = null;

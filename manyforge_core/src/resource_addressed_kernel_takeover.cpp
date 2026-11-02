@@ -90,7 +90,7 @@ ResourceAddressedExecutionKernel::try_accept_motion_takeover(
     if (target_physical != physical->slot_owner) return busy();
     if (auto refusal = component_command_refusal_locked(registration))
       return Outcome::Err(std::move(*refusal));
-    if (motion_admission_closed_)
+    if (motion_admission_closed_locked())
       return reject<std::optional<OperationAcceptedDTO>>("new motion admission is closed",
                                                          "motion_admission_closed",
                                                          ErrorCode::kInvalidStateTransition);
@@ -213,8 +213,6 @@ ResourceAddressedExecutionKernel::try_accept_motion_takeover(
       winner->state = logical_state;
       incumbent->pending_motion_takeover = std::move(prepared_operation);
     }
-    // Item 37: a new operation ends the operator's Force close arm.
-    force_close_stop_generation_.reset();
   }
   const auto accepted_write = attempt_journal_write([&] {
     return journal_.RecordOperationAccepted(config_.request_owner_epoch, prepared_replay.intent,
@@ -328,8 +326,8 @@ Result<void> ResourceAddressedExecutionKernel::commit_motion_takeover_owner_lock
       incumbent.recovery_effect_in_flight || incumbent.stop_effect_in_flight ||
       old_row->dispatch_effect_in_flight || next_row->prepare_in_flight ||
       (mode == ResourceSlotOwnerTransferMode::kMoving && !next_row->prepared_participant) ||
-      !candidate.ordinary_acceptance_durable || motion_admission_closed_ ||
-      is_active_stop_fault_latch(active_stop_fault_latch_))
+      !candidate.ordinary_acceptance_durable || motion_admission_closed_locked() ||
+      cell_latched_locked())
     return reject<void>("takeover ownership is no longer current", "motion_takeover_owner_stale");
   const auto scope = validate_program_execution_scope_locked(candidate.intent, false, false);
   if (!scope.ok()) return scope;
@@ -405,7 +403,8 @@ Result<void> ResourceAddressedExecutionKernel::commit_motion_takeover_owner_lock
         incumbent.state.operation_id, MotionTakeoverPathDTO::kMovingReplacement, std::nullopt,
         next_state.updated_at_ns,
         std::max<std::int64_t>(0, next_state.updated_at_ns - candidate.accepted.accepted_at_ns),
-        next_row->takeover_preparation_budget_ns.value_or(0), std::nullopt};
+        next_row->takeover_preparation_budget_ns.value_or(0), std::nullopt,
+        next_row->takeover_planning_budget_ns.value_or(0)};
   }
   stamp_operation_capture_locked(candidate, next_state);
   captures = {old_state, next_state};
@@ -628,7 +627,7 @@ Result<void> ResourceAddressedExecutionKernel::advance_motion_takeover_impl(
       if (!incumbent || !candidate || incumbent->state.active_stop_id ||
           incumbent->pending_motion_takeover.empty() ||
           incumbent->pending_motion_takeover.key() != candidate_id || candidate->state.preemption ||
-          motion_admission_closed_)
+          motion_admission_closed_locked())
         return Result<void>::Ok();
       auto& row = candidate->participants.front();
       if (!snapshot.participant || !snapshot.backend_prepare_result)
@@ -668,7 +667,7 @@ Result<void> ResourceAddressedExecutionKernel::advance_motion_takeover_impl(
       auto* incumbent = find_active_operation_locked(incumbent_id);
       auto* candidate = find_pending_motion_operation_locked(candidate_id);
       if (!incumbent || !candidate || incumbent->state.active_stop_id ||
-          candidate->state.preemption || motion_admission_closed_)
+          candidate->state.preemption || motion_admission_closed_locked())
         return Result<void>::Ok();
       const auto scope = validate_program_execution_scope_locked(candidate->intent, false, false);
       if (!scope.ok()) return scope;

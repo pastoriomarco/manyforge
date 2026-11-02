@@ -44,32 +44,22 @@ _PREFERRED_SERVICES_BY_TYPE: Final = {
     RESET_SERVICE_TYPE: {
         "/reset_simulation",
         "/ResetSimulation",
-        "/isaacsim/reset_simulation",
-        "/isaacsim/ResetSimulation",
     },
     GET_SIMULATION_STATE_SERVICE_TYPE: {
         "/get_simulation_state",
         "/GetSimulationState",
-        "/isaacsim/get_simulation_state",
-        "/isaacsim/GetSimulationState",
     },
     SET_SIMULATION_STATE_SERVICE_TYPE: {
         "/set_simulation_state",
         "/SetSimulationState",
-        "/isaacsim/set_simulation_state",
-        "/isaacsim/SetSimulationState",
     },
     STEP_SIMULATION_SERVICE_TYPE: {
         "/step_simulation",
         "/StepSimulation",
-        "/isaacsim/step_simulation",
-        "/isaacsim/StepSimulation",
     },
     SET_ENTITY_STATE_SERVICE_TYPE: {
         "/set_entity_state",
         "/SetEntityState",
-        "/isaacsim/set_entity_state",
-        "/isaacsim/SetEntityState",
     },
 }
 

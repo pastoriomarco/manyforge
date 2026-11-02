@@ -1431,17 +1431,14 @@ class TerminalPlanIndex final {
 
 [[nodiscard]] V interrupt_correlation_value(const StopInterruptCorrelationDTO& v) {
   return arr({enc(v.interrupt_source_id), enc(v.interrupt_policy_id),
-              enc(v.motion_interrupt_scope_id), opt(v.interrupt_latch_id, id_value)});
+              enc(v.motion_interrupt_scope_id)});
 }
 
 [[nodiscard]] StopInterruptCorrelationDTO interrupt_correlation_from(const V& v) {
-  const auto& f = exact(v, 4U, "interrupt correlation");
+  const auto& f = exact(v, 3U, "interrupt correlation");
   return StopInterruptCorrelationDTO{did<InterruptSourceId>(f[0], "interrupt source ID"),
                                      did<InterruptPolicyId>(f[1], "interrupt policy ID"),
-                                     did<MotionInterruptScopeId>(f[2], "interrupt scope ID"),
-                                     dopt<InterruptLatchId>(f[3], [](const V& item) {
-                                       return did<InterruptLatchId>(item, "interrupt latch ID");
-                                     })};
+                                     did<MotionInterruptScopeId>(f[2], "interrupt scope ID")};
 }
 
 // Certificate v4: 23 fixed slots. The v3 slots without evidence_items (the
@@ -1466,8 +1463,6 @@ class TerminalPlanIndex final {
               vec(v.unsettled, scope_key_value),
               vec(v.failed, scope_key_value),
               opt(v.interrupt_correlation, interrupt_correlation_value),
-              opt(v.fault_latch_id, id_value),
-              opt(v.fault_latch_generation, id_value),
               content_identity::nonnegative_int64_value(v.completed_at_ns),
               opt(v.terminal_error, error_value),
               vec(v.lane_hard_stop_requested, scope_key_value)});
@@ -1475,7 +1470,7 @@ class TerminalPlanIndex final {
 
 /// Leaves evidence_items empty; terminal_root_from derives them.
 [[nodiscard]] StopCertificateDTO certificate_from(const V& v, TerminalPlanIndex& plans) {
-  const auto& f = exact(v, 23U, "Stop certificate");
+  const auto& f = exact(v, 21U, "Stop certificate");
   return StopCertificateDTO{
       did<StopCertificateId>(f[0], "certificate ID"),
       did<StopCertificateRevision>(f[1], "certificate revision"),
@@ -1499,16 +1494,9 @@ class TerminalPlanIndex final {
       dvec<StopScopeEntryKeyDTO>(f[15], scope_key_from, "unsettled scope"),
       dvec<StopScopeEntryKeyDTO>(f[16], scope_key_from, "failed scope"),
       dopt<StopInterruptCorrelationDTO>(f[17], interrupt_correlation_from),
-      dopt<StopFaultLatchId>(
-          f[18], [](const V& item) { return did<StopFaultLatchId>(item, "fault latch ID"); }),
-      dopt<StopFaultLatchGeneration>(f[19],
-                                     [](const V& item) {
-                                       return did<StopFaultLatchGeneration>(
-                                           item, "fault latch generation");
-                                     }),
-      i64(f[20], "certificate completion time"),
-      dopt<ErrorDTO>(f[21], error_from),
-      dvec<StopScopeEntryKeyDTO>(f[22], scope_key_from, "lane hard stop requested")};
+      i64(f[18], "certificate completion time"),
+      dopt<ErrorDTO>(f[19], error_from),
+      dvec<StopScopeEntryKeyDTO>(f[20], scope_key_from, "lane hard stop requested")};
 }
 
 [[nodiscard]] V remaining_budget_value(const RemainingStopBudgetDTO& v) {
@@ -1540,228 +1528,21 @@ class TerminalPlanIndex final {
                              remaining_budget_from(f[4])};
 }
 
-[[nodiscard]] V fault_latch_value(const StopFaultLatchDTO& v) {
-  return arr(
-      {enc(v.cell_id), enc(v.stop_id), enc(v.stop_generation),
-       opt(v.stop_certificate, certificate_ref_value), enc(v.latch_id), enc(v.latch_generation),
-       enc(v.trigger), V(v.persistence_degraded), vec(v.captured_operation_ids, id_value),
-       vec(v.captured_resources, id_value), enc(v.retained_bundle_id), enc(v.graph_revision),
-       projection_status_value(v.terminal_projection), projection_status_value(v.clear_projection),
-       enc(v.state), V(static_cast<double>(v.recovery_assessment_revision)), enc(v.recovery_status),
-       V(v.reason_code), vec(v.evidence_refs, [](const StopFaultRecoveryEvidenceRefDTO& row) {
-         return arr({enc(row.kind), enc(row.evidence_digest)});
-       }),
-       vec(v.observed_triggers, id_value)});
-}
-
-[[nodiscard]] StopFaultLatchDTO fault_latch_from(const V& v) {
-  const auto& f = exact(v, 20U, "Stop fault latch");
-  return StopFaultLatchDTO{
-      did<CellId>(f[0], "cell ID"),
-      did<StopId>(f[1], "Stop ID"),
-      did<StopGeneration>(f[2], "Stop generation"),
-      dopt<StopCertificateRefDTO>(f[3], certificate_ref_from),
-      did<StopFaultLatchId>(f[4], "fault latch ID"),
-      did<StopFaultLatchGeneration>(f[5], "fault latch generation"),
-      den<StopFaultTriggerDTO>(f[6], kStopFaultTriggerCount - 1U, "fault trigger"),
-      boolean(f[7], "persistence degraded"),
-      dvec<OperationId>(
-          f[8], [](const V& item) { return did<OperationId>(item, "operation ID"); },
-          "captured operations"),
-      dvec<ResourceId>(
-          f[9], [](const V& item) { return did<ResourceId>(item, "resource ID"); },
-          "captured resources"),
-      did<RetainedBundleId>(f[10], "retained bundle ID"),
-      did<GraphRevision>(f[11], "graph revision"),
-      projection_status_from(f[12]),
-      projection_status_from(f[13]),
-      den<StopFaultLatchStateDTO>(f[14], 2U, "fault latch state"),
-      u64(f[15], "recovery assessment revision"),
-      den<StopFaultRecoveryStatusDTO>(f[16], 7U, "fault recovery status"),
-      str(f[17], "fault reason code"),
-      dvec<StopFaultRecoveryEvidenceRefDTO>(
-          f[18],
-          [](const V& item) {
-            const auto& row = exact(item, 2U, "fault recovery evidence ref");
-            return StopFaultRecoveryEvidenceRefDTO{
-                den<StopFaultRecoveryEvidenceKindDTO>(row[0], 4U, "recovery evidence kind"),
-                did<ContentDigest>(row[1], "recovery evidence digest")};
-          },
-          "fault recovery evidence refs"),
-      dvec<StopFaultTriggerDTO>(
-          f[19],
-          [](const V& item) {
-            return den<StopFaultTriggerDTO>(item, kStopFaultTriggerCount - 1U,
-                                            "observed fault trigger");
-          },
-          "observed fault triggers")};
-}
-
-[[nodiscard]] V public_request_context_value(const PublicRequestContextDTO& v) {
-  return arr({enc(v.request_id), enc(v.request_owner_epoch), V(v.source_label),
-              opt(v.correlation_id, [](const std::string& item) { return V(item); })});
-}
-
-[[nodiscard]] PublicRequestContextDTO public_request_context_from(const V& v) {
-  const auto& f = exact(v, 4U, "public request context");
-  return PublicRequestContextDTO{
-      did<RequestId>(f[0], "request ID"), did<RequestOwnerEpoch>(f[1], "request owner epoch"),
-      str(f[2], "request source label"),
-      dopt<std::string>(f[3], [](const V& item) { return str(item, "correlation ID"); })};
-}
-
-[[nodiscard]] V recovery_configuration_value(
-    const StopFaultRecoveryConfigurationExpectationDTO& v) {
-  return arr({enc(v.control_domain_id), enc(v.active_control_configuration_id),
-              enc(v.active_control_configuration_generation)});
-}
-
-[[nodiscard]] StopFaultRecoveryConfigurationExpectationDTO recovery_configuration_from(const V& v) {
-  const auto& f = exact(v, 3U, "fault recovery configuration expectation");
-  return StopFaultRecoveryConfigurationExpectationDTO{
-      did<ControlDomainId>(f[0], "control domain ID"),
-      did<ActiveControlConfigurationId>(f[1], "active configuration ID"),
-      did<ActiveControlConfigurationGeneration>(f[2], "active configuration generation")};
-}
-
-[[nodiscard]] V recovery_intent_value(const StopFaultRecoveryIntentDTO& v) {
-  return arr({public_request_context_value(v.request_context), enc(v.expected_latch_id),
-              enc(v.expected_latch_generation),
-              V(static_cast<double>(v.expected_recovery_assessment_revision)),
-              enc(v.expected_stop_certificate_id), enc(v.expected_stop_certificate_revision),
-              enc(v.expected_cell_id), enc(v.expected_retained_bundle_id),
-              enc(v.expected_graph_revision),
-              vec(v.configuration_expectations, recovery_configuration_value),
-              opt(v.reason, [](const std::string& item) { return V(item); })});
-}
-
-[[nodiscard]] StopFaultRecoveryIntentDTO recovery_intent_from(const V& v) {
-  const auto& f = exact(v, 11U, "fault recovery intent");
-  return StopFaultRecoveryIntentDTO{
-      public_request_context_from(f[0]),
-      did<StopFaultLatchId>(f[1], "expected latch ID"),
-      did<StopFaultLatchGeneration>(f[2], "expected latch generation"),
-      u64(f[3], "expected recovery assessment revision"),
-      did<StopCertificateId>(f[4], "expected certificate ID"),
-      did<StopCertificateRevision>(f[5], "expected certificate revision"),
-      did<CellId>(f[6], "expected cell ID"),
-      did<RetainedBundleId>(f[7], "expected retained bundle ID"),
-      did<GraphRevision>(f[8], "expected graph revision"),
-      dvec<StopFaultRecoveryConfigurationExpectationDTO>(
-          f[9], recovery_configuration_from, "fault recovery configuration expectations"),
-      dopt<std::string>(f[10], [](const V& item) { return str(item, "recovery reason"); })};
-}
-
-[[nodiscard]] V recovery_result_value(const StopFaultRecoveryResultDTO& v) {
-  return arr({enc(v.request_id), enc(v.replay_status), V(v.accepted), fault_latch_value(v.latch),
-              opt(v.error, error_value)});
-}
-
-[[nodiscard]] StopFaultRecoveryResultDTO recovery_result_from(const V& v) {
-  const auto& f = exact(v, 5U, "fault recovery result");
-  return StopFaultRecoveryResultDTO{did<RequestId>(f[0], "recovery result request ID"),
-                                    den<RequestReplayStatusDTO>(f[1], 5U, "recovery replay status"),
-                                    boolean(f[2], "recovery accepted"), fault_latch_from(f[3]),
-                                    dopt<ErrorDTO>(f[4], error_from)};
-}
-
-[[nodiscard]] V surveillance_source_value(const StopSurveillanceSourceStatusDTO& v) {
-  return arr(
-      {scope_key_value(v.scope_key), enc(v.evidence_item_id),
-       resolved_evidence_source_value(v.resolved_source), enc(v.availability),
-       opt(v.source_epoch, id_value),
-       opt(v.source_sequence,
-           [](const std::uint64_t item) { return V(static_cast<double>(item)); }),
-       opt(v.source_age_ns,
-           [](const std::int64_t item) { return content_identity::nonnegative_int64_value(item); }),
-       opt(v.error, error_value)});
-}
-
-[[nodiscard]] StopSurveillanceSourceStatusDTO surveillance_source_from(const V& v) {
-  const auto& f = exact(v, 8U, "surveillance source status");
-  return StopSurveillanceSourceStatusDTO{
-      scope_key_from(f[0]),
-      did<StopEvidenceItemId>(f[1], "evidence item ID"),
-      resolved_evidence_source_from(f[2]),
-      den<StopSurveillanceSourceAvailabilityDTO>(f[3], 2U, "source availability"),
-      dopt<RuntimeEpoch>(f[4],
-                         [](const V& item) { return did<RuntimeEpoch>(item, "source epoch"); }),
-      dopt<std::uint64_t>(f[5], [](const V& item) { return u64(item, "source sequence"); }),
-      dopt<std::int64_t>(f[6], [](const V& item) { return i64(item, "source age"); }),
-      dopt<ErrorDTO>(f[7], error_from)};
-}
-
-[[nodiscard]] V surveillance_value(const StopPostTerminalSurveillanceDTO& v) {
-  return arr(
-      {enc(v.stop_id), enc(v.stop_generation), certificate_ref_value(v.stop_certificate),
-       enc(v.latch_id), enc(v.latch_generation), enc(v.owner_epoch),
-       V(static_cast<double>(v.surveillance_generation)), vec(v.resources, id_value),
-       vec(v.source_statuses, surveillance_source_value),
-       arr({content_identity::nonnegative_int64_value(v.policy.sample_cadence_ns),
-            content_identity::nonnegative_int64_value(v.policy.checkpoint_interval_ns),
-            V(static_cast<double>(v.policy.retained_checkpoint_limit))}),
-       V(static_cast<double>(v.continued_motion_count)),
-       opt(v.first_continued_motion_at_ns,
-           [](const std::int64_t item) { return content_identity::nonnegative_int64_value(item); }),
-       opt(v.last_continued_motion_at_ns,
-           [](const std::int64_t item) { return content_identity::nonnegative_int64_value(item); }),
-       opt(v.late_quiescence_evidence_digest, id_value),
-       opt(v.late_quiescence_observed_at_ns,
-           [](const std::int64_t item) { return content_identity::nonnegative_int64_value(item); }),
-       enc(v.state), V(static_cast<double>(v.checkpoint_generation)),
-       projection_status_value(v.checkpoint_projection)});
-}
-
-[[nodiscard]] StopPostTerminalSurveillanceDTO surveillance_from(const V& v) {
-  const auto& f = exact(v, 18U, "post-terminal surveillance");
-  const auto& policy = exact(f[9], 3U, "surveillance policy");
-  return StopPostTerminalSurveillanceDTO{
-      did<StopId>(f[0], "Stop ID"),
-      did<StopGeneration>(f[1], "Stop generation"),
-      certificate_ref_from(f[2]),
-      did<StopFaultLatchId>(f[3], "fault latch ID"),
-      did<StopFaultLatchGeneration>(f[4], "fault latch generation"),
-      did<RequestOwnerEpoch>(f[5], "owner epoch"),
-      u64(f[6], "surveillance generation"),
-      dvec<ResourceId>(
-          f[7], [](const V& item) { return did<ResourceId>(item, "resource ID"); },
-          "surveillance resources"),
-      dvec<StopSurveillanceSourceStatusDTO>(f[8], surveillance_source_from, "surveillance sources"),
-      StopSurveillancePolicyDTO{i64(policy[0], "sample cadence"),
-                                i64(policy[1], "checkpoint interval"),
-                                static_cast<std::size_t>(u64(policy[2], "checkpoint limit"))},
-      u64(f[10], "continued-motion count"),
-      dopt<std::int64_t>(f[11],
-                         [](const V& item) { return i64(item, "first continued motion time"); }),
-      dopt<std::int64_t>(f[12],
-                         [](const V& item) { return i64(item, "last continued motion time"); }),
-      dopt<ContentDigest>(
-          f[13], [](const V& item) { return did<ContentDigest>(item, "late quiescence digest"); }),
-      dopt<std::int64_t>(f[14], [](const V& item) { return i64(item, "late quiescence time"); }),
-      den<StopPostTerminalSurveillanceStateDTO>(f[15], 1U, "surveillance state"),
-      u64(f[16], "checkpoint generation"),
-      projection_status_from(f[17])};
-}
-
-// Terminal v4 status_rest: the StopStatusDTO fields that the certificate and
-// fault latch cannot rebuild (TerminalStopStatusFromCertificate rebuilds the rest).
+// Terminal v5 status_rest: the StopStatusDTO fields that the certificate
+// cannot rebuild (TerminalStopStatusFromCertificate rebuilds the rest).
 [[nodiscard]] V status_rest_value(const StopTerminalStatusRestDTO& v) {
   return arr({accepted_value(v.accepted), vec(v.current_stages, current_stage_value),
               projection_status_value(v.acceptance_projection),
-              projection_status_value(v.terminal_projection),
-              projection_status_value(v.surveillance_projection),
-              opt(v.surveillance, surveillance_value)});
+              projection_status_value(v.terminal_projection)});
 }
 
 [[nodiscard]] StopTerminalStatusRestDTO status_rest_from(const V& v) {
-  const auto& f = exact(v, 6U, "Stop terminal status rest");
+  const auto& f = exact(v, 4U, "Stop terminal status rest");
   return StopTerminalStatusRestDTO{
       accepted_from(f[0]),
       dvec<StopCurrentStageDTO>(f[1], current_stage_from, "current stages"),
       projection_status_from(f[2]),
-      projection_status_from(f[3]),
-      projection_status_from(f[4]),
-      dopt<StopPostTerminalSurveillanceDTO>(f[5], surveillance_from)};
+      projection_status_from(f[3])};
 }
 
 // Checks the version slot before the arity, so every other version (whatever
@@ -1811,51 +1592,21 @@ using TerminalPlans = std::map<std::string, const PreparedParticipantStopPlanDTO
   for (const auto& row : plans) plan_values.push_back(prepared_plan_value(*row.second));
   return arr({V(std::string(kStopJournalTerminalProjectionApiVersion)),
               status_rest_value(TerminalStopStatusRest(value.stop_status)),
-              certificate_value(value.certificate), opt(value.fault_latch, fault_latch_value),
-              V(std::move(plan_values))});
+              certificate_value(value.certificate), V(std::move(plan_values))});
 }
 
 [[nodiscard]] StopJournalTerminalProjectionDTO terminal_root_from(const V& value) {
-  const auto& f = versioned(value, kStopJournalTerminalProjectionApiVersion, 5U,
+  const auto& f = versioned(value, kStopJournalTerminalProjectionApiVersion, 4U,
                             "Stop journal terminal projection");
-  TerminalPlanIndex plans(f[4]);
+  TerminalPlanIndex plans(f[3]);
   auto rest = status_rest_from(f[1]);
   auto certificate = certificate_from(f[2], plans);
   plans.require_all_referenced();
   auto evidence = DeriveStopCertificateEvidence(certificate.attempted_stage_results);
   if (!evidence.ok()) bad(evidence.error().code);
   certificate.evidence_items = std::move(evidence.value());
-  auto fault_latch = dopt<StopFaultLatchDTO>(f[3], fault_latch_from);
-  auto status = TerminalStopStatusFromCertificate(rest, certificate, fault_latch);
-  return StopJournalTerminalProjectionDTO{std::move(status), std::move(certificate),
-                                          std::move(fault_latch)};
-}
-
-[[nodiscard]] V surveillance_root(const StopJournalSurveillanceProjectionDTO& value) {
-  return arr({V(std::string(kStopJournalSurveillanceProjectionApiVersion)),
-              surveillance_value(value.checkpoint), fault_latch_value(value.fault_latch)});
-}
-
-[[nodiscard]] StopJournalSurveillanceProjectionDTO surveillance_root_from(const V& value) {
-  const auto& fields = exact(value, 3U, "Stop journal surveillance projection");
-  if (str(fields[0], "surveillance API version") != kStopJournalSurveillanceProjectionApiVersion) {
-    bad("Stop journal surveillance projection API version is unsupported");
-  }
-  return StopJournalSurveillanceProjectionDTO{surveillance_from(fields[1]),
-                                              fault_latch_from(fields[2])};
-}
-
-[[nodiscard]] V fault_clear_root(const StopJournalFaultClearProjectionDTO& value) {
-  return arr({V(std::string(kStopJournalFaultClearProjectionApiVersion)),
-              recovery_intent_value(value.recovery_intent),
-              recovery_result_value(value.recovery_result)});
-}
-
-[[nodiscard]] StopJournalFaultClearProjectionDTO fault_clear_root_from(const V& value) {
-  const auto& fields = versioned(value, kStopJournalFaultClearProjectionApiVersion, 3U,
-                                 "Stop journal fault-clear projection");
-  return StopJournalFaultClearProjectionDTO{recovery_intent_from(fields[1]),
-                                            recovery_result_from(fields[2])};
+  auto status = TerminalStopStatusFromCertificate(rest, certificate);
+  return StopJournalTerminalProjectionDTO{std::move(status), std::move(certificate)};
 }
 
 template <typename T, typename Root>
@@ -1905,8 +1656,8 @@ template <typename T, typename Root>
 
 [[nodiscard]] Result<std::string> terminal_bytes(
     const StopJournalTerminalProjectionDTO& projection) {
-  if (const auto error = stop_terminal_projection_field_error(
-          projection.stop_status, projection.certificate, projection.fault_latch);
+  if (const auto error =
+          stop_terminal_projection_field_error(projection.stop_status, projection.certificate);
       error.has_value()) {
     return reject<std::string>(*error);
   }
@@ -1919,22 +1670,6 @@ template <typename T, typename Root>
   }
   return encode_projection(projection,
                            [&](const auto& value) { return terminal_root(value, *plans); });
-}
-
-[[nodiscard]] Result<std::string> fault_clear_bytes(
-    const StopJournalFaultClearProjectionDTO& projection) {
-  // The resulting status and certificate are not stored; the journal writer
-  // derives and checks that join in-process before recording the clear.
-  const auto& intent = projection.recovery_intent;
-  const auto& result = projection.recovery_result;
-  if (stop_fault_recovery_intent_field_error(intent).has_value() ||
-      result.request_id != intent.request_context.request_id ||
-      result.replay_status != RequestReplayStatusDTO::kAcceptedNew || !result.accepted ||
-      result.error.has_value() || result.latch.state != StopFaultLatchStateDTO::kCleared ||
-      stop_fault_latch_field_error(result.latch).has_value()) {
-    return reject<std::string>("fault-clear projection is invalid");
-  }
-  return encode_projection(projection, fault_clear_root);
 }
 
 // Encode never yields bytes its own decoder refuses: the bytes must decode
@@ -1991,49 +1726,6 @@ Result<StopJournalTerminalProjectionDTO> DecodeStopJournalTerminalProjection(
   if (!encoded.ok()) return Result<StopJournalTerminalProjectionDTO>::Err(encoded.error());
   if (encoded.value() != canonical_bytes) {
     return reject<StopJournalTerminalProjectionDTO>("terminal projection is not canonical");
-  }
-  return decoded;
-}
-
-Result<std::string> EncodeStopJournalSurveillanceProjection(
-    const StopJournalSurveillanceProjectionDTO& projection) {
-  if (stop_post_terminal_surveillance_field_error(projection.checkpoint).has_value() ||
-      stop_fault_latch_field_error(projection.fault_latch).has_value() ||
-      !projection.fault_latch.stop_certificate.has_value() ||
-      projection.checkpoint.stop_certificate != *projection.fault_latch.stop_certificate ||
-      projection.checkpoint.latch_id != projection.fault_latch.latch_id ||
-      projection.checkpoint.latch_generation != projection.fault_latch.latch_generation ||
-      projection.fault_latch.state == StopFaultLatchStateDTO::kCleared) {
-    return reject<std::string>("surveillance projection is invalid");
-  }
-  return Result<std::string>::Ok(content_identity::canonical_json(surveillance_root(projection)));
-}
-
-Result<StopJournalSurveillanceProjectionDTO> DecodeStopJournalSurveillanceProjection(
-    const std::string_view canonical_bytes) {
-  auto decoded = decode_projection<StopJournalSurveillanceProjectionDTO>(canonical_bytes,
-                                                                         surveillance_root_from);
-  if (!decoded.ok()) return decoded;
-  const auto encoded = EncodeStopJournalSurveillanceProjection(decoded.value());
-  if (!encoded.ok() || encoded.value() != canonical_bytes) {
-    return reject<StopJournalSurveillanceProjectionDTO>("surveillance projection is not canonical");
-  }
-  return decoded;
-}
-
-Result<std::string> EncodeStopJournalFaultClearProjection(
-    const StopJournalFaultClearProjectionDTO& projection) {
-  return readable(fault_clear_bytes(projection), projection, fault_clear_root_from);
-}
-
-Result<StopJournalFaultClearProjectionDTO> DecodeStopJournalFaultClearProjection(
-    const std::string_view canonical_bytes) {
-  auto decoded =
-      decode_projection<StopJournalFaultClearProjectionDTO>(canonical_bytes, fault_clear_root_from);
-  if (!decoded.ok()) return decoded;
-  const auto encoded = fault_clear_bytes(decoded.value());
-  if (!encoded.ok() || encoded.value() != canonical_bytes) {
-    return reject<StopJournalFaultClearProjectionDTO>("fault-clear projection is not canonical");
   }
   return decoded;
 }

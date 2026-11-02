@@ -97,7 +97,7 @@ _PROGRAM_MOTION_DEFAULTS: Final = frozenset(
         "velocity_scale",
         "acceleration_scale",
         "translation_tol_m",
-        "max_blend_deviation_rad",
+        "blend_radius_m",
     }
 )
 _PROGRAM_MOTION_CEILINGS: Final = frozenset(
@@ -1274,6 +1274,9 @@ MOTION_NODE_IDS: Final = frozenset(
 INTERRUPT_MOTION_NODE_IDS: Final = frozenset(
     {"motion.move_until_signal", "motion.probe_search"}
 )
+# The core-held `changed_outside` signal of an output with read-back
+# (CONTRACTS §7) is named by the output's resource role plus this suffix.
+CHANGED_OUTSIDE_SUFFIX: Final = ".changed_outside"
 # Signal-reading io nodes: their one signal is (target_role, resource_role).
 IO_SIGNAL_INPUT_NODE_IDS: Final = frozenset(
     {"io.get_input", "io.check_input", "io.wait_for_input"}
@@ -1335,12 +1338,13 @@ def is_active_tcp_key(key: str) -> bool:
 # any key. Reserved like node_outcome: never authored nor written by nodes.
 # A Program alone cannot see the Deployment, so its validation declares the
 # key of each rule id it references (read-only; writes stay refused). The join
-# against the Deployment's declared rules is where both are known: the native
+# against the Deployment's declared rules is where both are known: the host
 # Apply validation view (rules from the retained bundle), the Runner's
 # with_interrupt_state_keys (Applied rule ids) and the Composer GUI (Draft
 # rules); `require_interrupt_state_rules` is the Python form of that check.
 INTERRUPT_STATE_NAMESPACE: Final = "interrupt_state"
-INTERRUPT_STATE_VALUES: Final = ("clear", "tripped", "latched")
+# CONTRACTS §8: the key is withdrawn (absent) while the rule can't watch.
+INTERRUPT_STATE_VALUES: Final = ("inactive", "clear", "tripped")
 
 
 def is_interrupt_state_key(key: str) -> bool:
@@ -1443,15 +1447,17 @@ def _declare_interrupt_state_keys(
 
 
 def require_interrupt_state_rules(program: "Program", rule_ids: Iterable[str]) -> None:
-    """The Program x Deployment join (contract 64): every
-    ``interrupt_state.<rule_id>`` the Program reads names a declared global
-    rule of the Deployment."""
+    """The Program x Deployment join (contract 64, CONTRACTS §9): every
+    ``interrupt_state.<rule_id>`` the Program reads and every rule its
+    ``rules.set_active`` nodes name is a declared global rule of the
+    Deployment."""
 
-    missing = sorted(set(program.interrupt_state_rule_ids) - set(rule_ids))
+    named = set(program.interrupt_state_rule_ids) | set(program.rule_activation_rule_ids)
+    missing = sorted(named - set(rule_ids))
     if missing:
         raise ProgramValidationError(
-            "Program reads interrupt_state key(s) of global rule(s) the "
-            f"Deployment does not declare: {', '.join(missing)}"
+            "Program names global rule(s) the Deployment does not declare: "
+            + ", ".join(missing)
         )
 
 
@@ -3523,6 +3529,12 @@ def _validate_semantic_value(
                 and identity not in context.blackboard_keys
             ):
                 _program_error(path, "does not name a declared blackboard key")
+            if semantic_type == "resource_role" and identity.endswith(
+                CHANGED_OUTSIDE_SUFFIX
+            ):
+                # `<output role>.changed_outside`: the core-held signal of
+                # that output (CONTRACTS §7), read like any input signal.
+                identity = identity[: -len(CHANGED_OUTSIDE_SUFFIX)]
             if semantic_type in {
                 "frame_role",
                 "resource_role",
@@ -5256,6 +5268,8 @@ class Program:
         self.expressions = expressions
         self.canonical_bytes = canonical
         self.interrupt_condition_keys = _interrupt_condition_keys(tree)
+        # The global rule ids this Program activates (`rules.set_active`).
+        self.rule_activation_rule_ids = _rule_activation_rule_ids(tree)
         # The global rule ids this Program reads (`interrupt_state.<rule_id>`).
         self.interrupt_state_rule_ids = tuple(
             key[len(INTERRUPT_STATE_NAMESPACE) + 1 :]
@@ -5364,6 +5378,22 @@ def _interrupt_condition_keys(tree: ProgramTreeNode) -> tuple[str, ...]:
                 keys |= condition_keys(condition)
         pending.extend(node.children)
     return tuple(sorted(keys))
+
+
+def _rule_activation_rule_ids(tree: ProgramTreeNode) -> tuple[str, ...]:
+    """The global rule ids the Program's ``rules.set_active`` nodes name
+    literally, sorted (each must be a rule of the Deployment, CONTRACTS §9)."""
+
+    rule_ids: set[str] = set()
+    pending = [tree]
+    while pending:
+        node = pending.pop()
+        if node.node_id == "rules.set_active":
+            rule_id = node.parameters.get("rule_id")
+            if type(rule_id) is str:
+                rule_ids.add(rule_id)
+        pending.extend(node.children)
+    return tuple(sorted(rule_ids))
 
 
 def migrate_program_v1(data: dict[str, Any], catalog: NodeCatalog) -> Program:
@@ -5503,6 +5533,7 @@ __all__ = [
     "is_active_tcp_key",
     "INTERRUPT_STATE_NAMESPACE",
     "INTERRUPT_STATE_VALUES",
+    "CHANGED_OUTSIDE_SUFFIX",
     "interrupt_state_declaration",
     "require_interrupt_state_rules",
     "require_interrupt_key_initials",

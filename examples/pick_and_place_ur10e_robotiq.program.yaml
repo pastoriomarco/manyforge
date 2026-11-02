@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: pick_and_place_ur10e_robotiq_demo
-program_revision: sha256:255837426fdbce32471fad3620b945c5ad3422242ba8bd2172b53d86bad26ca7
+program_revision: sha256:2314f15be6829a5742ca2d949de1c411d2156ea4d2db008aa428b4a990834afc
 program_profile: composable-cell-v1
 name: pick_and_place_ur10e_robotiq_demo
 description: Pick-and-place demo for the source-local UR10e and Robotiq 2F-140 model. It preserves the
@@ -42,9 +42,6 @@ target_roles:
       parameters: {}
       disposition: required
     - capability_id: planning.motion.pose_goal
-      parameters: {}
-      disposition: required
-    - capability_id: planning.profile.balanced
       parameters: {}
       disposition: required
     - capability_id: planning.trajectory.time_parameterized

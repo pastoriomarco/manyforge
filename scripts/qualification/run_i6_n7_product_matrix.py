@@ -40,49 +40,49 @@ EXPECTED_SNAPSHOT_SOURCE_GATE = "model_snapshot_image_source_unavailable"
 
 SCENARIOS = (
     (
-        "lite6_pick_and_place",
+        "mock_lite6_pick_and_place",
         "lite6_pick_place_cell",
         "canonical-empty-admission.lite6_pick_place_cell.json",
         "succeeded",
     ),
     (
-        "ur5_pick_and_place",
+        "mock_ur5_pick_and_place",
         "ur5_pick_place_cell",
         "canonical-empty-admission.ur5_pick_place_cell.json",
         "succeeded",
     ),
     (
-        "ur5_pick_and_place_minimal",
+        "mock_ur5_pick_and_place_minimal",
         "ur5_pick_place_cell",
         "canonical-empty-admission.ur5_pick_place_cell.json",
         "succeeded",
     ),
     (
-        "ur10e_pick_and_place",
+        "mock_ur10e_pick_and_place",
         "ur10e_pick_place_cell",
         "canonical-empty-admission.ur10e_pick_place_cell.json",
         "succeeded",
     ),
     (
-        "ur10e_assistant_scene_authoring",
+        "mock_ur10e_assistant_scene_authoring",
         "ur10e_assistant_authoring_cell",
         "canonical-empty-admission.ur10e_assistant_authoring_cell.json",
         "succeeded",
     ),
     (
-        "ur5_semantic_shape_pick",
+        "mock_ur5_semantic_object_pick",
         "ur5_semantic_shape_pick_cell",
         "canonical-empty-admission.ur5_semantic_shape_pick_cell.json",
         "succeeded",
     ),
     (
-        "ur5_vision_guided_bin_pick",
+        "mock_ur5_vision_bin_pick",
         "ur5_vision_bin_pick_cell",
         "canonical-empty-admission.ur5_vision_bin_pick_cell.json",
         "failed",
     ),
     (
-        "ur5_vision_guided_pose_pick",
+        "mock_ur5_vision_pose_pick",
         "ur5_vision_pose_pick_cell",
         "canonical-empty-admission.ur5_vision_pose_pick_cell.json",
         "failed",
@@ -90,14 +90,14 @@ SCENARIOS = (
 )
 
 PROGRAM_FILES = {
-    "lite6_pick_and_place": "lite6_lite_gripper_pick_and_place.program.yaml",
-    "ur5_pick_and_place": "pick_and_place.program.yaml",
-    "ur5_pick_and_place_minimal": "pick_and_place_minimal.program.yaml",
-    "ur10e_pick_and_place": "pick_and_place_ur10e_robotiq.program.yaml",
-    "ur10e_assistant_scene_authoring": "pick_and_place_ur10e_robotiq.program.yaml",
-    "ur5_semantic_shape_pick": "semantic_shape_pick.program.yaml",
-    "ur5_vision_guided_bin_pick": "vision_guided_bin_pick.program.yaml",
-    "ur5_vision_guided_pose_pick": "vision_guided_pose_pick.program.yaml",
+    "mock_lite6_pick_and_place": "lite6_lite_gripper_pick_and_place.program.yaml",
+    "mock_ur5_pick_and_place": "pick_and_place.program.yaml",
+    "mock_ur5_pick_and_place_minimal": "pick_and_place_minimal.program.yaml",
+    "mock_ur10e_pick_and_place": "pick_and_place_ur10e_robotiq.program.yaml",
+    "mock_ur10e_assistant_scene_authoring": "pick_and_place_ur10e_robotiq.program.yaml",
+    "mock_ur5_semantic_object_pick": "semantic_shape_pick.program.yaml",
+    "mock_ur5_vision_bin_pick": "vision_guided_bin_pick.program.yaml",
+    "mock_ur5_vision_pose_pick": "vision_guided_pose_pick.program.yaml",
 }
 
 
@@ -438,8 +438,8 @@ def qualify_scenario(
                     )
                 if applied["program"] != program:
                     raise RuntimeError("applied scenario selected another Program")
-                # Use the maintained operator's exact CCLC convergence, not a
-                # second lifecycle implementation or diagnostics-as-readiness.
+                # Use the maintained operator's exact component convergence, not
+                # a second lifecycle implementation or diagnostics-as-readiness.
                 spec = importlib.util.spec_from_file_location(
                     "matrix_workbench", WORKSPACE / "scripts/dev-workbench.py"
                 )
@@ -554,7 +554,7 @@ def _ai_model_port() -> int:
     """
 
     deployment = load_strict_json_yaml(
-        WORKSPACE / "examples/ur5_semantic_shape_pick.scenario/deployment.yaml"
+        WORKSPACE / "examples/mock_ur5_semantic_object_pick.scenario/deployment.yaml"
     )
     (base_url,) = (
         component["configuration"]["runtime_configuration"]["base_url"]
@@ -578,7 +578,7 @@ def main() -> int:
         if not rows:
             raise RuntimeError("N7_MATRIX_SCENARIO selected no scenario")
         results = [qualify_scenario(*row) for row in rows]
-        expected_model_calls = int(any(row[0] == "ur5_semantic_shape_pick" for row in rows))
+        expected_model_calls = int(any(row[0] == "mock_ur5_semantic_object_pick" for row in rows))
         if len(model_requests) != expected_model_calls:
             raise RuntimeError(
                 "unexpected bounded semantic-selection call count: "

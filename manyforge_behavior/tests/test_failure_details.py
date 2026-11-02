@@ -33,7 +33,8 @@ def test_registered_keys_are_the_contract_set() -> None:
         "path",
         "source_kind",
         "source_reference",
-        "latch_id",
+        "rule_id",
+        "component_id",
         "retryable",
         "required_action",
     )
@@ -45,7 +46,7 @@ def test_only_registered_flat_bounded_entries_are_carried() -> None:
             "reason": "observed_state_unavailable",
             "retryable": False,
             "path": None,
-            "latch_id": 7,
+            "rule_id": 7,
             "reference_id": 1.5,
             # Unregistered keys are not carried.
             "stack": "Traceback ...",
@@ -65,7 +66,7 @@ def test_only_registered_flat_bounded_entries_are_carried() -> None:
         ("reason", "observed_state_unavailable"),
         ("reference_id", 1.5),
         ("path", None),
-        ("latch_id", 7),
+        ("rule_id", 7),
         ("retryable", False),
     ]
 

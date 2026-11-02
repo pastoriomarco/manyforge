@@ -326,8 +326,6 @@ std::string_view NativeShutdownPhaseName(const NativeShutdownPhase phase) {
     return "projection-destruction";
   case NativeShutdownPhase::kLivenessReceiverDestruction:
     return "liveness-receiver-destruction";
-  case NativeShutdownPhase::kStopSurveillanceDestruction:
-    return "stop-surveillance-destruction";
   case NativeShutdownPhase::kSchedulerOwnerRelease:
     return "scheduler-owner-release";
   case NativeShutdownPhase::kFenceOwnerDestruction:

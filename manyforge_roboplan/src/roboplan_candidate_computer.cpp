@@ -3,6 +3,7 @@
 #include <manyforge_core/trajectory/trajectory_sampler.hpp>
 #include <manyforge_core/trajectory/trajectory_splice.hpp>
 #include <manyforge_roboplan/cartesian_planning_contract.hpp>
+#include <manyforge_roboplan/detail/cartesian_path_densification.hpp>
 #include <manyforge_roboplan/detail/cartesian_trajectory_contract.hpp>
 #include <manyforge_roboplan/roboplan_planner_options.hpp>
 
@@ -13,6 +14,8 @@
 #include <cstdio>
 #include <limits>
 #include <map>
+#include <numbers>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -102,8 +105,10 @@ collision_failure_details(const roboplan::Scene &scene,
   const auto &data = scene.getCollisionData();
   const auto pair_count =
       std::min(model.collisionPairs.size(), data.collisionResults.size());
+  // Pairs the request's contact policy deactivated keep stale results.
   for (std::size_t index = 0U; !start_state && index < pair_count; ++index) {
-    if (!data.collisionResults[index].isCollision()) {
+    if (!data.activeCollisionPairs[index] ||
+        !data.collisionResults[index].isCollision()) {
       continue;
     }
     const auto &pair = model.collisionPairs[index];
@@ -123,7 +128,7 @@ collision_failure_details(const roboplan::Scene &scene,
   // `classification: clearance`.
   for (const bool clearance : {false, true}) {
     for (std::size_t index = 0U; index < distance_count; ++index) {
-      if (start_state && !data.activeCollisionPairs[index]) continue;
+      if (!data.activeCollisionPairs[index]) continue;
       const auto distance = data.distanceResults[index].min_distance;
       const double margin = index < data.collisionRequests.size()
                                 ? data.collisionRequests[index].security_margin
@@ -445,7 +450,7 @@ validate_binding(const roboplan::Scene &scene,
       config.maximum_trajectory_samples < 2U ||
       config.maximum_trajectory_samples > 1'000'000U ||
       !finite_positive(config.trajectory_sample_period_s) ||
-      !finite_positive(config.collision_check_step_rad)) {
+      !core::valid_planner_settings(config.planner_defaults())) {
     return core::Result<void>::Err(
         make_error(ErrorCode::kInvalidRequest,
                    "RoboPlan candidate binding is incomplete or inconsistent",
@@ -463,17 +468,6 @@ validate_binding(const roboplan::Scene &scene,
   return core::Result<void>::Ok();
 }
 
-[[nodiscard]] bool
-valid_planning_profile(core::PlanningProfileDTO profile) noexcept {
-  switch (profile) {
-  case core::PlanningProfileDTO::kFirstFeasible:
-  case core::PlanningProfileDTO::kBalanced:
-  case core::PlanningProfileDTO::kQualityBounded:
-    return true;
-  }
-  return false;
-}
-
 [[nodiscard]] core::Result<void>
 validate_request_binding(const RoboPlanCandidateBindingDTO &binding,
                          const RoboPlanCandidateRequestDTO &request) {
@@ -483,11 +477,7 @@ validate_request_binding(const RoboPlanCandidateBindingDTO &binding,
       request.model_revision != binding.model_revision ||
       request.resources != binding.resources ||
       !contains_frame(binding.permitted_frames, request.base_frame) ||
-      !contains_frame(binding.permitted_frames, request.tcp_frame) ||
-      !std::all_of(request.speed_check_frames.begin(),
-                   request.speed_check_frames.end(), [&](const auto &frame) {
-                     return contains_frame(binding.permitted_frames, frame);
-                   })) {
+      !contains_frame(binding.permitted_frames, request.tcp_frame)) {
     return core::Result<void>::Err(
         make_error(ErrorCode::kInvalidRequest,
                    "RoboPlan request does not match the exact retained "
@@ -520,10 +510,10 @@ validate_request_binding(const RoboPlanCandidateBindingDTO &binding,
       !finite_nonnegative(tolerances.joint_position_tol_rad) ||
       !finite_nonnegative(tolerances.translation_tol_m) ||
       !finite_nonnegative(tolerances.rotation_tol_rad) ||
-      !valid_planning_profile(request.planning_profile)) {
+      !core::valid_planner_override(request.planner)) {
     return core::Result<void>::Err(make_error(
         ErrorCode::kInvalidRequest,
-        "RoboPlan request has invalid tolerances, limits, timeout, or profile",
+        "RoboPlan request has invalid tolerances, limits, timeout, or planner",
         "native_candidate_request_numeric_invalid"));
   }
   return core::Result<void>::Ok();
@@ -630,37 +620,113 @@ void normalize_ik_goal_for_limits(const std::shared_ptr<roboplan::Scene> &scene,
   }
 }
 
-struct DensifiedCartesianPath final {
-  std::vector<Eigen::Matrix4d> poses;
-  std::vector<std::size_t> source_waypoint_dense_indices;
+} // namespace
+
+namespace detail {
+namespace {
+
+// Rotation vector (world frame) taking `from` to `to` along the shorter way.
+[[nodiscard]] Eigen::Vector3d rotation_vector(const Eigen::Quaterniond &from,
+                                              const Eigen::Quaterniond &to) {
+  Eigen::Quaterniond relative = to * from.conjugate();
+  if (relative.w() < 0.0) {
+    relative.coeffs() *= -1.0;
+  }
+  const Eigen::AngleAxisd angle_axis(relative.normalized());
+  return angle_axis.angle() * angle_axis.axis();
+}
+
+[[nodiscard]] Eigen::Quaterniond rotated(const Eigen::Vector3d &rotation,
+                                         const Eigen::Quaterniond &base) {
+  const double angle = rotation.norm();
+  if (angle == 0.0) {
+    return base;
+  }
+  return (Eigen::Quaterniond(Eigen::AngleAxisd(angle, rotation / angle)) * base)
+      .normalized();
+}
+
+[[nodiscard]] Eigen::Matrix4d pose_of(const Eigen::Vector3d &position,
+                                      const Eigen::Quaterniond &orientation) {
+  Eigen::Matrix4d pose = Eigen::Matrix4d::Identity();
+  pose.block<3, 3>(0, 0) = orientation.toRotationMatrix();
+  pose.block<3, 1>(0, 3) = position;
+  return pose;
+}
+
+// One rounded corner: the arc tangent to both segments at `distance` from the
+// waypoint. `rotation_in`/`rotation_out` are the adjacent segments' rotation
+// per metre (world rotation vectors).
+struct CornerArc final {
+  double distance{};
+  double turn{};
+  double radius{};
+  Eigen::Vector3d center;
+  Eigen::Vector3d inward;
+  Eigen::Vector3d direction_in;
+  Eigen::Vector3d rotation_in;
+  Eigen::Vector3d rotation_out;
+  Eigen::Quaterniond orientation;
+  std::size_t steps{};
+
+  [[nodiscard]] Eigen::Matrix4d at(double fraction) const {
+    const double angle = fraction * turn;
+    const Eigen::Vector3d position =
+        center + radius * (-inward * std::cos(angle) +
+                           direction_in * std::sin(angle));
+    // Cubic Hermite in rotation-vector space about the waypoint orientation:
+    // ends match the segments' orientation, slopes their rotation per metre.
+    const double length = radius * turn;
+    const double u = fraction, u2 = u * u, u3 = u2 * u;
+    const Eigen::Vector3d rotation =
+        (2.0 * u3 - 3.0 * u2 + 1.0) * (-distance * rotation_in) +
+        (u3 - 2.0 * u2 + u) * (length * rotation_in) +
+        (-2.0 * u3 + 3.0 * u2) * (distance * rotation_out) +
+        (u3 - u2) * (length * rotation_out);
+    return pose_of(position, rotated(rotation, orientation));
+  }
 };
 
-[[nodiscard]] core::Result<DensifiedCartesianPath>
+} // namespace
+
+core::Result<DensifiedCartesianPath>
 densify_cartesian_path(const core::CartesianPathDTO &path,
                        const RoboPlanCandidateControl &control) {
   constexpr std::size_t kMaximumInputWaypoints = 4096U;
   constexpr std::size_t kMaximumDensifiedWaypoints = 100'000U;
   constexpr std::size_t kControlStride = 64U;
+  // Below this a waypoint is collinear (no corner); above pi minus it the
+  // path reverses and no arc can round it.
+  constexpr double kMinimumTurnRad = 1e-6;
+  constexpr double kMinimumLengthM = 1e-9;
+  const auto invalid_radius = [](double radius) {
+    return !std::isfinite(radius) || radius < 0.0;
+  };
   if (path.waypoints.size() < 2U ||
       path.waypoints.size() > kMaximumInputWaypoints ||
       !finite_positive(path.max_translation_step_m) ||
       !finite_positive(path.max_rotation_step_rad) ||
-      path.speed_mode != core::CartesianSpeedModeDTO::kBounded ||
       path.fallback_policy != core::CartesianFallbackPolicyDTO::kFailClosed ||
       !finite_positive(path.max_angular_speed_rad_s) ||
       !finite_positive(path.max_linear_acceleration_mps2) ||
       !finite_positive(path.max_angular_acceleration_rad_s2) ||
-      !std::isfinite(path.max_blend_deviation_rad) ||
-      path.max_blend_deviation_rad < 0.0) {
+      (!path.blend_radii_m.empty() &&
+       path.blend_radii_m.size() != path.waypoints.size()) ||
+      std::any_of(path.blend_radii_m.begin(), path.blend_radii_m.end(),
+                  invalid_radius)) {
     return fail<DensifiedCartesianPath>(
         ErrorCode::kInvalidRequest,
-        "Cartesian request shape, policy, steps, or limits are invalid",
+        "Cartesian request shape, policy, steps, limits or blend radii are "
+        "invalid",
         "cartesian_request_invalid");
   }
 
-  std::vector<Eigen::Matrix4d> source;
-  source.reserve(path.waypoints.size());
-  for (std::size_t index = 0U; index < path.waypoints.size(); ++index) {
+  const std::size_t count = path.waypoints.size();
+  std::vector<Eigen::Vector3d> positions;
+  std::vector<Eigen::Quaterniond> orientations;
+  positions.reserve(count);
+  orientations.reserve(count);
+  for (std::size_t index = 0U; index < count; ++index) {
     if (index % kControlStride == 0U) {
       if (auto error = control_error(control, "cartesian_path_densification");
           error.has_value()) {
@@ -674,65 +740,163 @@ densify_cartesian_path(const core::CartesianPathDTO &path,
           "cartesian_waypoint_not_finite",
           {{"waypoint_index", std::to_string(index)}});
     }
-    source.push_back(native_pose(path.waypoints[index]));
+    const Eigen::Matrix4d pose = native_pose(path.waypoints[index]);
+    positions.push_back(pose.block<3, 1>(0, 3));
+    orientations.emplace_back(Eigen::Matrix3d(pose.block<3, 3>(0, 0)));
+  }
+
+  // Segment k runs from waypoint k to k + 1.
+  std::vector<double> lengths(count - 1U);
+  std::vector<Eigen::Vector3d> rotations(count - 1U);
+  for (std::size_t k = 0U; k + 1U < count; ++k) {
+    lengths[k] = (positions[k + 1U] - positions[k]).norm();
+    rotations[k] = rotation_vector(orientations[k], orientations[k + 1U]);
+  }
+
+  std::vector<std::optional<CornerArc>> corners(count);
+  for (std::size_t i = 1U; i + 1U < count; ++i) {
+    const double requested = path.blend_radii_m.empty() ? 0.0 : path.blend_radii_m[i];
+    const double length_in = lengths[i - 1U];
+    const double length_out = lengths[i];
+    if (requested <= 0.0 || length_in <= kMinimumLengthM ||
+        length_out <= kMinimumLengthM) {
+      continue;
+    }
+    const Eigen::Vector3d direction_in =
+        (positions[i] - positions[i - 1U]) / length_in;
+    const Eigen::Vector3d direction_out =
+        (positions[i + 1U] - positions[i]) / length_out;
+    const double turn =
+        std::acos(std::clamp(direction_in.dot(direction_out), -1.0, 1.0));
+    if (turn <= kMinimumTurnRad || turn >= std::numbers::pi - kMinimumTurnRad) {
+      continue;
+    }
+    CornerArc arc;
+    arc.distance = std::min({requested, 0.5 * length_in, 0.5 * length_out});
+    arc.turn = turn;
+    arc.radius = arc.distance / std::tan(0.5 * turn);
+    arc.direction_in = direction_in;
+    arc.inward = (direction_out - direction_out.dot(direction_in) * direction_in)
+                     .normalized();
+    arc.center =
+        positions[i] - arc.distance * direction_in + arc.radius * arc.inward;
+    arc.rotation_in = rotations[i - 1U] / length_in;
+    arc.rotation_out = rotations[i] / length_out;
+    arc.orientation = orientations[i];
+    const double arc_length = arc.radius * turn;
+    const double arc_rotation =
+        arc.distance * (arc.rotation_in.norm() + arc.rotation_out.norm());
+    const double steps = std::max(
+        {2.0, std::ceil(turn / kCornerArcMaxTurnRad),
+         std::ceil(arc_length / path.max_translation_step_m),
+         std::ceil(arc_rotation / path.max_rotation_step_rad)});
+    // An even count puts the arc middle on a sample (the waypoint's stand-in).
+    arc.steps = static_cast<std::size_t>(steps) + (static_cast<std::size_t>(steps) % 2U);
+    corners[i] = arc;
   }
 
   DensifiedCartesianPath result;
-  result.poses.reserve(source.size());
-  result.source_waypoint_dense_indices.reserve(source.size());
-  result.poses.push_back(source.front());
+  for (const auto &corner : corners) {
+    if (corner) {
+      result.smallest_corner_radius_m =
+          std::min(result.smallest_corner_radius_m, corner->radius);
+    }
+  }
+  result.poses.reserve(count);
+  result.source_waypoint_dense_indices.reserve(count);
+  result.poses.push_back(pose_of(positions.front(), orientations.front()));
   result.source_waypoint_dense_indices.push_back(0U);
-  for (std::size_t segment = 1U; segment < source.size(); ++segment) {
+  const auto budget_exceeded = [&](std::size_t segment, double required) {
+    const std::size_t remaining =
+        kMaximumDensifiedWaypoints - result.poses.size();
+    if (finite(required) && required <= static_cast<double>(remaining)) {
+      return std::optional<core::ErrorDTO>{};
+    }
+    return std::optional<core::ErrorDTO>{make_error(
+        ErrorCode::kInvalidRequest,
+        "Cartesian path exceeds its bounded densification budget",
+        "cartesian_path_too_dense",
+        {{"segment_index", std::to_string(segment)},
+         {"maximum_waypoints", std::to_string(kMaximumDensifiedWaypoints)}})};
+  };
+  for (std::size_t segment = 0U; segment + 1U < count; ++segment) {
     if (auto error = control_error(control, "cartesian_path_densification");
         error.has_value()) {
       return core::Result<DensifiedCartesianPath>::Err(std::move(*error));
     }
-    const auto &from = source[segment - 1U];
-    const auto &to = source[segment];
-    const double translation =
-        (to.block<3, 1>(0, 3) - from.block<3, 1>(0, 3)).norm();
-    const double rotation =
-        rotation_distance(from.block<3, 3>(0, 0), to.block<3, 3>(0, 0));
-    const double required = std::max(
-        1.0, std::ceil(std::max(translation / path.max_translation_step_m,
-                                rotation / path.max_rotation_step_rad)));
-    const std::size_t remaining =
-        kMaximumDensifiedWaypoints - result.poses.size();
-    if (!finite(required) || required > static_cast<double>(remaining)) {
-      return fail<DensifiedCartesianPath>(
-          ErrorCode::kInvalidRequest,
-          "Cartesian path exceeds its bounded densification budget",
-          "cartesian_path_too_dense",
-          {{"segment_index", std::to_string(segment - 1U)},
-           {"maximum_waypoints", std::to_string(kMaximumDensifiedWaypoints)}});
-    }
-    const auto subdivisions = static_cast<std::size_t>(required);
-    Eigen::Quaterniond from_orientation(from.block<3, 3>(0, 0));
-    Eigen::Quaterniond to_orientation(to.block<3, 3>(0, 0));
-    if (from_orientation.dot(to_orientation) < 0.0) {
+    // The straight part between this segment's corner arcs, as fractions.
+    const double length = lengths[segment];
+    const double first =
+        corners[segment] ? corners[segment]->distance / length : 0.0;
+    const double last =
+        corners[segment + 1U] ? 1.0 - corners[segment + 1U]->distance / length
+                              : 1.0;
+    Eigen::Quaterniond to_orientation = orientations[segment + 1U];
+    if (orientations[segment].dot(to_orientation) < 0.0) {
       to_orientation.coeffs() *= -1.0;
     }
-    for (std::size_t step = 1U; step <= subdivisions; ++step) {
-      if (step % kControlStride == 0U) {
-        if (auto error = control_error(control, "cartesian_path_densification");
-            error.has_value()) {
-          return core::Result<DensifiedCartesianPath>::Err(std::move(*error));
-        }
+    const double span = last - first;
+    if (span * length > kMinimumLengthM || !corners[segment + 1U]) {
+      const double required = std::max(
+          1.0, std::ceil(std::max(span * length / path.max_translation_step_m,
+                                  span * rotations[segment].norm() /
+                                      path.max_rotation_step_rad)));
+      if (auto error = budget_exceeded(segment, required); error.has_value()) {
+        return core::Result<DensifiedCartesianPath>::Err(std::move(*error));
       }
-      const double alpha =
-          static_cast<double>(step) / static_cast<double>(subdivisions);
-      Eigen::Matrix4d waypoint = Eigen::Matrix4d::Identity();
-      waypoint.block<3, 3>(0, 0) = from_orientation.slerp(alpha, to_orientation)
-                                       .normalized()
-                                       .toRotationMatrix();
-      waypoint.block<3, 1>(0, 3) =
-          (1.0 - alpha) * from.block<3, 1>(0, 3) + alpha * to.block<3, 1>(0, 3);
-      result.poses.push_back(std::move(waypoint));
+      const auto subdivisions = static_cast<std::size_t>(required);
+      for (std::size_t step = 1U; step <= subdivisions; ++step) {
+        if (step % kControlStride == 0U) {
+          if (auto error =
+                  control_error(control, "cartesian_path_densification");
+              error.has_value()) {
+            return core::Result<DensifiedCartesianPath>::Err(std::move(*error));
+          }
+        }
+        const double alpha =
+            first + span * static_cast<double>(step) /
+                        static_cast<double>(subdivisions);
+        result.poses.push_back(pose_of(
+            (1.0 - alpha) * positions[segment] + alpha * positions[segment + 1U],
+            orientations[segment].slerp(alpha, to_orientation).normalized()));
+      }
     }
-    result.source_waypoint_dense_indices.push_back(result.poses.size() - 1U);
+    const auto &arc = corners[segment + 1U];
+    if (!arc) {
+      result.source_waypoint_dense_indices.push_back(result.poses.size() - 1U);
+      continue;
+    }
+    if (auto error = budget_exceeded(segment, static_cast<double>(arc->steps));
+        error.has_value()) {
+      return core::Result<DensifiedCartesianPath>::Err(std::move(*error));
+    }
+    for (std::size_t step = 1U; step <= arc->steps; ++step) {
+      result.poses.push_back(arc->at(static_cast<double>(step) /
+                                     static_cast<double>(arc->steps)));
+      if (2U * step == arc->steps) {
+        result.source_waypoint_dense_indices.push_back(result.poses.size() - 1U);
+      }
+    }
   }
   return core::Result<DensifiedCartesianPath>::Ok(std::move(result));
 }
+
+CartesianResolutionTolerances
+cartesian_resolution_tolerances(const DensifiedCartesianPath &dense,
+                                double translation_tol_m,
+                                double rotation_tol_rad) {
+  // RoboPlan 0.8's resolution step is this share of its position and
+  // orientation tolerances (`kSeedStepFraction`).
+  constexpr double kRoboPlanResolutionStepFraction = 0.5;
+  const double scale = std::min(
+      1.0, kCornerArcMaxTurnRad * dense.smallest_corner_radius_m /
+               (kRoboPlanResolutionStepFraction * translation_tol_m));
+  return {scale * translation_tol_m, scale * rotation_tol_rad};
+}
+
+} // namespace detail
+
+namespace {
 
 void scale_trajectory_time(roboplan::JointTrajectory &trajectory,
                            double scale) {
@@ -748,15 +912,6 @@ void scale_trajectory_time(roboplan::JointTrajectory &trajectory,
   }
 }
 
-[[nodiscard]] std::vector<std::string>
-compiled_speed_frames(const std::vector<core::ResolvedFrameDTO> &frames) {
-  std::vector<std::string> result;
-  result.reserve(frames.size());
-  for (const auto &frame : frames)
-    result.push_back(core::compiled_frame_name(frame));
-  return result;
-}
-
 [[nodiscard]] detail::CartesianTrajectoryContractInput
 cartesian_contract_input(const RoboPlanCandidateBindingDTO &binding,
                          const RoboPlanCandidateRequestDTO &request,
@@ -765,8 +920,7 @@ cartesian_contract_input(const RoboPlanCandidateBindingDTO &binding,
       binding.compiled_group_name,
       core::compiled_frame_name(request.base_frame),
       core::compiled_frame_name(request.tcp_frame), request.speed_profile,
-      caps.portable_by_joint,
-      compiled_speed_frames(request.speed_check_frames)};
+      caps.portable_by_joint};
 }
 
 [[nodiscard]] CartesianPlanningControl
@@ -817,14 +971,14 @@ prepare_candidate_time_law(
     roboplan::JointTrajectory &trajectory,
     const Eigen::VectorXd &model_velocity_limits,
     const Eigen::VectorXd &model_acceleration_limits,
-    const CartesianPlanningControl &control,
+    const CartesianPlanningControl &control, bool tcp_held_by_toppra,
     std::vector<double>* cartesian_waypoint_times_s = nullptr,
     bool retain_moving_evidence = false) {
   const auto incomplete = [] {
     return fail<core::TrajectoryRuntimeScaleBoundsDTO>(
         ErrorCode::kValidationLimitsViolation,
         "Trajectory lacks a complete runtime dynamics preparation",
-        "native_runtime_scale_preparation_invalid");
+        "execution_host_scale_preparation_invalid");
   };
   if (trajectory.positions.size() < 2U ||
       trajectory.times.size() != trajectory.positions.size() ||
@@ -862,9 +1016,11 @@ prepare_candidate_time_law(
                                               model_velocity_limits,
                                               model_acceleration_limits);
   double frame_velocity_ratio = 0.0;
-  if (path || contract.speed_profile.max_tcp_linear_speed_mps) {
+  double tcp_time_multiplier = 1.0;
+  if (path &&
+      path->speed_mode != core::CartesianSpeedModeDTO::kTimeOptimal) {
     auto frame = detail::measure_cartesian_frame_dynamics_envelope(
-        contract, path, scene, trajectory, control);
+        contract, *path, scene, trajectory, control);
     if (!frame.ok())
       return core::Result<core::TrajectoryRuntimeScaleBoundsDTO>::Err(
           frame.error());
@@ -894,6 +1050,23 @@ prepare_candidate_time_law(
            0.0});
       limits.push_back({angular_velocity, angular_acceleration, std::nullopt});
     }
+    tcp_time_multiplier = std::max(1.0, frame_velocity_ratio);
+  } else if (contract.speed_profile.max_tcp_linear_speed_mps) {
+    // Check the active TCP at the samples only (linear; time_optimal
+    // Cartesian moves also angular). Exceedances between samples are
+    // accepted. RP-3 (motion timing fast, time_optimal Cartesian moves):
+    // TOPP-RA held the TCP at 0.98 of its limit on its grid, so only a sample
+    // above the limit stretches the whole trajectory back to the 0.98 target.
+    // Motion timing smooth (M8): TOPP-RA ignored the TCP, so the stretch
+    // brings the sample peak down to the 0.98 target.
+    const auto ratio =
+        detail::measure_tcp_sample_speed_ratio(contract, path, scene,
+                                               trajectory);
+    if (!ratio)
+      return incomplete();
+    frame_velocity_ratio = *ratio;
+    if (*ratio > (tcp_held_by_toppra ? 1.0 : detail::kTcpSpeedTargetFraction))
+      tcp_time_multiplier = *ratio / detail::kTcpSpeedTargetFraction;
   }
   // One implementation constant, not an extra operator setting. Reserving 20%
   // avoids spending the complete acceleration/jerk budget on nominal timing.
@@ -901,7 +1074,7 @@ prepare_candidate_time_law(
   if (!std::isfinite(frame_velocity_ratio))
     return incomplete();
   const std::array envelopes{core::detail::TrajectoryDynamicsEnvelope{
-      derivatives, limits, std::max(1.0, frame_velocity_ratio)}};
+      derivatives, limits, tcp_time_multiplier}};
   const auto prepared = core::detail::prepare_runtime_scaling(
       envelopes, kNominalScalingHeadroom, {4.0, 16.0});
   if (!prepared)
@@ -1046,11 +1219,11 @@ native_trajectory(const core::TrajectoryDTO &trajectory) {
       positions->second.size() != width)
     return fail<void>(ErrorCode::kValidationLimitsViolation,
                       "Moving position limits are unavailable",
-                      "native_runtime_scale_preparation_invalid");
+                      "execution_host_scale_preparation_invalid");
   const auto invalid = [] {
     return fail<void>(ErrorCode::kValidationLimitsViolation,
                       "Moving position bounds are not finite",
-                      "native_runtime_scale_preparation_invalid");
+                      "execution_host_scale_preparation_invalid");
   };
   // Bernstein subdivision is bounded independently of numeric convergence.
   // Exhaustion is inconclusive and never an acceptance of a joint limit.
@@ -1096,7 +1269,7 @@ measure_fixed_piece(const detail::CartesianTrajectoryContractInput &contract,
     return fail<FixedPieceMeasurement>(
         ErrorCode::kValidationLimitsViolation,
         "Moving trajectory lacks a complete exact-curve qualification",
-        "native_runtime_scale_preparation_invalid");
+        "execution_host_scale_preparation_invalid");
   };
   // Both callers supply complete P/V/A curves already checked by the input
   // contract or shared splice builder. Keep absolute output times here: a
@@ -1140,14 +1313,13 @@ measure_fixed_piece(const detail::CartesianTrajectoryContractInput &contract,
     MovingEnvelopeMeasurement timer(measurements, 1U,
                                     measurements.source ? "source_tcp_begin"
                                                         : "future_tcp_begin");
-    auto frame = detail::measure_cartesian_frame_dynamics_envelope(
-        contract, nullptr, scene, trajectory, control);
-    if (!frame.ok())
-      return core::Result<FixedPieceMeasurement>::Err(frame.error());
-    if (!frame.value().complete)
+    // RP-3: the same sample check as ordinary joint moves.
+    const auto ratio =
+        detail::measure_tcp_sample_speed_ratio(contract, nullptr, scene,
+                                               trajectory);
+    if (!ratio)
       return invalid();
-    result.velocity_ratio = std::max(frame.value().linear_speed_ratio,
-                                     frame.value().angular_speed_ratio);
+    result.velocity_ratio = *ratio;
     if (!measurements.source)
       measurements.future_tcp_ratio = result.velocity_ratio;
   }
@@ -1228,7 +1400,7 @@ plan_cartesian_candidate(const std::shared_ptr<roboplan::Scene> &scene,
         "tolerances",
         "cartesian_numeric_option_invalid");
   }
-  auto dense = densify_cartesian_path(path, control);
+  auto dense = detail::densify_cartesian_path(path, control);
   if (!dense.ok()) {
     return core::Result<roboplan::JointTrajectory>::Err(dense.error());
   }
@@ -1279,204 +1451,225 @@ plan_cartesian_candidate(const std::shared_ptr<roboplan::Scene> &scene,
         "cartesian_model_dynamics_limits_unavailable");
   }
 
+  const auto contract = cartesian_contract_input(binding, request, caps);
+  const auto contract_control = cartesian_control(control);
+  // CT-1: the Deployment's `cartesian_timing` applies when the move sets none.
+  core::CartesianPathDTO timed = path;
+  timed.speed_mode = path.speed_mode.value_or(config.cartesian_timing);
+  const bool time_optimal =
+      *timed.speed_mode == core::CartesianSpeedModeDTO::kTimeOptimal;
+
   roboplan::CartesianPlannerOptions options;
   options.group_name = binding.compiled_group_name;
   options.dt = config.trajectory_sample_period_s;
-  options.speed_mode = roboplan::CartesianSpeedMode::Bounded;
+  options.speed_mode = time_optimal ? roboplan::CartesianSpeedMode::TimeOptimal
+                                    : roboplan::CartesianSpeedMode::Bounded;
   if (!request.speed_profile.max_tcp_linear_speed_mps.has_value()) {
     return fail<roboplan::JointTrajectory>(
         ErrorCode::kInvalidRequest,
         "Cartesian planning requires the admitted TCP linear speed",
         "cartesian_tcp_linear_speed_missing");
   }
-  options.max_linear_speed =
-      *request.speed_profile.max_tcp_linear_speed_mps;
-  options.max_angular_speed = path.max_angular_speed_rad_s;
-  options.max_linear_acceleration = path.max_linear_acceleration_mps2;
-  options.max_angular_acceleration = path.max_angular_acceleration_rad_s2;
-  options.max_position_error = request.tolerances.translation_tol_m;
-  options.max_orientation_error = request.tolerances.rotation_tol_rad;
+  options.position_tolerance = request.tolerances.translation_tol_m;
+  options.orientation_tolerance = request.tolerances.rotation_tol_rad;
+  // N18: Bounded times the resolved samples themselves, so a rounded corner
+  // is resolved at most every r/20 (the whole path takes the finer step; the
+  // fidelity check below still holds the node's own tolerances). TimeOptimal
+  // reduces the samples to its tolerance budget and keeps the node's values.
+  if (!time_optimal) {
+    const auto resolution = detail::cartesian_resolution_tolerances(
+        dense.value(), options.position_tolerance,
+        options.orientation_tolerance);
+    options.position_tolerance = resolution.translation_m;
+    options.orientation_tolerance = resolution.rotation_rad;
+  }
   options.velocity_scale = request.speed_profile.velocity_scale;
-  options.acceleration_scale = request.speed_profile.acceleration_scale;
-
-  constexpr std::size_t kMaximumBlendAttempts = 5U;
-  std::array<double, kMaximumBlendAttempts> blend_attempts{};
-  blend_attempts.front() = path.max_blend_deviation_rad;
-  std::size_t blend_attempt_count = 1U;
-  if (path.max_blend_deviation_rad > 0.0) {
-    for (std::size_t index = 1U; index + 1U < kMaximumBlendAttempts; ++index) {
-      blend_attempts[index] = blend_attempts[index - 1U] * 0.5;
-    }
-    blend_attempts.back() = 0.0;
-    blend_attempt_count = kMaximumBlendAttempts;
+  // As for fast joint moves: time within the nominal acceleration share
+  // directly, so the live-scaling headroom needs no uniform stretch; the
+  // final stretch covers only what is still exceeded.
+  options.acceleration_scale = request.speed_profile.acceleration_scale *
+                               (1.0 - kNominalScalingHeadroom);
+  // Bounded applies the scales to the joint limits only, so its Cartesian
+  // maxima get them here: speeds at the 0.98 TCP target, accelerations within
+  // the nominal share.
+  options.max_linear_speed = detail::kTcpSpeedTargetFraction *
+                             *request.speed_profile.max_tcp_linear_speed_mps *
+                             options.velocity_scale;
+  options.max_angular_speed = detail::kTcpSpeedTargetFraction *
+                              path.max_angular_speed_rad_s *
+                              options.velocity_scale;
+  options.max_linear_acceleration =
+      path.max_linear_acceleration_mps2 * options.acceleration_scale;
+  options.max_angular_acceleration =
+      path.max_angular_acceleration_rad_s2 * options.acceleration_scale;
+  // Corners are rounded by densify_cartesian_path (RP-2). TimeOptimal keeps
+  // RoboPlan's own small joint-space blend between the waypoints it keeps;
+  // RP-3 holds the active TCP at 0.98 of its linear and angular speed limits
+  // on TOPP-RA's grid (patches 0016, 0018).
+  if (time_optimal) {
+    auto bound =
+        detail::make_tcp_speed_path_velocity_bound(contract, &timed, scene);
+    if (!bound)
+      return fail<roboplan::JointTrajectory>(
+          ErrorCode::kValidationLimitsViolation,
+          "Trajectory lacks a complete runtime dynamics preparation",
+          "execution_host_scale_preparation_invalid");
+    options.toppra_max_path_velocity = std::move(*bound);
   }
 
-  for (std::size_t blend_attempt = 0U;
-       blend_attempt < blend_attempt_count; ++blend_attempt) {
-    options.toppra_blend_deviation = blend_attempts[blend_attempt];
-
-    if (auto error = control_error(control, "before_cartesian_tracking");
+  if (auto error = control_error(control, "before_cartesian_tracking");
+      error.has_value()) {
+    return core::Result<roboplan::JointTrajectory>::Err(std::move(*error));
+  }
+  auto planned = [&] {
+    // RoboPlan's Cartesian tracker cannot parameterize a zero-length pose
+    // path. Reuse its ordinary stationary joint timing instead. This is only
+    // floating-point equality, not permission to omit small authored moves
+    // merely because they fit within the goal tolerance.
+    const bool stationary =
+        std::all_of(dense.value().poses.begin(), dense.value().poses.end(),
+                    [&](const auto &target) {
+                      return target.isApprox(actual_start, 1e-12);
+                    });
+    if (stationary) {
+      roboplan::PathParameterizerTOPPRA parameterizer(
+          scene, binding.compiled_group_name);
+      roboplan::TOPPRAOptions timing;
+      timing.dt = config.trajectory_sample_period_s;
+      timing.mode = roboplan::SplineFittingMode::Hermite;
+      timing.velocity_scale = options.velocity_scale;
+      timing.acceleration_scale = options.acceleration_scale;
+      timing.max_output_samples = config.maximum_trajectory_samples;
+      return parameterizer.generate(
+          roboplan::JointPath{binding.compiled_joint_names,
+                              {group_start, group_start}},
+          timing);
+    }
+    roboplan::CartesianPathPlanner planner(scene, options);
+    const roboplan::CartesianPath native_path(
+        {core::compiled_frame_name(request.base_frame)},
+        {core::compiled_frame_name(request.tcp_frame)},
+        {dense.value().poses});
+    roboplan::JointConfiguration native_start;
+    native_start.positions = full_start;
+    return planner.plan(native_path, native_start);
+  }();
+  if (!planned.has_value()) {
+    if (auto error = control_error(control, "cartesian_tracking");
         error.has_value()) {
       return core::Result<roboplan::JointTrajectory>::Err(std::move(*error));
     }
-    auto planned = [&] {
-      // RoboPlan's Cartesian tracker cannot parameterize a zero-length pose
-      // path. Reuse its ordinary stationary joint timing instead. This is only
-      // floating-point equality, not permission to omit small authored moves
-      // merely because they fit within the goal tolerance.
-      const bool stationary =
-          std::all_of(dense.value().poses.begin(), dense.value().poses.end(),
-                      [&](const auto &target) {
-                        return target.isApprox(actual_start, 1e-12);
-                      });
-      if (stationary) {
-        roboplan::PathParameterizerTOPPRA parameterizer(
-            scene, binding.compiled_group_name);
-        roboplan::TOPPRAOptions timing;
-        timing.dt = config.trajectory_sample_period_s;
-        timing.mode = roboplan::SplineFittingMode::Hermite;
-        timing.velocity_scale = options.velocity_scale;
-        timing.acceleration_scale = options.acceleration_scale;
-        timing.max_output_samples = config.maximum_trajectory_samples;
-        return parameterizer.generate(
-            roboplan::JointPath{binding.compiled_joint_names,
-                                {group_start, group_start}},
-            timing);
-      }
-      roboplan::CartesianPathPlanner planner(scene, options);
-      const roboplan::CartesianPath native_path(
-          {core::compiled_frame_name(request.base_frame)},
-          {core::compiled_frame_name(request.tcp_frame)},
-          {dense.value().poses});
-      roboplan::JointConfiguration native_start;
-      native_start.positions = full_start;
-      return planner.plan(native_path, native_start);
-    }();
-    if (!planned.has_value()) {
-      if (auto error = control_error(control, "cartesian_tracking");
-          error.has_value()) {
-        return core::Result<roboplan::JointTrajectory>::Err(std::move(*error));
-      }
-      return core::Result<roboplan::JointTrajectory>::Err(
-          map_cartesian_backend_failure(planned.error(), 0.0, 0U));
-    }
-    auto trajectory = std::move(planned.value());
-    const auto contract = cartesian_contract_input(binding, request, caps);
-    const auto contract_control = cartesian_control(control);
-    if (const auto error =
-            detail::validate_and_normalize_cartesian_trajectory_output(
-                trajectory, binding.compiled_joint_names, contract_control);
-        error.has_value()) {
-      return core::Result<roboplan::JointTrajectory>::Err(*error);
-    }
+    return core::Result<roboplan::JointTrajectory>::Err(
+        map_cartesian_backend_failure(planned.error(), 0.0, 0U));
+  }
+  auto trajectory = std::move(planned.value());
+  if (const auto error =
+          detail::validate_and_normalize_cartesian_trajectory_output(
+              trajectory, binding.compiled_joint_names, contract_control);
+      error.has_value()) {
+    return core::Result<roboplan::JointTrajectory>::Err(*error);
+  }
 
-    auto interpolant = detail::sample_cartesian_interpolant_path(
-        contract, scene, trajectory, request.tolerances.translation_tol_m,
-        request.tolerances.rotation_tol_rad, contract_control);
-    if (!interpolant.ok()) {
-      return core::Result<roboplan::JointTrajectory>::Err(interpolant.error());
-    }
-    const double certified_translation =
-        request.tolerances.translation_tol_m -
-        interpolant.value().unsampled_translation_bound_m;
-    const double certified_rotation =
-        request.tolerances.rotation_tol_rad -
-        interpolant.value().unsampled_rotation_bound_rad;
-    if (!finite_positive(certified_translation) ||
-        !finite_positive(certified_rotation)) {
-      return fail<roboplan::JointTrajectory>(
-          ErrorCode::kCartesianIncomplete,
-          "Cartesian continuous-path fidelity margin cannot be represented",
-          "cartesian_resource_budget_exceeded",
-          {{"failure_stage", "cartesian_output_validation"},
-           {"resource", "interpolant_fidelity_margin"}});
-    }
-    auto fidelity = verify_cartesian_path_fidelity_controlled(
-        dense.value().poses, interpolant.value().poses, certified_translation,
-        certified_rotation, contract_control,
-        dense.value().source_waypoint_dense_indices);
-    if (!fidelity.ok()) {
-      return core::Result<roboplan::JointTrajectory>::Err(fidelity.error());
-    }
-    if (!fidelity.value().complete) {
-      if (blend_attempt + 1U < blend_attempt_count) continue;
-      std::map<std::string, std::string> details{
+  auto interpolant = detail::sample_cartesian_interpolant_path(
+      contract, scene, trajectory, request.tolerances.translation_tol_m,
+      request.tolerances.rotation_tol_rad, contract_control);
+  if (!interpolant.ok()) {
+    return core::Result<roboplan::JointTrajectory>::Err(interpolant.error());
+  }
+  const double certified_translation =
+      request.tolerances.translation_tol_m -
+      interpolant.value().unsampled_translation_bound_m;
+  const double certified_rotation =
+      request.tolerances.rotation_tol_rad -
+      interpolant.value().unsampled_rotation_bound_rad;
+  if (!finite_positive(certified_translation) ||
+      !finite_positive(certified_rotation)) {
+    return fail<roboplan::JointTrajectory>(
+        ErrorCode::kCartesianIncomplete,
+        "Cartesian continuous-path fidelity margin cannot be represented",
+        "cartesian_resource_budget_exceeded",
+        {{"failure_stage", "cartesian_output_validation"},
+         {"resource", "interpolant_fidelity_margin"}});
+  }
+  auto fidelity = verify_cartesian_path_fidelity_controlled(
+      dense.value().poses, interpolant.value().poses, certified_translation,
+      certified_rotation, contract_control,
+      dense.value().source_waypoint_dense_indices);
+  if (!fidelity.ok()) {
+    return core::Result<roboplan::JointTrajectory>::Err(fidelity.error());
+  }
+  if (!fidelity.value().complete) {
+    std::map<std::string, std::string> details{
         {"reason", "cartesian_path_tolerance_exceeded"},
         {"failure_stage", "cartesian_output_validation"},
+        {"cartesian_timing",
+         std::string(core::cartesian_speed_mode_name(*timed.speed_mode))},
         {"fraction_completed",
          std::to_string(fidelity.value().fraction_completed)},
         {"max_translation_error_m",
          std::to_string(fidelity.value().max_translation_error_m)},
         {"max_rotation_error_rad",
-         std::to_string(fidelity.value().max_rotation_error_rad)},
-        {"requested_max_blend_deviation_rad",
-         std::to_string(path.max_blend_deviation_rad)},
-        {"planning_attempt_count", std::to_string(blend_attempt + 1U)}};
-      if (fidelity.value().first_failing_path_sample_index.has_value()) {
-        details["first_failing_path_sample_index"] =
-            std::to_string(*fidelity.value().first_failing_path_sample_index);
-      }
-      return core::Result<roboplan::JointTrajectory>::Err(
-          make_error(ErrorCode::kCartesianIncomplete,
-                     "Cartesian trajectory deviated from the requested path",
-                     "cartesian_path_tolerance_exceeded", std::move(details)));
+         std::to_string(fidelity.value().max_rotation_error_rad)}};
+    if (fidelity.value().first_failing_path_sample_index.has_value()) {
+      details["first_failing_path_sample_index"] =
+          std::to_string(*fidelity.value().first_failing_path_sample_index);
     }
+    return core::Result<roboplan::JointTrajectory>::Err(
+        make_error(ErrorCode::kCartesianIncomplete,
+                   "Cartesian trajectory deviated from the requested path",
+                   "cartesian_path_tolerance_exceeded", std::move(details)));
+  }
 
-    const auto &matches = fidelity.value().waypoint_actual_sample_indices;
-    if (matches.size() != path.waypoints.size() ||
-        interpolant.value().times_s.size() != interpolant.value().poses.size())
+  const auto &matches = fidelity.value().waypoint_actual_sample_indices;
+  if (matches.size() != path.waypoints.size() ||
+      interpolant.value().times_s.size() != interpolant.value().poses.size())
+    return fail<roboplan::JointTrajectory>(
+        ErrorCode::kCartesianIncomplete,
+        "Cartesian source waypoint correspondence is incomplete",
+        "cartesian_waypoint_correspondence_invalid");
+  waypoint_times_s.clear();
+  waypoint_times_s.reserve(matches.size());
+  for (std::size_t i = 0; i < matches.size(); ++i) {
+    if (matches[i] >= interpolant.value().poses.size())
       return fail<roboplan::JointTrajectory>(
           ErrorCode::kCartesianIncomplete,
-          "Cartesian source waypoint correspondence is incomplete",
+          "Cartesian source waypoint has no reached trajectory sample",
           "cartesian_waypoint_correspondence_invalid");
-    waypoint_times_s.clear();
-    waypoint_times_s.reserve(matches.size());
-    for (std::size_t i = 0; i < matches.size(); ++i) {
-      if (matches[i] >= interpolant.value().poses.size())
-        return fail<roboplan::JointTrajectory>(
-            ErrorCode::kCartesianIncomplete,
-            "Cartesian source waypoint has no reached trajectory sample",
-            "cartesian_waypoint_correspondence_invalid");
-      const auto &actual = interpolant.value().poses[matches[i]];
-      const auto &requested =
-          dense.value().poses[dense.value().source_waypoint_dense_indices[i]];
-      if ((actual.block<3, 1>(0, 3) - requested.block<3, 1>(0, 3)).norm() >
-              request.tolerances.translation_tol_m ||
-          rotation_distance(actual.block<3, 3>(0, 0),
-                            requested.block<3, 3>(0, 0)) >
-              request.tolerances.rotation_tol_rad)
-        return fail<roboplan::JointTrajectory>(
-            ErrorCode::kCartesianIncomplete,
-            "Cartesian waypoint milestone is outside its pose tolerance",
-            "cartesian_waypoint_correspondence_invalid");
-      waypoint_times_s.push_back(interpolant.value().times_s[matches[i]]);
-    }
-    auto prepared = prepare_candidate_time_law(
-        contract, &path, scene, trajectory, model_velocity_limits->second,
-        model_acceleration_limits->second, contract_control, &waypoint_times_s);
-    if (!prepared.ok())
-      return core::Result<roboplan::JointTrajectory>::Err(prepared.error());
-    scale_bounds = prepared.value();
-    fidelity_metrics = core::CartesianFidelityMetricsDTO{
-        request.tolerances.translation_tol_m,
-        request.tolerances.rotation_tol_rad,
-        fidelity.value().max_translation_error_m,
-        fidelity.value().max_rotation_error_rad,
-        interpolant.value().unsampled_translation_bound_m,
-        interpolant.value().unsampled_rotation_bound_rad,
-        fidelity.value().max_translation_error_m +
-            interpolant.value().unsampled_translation_bound_m,
-        fidelity.value().max_rotation_error_rad +
-            interpolant.value().unsampled_rotation_bound_rad,
-        path.max_blend_deviation_rad,
-        options.toppra_blend_deviation,
-        static_cast<std::uint32_t>(blend_attempt + 1U)};
-    return core::Result<roboplan::JointTrajectory>::Ok(std::move(trajectory));
+    const auto &actual = interpolant.value().poses[matches[i]];
+    const auto &requested =
+        dense.value().poses[dense.value().source_waypoint_dense_indices[i]];
+    if ((actual.block<3, 1>(0, 3) - requested.block<3, 1>(0, 3)).norm() >
+            request.tolerances.translation_tol_m ||
+        rotation_distance(actual.block<3, 3>(0, 0),
+                          requested.block<3, 3>(0, 0)) >
+            request.tolerances.rotation_tol_rad)
+      return fail<roboplan::JointTrajectory>(
+          ErrorCode::kCartesianIncomplete,
+          "Cartesian waypoint milestone is outside its pose tolerance",
+          "cartesian_waypoint_correspondence_invalid");
+    waypoint_times_s.push_back(interpolant.value().times_s[matches[i]]);
   }
-  return fail<roboplan::JointTrajectory>(
-      ErrorCode::kCartesianIncomplete,
-      "Cartesian blend search exhausted without a candidate",
-      "cartesian_blend_search_exhausted");
+  // Cartesian moves follow `cartesian_timing`, never `motion_timing`:
+  // time_optimal carries the RP-3 bound; constant_speed is certified above.
+  auto prepared = prepare_candidate_time_law(
+      contract, &timed, scene, trajectory, model_velocity_limits->second,
+      model_acceleration_limits->second, contract_control,
+      /*tcp_held_by_toppra=*/true, &waypoint_times_s);
+  if (!prepared.ok())
+    return core::Result<roboplan::JointTrajectory>::Err(prepared.error());
+  scale_bounds = prepared.value();
+  fidelity_metrics = core::CartesianFidelityMetricsDTO{
+      request.tolerances.translation_tol_m,
+      request.tolerances.rotation_tol_rad,
+      fidelity.value().max_translation_error_m,
+      fidelity.value().max_rotation_error_rad,
+      interpolant.value().unsampled_translation_bound_m,
+      interpolant.value().unsampled_rotation_bound_rad,
+      fidelity.value().max_translation_error_m +
+          interpolant.value().unsampled_translation_bound_m,
+      fidelity.value().max_rotation_error_rad +
+          interpolant.value().unsampled_rotation_bound_rad};
+  return core::Result<roboplan::JointTrajectory>::Ok(std::move(trajectory));
 }
 
 [[nodiscard]] core::Result<roboplan::JointTrajectory> time_joint_candidate(
@@ -1484,6 +1677,7 @@ plan_cartesian_candidate(const std::shared_ptr<roboplan::Scene> &scene,
     const RoboPlanCandidateBindingDTO &binding,
     const RoboPlanCandidateRequestDTO &request,
     const RoboPlanCandidateComputerConfig &config,
+    const detail::CartesianTrajectoryContractInput &contract,
     const RoboPlanCandidateControl &control, const roboplan::JointPath &path,
     const Eigen::VectorXd &start, const Eigen::VectorXd &goal) {
   if (auto error = control_error(control, "joint_time_parameterization");
@@ -1496,8 +1690,29 @@ plan_cartesian_candidate(const std::shared_ptr<roboplan::Scene> &scene,
   options.dt = config.trajectory_sample_period_s;
   options.mode = roboplan::SplineFittingMode::Hermite;
   options.velocity_scale = request.speed_profile.velocity_scale;
-  options.acceleration_scale = request.speed_profile.acceleration_scale;
+  // N12 / RP-3b: the robot's Deployment `motion_timing`.
+  const bool fast = config.motion_timing == core::MotionTimingDTO::kFast;
+  // Fast: time within the nominal acceleration share directly, so the
+  // live-scaling headroom needs no uniform stretch that would also slow the
+  // stretches held at the TCP target; the final stretch covers only what is
+  // still exceeded. Smooth (M8): the full acceleration scale; the final
+  // uniform stretch adds the TCP target, the headroom and jerk limits.
+  options.acceleration_scale =
+      request.speed_profile.acceleration_scale *
+      (fast ? 1.0 - kNominalScalingHeadroom : 1.0);
   options.max_output_samples = config.maximum_trajectory_samples;
+  // Fast (RP-3): hold the active TCP at 0.98 of its speed limit on TOPP-RA's
+  // grid.
+  if (fast && contract.speed_profile.max_tcp_linear_speed_mps) {
+    auto bound =
+        detail::make_tcp_speed_path_velocity_bound(contract, nullptr, scene);
+    if (!bound)
+      return fail<roboplan::JointTrajectory>(
+          ErrorCode::kValidationLimitsViolation,
+          "Trajectory lacks a complete runtime dynamics preparation",
+          "execution_host_scale_preparation_invalid");
+    options.max_path_velocity = std::move(*bound);
+  }
   auto generated = parameterizer.generate(path, options);
   if (auto error = control_error(control, "joint_time_parameterization");
       error.has_value())
@@ -1511,9 +1726,9 @@ plan_cartesian_candidate(const std::shared_ptr<roboplan::Scene> &scene,
 
   auto trajectory = std::move(generated.value());
   anchor_trajectory_endpoints(trajectory, start, goal);
-  // The caller certifies the final interpolant and applies one common time
-  // dilation for joint/TCP caps, optional jerk and live-scaling headroom.
-  // Re-running TOPPRA against sampled peaks would duplicate that stronger gate.
+  // The caller checks the samples and applies one common time dilation for
+  // joint caps, the TCP (smooth: down to its target; fast: a sampled
+  // exceedance), optional jerk and live-scaling headroom.
   return core::Result<roboplan::JointTrajectory>::Ok(std::move(trajectory));
 }
 
@@ -1527,7 +1742,7 @@ constexpr double kPoseGoalRefineAngularRad = 1e-4;
     const core::ResolvedFrameDTO &base_frame,
     const core::ResolvedFrameDTO &tcp_frame,
     const core::ControlledStateDTO &seed_state, double timeout_s,
-    const RoboPlanCandidateControl &control, core::PlanningProfileDTO profile,
+    const RoboPlanCandidateControl &control,
     const core::TolerancesDTO *tolerances = nullptr) {
   if (!valid_pose(goal) || !finite_positive(timeout_s) ||
       !contains_frame(binding.permitted_frames, base_frame) ||
@@ -1556,8 +1771,7 @@ constexpr double kPoseGoalRefineAngularRad = 1e-4;
     return core::Result<std::vector<double>>::Err(std::move(*error));
   }
 
-  auto options = planning_profile_ik_options(
-      production_planning_ik_options(binding.compiled_group_name), profile);
+  auto options = production_planning_ik_options(binding.compiled_group_name);
   options.max_time = std::min(options.max_time, timeout_s);
   if (tolerances != nullptr) {
     if (finite_positive(tolerances->translation_tol_m)) {
@@ -1668,12 +1882,7 @@ moving_suffix_request(const RoboPlanCandidateBindingDTO &binding,
       !prefix.cartesian_waypoint_times_s.empty() ||
       prefix.cartesian_fidelity_metrics ||
       !contains_frame(binding.permitted_frames, moving.source_base_frame) ||
-      !contains_frame(binding.permitted_frames, moving.source_tcp_frame) ||
-      !std::all_of(moving.source_speed_check_frames.begin(),
-                   moving.source_speed_check_frames.end(),
-                   [&](const auto &frame) {
-                     return contains_frame(binding.permitted_frames, frame);
-                   }))
+      !contains_frame(binding.permitted_frames, moving.source_tcp_frame))
     return invalid();
   if (const auto error = detail::validate_cartesian_trajectory_output(
           native_trajectory(prefix), binding.compiled_joint_names, control))
@@ -1786,8 +1995,7 @@ moving_suffix_request(const RoboPlanCandidateBindingDTO &binding,
       binding.compiled_group_name,
       core::compiled_frame_name(moving.source_base_frame),
       core::compiled_frame_name(moving.source_tcp_frame),
-      moving.source_speed_profile, source_caps.value().portable_by_joint,
-      compiled_speed_frames(moving.source_speed_check_frames)};
+      moving.source_speed_profile, source_caps.value().portable_by_joint};
   const auto future_contract =
       cartesian_contract_input(binding, input, future_caps);
   const auto contract_control = cartesian_control(control);
@@ -1827,7 +2035,7 @@ moving_suffix_request(const RoboPlanCandidateBindingDTO &binding,
     return fail<core::TrajectoryDTO>(
         ErrorCode::kValidationLimitsViolation,
         "Moving suffix lacks final time-law evidence",
-        "native_runtime_scale_preparation_invalid");
+        "execution_host_scale_preparation_invalid");
   const auto suffix_bounds = *suffix.runtime_scale_bounds;
   suffix.runtime_scale_bounds.reset();
   const auto velocity_limits =
@@ -2056,8 +2264,7 @@ core::Result<std::vector<double>> RoboPlanCandidateComputer::solve_ik(
       scene_->setRngSeed(*config_.rng_seed);
     }
     return solve_ik_locked(scene_, binding_, goal, base_frame, tcp_frame,
-                           seed_state, timeout_s, control,
-                           core::PlanningProfileDTO::kFirstFeasible);
+                           seed_state, timeout_s, control);
   } catch (const std::exception &error) {
     return fail<std::vector<double>>(ErrorCode::kPlanningFailed,
                                      "RoboPlan IK adapter failed: " +
@@ -2279,7 +2486,7 @@ core::Result<core::TrajectoryDTO> RoboPlanCandidateComputer::compute(
       auto solution = solve_ik_locked(
           planning_scene, binding_, pose->goal, request.base_frame,
           request.tcp_frame, request.start_state, ik_timeout, control,
-          request.planning_profile, &request.tolerances);
+          &request.tolerances);
       if (!solution.ok()) {
         return core::Result<core::TrajectoryDTO>::Err(solution.error());
       }
@@ -2329,40 +2536,83 @@ core::Result<core::TrajectoryDTO> RoboPlanCandidateComputer::compute(
       return fail<core::TrajectoryDTO>(ErrorCode::kPlanningTimeout,
                                        "Moving suffix planning timeout expired",
                                        "planning_timeout");
-    auto rrt_options = planning_profile_rrt_options(
+    const auto planner_settings = core::resolve_planner_settings(
+        config_.planner_defaults(), request.planner);
+    roboplan::RRT planner(
+        planning_scene,
         production_rrt_options(binding_.compiled_group_name, rrt_timeout,
                                request.planning_attempt_index,
-                               config_.collision_check_step_rad),
-        request.planning_profile);
-    roboplan::RRT planner(planning_scene, rrt_options);
-    if (request_seed.has_value()) {
-      planner.setRngSeed(*request_seed);
+                               planner_settings));
+    // best_of_n: n first-path plans with distinct seeds (seed + run) sharing
+    // the RRT budget; the shortest shortcut path wins. Other modes plan once.
+    const auto search_started = std::chrono::steady_clock::now();
+    const std::uint32_t runs =
+        planner_settings.optimize == core::PlannerOptimizeDTO::kBestOfN
+            ? planner_settings.n
+            : 1U;
+    std::optional<roboplan::JointPath> candidate_path;
+    double candidate_length = std::numeric_limits<double>::infinity();
+    std::string planner_error;
+    for (std::uint32_t run = 0U; run < runs; ++run) {
+      if (run > 0U) {
+        const double remaining =
+            rrt_timeout - std::chrono::duration<double>(
+                              std::chrono::steady_clock::now() - search_started)
+                              .count();
+        if (!finite_positive(remaining)) break;
+        planner.setOptions(production_rrt_options(
+            binding_.compiled_group_name, remaining,
+            request.planning_attempt_index, planner_settings));
+      }
+      const auto run_seed =
+          request_seed.has_value()
+              ? std::optional<std::uint32_t>(*request_seed + run)
+              : std::nullopt;
+      if (run_seed.has_value()) {
+        planner.setRngSeed(*run_seed);
+      }
+      auto path = planner.plan(native_start, native_goal);
+      if (auto error = control_error(control, "rrt"); error.has_value()) {
+        return core::Result<core::TrajectoryDTO>::Err(std::move(*error));
+      }
+      if (!path.has_value()) {
+        planner_error = path.error();
+        continue;
+      }
+      auto run_path = std::move(path.value());
+      if (shortcut_candidate_for_attempt(request.planning_attempt_index)) {
+        const auto shortcut_options = production_shortcutting_options(
+            binding_.compiled_group_name, run_seed,
+            request.planning_attempt_index,
+            planner_settings.collision_check_step_rad);
+        roboplan::PathShortcutter shortcutter(planning_scene, shortcut_options);
+        run_path = shortcutter.shortcut(run_path);
+        if (auto error = control_error(control, "shortcut"); error.has_value()) {
+          return core::Result<core::TrajectoryDTO>::Err(std::move(*error));
+        }
+      }
+      const double length =
+          runs == 1U ? 0.0
+                     : roboplan::computePathLength(*planning_scene,
+                                                   binding_.compiled_group_name,
+                                                   run_path)
+                           .value_or(std::numeric_limits<double>::infinity());
+      if (!candidate_path.has_value() || length < candidate_length) {
+        candidate_path = std::move(run_path);
+        candidate_length = length;
+      }
     }
-    auto path = planner.plan(native_start, native_goal);
-    if (auto error = control_error(control, "rrt"); error.has_value()) {
-      return core::Result<core::TrajectoryDTO>::Err(std::move(*error));
-    }
-    if (!path.has_value()) {
+    if (!candidate_path.has_value()) {
       return fail<core::TrajectoryDTO>(
           ErrorCode::kPlanningFailed,
           "RoboPlan could not find a collision-free joint path",
-          "native_rrt_failed", {{"planner_error", path.error()}});
+          "native_rrt_failed", {{"planner_error", planner_error}});
     }
-
-    auto candidate_path = std::move(path.value());
-    if (shortcut_candidate_for_attempt(request.planning_attempt_index)) {
-      const auto shortcut_options = production_shortcutting_options(
-          binding_.compiled_group_name, request_seed,
-          request.planning_attempt_index, config_.collision_check_step_rad);
-      roboplan::PathShortcutter shortcutter(planning_scene, shortcut_options);
-      candidate_path = shortcutter.shortcut(candidate_path);
-      if (auto error = control_error(control, "shortcut"); error.has_value()) {
-        return core::Result<core::TrajectoryDTO>::Err(std::move(*error));
-      }
-    }
+    const auto contract =
+        cartesian_contract_input(binding_, request, caps.value());
     auto trajectory = time_joint_candidate(
-        planning_scene, binding_, request, config_, control,
-        candidate_path, native_start.positions, native_goal.positions);
+        planning_scene, binding_, request, config_, contract, control,
+        *candidate_path, native_start.positions, native_goal.positions);
     if (!trajectory.ok()) {
       return core::Result<core::TrajectoryDTO>::Err(trajectory.error());
     }
@@ -2381,10 +2631,11 @@ core::Result<core::TrajectoryDTO> RoboPlanCandidateComputer::compute(
           "native_model_dynamics_limits_unavailable");
     }
     auto prepared = prepare_candidate_time_law(
-        cartesian_contract_input(binding_, request, caps.value()), nullptr,
+        contract, nullptr,
         planning_scene, trajectory.value(), model_velocity->second,
-        model_acceleration->second, cartesian_control(control), nullptr,
-        input.moving_replacement.has_value());
+        model_acceleration->second, cartesian_control(control),
+        /*tcp_held_by_toppra=*/config_.motion_timing == core::MotionTimingDTO::kFast,
+        nullptr, input.moving_replacement.has_value());
     if (!prepared.ok())
       return core::Result<core::TrajectoryDTO>::Err(prepared.error());
     auto portable = portable_trajectory(trajectory.value(), binding_,

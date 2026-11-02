@@ -4,13 +4,11 @@
 #include <cstdint>
 #include <manyforge_deployment/canonical_value.hpp>
 #include <manyforge_deployment/execution_runtime_contract.hpp>
-#include <manyforge_core/component_stream_health.hpp>
 #include <manyforge_core/types/cell_graph.hpp>
 #include <manyforge_core/types/motion_interrupt.hpp>
 #include <manyforge_core/types/gripper.hpp>
 #include <manyforge_core/types/io_signal.hpp>
 #include <manyforge_core/types/strong_id.hpp>
-#include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <map>
 #include <optional>
 #include <string>
@@ -26,9 +24,8 @@ class RetainedBundle;
 
 namespace manyforge::deployment::ros2_control_execution_runtime_contract {
 
-/// Build-owned identities for the retained ROS/JTC execution runtime. This is
-/// a separate runtime product from native simulated execution; both reuse the
-/// same Manager-owned installed-target process protocol.
+/// Build-owned identities for the retained ROS/JTC execution runtime. It uses
+/// the Manager-owned installed-target process protocol.
 inline constexpr std::string_view kProductContractId =
     "manyforge.ros2_control_execution_runtime_unit";
 inline constexpr std::string_view kRuntimeProfileId =
@@ -97,25 +94,27 @@ struct Configuration final {
                            const FaultStopProfile &) = default;
   };
 
-  /// Q68: the controller profile each hosted controllable component selects
+  /// Q68: the controller profile of each hosted controllable component
   /// inside the one ROS runtime unit (one controller manager per component,
-  /// Q66). Exactly one of the lane selectors is present.
+  /// Q66). The execution host reads the model's `component.yaml`
+  /// `lanes.<lane>` row (CONTRACTS §12) from `lane` and `model_family_id`;
+  /// Real's adapter comes from that row (`lanes.real.adapter`).
   struct ControllerProfile final {
     core::ControllableComponentId controllable_component_id;
-    /// Isaac lane profile (`lite6`, `ur10e`).
-    std::optional<std::string> isaac_profile;
-    /// Offline mock lane profile (one per offline model family).
-    std::optional<std::string> mock_profile;
+    /// The authored lane: `mock`, `isaac` or `real`.
+    std::string lane;
+    /// The model's `lanes.<lane>` row (CONTRACTS §12 ModelLaneRow: adapter,
+    /// controller, arrival_tolerance_rad, goal_time_s?, adapter-specific
+    /// keys, controllers_file?), verbatim as canonical JSON of one object.
+    std::string lane_row;
+    /// The model family whose lane row runs this component.
+    std::string model_family_id;
     /// Q82 authored literal TF prefix; empty preserves unprefixed frames.
     std::string frame_prefix{};
-    /// CP8 step 1 (temporary; package IDs replace all three selectors in CP8
-    /// step 3): a real robot profile, with the site-settings name of the
-    /// robot's address. The address itself is a site fact, never compiled.
-    std::optional<std::string> real_profile{};
+    /// CP8 step 1: the site-settings name of a Real robot's address, present
+    /// exactly on lane `real`. The address itself is a site fact, never
+    /// compiled.
     std::optional<std::string> device_address_ref{};
-    /// V-B4: a real robot's vendor adapter family (e.g. `xarm`), which
-    /// selects its vendor adapter; present exactly with `real_profile`.
-    std::optional<std::string> adapter_family{};
     /// Where this component's soft Stop lead-in starts when its trip state is
     /// measured (Real): the controller's command position (absent or
     /// `commanded`) or the measured position (`measured`).
@@ -123,7 +122,26 @@ struct Configuration final {
     /// M6b: whether TCP updates are sent to the robot's controller (Real,
     /// default on). Off: its vendor adapter keeps the controller's TCP offset
     /// at zero. Lanes without a vendor adapter ignore it.
-    bool controller_tcp_offset_sync{true};
+    bool controller_tcp_offset_sync{core::kDefaultControllerTcpOffsetSync};
+    /// CONTRACTS §16: a machine's arm member names its owner and role; its
+    /// `device_address_ref` is the owner's.
+    std::optional<std::string> owner_component_id{};
+    std::optional<std::string> member_role{};
+    /// N17: the launch values the compiler writes, so the host launches the
+    /// component from its row alone. An arm's model source joints in
+    /// controller order (its family's `arm_joints`); a tool's one gripper
+    /// joint. Exactly one of the two is present.
+    std::vector<std::string> joint_names{};
+    std::optional<std::string> gripper_joint_name{};
+    /// The launched robot_description: the model's source URDF with the
+    /// static frames the cell adds (offset frames, custom TCPs, the mounts
+    /// on it and a process-less mounted child's fixed links).
+    std::string description{};
+    /// Q48: an arm's operator (controlled) Stop maximum deceleration per
+    /// source joint, every arm joint, from the Deployment's
+    /// `controlled_stop.per_joint_limits`: its JTC's
+    /// `max_deceleration_on_cancel` on every lane. Empty on a tool row.
+    std::map<std::string, double, std::less<>> max_deceleration_on_cancel_rad_s2{};
 
     friend bool operator==(const ControllerProfile &,
                            const ControllerProfile &) = default;
@@ -131,6 +149,48 @@ struct Configuration final {
 
   /// One row per hosted controllable component, sorted by component.
   std::vector<ControllerProfile> controller_profiles;
+  /// CONTRACTS §16 / BOUNDARY §3: one row per machine owner, sorted by
+  /// component. The owner has no targets; `machine_lane_row` is its machine
+  /// model's `lanes.<lane>` row as canonical JSON (absent on a lane without
+  /// one: the host's passive owner).
+  struct Machine final {
+    /// The machine's deactivated arm on a lane where the machine has a
+    /// process: the owner runs that process itself (the arm's description,
+    /// no arm controllers, hardware left inactive). `lane_row` is the arm
+    /// model's `lanes.<lane>` row as canonical JSON, `model_family_id` its
+    /// family (the row's relative `controllers_file` is in its folder).
+    struct DeactivatedArm final {
+      std::string lane_row;
+      std::string model_family_id;
+      std::string description;
+      std::vector<std::string> joint_names;
+
+      friend bool operator==(const DeactivatedArm &, const DeactivatedArm &) = default;
+    };
+    core::ControllableComponentId controllable_component_id;
+    std::string lane;
+    std::optional<std::string> machine_lane_row{};
+    std::optional<std::string> device_address_ref{};
+    std::optional<DeactivatedArm> deactivated_arm{};
+
+    friend bool operator==(const Machine &, const Machine &) = default;
+  };
+  std::vector<Machine> machines;
+  /// One row per sensor component (`kind: sensor` model, runtime kind
+  /// `sensor`, e.g. a point-cloud source), sorted by component. No targets,
+  /// no lane. `adapter_row` is the model's one adapter row as canonical JSON;
+  /// `settings` is the canonical JSON object of the
+  /// effective settings (for a point cloud `{topic, source_frame_id,
+  /// max_points, minimum_period_s}`), which the host lays over the adapter
+  /// row for the adapter.
+  struct Sensor final {
+    core::ControllableComponentId controllable_component_id;
+    std::string adapter_row;
+    std::string settings;
+
+    friend bool operator==(const Sensor &, const Sensor &) = default;
+  };
+  std::vector<Sensor> sensors;
   std::uint32_t planner_rng_seed{};
   std::vector<double> initial_joint_positions_rad;
   std::vector<
@@ -139,8 +199,7 @@ struct Configuration final {
   /// At most one per hosted motion target; absent targets have no fault
   /// Stop profile (as `main` without `default_fault_stop_profile`).
   std::vector<FaultStopProfile> default_fault_stop_profiles;
-  /// DX791: active ROS rows require an explicit output choice. The unchanged
-  /// neutral base is also used by pure archival Native decoding; no absent
+  /// DX791: active ROS rows require an explicit output choice; no absent
   /// authored ROS field is interpreted as commanded output.
   struct PneumaticOutput final {
     core::IoSignalId signal;
@@ -183,17 +242,23 @@ struct Configuration final {
     /// are required for a particular open or close command.
     std::optional<PneumaticIo> pneumatic_io;
     std::optional<GraspConfirmation> grasp_confirmation;
+    /// Position grippers: overrides the component's lane-row
+    /// `gripper_stop_finish_tolerance` (finger position units, >= 0; 0 always
+    /// cancels). Absence keeps the component default.
+    std::optional<double> stop_finish_tolerance;
 
     GripperTargetConfiguration(
         execution_runtime_contract::Configuration::GripperTargetConfiguration value,
         core::GripperOutputMode mode,
         std::optional<double> delivery_timeout = std::nullopt,
         std::optional<PneumaticIo> io = std::nullopt,
-        std::optional<GraspConfirmation> grasp = std::nullopt)
+        std::optional<GraspConfirmation> grasp = std::nullopt,
+        std::optional<double> finish_tolerance = std::nullopt)
         : execution_runtime_contract::Configuration::GripperTargetConfiguration(
               std::move(value)), output_mode(mode),
           delivery_result_timeout_s(delivery_timeout), pneumatic_io(std::move(io)),
-          grasp_confirmation(std::move(grasp)) {}
+          grasp_confirmation(std::move(grasp)),
+          stop_finish_tolerance(finish_tolerance) {}
 
     friend bool operator==(const GripperTargetConfiguration &,
                            const GripperTargetConfiguration &) = default;
@@ -209,10 +274,12 @@ struct Configuration final {
   std::optional<std::uint32_t> runtime_collision_lookahead_workers;
   std::optional<double> runtime_dynamic_body_max_age_cap_ms;
   std::optional<std::uint32_t> validation_collision_workers;
-  /// Collision clearance (m) and the planner/validation collision-check
-  /// step (rad); absent keeps the kernel defaults.
+  /// Collision clearance (m), the planner/validation collision-check
+  /// step (rad) and whether fresh plans get the pre-dispatch waypoint check;
+  /// absent keeps the kernel defaults.
   std::optional<double> collision_clearance_m;
   std::optional<double> collision_check_step_rad;
+  std::optional<bool> collision_check_fresh_plans;
 
   /// CP9: one row per model-free pose-source component (runtime kind
   /// `pose_source`, profile `pose_source_v0`), sorted by component. The
@@ -263,15 +330,15 @@ struct Configuration final {
   };
   std::vector<AiModel> ai_models;
 
-  /// CP9: each hosted component's declared streams with their defaults
+  /// CP9: each hosted component's declared streams and freshness budgets
   /// (`component_streams`), sorted by (component, stream). Deployment
-  /// `policies.component_streams` rows override them at runtime.
+  /// `policies.component_streams` rows override the budget at runtime. What a
+  /// stale stream means belongs to the adapter, by component kind
+  /// (CONTRACTS §7).
   struct ComponentStream final {
     core::ControllableComponentId controllable_component_id;
     std::string stream_id;
     std::int64_t budget_ns{};
-    core::StreamSeverityDTO severity{};
-    core::StreamRecoveryDTO recovery{};
 
     friend bool operator==(const ComponentStream &,
                            const ComponentStream &) = default;
@@ -312,8 +379,7 @@ component_lifecycle_budgets_ns(const core::CellGraphDTO &graph);
 
 /// The budget of every component of the graph, for a composition exchange:
 /// the authored one (an I/O device's always is), else the default component
-/// lifecycle budget `core::kDefaultLifecycleBudgetNs`, the bound its plans
-/// use.
+/// lifecycle budget `kDefaultLifecycleBudgetNs`.
 [[nodiscard]] std::map<std::string, std::int64_t, std::less<>>
 component_composition_budgets_ns(const core::CellGraphDTO &graph);
 
@@ -331,6 +397,11 @@ find_pose_source(const Configuration &configuration,
 [[nodiscard]] const Configuration::AiModel *
 find_ai_model(const Configuration &configuration,
               const core::ControllableComponentId &component_id);
+
+/// The sensor row of one hosted component, or none.
+[[nodiscard]] const Configuration::Sensor *
+find_sensor(const Configuration &configuration,
+            const core::ControllableComponentId &component_id);
 
 /// The default row of one declared component stream, or none when the
 /// component does not list the stream.

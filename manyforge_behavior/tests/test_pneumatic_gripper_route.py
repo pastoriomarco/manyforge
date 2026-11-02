@@ -1,4 +1,5 @@
-"""Program pneumatic sequence uses ordinary operation, watch and read ports."""
+"""Program pneumatic sequence: valve writes through the one write path
+(CONTRACTS §7), then the ordinary watch, read and operation ports."""
 
 from types import SimpleNamespace
 
@@ -6,14 +7,8 @@ import py_trees
 import pytest
 
 from manyforge_behavior.nodes.v2_owner import GripperCommandAdapter
-from manyforge_behavior.nodes.stop_policy import (
-    OperatorMotionStopPolicy,
-    OperatorMotionStopSnapshot,
-    OperatorMotionStopState,
-)
 from manyforge_behavior.orchestration_ports import (
     NodeAttemptIdentity,
-    OwnerInvocationHeldError,
     OwnerInvocationResult,
     OwnerTaskSnapshot,
     OwnerTaskState,
@@ -22,18 +17,12 @@ from manyforge_behavior.program_clock import ProgramClock
 
 
 class _Operations:
-    def __init__(self, route, events, *, output_evidence="source_accepted"):
+    def __init__(self, route, events):
         self.route = route
         self.events = events
-        self.output_evidence = output_evidence
 
     def pneumatic_plan(self, identity, inputs):
         return self.route
-
-    def start_pneumatic_output(self, identity, inputs, step):
-        self.events.append(("output", step, dict(inputs.parameters)))
-        return OwnerTaskSnapshot(f"valve.{step}", OwnerTaskState.SUCCEEDED,
-                                 metadata={"output_evidence": self.output_evidence})
 
     def start(self, node_id, identity, inputs):
         self.events.append(("logical", dict(inputs.parameters)))
@@ -71,19 +60,29 @@ class _Watches:
 
 
 class _Reads:
-    def __init__(self, levels, events):
+    """The io_signals port: valve writes (`io.set_output`) and input reads."""
+
+    def __init__(self, levels, events, writes):
         self.levels = levels
         self.events = events
+        # Scripted result per valve role; absent roles succeed.
+        self.writes = writes
 
     def invoke(self, node_id, identity, inputs):
         row = inputs.parameters
+        if node_id == "io.set_output":
+            self.events.append(("output", row["resource_role"], row["value"]))
+            result = self.writes.get(row["resource_role"], OwnerInvocationResult(True))
+            if isinstance(result, Exception):
+                raise result
+            return result
         self.events.append(("read", row["resource_role"]))
         if self.levels[row["resource_role"]] is row["expected_value"]:
             return OwnerInvocationResult(True)
         return OwnerInvocationResult(False, reason_code="io_input_not_matched")
 
 
-def _node(*, required, dwell=0.0, evidence="source_accepted"):
+def _node(*, required, dwell=0.0, writes=None):
     from manyforge_behavior.orchestration_ports import OwnerNodeInputs
 
     events, levels, now = [], {"closed": True, "part": True}, [0.0]
@@ -99,7 +98,7 @@ def _node(*, required, dwell=0.0, evidence="source_accepted"):
         "logical": OwnerNodeInputs({"position": {"kind": "linear_m", "value_m": 0.0}}),
         "dwell_s": dwell,
     }
-    operations = _Operations(route, events, output_evidence=evidence)
+    operations = _Operations(route, events)
     attempts = []
     def begin(node):
         identity = NodeAttemptIdentity("run", node, f"attempt.{len(attempts)}")
@@ -112,7 +111,8 @@ def _node(*, required, dwell=0.0, evidence="source_accepted"):
         input_resolver=SimpleNamespace(snapshot=lambda **kwargs: SimpleNamespace(
             parameters=kwargs["parameters"], blackboard={})),
         port=operations, program_clock=ProgramClock(lambda: now[0]),
-        io_watches=_Watches(levels, events), io_signals=_Reads(levels, events),
+        io_watches=_Watches(levels, events), io_signals=_Reads(levels, events, writes or {}),
+        transport_timeout_s=5.0,
     )
     return adapter, events, levels, now
 
@@ -125,11 +125,11 @@ def _tick_until(node, predicate, limit=20):
     pytest.fail("gripper did not reach the expected stage")
 
 
-def test_valves_are_acknowledged_before_waits_and_logical_completion():
+def test_valves_are_written_before_waits_and_logical_completion():
     node, events, _, _ = _node(required=("closed", "part"))
     _tick_until(node, lambda: node.status is py_trees.common.Status.SUCCESS)
     assert [event[:2] for event in events] == [
-        ("output", 0), ("ack", "valve.0"), ("output", 1), ("ack", "valve.1"),
+        ("output", "valve-a"), ("output", "valve-b"),
         ("watch", "closed"), ("watch-release", "closed"),
         ("watch", "part"), ("watch-release", "part"),
         ("read", "closed"), ("read", "part"), ("logical", {"position": {"kind": "linear_m", "value_m": 0.0}}),
@@ -160,12 +160,29 @@ def test_input_wait_zero_has_no_deadline_positive_expires(dwell):
     assert not any(event[0] == "logical" for event in events)
 
 
-def test_unconfirmed_output_is_not_acknowledged_or_followed_by_more_writes():
-    node, events, _, _ = _node(required=(), evidence="acceptance_unknown")
+@pytest.mark.parametrize("result,code", [
+    # failed and unknown write results, and an admission refusal, all carry
+    # the host's code (CONTRACTS §7).
+    (OwnerInvocationResult(False, reason_code="io_output_write_failed", message="refused"),
+     "io_output_write_failed"),
+    (OwnerInvocationResult(False, reason_code="io_output_acceptance_unknown", message="unknown"),
+     "io_output_acceptance_unknown"),
+    (OwnerInvocationResult(False, reason_code="cell_latched", message="latched"), "cell_latched"),
+])
+def test_failed_valve_write_fails_the_node_without_resend_or_later_writes(result, code):
+    node, events, _, _ = _node(required=("part",), writes={"valve-a": result})
     node.tick_once()
     assert node.status is py_trees.common.Status.FAILURE
-    assert node.failure_reason_code == "io_output_acceptance_unconfirmed"
-    assert [event[0] for event in events] == ["output"]
+    assert node.failure_reason_code == code
+    assert events == [("output", "valve-a", False)]
+
+
+def test_lost_write_reply_fails_once_and_is_never_resent():
+    node, events, _, _ = _node(required=(), writes={"valve-b": RuntimeError("socket closed")})
+    node.tick_once()
+    assert node.status is py_trees.common.Status.FAILURE
+    assert node.failure_reason_code == "owner_request_failed"
+    assert [event[:2] for event in events] == [("output", "valve-a"), ("output", "valve-b")]
 
 
 def test_no_inputs_preserves_dwell_before_logical_completion():
@@ -175,62 +192,6 @@ def test_no_inputs_preserves_dwell_before_logical_completion():
     assert not any(event[0] == "logical" for event in events)
     now[0] = 0.5
     _tick_until(node, lambda: node.status is py_trees.common.Status.SUCCESS)
-
-
-def test_stop_after_accepted_valve_settles_then_continues_same_attempt():
-    node, events, _, _ = _node(required=())
-    class ActiveFirst(_Operations):
-        def start_pneumatic_output(self, identity, inputs, step):
-            self.events.append(("output", step, identity.node_attempt_id))
-            if step == 0:
-                return OwnerTaskSnapshot("valve.0", OwnerTaskState.ACTIVE)
-            return OwnerTaskSnapshot(f"valve.{step}", OwnerTaskState.SUCCEEDED,
-                                     metadata={"output_evidence": "source_accepted"})
-        def observe(self, task_id):
-            return OwnerTaskSnapshot(task_id, OwnerTaskState.SUCCEEDED,
-                                     metadata={"output_evidence": "source_accepted"})
-    node._port = ActiveFirst(node._port.route, events)
-    state = OperatorMotionStopState({"close": ()})
-    node._operator_stop_state = state
-    wrapper = OperatorMotionStopPolicy(child=node, node_instance_id="close", stop_state=state)
-    wrapper.tick_once()  # valve 0 accepted, still active
-    state.publish(OperatorMotionStopSnapshot(1, frozenset({"close"})))
-    wrapper.tick_once()  # observe and acknowledge valve 0 during the hold
-    assert ("ack", "valve.0") in events
-    state.publish(OperatorMotionStopSnapshot(2))
-    _tick_until(wrapper, lambda: wrapper.status is py_trees.common.Status.SUCCESS)
-    output_attempts = [(event[1], event[2]) for event in events if event[0] == "output"]
-    assert output_attempts == [(0, "attempt.0"), (1, "attempt.0")]
-
-
-def test_stop_refusing_second_valve_starts_fresh_attempt_and_rewrites_first():
-    node, events, _, _ = _node(required=())
-    snapshot = [OperatorMotionStopSnapshot()]
-    state = OperatorMotionStopState({"close": ()}, read_scope=lambda: snapshot[0])
-    state.refresh()
-    class HeldSecond(_Operations):
-        refused = False
-        def start_pneumatic_output(self, identity, inputs, step):
-            if step == 1 and not self.refused:
-                self.refused = True
-                snapshot[0] = OperatorMotionStopSnapshot(1, frozenset({"close"}))
-                raise OwnerInvocationHeldError(1)
-            self.events.append(("output", step, identity.node_attempt_id))
-            return OwnerTaskSnapshot(f"valve.{step}", OwnerTaskState.SUCCEEDED,
-                                     metadata={"output_evidence": "source_accepted"})
-    node._port = HeldSecond(node._port.route, events)
-    node._operator_stop_state = state
-    wrapper = OperatorMotionStopPolicy(child=node, node_instance_id="close", stop_state=state)
-    wrapper.tick_once()  # first valve confirmed
-    wrapper.tick_once()  # second refused because Stop crossed admission
-    assert node.presented_held
-    snapshot[0] = OperatorMotionStopSnapshot(2)
-    state.refresh()
-    _tick_until(wrapper, lambda: wrapper.status is py_trees.common.Status.SUCCESS)
-    output_attempts = [(event[1], event[2]) for event in events if event[0] == "output"]
-    assert output_attempts == [(0, "attempt.0"), (0, "attempt.1"), (1, "attempt.1")]
-
-
 
 
 _PART_CHECK = {"node_id": "io.check_input",

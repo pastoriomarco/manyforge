@@ -7,7 +7,6 @@
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/execute_request.hpp>
 #include <manyforge_core/types/gripper.hpp>
-#include <manyforge_core/types/io_output.hpp>
 #include <manyforge_core/types/io_rule_stop_response.hpp>
 #include <manyforge_core/types/motion_interrupt.hpp>
 #include <manyforge_core/types/prepared_execution.hpp>
@@ -128,19 +127,10 @@ struct ResolvedPreparedGripperCommandAuthorityDTO final {
   GripperCommandRequestDTO command_request;
 };
 
-struct ResolvedPreparedIoOutputCommandAuthorityDTO final {
-  IoSignalId signal_id;
-  ResourceId output_resource;
-  bool value;
-  ResolvedLifecycleProviderOccurrenceDTO provider;
-  IoOutputCompletionPolicyDTO completion_policy;
-};
-
 struct ResolvedPreparedCapabilityCommandExecutionRequestDTO final {
   std::shared_ptr<const PreparedOperationParticipantDTO> participant;
   RuntimeParticipantBinding binding;
-  std::variant<ResolvedPreparedGripperCommandAuthorityDTO,
-               ResolvedPreparedIoOutputCommandAuthorityDTO> authority;
+  ResolvedPreparedGripperCommandAuthorityDTO authority;
 
   ResolvedPreparedCapabilityCommandExecutionRequestDTO(
       std::shared_ptr<const PreparedOperationParticipantDTO> supplied_participant,
@@ -151,18 +141,8 @@ struct ResolvedPreparedCapabilityCommandExecutionRequestDTO final {
         authority(ResolvedPreparedGripperCommandAuthorityDTO{
             std::move(stop_readiness), std::move(limits), category, std::move(command_request)}) {}
 
-  ResolvedPreparedCapabilityCommandExecutionRequestDTO(
-      std::shared_ptr<const PreparedOperationParticipantDTO> supplied_participant,
-      RuntimeParticipantBinding supplied_binding,
-      ResolvedPreparedIoOutputCommandAuthorityDTO output)
-      : participant(std::move(supplied_participant)), binding(std::move(supplied_binding)),
-        authority(std::move(output)) {}
-
   [[nodiscard]] const ResolvedPreparedGripperCommandAuthorityDTO& gripper() const {
-    return std::get<ResolvedPreparedGripperCommandAuthorityDTO>(authority);
-  }
-  [[nodiscard]] const ResolvedPreparedIoOutputCommandAuthorityDTO* output() const noexcept {
-    return std::get_if<ResolvedPreparedIoOutputCommandAuthorityDTO>(&authority);
+    return authority;
   }
 };
 
@@ -188,10 +168,6 @@ struct ResolvedPreparedCapabilityCommandSnapshotDTO final {
   std::optional<ControllerGoalGeneration> controller_goal_generation;
   std::optional<GripperCommandResultDTO> dispatch_result;
   std::optional<ErrorDTO> error;
-  /// Correlated provider evidence is distinct from the neutral dispatch receipt.
-  std::optional<IoOutputObservationDTO> output_observation{};
-  /// Same serialized observation as output_observation, avoiding split reads.
-  std::optional<ExecutionStatus> output_execution_status{};
 };
 
 /// Two-phase subordinate motion engine used by the addressed Kernel's

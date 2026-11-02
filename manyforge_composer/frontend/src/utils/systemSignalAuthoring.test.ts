@@ -76,7 +76,7 @@ describe('Draft carried-object-lost signal rows', () => {
             { controllable_component_id: 'arm_only', command_target_id: 'gripper' },
           ] },
         } },
-        { component_id: 'real_without_gripper', component_profile_id: 'real_profile', configuration: {
+        { component_id: 'real_without_gripper', component_profile_id: 'real_model', configuration: {
           runtime_configuration: { gripper_target_configurations: [] },
         } },
         { component_id: 'robot', component_profile_id: 'robot_profile', configuration: {

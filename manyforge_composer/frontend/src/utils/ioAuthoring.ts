@@ -1,3 +1,4 @@
+import { CHANGED_OUTSIDE_SUFFIX, ioSignalId } from '../types/components';
 import type {
   CatalogJsonSchema, JsonValue, ProgramAuthoringDocument, ProgramBindingDocument,
 } from '../types/api';
@@ -27,6 +28,10 @@ interface IoTargetRoleRow {
   }>;
 }
 
+const NO_CHANGED_OUTSIDE: ReadonlySet<string> = new Set();
+/** CONTRACTS §9: clears an output's core-held `changed outside` signal. */
+export const IO_CLEAR_OUTSIDE_CHANGE_NODE_ID = 'io.clear_outside_change';
+
 /** The executable io nodes that read one input signal. */
 export const IO_INPUT_NODE_IDS: ReadonlySet<string> = new Set([
   'io.get_input',
@@ -52,9 +57,10 @@ export function ioSignalRoleChoices(
   binding: ProgramBindingDocument | null | undefined,
   draftFacts?: TargetRoleDraftFacts,
   systemSignals: readonly CarriedObjectLostSignalChoice[] = [],
+  changedOutside: ReadonlySet<string> = NO_CHANGED_OUTSIDE,
 ): ProgramSemanticChoice[] | null {
   const direction = IO_INPUT_NODE_IDS.has(nodeId) ? 'input'
-    : nodeId === 'io.set_output' ? 'output' : null;
+    : nodeId === 'io.set_output' || nodeId === IO_CLEAR_OUTSIDE_CHANGE_NODE_ID ? 'output' : null;
   if (direction === null || typeof targetRole !== 'string') return null;
   let targets: IoTargetRoleRow[] | null = binding != null ? binding.target_role_bindings : null;
   if (targets === null && draftFacts !== undefined) {
@@ -98,6 +104,16 @@ export function ioSignalRoleChoices(
     : (target.signal_role_bindings ?? []).some((row) => (
       row.resource_role_id === CARRIED_OBJECT_LOST_RESOURCE_ROLE
     ));
+  // V2-7: an output's core-held `changed outside` signal, by its eligible outputs.
+  const eligibleOutputs = (target.signal_role_bindings ?? []).filter((row) => row.direction === 'output'
+    && changedOutside.has(ioSignalId(target.controllable_component_id, row.signal_name)));
+  if (nodeId === IO_CLEAR_OUTSIDE_CHANGE_NODE_ID) {
+    return eligibleOutputs.map((row) => ({
+      value: row.resource_role_id,
+      label: `${row.resource_role_id} · ${row.signal_name} (output)`,
+      group: `${targetRole} outputs with changed outside`,
+    }));
+  }
   const choices = (target.signal_role_bindings ?? [])
     .filter((row) => row.direction === direction)
     .filter((row) => row.resource_role_id !== CARRIED_OBJECT_LOST_RESOURCE_ROLE
@@ -111,6 +127,15 @@ export function ioSignalRoleChoices(
         group: `${targetRole} ${direction} signals`,
       };
     });
+  if (direction === 'input') {
+    for (const row of eligibleOutputs) {
+      choices.push({
+        value: `${row.resource_role_id}${CHANGED_OUTSIDE_SUFFIX}`,
+        label: `${row.resource_role_id} · ${row.signal_name} → changed outside`,
+        group: `${targetRole} output signals`,
+      });
+    }
+  }
   if (direction === 'input' && requiresCarriedObjectLost && systemSignal !== undefined
     && !choices.some((choice) => choice.value === CARRIED_OBJECT_LOST_RESOURCE_ROLE)) {
     choices.push({

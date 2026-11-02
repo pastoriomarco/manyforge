@@ -1,0 +1,146 @@
+diff --git a/roboplan_core/include/roboplan/core/scene.hpp b/roboplan_core/include/roboplan/core/scene.hpp
+index 1f1fab0..01cd297 100644
+--- a/roboplan_core/include/roboplan/core/scene.hpp
++++ b/roboplan_core/include/roboplan/core/scene.hpp
+@@ -136,6 +136,19 @@ public:
+   /// @return Void if successful, else a string describing the error.
+   tl::expected<void, std::string> setCollisionPairMargins(std::span<const double> margins_m);
+ 
++  /// @brief Activates or deactivates existing collision pairs between bodies at runtime.
++  /// @details Only flips each pair's active flag in the collision data: the pair list keeps its
++  /// order, per-pair margins are kept, and nothing is rebuilt. Pairs between the bodies that are
++  /// not in getCollisionModel().collisionPairs (removed by an SRDF or setCollisions()) stay
++  /// removed. Changing geometry or collision pairs reactivates every pair. SceneContexts created
++  /// afterwards copy the flags; existing ones keep theirs.
++  /// @param pairs The body name pairs (model frame names or names of geometry added to the scene).
++  /// @param active If true, the pairs are checked again; if false, they are skipped.
++  /// @return Void if successful, else a string describing the error (the scene is unchanged).
++  tl::expected<void, std::string>
++  setCollisionPairsActive(const std::vector<std::pair<std::string, std::string>>& pairs,
++                          const bool active);
++
+   /// @brief Updates geometry placements and computes distance results for all
+   /// active collision pairs at the specified joint configuration.
+   /// @details After this call, distances are available via
+diff --git a/roboplan_core/include/roboplan/core/scene_context.hpp b/roboplan_core/include/roboplan/core/scene_context.hpp
+index 612d770..e28c6e2 100644
+--- a/roboplan_core/include/roboplan/core/scene_context.hpp
++++ b/roboplan_core/include/roboplan/core/scene_context.hpp
+@@ -35,7 +35,8 @@ class Scene;
+ /// A context borrows the scene's model and collision geometry and sizes its own scratch from them
+ /// at construction. Adding/removing geometry or changing collision pairs leaves that scratch stale
+ /// (see Scene::getGeometryVersion): the collision queries throw std::runtime_error, while
+-/// kinematics and sampling are unaffected. Moving existing geometry invalidates nothing.
++/// kinematics and sampling are unaffected. Moving existing geometry invalidates nothing. The
++/// per-pair margins and active flags (Scene::setCollisionPairsActive) are copied at construction.
+ class SceneContext {
+ public:
+   /// @brief Snapshots the current collision geometry of `scene`.
+diff --git a/roboplan_core/src/core/scene.cpp b/roboplan_core/src/core/scene.cpp
+index b52a023..bef6dfe 100644
+--- a/roboplan_core/src/core/scene.cpp
++++ b/roboplan_core/src/core/scene.cpp
+@@ -1495,6 +1495,22 @@ tl::expected<void, std::string> Scene::setCollisionPairMargins(std::span<const d
+   return {};
+ }
+ 
++tl::expected<void, std::string>
++Scene::setCollisionPairsActive(const std::vector<std::pair<std::string, std::string>>& pairs,
++                               const bool active) {
++  const auto maybe_pairs = getCollisionPairs(pairs);
++  if (!maybe_pairs) {
++    return tl::make_unexpected("Could not set collision pairs active: " + maybe_pairs.error());
++  }
++  for (const auto& pair : maybe_pairs.value()) {
++    const auto index = collision_model_.findCollisionPair(pair);
++    if (index < collision_model_.collisionPairs.size()) {
++      collision_model_data_->activeCollisionPairs[index] = active;
++    }
++  }
++  return {};
++}
++
+ tl::expected<void, std::string> Scene::allowAdjacentLinkCollisions() {
+   std::vector<std::vector<std::string>> links_by_joint(static_cast<size_t>(model_.njoints));
+   for (const auto& frame : model_.frames) {
+diff --git a/roboplan_core/src/core/scene_context.cpp b/roboplan_core/src/core/scene_context.cpp
+index 5baa801..2aad97d 100644
+--- a/roboplan_core/src/core/scene_context.cpp
++++ b/roboplan_core/src/core/scene_context.cpp
+@@ -23,8 +23,10 @@ SceneContext::SceneContext(const Scene& scene)
+   std::random_device rd;
+   rng_gen_ = std::mt19937(rd());
+ 
+-  // Carry the Scene's per-pair collision requests (security margins) into this context.
++  // Carry the Scene's per-pair collision requests (security margins) and active flags into this
++  // context.
+   geom_data_.collisionRequests = scene.getCollisionData().collisionRequests;
++  geom_data_.activeCollisionPairs = scene.getCollisionData().activeCollisionPairs;
+ 
+   // Bind a fresh broadphase manager to this context's own geometry data, then seed the geometry
+   // world placements (at the neutral configuration) before the first AABB-tree build so coal does
+diff --git a/roboplan_core/test/test_scene.cpp b/roboplan_core/test/test_scene.cpp
+index ae48c6d..b046b25 100644
+--- a/roboplan_core/test/test_scene.cpp
++++ b/roboplan_core/test/test_scene.cpp
+@@ -589,6 +589,60 @@ TEST_F(RoboPlanSceneTest, TestCollisionPairMargins) {
+   EXPECT_FALSE(scene->setCollisionPairMargins(margins).has_value());
+ }
+ 
++TEST_F(RoboPlanSceneTest, TestSetCollisionPairsActive) {
++  Eigen::VectorXd q(6);
++  q << 0.0, 0.0, 0.0, 0.0, 0.0, 0.0;
++  const auto add_sphere_result =
++      scene->addSphereGeometry("test_sphere", "universe", Sphere(0.3), Eigen::Matrix4d::Identity(),
++                               Eigen::Vector4d(0.5, 0.5, 0.5, 0.5));
++  ASSERT_TRUE(add_sphere_result.has_value()) << add_sphere_result.error();
++  ASSERT_TRUE(scene->hasCollisions(q));
++
++  // A margin on the sphere's pairs only.
++  const auto sphere_ids = scene->getCollisionGeometryIds("test_sphere").value();
++  std::vector<double> margins(scene->getCollisionModel().collisionPairs.size(), 0.0);
++  for (size_t k = 0; k < margins.size(); ++k) {
++    const auto& pair = scene->getCollisionModel().collisionPairs[k];
++    for (const auto id : sphere_ids) {
++      if (pair.first == id || pair.second == id) {
++        margins[k] = 0.001;
++      }
++    }
++  }
++  ASSERT_TRUE(scene->setCollisionPairMargins(margins).has_value());
++  const auto pairs_before = scene->getCollisionModel().collisionPairs;
++  const auto version_before = scene->getGeometryVersion();
++
++  // Every robot body against the sphere.
++  std::vector<std::pair<std::string, std::string>> sphere_pairs;
++  for (const auto& frame : scene->getModel().frames) {
++    if (frame.type == pinocchio::BODY) {
++      sphere_pairs.emplace_back(frame.name, "test_sphere");
++    }
++  }
++  ASSERT_TRUE(scene->setCollisionPairsActive(sphere_pairs, false).has_value());
++  EXPECT_FALSE(scene->hasCollisions(q));
++  EXPECT_FALSE(scene->hasCollisions(q, /*debug=*/true));
++  EXPECT_FALSE(SceneContext(*scene).hasCollisions(q));
++
++  // The pair list, its margins and existing contexts are untouched.
++  EXPECT_EQ(scene->getCollisionModel().collisionPairs, pairs_before);
++  EXPECT_EQ(scene->getGeometryVersion(), version_before);
++  for (size_t k = 0; k < margins.size(); ++k) {
++    EXPECT_DOUBLE_EQ(scene->getCollisionData().collisionRequests[k].security_margin, margins[k]);
++  }
++
++  ASSERT_TRUE(scene->setCollisionPairsActive(sphere_pairs, true).has_value());
++  EXPECT_TRUE(scene->hasCollisions(q));
++  EXPECT_TRUE(SceneContext(*scene).hasCollisions(q));
++  EXPECT_EQ(scene->getCollisionModel().collisionPairs, pairs_before);
++
++  // A bad name leaves every pair active.
++  sphere_pairs.emplace_back("nonexistent_link", "test_sphere");
++  EXPECT_FALSE(scene->setCollisionPairsActive(sphere_pairs, false).has_value());
++  EXPECT_TRUE(scene->hasCollisions(q));
++}
++
+ TEST_F(RoboPlanSceneTest, TestAllowAdjacentLinkCollisions) {
+   Scene scene_no_srdf("test_scene", loadUrdfSceneDescription(urdf_path, package_paths));
+ 

@@ -3,11 +3,12 @@ import { errorCatalogRow } from '../state/commandRefusal';
 /**
  * Live state of each Applied global (cell-level) interrupt rule, as the
  * Headless event pump projects it into the control-state shell
- * (`global_rules`, contracts 64/75/78/86/110). `null` is an unknown
- * catalog (never "no rules"); an empty list proves that the Deployment has
- * no global rule. A row state of `unknown` means that rule is unavailable.
+ * (`global_rules`, CONTRACTS §8). `null` is an unknown catalog (never "no
+ * rules"); an empty list proves that the Deployment has no global rule. A row
+ * state of `unknown` means the rule can't watch its signals (its
+ * `interrupt_state` key is withdrawn) and gates its scope until it can.
  */
-export type GlobalRuleState = 'clear' | 'tripped' | 'latched' | 'unknown' | 'pending' | 'waiting_for_program';
+export type GlobalRuleState = 'inactive' | 'clear' | 'tripped' | 'unknown' | 'pending' | 'waiting_for_program';
 
 export interface GlobalRuleStatus {
   ruleId: string;
@@ -24,7 +25,7 @@ export interface GlobalRuleUnavailableReason {
   details: Readonly<Record<string, string>>;
 }
 
-const STATES: ReadonlySet<string> = new Set(['clear', 'tripped', 'latched', 'unknown', 'pending', 'waiting_for_program']);
+const STATES: ReadonlySet<string> = new Set(['inactive', 'clear', 'tripped', 'unknown', 'pending', 'waiting_for_program']);
 
 export function parseGlobalRuleStatus(value: unknown): readonly GlobalRuleStatus[] | null {
   if (value === null) return null;
@@ -69,10 +70,10 @@ function isUnavailableReason(value: unknown): value is GlobalRuleUnavailableReas
 /** The operator text of one rule's state. */
 export function globalRuleStateText(rule: GlobalRuleStatus): string {
   switch (rule.state) {
+    case 'inactive': return 'inactive';
     case 'clear': return 'clear';
     case 'tripped': return 'tripped';
-    case 'latched': return 'latched (see its recovery notice)';
-    case 'unknown': return "can't watch (motion blocked)";
+    case 'unknown': return "can't watch (its scope is held)";
     case 'pending': return 'pending (no current state yet)';
     case 'waiting_for_program':
       return `waiting for a Program that declares ${rule.keys.join(', ')}`;

@@ -282,38 +282,6 @@ def test_intent_rejects_generated_fields_aliases_and_invalid_values(
         validate_deployment_intent(value, source="fixture")
 
 
-@pytest.mark.parametrize("check", [None, "active_tcp", "active_tcp_and_flange"])
-def test_intent_keeps_tcp_speed_check_as_authored(check: str | None) -> None:
-    value = _intent()
-    if check is not None:
-        value["components"][0]["target_settings"]["arm"]["tcp_speed_check"] = check
-
-    arm = validate_deployment_intent(value, source="fixture")["components"][1][
-        "target_settings"
-    ]["arm"]
-
-    # Omitted stays omitted: the Deployment compiler materializes the default.
-    assert arm.get("tcp_speed_check") == check
-
-
-@pytest.mark.parametrize(
-    "target, row",
-    [
-        ("arm", {"maximum_tcp_linear_speed_mps": 0.2, "tcp_speed_check": "flange"}),
-        ("arm", {"maximum_tcp_linear_speed_mps": 0.2, "tcp_speed_check": None}),
-        ("gripper", {"tcp_speed_check": "active_tcp"}),
-    ],
-)
-def test_intent_refuses_invalid_or_unbound_tcp_speed_check(
-    target: str, row: dict
-) -> None:
-    value = _intent()
-    value["components"][1]["target_settings"][target] = row
-
-    with pytest.raises(DeploymentIntentError, match=f"{target}.tcp_speed_check"):
-        validate_deployment_intent(value, source="fixture")
-
-
 def test_source_reference_inventory_is_exact_and_stable() -> None:
     rows = list(iter_source_references(_intent()))
 
@@ -405,46 +373,6 @@ def test_draft_session_edits_intent_target_setting_and_round_trips_state() -> No
     assert restored.retained_state() == retained
 
 
-def test_draft_session_sets_and_keeps_tcp_speed_check() -> None:
-    session = DeploymentDraftSession()
-    initial = session.retained_state()
-    opened = session.preview_source(json.dumps(_intent()))
-    session.commit_open(
-        opened,
-        "/tmp/cell/deployment.yaml",
-        draft_id=initial["draft_id"],
-        expected_revision=initial["draft_revision"],
-        confirm_discard=False,
-    )
-
-    def edit(speed: float, check: str | None) -> dict:
-        current = session.retained_state()
-        session.commit_compiled(
-            session.preview_motion_target_limit_update(
-                controllable_component_id="robot_b",
-                command_target_id="arm",
-                maximum_tcp_linear_speed_mps=speed,
-                draft_id=current["draft_id"],
-                expected_revision=current["draft_revision"],
-                tcp_speed_check=check,
-            ),
-            draft_id=current["draft_id"],
-            expected_revision=current["draft_revision"],
-        )
-        return session.snapshot()["draft"]["document"]["components"][1][
-            "target_settings"
-        ]["arm"]
-
-    assert "tcp_speed_check" not in edit(0.3, None)
-    assert edit(0.3, "active_tcp")["tcp_speed_check"] == "active_tcp"
-    kept = edit(0.25, None)
-    assert kept["tcp_speed_check"] == "active_tcp"
-    assert kept["maximum_tcp_linear_speed_mps"] == 0.25
-    assert edit(0.25, "active_tcp_and_flange")["tcp_speed_check"] == (
-        "active_tcp_and_flange"
-    )
-
-
 @pytest.mark.parametrize("stop_mode", ["spring_back_hold", "spring_back_fast"])
 def test_draft_session_edits_one_authored_stop_profile_by_target(stop_mode: str) -> None:
     session = DeploymentDraftSession()
@@ -458,27 +386,28 @@ def test_draft_session_edits_one_authored_stop_profile_by_target(stop_mode: str)
         confirm_discard=False,
     )
     current = session.retained_state()
+    stop_profile = {
+        "stop_mode": stop_mode,
+        "allow_natural_completion_on_short_path": False,
+        "jerk_limits_enabled": False,
+        "deceleration_time_s": 1.25,
+        "max_stop_time_s": 3.0,
+        "per_resource_limits": [
+            {
+                "resource_id": "joint1",
+                "max_deceleration": {
+                    "coordinate_kind": "angular_rad_s2",
+                    "value": 3.5,
+                },
+                "settle_velocity_threshold": {
+                    "coordinate_kind": "angular_rad_s",
+                    "value": 0.02,
+                },
+            }
+        ],
+    }
     edited = session.preview_controlled_stop_update(
-        {
-            "stop_mode": stop_mode,
-            "allow_natural_completion_on_short_path": False,
-            "jerk_limits_enabled": False,
-            "deceleration_time_s": 1.25,
-            "max_stop_time_s": 3.0,
-            "per_resource_limits": [
-                {
-                    "resource_id": "joint1",
-                    "max_deceleration": {
-                        "coordinate_kind": "angular_rad_s2",
-                        "value": 3.5,
-                    },
-                    "settle_velocity_threshold": {
-                        "coordinate_kind": "angular_rad_s",
-                        "value": 0.02,
-                    },
-                }
-            ],
-        },
+        stop_profile,
         controllable_component_id="robot_b",
         command_target_id="arm",
         draft_id=current["draft_id"],
@@ -499,6 +428,20 @@ def test_draft_session_edits_one_authored_stop_profile_by_target(stop_mode: str)
     # Q51: the robot's own explicit maximum Stop time lives in its profile.
     assert stop["max_stop_time_s"] == 3.0
     assert "timing" not in stop
+    # Q51: a maximum shorter than the deceleration is the robot's own choice,
+    # not an Apply-time refusal.
+    shorter = session.preview_controlled_stop_update(
+        {**stop_profile, "deceleration_time_s": 1.1, "max_stop_time_s": 0.5},
+        controllable_component_id="robot_b",
+        command_target_id="arm",
+        draft_id=current["draft_id"],
+        expected_revision=current["draft_revision"],
+    )
+    shorter_stop = shorter.document["components"][1]["target_settings"]["arm"][
+        "controlled_stop"
+    ]
+    assert shorter_stop["deceleration_time_s"] == 1.1
+    assert shorter_stop["max_stop_time_s"] == 0.5
 
 
 def test_frame_prefix_has_empty_default_and_preserves_authored_literal() -> None:
@@ -531,20 +474,6 @@ def test_frame_prefix_refuses_invalid_format_with_reason(prefix: str) -> None:
     intent["components"][0]["frame_prefix"] = prefix
     with pytest.raises(DeploymentIntentError, match="frame_prefix must be empty or use only ASCII letters"):
         validate_deployment_intent(intent, source="test")
-
-
-def test_existing_robot_prefix_edit_preserves_peers_and_add_boundary() -> None:
-    from copy import deepcopy
-    from manyforge_composer.backend.state import _controllable_composition_change_kinds
-    before = validate_deployment_intent(_intent(), source="test")
-    changed = deepcopy(before)
-    changed["components"][0]["frame_prefix"] = "robot_a/"
-    assert _controllable_composition_change_kinds(before, changed) == ()
-    assert changed["components"][1] == before["components"][1]
-    newcomer = deepcopy(changed["components"][0])
-    newcomer["component_id"] = "robot_c"
-    changed["components"].append(newcomer)
-    assert "controllable_components" in _controllable_composition_change_kinds(before, changed)
 
 
 def _io_device() -> dict:
@@ -758,16 +687,6 @@ def test_assistant_profile_aliases_come_from_the_maintained_profiles() -> None:
     assert profiles["semantic_shape_selection"] == ["assistant_model", "selection_model"]
 
 
-def test_appending_model_free_components_is_a_composition_change() -> None:
-    from manyforge_composer.backend.state import _controllable_composition_change_kinds
-    before = validate_deployment_intent(_intent(), source="test")
-    after = validate_deployment_intent(_intent(), source="test")
-    after["components"] += [_io_device(), _pose_source(), _ai_model()]
-    assert _controllable_composition_change_kinds(before, after) == (
-        "controllable_components",
-    )
-
-
 def _with_fallbacks(primary: str, fallbacks: object) -> dict:
     intent = _intent()
     stop = intent["components"][0]["target_settings"]["arm"]["controlled_stop"]
@@ -941,3 +860,187 @@ def test_recorded_fallbacks_read_legacy_substitution_and_refuse_both() -> None:
     assert fallback_candidates("spring_back_hold") == ("spring_back_fast",)
     assert fallback_candidates("spring_back_fast") == ()
     assert fallback_candidates("hard_deceleration") == ()
+
+
+# --- machines: owner and member rows (CONTRACTS §16) ----------------------
+
+
+def _machine_intent() -> dict:
+    """`robot_b` becomes the arm member of owner `cell_arm`, plus I/O members."""
+    intent = _intent()
+    arm = intent["components"][0]
+    arm.pop("lane", None)
+    arm.update(owner="cell_arm", role="arm")
+    intent["components"] += [
+        {
+            "component_id": "cell_arm",
+            "component_profile_id": "ufactory.lite6_machine",
+            "lane": "real",
+            "configuration": {"device_address_ref": "lite6_main"},
+        },
+        {
+            "component_id": "cell_arm_controller_io",
+            "component_profile_id": "ufactory.lite6_controller_io",
+            "owner": "cell_arm",
+            "role": "controller_io",
+        },
+        {
+            "component_id": "cell_arm_tool_io",
+            "component_profile_id": "ufactory.lite6_tool_io",
+            "owner": "cell_arm",
+            "role": "tool_io",
+            "active": False,
+        },
+    ]
+    return intent
+
+
+def test_machine_rows_round_trip_and_keep_inactive_members() -> None:
+    normalized = validate_deployment_intent(_machine_intent(), source="test")
+    rows = {row["component_id"]: row for row in normalized["components"]}
+    assert rows["cell_arm"] == {
+        "component_id": "cell_arm",
+        "component_profile_id": "ufactory.lite6_machine",
+        "lane": "real",
+        "configuration": {"device_address_ref": "lite6_main"},
+    }
+    assert rows["robot_b"]["owner"] == "cell_arm" and rows["robot_b"]["role"] == "arm"
+    assert "lane" not in rows["robot_b"] and "active" not in rows["robot_b"]
+    assert rows["cell_arm_controller_io"] == {
+        "component_id": "cell_arm_controller_io",
+        "component_profile_id": "ufactory.lite6_controller_io",
+        "owner": "cell_arm",
+        "role": "controller_io",
+    }
+    # Inactive rows stay in the file; only the compiler leaves them out.
+    assert rows["cell_arm_tool_io"]["active"] is False
+    # Members without a model source add no source reference.
+    assert [ref for _path, ref, _dir in iter_source_references(_machine_intent())] == [
+        ref for _path, ref, _dir in iter_source_references(_intent())
+    ]
+
+
+def test_machine_active_true_is_the_default() -> None:
+    intent = _machine_intent()
+    intent["components"][-1]["active"] = True
+    rows = {
+        row["component_id"]: row
+        for row in validate_deployment_intent(intent, source="test")["components"]
+    }
+    assert "active" not in rows["cell_arm_tool_io"]
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda rows: rows["cell_arm"].update(target_settings={}), "target_settings"),
+        (lambda rows: rows["cell_arm"]["configuration"].update(address="10.0.0.1"),
+         "address"),
+        (lambda rows: rows["cell_arm"].pop("lane"), "missing lane"),
+        (lambda rows: rows["cell_arm_controller_io"].update(io_signals=[]), "io_signals"),
+        (lambda rows: rows["cell_arm_controller_io"].update(active="no"),
+         "active must be a boolean"),
+        (lambda rows: rows["robot_b"].update(lane="real"), "lane"),
+        (lambda rows: rows["robot_b"].pop("role"), "missing role"),
+    ],
+)
+def test_machine_rows_are_closed(mutate, message: str) -> None:
+    intent = _machine_intent()
+    mutate({row["component_id"]: row for row in intent["components"]})
+    with pytest.raises(DeploymentIntentError, match=message):
+        validate_deployment_intent(intent, source="test")
+
+
+def _open_session(intent: dict) -> tuple[DeploymentDraftSession, dict]:
+    session = DeploymentDraftSession()
+    initial = session.retained_state()
+    session.commit_open(
+        session.preview_source(json.dumps(intent)),
+        "/tmp/cell/deployment.yaml",
+        draft_id=initial["draft_id"],
+        expected_revision=initial["draft_revision"],
+        confirm_discard=False,
+    )
+    return session, session.retained_state()
+
+
+def test_draft_adds_a_machine_and_toggles_a_member() -> None:
+    machine = _machine_intent()
+    added = [row for row in machine["components"] if row["component_id"] != "robot_a"]
+    intent = _intent()
+    intent["components"] = [intent["components"][1]]  # robot_a only
+    session, state = _open_session(intent)
+    compiled = session.preview_component_addition(
+        added, [], draft_id=state["draft_id"], expected_revision=state["draft_revision"]
+    )
+    ids = [row["component_id"] for row in compiled.document["components"]]
+    assert ids == sorted(
+        ["robot_a", "robot_b", "cell_arm", "cell_arm_controller_io", "cell_arm_tool_io"]
+    )
+    session.commit_compiled(
+        compiled, draft_id=state["draft_id"], expected_revision=state["draft_revision"]
+    )
+    state = session.retained_state()
+    index = ids.index("cell_arm_tool_io")
+    toggled = session.preview_update(
+        ["components", index, "active"], True, "set",
+        draft_id=state["draft_id"], expected_revision=state["draft_revision"],
+    )
+    assert "active" not in toggled.document["components"][index]
+
+
+def test_draft_removing_an_owner_removes_its_members() -> None:
+    session, state = _open_session(_machine_intent())
+    ids = [row["component_id"] for row in session.snapshot()["draft"]["document"]["components"]]
+    compiled = session.preview_update(
+        ["components", ids.index("cell_arm")], None, "remove",
+        draft_id=state["draft_id"], expected_revision=state["draft_revision"],
+    )
+    assert [row["component_id"] for row in compiled.document["components"]] == ["robot_a"]
+
+
+def _sensor_intent(**changes: object) -> dict:
+    row = {
+        "component_id": "front_points",
+        "component_profile_id": "manyforge.pointcloud_source",
+        "target_settings": {},
+        "configuration": {
+            "runtime_kind": "sensor",
+            "runtime_configuration": {"topic": "/front/points", "max_points": 1000},
+        },
+        **changes,
+    }
+    return {
+        "api_version": DEPLOYMENT_INTENT_API_VERSION,
+        "deployment_artifact_id": "sensor_check",
+        "name": "sensor check",
+        "components": [row],
+        "attachments": [],
+        "policies": {},
+    }
+
+
+def test_sensor_row_keeps_its_model_and_settings() -> None:
+    intent = _sensor_intent()
+    assert validate_deployment_intent(intent, source="test")["components"] == intent["components"]
+
+
+def test_sensor_row_keeps_its_lifecycle_time() -> None:
+    intent = _sensor_intent(configuration={
+        "runtime_kind": "sensor",
+        "lifecycle_command_timeout_s": 20.0,
+        "runtime_configuration": {"topic": "/front/points"},
+    })
+    assert validate_deployment_intent(intent, source="test")["components"] == intent["components"]
+
+
+@pytest.mark.parametrize("changes", [
+    {"lane": "isaac"},
+    {"target_settings": {"arm": {}}},
+    {"model_source": {}},
+    {"configuration": {"runtime_kind": "sensor"}},
+])
+def test_sensor_row_refuses_a_lane_targets_models_and_missing_settings(changes: dict) -> None:
+    intent = _sensor_intent(**changes)
+    with pytest.raises(DeploymentIntentError):
+        validate_deployment_intent(intent, source="test")

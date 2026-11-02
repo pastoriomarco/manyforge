@@ -17,12 +17,7 @@ using KernelApplyFenceRpcRequest = std::variant<
     manyforge::core::ApplyFenceAcquireAttemptQueryDTO,
     manyforge::core::ApplyFenceRehydrateDTO,
     manyforge::core::ConfigurationFenceStatusQueryDTO,
-    manyforge::core::ConfigurationFenceReleaseDTO,
-    manyforge::core::SelectedBringUpConfigurationFenceIntentDTO,
-    manyforge::core::SelectedBringUpFenceAcquireAttemptQueryDTO,
-    manyforge::core::SelectedBringUpConfigurationFenceStatusQueryDTO,
-    manyforge::core::SelectedBringUpConfigurationFenceReleaseDTO,
-    manyforge::core::SelectedBringUpFenceReleaseAttemptQueryDTO>;
+    manyforge::core::ConfigurationFenceReleaseDTO>;
 
 struct KernelApplyFenceRpcFailure final {
   manyforge::core::ErrorDTO error;
@@ -34,13 +29,17 @@ using KernelApplyFenceRpcResponse = std::variant<
     manyforge::core::ApplyFenceAcquireAttemptReconcileResultDTO,
     manyforge::core::ApplyFenceReconcileResultDTO,
     manyforge::core::ConfigurationFenceStatusDTO,
-    manyforge::core::ConfigurationFenceReleasedDTO, KernelApplyFenceRpcFailure,
-    manyforge::core::SelectedBringUpFenceAcquireAttemptReconcileResultDTO,
-    manyforge::core::SelectedBringUpConfigurationFenceStatusDTO,
-    manyforge::core::SelectedBringUpConfigurationFenceReleasedDTO,
-    manyforge::core::SelectedBringUpFenceReleaseAttemptReconcileResultDTO>;
+    manyforge::core::ConfigurationFenceReleasedDTO, KernelApplyFenceRpcFailure>;
 
 [[nodiscard]] bool IsKernelApplyFenceRpcPacket(std::string_view bytes) noexcept;
+
+/// Closed standalone record of one configuration-fence scope (controller and
+/// provider domains), shared by the Apply journal and the runtime-composition
+/// RPC. It restores the value only; it grants no fence ownership.
+[[nodiscard]] std::string EncodeConfigurationFenceScopeRecord(
+    const manyforge::core::ConfigurationFenceScopeDTO &scope);
+[[nodiscard]] manyforge::core::ConfigurationFenceScopeDTO
+DecodeConfigurationFenceScopeRecord(std::string_view bytes);
 
 [[nodiscard]] std::string
 EncodeKernelApplyFenceRpcRequest(const KernelApplyFenceRpcRequest &request);

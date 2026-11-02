@@ -67,23 +67,6 @@ function hasAlert(all: (match: (props: MountedProps) => boolean) => MountedProps
 }
 
 describe('IoSignalConfigurationSection', () => {
-  it('authors xArm input with the standard 250 ms age and selected bank', async () => {
-    const mounted = await mount([existing]);
-    try {
-      await mounted.type('part_present Source profile', 'xarm_digital');
-      await mounted.type('part_present Robot component', 'lite6_robot');
-      await mounted.type('part_present Bank', 'controller');
-      await mounted.type('part_present Pin', '15');
-      expect(mounted.control('part_present Maximum sample age').value).toBe('250');
-      await mounted.click('Update I/O Draft');
-      expect(mounted.controller.mutate).toHaveBeenCalledExactlyOnceWith(
-        ['graph', 'runtime_units', 0, 'configuration', 'io_signals'], 'set',
-        [{ ...existing, update_mode: 'sampled', freshness: { mode: 'sample_age', maximum_age_ns: 250_000_000 },
-          provider: { profile: 'xarm_digital', robot_component_id: 'lite6_robot', bank: 'controller', pin: 15 } }],
-      );
-    } finally { await mounted.unmount(); }
-  });
-
   it('commits the whole io_signals array, keeping existing rows and outputs exact', async () => {
     const mounted = await mount([existing, output]);
     try {
@@ -181,20 +164,25 @@ describe('IoSignalConfigurationSection', () => {
     } finally { await mounted.unmount(); }
   });
 
-  it('declares a UR io_states input (periodic, no liveness selector) with the driver note', async () => {
+  it('declares a ros2_control GPIO input (periodic, no liveness selector) with the driver note; offers no UR profile', async () => {
     const mounted = await mount([existing]);
     try {
-      await mounted.type('part_present Source profile', 'ur_io_states');
+      const profiles = (mounted.control('part_present Source profile').children as Array<{ props: { value: string } }>)
+        .map((option) => option.props.value);
+      expect(profiles).not.toContain('ur_io_states');
+      await mounted.type('part_present Source profile', 'ros2_control_gpio');
       expect(() => mounted.control('part_present Liveness')).toThrow();
+      expect(() => mounted.control('part_present Pin')).toThrow();
       expect(mounted.all((props) => props['data-io-driver-note'] !== undefined)).toHaveLength(1);
-      await mounted.type('part_present Topic', '/io_and_status_controller/io_states');
-      await mounted.type('part_present Pin', '17');
+      await mounted.type('part_present Topic', '/gpio_controller/gpio_states');
+      await mounted.type('part_present Group', 'flange');
+      await mounted.type('part_present Interface name', 'di3');
       await mounted.type('part_present Maximum sample age', '50');
       await mounted.click('Update I/O Draft');
       expect(mounted.controller.mutate).toHaveBeenCalledExactlyOnceWith(
         ['graph', 'runtime_units', 0, 'configuration', 'io_signals'], 'set',
         [{ ...existing, update_mode: 'sampled', freshness: { mode: 'sample_age', maximum_age_ns: 50_000_000 },
-          provider: { profile: 'ur_io_states', topic: '/io_and_status_controller/io_states', pin: 17 } }],
+          provider: { profile: 'ros2_control_gpio', topic: '/gpio_controller/gpio_states', group: 'flange', interface_name: 'di3' } }],
       );
     } finally { await mounted.unmount(); }
   });
@@ -226,7 +214,7 @@ describe('IoSignalConfigurationSection', () => {
     } finally { await mounted.unmount(); }
   });
 
-  it('adds no signal to an arm: robot-hosted I/O is its own I/O device (contract 84)', async () => {
+  it('adds no signal to an arm: ROS-connected I/O is its own I/O device (contract 84)', async () => {
     const mounted = await mount([{ ...existing, controllable_component_id: 'arm' }], false);
     try {
       expect(() => mounted.button('Add input signal')).toThrow();

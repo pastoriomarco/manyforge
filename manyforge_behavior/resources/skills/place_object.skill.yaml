@@ -42,11 +42,6 @@
           "disposition": "required"
         },
         {
-          "capability_id": "planning.profile.balanced",
-          "parameters": {},
-          "disposition": "required"
-        },
-        {
           "capability_id": "planning.trajectory.time_parameterized",
           "parameters": {},
           "disposition": "required"

@@ -26,10 +26,8 @@
 #include <manyforge_core/prepared_participant_stop_plan_codec.hpp>
 #include <manyforge_core/stop_terminal_reducer.hpp>
 #include <manyforge_core/types/spring_back_return_point.hpp>
-#include <manyforge_core/types/tcp_speed_check.hpp>
 #include <manyforge_core/trajectory/trajectory_sampler.hpp>
 #include <manyforge_core/trajectory/trajectory_splice.hpp>
-#include <manyforge_core/trajectory/validation_sampling.hpp>
 #include <manyforge_core/types/error_code_mapping.hpp>
 #include <manyforge_core/types/kernel_event_factories.hpp>
 #include <manyforge_core/types/reason_codes.hpp>
@@ -933,10 +931,9 @@ ExecutionKernel::ExecutionKernel(IPlannerBackend& planner, ExecutionKernelPorts 
         config_.collision_clearance_m <= kMaxCollisionClearanceM)) {
     throw std::invalid_argument("collision_clearance_m must be in [0, 0.05]");
   }
-  if (!(config_.collision_check_step_rad > 0.0 &&
-        config_.collision_check_step_rad <= kMaxCollisionCheckStepRad)) {
-    throw std::invalid_argument("collision_check_step_rad must be in (0, 0.2]");
-  }
+  collision_clearance_m_.store(config_.collision_clearance_m, std::memory_order_release);
+  collision_check_fresh_plans_.store(config_.collision_check_fresh_plans,
+                                     std::memory_order_release);
   if (config_.validation_collision_min_waypoints_for_parallel < 1) {
     config_.validation_collision_min_waypoints_for_parallel = 1;
   }
@@ -953,8 +950,7 @@ ExecutionKernel::ExecutionKernel(IPlannerBackend& planner, ExecutionKernelPorts 
   // Seed a complete first-read DTO without emitting a lifecycle event before
   // subscribers can exist. Later authority changes use the normal revisioned
   // publication path.
-  auto initial_assessment = build_recovery_assessment(capture_recovery_authority_locked(),
-                                                      recovery_readiness_policy(), 0);
+  auto initial_assessment = build_recovery_assessment(capture_recovery_authority_locked(), 0);
   {
     std::lock_guard<std::mutex> lock(recovery_assessment_mutex_);
     recovery_assessment_ = std::move(initial_assessment);
@@ -1130,14 +1126,6 @@ void ExecutionKernel::dispatch_prepared_event(KernelEvent& event_to_emit) {
     std::lock_guard<std::mutex> lock(metrics_mutex_);
     metrics_.event_subscriber_exceptions += subscriber_exceptions;
   }
-}
-
-void ExecutionKernel::set_flight_recorder_directory(std::string directory) {
-  flight_recorder_.set_dump_directory(std::move(directory));
-}
-
-std::string ExecutionKernel::dump_flight_record(const char* reason) noexcept {
-  return flight_recorder_.dump_now(reason);
 }
 
 void ExecutionKernel::set_active_request_correlation(const ExecuteRequestDTO& request) {
@@ -1890,10 +1878,6 @@ Result<void> ExecutionKernel::retire_prepared_motion_membership(
   return Result<void>::Ok();
 }
 
-void ExecutionKernel::notify_execution_waiters() {
-  worker_signals_.notify();
-}
-
 bool ExecutionKernel::retire_execute_worker(std::unique_lock<std::mutex>& lifecycle_lock,
                                             const bool containment_already_certified) {
   if (!worker_thread_.joinable()) {
@@ -2175,11 +2159,13 @@ ExecutionKernel::execute_worker_validate_replan_phase(
                 {{"attempt_index", std::to_string(authoritative_validation_attempt)},
                  {"max_attempts", std::to_string(max_authoritative_validation_attempts)}}});
 
-    // Validate at the step this trajectory was planned with.
+    // A fresh plan without an active contact policy is collision-checked
+    // again only when the Deployment keeps `collision_check_fresh_plans` on.
     val_result = validate_trajectory(
         trajectory, request, scene_snapshot_lease_inventory, nullptr, {},
         &conclusive_collision_failure, {}, nullptr,
-        plan_request ? plan_request->planning_attempt_index : 0U);
+        !active_trajectory_from_cache &&
+            !collision_check_fresh_plans_.load(std::memory_order_acquire));
     if (finalize_prepared_motion_cancellation_if_requested(
             prepared_session, request, exec_id, motion_state,
             "prepared_motion_cancelled_during_validation")) {
@@ -2436,7 +2422,10 @@ ExecutionKernel::execute_worker_validate_replan_phase(
          validation_telemetry.ordered_contact_summary_used ? "true" : "false"},
         {"collision_validation_wall_ns", std::to_string(validation_telemetry.total_wall_ns)},
         {"dynamically_discovered_start_contact_count",
-         std::to_string(val_result.value().dynamically_discovered_start_contact_count)}}});
+         std::to_string(val_result.value().dynamically_discovered_start_contact_count)},
+        {"collision_evidence", val_result.value().collision_checked_by_planning
+                                   ? "planning"
+                                   : "pre_dispatch_validation"}}});
   {
     std::lock_guard<std::mutex> lock(metrics_mutex_);
     metrics_.validations_passed++;
@@ -3628,7 +3617,7 @@ Result<ExecutionKernel::ValidatedMotionPlan> ExecutionKernel::compute_validated_
 
   auto validated = validate_trajectory(
       *planned.value().result.trajectory, request, projection_inventory, &start_state, stop_token,
-      nullptr, std::move(validation_cancellation), replacement, planning_attempt_index);
+      nullptr, std::move(validation_cancellation), replacement);
   if (stop_token.stop_requested()) {
     return reject(ErrorCode::kExecutionAborted, "Motion preview was cancelled during validation",
                   "motion_preview_cancelled");
@@ -4102,7 +4091,7 @@ Result<bool> ExecutionKernel::PrepareColdMotionAfterStop(const std::uint64_t can
     if (certificate.stop_id != stage.stop_id ||
         certificate.stop_generation != stage.stop_generation ||
         certificate.result != StopCertificateResultDTO::kSucceededNominal ||
-        certificate.terminal_error || certificate.fault_latch_id ||
+        certificate.terminal_error ||
         !certificate.unsettled.empty() || !certificate.failed.empty() || !local ||
         local->execution_id != captured.execution_id ||
         local->aggregate_stop_certificate !=
@@ -4520,8 +4509,7 @@ void ExecutionKernel::compute_motion_replacement(const std::stop_token stop_toke
         source->plan_request.speed_profile,
         source->plan_request.per_resource_dynamics_limits,
         static_cast<double>(context.preparation_budget_ns - *elapsed) / 1e9,
-        std::nullopt,
-        source->plan_request.speed_check_frames};
+        std::nullopt};
     auto retained =
         retain_current_scene_snapshot_lease_inventory(session->execution_id, request.move_id);
     if (!retained.ok()) return Result<void>::Err(retained.error());
@@ -6486,18 +6474,12 @@ RecoveryAuthorityCapture ExecutionKernel::capture_recovery_authority_locked() {
       lifecycle_worker_retirement_in_progress_.load(std::memory_order_acquire);
   {
     std::lock_guard<std::mutex> lock(recovery_certificate_mutex_);
-    capture.fault_preempt_certificate =
-        recovery_certificates_.authoritative(StopOwnerKind::kFaultPreemptWorker);
     capture.operator_stop_certificate =
         recovery_certificates_.authoritative(StopOwnerKind::kOperatorStopWorker);
   }
   capture.addressed_motion_stop_evidence = addressed_motion_stop_recovery_evidence_;
   const auto& fact_error =
       status.fact.has_value() ? status.fact->error : std::optional<ErrorDTO>{};
-  if (capture.execution_state == ExecutionState::kInterventionRequired) {
-    capture.stop_fault_intervention_classified =
-        fact_error.has_value() && is_classified_stop_intervention(fact_error->details);
-  }
   if (capture.execution_state == ExecutionState::kFailed) {
     const auto never_dispatched = failed_preparation_never_dispatched_locked();
     capture.failed_preparation_never_dispatched = never_dispatched != nullptr;
@@ -6577,7 +6559,7 @@ KernelRecoveryAssessmentDTO ExecutionKernel::publish_recovery_assessment_locked(
     previous = recovery_assessment_;
   }
   auto publication = prepare_recovery_assessment_publication(
-      previous, capture, recovery_readiness_policy(),
+      previous, capture,
       trigger != nullptr ? std::string_view(trigger) : std::string_view{});
   auto& next = publication.candidate;
   if (!publication.changed) {
@@ -6611,22 +6593,6 @@ KernelRecoveryAssessmentDTO ExecutionKernel::publish_recovery_assessment_locked(
   event.details = std::move(publication.event_details);
   emit_event(std::move(event));
   return next;
-}
-
-void ExecutionKernel::try_refresh_recovery_assessment(const char* trigger) {
-  // ONLY callable from contexts that provably never own lifecycle_mutex_
-  // (collision-tick ingest tail, stop-worker lambdas): std::mutex try_lock
-  // by the owning thread is UB.
-  // Deferred callbacks may re-enter lifecycle methods. Destroy the lifecycle
-  // lock before the event scope dispatches them, as in the other owner paths.
-  EventDeferralScope event_scope(*this);
-  std::unique_lock<std::mutex> lifecycle_lock(lifecycle_mutex_, std::try_to_lock);
-  if (!lifecycle_lock.owns_lock()) {
-    recovery_assessment_dirty_.store(true, std::memory_order_release);
-    schedule_recovery_assessment_refresh(trigger);
-    return;
-  }
-  (void)refresh_recovery_assessment_locked(trigger);
 }
 
 void ExecutionKernel::schedule_recovery_assessment_refresh(const char* trigger) noexcept {
@@ -6676,7 +6642,6 @@ namespace {
 /// deadline is never left to elapse silently.
 [[nodiscard]] bool recovery_observation_tracked(const KernelRecoveryAssessmentDTO& assessment) {
   return assessment.recovery_class == RecoveryClass::kRuntimeCollision ||
-         assessment.recovery_class == RecoveryClass::kStopFaultIntervention ||
          assessment.recovery_class == RecoveryClass::kOrdinaryOperatorStop ||
          (assessment.recovery_class == RecoveryClass::kFailedValidation &&
           assessment.retry_admissible);
@@ -6872,7 +6837,6 @@ KernelRecoveryActionResultDTO ExecutionKernel::apply_recovery_action_impl(
       {"principal_id", request.principal_id},
       {"assessment_revision", std::to_string(assessment.assessment_revision)},
       {"stop_certificate_id", assessment.stop_certificate_id},
-      {"latch_id", assessment.latch_id},
       {"backend_reset_performed", "false"},
       {"reason_code", "recovery_action_accepted"},
   };
@@ -7569,15 +7533,15 @@ void ExecutionKernel::install_collision_clearance(const ExecuteRequestDTO& reque
   // The motion's own clearance replaces the cell clearance for this move.
   auto margins = build_collision_clearance_margins(
       *bundle.world, *bundle.policy, request.contact_policy_id,
-      request.clearance_m.value_or(config_.collision_clearance_m));
+      request.clearance_m.value_or(collision_clearance_m_.load(std::memory_order_acquire)));
   if (!margins) {
     return;
   }
 
   // Start-in-margin release: a pair already within its margin at the start
   // keeps a margin just below its start clearance, so the move may move away
-  // from that obstacle but not closer. Validation remains the authority; an
-  // unavailable or inconclusive start query leaves the margins unchanged.
+  // from that obstacle but not closer. An unavailable or inconclusive start
+  // query leaves the margins unchanged.
   const auto collision_resources = collision_resources_.snapshot();
   const auto engine = std::find_if(collision_resources.validation_engines.begin(),
                                    collision_resources.validation_engines.end(),
@@ -7690,7 +7654,7 @@ Result<PlanRequestDTO> ExecutionKernel::make_plan_request(
       request.motion,
       request.tolerances,
       request.speed_profile,
-      request.planning_profile,
+      request.planner,
       request.contact_policy_id.empty() ? std::nullopt
                                         : std::optional<std::string>{request.contact_policy_id},
       request.per_resource_dynamics_limits,
@@ -7703,8 +7667,7 @@ Result<PlanRequestDTO> ExecutionKernel::make_plan_request(
       projection_inventory.bundle.policy.has_value()
           ? std::make_shared<const CollisionPolicySnapshot>(*projection_inventory.bundle.policy)
           : nullptr,
-      replacement ? std::optional<MovingReplacementInputDTO>{*replacement} : std::nullopt,
-      binding.speed_check_frames};
+      replacement ? std::optional<MovingReplacementInputDTO>{*replacement} : std::nullopt};
   plan_request.retained_clearance_margins = projection_inventory.bundle.clearance_margins;
   return Result<PlanRequestDTO>::Ok(std::move(plan_request));
 }
@@ -7815,7 +7778,7 @@ Result<ExecutionKernel::CollisionValidationSuccess> ExecutionKernel::validate_tr
     const RobotStateDTO* start_state_override, const std::stop_token external_stop_token,
     bool* conclusive_collision_failure,
     std::shared_ptr<CollisionCancellationToken> validation_cancellation,
-    const MovingReplacementInputDTO* replacement, const std::uint32_t planning_attempt_index) {
+    const MovingReplacementInputDTO* replacement, const bool collision_checked_by_planning) {
   if (conclusive_collision_failure != nullptr) {
     *conclusive_collision_failure = false;
   }
@@ -7892,21 +7855,14 @@ Result<ExecutionKernel::CollisionValidationSuccess> ExecutionKernel::validate_tr
   opts.base_frame = compiled_frame_name(request.binding.base_frame);
   opts.max_tcp_linear_speed_mps = request.speed_profile.max_tcp_linear_speed_mps.value_or(0.0);
   opts.run_collision_checks = false;
-  const auto validation_speed_frames = [](const std::vector<ResolvedFrameDTO>& frames) {
-    std::vector<SpeedCheckFrameDTO> result;
-    result.reserve(frames.size());
-    for (const auto& frame : frames)
-      result.push_back({compiled_frame_name(frame), frame_role_id(frame)});
-    return result;
-  };
-  opts.speed_frames = validation_speed_frames(request.binding.speed_check_frames);
+  opts.tcp_frame_role_id = frame_role_id(request.binding.tcp_frame);
   if (replacement) {
     opts.retained_prefix = RetainedTrajectoryPrefixValidationOptionsDTO{
         replacement->divergence_cursor_s - replacement->source_cursor_s,
         replacement->source_speed_profile.max_tcp_linear_speed_mps.value_or(0.0),
         compiled_frame_name(replacement->source_tcp_frame),
         compiled_frame_name(replacement->source_base_frame),
-        validation_speed_frames(replacement->source_speed_check_frames)};
+        frame_role_id(replacement->source_tcp_frame)};
   }
   const auto noncollision_started = replacement ? clock_.now() : 0;
   auto val_result = trajectory_validator_.validate_non_collision(trajectory, opts, *cancel);
@@ -7919,45 +7875,55 @@ Result<ExecutionKernel::CollisionValidationSuccess> ExecutionKernel::validate_tr
     return Result<CollisionValidationSuccess>::Err(ErrorCode::kValidationCollision);
   }
 
-  // Check the executed curve between the stored waypoints too: samples of the
-  // controller's per-segment polynomial (from the stored P/V/A, before
-  // projection), then projected (positions only) to the collision model, at
-  // the planner's collision-check step for the attempt that planned it
-  // (min(step, 0.01) on a retry). The returned collision trajectory,
-  // armed for lookahead and state projection, stays the stored one; failure
-  // indexes refer to the sampled copy, and contact windows keep the stored
-  // trajectory's fractions.
-  const auto admitted_margins = scene_snapshot_lease_inventory.bundle.clearance_margins;
-  const auto sampling_deadline = clock_.now() + config_.validation_collision_wall_timeout_ns;
-  auto sampled = sample_for_collision_validation(
-      trajectory,
-      collision_check_step_for_attempt(config_.collision_check_step_rad, planning_attempt_index),
-      kValidationMaxCheckedStates,
-      [&cancel, this, sampling_deadline]() -> const char* {
-        if (cancel->is_cancel_requested()) return "collision_validation_cancelled";
-        if (clock_.now() >= sampling_deadline) return "collision_validation_wall_timeout";
-        return nullptr;
-      });
-  if (!sampled.ok()) {
-    return Result<CollisionValidationSuccess>::Err(std::move(sampled.error()));
-  }
-  const auto& samples = sampled.value();
-  std::optional<TrajectoryDTO> projected_samples;
-  if (samples.inserted > 0) {
-    auto projected = collision_projector_.expand_for_collision(samples.trajectory, current_state);
-    if (!projected.ok()) {
-      return Result<CollisionValidationSuccess>::Err(std::move(projected.error()));
+  // A trajectory planned in this request was collision-checked by planning
+  // against this same scene and policy; time-scaling keeps its path. With the
+  // Deployment's `collision_check_fresh_plans` off it is not checked again
+  // here: its evidence is the planning-time world and policy, and
+  // changes since planning are caught by the runtime collision checks during
+  // motion. Only the collision curve for those checks is built. The planner
+  // switches the pairs of an active contact policy off (support contacts and
+  // the move's contact grasp), so such a move is validated as before.
+  const auto& planned_policy = scene_snapshot_lease_inventory.bundle.policy;
+  const bool contact_policy_active =
+      !request.contact_policy_id.empty() ||
+      (planned_policy ? !planned_policy->support_contacts.empty()
+                      : snapshot && !snapshot->support_contacts.empty());
+  if (collision_checked_by_planning && !contact_policy_active) {
+    auto collision_curve = collision_projector_.expand_for_collision(trajectory, current_state);
+    if (!collision_curve.ok()) {
+      return Result<CollisionValidationSuccess>::Err(std::move(collision_curve.error()));
     }
-    projected_samples = std::move(projected.value());
+    const auto& planned_scene = scene_snapshot_lease_inventory.bundle;
+    if (!planned_scene.world) {
+      return Result<CollisionValidationSuccess>::Err(
+          authoritative_collision_validation_config_error("snapshot_unavailable"));
+    }
+    if (!planned_scene.policy && !snapshot) {
+      return Result<CollisionValidationSuccess>::Err(
+          authoritative_collision_validation_config_error("missing_collision_policy_snapshot"));
+    }
+    CollisionDecision decision;
+    decision.collision_world_revision = planned_scene.world->revision;
+    ParallelValidationTelemetry telemetry;
+    telemetry.workers_actually_used = 0;
+    return Result<CollisionValidationSuccess>::Ok(CollisionValidationSuccess{
+        planned_scene.world->revision,
+        planned_scene.policy ? planned_scene.policy->revision : snapshot->revision,
+        std::move(val_result), std::move(decision), std::move(collision_curve.value()), telemetry,
+        request.dynamically_discovered_start_contact_count, true});
   }
+
+  // Check the trajectory's own waypoints, projected to the collision model.
+  // The clearance covers the executed spline's deviation between them. The
+  // projected trajectory is also armed for lookahead and state projection.
+  const auto admitted_margins = scene_snapshot_lease_inventory.bundle.clearance_margins;
   auto collision_trajectory_result =
       collision_projector_.expand_for_collision(trajectory, current_state);
   if (!collision_trajectory_result.ok()) {
     return Result<CollisionValidationSuccess>::Err(std::move(collision_trajectory_result.error()));
   }
   auto collision_trajectory = std::move(collision_trajectory_result.value());
-  const TrajectoryDTO& validation_trajectory =
-      projected_samples ? *projected_samples : collision_trajectory;
+  const TrajectoryDTO& validation_trajectory = collision_trajectory;
 
   int available_validation_engines = 0;
   for (const auto& engine : validation_engines) {
@@ -8012,7 +7978,6 @@ Result<ExecutionKernel::CollisionValidationSuccess> ExecutionKernel::validate_tr
             : static_cast<std::int64_t>(config_.validation_collision_query_timeout_ns);
     cfg.surface = CollisionSurface::kPreExecutionValidation;
     cfg.contact_policy_id = request.contact_policy_id;
-    if (samples.inserted > 0) cfg.original_trajectory_sample_fractions = samples.original_fractions;
     cfg.clearance_margins = world_policy_bundle.clearance_margins;
 
     AuthoritativeValidationAttempt attempt;
@@ -8136,8 +8101,7 @@ Result<ExecutionKernel::CollisionValidationSuccess> ExecutionKernel::validate_tr
                  std::move(details)});
   }
   if (config_.enable_collision_diagnostic_compare && collision_diagnostic_comparator_ != nullptr) {
-    append_collision_compare_diagnostics(details, bundle,
-                                         samples.inserted == 0 ? trajectory : samples.trajectory,
+    append_collision_compare_diagnostics(details, bundle, trajectory,
                                          *collision_diagnostic_comparator_);
   }
   if (conclusive_collision_failure != nullptr && !contact_policy_violation.has_value() &&
@@ -8163,6 +8127,17 @@ Result<ExecutionKernel::CollisionValidationSuccess> ExecutionKernel::validate_tr
       ErrorDTO{rejection_error_code,
                pre_dispatch_collision_validation_message(details, bundle.decision.action),
                std::move(details)});
+}
+
+void ExecutionKernel::set_collision_clearance_m(const double clearance_m) {
+  if (!(clearance_m >= 0.0 && clearance_m <= kMaxCollisionClearanceM)) {
+    throw std::invalid_argument("collision_clearance_m must be in [0, 0.05]");
+  }
+  collision_clearance_m_.store(clearance_m, std::memory_order_release);
+}
+
+void ExecutionKernel::set_collision_check_fresh_plans(const bool enabled) noexcept {
+  collision_check_fresh_plans_.store(enabled, std::memory_order_release);
 }
 
 void ExecutionKernel::set_collision_validation_policy_snapshot(
@@ -8592,13 +8567,6 @@ std::optional<ErrorDTO> ExecutionKernel::collision_validation_admission_error() 
     return std::nullopt;
   }
   return validation_admission_error(sm_.status().state, resources, admission, protection);
-}
-
-void ExecutionKernel::set_collision_validation_retry_config(PoseSourceRetryConfig retry,
-                                                            std::int64_t per_state_timeout_ns) {
-  std::scoped_lock lock(coordinator_mutex_);
-  coordinator_retry_config_ = retry;
-  coordinator_per_state_timeout_ns_ = per_state_timeout_ns;
 }
 
 namespace {

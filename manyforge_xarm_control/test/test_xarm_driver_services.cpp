@@ -12,9 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// R7 package 4 (D10): the operator's Recover reaches the unmodified driver's
-// `clean_error` and `clean_warn` once each; no answer in time or a non-zero
-// vendor return is an unknown outcome, never retried.
+// Each driver service the adapters call is one request; no answer in time or a
+// non-zero vendor return is an unknown outcome, never retried.
 
 #include <gtest/gtest.h>
 
@@ -59,7 +58,7 @@ public:
   return "/xarm_services_test_" + std::to_string(device()) + "/manyforge/lite6/xarm";
 }
 
-/// The driver's two services with a configurable vendor return and delay,
+/// The driver's `clean_error` with a configurable vendor return and delay,
 /// and the client node, spun on one background executor.
 struct World final {
   explicit World(const bool serve = true) : ns(unique_namespace()) {
@@ -74,20 +73,13 @@ struct World final {
             std::this_thread::sleep_for(delay.load());
             response->ret = error_return.load();
           });
-      clean_warn = server_node->create_service<Call>(
-          ns + "/clean_warn",
-          [this](const Call::Request::SharedPtr, Call::Response::SharedPtr response) {
-            ++clean_warn_calls;
-            response->ret = warn_return.load();
-          });
     }
     executor.add_node(client_node);
     executor.add_node(server_node);
     spinner = std::thread([this] { executor.spin(); });
     if (serve) {
       // The services' own clients see the servers on the same node graph.
-      for (const auto *name : {"/clean_error", "/clean_warn"})
-        EXPECT_TRUE(client_node->create_client<Call>(ns + name)->wait_for_service(10s));
+      EXPECT_TRUE(client_node->create_client<Call>(ns + "/clean_error")->wait_for_service(10s));
     }
   }
 
@@ -96,10 +88,9 @@ struct World final {
     if (spinner.joinable()) spinner.join();
   }
 
-  [[nodiscard]] XArmServiceCallResult Send(const XArmLifecycleCommand command,
-                                           const std::chrono::nanoseconds timeout =
-                                               kXArmServiceResponseTimeout) {
-    return services->Call(command, timeout, std::stop_token{});
+  [[nodiscard]] XArmServiceCallResult Clear(const std::chrono::nanoseconds timeout =
+                                                kXArmServiceResponseTimeout) {
+    return services->CleanError(timeout, std::stop_token{});
   }
 
   std::string ns;
@@ -107,34 +98,48 @@ struct World final {
   rclcpp::Node::SharedPtr server_node;
   std::unique_ptr<XArmDriverServices> services;
   rclcpp::Service<Call>::SharedPtr clean_error;
-  rclcpp::Service<Call>::SharedPtr clean_warn;
   std::atomic<int> clean_error_calls{0};
-  std::atomic<int> clean_warn_calls{0};
   std::atomic<int> error_return{0};
-  std::atomic<int> warn_return{0};
   std::atomic<std::chrono::milliseconds> delay{0ms};
   rclcpp::executors::MultiThreadedExecutor executor{rclcpp::ExecutorOptions(), 4U};
   std::thread spinner;
 };
 
-TEST(XArmDriverServices, EachRecoverStepIsOneCallAndOnlyZeroReturnSucceeds) {
+TEST(XArmDriverServices, CleanErrorIsOneCallAndReportsTheVendorReturn) {
   World world;
-  const auto cleared = world.Send(XArmLifecycleCommand::kClearError);
+  const auto cleared = world.Clear();
   EXPECT_EQ(cleared.outcome, Outcome::kSucceeded);
   EXPECT_EQ(cleared.vendor_return, 0);
   EXPECT_TRUE(cleared.reason.empty());
   EXPECT_EQ(world.clean_error_calls.load(), 1);
-  EXPECT_EQ(world.clean_warn_calls.load(), 0);
 
-  // A non-zero vendor return is not a known failure: unknown, not retried.
-  world.warn_return = 1;
-  const auto warned = world.Send(XArmLifecycleCommand::kClearWarning);
-  EXPECT_EQ(warned.outcome, Outcome::kUnknown);
-  EXPECT_EQ(warned.reason, "xarm_service_returned_nonzero");
-  EXPECT_EQ(warned.vendor_return, 1);
+  // `ret=1` (an error still present) is answered, never retried.
+  world.error_return = 1;
+  const auto remaining = world.Clear();
+  EXPECT_EQ(remaining.outcome, Outcome::kUnknown);
+  EXPECT_EQ(remaining.reason, "xarm_service_returned_nonzero");
+  EXPECT_EQ(remaining.vendor_return, 1);
   std::this_thread::sleep_for(200ms);
-  EXPECT_EQ(world.clean_warn_calls.load(), 1);
-  EXPECT_EQ(world.clean_error_calls.load(), 1);
+  EXPECT_EQ(world.clean_error_calls.load(), 2);
+}
+
+// The owner's Recover clears a warning with `clean_warn`: one call on its own
+// service name.
+TEST(XArmDriverServices, CleanWarnIsOneCallOnItsOwnService) {
+  World world;
+  std::atomic<int> calls{0};
+  const auto server = world.server_node->create_service<Call>(
+      world.ns + "/clean_warn",
+      [&calls](const Call::Request::SharedPtr, Call::Response::SharedPtr response) {
+        ++calls;
+        response->ret = 0;
+      });
+  ASSERT_TRUE(world.client_node->create_client<Call>(world.ns + "/clean_warn")
+                  ->wait_for_service(10s));
+  const auto cleared = world.services->CleanWarn(kXArmServiceResponseTimeout, std::stop_token{});
+  EXPECT_EQ(cleared.outcome, Outcome::kSucceeded);
+  EXPECT_EQ(calls.load(), 1);
+  EXPECT_EQ(world.clean_error_calls.load(), 0);
 }
 
 // TOOLCTX: the payload reaches `set_tcp_load` once, in kg and millimetres.
@@ -211,10 +216,11 @@ TEST(XArmDriverServices, SetTcpOffsetSendsMillimetresAndRadiansOnce) {
   EXPECT_EQ(calls.load(), 2);
 }
 
-// M6 ADAPTERM: the re-engage sends `set_mode(1)` then `set_state(0)`, each
-// once; a non-zero vendor return is an unknown outcome, never retried.
-TEST(XArmDriverServices, SetModeAndSetStateSendOneRequestEach) {
+// `set_state`, `system_control` and the digital outputs: one request each,
+// with the bank's own service; a non-zero return is reported, never retried.
+TEST(XArmDriverServices, Int16AndDigitalOutputServicesSendOneRequestEach) {
   using SetInt16 = xarm_msgs::srv::SetInt16;
+  using SetDigitalIO = xarm_msgs::srv::SetDigitalIO;
   World world;
   std::vector<std::pair<std::string, int>> received;
   std::mutex mutex;
@@ -229,31 +235,53 @@ TEST(XArmDriverServices, SetModeAndSetStateSendOneRequestEach) {
           response->ret = static_cast<std::int16_t>(vendor_return.load());
         });
   };
-  const auto mode_server = serve("set_mode");
+  const auto serve_io = [&](const std::string &name) {
+    return world.server_node->create_service<SetDigitalIO>(
+        world.ns + "/" + name,
+        [&, name](const SetDigitalIO::Request::SharedPtr request,
+                  SetDigitalIO::Response::SharedPtr response) {
+          std::lock_guard lock(mutex);
+          received.emplace_back(name, request->ionum * 10 + request->value);
+          EXPECT_FLOAT_EQ(request->delay_sec, 0.0F);
+          response->ret = static_cast<std::int16_t>(vendor_return.load());
+        });
+  };
   const auto state_server = serve("set_state");
-  ASSERT_TRUE(world.client_node->create_client<SetInt16>(world.ns + "/set_mode")
-                  ->wait_for_service(10s));
-  ASSERT_TRUE(world.client_node->create_client<SetInt16>(world.ns + "/set_state")
-                  ->wait_for_service(10s));
-  EXPECT_EQ(world.services->SetMode(1, kXArmServiceResponseTimeout, std::stop_token{}).outcome,
+  const auto system_server = serve("system_control");
+  const auto cgpio_server = serve_io("set_cgpio_digital");
+  const auto tgpio_server = serve_io("set_tgpio_digital");
+  for (const auto *name : {"/set_state", "/system_control"})
+    ASSERT_TRUE(world.client_node->create_client<SetInt16>(world.ns + name)
+                    ->wait_for_service(10s));
+  for (const auto *name : {"/set_cgpio_digital", "/set_tgpio_digital"})
+    ASSERT_TRUE(world.client_node->create_client<SetDigitalIO>(world.ns + name)
+                    ->wait_for_service(10s));
+  const auto cap = kXArmServiceResponseTimeout;
+  EXPECT_EQ(world.services->SetState(0, cap, std::stop_token{}).outcome, Outcome::kSucceeded);
+  EXPECT_EQ(world.services->SystemControl(kXArmSystemReboot, cap, std::stop_token{}).outcome,
             Outcome::kSucceeded);
-  EXPECT_EQ(world.services->SetState(0, kXArmServiceResponseTimeout, std::stop_token{}).outcome,
+  EXPECT_EQ(world.services->SetDigitalOutput(XArmIoBank::kController, 1, true, cap,
+                                             std::stop_token{})
+                .outcome,
             Outcome::kSucceeded);
   vendor_return = 1;
-  const auto refused =
-      world.services->SetState(0, kXArmServiceResponseTimeout, std::stop_token{});
+  const auto refused = world.services->SetDigitalOutput(XArmIoBank::kTool, 0, false, cap,
+                                                        std::stop_token{});
   EXPECT_EQ(refused.outcome, Outcome::kUnknown);
   EXPECT_EQ(refused.reason, "xarm_service_returned_nonzero");
+  EXPECT_EQ(refused.vendor_return, 1);
   std::lock_guard lock(mutex);
-  EXPECT_EQ(received, (std::vector<std::pair<std::string, int>>{
-                          {"set_mode", 1}, {"set_state", 0}, {"set_state", 0}}));
+  EXPECT_EQ(received, (std::vector<std::pair<std::string, int>>{{"set_state", 0},
+                                                               {"system_control", 2},
+                                                               {"set_cgpio_digital", 11},
+                                                               {"set_tgpio_digital", 0}}));
 }
 
 TEST(XArmDriverServices, NoAnswerInTimeIsAnUnknownOutcomeAndIsNeverRetried) {
   World world;
   world.delay = 600ms;
   const auto started = std::chrono::steady_clock::now();
-  const auto result = world.Send(XArmLifecycleCommand::kClearError, 100ms);
+  const auto result = world.Clear(100ms);
   EXPECT_LT(std::chrono::steady_clock::now() - started, 500ms);
   EXPECT_EQ(result.outcome, Outcome::kUnknown);
   EXPECT_EQ(result.reason, "xarm_service_timeout");
@@ -271,34 +299,27 @@ TEST(XArmDriverServices, CancelledInFlightIsUnknown) {
     std::this_thread::sleep_for(100ms);
     stop.request_stop();
   });
-  const auto result = world.services->Call(XArmLifecycleCommand::kClearError,
-                                            kXArmServiceResponseTimeout,
-                                            stop.get_token());
+  const auto result =
+      world.services->CleanError(kXArmServiceResponseTimeout, stop.get_token());
   canceller.join();
   EXPECT_EQ(result.outcome, Outcome::kUnknown);
   EXPECT_EQ(result.reason, "xarm_service_cancelled");
 }
 
-TEST(XArmDriverServices, RefusesBeforeEffectWithoutServiceCommandOrBudget) {
+TEST(XArmDriverServices, RefusesBeforeEffectWithoutServiceOrWhenCancelled) {
   World unserved(false);
-  const auto missing = unserved.Send(XArmLifecycleCommand::kClearError);
+  const auto missing = unserved.Clear();
   EXPECT_EQ(missing.outcome, Outcome::kNotSent);
   EXPECT_EQ(missing.reason, "xarm_service_unavailable");
 
   World world;
-  // Arming is the hardware activation, never a driver service.
-  const auto arm = world.Send(XArmLifecycleCommand::kArm);
-  EXPECT_EQ(arm.outcome, Outcome::kNotSent);
-  EXPECT_EQ(arm.reason, "xarm_service_command_unsupported");
   std::stop_source stop;
   stop.request_stop();
-  const auto cancelled = world.services->Call(
-      XArmLifecycleCommand::kClearWarning, kXArmServiceResponseTimeout,
-      stop.get_token());
+  const auto cancelled =
+      world.services->CleanError(kXArmServiceResponseTimeout, stop.get_token());
   EXPECT_EQ(cancelled.outcome, Outcome::kNotSent);
   EXPECT_EQ(cancelled.reason, "xarm_service_cancelled");
   EXPECT_EQ(world.clean_error_calls.load(), 0);
-  EXPECT_EQ(world.clean_warn_calls.load(), 0);
   EXPECT_THROW(XArmDriverServices(*world.client_node, "relative/xarm"),
                std::invalid_argument);
 }

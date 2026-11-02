@@ -74,7 +74,7 @@ def test_native_commands_retain_five_owner_entrypoints(tmp_path: Path):
     assert specs[0].argv[
         specs[0].argv.index("--reconciliation-period-ms") + 1
     ] == "500"
-    assert "--cell-id native" in commands[1]
+    assert "--cell-id cell" in commands[1]
     assert "--manager-timeout-s 60.0" in commands[1]
     assert specs[1].argv[
         specs[1].argv.index("--node-environment-manifest-path") + 1
@@ -130,6 +130,9 @@ def test_native_commands_retain_five_owner_entrypoints(tmp_path: Path):
         spec.environment["MANYFORGE_FS_ROOTS"] == str(config.install_root)
         for spec in specs[:3]
     )
+    # The Manager's execution host and its component processes (a point-cloud
+    # source) inherit the Composer's URL.
+    assert specs[0].environment["MANYFORGE_COMPOSER_URL"] == "http://127.0.0.1:9000"
     assert specs[4].environment == {
         "MANYFORGE_FS_ROOTS": (
             f"{config.source_root / 'examples'},"
@@ -172,7 +175,7 @@ def test_native_ordered_roots_make_examples_the_default_browse_root(
         ("install_root", "package,extra", "MANYFORGE_FS_ROOTS"),
         ("install_root", "package ", "MANYFORGE_FS_ROOTS"),
         ("state_root", "operator,state", "MANYFORGE_FS_ROOTS"),
-        ("instance_id", "native,extra", "path-safe"),
+        ("instance_id", "workbench,extra", "path-safe"),
     ],
 )
 def test_native_configuration_rejects_ambiguous_composer_roots_before_effects(
@@ -259,7 +262,7 @@ def test_native_configuration_rejects_overlapping_composer_roots_without_mutatio
 ):
     config = _config(tmp_path)
     state_root = tmp_path / "prospective-state"
-    instance_id = "native"
+    instance_id = "workbench"
     prospective_workspace = (
         state_root / instance_id / "state" / "composer-authoring" /
         "program-workspace"
@@ -517,11 +520,11 @@ def test_atomic_state_store_round_trip(tmp_path: Path, configuration_factory):
 
     status = make_status(configuration_factory(), state=LaunchInstanceState.STARTING, with_resources=False)
     with store.lock():
-        store.write(status, {"profile": "native", "processes": {}})
+        store.write(status, {"profile": "standard", "processes": {}})
         loaded = store.read()
     assert loaded is not None
     assert loaded[0] == status
-    assert loaded[1]["profile"] == "native"
+    assert loaded[1]["profile"] == "standard"
     store.record_path.write_text("{\"partial\":", encoding="utf-8")
     with store.lock(), pytest.raises(Exception):
         store.read()
@@ -766,9 +769,9 @@ def test_detached_spawn_routes_to_journal_and_keeps_target_identity(tmp_path, mo
     monkeypatch.setattr("manyforge_operator.orchestrator.os.getpgid", lambda pid: pid)
     spec = ProcessSpec("manager", ("/bin/echo", "some value"), {"CUSTOM": "value"}, tmp_path)
     managed = launcher._spawn(spec)
-    assert captured["argv"] == ["/usr/bin/systemd-cat", "-t", "manyforge-native-manager", "--", *spec.argv]
+    assert captured["argv"] == ["/usr/bin/systemd-cat", "-t", "manyforge-workbench-manager", "--", *spec.argv]
     assert captured["kwargs"]["stdout"] == -3
     assert captured["kwargs"]["env"]["CUSTOM"] == "value"
     assert managed.argv == spec.argv
-    assert managed.log_path == "journalctl -t manyforge-native-manager"
+    assert managed.log_path == "journalctl -t manyforge-workbench-manager"
     assert not (launcher.store.root / "logs").exists()

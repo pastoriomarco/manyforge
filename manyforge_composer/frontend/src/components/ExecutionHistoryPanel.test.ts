@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   ExecutionHistoryPanel,
   historyFilterQuery,
+  historyRunEnd,
   type ExecutionHistoryEventView,
 } from './ExecutionHistoryPanel';
 import type { HistorianDetail } from '../types/headless';
@@ -156,5 +157,36 @@ describe('execution history filtering', () => {
     }));
 
     expect(markup).toContain('history-event severity-error selected');
+    expect(markup).not.toContain('run-end');
+  });
+
+  it('shows a Program run\'s end reason (CONTRACTS §9) in its event detail', () => {
+    expect(historyRunEnd({})).toBeNull();
+    expect(historyRunEnd({ run_end: { end_reason: 'completed', details: {} } }))
+      .toEqual({ label: 'Completed', tone: 'neutral', text: 'Completed' });
+    const selected: HistorianDetail = {
+      schemaVersion: 'manyforge.historian_detail.v2',
+      sequence: 10,
+      event: {
+        schemaVersion: 'manyforge.historian_event.v2',
+        eventId: 'event-10',
+        component: 'manyforge.program_runner',
+        eventType: 'program_run_ended',
+        severity: 'WARN',
+        occurredAtNs: '10',
+        occurredAtWall: '2026-11-01T10:00:00Z',
+        payload: { run_end: { end_reason: 'stopped', details: { stopped_by: 'rule', rule_id: 'door' } } },
+      },
+      sections: {
+        incident: { available: false, reason: 'not published', value: null },
+        executionDigest: { available: false, reason: 'not published', value: null },
+        blackboard: { available: false, reason: 'not published', value: null },
+        latency: { available: false, reason: 'not published', value: null },
+      },
+    };
+    const markup = renderToStaticMarkup(createElement(ExecutionHistoryPanel, {
+      open: true, onClose: vi.fn(), events: [], selectedDetail: selected,
+    }));
+    expect(markup).toContain('<p class="run-end tone-warning" role="status"><strong>Stopped</strong> · Stopped by rule door</p>');
   });
 });

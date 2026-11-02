@@ -35,6 +35,9 @@ from manyforge_behavior.orchestration_ports import (
 from manyforge_behavior.production_ports import NativeKernelProgramPort
 from manyforge_behavior.program_clock import ProgramClock
 
+# The Runner's execution transport timeout handed to owner task nodes.
+_TRANSPORT_TIMEOUT_S = 30.0
+
 _RUNNING = py_trees.common.Status.RUNNING
 _SUCCESS = py_trees.common.Status.SUCCESS
 _FAILURE = py_trees.common.Status.FAILURE
@@ -188,7 +191,7 @@ def _clock() -> ProgramClock:
 
 def _motion(mock, events, log, rows=_ROWS):
     port = _TaskPort(log)
-    node = InterruptMotionTaskAdapter(
+    node = InterruptMotionTaskAdapter(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
         **_common("motion.move_until_signal", mock, events, rows),
         port=port,
         owner_port_name="kernel_operations",
@@ -379,7 +382,7 @@ def test_operator_retry_takes_a_new_index() -> None:
         "authored_failure_policy_parameter": "no_feasible_plan_policy",
     }
     interventions = _Interventions()
-    node = OwnerTaskAdapter(
+    node = OwnerTaskAdapter(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
         **_common("motion.move_until_signal", mock, [], _ROWS),
         port=port,
         owner_port_name="kernel_operations",
@@ -418,7 +421,7 @@ def test_hold_before_admission_release_takes_a_new_index() -> None:
     port = _TaskPort(log)
     port.start_errors = [OwnerInvocationHeldError(1)]
     stop = _StopState()
-    node = OwnerTaskAdapter(
+    node = OwnerTaskAdapter(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
         **_common("motion.move_until_signal", mock, [], _ROWS),
         port=port,
         owner_port_name="kernel_operations",

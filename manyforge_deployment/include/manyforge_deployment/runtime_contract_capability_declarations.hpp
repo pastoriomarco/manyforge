@@ -25,7 +25,7 @@ inline constexpr std::array<std::string_view, 14U> kLogicalSceneServices{{
     "scene.shape.sphere",
 }};
 
-inline constexpr std::array<std::string_view, 20U> kExecutionServices{{
+inline constexpr std::array<std::string_view, 17U> kExecutionServices{{
     "execution.contact.geometric",
     "execution.contact.geometric_signed_penetration",
     "execution.feedback.phase_events",
@@ -38,9 +38,6 @@ inline constexpr std::array<std::string_view, 20U> kExecutionServices{{
     "planning.motion.cartesian_path",
     "planning.motion.joint_goal",
     "planning.motion.pose_goal",
-    "planning.profile.balanced",
-    "planning.profile.first_feasible",
-    "planning.profile.quality_bounded",
     "planning.trajectory.time_parameterized",
     "state.observed.current",
     "tool.gripper.command",

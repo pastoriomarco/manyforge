@@ -397,10 +397,9 @@ bool RequiresAttention(const AlarmLifecycleState state) noexcept {
 }
 
 bool GatesMotion(const OperatorAlarmRecord &record) noexcept {
-  return record.requires_motion_attention &&
-         (record.acknowledgement_required
-              ? RequiresAttention(record.lifecycle_state)
-              : IsActive(record.lifecycle_state));
+  // Only condition interlocks gate motion, exactly while active: the catalog
+  // refuses an alarm that both needs acknowledgement and gates motion (V2-5).
+  return record.requires_motion_attention && IsActive(record.lifecycle_state);
 }
 
 bool operator<(const AlarmAcknowledgementMember &left,

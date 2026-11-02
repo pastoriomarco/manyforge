@@ -1,6 +1,6 @@
 #include <manyforge_roboplan/host_component_stream_health.hpp>
 
-#include <manyforge_roboplan/native_runtime_support.hpp>
+#include <manyforge_roboplan/execution_host_support.hpp>
 
 namespace manyforge::roboplan_backend {
 

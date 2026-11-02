@@ -3,12 +3,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <manyforge_core/emergency_stop_acceptance_reserve.hpp>
-#include <manyforge_core/stop_fault_recovery.hpp>
+#include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/stop_terminal_state.hpp>
 #include <manyforge_core/types/cell_admission.hpp>
 #include <manyforge_core/types/error_code.hpp>
+#include <manyforge_core/types/configuration_fence.hpp>
 #include <manyforge_core/types/io_rule_state.hpp>
-#include <manyforge_core/types/io_rule_recovery.hpp>
 #include <manyforge_core/types/operation_runtime.hpp>
 #include <manyforge_core/types/prepared_operation_diagnostics.hpp>
 #include <manyforge_core/types/tcp_entry.hpp>
@@ -84,15 +84,13 @@ struct EmergencyStopAcceptanceProjectionResultDTO final {
 };
 
 /// Complete durable Stop truth recovered at one owner-epoch boundary. The
-/// acceptance is always present. Terminal, fault-latch, and surveillance truth
-/// is present only after its corresponding atomic projection committed. The
+/// acceptance is always present. Terminal truth is present only after its
+/// atomic projection committed. The
 /// affected-state capture stays in the acceptance journal row only (journal
 /// v17); recovery has no reader for it.
 struct RecoveredStopJournalStateDTO final {
   StopAcceptedDTO accepted;
   std::optional<StopCertificateDTO> terminal_certificate;
-  std::optional<StopFaultLatchDTO> fault_latch;
-  std::optional<StopPostTerminalSurveillanceDTO> surveillance;
 
   friend bool operator==(const RecoveredStopJournalStateDTO&,
                          const RecoveredStopJournalStateDTO&) = default;
@@ -173,41 +171,15 @@ class IOperationJournal {
       const EmergencyStopProjectedIntentDTO& intent, const StopAcceptedDTO& accepted,
       const EmergencyStopAffectedStateSnapshotDTO& affected_state) noexcept = 0;
 
-  /// Atomically projects one complete terminal Stop status, immutable
-  /// certificate, and optional fault latch. Exact replay returns the original
-  /// sequence; conflicting replay fails without modifying durable truth.
+  /// Atomically projects one complete terminal Stop status and its immutable
+  /// certificate. Exact replay returns the original sequence; conflicting
+  /// replay fails without modifying durable truth.
   [[nodiscard]] virtual StopForensicProjectionResultDTO RecordStopTerminal(
       const RequestOwnerEpoch& owner_epoch, const StopStatusDTO& stop_status,
-      const StopCertificateDTO& certificate,
-      const std::optional<StopFaultLatchDTO>& fault_latch) noexcept = 0;
-
-  /// Coalesces one complete bounded post-terminal surveillance checkpoint and
-  /// its exact current non-cleared latch. Exact replay returns the first
-  /// sequence; conflict fails without changing durable truth.
-  [[nodiscard]] virtual StopForensicProjectionResultDTO RecordStopSurveillanceCheckpoint(
-      const RequestOwnerEpoch& owner_epoch, const StopPostTerminalSurveillanceDTO& checkpoint,
-      const StopFaultLatchDTO& fault_latch, std::int64_t projected_at_ns) noexcept = 0;
-
-  /// Atomically records the public recovery intent and result (with the
-  /// cleared latch) before Kernel may publish clear. The exact resulting
-  /// terminal status is checked against durable truth but not stored.
-  [[nodiscard]] virtual Result<std::uint64_t> RecordStopFaultCleared(
-      const RequestOwnerEpoch& owner_epoch, const StopFaultRecoveryIntentDTO& recovery_intent,
-      const StopFaultRecoveryResultDTO& recovery_result, const StopFaultLatchDTO& cleared_latch,
-      const StopStatusDTO& resulting_stop_status) = 0;
-
-  /// Same durable recovery/replay owner, without fabricated Stop identities.
-  /// Exact retries of an immutable payload return the original sequence.
-  [[nodiscard]] virtual Result<std::uint64_t> RecordGlobalIoRuleCleared(
-      const IoGlobalRuleRecoveryRecordDTO&) {
-    return Result<std::uint64_t>::Err(
-        {"unsupported_capability", "Global rule recovery journal is not installed",
-         {{"reason", "io_global_rule_recovery_journal_unsupported"}}});
-  }
+      const StopCertificateDTO& certificate) noexcept = 0;
 
   /// The sole durable clean-owner marker. It succeeds only when no journaled
-  /// operation, Stop projection, active latch/surveillance owner, or orphan
-  /// remains unresolved.
+  /// operation, Stop projection, or orphan remains unresolved.
   [[nodiscard]] virtual Result<std::uint64_t> CloseOwnerEpoch(const RequestOwnerEpoch& owner_epoch,
                                                               std::int64_t closed_at_ns) = 0;
 

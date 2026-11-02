@@ -620,6 +620,29 @@ def _edit_compiled_controlled_stop_profile(
     return candidate
 
 
+def _without_orphaned_members(
+    before: dict[str, Any], candidate: dict[str, Any]
+) -> dict[str, Any]:
+    """Removing a machine's owner removes its members (CONTRACTS §11, §16):
+    member rows whose `owner` was a component before the edit and isn't any
+    more go with it."""
+
+    def ids(document: dict[str, Any]) -> set[str]:
+        rows = document.get("components")
+        if not isinstance(rows, list):
+            return set()
+        return {row.get("component_id") for row in rows if isinstance(row, dict)}
+
+    removed = ids(before) - ids(candidate)
+    if not removed or not isinstance(candidate.get("components"), list):
+        return candidate
+    candidate["components"] = [
+        row for row in candidate["components"]
+        if not (isinstance(row, dict) and row.get("owner") in removed)
+    ]
+    return candidate
+
+
 def _edit_controlled_stop_profile(
     document: dict[str, Any],
     profile: dict[str, Any] | None,
@@ -777,13 +800,11 @@ def _edit_motion_target_limit(
     controllable_component_id: str,
     command_target_id: str,
     maximum_tcp_linear_speed_mps: float,
-    tcp_speed_check: str | None = None,
 ) -> dict[str, Any]:
     """Edit one exact Deployment-owned target ceiling.
 
-    This authored ceiling is the target's sole configured TCP-speed maximum.
-    `tcp_speed_check` (None keeps the stored value) chooses the points where
-    that ceiling is held: the active TCP, or the active TCP and the flange.
+    This authored ceiling is the target's sole configured TCP-speed maximum,
+    held at the active TCP.
     """
 
     if (
@@ -828,8 +849,6 @@ def _edit_motion_target_limit(
         matches[0]["maximum_tcp_linear_speed_mps"] = float(
             maximum_tcp_linear_speed_mps
         )
-        if tcp_speed_check is not None:
-            matches[0]["tcp_speed_check"] = tcp_speed_check
         try:
             return validate_deployment_intent(
                 candidate, source="<Deployment Draft mutation>"
@@ -872,8 +891,6 @@ def _edit_motion_target_limit(
             status_code=409,
         )
     matches[0]["maximum_tcp_linear_speed_mps"] = float(maximum_tcp_linear_speed_mps)
-    if tcp_speed_check is not None:
-        matches[0]["tcp_speed_check"] = tcp_speed_check
     return candidate
 
 
@@ -968,6 +985,7 @@ class DeploymentDraftSession:
                     status_code=404,
                 )
             candidate = _edit_at_path(self._compiled.document, path, value, operation)
+            candidate = _without_orphaned_members(self._compiled.document, candidate)
         return self._compiler(_source(candidate))
 
     def preview_component_addition(
@@ -1031,7 +1049,6 @@ class DeploymentDraftSession:
         maximum_tcp_linear_speed_mps: float,
         draft_id: str,
         expected_revision: int,
-        tcp_speed_check: str | None = None,
     ) -> CompiledDeploymentDocument:
         with self._lock:
             self._require_current(draft_id, expected_revision)
@@ -1046,7 +1063,6 @@ class DeploymentDraftSession:
                 controllable_component_id=controllable_component_id,
                 command_target_id=command_target_id,
                 maximum_tcp_linear_speed_mps=maximum_tcp_linear_speed_mps,
-                tcp_speed_check=tcp_speed_check,
             )
         return self._compiler(_source(candidate))
 

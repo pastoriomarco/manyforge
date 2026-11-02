@@ -10,10 +10,7 @@
 namespace manyforge::core {
 namespace {
 
-static_assert(!std::is_same_v<LifecycleTransactionId, RouteSelectionTransactionId>);
 static_assert(!std::is_same_v<LifecycleTransactionId, StopCertificateId>);
-static_assert(!std::is_same_v<LifecycleTransactionGeneration,
-                             RouteSelectionTransactionGeneration>);
 static_assert(!std::is_same_v<ComponentLifecycleGeneration,
                              ActiveControlConfigurationGeneration>);
 static_assert(!std::is_same_v<StopCertificateRevision, StopGeneration>);
@@ -78,14 +75,11 @@ static_assert(std::is_same_v<
 
 TEST(ActiveControlConfigurationContract, StrongLifecycleAndStopCertificateTypesStayDistinct) {
   const LifecycleTransactionId lifecycle("same");
-  const RouteSelectionTransactionId route("same");
   const StopCertificateId certificate("same");
 
-  EXPECT_EQ(lifecycle.value(), route.value());
-  EXPECT_EQ(route.value(), certificate.value());
+  EXPECT_EQ(lifecycle.value(), certificate.value());
   EXPECT_EQ(LifecycleTransactionGeneration(4U).value(), 4U);
   EXPECT_EQ(ComponentLifecycleGeneration(5U).value(), 5U);
-  EXPECT_EQ(RouteSelectionTransactionGeneration(6U).value(), 6U);
   EXPECT_EQ(StopCertificateRevision(7U).value(), 7U);
 }
 

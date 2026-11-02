@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: pick_and_place_minimal
-program_revision: sha256:41ae8338c671877c6b2d36d627de151ec9584fb1843d1630de856406e7c304a5
+program_revision: sha256:a7ab2f7e0b33c819c950de178bc144a7b340e85582ef0de9164b7ab0b9138299
 program_profile: composable-cell-v1
 name: pick_and_place_minimal
 description: 'Minimal smoke Program for the ur5-simple-pick-place scenario: one target-scoped source-joint
@@ -34,9 +34,6 @@ target_roles:
       parameters: {}
       disposition: required
     - capability_id: planning.motion.joint_goal
-      parameters: {}
-      disposition: required
-    - capability_id: planning.profile.balanced
       parameters: {}
       disposition: required
     - capability_id: planning.trajectory.time_parameterized

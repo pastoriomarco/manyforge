@@ -1,0 +1,11 @@
+# Isaac lane driver (CONTRACTS §12). Isaac Sim itself runs outside ManyForge;
+# the ros2_control side is the topic-based hardware plugin, built into the ROS
+# image from this pinned source (Dockerfile.ros-lyrical-full).
+source:
+  repository: https://github.com/PickNikRobotics/topic_based_ros2_control.git
+  commit: aa9f9ef9525a60f8becea322537dd1d6d1bf9123
+hardware_plugin: topic_based_ros2_control/TopicBasedSystem
+# The controllers template of this lane (one file for every arm; the
+# generator expands it with the model row and the Deployment).
+base_files:
+  - controllers.template.yaml

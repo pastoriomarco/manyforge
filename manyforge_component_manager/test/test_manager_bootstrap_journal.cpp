@@ -73,7 +73,7 @@ class TemporaryDirectory final {
   std::filesystem::path path_;
 };
 
-core::ProjectionNativeRuntimeBindingDTO Binding(
+core::ProjectionExecutionHostBindingDTO Binding(
     const std::string& suffix) {
   return {
       core::CapabilityProviderBindingId("provider-" + suffix),
@@ -271,18 +271,18 @@ TEST(
 
 TEST(ManagerBootstrapJournalValues, EnforcesClosedTypedShape) {
   auto invalid = Intent();
-  invalid.native_runtime_bindings = {Binding("b"), Binding("a")};
+  invalid.execution_host_bindings = {Binding("b"), Binding("a")};
   EXPECT_FALSE(invalid.valid());
 
   invalid = Intent();
-  invalid.native_runtime_bindings.push_back(Binding("c"));
-  while (invalid.native_runtime_bindings.size() <=
-         kMaximumBootstrapNativeRuntimeBindings) {
+  invalid.execution_host_bindings.push_back(Binding("c"));
+  while (invalid.execution_host_bindings.size() <=
+         kMaximumBootstrapExecutionHostBindings) {
     const auto suffix =
         std::string("z") +
         std::to_string(
-            1000U + invalid.native_runtime_bindings.size());
-    invalid.native_runtime_bindings.push_back(Binding(suffix));
+            1000U + invalid.execution_host_bindings.size());
+    invalid.execution_host_bindings.push_back(Binding(suffix));
   }
   EXPECT_FALSE(invalid.valid());
 
@@ -385,7 +385,7 @@ TEST(
       snapshot.accepted_target->accepted_target_digest.value(),
       accepted_digest);
   EXPECT_EQ(
-      reopened.VerifyIntegrity().native_runtime_binding_row_count,
+      reopened.VerifyIntegrity().execution_host_binding_row_count,
       2);
 }
 
@@ -476,11 +476,11 @@ TEST(ManagerBootstrapJournal, BootstrapAttemptInventoryIsBounded) {
        generation <= kMaximumBootstrapAttempts;
        ++generation) {
     auto intent = Intent(generation);
-    intent.native_runtime_bindings.clear();
+    intent.execution_host_bindings.clear();
     EXPECT_TRUE(journal.EnsureIntent(intent).inserted);
   }
   auto exhausted = Intent(kMaximumBootstrapAttempts + 1U);
-  exhausted.native_runtime_bindings.clear();
+  exhausted.execution_host_bindings.clear();
   EXPECT_THROW(
       static_cast<void>(journal.EnsureIntent(exhausted)),
       ManagerBootstrapJournalLimitError);
@@ -719,7 +719,7 @@ TEST(ManagerBootstrapJournalIntegrity, WrongStoredDigestFailsReopen) {
       "bootstrap_id,bootstrap_generation,"
       "canonical_empty_retained_bundle_id,"
       "canonical_empty_graph_revision,"
-      "native_runtime_binding_set_digest,intent_digest"
+      "execution_host_binding_set_digest,intent_digest"
       ") VALUES ('bootstrap-1',1,'"
       "sha256:1111111111111111111111111111111111111111111111111111111111111111',"
       "'sha256:2222222222222222222222222222222222222222222222222222222222222222',"
@@ -764,7 +764,7 @@ TEST(ManagerBootstrapJournalIntegrity, DurableRowsRejectRawMutation) {
       "UPDATE manager_bootstrap_intents "
       "SET bootstrap_id='bootstrap-replaced' "
       "WHERE bootstrap_id='bootstrap-1' AND bootstrap_generation=1;",
-      "DELETE FROM manager_bootstrap_native_runtime_bindings "
+      "DELETE FROM manager_bootstrap_execution_host_bindings "
       "WHERE bootstrap_id='bootstrap-1' AND bootstrap_generation=1;",
       "UPDATE manager_bootstrap_accepted_targets "
       "SET candidate_scene_id='scene-replaced' "

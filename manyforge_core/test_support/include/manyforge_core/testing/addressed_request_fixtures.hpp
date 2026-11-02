@@ -266,7 +266,7 @@ inline PlanRequestDTO make_test_plan_request(std::string move_id, ResolvedMotion
                         std::move(motion),
                         TolerancesDTO{},
                         SpeedProfileDTO{},
-                        PlanningProfileDTO::kFirstFeasible,
+                        PlannerOverrideDTO{},
                         std::nullopt,
                         {},
                         5.0,

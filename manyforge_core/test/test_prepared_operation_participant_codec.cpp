@@ -244,8 +244,8 @@ struct SealedInputs final {
           {},
           {},
           2.0,
-          *schema.completion_rule,
-          *schema.confirmation_rule,
+          schema.completion_rule,
+          schema.confirmation_rule,
           schema.stop_evidence_requirements};
 }
 
@@ -414,7 +414,7 @@ struct SealedInputs final {
       ResolvedJointGoalDTO{resources, joints, {0.5, -0.5}},
       TolerancesDTO{0.01, 0.01, 0.01},
       SpeedProfileDTO{0.5, 0.5, 0.5},
-      PlanningProfileDTO::kFirstFeasible,
+      PlannerOverrideDTO{},
       std::nullopt,
       {},
       2.0,
@@ -632,7 +632,7 @@ TEST(PreparedOperationParticipantCodecTest,
           made.value(), physical.value(), PreparedParticipantPayloadKindDTO::kMotionExecution)
           .has_value());
 
-  // ur5_pick_and_place: a second role (the UR5 `flange`) on the compiled frame
+  // mock_ur5_pick_and_place: a second role (the UR5 `flange`) on the compiled frame
   // of an existing role (its `tcp`) still contains the Program participant.
   auto shared_value = physical.value().value();
   ASSERT_FALSE(shared_value.frame_bindings.empty());

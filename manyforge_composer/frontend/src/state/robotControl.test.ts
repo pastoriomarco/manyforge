@@ -27,10 +27,10 @@ describe('addressed Robot Control state', () => {
   it('keeps an owner refusal with its message and clears both together', () => {
     const approving = robotControlReducer(readyState(), { type: 'approve_started' });
     expect(approving.phase).toBe('approving');
-    const cause = { code: 'global_interrupt_gated', message: 'gate', details: {}, origin: null };
+    const cause = { code: 'rule_holds', message: 'held', details: {}, origin: null };
     const refused = robotControlReducer(approving, {
       type: 'approve_rejected', generation: approving.generation,
-      error: 'Motion waits: the gate is active.', errorRefusal: cause,
+      error: 'A global interrupt rule holds this scope.', errorRefusal: cause,
     });
     expect(refused.errorRefusal).toEqual(cause);
     const dismissed = robotControlReducer(refused, { type: 'dismiss_error' });
@@ -387,7 +387,6 @@ describe('addressed Robot Control state', () => {
       velocityScale: 0.4, accelerationScale: 0.3, tcpLinearSpeedMps: 0.07,
       tcpAngularSpeedRadS: 0.2, tcpLinearAccelerationMps2: 0.15, tcpAngularAccelerationRadS2: 0.6,
       cartesianTranslationToleranceM: 0.003, cartesianRotationToleranceRad: 0.04,
-      cartesianMaxBlendDeviationRad: 0.02,
       jointLimits: { joint1: { max_velocity_rad_s: 0.5 } },
     } });
     state = robotControlReducer(state, { type: 'edit_motion_settings', update: {
@@ -408,11 +407,15 @@ describe('addressed Robot Control state', () => {
       motionKinds.push(payload.motion.kind);
       expect(payload.tcp_endpoint).toEqual({ kind: 'current' });
       expect(payload).not.toHaveProperty('tcp_frame_role_id');
-      if (mode === 'cartesian_path') expect(payload).toMatchObject({ motion: {
-        max_angular_speed_rad_s: 0.2,
-        max_linear_acceleration_mps2: 0.15, max_angular_acceleration_rad_s2: 0.6,
-        max_blend_deviation_rad: 0.02,
-      }, tolerances: { translation_tol_m: 0.003, rotation_tol_rad: 0.04 } });
+      if (mode === 'cartesian_path') {
+        expect(payload).toMatchObject({ motion: {
+          max_angular_speed_rad_s: 0.2,
+          max_linear_acceleration_mps2: 0.15, max_angular_acceleration_rad_s2: 0.6,
+          // Manual moves keep exact corners and leave timing to the Deployment.
+          blend_radii_m: [0, 0],
+        }, tolerances: { translation_tol_m: 0.003, rotation_tol_rad: 0.04 } });
+        expect(payload.motion).not.toHaveProperty('speed_mode');
+      }
     }
     expect(motionKinds).toEqual(expect.arrayContaining([
       'joint_goal', 'pose_goal', 'cartesian_path',
@@ -454,54 +457,44 @@ describe('addressed Robot Control state', () => {
     let state = robotControlReducer(initialRobotControlState, {
       type: 'status_resolved',
       status,
-      cartesianDefaults: {
-        translationToleranceM: 0.002,
-        maxBlendDeviationRad: 0.015,
-      },
+      cartesianDefaults: { translationToleranceM: 0.002 },
     });
     expect(state.motionSettings.cartesianTranslationToleranceM).toBe(0.002);
-    expect(state.motionSettings.cartesianMaxBlendDeviationRad).toBe(0.015);
     state = robotControlReducer(state, {
       type: 'edit_motion_settings',
-      update: {
-        cartesianTranslationToleranceM: 0.001,
-        cartesianMaxBlendDeviationRad: 0,
-      },
+      update: { cartesianTranslationToleranceM: 0.001 },
     });
     expect(state.motionSettings.cartesianTranslationToleranceM).toBe(0.001);
-    expect(state.motionSettings.cartesianMaxBlendDeviationRad).toBe(0);
   });
 
   it('takes only Applied Cartesian defaults, or manual defaults without a Program', () => {
-    const applied = { translationToleranceM: 0.005, maxBlendDeviationRad: 0.01 };
+    const applied = { translationToleranceM: 0.003 };
     expect(appliedCartesianDefaults(applied)).toEqual(applied);
     // Without an Applied Program the manual defaults stand in for it.
     expect(appliedCartesianDefaults(null))
-      .toEqual({ translationToleranceM: 0.005, maxBlendDeviationRad: 0.01 });
+      .toEqual({ translationToleranceM: 0.005 });
   });
 
   it('keeps manual Cartesian values until the Program default itself changes', () => {
     const status = statusFixture();
-    const defaults = { translationToleranceM: 0.005, maxBlendDeviationRad: 0.01 };
+    const defaults = { translationToleranceM: 0.005 };
     let state = robotControlReducer(initialRobotControlState, {
       type: 'status_resolved', status, cartesianDefaults: defaults,
     });
     // Defaults, not limits: any valid manual value is kept...
     state = robotControlReducer(state, {
       type: 'edit_motion_settings',
-      update: { cartesianTranslationToleranceM: 0.02, cartesianMaxBlendDeviationRad: 0.001 },
+      update: { cartesianTranslationToleranceM: 0.02 },
     });
     // ...including when the same defaults are sent again (after a manual move).
     state = robotControlReducer(state, { type: 'program_cartesian_defaults_changed', defaults });
     expect(state.motionSettings.cartesianTranslationToleranceM).toBe(0.02);
-    expect(state.motionSettings.cartesianMaxBlendDeviationRad).toBe(0.001);
     // A changed Program default (Apply, or a stricter Draft) replaces them.
     state = robotControlReducer(state, {
       type: 'program_cartesian_defaults_changed',
-      defaults: { translationToleranceM: 0.004, maxBlendDeviationRad: 0.01 },
+      defaults: { translationToleranceM: 0.004 },
     });
     expect(state.motionSettings.cartesianTranslationToleranceM).toBe(0.004);
-    expect(state.motionSettings.cartesianMaxBlendDeviationRad).toBe(0.001);
   });
 
   it('does not plan when only settings change at idle, and resets settings with the target owner', () => {

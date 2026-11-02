@@ -214,7 +214,7 @@ class FakeMotionPreview final : public IAddressedMotionPreviewSession {
     request.speed_profile = motion->speed_profile;
     request.timeouts = motion->timeouts;
     request.cache_mode = motion->cache_mode;
-    request.planning_profile = motion->planning_profile;
+    request.planner = motion->planner;
     request.target_mode = motion->target_mode;
     request.target_reference = motion->target_reference;
     request.offset_reference = motion->offset_reference;
@@ -359,7 +359,7 @@ class FakeMotionPreviewOwner final : public IAddressedMotionPreviewOwner {
                                                                 SpeedProfileDTO{},
                                                                 TimeoutsDTO{1.0, 1.0},
                                                                 CacheMode::kDefault,
-                                                                PlanningProfileDTO::kFirstFeasible,
+                                                                PlannerOverrideDTO{},
                                                                 MotionTargetModeDTO::kAbsolute,
                                                                 std::nullopt,
                                                                 std::nullopt,
@@ -711,10 +711,10 @@ class ReplacingPlanningSceneSynchronizer final : public IPlanningSceneSynchroniz
                                    PoseGoalDTO{Pose3DTO{{0.0, 0.0, 0.3}, {}}});
   auto descend = motion_operation(
       "place.descend", "place.descend",
-      CartesianPathDTO{{Pose3DTO{{0.0, 0.0, 0.3}, {}}, Pose3DTO{{0.0, 0.0, 0.2}, {}}}});
+      CartesianPathDTO{.waypoints = {Pose3DTO{{0.0, 0.0, 0.3}, {}}, Pose3DTO{{0.0, 0.0, 0.2}, {}}}});
   auto retreat = motion_operation(
       "place.retreat", "place.retreat",
-      CartesianPathDTO{{Pose3DTO{{0.0, 0.0, 0.2}, {}}, Pose3DTO{{0.0, 0.0, 0.3}, {}}}});
+      CartesianPathDTO{.waypoints = {Pose3DTO{{0.0, 0.0, 0.2}, {}}, Pose3DTO{{0.0, 0.0, 0.3}, {}}}});
   const TargetCarrierSceneFrameRefDTO carrier{ControllableComponentId("component:test"),
                                               CommandTargetId("target:test"),
                                               FrameRoleId("frame-role:tcp")};
@@ -1406,11 +1406,11 @@ TEST(AddressedPickPlacePlanningOwner, NamesAnUnresolvedCarrierFrameWithTheToolTa
                          PoseGoalDTO{Pose3DTO{{0.0, 0.0, 0.3}, {}}}),
         motion_operation(
             "absent-carrier-place.descend", "place.descend",
-            CartesianPathDTO{{Pose3DTO{{0.0, 0.0, 0.3}, {}}, Pose3DTO{{0.0, 0.0, 0.2}, {}}}}),
+            CartesianPathDTO{.waypoints = {Pose3DTO{{0.0, 0.0, 0.3}, {}}, Pose3DTO{{0.0, 0.0, 0.2}, {}}}}),
         tool_operation("absent-carrier-place.tool", 0.04),
         motion_operation(
             "absent-carrier-place.retreat", "place.retreat",
-            CartesianPathDTO{{Pose3DTO{{0.0, 0.0, 0.2}, {}}, Pose3DTO{{0.0, 0.0, 0.3}, {}}}})});
+            CartesianPathDTO{.waypoints = {Pose3DTO{{0.0, 0.0, 0.2}, {}}, Pose3DTO{{0.0, 0.0, 0.3}, {}}}})});
     ASSERT_FALSE(place.ok());
     expect_carrier_named(place.error(), "place_carrier_frame_unresolved");
   }
@@ -1553,10 +1553,10 @@ TEST(AddressedPickPlacePlanningOwner, ResolvesThePublicInversePlaceWithoutCommit
                                    PoseGoalDTO{Pose3DTO{{0.0, 0.0, 0.3}, {}}});
   auto descend = motion_operation(
       "public.place.descend", "place.descend",
-      CartesianPathDTO{{Pose3DTO{{0.0, 0.0, 0.3}, {}}, Pose3DTO{{0.0, 0.0, 0.2}, {}}}});
+      CartesianPathDTO{.waypoints = {Pose3DTO{{0.0, 0.0, 0.3}, {}}, Pose3DTO{{0.0, 0.0, 0.2}, {}}}});
   auto retreat = motion_operation(
       "public.place.retreat", "place.retreat",
-      CartesianPathDTO{{Pose3DTO{{0.0, 0.0, 0.2}, {}}, Pose3DTO{{0.0, 0.0, 0.3}, {}}}});
+      CartesianPathDTO{.waypoints = {Pose3DTO{{0.0, 0.0, 0.2}, {}}, Pose3DTO{{0.0, 0.0, 0.3}, {}}}});
 
   auto result = owner.PlanPlace(PlaceSequencePlanningIntentDTO{
       "public-place-1", SceneResourceId("workpiece"), FrameRoleId("frame-role:tcp"),
@@ -1589,10 +1589,10 @@ TEST(AddressedPickPlacePlanningOwner, AcceptsNewerSameLineageProjectionBeyondCap
                                   PoseGoalDTO{Pose3DTO{{0.0, 0.0, 0.3}, {}}});
   auto descend = motion_operation(
       "floor.place.descend", "place.descend",
-      CartesianPathDTO{{Pose3DTO{{0.0, 0.0, 0.3}, {}}, Pose3DTO{{0.0, 0.0, 0.2}, {}}}});
+      CartesianPathDTO{.waypoints = {Pose3DTO{{0.0, 0.0, 0.3}, {}}, Pose3DTO{{0.0, 0.0, 0.2}, {}}}});
   auto retreat = motion_operation(
       "floor.place.retreat", "place.retreat",
-      CartesianPathDTO{{Pose3DTO{{0.0, 0.0, 0.2}, {}}, Pose3DTO{{0.0, 0.0, 0.3}, {}}}});
+      CartesianPathDTO{.waypoints = {Pose3DTO{{0.0, 0.0, 0.2}, {}}, Pose3DTO{{0.0, 0.0, 0.3}, {}}}});
 
   const auto result = owner.PlanPlace(PlaceSequencePlanningIntentDTO{
       "floor-place-1", SceneResourceId("workpiece"), FrameRoleId("frame-role:tcp"),

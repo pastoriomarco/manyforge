@@ -115,7 +115,7 @@ def test_isaac_start_without_host_or_path_refuses_with_typed_error(tmp_path, cap
     assert result["outcome"] == "failed"
     assert result["error"]["code"] == "operator_configuration_invalid"
     assert flag.removeprefix("--") in result["error"]["message"]
-    assert not (tmp_path / "state" / "native").exists()
+    assert not (tmp_path / "state" / "workbench").exists()
 
 
 def test_remote_native_command_keeps_optional_source_identity_absent(tmp_path: Path):
@@ -123,7 +123,7 @@ def test_remote_native_command_keeps_optional_source_identity_absent(tmp_path: P
 
     command = launcher._remote_native_shell("start")
 
-    assert "--profile native" in command
+    assert "--profile standard" in command
     assert "--simulation-control-config" in command
     assert "--expected-source-fingerprint" not in command
     assert "--expected-head-commit" not in command
@@ -307,7 +307,7 @@ def test_container_ready_reads_owner_facts_and_keeps_exact_birth_identity(tmp_pa
     launcher = IsaacLauncher(_container_config(tmp_path))
     readback = _container_readback(launcher)
     status = launcher._container_status(readback)
-    assert status["state"] == "ready"  # Inactive CCLC peers do not change G readiness.
+    assert status["state"] == "ready"  # Inactive component peers do not change G readiness.
     assert len(status["readiness_observations"]) == 4
     resource = status["owned_resources"][0]
     assert resource["container_id"] == "d" * 64

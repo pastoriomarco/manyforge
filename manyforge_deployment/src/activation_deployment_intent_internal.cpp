@@ -1,6 +1,7 @@
 #include "activation_deployment_intent_internal.hpp"
 
 #include <algorithm>
+#include <map>
 #include <cmath>
 #include <cstddef>
 #include <optional>
@@ -10,6 +11,8 @@
 #include <string_view>
 #include <utility>
 #include <variant>
+
+#include <manyforge_core/types/typed_error.hpp>
 
 namespace manyforge::deployment::detail {
 namespace {
@@ -296,6 +299,20 @@ void require_target_settings(const CanonicalValue &value,
   return portable_identifier(*value, label);
 }
 
+// A component's lifecycle time budget (`configuration.
+// lifecycle_command_timeout_s`, seconds, (0, 3600]); absent means the default.
+void require_lifecycle_budget(const CanonicalValue &configuration,
+                              const std::string &label) {
+  const auto *budget =
+      configuration.find_object_member("lifecycle_command_timeout_s");
+  if (budget == nullptr) return;
+  const auto *seconds = std::get_if<double>(&budget->storage());
+  if (seconds == nullptr || !std::isfinite(*seconds) || !(*seconds > 0.0) ||
+      *seconds > 3600.0)
+    fail(label + ".configuration.lifecycle_command_timeout_s must be a "
+                 "number of seconds above 0 and at most 3600");
+}
+
 } // namespace
 
 ActivationDeploymentIntent parse_activation_deployment_intent(
@@ -332,12 +349,86 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
     if (kind->as_string() == "ai_model") return "ai_model_v0";
     return std::nullopt;
   };
-  const bool has_model_free = std::any_of(
-      components.begin(), components.end(), [&](const auto &component) {
-        return model_free_profile(component).has_value();
-      });
-  if (!has_model_free && components.size() != captured_sources.size())
+  // A sensor (`runtime_kind: sensor`, a `kind: sensor` model) owns no model
+  // source and has no lane.
+  const auto is_sensor = [](const CanonicalValue &component) {
+    const auto *configuration = component.find_object_member("configuration");
+    const auto *kind =
+        configuration ? configuration->find_object_member("runtime_kind")
+                      : nullptr;
+    return kind != nullptr && kind->is_string() && kind->as_string() == "sensor";
+  };
+  // CONTRACTS §16: a member names its owner; an owner is a row with neither
+  // an owner, a model source nor a runtime kind; an I/O member has no model
+  // source.
+  const auto is_member = [](const CanonicalValue &component) {
+    return component.find_object_member("owner") != nullptr;
+  };
+  const auto is_owner = [&](const CanonicalValue &component) {
+    return !is_member(component) &&
+           component.find_object_member("model_source") == nullptr &&
+           !model_free_profile(component).has_value() &&
+           (component.find_object_member("configuration") == nullptr ||
+            component.find_object_member("configuration")
+                    ->find_object_member("runtime_kind") == nullptr);
+  };
+  const auto has_source = [&](const CanonicalValue &component) {
+    return !is_owner(component) && !model_free_profile(component) &&
+           !is_sensor(component) &&
+           (!is_member(component) ||
+            component.find_object_member("model_source") != nullptr);
+  };
+  const auto active = [](const CanonicalValue &component,
+                         std::string_view label) {
+    const auto *flag = component.find_object_member("active");
+    if (flag == nullptr) return true;
+    if (!flag->is_bool()) fail(std::string(label) + ".active must be a boolean");
+    return flag->as_bool();
+  };
+  if (static_cast<std::size_t>(std::count_if(components.begin(), components.end(),
+                                             has_source)) !=
+      captured_sources.size())
     fail("component count differs from the captured source closure");
+  // Owners by id with their `active`; the rows left out (inactive owners and
+  // members) by id.
+  std::map<std::string, bool, std::less<>> owners;
+  for (std::size_t index = 0U; index < components.size(); ++index) {
+    const auto &component = components[index];
+    const std::string label = "components[" + std::to_string(index) + "]";
+    if (!is_owner(component)) continue;
+    owners.emplace(portable_identifier(member(component, "component_id", label),
+                                       label + ".component_id"),
+                   active(component, label));
+  }
+  std::set<std::string, std::less<>> dropped;
+  for (std::size_t index = 0U; index < components.size(); ++index) {
+    const auto &component = components[index];
+    const std::string label = "components[" + std::to_string(index) + "]";
+    const auto &component_id = portable_identifier(
+        member(component, "component_id", label), label + ".component_id");
+    if (!is_member(component)) {
+      if (is_owner(component) && !owners.at(component_id))
+        dropped.insert(component_id);
+      continue;
+    }
+    const auto &owner = portable_identifier(member(component, "owner", label),
+                                            label + ".owner");
+    const auto found = owners.find(owner);
+    if (found == owners.end())
+      throw core::TypedError(
+          "deployment_member_owner_missing",
+          "Deployment intent deployment_member_owner_missing: " + component_id +
+              " names owner " + owner + ", which isn't a machine of this "
+              "Deployment");
+    const bool member_active = active(component, label);
+    if (member_active && !found->second)
+      throw core::TypedError(
+          "deployment_member_owner_inactive",
+          "Deployment intent deployment_member_owner_inactive: " +
+              component_id + " is active but its owner " + owner +
+              " is deactivated");
+    if (!member_active) dropped.insert(component_id);
+  }
   const auto &attachments =
       array(member(value, "attachments", "root"), "attachments");
   if (attachments.size() > kMaximumAttachments) {
@@ -350,10 +441,30 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
   for (std::size_t index = 0U; index < attachments.size(); ++index) {
     const auto &attachment = attachments[index];
     const std::string label = "attachments[" + std::to_string(index) + "]";
-    require_fields(attachment, {"child", "parent"}, {"pose", "primary"}, label);
+    require_fields(attachment, {"child", "parent"},
+                   {"collision_exclusions", "pose", "primary"}, label);
     if (const auto *primary = attachment.find_object_member("primary");
         primary != nullptr && !primary->is_bool())
       fail(label + ".primary must be a boolean");
+    if (const auto *exclusions =
+            attachment.find_object_member("collision_exclusions");
+        exclusions != nullptr) {
+      const std::string exclusions_label = label + ".collision_exclusions";
+      const auto &pairs = array(*exclusions, exclusions_label);
+      std::set<std::pair<std::string, std::string>> seen;
+      for (std::size_t pair_index = 0U; pair_index < pairs.size(); ++pair_index) {
+        const auto &pair = pairs[pair_index];
+        const std::string pair_label =
+            exclusions_label + "[" + std::to_string(pair_index) + "]";
+        require_fields(pair, {"child_link", "parent_link"}, {}, pair_label);
+        if (!seen.emplace(text(member(pair, "child_link", pair_label),
+                               pair_label + ".child_link"),
+                          text(member(pair, "parent_link", pair_label),
+                               pair_label + ".parent_link"))
+                 .second)
+          fail(exclusions_label + " repeats a pair");
+      }
+    }
     for (const std::string_view end : {"parent", "child"}) {
       const std::string end_label = label + "." + std::string(end);
       const auto &endpoint = member(attachment, end, label);
@@ -374,6 +485,7 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
   }
 
   std::vector<ActivationDeploymentComponent> parsed_components;
+  std::vector<ActivationInactiveMember> inactive_members;
   parsed_components.reserve(components.size());
   std::set<std::string, std::less<>> component_ids;
   std::string previous_component_id;
@@ -385,7 +497,38 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
     const auto *authored_id = component.find_object_member("component_id");
     const bool mounted = authored_id != nullptr && authored_id->is_string() &&
                          mounted_components.contains(authored_id->as_string());
-    if (required_model_free_profile)
+    const bool member_row = is_member(component);
+    const bool owner_row = is_owner(component);
+    const bool io_member = member_row && !has_source(component);
+    const bool sensor_row = !member_row && is_sensor(component);
+    if (sensor_row)
+      require_fields(component,
+                     {"component_id", "component_profile_id", "configuration",
+                      "target_settings"},
+                     {}, label);
+    else if (owner_row)
+      require_fields(component,
+                     {"component_id", "component_profile_id", "configuration",
+                      "lane"},
+                     {"active"}, label);
+    else if (io_member)
+      require_fields(component,
+                     {"component_id", "component_profile_id", "owner", "role"},
+                     {"active"}, label);
+    else if (member_row && mounted)
+      require_fields(component,
+                     {"component_id", "component_profile_id", "configuration",
+                      "model_source", "owner", "role", "target_settings"},
+                     {"active", "custom_tcps", "default_tcp", "frame_prefix"},
+                     label);
+    else if (member_row)
+      require_fields(component,
+                     {"component_id", "component_profile_id", "configuration",
+                      "model_source", "owner", "role", "root_pose_in_cell",
+                      "target_settings"},
+                     {"active", "custom_tcps", "default_tcp", "frame_prefix"},
+                     label);
+    else if (required_model_free_profile)
       require_fields(component,
                      {"component_id", "component_profile_id", "configuration",
                       "target_settings"},
@@ -394,12 +537,12 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
       require_fields(component,
                      {"component_id", "component_profile_id", "configuration",
                       "model_source", "target_settings"},
-                     {"custom_tcps", "default_tcp", "frame_prefix"}, label);
+                     {"custom_tcps", "default_tcp", "frame_prefix", "lane"}, label);
     else
       require_fields(component,
                      {"component_id", "component_profile_id", "configuration",
                       "model_source", "root_pose_in_cell", "target_settings"},
-                     {"custom_tcps", "default_tcp", "frame_prefix"}, label);
+                     {"custom_tcps", "default_tcp", "frame_prefix", "lane"}, label);
     const auto &component_id = portable_identifier(
         member(component, "component_id", label), label + ".component_id");
     const auto &profile_id = portable_identifier(
@@ -410,26 +553,83 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
       fail("components are not uniquely canonical-sorted");
     }
     previous_component_id = component_id;
+    std::optional<std::string> owner;
+    std::optional<std::string> role;
+    if (member_row) {
+      owner = portable_identifier(member(component, "owner", label),
+                                  label + ".owner");
+      role = portable_identifier(member(component, "role", label),
+                                 label + ".role");
+    }
+    if (dropped.contains(component_id)) {
+      // Left out of the compiled cell; its captured source is consumed (a
+      // physical member keeps its description for its owner's process).
+      std::optional<std::string> description;
+      if (!io_member && !owner_row) {
+        if (captured_index == captured_sources.size() ||
+            captured_sources[captured_index].component_id != component_id)
+          fail("component identities differ from the captured source closure");
+        description = std::move(captured_sources[captured_index++].urdf.bytes);
+      }
+      if (member_row)
+        inactive_members.push_back(
+            {component_id, profile_id, *owner, *role, std::move(description)});
+      continue;
+    }
+    if (owner_row || io_member) {
+      // An owner's configuration holds only its site address reference; an
+      // I/O member has none (its signals come from its model).
+      CanonicalValue configuration(Object{});
+      if (owner_row) {
+        configuration = member(component, "configuration", label);
+        require_fields(configuration, {}, {"device_address_ref"},
+                       label + ".configuration");
+        if (const auto *ref = configuration.find_object_member("device_address_ref"))
+          static_cast<void>(portable_identifier(
+              *ref, label + ".configuration.device_address_ref"));
+      }
+      parsed_components.push_back(
+          {component_id, profile_id, std::nullopt, CanonicalValue(Object{}),
+           std::move(configuration), std::nullopt, std::string{}, {},
+           std::nullopt,
+           owner_row ? std::optional<std::string>(portable_identifier(
+                           member(component, "lane", label), label + ".lane"))
+                     : std::nullopt,
+           owner, role});
+      continue;
+    }
+    if (sensor_row) {
+      // Its settings are checked against its model when it is compiled.
+      const auto &configuration = member(component, "configuration", label);
+      require_fields(configuration, {"runtime_kind", "runtime_configuration"},
+                     {"lifecycle_command_timeout_s"}, label + ".configuration");
+      require_lifecycle_budget(configuration, label);
+      static_cast<void>(object(member(configuration, "runtime_configuration",
+                                      label + ".configuration"),
+                               label + ".configuration.runtime_configuration"));
+      if (!object(member(component, "target_settings", label),
+                  label + ".target_settings")
+               .empty())
+        fail(label + " is a sensor and requires empty target_settings");
+      parsed_components.push_back(
+          {component_id, profile_id, std::nullopt, CanonicalValue(Object{}),
+           configuration, std::nullopt, std::string{}, {}, std::nullopt,
+           std::nullopt, std::nullopt, std::nullopt});
+      continue;
+    }
     const auto &target_settings = member(component, "target_settings", label);
     const auto &configuration = member(component, "configuration", label);
     require_target_settings(target_settings, label + ".target_settings");
     static_cast<void>(object(configuration, label + ".configuration"));
     std::optional<CapturedComponentModelSource> captured;
     std::optional<CanonicalValue> pose;
-    // The component's lifecycle time budget (seconds, (0, 3600]); an I/O
-    // device keeps its own in runtime_configuration.io_provider_devices.
-    if (const auto *budget =
-            configuration.find_object_member("lifecycle_command_timeout_s");
-        budget != nullptr) {
-      const auto *seconds = std::get_if<double>(&budget->storage());
-      if (required_model_free_profile == std::string_view("io_device_v0"))
-        fail(label + ".configuration.lifecycle_command_timeout_s: an I/O "
-                     "device sets it in runtime_configuration.io_provider_devices");
-      if (seconds == nullptr || !std::isfinite(*seconds) || !(*seconds > 0.0) ||
-          *seconds > 3600.0)
-        fail(label + ".configuration.lifecycle_command_timeout_s must be a "
-                     "number of seconds above 0 and at most 3600");
-    }
+    // An I/O device keeps its lifecycle time budget in
+    // runtime_configuration.io_provider_devices.
+    if (required_model_free_profile == std::string_view("io_device_v0") &&
+        configuration.find_object_member("lifecycle_command_timeout_s") != nullptr)
+      fail(label + ".configuration.lifecycle_command_timeout_s: an I/O "
+                   "device sets it in runtime_configuration.io_provider_devices");
+    require_lifecycle_budget(configuration, label);
     if (required_model_free_profile) {
       require_fields(configuration, {"runtime_kind", "runtime_configuration"},
                      {"lifecycle_command_timeout_s"}, label + ".configuration");
@@ -464,7 +664,39 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
          custom_tcps(component.find_object_member("custom_tcps"),
                      label + ".custom_tcps"),
          default_tcp(component.find_object_member("default_tcp"),
-                     label + ".default_tcp")});
+                     label + ".default_tcp"),
+         optional_portable_identifier(component.find_object_member("lane"),
+                                      label + ".lane"),
+         owner, role});
+  }
+  // An active component (or a policy) using a signal of a left-out member.
+  if (!dropped.empty()) {
+    const auto signal_of_dropped = [&](const auto &self,
+                                       const CanonicalValue &node) -> void {
+      if (const auto *rows = std::get_if<Array>(&node.storage())) {
+        for (const auto &row : *rows) self(self, row);
+        return;
+      }
+      const auto *fields = std::get_if<Object>(&node.storage());
+      if (fields == nullptr) return;
+      const auto *owner = node.find_object_member("controllable_component_id");
+      if (owner != nullptr && owner->is_string() &&
+          node.find_object_member("signal_name") != nullptr &&
+          dropped.contains(owner->as_string()))
+        throw core::TypedError(
+            "deployment_signal_member_inactive",
+            "Deployment intent deployment_signal_member_inactive: " +
+                owner->as_string() + "/" +
+                node.find_object_member("signal_name")->as_string() +
+                " belongs to a deactivated member");
+      for (const auto &[name, child] : *fields) {
+        static_cast<void>(name);
+        self(self, child);
+      }
+    };
+    for (const auto &parsed : parsed_components)
+      signal_of_dropped(signal_of_dropped, parsed.configuration);
+    signal_of_dropped(signal_of_dropped, member(value, "policies", "root"));
   }
 
   if (captured_index != captured_sources.size())
@@ -506,6 +738,7 @@ ActivationDeploymentIntent parse_activation_deployment_intent(
       std::move(parsed_components),
       value,
       std::move(assistant_model_components),
+      std::move(inactive_members),
   };
 }
 

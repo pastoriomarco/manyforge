@@ -13,7 +13,7 @@
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_deployment/runtime_contract_capability_declarations.hpp>
 
-#include "native_execution_runtime_unit_internal.hpp"
+#include "execution_host_unit_internal.hpp"
 #include "reference_runtime_unit_internal.hpp"
 #include "ros2_control_execution_runtime_unit_internal.hpp"
 #include "verified_retained_bundle_internal.hpp"

@@ -1,7 +1,0 @@
-{
-  "api_version": "manyforge.capability_definition.v1",
-  "capability_definition_revision": "sha256:14c53dad299a42d6604eac14240d015e22a4bc1adb363fb252111e62a2d2ad90",
-  "capability_id": "planning.profile.balanced",
-  "provider_binding_kind": "capability_provider_binding",
-  "scope": "target_binding"
-}

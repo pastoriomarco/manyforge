@@ -2,6 +2,7 @@
 
 #include <manyforge_component_manager/manager_apply_journal.hpp>
 #include <manyforge_core/ports/imanager_kernel_apply_fence_port.hpp>
+#include <manyforge_deployment/component_spec.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <mutex>
 #include <optional>
@@ -99,8 +100,6 @@ struct ManagerApplyFenceExpectationDTO final {
   std::vector<manyforge::core::DomainActiveControlConfigurationDTO>
       expected_active_control_configurations;
   std::optional<manyforge::core::ConfigurationFenceScopeDTO> actual_scope{};
-  std::vector<manyforge::core::ProviderConfigurationFenceLineageDTO>
-      expected_provider_lineages{};
 };
 
 /// Bounded durable pre-effect coordinator for one named Apply fence.
@@ -124,7 +123,8 @@ public:
       SqliteManagerApplyJournal &apply_journal,
       manyforge::core::IManagerKernelApplyFencePort
           &kernel_fence,
-      manyforge::core::RuntimeEpoch manager_runtime_epoch);
+      manyforge::core::RuntimeEpoch manager_runtime_epoch,
+      manyforge::deployment::SiteFacts site_facts = {});
 
   [[nodiscard]] ManagerApplyFenceAcquireResult AcquireOrRecoverFence(
       const ManagerApplyIntentDTO &apply_intent,
@@ -140,6 +140,8 @@ private:
   SqliteManagerApplyJournal &apply_journal_;
   manyforge::core::IManagerKernelApplyFencePort &kernel_fence_;
   manyforge::core::RuntimeEpoch manager_runtime_epoch_;
+  /// This machine's site facts: every component spec is derived with them.
+  manyforge::deployment::SiteFacts site_facts_;
   std::mutex operation_mutex_;
 };
 

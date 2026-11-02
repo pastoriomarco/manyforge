@@ -218,7 +218,6 @@ def _attention_projection(generation: int = 4) -> dict[str, Any]:
             {
                 "activation_id": "activation.1",
                 "condition_id": "condition.1",
-                "gate": "acknowledgement",
                 "record_revision": 1,
                 "subject": {
                     "resource_ids": ["robot.joint_1"],

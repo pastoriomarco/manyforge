@@ -13,12 +13,12 @@ describe('global rule status', () => {
     expect(parseGlobalRuleStatus([
       { rule_id: 'a', state: 'clear', keys: [] },
       { rule_id: 'b', state: 'tripped', keys: [] },
-      { rule_id: 'c', state: 'latched', keys: [] },
+      { rule_id: 'c', state: 'inactive', keys: [] },
       { rule_id: 'd', state: 'unknown', keys: [],
         unavailable_reason: { code: 'motion_interrupt_arm_failed', message: 'watch unavailable', details: { source: 'door' } } },
       { rule_id: 'e', state: 'pending', keys: [] },
       { rule_id: 'f', state: 'waiting_for_program', keys: ['part_ready'] },
-    ])?.map((rule) => rule.state)).toEqual(['clear', 'tripped', 'latched', 'unknown', 'pending', 'waiting_for_program']);
+    ])?.map((rule) => rule.state)).toEqual(['clear', 'tripped', 'inactive', 'unknown', 'pending', 'waiting_for_program']);
     expect(parseGlobalRuleStatus([
       { rule_id: 'd', state: 'unknown', keys: [],
         unavailable_reason: { code: 'motion_interrupt_arm_failed', message: 'watch unavailable', details: { source: 'door' } } },
@@ -48,6 +48,7 @@ describe('global rule status', () => {
     [[{ rule_id: 'a', state: 'clear', keys: [] }, { rule_id: 'a', state: 'clear', keys: [] }]],
     [[{ rule_id: 'a', state: 'waiting_for_program', keys: [] }]],
     [[{ rule_id: 'a', state: 'clear', keys: ['k'] }]],
+    [[{ rule_id: 'a', state: 'latched', keys: [] }]],
   ])('refuses a malformed list %#', (value) => {
     expect(() => parseGlobalRuleStatus(value)).toThrow();
   });
@@ -58,7 +59,7 @@ describe('global rule status', () => {
       unavailableReason: { code: 'motion_interrupt_arm_failed', message: 'watch unavailable', details: { source: 'door' } },
     };
     expect(globalRuleStateText(unknown))
-      .toBe("can't watch (motion blocked)");
+      .toBe("can't watch (its scope is held)");
     expect(globalRuleUnavailableText(unknown))
       .toBe("Interrupt rule a can't watch its signals: Signal interrupt not armed");
     expect(globalRuleUnavailableText({ ruleId: 'a', state: 'pending', keys: [] })).toBeNull();

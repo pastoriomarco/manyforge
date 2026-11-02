@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 import json
+from tempfile import TemporaryDirectory
 import hashlib
 import os
 from pathlib import Path
@@ -638,9 +639,9 @@ def _assistant_stack(
     metadata_environment: str = "MANYFORGE_ASSISTANT_NATIVE_METADATA",
     package_environment: str = "MANYFORGE_ASSISTANT_NATIVE_PACKAGE_ROOT",
     startup_scenario: str | None = None,
-    cell_id: str = "i6_lite6_arm_gripper_aggregate_cell",
 ) -> Iterator[ProcessStack]:
     selected_package_root = package_root or _required_path(package_environment)
+    cell_id = json.loads(_required_path(metadata_environment).read_text("utf-8"))["cell_id"]
     retained_programs = sorted((selected_package_root / "programs" / "sha256").glob("*.json"))
     assert len(retained_programs) == 1
     stack = ProcessStack(
@@ -791,41 +792,24 @@ def _matching_composer_snapshot(next_snapshot: Callable[[], dict], draft: dict) 
     raise RuntimeError("Composer did not publish the exact current Draft snapshot")
 
 
-def _matching_assistant_context(
-    stack: ProcessStack, composer: HeadlessHttpClient
-) -> tuple[dict, dict]:
-    selection_fields = (
-        "selection_projection_generation",
-        "selection_source_content_digest",
-        "selection_source_generation",
-        "selection_source_owner_epoch",
-        "selection_source_owner_id",
-    )
+def _matching_assistant_context(stack: ProcessStack) -> tuple[dict, dict]:
+    # One context read projects node environment, source model and assistant
+    # mode from one runtime snapshot, as Composer reads it for callbacks.
     deadline = time.monotonic() + 8.0
     while time.monotonic() < deadline:
         with HeadlessHttpClient(stack.base_url) as headless:
-            source_context = headless.source_model_context()
-        try:
-            assistant_mode = composer.assistant_mode("composer-assistant")
-        except HeadlessClientError as error:
-            if error.code not in {
-                "assistant_mode_projection_invalid",
-                "assistant_mode_projection_unavailable",
-                "node_environment_projection_invalid",
-            }:
-                raise
-            time.sleep(0.01)
-            continue
-        node_source = source_context["node_environment"]["source"]
-        model_source = source_context["source_model"]["source"]
-        assistant_source = assistant_mode["source"]
-        if all(
-            model_source[field] == node_source[field]
-            and assistant_source[field] == node_source[field]
-            for field in selection_fields
-        ):
-            return source_context, assistant_mode
-        time.sleep(0.01)
+            try:
+                context = headless.assistant_mode_context("composer-assistant")
+            except HeadlessClientError as error:
+                if error.code not in {
+                    "assistant_mode_projection_invalid",
+                    "assistant_mode_projection_unavailable",
+                    "node_environment_projection_invalid",
+                }:
+                    raise
+                time.sleep(0.01)
+                continue
+        return context, context["assistant_mode"]
     raise RuntimeError("Headless did not publish a coherent assistant context")
 
 
@@ -964,7 +948,7 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
             HeadlessHttpClient(stack.composer_url) as composer,
             HeadlessHttpClient(stack.base_url) as headless,
         ):
-            source_context, assistant_mode = _matching_assistant_context(stack, composer)
+            source_context, assistant_mode = _matching_assistant_context(stack)
             node_environment = source_context["node_environment"]
             source_model = source_context["source_model"]
             draft = composer.request("GET", "/api/program/draft")
@@ -975,10 +959,14 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
             active_bundle = stack.fixture_metadata["physical_candidate_retained_bundle_id"]
             active_graph = stack.fixture_metadata["physical_graph_revision"]
 
+            # The UR10e + Robotiq 2F-140 example cell: one model per physical
+            # component; the assistant's AI model has its model-free endpoint.
             assert {row["model_instance_id"] for row in source_model["occurrences"]} == {
-                "lite6_fixture_instance"
+                "ur10e_robot.model", "robotiq_2f_140.model"
             }
-            assert {row["component_id"] for row in source_model["targets"]} == {"lite6_arm"}
+            assert {row["component_id"] for row in source_model["targets"]} == {
+                "ur10e_robot", "robotiq_2f_140", "assistant_model"
+            }
             assert node_environment["retained_bundle_id"] == active_bundle
             assert node_environment["graph_revision"] == active_graph
             assert source_model["retained_bundle_id"] == active_bundle
@@ -987,15 +975,16 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
             assert assistant_mode["graph_revision"] == active_graph
             assert manager_before["active"]["retained_bundle_id"] == active_bundle
             assert manager_before["active"]["graph_revision"] == active_graph
-            assert {row["tool_id"] for row in assistant_mode["tools"]} == {
-                "program_read",
-                "scene_draft_add_object",
+            # The example's `assistant_scene_authoring` profile: this test uses
+            # these two of its tools.
+            assert {"program_read", "scene_draft_add_object"} <= {
+                row["tool_id"] for row in assistant_mode["tools"]
             }
 
             # A refreshed owner projection or admission generation changes the
             # exact payload, so every new attempt needs a new idempotency key.
             for attempt in range(8):
-                source_context, assistant_mode = _matching_assistant_context(stack, composer)
+                source_context, assistant_mode = _matching_assistant_context(stack)
                 node_environment = source_context["node_environment"]
                 source_model = source_context["source_model"]
                 accepted_body = _assistant_callback_body(
@@ -1048,7 +1037,7 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
                 row["scene_resource_id"] for row in after_accepted["program"]["scene"]
             }
             for attempt in range(8):
-                stale_context, stale_mode = _matching_assistant_context(stack, composer)
+                stale_context, stale_mode = _matching_assistant_context(stack)
                 stale_identity = _assistant_callback_body(
                     draft=after_accepted,
                     workspace=composer.request("GET", "/api/program/workspace")["authoringWorkspace"],
@@ -1082,7 +1071,7 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
             assert stale.value.code == "assistant_callback_context_stale"
 
             for attempt in range(8):
-                invalid_context, invalid_mode = _matching_assistant_context(stack, composer)
+                invalid_context, invalid_mode = _matching_assistant_context(stack)
                 invalid_edit = _assistant_callback_body(
                     draft=after_accepted,
                     workspace=composer.request("GET", "/api/program/workspace")["authoringWorkspace"],
@@ -1125,7 +1114,7 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
             callback_latencies_s: list[float] = []
             for index in range(12):
                 for attempt in range(8):
-                    read_context, read_mode = _matching_assistant_context(stack, composer)
+                    read_context, read_mode = _matching_assistant_context(stack)
                     program_read = next(
                         row for row in read_mode["tools"] if row["tool_id"] == "program_read"
                     )
@@ -1182,7 +1171,7 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
             assert replacement_draft["draft_id"] != after_accepted["draft_id"]
             assert "assistant_workpiece" not in {
                 row["scene_resource_id"]
-                for row in replacement_draft["program"]["scene"]
+                for row in replacement_draft["program"].get("scene", [])
             }
 
             def invoke(body: dict) -> tuple[str, str]:
@@ -1197,7 +1186,7 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
                 except HeadlessClientError as error:
                     return ("rejected", error.code)
 
-            replacement_context, replacement_mode = _matching_assistant_context(stack, replacement)
+            replacement_context, replacement_mode = _matching_assistant_context(stack)
             concurrent_generation = _current_authoring_generation(headless)
             concurrent_bodies = [
                 _assistant_callback_body(
@@ -1240,7 +1229,7 @@ def test_real_assistant_callback_uses_headless_source_facts_and_only_edits_draft
             final_draft = composer.request("GET", "/api/program/draft")
             concurrent_ids = {
                 row["scene_resource_id"]
-                for row in final_draft["program"]["scene"]
+                for row in final_draft["program"].get("scene", [])
                 if row["scene_resource_id"].startswith("concurrent_object_")
             }
             assert len(concurrent_ids) == accepted_count
@@ -1412,34 +1401,6 @@ def test_manager_api_cli_and_replacements_preserve_headless_owners(
         assert cli_payloads["node-environment"]["environment_digest"] == (
             environment["environment_digest"]
         )
-        apply_command = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "manyforge_headless_api",
-                "apply",
-                "candidate",
-                "sha256:" + "a" * 64,
-                "current-graph",
-                "current-bundle",
-                "sha256:" + "e" * 64,
-                "sha256:" + "9" * 64,
-                "sha256:" + "f" * 64,
-                "--request-id",
-                "request.cli.1",
-                "--request-owner-epoch",
-                first_epoch,
-                "--url",
-                stack.base_url,
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=5,
-            env=os.environ.copy(),
-        )
-        assert apply_command.returncode == 69
-        assert "execution_owner_unavailable" in apply_command.stderr
 
         stack.kill_manager()
         stale_runtime = stack.wait_complete(False, unavailable_section="manager")
@@ -1479,13 +1440,12 @@ def test_manager_robotiq_position_cell_has_no_motion_target_and_refuses_disabled
     import math
     import sqlite3
 
-    from manyforge_headless_api.cclc import CCLCOpenRequestClient
     from manyforge_headless_api.cell_admission import CellAdmissionClient
     from manyforge_headless_api.execution import ExecutionCommandClient
     from manyforge_headless_api.models import OperationIntentRequest, StopIntentRequest
-    from manyforge_roboplan.test.test_native_execution_path import (
+    from manyforge_headless_api.process_tests.test_managed_execution_path import (
         TERMINAL_STATES, _direct_control_gripper_operation,
-        _status_target, _status_observation, _submit_native_cclc_lifecycle,
+        _status_target, _status_observation,
     )
 
     package = _required_path("MANYFORGE_ROBOTIQ_POSITION_PACKAGE_ROOT")
@@ -1515,10 +1475,16 @@ def test_manager_robotiq_position_cell_has_no_motion_target_and_refuses_disabled
     assert expected_domain_ids == sorted(row["control_domain_id"] for row in graph["control_domains"])
     assert len(graph["runtime_units"]) == 1
     configuration = graph["runtime_units"][0]["configuration"]
-    assert configuration["controller_profiles"] == [{
-        "controllable_component_id": component_id, "frame_prefix": "",
-        "mock_profile": "ur5e_robotiq_2f_85",
-    }]
+    # The model's `lanes.mock` row travels verbatim as `lane_row`; the tool's
+    # launched description and gripper joint are compiled into the row.
+    [controller_profile] = configuration["controller_profiles"]
+    assert "<robot" in controller_profile["description"]
+    assert controller_profile["gripper_joint_name"]
+    assert {key: value for key, value in controller_profile.items()
+            if key not in {"lane_row", "description", "gripper_joint_name"}} == {
+        "controllable_component_id": component_id, "frame_prefix": "", "lane": "mock",
+        "model_family_id": controller_profile["model_family_id"],
+    }
     assert configuration["initial_joint_positions_rad"] == []
     assert configuration["motion_target_limits"] == []
     assert len(configuration["gripper_target_configurations"]) == 1
@@ -1527,11 +1493,11 @@ def test_manager_robotiq_position_cell_has_no_motion_target_and_refuses_disabled
     assert authored_target["command_target_id"] == command_binding["command_target_id"]
     assert authored_target["actuation_kind"] == "position_commanded"
     assert authored_target["output_mode"] == "commanded"
-    assert [(row["stream_id"], row["budget_ns"], row["severity"], row["recovery"])
+    assert [(row["stream_id"], row["budget_ns"])
             for row in configuration["component_streams"]
             if row["controllable_component_id"] == component_id] == [
-        ("gripper_feedback", 1000000000, "fault", "ack"),
-        ("measured_joints", 1000000000, "fault", "ack"),
+        ("gripper_feedback", 1000000000),
+        ("measured_joints", 250000000),
     ]
 
     def position_target(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -1741,23 +1707,26 @@ def test_manager_robotiq_position_cell_has_no_motion_target_and_refuses_disabled
         assert CellAdmissionClient(run_root).get()["authoring_allowed"] is True
         return projection
 
-    def lifecycle(intent_kind: str, request_id: str) -> dict[str, Any]:
-        if intent_kind in {"prepare", "enable"}:
-            deadline = time.monotonic() + 10.0
-            while True:
-                current = CCLCOpenRequestClient(run_root).component_snapshot(component_id)
-                assert current["retained_bundle_id"] == metadata["physical_candidate_retained_bundle_id"]
-                assert current["graph_revision"] == metadata["physical_graph_revision"]
-                assert sorted(row["control_domain_id"] for row in current["domains"]) == expected_domain_ids
-                readiness = current["readiness"]
-                if readiness["next_intent"] == intent_kind and readiness["ready"] is True:
-                    break
-                assert time.monotonic() < deadline, current
-                time.sleep(0.01)
-        return _submit_native_cclc_lifecycle(
-            run_root, intent_kind=intent_kind, request_id=request_id,
-            component_id=component_id,
-        )
+    def component_state() -> dict[str, Any]:
+        model = ExecutionCommandClient(run_root).component_model()
+        (state,) = [row for row in model["component_states"]
+                    if row["component_id"] == component_id]
+        return state
+
+    def lifecycle(action: str, _request_id: str) -> dict[str, Any]:
+        """One component action (CONTRACTS §2); its result is `last_action`."""
+        previous = component_state().get("last_action")
+        accepted = ExecutionCommandClient(run_root).component_action(component_id, action)
+        assert accepted["ok"] is True, accepted
+        deadline = time.monotonic() + 10.0
+        while True:
+            current = component_state()
+            last = current.get("last_action")
+            if "action" not in current and last is not None and last != previous:
+                assert last["action"] == action and last["outcome"] == "succeeded", current
+                return current
+            assert time.monotonic() < deadline, current
+            time.sleep(0.01)
 
     # Reuse the existing Manager fixture's private preview/public Apply,
     # Program Runner liveness, immutable artifacts and normal ProcessStack owner.
@@ -1768,7 +1737,7 @@ def test_manager_robotiq_position_cell_has_no_motion_target_and_refuses_disabled
                 owner_root, package_root=package,
                 metadata_environment="MANYFORGE_ROBOTIQ_POSITION_METADATA",
                 package_environment="MANYFORGE_ROBOTIQ_POSITION_PACKAGE_ROOT",
-                startup_scenario="program_apply_fixture", cell_id=metadata["cell_id"],
+                startup_scenario="program_apply_fixture",
             ) as stack:
                 assert stack.fixture_metadata is not None
                 assert all(stack.fixture_metadata[key] == value for key, value in metadata.items())
@@ -1875,7 +1844,6 @@ def test_manager_robotiq_position_cell_has_no_motion_target_and_refuses_disabled
                 assert terminal["result"] == "succeeded_nominal"
                 assert terminal["escalated"] is False
                 assert terminal["hard_stop_floor_used"] is False
-                assert stop_action["fault"] is None
                 stop_operation_id = started["accepted"]["operation_id"]
                 settled = completed_and_retired(stop_operation_id, {"stopped", "completed"})
                 matching_stages = [stage for stage in terminal["executed_stages"]
@@ -1910,7 +1878,7 @@ def test_manager_robotiq_position_cell_has_no_motion_target_and_refuses_disabled
                 disabled = lifecycle(
                     "disable", "gripper-only.disable",
                 )
-                assert disabled["current_state"] == "disabled", disabled
+                assert disabled["lifecycle"] == "prepared", disabled
                 after = client.diagnostics()["status"]
                 target = position_target(after)
                 operations_before_refusal = after["control_state"]["manual_operations"]
@@ -1924,14 +1892,11 @@ def test_manager_robotiq_position_cell_has_no_motion_target_and_refuses_disabled
                 )
                 assert refused["ok"] is False, refused
                 assert refused["error"]["details"]["reason"] == (
-                    "component_command_not_eligible"
+                    "component_not_enabled"
                 ), refused
                 assert client.diagnostics()["status"]["control_state"][
                     "manual_operations"
                 ] == operations_before_refusal
-                lifecycle(
-                    "prepare", "gripper-only.prepare-again",
-                )
                 lifecycle(
                     "enable", "gripper-only.enable-again",
                 )
@@ -1970,14 +1935,16 @@ def test_logical_zero_component_scenario_applies_and_runs_without_robot_launch(
     authoring.update({
         "program_id": "logical_process_program",
         "name": "Logical process Program",
+        # A Scenario's Program states its assistant disposition.
+        "compatibility": {"assistant": "forbidden"},
         "forest": [{"node_id": "timer", "instance_id": "logical.wait",
                     "parameters": {"duration_s": 0.05}, "children": []}],
     })
     scenario_id = "logical_process_scenario"
-    scenario = tmp_path / "logical.scenario"
+    scenario = tmp_path / f"{scenario_id}.scenario"
     save_scenario_artifact(
         build_scenario_document(
-            scenario_id=scenario_id, name="Logical process Scenario", description="",
+            scenario_id=scenario_id, name=scenario_id, description="",
             program_draft=authoring,
             deployment_draft={
                 "api_version": "manyforge.deployment_intent.v2",
@@ -1990,7 +1957,10 @@ def test_logical_zero_component_scenario_applies_and_runs_without_robot_launch(
         ),
         str(scenario), allowed_roots=[str(tmp_path)], overwrite=False,
     )
-    stack_root = tmp_path / "stack"
+    # POSIX socket paths are bounded: pytest's tmp_path is too long for the
+    # stack's sockets, so the stack root is short.
+    short_root = TemporaryDirectory(prefix="mf-logical-")
+    stack_root = Path(short_root.name) / "stack"
     stack_root.mkdir()
     metadata = json.loads(_required_path("MANYFORGE_MANAGER_APPLY_METADATA").read_text("utf-8"))
     stack = ProcessStack(
@@ -2009,53 +1979,18 @@ def test_logical_zero_component_scenario_applies_and_runs_without_robot_launch(
         stack.start_composer()
         stack.wait_composer()
         with (
-            _composer_snapshot_stream(stack, client_id="logical-process") as snapshots,
             HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as composer,
             HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless,
         ):
-            for attempt in range(8):
-                draft = composer.request("GET", "/api/program/draft")
-                snapshot = _matching_composer_snapshot(snapshots, draft)
-                deployment = composer.request("GET", "/api/deployment/workspace")
-                try:
-                    loaded = composer.request("POST", "/api/scenario-documents/load", body={
-                        **_composer_fence(snapshot, request_id=f"logical.load.{attempt}"),
-                        "deploymentDraftId": deployment["draft"]["id"],
-                        "expectedDeploymentDraftRevision": deployment["draft"]["revision"],
-                        "path": str(scenario), "confirmDiscard": False,
-                    })
-                    break
-                except HeadlessClientError as error:
-                    if error.code not in {"authoring_not_ready", "stale_generation"} or attempt == 7:
-                        raise
-            assert loaded["status"] == "accepted", loaded
-            activation = loaded["activation"]
-            deadline = time.monotonic() + 30.0
-            while True:
-                status = headless.manager_apply_status(
-                    activation["apply_id"], activation["apply_generation"]
-                )
-                if status["state"] != "pending":
-                    assert status["state"] == "succeeded" and status["ok"] is True, status
-                    break
-                assert time.monotonic() < deadline, status
-                time.sleep(0.01)
-            # Wait only for the exact successful public selection. No failed
-            # Apply or unrelated owner error becomes a retry or a fake success.
-            while True:
-                try:
-                    applied = composer.program_applied()
-                    if applied["scenario_id"] == scenario_id:
-                        break
-                except HeadlessClientError as error:
-                    if error.code not in {"program_applied_selection_not_active",
-                                          "program_applied_selection_not_found"}:
-                        raise
-                assert time.monotonic() < deadline, status
-                time.sleep(0.01)
+            # Load waits for the whole Apply (CONTRACTS §11).
+            loaded = composer.request("POST", "/api/scenario/load", body={"path": str(scenario)})
+            assert loaded["outcome"] == "succeeded", loaded
+            assert loaded["components"] == [], loaded
+            applied = composer.program_applied()
+            assert applied["scenario_id"] == scenario_id, applied
             assert applied["program_id"] == authoring["program_id"], applied
-            assert applied["program_binding_id"] == status["prepared_activation"]["program_binding_id"]
-            assert applied["retained_bundle_id"] == status["candidate_projection_revision"]["retained_bundle_id"]
+            active = headless.manager_status()["status"]["active"]
+            assert applied["retained_bundle_id"] == active["retained_bundle_id"], (applied, active)
             selected = headless.program_applied_status()
             assert selected["executable"] is True and selected["non_executable"] is None, selected
             assert selected["program_id"] == applied["program_id"], selected
@@ -2098,7 +2033,8 @@ def test_logical_zero_component_scenario_applies_and_runs_without_robot_launch(
             assert not list(stack.root.rglob("controller_launch_artifacts.json")), stack.root
     except BaseException:
         stack.log.flush()
-        keep_failure_evidence(tmp_path)
+        keep_failure_evidence(stack_root)
         raise
     finally:
         stack.close()
+        short_root.cleanup()

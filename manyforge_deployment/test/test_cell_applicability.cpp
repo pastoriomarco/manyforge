@@ -32,6 +32,7 @@
 #include <vector>
 
 #include "proof_root_transfer_test.hpp"
+#include "gripper_only_retention_fixture.hpp"
 #include "lite6_controllable_retention_fixture.hpp"
 
 namespace manyforge::deployment {
@@ -2302,15 +2303,6 @@ struct InputOptions final {
              CanonicalValue(std::move(parameter_rows))},
             {"commissioned_stop_interfaces",
              CanonicalValue(std::move(commissioned_rows))},
-            {"interrupt_sources", CanonicalValue(CanonicalValue::Array{})},
-            {"interrupt_policies", CanonicalValue(CanonicalValue::Array{})},
-            {"interrupt_config",
-             CanonicalValue(CanonicalValue::Object{
-                 {"queue_depth", CanonicalValue(8.0)},
-                 {"cancel_validation_timeout_ns", CanonicalValue(1000.0)},
-                 {"motion_scope_arm_timeout_ns", CanonicalValue(1000.0)},
-                 {"supervisory_poll_rate_hz", CanonicalValue(10.0)},
-             })},
         }));
   }
   if (overlay_reference.has_value()) {
@@ -4541,7 +4533,7 @@ void rewrite_authored_gripper_row(CanonicalValue::Object &graph,
 
 TEST(CellApplicability, TypedRosGripperActuationSelectsOnlyTheApprovedFloorAndEvidence) {
   for (const std::string_view kind : {"pneumatic", "position_commanded"}) {
-    const auto fixture = test::make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture(
+    const auto fixture = test::make_lite_gripper_only_retention_fixture(
         {}, kind, kind == "pneumatic" ? 0.0 : 0.8);
     const auto &plans = fixture.qualified.compiler_ir().applicability().stop_applicability();
     ASSERT_EQ(plans.size(), 1U);
@@ -4578,24 +4570,25 @@ TEST(CellApplicability, TypedRosGripperActuationSelectsOnlyTheApprovedFloorAndEv
 
 TEST(CellApplicability, TypedRosGripperRejectsAFalsePositionFloorAndForeignConfiguration) {
   const auto position_without_floor = +[](CanonicalValue::Object &graph) {
+    test::map_lite_gripper_only_graph(graph);
     rewrite_authored_gripper_row(graph, "actuation_kind", CanonicalValue("position_commanded"));
   };
   try {
-    (void)test::make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture(
-        {}, "pneumatic", 0.8, position_without_floor);
+    (void)test::make_lite_gripper_only_retention_fixture(
+                   {}, "pneumatic", 0.8, "commanded", false, position_without_floor);
     FAIL() << "position-commanded gripper accepted a nominal-only policy";
   } catch (const CellApplicabilityError &error) {
     EXPECT_NE(std::string(error.what()).find("exactly one distinct software-hard floor"),
               std::string::npos);
   }
   const auto pneumatic_with_floor = +[](CanonicalValue::Object &graph) {
+    test::map_lite_gripper_only_graph(graph);
     rewrite_authored_gripper_row(graph, "actuation_kind",
                                  CanonicalValue("pneumatic"));
   };
   try {
-    (void)test::
-        make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture(
-            {}, "position_commanded", 0.8, pneumatic_with_floor);
+    (void)test::make_lite_gripper_only_retention_fixture(
+                   {}, "position_commanded", 0.8, "commanded", false, pneumatic_with_floor);
     FAIL() << "pneumatic gripper accepted a software-hard floor";
   } catch (const CellApplicabilityError &error) {
     EXPECT_NE(std::string(error.what())
@@ -4603,11 +4596,13 @@ TEST(CellApplicability, TypedRosGripperRejectsAFalsePositionFloorAndForeignConfi
               std::string::npos);
   }
   const auto foreign_target = +[](CanonicalValue::Object &graph) {
+    test::map_lite_gripper_only_graph(graph);
     rewrite_authored_gripper_row(graph, "command_target_id", CanonicalValue("foreign_gripper"));
   };
-  EXPECT_THROW((void)test::make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture(
-                   {}, "pneumatic", 0.8, foreign_target), CellApplicabilityError);
+  EXPECT_THROW((void)test::make_lite_gripper_only_retention_fixture(
+                   {}, "pneumatic", 0.8, "commanded", false, foreign_target), CellApplicabilityError);
   const auto missing_row = +[](CanonicalValue::Object &graph) {
+    test::map_lite_gripper_only_graph(graph);
     for (auto &[name, value] : graph) {
       if (name != "runtime_units") continue;
       auto units = value.as_array();
@@ -4638,13 +4633,14 @@ TEST(CellApplicability, TypedRosGripperRejectsAFalsePositionFloorAndForeignConfi
       value = CanonicalValue(std::move(units));
     }
   };
-  EXPECT_THROW((void)test::make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture(
-                   {}, "pneumatic", 0.8, missing_row), CellApplicabilityError);
+  EXPECT_THROW((void)test::make_lite_gripper_only_retention_fixture(
+                   {}, "pneumatic", 0.8, "commanded", false, missing_row), CellApplicabilityError);
   const auto unknown_kind = +[](CanonicalValue::Object &graph) {
+    test::map_lite_gripper_only_graph(graph);
     rewrite_authored_gripper_row(graph, "actuation_kind", CanonicalValue("unknown"));
   };
-  EXPECT_THROW((void)test::make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture(
-                   {}, "pneumatic", 0.8, unknown_kind), CellGraphCodecError);
+  EXPECT_THROW((void)test::make_lite_gripper_only_retention_fixture(
+                   {}, "pneumatic", 0.8, "commanded", false, unknown_kind), CellGraphCodecError);
 }
 
 } // namespace

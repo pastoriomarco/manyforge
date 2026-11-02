@@ -126,7 +126,7 @@ std::set<c::ModelInstanceId> relations_model_instances(
   return model_instances;
 }
 
-// apply_component_delta.cpp:283-292 (RuntimeFamilies' mount rows), at the
+// merge-6b apply_component_delta.cpp (RuntimeFamilies' mount rows), at the
 // id level: the children of the component's mounts, in edge order.
 std::vector<c::ControllableComponentId> runtime_family_mount_children(
     const c::CellGraphDTO& graph, const c::ControllableComponentId& component) {

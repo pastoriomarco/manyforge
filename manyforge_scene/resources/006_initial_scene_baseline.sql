@@ -65,6 +65,8 @@ BEGIN
 END;
 CREATE TRIGGER logical_scene_initial_baseline_requests_no_delete
 BEFORE DELETE ON logical_scene_initial_baseline_requests
+WHEN (SELECT compaction_in_progress FROM logical_scene_history_state
+      WHERE singleton = 1) != 1
 BEGIN
     SELECT RAISE(ABORT, 'initial Scene requests are immutable');
 END;
@@ -75,6 +77,8 @@ BEGIN
 END;
 CREATE TRIGGER logical_scene_initial_baseline_intents_no_delete
 BEFORE DELETE ON logical_scene_initial_baseline_intents
+WHEN (SELECT compaction_in_progress FROM logical_scene_history_state
+      WHERE singleton = 1) != 1
 BEGIN
     SELECT RAISE(ABORT, 'initial Scene intents are immutable');
 END;
@@ -85,6 +89,8 @@ BEGIN
 END;
 CREATE TRIGGER logical_scene_initial_baseline_results_no_delete
 BEFORE DELETE ON logical_scene_initial_baseline_results
+WHEN (SELECT compaction_in_progress FROM logical_scene_history_state
+      WHERE singleton = 1) != 1
 BEGIN
     SELECT RAISE(ABORT, 'initial Scene results are immutable');
 END;

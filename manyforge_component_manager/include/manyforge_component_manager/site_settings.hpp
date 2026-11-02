@@ -9,6 +9,7 @@
 #include <vector>
 
 #include <manyforge_core/types/error_code.hpp>
+#include <manyforge_deployment/component_spec.hpp>
 
 namespace manyforge::component_manager {
 
@@ -61,5 +62,20 @@ private:
 [[nodiscard]] core::Result<std::string>
 ResolveSiteDeviceAddress(const std::optional<SiteSettings> &settings,
                          std::string_view device_address_ref);
+
+/// The address of `device_address_ref` as `spec` resolved it (FP-2: the
+/// host builds a component from its spec only); the same errors as
+/// ResolveSiteDeviceAddress.
+[[nodiscard]] core::Result<std::string>
+ResolveSpecDeviceAddress(const deployment::ComponentSpec &spec,
+                         std::string_view device_address_ref);
+
+/// The site facts every component spec is derived with (build spec plan):
+/// the configured device addresses; none without site settings.
+[[nodiscard]] deployment::SiteFacts
+SiteFactsOf(const std::optional<SiteSettings> &settings);
+/// The same from the Manager-validated site document (absent: none).
+[[nodiscard]] deployment::SiteFacts
+SiteFactsOfDocument(const std::optional<std::string> &document);
 
 } // namespace manyforge::component_manager

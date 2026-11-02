@@ -6,8 +6,8 @@ against the real execution host, Manager and Headless API. No fake transport:
 the trip, its Stop terminal record and the node outcome are each read back
 from the processes that own them.
 
-Fixture: ``examples/r5_trial_e_signal.scenario`` (shared Deployment
-``r5_live_trial_lite6_mock``), narrowed to its two move_until_signal nodes
+Fixture: ``examples/mock_lite6_signal_moves.scenario`` (shared Deployment
+``mock_lite6_signal_moves``), narrowed to its two move_until_signal nodes
 and their ``node_outcome`` checks, and to the Lite6 Mock and Mock station_io
 components (the ROS ``plc_io`` peer and the global rule are not part of this
 check). The nodes author their Mock scripts (contract 133): ``search_trip``
@@ -27,22 +27,19 @@ import sys
 from tempfile import TemporaryDirectory
 import time
 from typing import Any, Iterator
-import uuid
 
 import pytest
 
-from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
+from manyforge_headless_api.client import HeadlessHttpClient
 from manyforge_headless_api.execution import ExecutionCommandClient
 from manyforge_headless_api.process_tests.test_process_stack import (
     ProcessStack,
-    _composer_fence,
-    _composer_snapshot_stream,
-    _matching_composer_snapshot,
     _read_only_tree,
     keep_failure_evidence,
 )
 from manyforge_headless_api.process_tests.test_ui6i_grouped_execution import (
     _activate_loaded_components,
+    _component_states,
     _disable_for_reload,
     _native_events,
     _start_motion,
@@ -54,10 +51,10 @@ from manyforge_headless_api.process_tests.test_ui6i_grouped_execution import (
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
-TRIAL_SCENARIO = "r5_trial_e_signal"
+TRIAL_SCENARIO = "mock_lite6_signal_moves"
 # The trial's base project: its Lite6 Mock is the trial's unchanged robot.
-BOOTSTRAP_SCENARIO = "lite6_pick_and_place"
-SCENARIO_ID = "r5_trial_e_signal_process"
+BOOTSTRAP_SCENARIO = "mock_lite6_pick_and_place"
+SCENARIO_ID = "mock_lite6_signal_moves_process"
 # The dev workbench's ROS cell identity: the trial's proven bootstrap path.
 CELL_ID = "c1_build_authority_cell"
 ADMISSION_FILENAME = f"canonical-empty-admission.{CELL_ID}.json"
@@ -112,8 +109,8 @@ def _write_signal_scenario(directory: Path) -> Path:
     target = directory / f"{SCENARIO_ID}.scenario"
     scenario = build_scenario_document(
         scenario_id=SCENARIO_ID,
-        name="Signal-move interrupt nodes (process test)",
-        description="r5_trial_e_signal narrowed to move_until_signal trip/no-trip.",
+        name=SCENARIO_ID,
+        description="mock_lite6_signal_moves narrowed to move_until_signal trip/no-trip.",
         program_draft=program,
         deployment_draft=deployment,
         program_role_assignment=trial["program_role_assignment"],
@@ -216,50 +213,17 @@ def _load(
 ) -> dict[str, Any]:
     """One ordinary Composer Load and Apply, optionally followed by activation."""
 
-    load_identity = uuid.uuid4().hex
-    with (
-        _composer_snapshot_stream(stack, client_id="signal-nodes") as snapshots,
-        HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as composer,
-        HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless,
-    ):
-        draft = composer.request("GET", "/api/program/draft")
-        for attempt in range(8):
-            snapshot = _matching_composer_snapshot(snapshots, draft)
-            deployment = composer.request("GET", "/api/deployment/workspace")
-            try:
-                loaded = composer.request(
-                    "POST",
-                    "/api/scenario-documents/load",
-                    body={
-                        **_composer_fence(
-                            snapshot, request_id=f"signal.load.{load_identity}.{attempt}"
-                        ),
-                        "deploymentDraftId": deployment["draft"]["id"],
-                        "expectedDeploymentDraftRevision": deployment["draft"]["revision"],
-                        "path": str(project),
-                        "confirmDiscard": False,
-                    },
-                )
-                break
-            except HeadlessClientError as error:
-                if error.code not in {"authoring_not_ready", "stale_generation"} or attempt == 7:
-                    raise
-                draft = composer.request("GET", "/api/program/draft")
-        assert loaded["status"] == "accepted", loaded
-        activation = loaded["activation"]
-        deadline = time.monotonic() + 60.0
-        while True:
-            status = headless.manager_apply_status(
-                activation["apply_id"], activation["apply_generation"]
-            )
-            if status["state"] != "pending":
-                assert status["state"] == "succeeded", status
-                break
-            assert time.monotonic() < deadline, status
-            time.sleep(0.02)
+    with HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as composer:
+        loaded = composer.request("POST", "/api/scenario/load", body={"path": str(project)})
+        # Load waits for the whole Apply (CONTRACTS §11); components end prepared.
+        assert loaded["outcome"] == "succeeded", loaded
         if activate_components:
             component_ids = _activate_loaded_components(stack)
-            assert set(component_ids) == {"lite6_robot", "station_io"}, component_ids
+            # The Lite 6 machine owner `lite6` is a component too (CONTRACTS §16);
+            # its inactive I/O members never reach the compiled cell.
+            assert set(component_ids) == {
+                "lite6", "lite6_robot", "lite_gripper", "station_io"
+            }, component_ids
             _wait_components_reached_requested_target(stack, component_ids)
         stack.wait_authoring_admission(expected_allowed=True)
         applied = composer.program_applied()
@@ -284,10 +248,12 @@ def _write_runtime_configuration_candidate(directory: Path, project: Path) -> Pa
     )
     runtime = lite6["configuration"]["runtime_configuration"]
     runtime["initial_joint_positions_rad"][0] += 0.1
-    target = directory / f"{SCENARIO_ID}.runtime-apply.scenario"
+    # Same Scenario identity at a second path: folder, id and name are one name.
+    target = directory / "runtime-apply" / f"{SCENARIO_ID}.scenario"
+    target.parent.mkdir()
     candidate = build_scenario_document(
         scenario_id=SCENARIO_ID,
-        name="Signal-move retained I/O Apply (process test)",
+        name=SCENARIO_ID,
         description="Changes Lite6 runtime configuration; preserves the Scenario identity.",
         program_draft=source["program_draft"],
         deployment_draft=deployment,
@@ -442,7 +408,7 @@ def test_move_until_signal_trips_and_completes_over_the_real_wire() -> None:
               f"{contained[participant_id]!r} of {chain}")
 
 
-IO_SCENARIO_ID = "r5_trial_d_mock_io_process"
+IO_SCENARIO_ID = "mock_lite6_io_nodes_process"
 
 
 def _write_mock_io_scenario(directory: Path) -> Path:
@@ -459,7 +425,7 @@ def _write_mock_io_scenario(directory: Path) -> Path:
     )
 
     examples = Path(os.environ["MANYFORGE_EXAMPLE_SCENARIO_ROOT"])
-    source = examples / "r5_trial_d_io.scenario"
+    source = examples / "mock_lite6_io_nodes.scenario"
     trial, _ = load_scenario_artifact(str(source), allowed_roots=[str(examples)])
     program = deepcopy(trial["program_draft"])
     (root,) = program["forest"]
@@ -505,7 +471,7 @@ def _write_mock_io_scenario(directory: Path) -> Path:
     target = directory / f"{IO_SCENARIO_ID}.scenario"
     scenario = build_scenario_document(
         scenario_id=IO_SCENARIO_ID,
-        name="Trial D Mock-only I/O (process test)",
+        name=IO_SCENARIO_ID,
         description="D-derived Mock script, retained input and authored ACK timeout; excludes external PLC.",
         program_draft=program, deployment_draft=deployment,
         program_role_assignment=assignment,
@@ -605,21 +571,21 @@ def test_inactive_runtime_apply_rejoins_retained_io_component() -> None:
             HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless,
             HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as composer,
         ):
-            io_before = headless.cclc_component("station_io")
-            assert io_before["component_lifecycle_state"] == "active", io_before
+            io_before = _component_states(headless)["station_io"]
+            assert io_before["lifecycle"] == "enabled", io_before
             selected_before = composer.request("GET", "/api/deployment/workspace")["managerApplied"]
             assert selected_before["scenarioId"] == SCENARIO_ID, selected_before
         _disable_for_reload(stack, "lite6_robot")
         candidate = _write_runtime_configuration_candidate(project.parent, project)
         _load(stack, candidate, activate_components=False)
         with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
-            motion_after = headless.cclc_component("lite6_robot")
-            io_after = headless.cclc_component("station_io")
+            motion_after = _component_states(headless)["lite6_robot"]
+            io_after = _component_states(headless)["station_io"]
         with HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as composer:
             selected_after = composer.request("GET", "/api/deployment/workspace")["managerApplied"]
         assert before_apply["scenario_id"] == SCENARIO_ID, before_apply
         assert selected_after["scenarioId"] == SCENARIO_ID, selected_after
         assert selected_after["deploymentRevision"] != selected_before["deploymentRevision"]
-        assert motion_after["component_lifecycle_state"] == "disabled", motion_after
-        assert io_after["component_lifecycle_state"] == "active", io_after
-        assert io_after["provider_occurrences"] == io_before["provider_occurrences"]
+        assert motion_after["lifecycle"] == "prepared", motion_after
+        assert io_after["lifecycle"] == "enabled", io_after
+        assert io_after.get("last_action") == io_before.get("last_action")

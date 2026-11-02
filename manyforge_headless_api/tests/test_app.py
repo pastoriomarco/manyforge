@@ -33,6 +33,7 @@ from manyforge_headless_api.app import (
     create_app,
 )
 from manyforge_headless_api.cell_admission import CellAdmissionError
+from manyforge_headless_api.component_model import RUN_REFUSAL_CODES
 from manyforge_headless_api.control_state import HeadlessControlStateSource
 from manyforge_headless_api.execution import ExecutionCommandClient
 from manyforge_headless_api.models import (
@@ -42,7 +43,6 @@ from manyforge_headless_api.models import (
     ProgramFullStopResetRequest,
     SceneResourcePoseQuery,
     SceneTransactionRequest,
-    StopFaultRecoveryIntentRequest,
 )
 from manyforge_headless_api.native import HeadlessApiError, ViewerModelAsset
 from manyforge_headless_api.program_runner_client import ProgramRunnerClientError
@@ -230,20 +230,31 @@ def test_closed_core_invalid_request_maps_to_a_client_error() -> None:
     assert _error_status("invalid_request") == 400
     assert _error_status("full_stack_restart_required") == 409
     assert _error_status("assistant_ai_model_absent") == 503
-    assert _error_status("unacknowledged_operator_alarms") == 409
+    assert _error_status("operator_alarm_interlock_active") == 409
     # Preparation refuses the input before any claim or effect.
     assert _error_status("activation_preparation_failed") == 409
     assert _error_status("manual_handover_required") == 409
     assert _error_status("deployment_candidate_cell_mismatch") == 409
+    assert _error_status("activation_preparer_busy") == 409
     # D6: typed refusals before any effect are client errors, not 500.
     assert _error_status("cell_close_operation_nonterminal") == 409
     assert _error_status("cell_close_containment_uncertain") == 409
-    assert _error_status("stop_fault_recovery_closing") == 409
     assert _error_status("manual_operation_scope_stale") == 409
+    # RunReadiness reasons (CONTRACTS §10) are typed refusals, not 500.
+    for code in ("run_in_progress", "component_not_enabled", "component_unhealthy",
+                 "input_not_fresh", "program_motion_running",
+                 "manual_operation_in_progress", "program_not_executable"):
+        assert _error_status(code) == 409
     assert _error_status("program_required_component_not_active") == 409
     assert _error_status("route_selection_component_not_ready") == 409
-    # A lifecycle request while another transaction holds the domain.
-    assert _error_status("cclc_domain_busy") == 409
+
+
+def test_run_refusals_are_409_and_unknown_runner_stays_503() -> None:
+    # Every readiness reason and runner run refusal is a known refusal before
+    # any effect; only an unreachable runner leaves the outcome unknown.
+    for code in RUN_REFUSAL_CODES:
+        assert _error_status(code) == 409, code
+    assert _error_status("program_runner_unavailable") == 503
 
 
 @pytest.mark.parametrize(
@@ -1116,18 +1127,6 @@ class FakeExecution:
             },
         }
 
-    def stop_fault(self) -> dict[str, Any]:
-        self.requests.append(("stop_fault", None))
-        return {"ok": True, "command": "get_stop_fault", "stop_fault": None}
-
-    def recover_stop_fault(self, request: object) -> dict[str, Any]:
-        self.requests.append(("recover_stop_fault", request))
-        return {
-            "ok": True,
-            "command": "recover_stop_fault",
-            "result": {"accepted": True},
-        }
-
     def set_runtime_scale_control(
         self, request: object, *, trusted_principal_id: str | None
     ) -> dict[str, Any]:
@@ -1243,7 +1242,6 @@ class FakeProgramRunner:
             "operation_acknowledge_completed",
             "cell_full_stop",
             "execution_recovery",
-            "stop_recovery",
             "runtime_scale",
         )
         return {
@@ -1614,7 +1612,6 @@ def _service(
     manager: FakeManager,
     execution: object | None = None,
     program_runner: object | None = None,
-    cclc: object | None = None,
     activation_preparer: object | None = None,
 ) -> HeadlessService:
     return HeadlessService(
@@ -1623,7 +1620,6 @@ def _service(
         execution=execution,  # type: ignore[arg-type]
         program_runner=program_runner,  # type: ignore[arg-type]
         cell_admission=FakeCellAdmission(),
-        cclc=cclc,
         activation_preparer=activation_preparer,  # type: ignore[arg-type]
     )
 
@@ -1742,86 +1738,6 @@ def test_activation_preparation_refuses_removed_parameter_overrides() -> None:
     assert preparer.calls == []
 
 
-class FakeCCLC:
-    def __init__(self) -> None:
-        self.routes: list[dict[str, Any]] = []
-
-    def submit_route(self, request: dict[str, Any]) -> dict[str, Any]:
-        self.routes.append(copy.deepcopy(request))
-        return {
-            "transaction_id": "route.1",
-            "replay_status": "accepted_new",
-            "admission": None,
-        }
-
-
-def _route_selection_body(admission_generation: int) -> dict[str, Any]:
-    return {
-        "request_context": _caller(),
-        "expected_admission_generation": admission_generation,
-        "expected_retained_bundle_id": "bundle.1",
-        "expected_graph_revision": "graph.1",
-        "desired_configuration": {
-            "control_domain_id": "domain.arm",
-            "control_domain_revision": "domain.revision.1",
-            "controller_topology_id": "topology.arm",
-            "topology_revision": "topology.revision.1",
-            "activation_set_id": "activation.arm",
-            "binding_routes": [
-                {
-                    "control_binding_id": "binding.arm",
-                    "control_binding_revision": "binding.revision.1",
-                    "control_route_id": "route.normal",
-                }
-            ],
-        },
-        "expected_active_control_configuration": {
-            "presence": "absent",
-            "active_control_configuration_id": None,
-            "active_control_configuration_generation": None,
-        },
-        "component_expectations": [
-            {
-                "controllable_component_id": "component.arm",
-                "expected_component_lifecycle_generation": 1,
-                "expected_component_lifecycle_state": "prepared",
-            }
-        ],
-        "confirmed": True,
-    }
-
-
-def test_route_selection_preserves_admission_for_core_without_an_idle_gate() -> None:
-    core = FakeCore()
-    manager = FakeManager()
-    cclc = FakeCCLC()
-    service = _service(core, manager, cclc=cclc)
-    service.authoring_admission = lambda: pytest.fail(
-        "HTTP must not decide route admission"
-    )
-    app = create_app(
-        service=service,
-        cclc=cclc,  # type: ignore[arg-type]
-    )
-    with TestClient(app) as client:
-        stale = client.post(
-            "/api/cclc/routes/requests",
-            json=_route_selection_body(_ADMISSION_GENERATION + 1),
-        )
-        accepted = client.post(
-            "/api/cclc/routes/requests",
-            json=_route_selection_body(_ADMISSION_GENERATION),
-        )
-
-    # The thin boundary forwards both; the real Core claim owner, not HTTP,
-    # decides whether either generation is still admissible.
-    assert stale.status_code == 200
-    assert accepted.status_code == 200
-    assert len(cclc.routes) == 2
-    assert cclc.routes[0]["expected_admission_generation"] == _ADMISSION_GENERATION + 1
-    assert cclc.routes[1]["expected_admission_generation"] == _ADMISSION_GENERATION
-
-
 @pytest.mark.parametrize(
     "mutation",
     [
@@ -1938,16 +1854,6 @@ def test_runtime_manager_scene_alarm_history_and_health_are_thin_reads() -> None
         assert health["headless_projection_ready"] is True
         assert "ready" not in health
         assert "robot_readiness" not in health
-        overview = client.get("/api/component-overview").json()
-        assert overview["schema_version"] == "manyforge.component_overview.v2"
-        assert overview["readiness"] == "degraded"
-        assert overview["overview_revision"].startswith("sha256:")
-        assert (
-            next(
-                row for row in overview["components"] if row["id"] == "observe_render"
-            )["status"]
-            == "healthy"
-        )
 
 
 def test_alarm_snapshot_names_the_kernel_held_attention_copy() -> None:
@@ -2000,6 +1906,9 @@ def test_component_overview_fact_capture_reads_each_source_once() -> None:
         def program_applied(self) -> dict[str, Any]:
             return self.value("applied_program")
 
+        def program_applied_status(self) -> dict[str, Any]:
+            return self.value("applied_program_status")
+
         def source_model(self) -> dict[str, Any]:
             return self.value("source_model")
 
@@ -2011,6 +1920,10 @@ def test_component_overview_fact_capture_reads_each_source_once() -> None:
 
         def execution_control_state(self) -> dict[str, Any]:
             return self.value("execution_control")
+
+        def component_model(self) -> None:
+            self.calls.append("component_model")
+            return None
 
     service = CountingFactService()
     exact_cycle = {"source": "program_stream"}
@@ -2025,12 +1938,14 @@ def test_component_overview_fact_capture_reads_each_source_once() -> None:
         "alarms",
         "authoring_admission",
         "applied_program",
+        "applied_program_status",
         "source_model",
         "execution_identity",
         "execution_targets",
         "execution_control",
+        "component_model",
     ]
-    assert len(service.calls) == len(set(service.calls)) == 8
+    assert len(service.calls) == len(set(service.calls)) == 10
 
 
 def test_node_environment_joins_only_the_exact_applied_runner_offer() -> None:
@@ -2128,14 +2043,14 @@ def test_palette_gripper_and_multiple_capability_requirements() -> None:
 def test_palette_conditional_requirements_allow_one_complete_alternative() -> None:
     applied = _applied_projection(_program_document())
     all_offers = _node_availability_fixture(applied)[0]["capability_offers"]
-    one_profile = [offer for offer in all_offers if offer not in {
-        "planning.profile.balanced", "planning.profile.quality_bounded"}]
-    row = _palette_row(_palette_projection(applied, one_profile), "motion.move_to_joint_target")
+    # gripper.check_status requires tool.gripper.feedback under each
+    # `expected_state` alternative.
+    row = _palette_row(_palette_projection(applied, all_offers), "gripper.check_status")
     assert row["binding_available"] is True
-    none = [offer for offer in one_profile if offer != "planning.profile.first_feasible"]
-    row = _palette_row(_palette_projection(applied, none), "motion.move_to_joint_target")
+    none = [offer for offer in all_offers if offer != "tool.gripper.feedback"]
+    row = _palette_row(_palette_projection(applied, none), "gripper.check_status")
     assert row["binding_available"] is False
-    assert row["reasons"][0]["details"] == {"capability": "planning.profile.first_feasible"}
+    assert row["reasons"][0]["details"] == {"capability": "tool.gripper.feedback"}
 
 
 def test_palette_without_selected_binding_keeps_unselected_reason() -> None:
@@ -2616,7 +2531,7 @@ def test_program_run_status_carries_failure_details_and_origin_unchanged() -> No
             "reference_type": "frame",
             "reference_id": "r" * 256,
             "retryable": False,
-            "latch_id": None,
+            "component_id": None,
         },
         "origin": {
             "kind": "owner",
@@ -3269,7 +3184,7 @@ def test_duplicate_apply_notification_does_not_replace_deliberate_scene_edits():
     assert len([row for row in runner.calls if row[0] == "prepare_scene"]) == 2
 
 
-@pytest.mark.parametrize("kind", ["no_program", "sealed", "superseded"])
+@pytest.mark.parametrize("kind", ["no_program", "superseded"])
 def test_committed_apply_without_current_scenario_program_does_not_prepare_scene(kind):
     runner = _NotifiedRunner()
     service, core = _scene_completion_service(runner)
@@ -3279,10 +3194,6 @@ def test_committed_apply_without_current_scenario_program_does_not_prepare_scene
     else:
         status.update(executable=False, program_id=None, program_revision=None,
                       program_binding_id=None, program=None, non_executable=None)
-        if kind == "sealed":
-            status["origin"] = {"kind": "sealed_canonical_empty", "cell_id": "cell_a",
-                **{field: status[field] for field in ("deployment_artifact_id", "deployment_revision", "retained_bundle_id", "graph_revision")},
-                "admission_digest": "sha256:" + "e" * 64}
     service.notify_committed_apply()
     assert not runner.calls
 
@@ -3734,10 +3645,18 @@ def test_committed_activation_projects_every_committed_apply_of_the_history() ->
         assert response.status_code == 200
         assert response.json() == _committed_activation()
 
-        # A history that does not account for every publication is refused.
+        # Manager's journal evicts older committed Applies: a retained window
+        # shorter than the publication history is the current history.
+        evicted = {**_committed_activation(), "publication_generation": 300}
+        core.committed_activation = evicted  # type: ignore[attr-defined]
+        response = client.get("/api/program/committed-activation")
+        assert response.status_code == 200
+        assert response.json() == evicted
+
+        # More committed Applies than Apply publications is refused.
         core.committed_activation = {  # type: ignore[attr-defined]
             **_committed_activation(),
-            "publication_generation": 4,
+            "publication_generation": 2,
         }
         refused = client.get("/api/program/committed-activation")
         assert refused.json()["detail"]["code"] == "program_activation_invalid"
@@ -4334,13 +4253,24 @@ def test_openapi_contains_no_condition_mutation_route() -> None:
         "/api/execution/capability-command-previews",
         "/api/execution/stops",
         "/api/execution/full-stop",
-        "/api/execution/stop-fault",
-        "/api/execution/stop-fault/recover",
         "/api/execution/pick-place/plans/pick",
         "/api/execution/pick-place/plans/place",
     }.issubset(paths)
     assert all("pick-place/sequences" not in path for path in paths)
     assert "/api/kernel/stop" not in paths
+    # Component model v2: the stop-fault latch, Recover cell and CCLC routes
+    # are gone; components are read and acted on through /api/components.
+    assert not any(path.startswith(("/api/execution/stop-fault", "/api/execution/cell-recover",
+                                     "/api/cclc/")) for path in paths)
+    assert {
+        "/api/components",
+        "/api/components/actions",
+        "/api/components/{component_id}/actions",
+        "/api/cell/latch",
+        "/api/io",
+        "/api/io/{signal_id}/set",
+        "/api/program/readiness",
+    }.issubset(paths)
     assert "/api/cycle/stop" not in paths
     assert all("condition" not in path or "acknowledge" in path for path in paths)
 
@@ -4541,7 +4471,6 @@ def test_motion_preview_is_a_thin_non_effectful_execution_route(
                         "execution_timeout_s": 10.0,
                     },
                     "cache_mode": "default",
-                    "planning_profile": "first_feasible",
                     "target_mode": "absolute",
                     "target_reference": None,
                     "offset_reference": None,
@@ -4922,66 +4851,6 @@ def test_operation_controls_and_scale_control_are_thin_fenced_routes() -> None:
     ]
 
 
-def test_full_stop_and_stop_fault_recovery_are_thin_owner_routes() -> None:
-    execution = FakeExecution()
-    app = create_app(
-        service=_service(
-            FakeCore(),
-            FakeManager(),
-            execution,
-            program_runner=FakeProgramRunner(active=False),
-        )
-    )
-    context = {
-        "request_id": "request.full-stop.1",
-        "request_owner_epoch": "execution.epoch.1",
-        "source_label": "operator_ui",
-        "correlation_id": None,
-    }
-    recovery_context = {**context, "request_id": "request.recover-stop.1"}
-    recovery = {
-        "request_context": recovery_context,
-        "expected_latch_id": "stop-fault.1",
-        "expected_latch_generation": 1,
-        "expected_recovery_assessment_revision": 2,
-        "expected_stop_certificate_id": "stop-certificate.1",
-        "expected_stop_certificate_revision": 1,
-        "expected_cell_id": "cell.1",
-        "expected_retained_bundle_id": "sha256:" + "1" * 64,
-        "expected_graph_revision": "sha256:" + "2" * 64,
-        "configuration_expectations": [
-            {
-                "control_domain_id": "domain.1",
-                "active_control_configuration_id": "configuration.1",
-                "active_control_configuration_generation": 3,
-            }
-        ],
-        "reason": "fresh settlement verified",
-    }
-
-    with TestClient(app) as client:
-        full = client.post(
-            "/api/execution/full-stop",
-            json={
-                "request_context": context,
-                "expected_stop_generation": 0,
-            },
-        )
-        fault = client.get("/api/execution/stop-fault")
-        recovered = client.post("/api/execution/stop-fault/recover", json=recovery)
-
-    assert full.status_code == 200
-    assert fault.status_code == 200
-    assert fault.json()["stop_fault"] is None
-    assert recovered.status_code == 200
-    assert [kind for kind, _request in execution.requests] == [
-        "full_stop",
-        "stop_fault",
-        "recover_stop_fault",
-    ]
-    assert execution.principals == [("full_stop", None)]
-
-
 def test_execution_mutation_principal_can_only_come_from_trusted_adapter() -> None:
     execution = FakeExecution()
     app = create_app(
@@ -5300,147 +5169,6 @@ def test_program_run_admitted_speeds_copy_the_latest_owner_diagnostic_per_robot(
     }
 
 
-def _empty_preparation_selection() -> dict[str, Any]:
-    digest = "sha256:" + "1" * 64
-    return {"request_owner_epoch": "manager-actual", "cell_id": "cell_a",
-            "deployment_artifact_id": "cell_a", "deployment_revision": digest,
-            "candidate_retained_bundle_id": digest, "candidate_graph_revision": digest,
-            "admission_digest": "sha256:" + "2" * 64}
-
-
-def _empty_preparation_request() -> dict[str, Any]:
-    selected = _empty_preparation_selection()
-    return {"request_owner_epoch": selected["request_owner_epoch"],
-            "expected_admission_generation": _ADMISSION_GENERATION,
-            "origin": {"kind": "sealed_canonical_empty", "cell_id": selected["cell_id"],
-                       "deployment_artifact_id": selected["deployment_artifact_id"],
-                       "deployment_revision": selected["deployment_revision"],
-                       "retained_bundle_id": selected["candidate_retained_bundle_id"],
-                       "graph_revision": selected["candidate_graph_revision"],
-                       "admission_digest": selected["admission_digest"]}}
-
-
-class _EmptyPreparationManager(FakeManager):
-    def __init__(self) -> None:
-        super().__init__()
-        self.selections = [_empty_preparation_selection(), _empty_preparation_selection()]
-        self.selection_reads = 0
-
-    def canonical_empty_selection(self) -> dict[str, Any]:
-        selected = self.selections[min(self.selection_reads, len(self.selections) - 1)]
-        self.selection_reads += 1
-        return copy.deepcopy(selected)
-
-
-class _EmptyPreparationWorker(FakeActivationPreparer):
-    def __init__(self) -> None:
-        super().__init__()
-        self.released: list[str] = []
-
-    def prepare_canonical_empty(self, selection) -> dict[str, Any]:
-        self.calls.append(copy.deepcopy(selection))
-        return {"prepared_activation_id": "sha256:" + "6" * 64, "origin": _empty_preparation_request()["origin"]}
-
-    def release(self, prepared_id: str) -> None:
-        self.released.append(prepared_id)
-
-
-def test_sealed_preparation_uses_fresh_selection_and_has_no_apply_effect() -> None:
-    manager = _EmptyPreparationManager()
-    worker = _EmptyPreparationWorker()
-    client = TestClient(create_app(service=_service(FakeCore(), manager, activation_preparer=worker)))
-    response = client.post("/api/activation-preparations", json=_empty_preparation_request())
-    assert response.status_code == 200, response.text
-    assert response.json()["prepared_activation"]["origin"]["kind"] == "sealed_canonical_empty"
-    assert worker.calls == [_empty_preparation_selection()]
-    assert manager.selection_reads == 2
-    assert worker.released == []
-
-
-def test_sealed_preparation_refuses_close_while_a_part_is_attached() -> None:
-    class _CarryingCore(FakeCore):
-        def runtime_snapshot(self) -> dict[str, Any]:
-            snapshot = super().runtime_snapshot()
-            snapshot["sections"]["logical_scene"]["payload"]["snapshot"] = {
-                "carried_object_attachments": [{
-                    "carried_object_attachment_id": "attachment.1",
-                    "scene_resource_id": "graspable",
-                    "controllable_component_id": "lite6_robot",
-                    "command_target_id": "gripper",
-                }],
-            }
-            return snapshot
-
-    manager = _EmptyPreparationManager()
-    worker = _EmptyPreparationWorker()
-    client = TestClient(create_app(service=_service(_CarryingCore(), manager, activation_preparer=worker)))
-    response = client.post("/api/activation-preparations", json=_empty_preparation_request())
-    assert response.status_code == 409, response.text
-    detail = response.json()["detail"]
-    assert detail["code"] == "scenario_close_attachment_present"
-    assert detail["details"] == {"carried_objects": [{
-        "scene_resource_id": "graspable",
-        "controllable_component_id": "lite6_robot",
-        "command_target_id": "gripper",
-    }]}
-    assert worker.calls == [] and worker.released == []
-
-
-@pytest.mark.parametrize("field", ["request_owner_epoch", "cell_id", "deployment_artifact_id",
-    "deployment_revision", "candidate_retained_bundle_id", "candidate_graph_revision", "admission_digest"])
-@pytest.mark.parametrize("when", ["before", "after"])
-def test_sealed_preparation_refuses_changed_owner_or_any_admission_fact(field, when) -> None:
-    manager = _EmptyPreparationManager()
-    worker = _EmptyPreparationWorker()
-    index = 0 if when == "before" else 1
-    manager.selections[index][field] = "other" if field in {"request_owner_epoch", "cell_id", "deployment_artifact_id"} else "sha256:" + "f" * 64
-    client = TestClient(create_app(service=_service(FakeCore(), manager, activation_preparer=worker)))
-    response = client.post("/api/activation-preparations", json=_empty_preparation_request())
-    assert response.status_code == 409, response.text
-    assert response.json()["detail"]["code"] == "stale_generation"
-    assert len(worker.calls) == (1 if when == "after" else 0)
-    assert worker.released == (["sha256:" + "6" * 64] if when == "after" else [])
-
-
-def test_sealed_preparation_admission_change_releases_cache_and_never_applies() -> None:
-    manager = _EmptyPreparationManager()
-    worker = _EmptyPreparationWorker()
-    service = _service(FakeCore(), manager, activation_preparer=worker)
-    admission = FakeCellAdmission()
-    reads = 0
-
-    def get():
-        nonlocal reads
-        reads += 1
-        return {"authoring_allowed": reads == 1, "admission_generation": _ADMISSION_GENERATION}
-    admission.get = get
-    service.cell_admission = admission
-    client = TestClient(create_app(service=service))
-    response = client.post("/api/activation-preparations", json=_empty_preparation_request())
-    assert response.status_code == 409, response.text
-    assert worker.released == ["sha256:" + "6" * 64]
-
-
-@pytest.mark.parametrize("change", [None, {"program_id": "fake"}, {"graph_revision": "sha256:" + "f" * 64},
-    {"scenario_id": "fake"}, {"deployment_artifact_id": "foreign"}])
-def test_sealed_applied_status_keeps_true_no_scenario_and_exact_candidate(change) -> None:
-    core = FakeCore()
-    status = _applied_program_status_projection()
-    status.update(executable=False, program_id=None, program_revision=None, program_binding_id=None,
-                  message="No Program is selected")
-    status["origin"] = {"kind": "sealed_canonical_empty", "cell_id": "cell_a",
-        **{field: status[field] for field in ("deployment_artifact_id", "deployment_revision", "retained_bundle_id", "graph_revision")},
-        "admission_digest": "sha256:" + "e" * 64}
-    if change: status.update(change)
-    core.applied_program_status_projection = status
-    client = TestClient(create_app(service=_service(core, FakeManager())))
-    response = client.get("/api/program/applied/status")
-    assert response.status_code == (502 if change else 200), response.text
-    if not change:
-        assert "scenario_id" not in response.json() and "source_document_digest" not in response.json()
-        assert response.json()["origin"] == status["origin"]
-
-
 def test_program_only_apply_preserves_scene_and_still_reconciles_values():
     runner = _NotifiedRunner()
     service, core = _scene_completion_service(runner)
@@ -5462,10 +5190,8 @@ def test_replacing_headless_loses_scene_attempt_memory_for_initializing_apply():
     assert len([row for row in runner.calls if row[0] == "prepare_scene"]) == 2
 
 
-def test_operation_reset_carries_only_explicit_uncertain_output_acknowledgements() -> None:
-    """Contract 66: a targeted Reset lists only its own unknown outputs."""
-
-    from manyforge_headless_api.models import OperationResetRequest
+def test_operation_reset_carries_no_output_acknowledgement() -> None:
+    """CONTRACTS §6: Reset is never gated on an unknown output's outcome."""
 
     execution = FakeExecution()
     app = create_app(
@@ -5478,7 +5204,7 @@ def test_operation_reset_carries_only_explicit_uncertain_output_acknowledgements
     )
     body = {
         "request_context": {
-            "request_id": "request.control.ack",
+            "request_id": "request.control.reset",
             "request_owner_epoch": "execution.epoch.1",
             "source_label": "operator_ui",
             "correlation_id": None,
@@ -5487,95 +5213,11 @@ def test_operation_reset_carries_only_explicit_uncertain_output_acknowledgements
         "expected_operation_revision": 3,
         "reason": None,
     }
-    acknowledged = [
-        {"operation_id": "operation-1", "operation_revision": 2},
-        {"operation_id": "operation-1", "operation_revision": 3},
-    ]
     with TestClient(app) as client:
         plain = client.post("/api/execution/operations/operation-1/reset", json=body)
-        acked = client.post(
-            "/api/execution/operations/operation-1/reset",
-            json={**body, "acknowledged_uncertain_outputs": acknowledged},
-        )
-        foreign = client.post(
-            "/api/execution/operations/operation-1/reset",
-            json={
-                **body,
-                "acknowledged_uncertain_outputs": [
-                    {"operation_id": "operation-2", "operation_revision": 1}
-                ],
-            },
-        )
-        unsorted = client.post(
-            "/api/execution/operations/operation-1/reset",
-            json={**body, "acknowledged_uncertain_outputs": acknowledged[::-1]},
-        )
-        empty = client.post(
-            "/api/execution/operations/operation-1/reset",
-            json={**body, "acknowledged_uncertain_outputs": []},
-        )
 
     assert plain.status_code == 200
-    assert acked.status_code == 200
-    assert foreign.status_code == 422
-    assert unsorted.status_code == 422
-    assert empty.status_code == 422
-    sent = [request for kind, request in execution.requests if kind == "reset"]
-    assert len(sent) == 2
-    # An ordinary Reset keeps its exact wire shape (no null field).
-    assert "acknowledged_uncertain_outputs" not in sent[0].model_dump(mode="json")
-    assert sent[1].model_dump(mode="json")["acknowledged_uncertain_outputs"] == acknowledged
-    assert isinstance(sent[1], OperationResetRequest)
-
-
-def test_stop_fault_recovery_route_dispatches_the_global_io_rule_variant() -> None:
-    from manyforge_headless_api.models import GlobalIoRuleRecoveryIntentRequest
-
-    execution = FakeExecution()
-    app = create_app(
-        service=_service(
-            FakeCore(),
-            FakeManager(),
-            execution,
-            program_runner=FakeProgramRunner(active=False),
-        )
-    )
-    recovery = {
-        "kind": "global_io_rule",
-        "request_context": {
-            "request_id": "request.rule-recovery.1",
-            "request_owner_epoch": "execution.epoch.1",
-            "source_label": "operator_ui",
-            "correlation_id": None,
-        },
-        "selector": {
-            "context": {
-                "owner_epoch": "kernel.epoch.1",
-                "catalog_generation": "4",
-                "active_publication_generation": 2,
-                "bundle": "bundle.1",
-                "graph": "graph.1",
-            },
-            "rule_id": "door_open",
-            "expected_rule_registration_id": "9",
-        },
-        "reason": None,
-    }
-    with TestClient(app) as client:
-        recovered = client.post("/api/execution/stop-fault/recover", json=recovery)
-        stale_kind = client.post(
-            "/api/execution/stop-fault/recover",
-            json={**recovery, "expected_latch_id": "stop-fault.1"},
-        )
-    assert recovered.status_code == 200, recovered.text
-    assert stale_kind.status_code == 422
-    [(kind, request)] = execution.requests
-    assert kind == "recover_stop_fault"
-    assert isinstance(request, GlobalIoRuleRecoveryIntentRequest)
-    dumped = request.model_dump(mode="json")
-    assert dumped["selector"] == recovery["selector"]
-    assert dumped["reason"] is None
-    assert dumped["request_context"]["request_id"] == "request.rule-recovery.1"
+    assert len([request for kind, request in execution.requests if kind == "reset"]) == 1
 
 
 def test_request_validation_refusal_maps_each_field_path_to_its_code() -> None:

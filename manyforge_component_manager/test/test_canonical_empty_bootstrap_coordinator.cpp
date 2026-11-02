@@ -334,7 +334,7 @@ class InstrumentedSceneOwner final
       fail_next_begin_before_effect_ = false;
       throw std::runtime_error("simulated Begin failure before effect");
     }
-    if (!intent.valid() || !intent.native_runtime_bindings.empty() ||
+    if (!intent.valid() || !intent.execution_host_bindings.empty() ||
         intent.cell_id != expected_query_.cell_id ||
         intent.canonical_empty_retained_bundle.retained_bundle_id !=
             expected_query_.canonical_empty_retained_bundle_id ||
@@ -514,7 +514,7 @@ TEST(
   ASSERT_TRUE(snapshot.accepted_target.has_value());
   EXPECT_EQ(result, *snapshot.accepted_target);
   EXPECT_EQ(snapshot.intent->intent.bootstrap_generation.value(), 1U);
-  EXPECT_TRUE(snapshot.intent->intent.native_runtime_bindings.empty());
+  EXPECT_TRUE(snapshot.intent->intent.execution_host_bindings.empty());
   EXPECT_EQ(
       snapshot.intent->intent.bootstrap_id.value().size(),
       std::string_view("bootstrap-").size() + 32U);
@@ -850,7 +850,7 @@ TEST(
   ASSERT_TRUE(snapshot.intent.has_value());
   ASSERT_TRUE(snapshot.accepted_target.has_value());
   EXPECT_EQ(first_value, *snapshot.accepted_target);
-  EXPECT_TRUE(snapshot.intent->intent.native_runtime_bindings.empty());
+  EXPECT_TRUE(snapshot.intent->intent.execution_host_bindings.empty());
   EXPECT_EQ(scene_owner.accept_effect_count(), 1U);
   EXPECT_EQ(scene_owner.rebuild_calls(), 0U);
   EXPECT_EQ(scene_owner.finalize_calls(), 0U);

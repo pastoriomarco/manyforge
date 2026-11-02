@@ -63,6 +63,9 @@ from manyforge_behavior.program_runtime import (
     _presented_node_status,
 )
 
+# The Runner's execution transport timeout handed to owner task nodes.
+_TRANSPORT_TIMEOUT_S = 30.0
+
 _ROOT = Path(__file__).resolve().parents[2]
 _DIGEST_A = "sha256:" + "a" * 64
 _DIGEST_B = "sha256:" + "b" * 64
@@ -287,6 +290,7 @@ def _fake_port_run(**kwargs: Any) -> ExecutableProgramRun:
     The fake ports have no robot handles: role.component/role/tcp is a test-only
     endpoint convention, not a captured deployment binding.
     """
+    kwargs.setdefault("transport_timeout_s", _TRANSPORT_TIMEOUT_S)
     run = ExecutableProgramRun(**kwargs)
     for key in kwargs["program"].blackboard_keys:
         if key.startswith("active_tcp."):
@@ -322,13 +326,26 @@ def _capture(program: Program, *, binding_id: str = _DIGEST_A) -> ProgramRunCapt
     )
 
 
+def test_rule_activation_outside_change_and_output_are_immediate_kernel_invocations() -> None:
+    """CONTRACTS §7, §9: each is one immediate Kernel call."""
+
+    resolver = build_executable_node_resolver(build_node_environment())
+    nodes = {"rules.set_active", "io.clear_outside_change", "io.set_output"}
+    ports = {
+        item.row.node_id: item.owner_port_name
+        for item in resolver.dispositions
+        if item.row.node_id in nodes
+    }
+    assert ports == dict.fromkeys(nodes, "io_signals")
+
+
 def test_closed_resolver_exactly_disposes_all_effective_rows() -> None:
     environment = build_node_environment()
     resolver = build_executable_node_resolver(environment)
     dispositions = resolver.dispositions
 
-    assert len(dispositions) == len(environment.registry.rows) == 50  # TCP migration: motion.set_tcp row added
-    assert sum(item.adapter_build_qualified for item in dispositions) == 50  # TCP migration: motion.set_tcp row added
+    assert len(dispositions) == len(environment.registry.rows) == 52  # + rules.set_active, io.clear_outside_change
+    assert sum(item.adapter_build_qualified for item in dispositions) == 52
     assert sum(not item.adapter_build_qualified for item in dispositions) == 0
     assert all(
         (
@@ -451,7 +468,7 @@ def test_simulation_row_uses_the_focused_cancellable_task_owner() -> None:
     resolver = build_executable_node_resolver(build_node_environment())
     adapter = resolver.instantiate(
         build_node_environment().registry.record("simulation.reset"),
-        NodeAdapterBuildContext(
+        NodeAdapterBuildContext(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
             name="reset_sim",
             node_instance_id="reset_sim",
             parameters={},
@@ -489,7 +506,7 @@ def test_recovery_row_uses_the_exact_control_port_and_does_not_retry(outcome) ->
     environment = build_node_environment()
     adapter = build_executable_node_resolver(environment).instantiate(
         environment.registry.record("recovery.apply_offered_action"),
-        NodeAdapterBuildContext(
+        NodeAdapterBuildContext(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
             name="recover_arm",
             node_instance_id="recover_arm",
             parameters=program.tree.parameters,
@@ -542,7 +559,7 @@ def test_accepted_task_retries_only_typed_observation_unavailability() -> None:
     task = _OneOutageTaskPort()
     adapter = build_executable_node_resolver(build_node_environment()).instantiate(
         build_node_environment().registry.record("simulation.reset"),
-        NodeAdapterBuildContext(
+        NodeAdapterBuildContext(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
             name="reset_sim",
             node_instance_id="reset_sim",
             parameters={},
@@ -594,7 +611,7 @@ def test_held_task_observation_distinguishes_unstarted_from_settled_failure(unst
     state = OperatorMotionStopState({"action": ()})
     environment = build_node_environment()
     adapter = build_executable_node_resolver(environment).instantiate(
-        environment.registry.record("simulation.reset"), NodeAdapterBuildContext(
+        environment.registry.record("simulation.reset"), NodeAdapterBuildContext(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
             name="action", node_instance_id="action", parameters={},
             input_resolver=NodeAttemptInputResolver(program=program, catalog=catalog,
                 value_store=ProgramValueStore.from_program(program)),
@@ -659,7 +676,7 @@ def test_terminal_task_remains_running_while_owner_settlement_is_pending(
     task = _SettlingTaskPort()
     adapter = build_executable_node_resolver(build_node_environment()).instantiate(
         build_node_environment().registry.record("simulation.reset"),
-        NodeAdapterBuildContext(
+        NodeAdapterBuildContext(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
             name="reset_sim",
             node_instance_id="reset_sim",
             parameters={},
@@ -727,7 +744,7 @@ def test_non_transient_and_identity_changing_observations_still_fail() -> None:
     ):
         adapter = build_executable_node_resolver(build_node_environment()).instantiate(
             build_node_environment().registry.record("simulation.reset"),
-            NodeAdapterBuildContext(
+            NodeAdapterBuildContext(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
                 name="reset_sim",
                 node_instance_id="reset_sim",
                 parameters={},
@@ -841,7 +858,7 @@ def test_top_level_value_source_is_one_attempt_snapshot() -> None:
     resolver = build_executable_node_resolver(build_node_environment())
     node = resolver.instantiate(
         build_node_environment().registry.record("logic.check_condition"),
-        NodeAdapterBuildContext(
+        NodeAdapterBuildContext(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
             name="check_flag",
             node_instance_id="check_flag",
             parameters=program.tree.parameters,
@@ -1392,7 +1409,7 @@ def test_model_request_preserves_nonblocking_and_atomic_bundle_semantics() -> No
     resolver = build_executable_node_resolver(build_node_environment())
     adapter = resolver.instantiate(
         build_node_environment().registry.record("assistant.query_model"),
-        NodeAdapterBuildContext(
+        NodeAdapterBuildContext(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
             name=query.instance_id,
             node_instance_id=query.instance_id,
             parameters=query.parameters,
@@ -1464,6 +1481,7 @@ def test_program_run_reuses_thin_ports_and_preserves_portable_inputs() -> None:
     assert len(task.starts) == 1
 
 
+@pytest.mark.slow
 def test_all_maintained_program_node_forms_execute_through_the_closed_runner() -> None:
     sources = tuple(
         sorted(
@@ -1662,7 +1680,7 @@ def test_timed_nodes_require_the_runs_program_clock(node_id: str) -> None:
     with pytest.raises(ExecutableNodeResolverError, match="Program clock"):
         build_executable_node_resolver(environment).instantiate(
             environment.registry.record(node_id),
-            NodeAdapterBuildContext(
+            NodeAdapterBuildContext(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
                 name="leaf",
                 node_instance_id="leaf",
                 parameters={},
@@ -1696,7 +1714,7 @@ def test_every_cancellable_leaf_adapter_reports_interrupted_and_no_other_does() 
             parameters["target_role"] = "arm"
         adapter = resolver.instantiate(
             disposition.row,
-            NodeAdapterBuildContext(
+            NodeAdapterBuildContext(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
                 name="leaf",
                 node_instance_id="leaf",
                 parameters=parameters,
@@ -1740,7 +1758,7 @@ def _owner_task_adapter(node_id: str, task: _TaskPort, **context: Any):
     program = Program.from_dict(_identified(_minimal_document()), _catalog())
     return build_executable_node_resolver(environment).instantiate(
         environment.registry.record(node_id),
-        NodeAdapterBuildContext(
+        NodeAdapterBuildContext(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
             name="leaf",
             node_instance_id="leaf",
             parameters={},
@@ -2215,6 +2233,7 @@ def test_key_typed_value_is_checked_again_at_node_attempt_time() -> None:
         (_key("n", "string"), "slot a", "!=", "slot a", None, False),
     ],
 )
+@pytest.mark.slow
 def test_check_value_compares_by_key_type(
     key, actual, operator, value, tolerance, matched
 ) -> None:
@@ -2276,7 +2295,7 @@ def test_wait_for_value_times_out_on_the_program_clock_and_retry_is_fresh() -> N
     store = ProgramValueStore.from_program(program)
     node = build_executable_node_resolver(build_node_environment()).instantiate(
         build_node_environment().registry.record("logic.wait_for_value"),
-        NodeAdapterBuildContext(
+        NodeAdapterBuildContext(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
             name="wait",
             node_instance_id="wait",
             parameters=wait.parameters,
@@ -2333,7 +2352,7 @@ def _held_wait(
     state = OperatorMotionStopState({"wait": ()}, clock=clock.now)
     node = build_executable_node_resolver(build_node_environment()).instantiate(
         build_node_environment().registry.record(node_id),
-        NodeAdapterBuildContext(
+        NodeAdapterBuildContext(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
             name="wait",
             node_instance_id="wait",
             parameters=wait.parameters,
@@ -2537,23 +2556,19 @@ def test_set_tcp_pre_admission_refusal_preserves_owner_code_and_reason() -> None
     assert terminal.details["reason"] == "tcp_tool_not_mounted"
 
 
-def test_set_tcp_gated_refusal_preserves_owner_code_and_reason() -> None:
+def test_set_tcp_rule_holds_refusal_preserves_the_kernel_code() -> None:
     from manyforge_behavior.kernel_client import KernelOperationAdmissionRejectedError
-    from manyforge_behavior.orchestration_ports import OwnerInvocationGatedError
 
     class Refused(_TaskPort):
         def start(self, node_id, identity, inputs):
-            refusal = KernelOperationAdmissionRejectedError(
-                "execution_rejected", "rule is active",
-                {"reason": "global_interrupt_gated"},
+            raise KernelOperationAdmissionRejectedError(
+                "rule_holds", "Rule rule.1 holds its scope", {"rule_id": "rule.1"},
             )
-            raise OwnerInvocationGatedError("rule.1", refusal)
 
     run = _set_tcp_stop_run(policy="continue", task=Refused())
     assert run.tick_once() is py_trees.common.Status.FAILURE
     leaf = _leaf_node(run, "first")
-    assert leaf.failure_reason_code == "execution_rejected"
-    assert leaf.failure_details["reason"] == "global_interrupt_gated"
+    assert leaf.failure_reason_code == "rule_holds"
 
 
 def test_set_tcp_admitted_failure_preserves_owner_code_and_reason() -> None:
@@ -2898,6 +2913,7 @@ def test_timer_input_failure_exhausts_an_enclosing_retry_by_name() -> None:
         ),
     ],
 )
+@pytest.mark.slow
 def test_input_failures_name_the_problem_path_and_source(
     keys: list[dict[str, Any]],
     value_sources: dict[str, Any],
@@ -3013,6 +3029,7 @@ def test_retry_count_comes_from_its_value_source() -> None:
 
 @pytest.mark.parametrize("node_id", ["repeat", "retry"])
 @pytest.mark.parametrize("initial", [None, 0, -2, 1_000_001])
+@pytest.mark.slow
 def test_missing_or_invalid_sourced_count_fails_by_name_never_unlimited(
     node_id: str, initial: int | None
 ) -> None:
@@ -3271,6 +3288,7 @@ def test_offset_pose_across_frames_fails_by_name_without_a_transform_owner() -> 
         ((1.01, 0.5, 0.5), True, False),
     ],
 )
+@pytest.mark.slow
 def test_check_pose_bounds_is_an_axis_aligned_box_in_one_frame(
     position, inclusive, inside
 ) -> None:
@@ -3347,6 +3365,7 @@ def test_check_pose_bounds_refuses_an_empty_box_and_an_undeclared_frame_pair() -
         )
 
 
+@pytest.mark.slow
 def test_check_pose_distance_expresses_pose_b_in_pose_a_frame() -> None:
     def distance(
         first: dict[str, Any], second: dict[str, Any], frames: _FramePort | None = None
@@ -3503,6 +3522,7 @@ def test_field_expressions_and_computed_keys_resolve_from_one_snapshot() -> None
         ({"value_sources": {"condition": _expression("!(key.index > 1)")}}, py_trees.common.Status.FAILURE),
     ],
 )
+@pytest.mark.slow
 def test_check_condition_succeeds_only_while_its_condition_is_true(condition, status) -> None:
     program = _typed_program(
         [_key("index", "int64", initial=2)],
@@ -3874,6 +3894,7 @@ def test_behavior_stop_policy_oracle_for_inherited_chain_and_leaf_default(
         }), False),
     ],
 )
+@pytest.mark.slow
 def test_behavior_stop_policy_oracle_for_explicit_overrides_and_mixed_ancestors(
     selection_id: str, selected: frozenset[str], child_runs: bool,
 ) -> None:
@@ -3981,6 +4002,7 @@ def test_pneumatic_program_dwell_starts_at_first_observed_success_and_ack_once()
 
 @pytest.mark.parametrize("mode", [None, "pause", "count"])
 @pytest.mark.parametrize("policy", ["hold", "continue"])
+@pytest.mark.slow
 def test_pneumatic_program_dwell_uses_timer_hold_and_continue_rules(mode, policy):
     now = [100.0]
     run, task, _clock = _program_dwell_run(now, mode=mode, policy=policy)
@@ -4041,6 +4063,7 @@ def test_pneumatic_program_dwell_overlaps_pending_ack_and_halt(ack_at):
 
 
 @pytest.mark.parametrize("dwell", [0.0, 2.0])
+@pytest.mark.slow
 def test_pneumatic_program_dwell_zero_and_final_delivery_failure(dwell):
     now = [100.0]
     run, task, _clock = _program_dwell_run(now, dwell=dwell)

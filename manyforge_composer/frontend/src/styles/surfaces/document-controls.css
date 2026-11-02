@@ -166,7 +166,7 @@
   position: absolute;
   top: calc(100% + 0.3rem);
   left: 50%;
-  z-index: var(--mf-z-popover);
+  z-index: var(--mf-z-tooltip);
   width: max-content;
   max-width: 16rem;
   padding: 0.18rem 0.45rem;
@@ -430,7 +430,7 @@
   line-height: 1.45;
 }
 
-.deployment-apply-impact {
+.apply-impact {
   display: grid;
   gap: 0.35rem;
   color: var(--mf-text-neutral-68);
@@ -438,12 +438,12 @@
   line-height: 1.4;
 }
 
-.deployment-apply-impact ul,
-.deployment-apply-impact p {
+.apply-impact ul,
+.apply-impact p {
   margin: 0;
 }
 
-.deployment-apply-impact ul {
+.apply-impact ul {
   padding-left: 1.1rem;
 }
 

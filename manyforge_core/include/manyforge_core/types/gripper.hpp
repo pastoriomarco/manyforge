@@ -86,6 +86,9 @@ struct GripperCommandRequestDTO {
   std::string joint_name;
   double target_position = 0.0;
   double duration_s = 0.0;
+  /// GRP-2: complete only when the controller reports done and duration_s has
+  /// elapsed since the command started (else on the controller's report).
+  bool wait_for_duration = false;
   std::optional<double> max_effort;
 
   std::string commanded_state;
@@ -188,6 +191,9 @@ struct GripperCommandStatusDTO {
   /// Destructive lifecycle generation; pneumatic Stop's admission-only fence
   /// does not retire it. Reset/replacement/shutdown still do.
   std::uint64_t lifecycle_generation{};
+  /// A Stop/Reset cancel was sent and the controller has not yet reported
+  /// that goal's terminal (Q58: the Stop does not wait for it).
+  bool cancellation_pending{};
 };
 
 }  // namespace manyforge::core

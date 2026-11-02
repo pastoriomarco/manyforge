@@ -458,4 +458,44 @@ describe('ProgramPropertyEditor trip preset', () => {
       await act(() => root.unmount());
     }
   });
+
+  it('shows one Trip outcome card for each selected node, across selection changes', async () => {
+    const leaf = (node_id: string, instance_id: string): ProgramTreeNode => ({
+      node_id, instance_id, parameters: {}, children: [],
+    });
+    const forest = [
+      leaf('motion.move_until_signal', 'search_trip'),
+      leaf('motion.move_until_signal', 'search_no_trip'),
+      leaf('motion.probe_search', 'probe_no_trip'),
+      leaf('scene.attach_carried_object', 'attach_part'),
+      leaf('motion.move_until_signal', 'end_rest'),
+    ];
+    const catalogEntries = [
+      entry('motion.move_until_signal', 'Move until signal'),
+      entry('motion.probe_search', 'Probe search'),
+      entry('scene.attach_carried_object', 'Attach object'),
+    ];
+    // Deleted host elements lose their React props, so `all` counts mounted cards only.
+    const { host, all } = reactPropsHost();
+    const { createRoot } = await import('react-dom/client');
+    const root = createRoot(host as unknown as Element);
+    const select = (selectedId: string) => act(() => root.render(<ProgramPropertyEditor
+      roots={forest}
+      selectedId={selectedId}
+      catalogEntries={catalogEntries}
+      program={{ ...program, forest }}
+      busy={false}
+      onMutate={vi.fn()}
+      onUpdateNodePolicies={vi.fn()}
+    />));
+    try {
+      for (const { instance_id } of [...forest, forest[0]!, forest[1]!]) {
+        await select(instance_id);
+        expect(all((props) => props['aria-label'] === 'Trip outcome')).toHaveLength(1);
+        expect(all((props) => props.className === 'program-policy-editor dcard')).toHaveLength(1);
+      }
+    } finally {
+      await act(() => root.unmount());
+    }
+  });
 });

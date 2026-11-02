@@ -16,6 +16,9 @@ POINTCLOUD_OBSERVATION_VERSION: Final = 1
 POINTCLOUD_PROTOCOL_ID: Final = "manyforge.pointcloud_observation.v1"
 POINTCLOUD_STATUS_SCHEMA: Final = "manyforge.viewer_pointcloud_status.v2"
 POINTCLOUD_RECEIPT_SCHEMA: Final = "manyforge.pointcloud_observation_receipt.v1"
+# The one point-cloud sender the Composer accepts unless
+# MANYFORGE_POINTCLOUD_OWNER_ID names another (the same setting on both sides).
+POINTCLOUD_DEFAULT_OWNER_ID: Final = "manyforge.pointcloud"
 POINTCLOUD_MAX_POINTS: Final = 200_000
 POINTCLOUD_MAX_PACKET_BYTES: Final = 3_002_048
 POINTCLOUD_MEDIA_TYPE: Final = (
@@ -308,6 +311,7 @@ def decode_pointcloud_observation(packet: bytes) -> PointCloudObservation:
 
 
 __all__ = [
+    "POINTCLOUD_DEFAULT_OWNER_ID",
     "POINTCLOUD_MAX_PACKET_BYTES",
     "POINTCLOUD_MAX_POINTS",
     "POINTCLOUD_MEDIA_TYPE",

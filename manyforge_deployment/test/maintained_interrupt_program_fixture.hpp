@@ -76,7 +76,6 @@ LoadMaintainedInterruptProgram(
   options.capability_ids = {"execution.feedback.phase_events",
                             "execution.trajectory.execute",
                             "planning.motion.pose_goal",
-                            "planning.profile.balanced",
                             "planning.trajectory.time_parameterized",
                             "state.observed.current",
                             "validation.trajectory.non_collision"};

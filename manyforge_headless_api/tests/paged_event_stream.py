@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from threading import Event
 from typing import Any, Iterator
 
+from manyforge_headless_api.execution import COMPONENT_MODEL_STATE_FIELDS
 from manyforge_headless_api.execution_event_stream import EVENT_STREAM_API_VERSION
 from manyforge_headless_api.native import HeadlessApiError
 
@@ -35,6 +36,7 @@ def _state(page: dict[str, Any]) -> dict[str, Any]:
         "interrupt_rule_catalog": page.get("interrupt_rule_catalog"),
         "interrupt_rule_state_baseline": page.get("interrupt_rule_state_baseline"),
         "runtime_faults": page["runtime_faults"],
+        **{name: page[name] for name in COMPONENT_MODEL_STATE_FIELDS if name in page},
     }
 
 

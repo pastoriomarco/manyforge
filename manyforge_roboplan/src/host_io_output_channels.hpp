@@ -1,7 +1,6 @@
 #pragma once
 
 #include <cstdint>
-#include <manyforge_core/io_output_participant_engine.hpp>
 #include <manyforge_deployment/io_signal_catalog.hpp>
 #include <manyforge_roboplan/mock_boolean_output_provider.hpp>
 #include <manyforge_roboplan/ros_boolean_output_provider.hpp>
@@ -24,6 +23,9 @@ struct HostIoOutputAliasInstallation final {
   std::uint64_t prepared_driver_generation;
   std::weak_ptr<const void> actual_driver_owner;
   core::ActiveBundlePublicationGeneration active_publication_generation;
+  /// The owning device's authored `output_source_ack_timeout_s` (SetBool
+  /// outputs; CONTRACTS §7).
+  core::Duration ack_timeout_ns{};
 };
 
 // Captured only from a qualified predecessor Entry and its sealed GPIO row.
@@ -38,11 +40,8 @@ struct HostIoOutputChannelEntry final {
   using Provider = std::variant<std::shared_ptr<MockBooleanOutputProvider>,
                                 std::shared_ptr<RosBooleanOutputProvider>>;
 
-  HostIoOutputChannelEntry(
-      core::ResourceId resource, Provider output_provider,
-      std::unique_ptr<core::IoOutputParticipantEngine> output_engine)
-      : resource_id(std::move(resource)), provider(std::move(output_provider)),
-        engine(std::move(output_engine)) {}
+  HostIoOutputChannelEntry(core::ResourceId resource, Provider output_provider)
+      : resource_id(std::move(resource)), provider(std::move(output_provider)) {}
   HostIoOutputChannelEntry(HostIoOutputChannelEntry &&) noexcept = default;
   HostIoOutputChannelEntry(const HostIoOutputChannelEntry &) = delete;
   HostIoOutputChannelEntry &
@@ -50,14 +49,12 @@ struct HostIoOutputChannelEntry final {
   HostIoOutputChannelEntry &operator=(HostIoOutputChannelEntry &&) = delete;
 
   core::ResourceId resource_id;
-  // Destruction order keeps the leaf alive until its engine is destroyed.
   Provider provider;
-  std::unique_ptr<core::IoOutputParticipantEngine> engine;
 };
 
-// Typed SetBool/UR/GPIO addresses retain their complete qualified selectors;
-// channel grouping never drops a pin, group or interface.
-// One initially paused leaf and one subordinate engine per physical channel,
+// Typed SetBool/GPIO addresses retain their complete qualified selectors;
+// channel grouping never drops a group or interface.
+// One initially paused leaf per physical channel,
 // with separate gates for its exact provider occurrences. Uses the existing
 // node/executor/clock; does not create a worker, timer, registry or policy.
 // Known predecessor pins and newly created GPIO channels share the actual

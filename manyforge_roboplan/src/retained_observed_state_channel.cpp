@@ -245,7 +245,7 @@ publication_config(const core::RuntimeParticipantBinding &binding,
   if (sources.empty()) {
     sources.push_back(core::ObservedRobotStateSourceConfig{
         numeric_source_kind(config.source_kind), config.source_id, profile,
-        config.freshness_budget_ns, "retained_native_state_authority"});
+        config.freshness_budget_ns, "retained_state_authority"});
   } else if (sources.front().kind != numeric_source_kind(config.source_kind) ||
              sources.front().source_id != config.source_id ||
              sources.front().authority_profile != profile) {

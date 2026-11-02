@@ -1,12 +1,14 @@
 #include <algorithm>
 #include <deque>
 #include <limits>
+#include <manyforge_core/execution_event_change_signal.hpp>
 #include <manyforge_core/io_condition_evaluator.hpp>
 #include <manyforge_core/io_signal_descriptor.hpp>
 #include <manyforge_core/io_signal_subsystem.hpp>
 #include <map>
 #include <mutex>
 #include <set>
+#include <tuple>
 #include <utility>
 #include <variant>
 
@@ -62,6 +64,9 @@ struct IoSignalSubsystem::State final {
     IoSignalDescriptorDTO descriptor;
     std::optional<IoSignalSampleDTO> latest;
     std::uint64_t latest_loss_generation{};
+    /// Outputs with read-back that aren't controller owned: the core-held
+    /// `changed_outside` signal of this output (CONTRACTS §7).
+    std::optional<IoSignalId> changed_outside{};
   };
   struct Source final {
     std::optional<IoSourceIncarnation> incarnation;
@@ -74,6 +79,9 @@ struct IoSignalSubsystem::State final {
     std::deque<IoSignalRecordDTO> records;
     std::size_t record_capacity{};
     bool blackboard_source{};
+    /// The source of one core-held `changed_outside` signal; never published
+    /// to, lost or replaced from outside.
+    bool core_held{};
     bool blackboard_continuity_lost{};
     std::optional<IoProgramBlackboardSourceBindingDTO> blackboard_binding;
     std::shared_ptr<const IoProgramBlackboardSnapshotDTO> blackboard_snapshot;
@@ -123,6 +131,102 @@ struct IoSignalSubsystem::State final {
       const auto id = descriptor.signal_id;
       signals.emplace(id, Signal{std::move(descriptor), std::nullopt});
     }
+    // Every core-held `changed_outside` signal is an always-fresh in-process
+    // input on its own core source, starting false.
+    const auto now = clock.now();
+    std::vector<IoSignalDescriptorDTO> derived;
+    for (auto& [output_id, output] : signals) {
+      if (!HoldsChangedOutside(output.descriptor)) continue;
+      const auto id = ChangedOutsideSignalId(output_id);
+      const auto source_id = ChangedOutsideSourceId(output_id);
+      auto& source = sources[source_id];
+      source.incarnation = IoSourceIncarnation("core");
+      source.available = true;
+      source.core_held = true;
+      source.record_capacity = limits.records_per_source;
+      output.changed_outside = id;
+      derived.push_back({id, source_id, IoSignalValueType::kBoolean, IoSignalDirection::kInput,
+          IoSignalUpdateMode::kChangeOnly, IoTransitionCapability::kSampledOnly,
+          {IoFreshnessMode::kProviderValidity, std::nullopt}, std::nullopt,
+          IoSignalLivenessMode::kInProcess});
+    }
+    for (auto& descriptor : derived) {
+      const auto id = descriptor.signal_id;
+      const auto source_id = descriptor.source_id;
+      signals.emplace(id, Signal{std::move(descriptor), std::nullopt});
+      Commit({source_id, IoSourceIncarnation("core"), 1U, now,
+              {{id, IoSampleValidity::kValid, false, std::nullopt}}});
+    }
+  }
+
+  /// Applies one validated acquisition: samples, record, watches, rules. An
+  /// output sample entering `outside` sets its `changed_outside` signal; one
+  /// entering `manyforge_write` (our accepted write) clears it.
+  IoSourceCursorDTO Commit(const IoSourceAcquisitionDTO& acquisition) {
+    auto& source = sources.at(acquisition.source_id);
+    const bool gap = source.last_source_sequence != 0U &&
+                     acquisition.source_sequence - source.last_source_sequence != 1U;
+    if (gap) {
+      ++source.loss_generation;
+      Append(acquisition.source_id, source, std::nullopt,
+             IoSourceLossDTO{IoSourceLossReason::kSequenceGap, source.last_source_sequence,
+                             source.last_source_sequence + 1U,
+                             acquisition.source_sequence - 1U, std::nullopt, std::nullopt});
+    }
+    std::vector<std::pair<IoSignalId, bool>> outside_changes;
+    // Commit the entire source acquisition before any watch evaluation.
+    for (const auto& update : acquisition.updates) {
+      auto& signal = signals.at(update.signal_id);
+      if (signal.changed_outside && update.validity == IoSampleValidity::kValid) {
+        const auto& prior = signal.latest;
+        const bool repeated = prior && prior->publication.source == update.source &&
+                              prior->publication.value == update.value;
+        if (!repeated && update.source == IoSignalSampleSource::kOutside)
+          outside_changes.emplace_back(update.signal_id, true);
+        if (!repeated && update.source == IoSignalSampleSource::kManyforgeWrite)
+          outside_changes.emplace_back(update.signal_id, false);
+      }
+      signal.latest = IoSignalSampleDTO{
+          {update.signal_id, acquisition.source_id, acquisition.incarnation,
+           acquisition.source_sequence, update.validity, update.value, update.error, update.source},
+          acquisition.trusted_received_at_ns};
+      signal.latest_loss_generation = source.loss_generation;
+    }
+    source.last_source_sequence = acquisition.source_sequence;
+    source.last_received_at_ns = acquisition.trusted_received_at_ns;
+    source.available = true;
+    source.error.reset();
+    Append(acquisition.source_id, source, acquisition, std::nullopt);
+    const auto now = clock.now();
+    for (const auto& update : acquisition.updates) {
+      const auto& signal = signals.at(update.signal_id);
+      if (Availability(signal, now) != IoSignalAvailability::kFresh) continue;
+      for (auto& [watch_id, registration] : watches) {
+        (void)watch_id;
+        auto* watch = std::get_if<Watch>(&registration);
+        if (watch && !watch->matched && watch->signal_id == update.signal_id &&
+            watch->expected_value == *update.value)
+          watch->matched = signal.latest;
+      }
+    }
+    const IoRuleAcquisitionKeyDTO acquired{acquisition.source_id, acquisition.incarnation,
+                                           acquisition.source_sequence,
+                                           Cursor(acquisition.source_id, source)};
+    EvaluateRegisteredRules(now, true, &acquired);
+    const auto cursor = Cursor(acquisition.source_id, source);
+    for (const auto& [output, changed] : outside_changes) SetChangedOutside(output, changed, now);
+    return cursor;
+  }
+
+  /// One change of an output's core-held `changed_outside` signal.
+  void SetChangedOutside(const IoSignalId& output, bool value, TimePoint now) {
+    const auto& derived_id = *signals.at(output).changed_outside;
+    const auto& derived = signals.at(derived_id);
+    if (derived.latest && derived.latest->publication.value == std::optional(value)) return;
+    const auto& source_id = derived.descriptor.source_id;
+    const auto& source = sources.at(source_id);
+    Commit({source_id, *source.incarnation, source.last_source_sequence + 1U, now,
+            {{derived_id, IoSampleValidity::kValid, value, std::nullopt}}});
   }
 
   IoSourceCursorDTO Cursor(const InterruptSourceId& id, const Source& source) const {
@@ -388,7 +492,8 @@ struct IoSignalSubsystem::State final {
     const auto found = sources.find(acquisition.source_id);
     if (found == sources.end()) return Result<void>::Err(invalid("io_source_unknown"));
     const auto& source = found->second;
-    if (source.blackboard_source) return Result<void>::Err(invalid("io_source_kind_mismatch"));
+    if (source.blackboard_source || source.core_held)
+      return Result<void>::Err(invalid("io_source_kind_mismatch"));
     if (!source.incarnation || *source.incarnation != acquisition.incarnation)
       return Result<void>::Err(stale("io_source_incarnation_stale"));
     if (acquisition.source_sequence == 0U ||
@@ -400,6 +505,11 @@ struct IoSignalSubsystem::State final {
       const auto& update = acquisition.updates[index];
       const auto signal = signals.find(update.signal_id);
       if (signal == signals.end()) return Result<void>::Err(invalid("io_signal_unknown"));
+      if (update.source != IoSignalSampleSource::kDevice &&
+          update.source != IoSignalSampleSource::kManyforgeWrite &&
+          update.source != IoSignalSampleSource::kOutside &&
+          update.source != IoSignalSampleSource::kLastWrite)
+        return Result<void>::Err(invalid("io_sample_shape_invalid"));
       if (signal->second.descriptor.source_id != acquisition.source_id)
         return Result<void>::Err(invalid("io_signal_source_mismatch"));
       for (std::size_t prior = 0; prior < index; ++prior)
@@ -435,6 +545,7 @@ struct IoSignalSubsystem::State final {
     const auto found = sources.find(id);
     if (found == sources.end()) return Result<void>::Err(invalid("io_source_unknown"));
     auto& source = found->second;
+    if (source.core_held) return Result<void>::Err(invalid("io_source_kind_mismatch"));
     if (!source.incarnation || *source.incarnation != incarnation)
       return Result<void>::Err(stale("io_source_incarnation_stale"));
     if (expected_source_sequence && *expected_source_sequence != source.last_source_sequence)
@@ -504,6 +615,33 @@ struct IoSignalSubsystem::State final {
   std::map<InterruptSourceId, Source> sources;
   std::map<std::uint64_t, Registration> watches;
   std::uint64_t last_watch_id{};
+  /// What `signal_samples` last showed of each signal: value, source and
+  /// freshness (CONTRACTS §7 `SignalSample` without its age).
+  using PublishedSample =
+      std::tuple<std::optional<std::variant<bool, double>>, IoSignalSampleSource, bool>;
+  std::map<IoSignalId, PublishedSample> published_samples;
+
+  /// Raises the event-stream change signal when a sample's value, source or
+  /// freshness changed since the last call; the age alone never does.
+  void NotifySampleChanges() {
+    const auto now = clock.now();
+    bool changed = false;
+    for (const auto& [id, signal] : signals) {
+      PublishedSample current{std::nullopt, IoSignalSampleSource::kDevice,
+                              Availability(signal, now) == IoSignalAvailability::kFresh};
+      if (signal.latest) {
+        if (signal.latest->publication.value)
+          std::get<0>(current) = *signal.latest->publication.value;
+        std::get<1>(current) = signal.latest->publication.source;
+      }
+      auto [row, inserted] = published_samples.try_emplace(id, current);
+      if (inserted || row->second != current) {
+        row->second = std::move(current);
+        changed = true;
+      }
+    }
+    if (changed) execution_event_change_signal().Notify();
+  }
 };
 
 Result<std::unique_ptr<IoSignalSubsystem>> IoSignalSubsystem::Create(IoSignalCatalogDTO catalog,
@@ -525,6 +663,19 @@ Result<std::unique_ptr<IoSignalSubsystem>> IoSignalSubsystem::Create(IoSignalCat
   }
   std::map<IoSignalId, bool> identities;
   std::map<InterruptSourceId, bool> sources;
+  for (const auto& signal : catalog.signals) {
+    // Only outputs carry controller ownership and read-back; each core-held
+    // `changed_outside` signal counts against the bounds like any signal.
+    if (signal.direction == IoSignalDirection::kInput &&
+        (signal.controller_owned || signal.readback))
+      return Reply::Err(invalid("io_signal_descriptor_invalid"));
+    if (HoldsChangedOutside(signal) &&
+        (!identities.emplace(ChangedOutsideSignalId(signal.signal_id), true).second ||
+         !sources.emplace(ChangedOutsideSourceId(signal.signal_id), true).second))
+      return Reply::Err(invalid("io_signal_identity_invalid"));
+  }
+  if (identities.size() + catalog.signals.size() > limits.maximum_signals)
+    return Reply::Err(invalid("io_catalog_bounds_invalid"));
   for (const auto& signal : catalog.signals) {
     if (!text_valid(signal.signal_id.controllable_component_id.value(), limits.maximum_identity_bytes) ||
         !text_valid(signal.signal_id.name, limits.maximum_identity_bytes) ||
@@ -836,7 +987,8 @@ Result<void> IoSignalSubsystem::InstallSource(
   if (!text_valid(incarnation.value(), state_->limits.maximum_identity_bytes))
     return Result<void>::Err(invalid("io_source_incarnation_invalid"));
   auto& source = found->second;
-  if (source.blackboard_source) return Result<void>::Err(invalid("io_source_kind_mismatch"));
+  if (source.blackboard_source || source.core_held)
+    return Result<void>::Err(invalid("io_source_kind_mismatch"));
   if (source.incarnation == incarnation) return Result<void>::Ok();
   if (source.incarnation != expected_current_incarnation)
     return Result<void>::Err(stale("io_source_install_predecessor_stale"));
@@ -860,6 +1012,7 @@ Result<void> IoSignalSubsystem::InstallSource(
                                                            old_sequence, std::nullopt, std::nullopt,
                                                            std::nullopt, std::nullopt})
                            : std::nullopt);
+  state_->NotifySampleChanges();
   return Result<void>::Ok();
 }
 
@@ -875,54 +1028,16 @@ Result<IoSourceCursorDTO> IoSignalSubsystem::Publish(const IoSourceAcquisitionDT
   const auto valid = state_->Validate(acquisition);
   if (!valid.ok()) return Reply::Err(valid.error());
   state_->EvaluateRegisteredRules(state_->clock.now(), false);
-  auto& source = state_->sources.at(acquisition.source_id);
-  const bool gap = source.last_source_sequence != 0U &&
-                   acquisition.source_sequence - source.last_source_sequence != 1U;
-  if (gap) {
-    ++source.loss_generation;
-    state_->Append(acquisition.source_id, source, std::nullopt,
-                   IoSourceLossDTO{IoSourceLossReason::kSequenceGap, source.last_source_sequence,
-                                   source.last_source_sequence + 1U,
-                                   acquisition.source_sequence - 1U, std::nullopt, std::nullopt});
-  }
-  // Commit the entire source acquisition before any watch evaluation.
-  for (const auto& update : acquisition.updates) {
-    auto& signal = state_->signals.at(update.signal_id);
-    signal.latest = IoSignalSampleDTO{
-        {update.signal_id, acquisition.source_id, acquisition.incarnation,
-         acquisition.source_sequence, update.validity, update.value, update.error},
-        acquisition.trusted_received_at_ns};
-    signal.latest_loss_generation = source.loss_generation;
-  }
-  source.last_source_sequence = acquisition.source_sequence;
-  source.last_received_at_ns = acquisition.trusted_received_at_ns;
-  source.available = true;
-  source.error.reset();
-  state_->Append(acquisition.source_id, source, acquisition, std::nullopt);
-  const auto now = state_->clock.now();
-  for (const auto& update : acquisition.updates) {
-    const auto& signal = state_->signals.at(update.signal_id);
-    if (state_->Availability(signal, now) != IoSignalAvailability::kFresh) continue;
-    for (auto& [watch_id, registration] : state_->watches) {
-      (void)watch_id;
-      auto* watch = std::get_if<State::Watch>(&registration);
-      if (watch && !watch->matched && watch->signal_id == update.signal_id &&
-          watch->expected_value == *update.value)
-        watch->matched = signal.latest;
-    }
-  }
-  const IoRuleAcquisitionKeyDTO acquired{acquisition.source_id, acquisition.incarnation,
-                                         acquisition.source_sequence,
-                                         state_->Cursor(acquisition.source_id, source)};
-  state_->EvaluateRegisteredRules(now, true, &acquired);
-  return Reply::Ok(state_->Cursor(acquisition.source_id, source));
+  const auto cursor = state_->Commit(acquisition);
+  state_->NotifySampleChanges();
+  return Reply::Ok(cursor);
 }
 
 Result<IoSignalIngressConfigurationDTO> IoSignalSubsystem::IngressConfiguration() const {
   std::lock_guard lock(state_->mutex);
   IoSignalIngressConfigurationDTO configuration{state_->limits, {}};
   for (const auto& [id, source] : state_->sources) {
-    if (source.blackboard_source) continue;
+    if (source.blackboard_source || source.core_held) continue;
     if (!source.incarnation)
       return Result<IoSignalIngressConfigurationDTO>::Err(invalid("io_source_not_installed"));
     configuration.sources.push_back({id, *source.incarnation, source.last_source_sequence,
@@ -935,10 +1050,12 @@ Result<void> IoSignalSubsystem::ReportIngressLoss(const IoIngressLossBarrierDTO&
   std::lock_guard lock(state_->mutex);
   // Typed loss evidence needs no generated error text or adapter error budget.
   // LoseSource fences incarnation before validating an obsolete event's shape.
-  return state_->LoseSource(
+  auto lost = state_->LoseSource(
       barrier.source_id, barrier.incarnation,
       barrier.disconnected ? IoSourceLossReason::kDisconnected : IoSourceLossReason::kIngressLoss,
       std::nullopt, std::nullopt, barrier);
+  state_->NotifySampleChanges();
+  return lost;
 }
 
 Result<std::vector<IoSignalObservationDTO>> IoSignalSubsystem::ReadSignals(
@@ -962,15 +1079,19 @@ Result<void> IoSignalSubsystem::MarkSourceUnavailable(const InterruptSourceId& s
                                                       std::uint64_t expected_source_sequence,
                                                       const ErrorDTO& error) {
   std::lock_guard lock(state_->mutex);
-  return state_->LoseSource(source, incarnation, IoSourceLossReason::kDisconnected, error,
-                            expected_source_sequence);
+  auto lost = state_->LoseSource(source, incarnation, IoSourceLossReason::kDisconnected, error,
+                                 expected_source_sequence);
+  state_->NotifySampleChanges();
+  return lost;
 }
 
 Result<void> IoSignalSubsystem::ReportIngressOverflow(const InterruptSourceId& source,
                                                       const IoSourceIncarnation& incarnation,
                                                       const ErrorDTO& error) {
   std::lock_guard lock(state_->mutex);
-  return state_->LoseSource(source, incarnation, IoSourceLossReason::kIngressOverflow, error);
+  auto lost = state_->LoseSource(source, incarnation, IoSourceLossReason::kIngressOverflow, error);
+  state_->NotifySampleChanges();
+  return lost;
 }
 
 Result<IoSignalRecordPageDTO> IoSignalSubsystem::ReadRecords(const IoSourceCursorDTO& after,
@@ -1222,6 +1343,51 @@ Result<std::optional<TimePoint>> IoSignalSubsystem::NextRuleExpiry() const {
     }
   }
   return Result<std::optional<TimePoint>>::Ok(next);
+}
+
+Result<void> IoSignalSubsystem::ClearOutsideChange(const IoSignalId& output) {
+  std::lock_guard lock(state_->mutex);
+  const auto found = state_->signals.find(output);
+  if (found == state_->signals.end()) return Result<void>::Err(invalid("io_signal_unknown"));
+  if (!found->second.changed_outside)
+    return Result<void>::Err(invalid("io_signal_changed_outside_unavailable"));
+  state_->SetChangedOutside(output, false, state_->clock.now());
+  state_->NotifySampleChanges();
+  return Result<void>::Ok();
+}
+
+Result<void> IoSignalSubsystem::ClearComponentOutsideChanges(
+    const ControllableComponentId& component) {
+  std::lock_guard lock(state_->mutex);
+  const auto now = state_->clock.now();
+  for (const auto& [id, signal] : state_->signals)
+    if (id.controllable_component_id == component && signal.changed_outside)
+      state_->SetChangedOutside(id, false, now);
+  state_->NotifySampleChanges();
+  return Result<void>::Ok();
+}
+
+std::optional<TimePoint> IoSignalSubsystem::NextSampleExpiry() const {
+  std::lock_guard lock(state_->mutex);
+  std::optional<TimePoint> next;
+  const auto now = state_->clock.now();
+  for (const auto& [id, signal] : state_->signals) {
+    (void)id;
+    if (signal.descriptor.freshness.mode == IoFreshnessMode::kProviderValidity ||
+        state_->Availability(signal, now) != IoSignalAvailability::kFresh)
+      continue;
+    const auto receipt = signal.latest->received_at_ns;
+    const auto age = *signal.descriptor.freshness.maximum_age_ns;
+    if (receipt > std::numeric_limits<TimePoint>::max() - age - 1) continue;
+    const auto expiry = receipt + age + 1;
+    if (!next || expiry < *next) next = expiry;
+  }
+  return next;
+}
+
+void IoSignalSubsystem::RefreshSamples() {
+  std::lock_guard lock(state_->mutex);
+  state_->NotifySampleChanges();
 }
 
 Result<IoSignalObservationDTO> IoSignalSubsystem::ReadSignal(const IoSignalId& signal) const {

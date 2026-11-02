@@ -176,7 +176,6 @@ def _reset_runtime(
     monkeypatch.setattr(runtime, "_establish_startup_bbkey_source", lambda: None)
     monkeypatch.setattr(runtime, "_follow_cell_bbkey_source", lambda: None)
     monkeypatch.setattr(runtime, "_prepare_scene_after_reset", scene)
-    monkeypatch.setattr(runtime, "_clear_reset_stop_fault", lambda _request: None)
     runtime.start()
     runtime._reconcile_persistent_keys(register)  # noqa: SLF001
     _stored(register)

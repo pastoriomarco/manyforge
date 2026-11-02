@@ -65,6 +65,16 @@ class IIoSignalService {
   virtual Result<std::optional<TimePoint>> NextRuleExpiry() const {
     return Result<std::optional<TimePoint>>::Err(RuleUnsupported());
   }
+  /// CONTRACTS §7: clears one output's core-held `changed_outside` signal
+  /// (node `io.clear_outside_change`); refused for an output without it.
+  virtual Result<void> ClearOutsideChange(const IoSignalId&) {
+    return Result<void>::Err(ChangedOutsideUnsupported());
+  }
+  /// Clears every `changed_outside` signal of a component that became
+  /// `prepared` (the value at that moment isn't a change).
+  virtual Result<void> ClearComponentOutsideChanges(const ControllableComponentId&) {
+    return Result<void>::Err(ChangedOutsideUnsupported());
+  }
   virtual Result<IoSignalObservationDTO> ReadSignal(const IoSignalId& signal) const = 0;
   virtual Result<IoWatchRegistrationDTO> RegisterLevelWatch(
       const IoLevelWatchRequestDTO& request) = 0;
@@ -120,6 +130,11 @@ class IIoSignalService {
     return {"unsupported_capability",
             "Program blackboard source is not installed",
             {{"reason", "program_bb_service_unsupported"}}};
+  }
+  static ErrorDTO ChangedOutsideUnsupported() {
+    return {"unsupported_capability",
+            "Core-held changed_outside signals are not installed",
+            {{"reason", "io_changed_outside_unsupported"}}};
   }
   static ErrorDTO RuleUnsupported() {
     return {"unsupported_capability",

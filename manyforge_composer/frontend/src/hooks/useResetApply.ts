@@ -2,9 +2,11 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { api } from '../api/client';
 import { programRunExists } from '../state/heldRunAuthoring';
+import { applyResultText } from '../components/ApplyImpact';
 import { programActionUnavailableReason } from '../state/authoringWorkspace';
 import { deploymentActionUnavailableReason } from '../state/documentStates';
 import {
+  deploymentApplyResetsRun,
   nextResetApplyStep,
   resetApplyContext,
   resetApplyDismissible,
@@ -23,11 +25,9 @@ import {
   type WorkbenchNotice,
 } from '../state/workbenchNotices';
 import type { ManagerApplyStatus } from '../types/api';
+import type { ApplyPreview } from '../types/components';
 import type { ComposerHeadlessState } from '../types/headless';
-import {
-  DeploymentDraftChangedError,
-  type DeploymentWorkspaceController,
-} from './useDeploymentWorkspace';
+import type { DeploymentWorkspaceController } from './useDeploymentWorkspace';
 import type { ProgramRuntimeController } from './useProgramRuntime';
 import {
   ProgramDraftChangedError,
@@ -50,11 +50,12 @@ export interface ResetApplyInputs {
 }
 
 /**
- * Apply while a Program run exists: one informed confirmation, then the
- * ordinary Reset of exactly the confirmed run, its observed correlated Idle,
- * and the ordinary Apply of exactly the confirmed Draft revision (spec 450
- * §5.1.1, maintainer 2026-10-02). It reuses the Program runtime's exact
- * Reset, the workspaces' exact Draft fences and Apply tracking; the backend
+ * Program Apply while a Program run exists: one informed confirmation, then
+ * the ordinary Reset of exactly the confirmed run, its observed correlated
+ * Idle, and the ordinary Apply of exactly the confirmed Program Draft
+ * revision (spec 450 §5.1.1, maintainer 2026-10-02). The Deployment Apply
+ * offers the same chain while a run is stopped or held (AUD-4): its Apply is
+ * the server Apply of exactly the confirmed Preview's scope. The backend
  * fences stay authoritative. State lives only in this page: reopening
  * observes owners and never resumes a chain.
  */
@@ -83,26 +84,26 @@ export function useResetApply({
 
   /** Apply must first Reset the run: one exists, whatever its motion. */
   const runExists = programRunExists(snapshot);
+  /** A Deployment Apply must first Reset a stopped or held run (AUD-4). */
+  const deploymentRunReset = deploymentApplyResetsRun(snapshot);
   const inProgress = sequence !== null && !resetApplyTerminal(sequence.phase);
   const programWorkspace = program.state.workspace;
   const deploymentWorkspace = deployment.workspace;
 
   /**
-   * Why Apply (with its Reset) is unavailable for `document` while a run
-   * exists, or null. Never depends on a motion preview.
+   * Why Program Apply (with its Reset) is unavailable while a run exists, or
+   * null. Never depends on a motion preview.
    */
-  const unavailableReason = useCallback((document: ResetApplyDocument): string | null => {
+  const unavailableReason = useCallback((document: ResetApplyDocument = 'program'): string | null => {
     if (inProgress) return 'An Apply that Resets the run is in progress.';
     // The Draft is editable only while all Program motion is stopped; the
     // same holds for Applying it.
-    const editReason = document === 'program'
-      ? program.mutationUnavailableReason : deployment.mutationUnavailableReason;
-    const reason = document === 'program'
-      ? programActionUnavailableReason(programWorkspace, 'apply', editReason)
-      : deploymentActionUnavailableReason(deploymentWorkspace, 'apply', editReason);
+    const reason = document === 'deployment'
+      ? deploymentActionUnavailableReason(deploymentWorkspace, 'apply', deployment.mutationUnavailableReason)
+      : programActionUnavailableReason(programWorkspace, 'apply', program.mutationUnavailableReason);
     if (reason !== null) return reason;
-    if (!runtime.commandAllowed('program_reset')) {
-      const refusal = runtime.commandDisabledReason('program_reset');
+    if (!runtime.runnerAllows('program_reset')) {
+      const refusal = runtime.runnerRefusal('program_reset');
       return `Reset is not available now${refusal ? `: ${refusal.replaceAll('_', ' ')}` : ''}.`;
     }
     return null;
@@ -124,7 +125,11 @@ export function useResetApply({
    * that the run is Reset). Captures the exact run and Draft identities now;
    * resolves to a refusal message when nothing was started.
    */
-  const confirm = useCallback(async (document: ResetApplyDocument): Promise<string | null> => {
+  const confirm = useCallback(async (
+    document: ResetApplyDocument = 'program',
+    /** Deployment only: the Preview the operator confirmed. */
+    scope: ApplyPreview['scope'] | null = null,
+  ): Promise<string | null> => {
     if (chain.current !== null) return 'An Apply that Resets the run is in progress.';
     const reason = unavailableReason(document);
     if (reason !== null) return reason;
@@ -132,9 +137,18 @@ export function useResetApply({
     if (cycle === null || cycle.programRunId === null) {
       return 'The observed cycle has no run to Reset. Wait for the run state to refresh.';
     }
-    let draft: Pick<ResetApplyPlan,
-      'draftId' | 'draftRevision' | 'draftContentRevision' | 'appliedRevision' | 'activationScope'>;
-    if (document === 'program') {
+    let draft: Pick<ResetApplyPlan, 'draftId' | 'draftRevision' | 'draftContentRevision' | 'appliedRevision'>;
+    if (document === 'deployment') {
+      if (deploymentWorkspace === null || scope === null) {
+        return 'Preview the Deployment Draft before Reset and Apply.';
+      }
+      draft = {
+        draftId: deploymentWorkspace.draft.id,
+        draftRevision: deploymentWorkspace.draft.revision,
+        draftContentRevision: deploymentWorkspace.draft.deploymentRevision,
+        appliedRevision: deploymentWorkspace.managerApplied.deploymentRevision,
+      };
+    } else {
       const fence = program.fenceDraft;
       if (programWorkspace === null || fence === null || fence.programRevision === null) {
         return 'The Program Draft has no complete candidate to Apply.';
@@ -144,26 +158,6 @@ export function useResetApply({
         draftRevision: fence.draftRevision,
         draftContentRevision: fence.programRevision,
         appliedRevision: programWorkspace.applied.programRevision,
-        activationScope: null,
-      };
-    } else {
-      if (deploymentWorkspace === null) return 'The Deployment workspace is not loaded.';
-      // Deployment activation also compiles the current Program Draft with
-      // the Scenario's assignment and source: the confirmation covers all.
-      const scope = deployment.activationScope;
-      if (
-        scope === null
-        || scope.deploymentDraftId !== deploymentWorkspace.draft.id
-        || scope.deploymentDraftRevision !== deploymentWorkspace.draft.revision
-      ) {
-        return 'The Deployment activation input is still synchronizing. Wait for it to refresh.';
-      }
-      draft = {
-        activationScope: scope,
-        draftId: deploymentWorkspace.draft.id,
-        draftRevision: deploymentWorkspace.draft.revision,
-        draftContentRevision: deploymentWorkspace.draft.deploymentRevision,
-        appliedRevision: deploymentWorkspace.managerApplied.deploymentRevision,
       };
     }
     const plan: ResetApplyPlan = {
@@ -173,6 +167,7 @@ export function useResetApply({
       programRunnerOwnerEpoch: cycle.programRunnerOwnerEpoch,
       cycleGeneration: cycle.cycleGeneration,
       ...draft,
+      scope: document === 'deployment' ? scope : null,
     };
     chain.current = plan.correlationId;
     setSequence({ plan, phase: { kind: 'recording' } });
@@ -216,33 +211,29 @@ export function useResetApply({
       delivery: outcome.status === 'sent' ? 'confirmed' : 'unconfirmed',
     });
     return null;
-  }, [advance, deployment.activationScope, deploymentWorkspace, fail, program.fenceDraft, programWorkspace, snapshot, unavailableReason]);
+  }, [advance, deploymentWorkspace, fail, program.fenceDraft, programWorkspace, snapshot, unavailableReason]);
 
   // --- Drive the chain from owner observations (never from receipts alone).
-  const document = sequence?.plan.document ?? null;
-  const correlationId = sequence?.plan.correlationId ?? null;
   const programPending = program.state.status === 'loading'
     || (program.state.status === 'ready' && program.state.pendingAction !== null);
-  const facts = useMemo((): ResetApplyFacts => ({
+  const chainDocument = sequence?.plan.document ?? 'program';
+  const facts = useMemo((): ResetApplyFacts => (chainDocument === 'deployment' ? {
     cycle: snapshot?.programCycle ?? null,
-    applyAvailable: document === 'deployment'
-      ? deployment.documentUnavailableReason === null
-      : program.documentUnavailableReason === null,
-    workspacePending: document === 'deployment' ? deployment.busy : programPending,
+    applyAvailable: deployment.documentUnavailableReason === null,
+    workspacePending: deployment.busy,
+    draft: deploymentWorkspace === null ? null
+      : { draftId: deploymentWorkspace.draft.id, draftRevision: deploymentWorkspace.draft.revision },
+    appliedRevision: deploymentWorkspace?.managerApplied.deploymentRevision ?? null,
+    activation: null,
+  } : {
+    cycle: snapshot?.programCycle ?? null,
+    applyAvailable: program.documentUnavailableReason === null,
+    workspacePending: programPending,
     // The content the next fence acts upon, not a possibly newer reply.
-    draft: document === 'deployment'
-      ? deploymentWorkspace === null ? null
-        : { draftId: deploymentWorkspace.draft.id, draftRevision: deploymentWorkspace.draft.revision }
-      : program.fenceDraft,
-    appliedRevision: document === 'deployment'
-      ? deploymentWorkspace?.managerApplied.deploymentRevision ?? null
-      : programWorkspace?.applied.programRevision ?? null,
+    draft: program.fenceDraft,
+    appliedRevision: programWorkspace?.applied.programRevision ?? null,
     activation,
-    activationScope: document === 'deployment' ? deployment.activationScope : null,
-    correlatedApply: correlationId !== null
-      && deployment.acceptedApplyCorrelationId === correlationId
-      ? deployment.acceptedApply : null,
-  }), [activation, correlationId, deployment.acceptedApply, deployment.acceptedApplyCorrelationId, deployment.activationScope, deployment.busy, deployment.documentUnavailableReason, deploymentWorkspace, document, program.documentUnavailableReason, program.fenceDraft, programPending, programWorkspace, snapshot]);
+  }), [activation, chainDocument, deployment.busy, deployment.documentUnavailableReason, deploymentWorkspace, program.documentUnavailableReason, program.fenceDraft, programPending, programWorkspace, snapshot]);
 
   useEffect(() => {
     const current = sequence;
@@ -259,7 +250,6 @@ export function useResetApply({
     applySent.current.add(correlationId);
     advance(correlationId, { ...current.phase, sent: true });
     const refused = (error: unknown) => fail(correlationId, error instanceof ProgramDraftChangedError
-      || error instanceof DeploymentDraftChangedError
       ? {
         kind: 'failed', stage: 'apply', unknown: false, apply: null,
         message: `${error.message} Apply was not sent; the Draft keeps its edits.`,
@@ -272,47 +262,31 @@ export function useResetApply({
       kind: 'failed', stage: 'apply', unknown: true, apply: null,
       message: `Apply was refused or its reply was lost${detail ? `: ${detail}` : ''}. The Draft keeps its edits; Activity shows any accepted activation.`,
     });
-    if (plan.document === 'program') {
-      void latest.current.program.apply({
-        correlationId,
-        expectedDraft: {
-          draftId: plan.draftId,
-          draftRevision: plan.draftRevision,
-          programRevision: plan.draftContentRevision ?? '',
-        },
-      }).then((result) => {
-        if (result === null) {
-          lost(latest.current.program.state.error);
-        } else if (result.transitionStatus === 'applied') {
-          advance(correlationId, { kind: 'applied', apply: null });
-        } else if (result.acceptedApply) {
-          advance(correlationId, { kind: 'awaiting_apply', apply: result.acceptedApply });
-        } else {
-          lost('accepted without an exact identity to follow');
-        }
+    if (plan.document === 'deployment') {
+      // The server Apply runs to its end: its result settles the chain.
+      void latest.current.deployment.applyConfirmedScope(plan.scope ?? {}).then((result) => {
+        if (result === null) lost(latest.current.deployment.error);
+        else if (result.outcome === 'failed') {
+          fail(correlationId, { kind: 'failed', stage: 'apply', unknown: false, apply: null,
+            message: `${applyResultText(result)} The Draft keeps its edits.` });
+        } else advance(correlationId, { kind: 'applied', apply: null });
       }, refused);
       return;
     }
-    void latest.current.deployment.applyDraft({
+    void latest.current.program.apply({
       correlationId,
-      expectedDraft: { draftId: plan.draftId, draftRevision: plan.draftRevision },
-      expectedScope: plan.activationScope,
-    }).then((response) => {
-      if (response === null) {
-        lost(latest.current.deployment.error ?? latest.current.deployment.feedback);
-      } else if (response.result.status === 'confirmation_required') {
-        // The ordinary disruptive-change confirmation takes over.
-        advance(correlationId, { kind: 'confirmation_required' });
-      } else if (response.result.status === 'accepted' && response.result.managerApply !== null) {
-        advance(correlationId, {
-          kind: 'awaiting_apply',
-          apply: {
-            applyId: response.result.managerApply.applyId,
-            applyGeneration: response.result.managerApply.applyGeneration,
-          },
-        });
-      } else if (response.result.status === 'applied') {
+      expectedDraft: {
+        draftId: plan.draftId,
+        draftRevision: plan.draftRevision,
+        programRevision: plan.draftContentRevision ?? '',
+      },
+    }).then((result) => {
+      if (result === null) {
+        lost(latest.current.program.state.error);
+      } else if (result.transitionStatus === 'applied') {
         advance(correlationId, { kind: 'applied', apply: null });
+      } else if (result.acceptedApply) {
+        advance(correlationId, { kind: 'awaiting_apply', apply: result.acceptedApply });
       } else {
         lost('accepted without an exact identity to follow');
       }
@@ -347,6 +321,8 @@ export function useResetApply({
   return {
     /** A Program run exists: Apply Resets it first. */
     runExists,
+    /** A stopped or held run: the Deployment Apply Resets it first (AUD-4). */
+    deploymentRunReset,
     unavailableReason,
     confirm,
     inProgress,

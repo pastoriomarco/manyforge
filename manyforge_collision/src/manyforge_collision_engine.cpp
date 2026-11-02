@@ -56,7 +56,7 @@ typedef std::shared_ptr<ModelInterface> ModelInterfaceSharedPtr;
 #include <utility>
 
 #ifndef MANYFORGE_COLLISION_ENGINE_VERSION
-#define MANYFORGE_COLLISION_ENGINE_VERSION "0.1.0+unknown"
+#define MANYFORGE_COLLISION_ENGINE_VERSION "0.2.0+unknown"
 #endif
 
 namespace manyforge::collision {
@@ -636,7 +636,7 @@ core::Vector3DTO vector3_from_eigen(const Eigen::Vector3d& value) {
   return {value.x(), value.y(), value.z()};
 }
 
-core::CollisionGeometryDescriptor retained_native_geometry_descriptor(
+core::CollisionGeometryDescriptor retained_geometry_descriptor(
     const core::CollisionBodyId& body_id,
     const RetainedComponentCollisionBodyProjectionInput& input,
     const pinocchio::Model& model,
@@ -653,7 +653,7 @@ core::CollisionGeometryDescriptor retained_native_geometry_descriptor(
   descriptor.body_id = body_id;
   descriptor.owner_kind = core::CollisionOwnerKind::kComponentModelBody;
   descriptor.local_pose = pose_from_se3(frame_from_geometry);
-  descriptor.quality_labels = {"exact_retained_native_geometry"};
+  descriptor.quality_labels = {"exact_retained_geometry"};
 
   const auto& geometry = geometry_object.geometry;
   if (geometry != nullptr) {
@@ -693,7 +693,7 @@ core::CollisionGeometryDescriptor retained_native_geometry_descriptor(
   }
 
   const std::string generated_source =
-      "retained-native://component/" +
+      "retained://component/" +
       input.controllable_component_id.value() + "/model/" +
       input.model_instance_id.value() + "/frame/" +
       input.compiled_frame_name + "/geometry/" + geometry_object.name;
@@ -1304,7 +1304,7 @@ ManyForgeCollisionEngine::project_retained_component_collision(
     }
     auto& body = projection.component_bodies[body_match->second];
     try {
-      body.geometries.push_back(retained_native_geometry_descriptor(
+      body.geometries.push_back(retained_geometry_descriptor(
           body.body_id, bodies[body_match->second], shared_model->model,
           geometry_object));
     } catch (const std::exception& error) {

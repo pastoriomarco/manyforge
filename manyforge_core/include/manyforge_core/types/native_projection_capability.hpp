@@ -12,14 +12,11 @@ namespace manyforge::core {
 /// This list is deliberately closed. ID prefixes are presentation taxonomy,
 /// not runtime authority: adding another planning/validation/collision
 /// capability does not silently make it a native projection participant.
-inline constexpr std::array<std::string_view, 12U> kNativeProjectionCapabilityIds{{
+inline constexpr std::array<std::string_view, 9U> kNativeProjectionCapabilityIds{{
     "planning.motion.joint_goal",
     "planning.motion.pose_goal",
     "planning.motion.cartesian_path",
     "planning.motion.named_target",
-    "planning.profile.first_feasible",
-    "planning.profile.balanced",
-    "planning.profile.quality_bounded",
     "planning.trajectory.time_parameterized",
     "validation.trajectory.non_collision",
     "collision.query.pre_execution",

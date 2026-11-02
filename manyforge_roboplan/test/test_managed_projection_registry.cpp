@@ -279,9 +279,9 @@ private:
   std::shared_future<void> released_;
 };
 
-[[nodiscard]] core::ProjectionNativeRuntimeBindingDTO
+[[nodiscard]] core::ProjectionExecutionHostBindingDTO
 Binding(const std::string &provider) {
-  return core::ProjectionNativeRuntimeBindingDTO{
+  return core::ProjectionExecutionHostBindingDTO{
       core::CapabilityProviderBindingId(provider),
       core::CapabilityProviderBindingRevision(provider + "-revision"),
       core::RuntimeUnitId("native-unit"), core::RuntimeEpoch("epoch-1")};
@@ -366,7 +366,7 @@ TEST(NativeProjectionRpcCodec, HealthSelectorPreservesLegacyAndHasOneEncoding) {
       detail::DecodeNativeProjectionRpcRequest(legacy);
   const auto &plain =
       std::get<detail::NativeProjectionHealthQuery>(ordinary_decoded);
-  EXPECT_EQ(plain.native_runtime_binding, ordinary.native_runtime_binding);
+  EXPECT_EQ(plain.execution_host_binding, ordinary.execution_host_binding);
   EXPECT_FALSE(plain.selected_projection_revision.has_value());
 
   static constexpr char selector_bytes[] =
@@ -390,7 +390,7 @@ TEST(NativeProjectionRpcCodec, HealthSelectorPreservesLegacyAndHasOneEncoding) {
   EXPECT_EQ(detail::EncodeNativeProjectionRpcRequest(selected), canonical);
   const auto decoded = detail::DecodeNativeProjectionRpcRequest(canonical);
   const auto &typed = std::get<detail::NativeProjectionHealthQuery>(decoded);
-  EXPECT_EQ(typed.native_runtime_binding, selected.native_runtime_binding);
+  EXPECT_EQ(typed.execution_host_binding, selected.execution_host_binding);
   EXPECT_EQ(typed.selected_projection_revision,
             selected.selected_projection_revision);
 

@@ -395,30 +395,6 @@ materialize_durable_controllable_lite6_bundle(
   return {std::move(input), std::move(bundle)};
 }
 
-[[nodiscard]] DurableControllableLite6Fixture
-materialize_durable_native_motion_lite6_bundle(
-    const std::filesystem::path &root, bool two_instances = false) {
-  auto input =
-      two_instances
-          ? test::make_two_lite6_same_type_native_motion_retention_fixture()
-          : test::make_lite6_native_motion_retention_fixture();
-  const test::Lite6ControllableCompilerInputArtifactSource input_source(input);
-  FilesystemBuildManifestRepository manifest_repository(root);
-  FilesystemCatalogArtifactStore catalog_store(root);
-  FilesystemRawArtifactStore raw_store(root);
-  FilesystemRetainedBundleRepository bundle_repository(root);
-  auto bundle = detail::RetainedBundleMaterializer::
-      materialize_store_and_reload_production(
-          input.qualified, manifest_repository, input_source,
-          input.structural_preparations(), catalog_store, raw_store,
-          bundle_repository);
-  if (bundle == nullptr) {
-    throw std::logic_error(
-        "native-motion Lite6 fixture materialization returned no bundle");
-  }
-  return {std::move(input), std::move(bundle)};
-}
-
 [[nodiscard]] DurableLite6PlanningFixture
 materialize_durable_lite6_bundle(
     const std::filesystem::path& root) {
@@ -2922,84 +2898,6 @@ TEST(FilesystemRetentionStoreTest,
   EXPECT_EQ(verified_runtime->runtime_role_id(), "manager_fixture");
   EXPECT_EQ(verified_runtime->status_endpoint_role_id(), "runtime_status");
 }
-
-TEST(FilesystemRetentionStoreTest,
-     NativeRuntimeProductsDurablyReloadAndVerifyPerExactRuntimeUnit) {
-  GTEST_SKIP() << "held: multi-unit discussion";
-  // DX-753: compiled archival two-unit reference; no native execution admission.
-  const std::string archived_native_product_contract_id =
-      "manyforge.native_execution_runtime_unit";
-  const std::string archived_native_launch_descriptor =
-      "{\"api_version\":\"manyforge.installed_target_launch.v1\","
-      "\"implementation_id\":\"manyforge.native_execution_host\","
-      "\"implementation_revision\":\"sha256:"
-      "04603026d6ba467482fbc417c7e4f759e0d3f88de98ce2632949d7a3719d0100\","
-      "\"target_id\":\"manyforge_native_execution_host\"}";
-  const std::string archived_native_launch_environment_contract =
-      "manyforge.native_execution_host.abi.v1";
-  const std::string archived_native_runtime_role_id =
-      "native_execution";
-  const std::string archived_native_status_endpoint_role_id =
-      "native_execution_status";
-  const std::string archived_native_process_adapter_contract_id =
-      "manyforge.installed_execution_target";
-  const core::ProductContractRevision archived_native_product_contract_revision(
-      "sha256:046d1e98d52a0d94972c66e6a9bf51c5602ca4471b05de9f00a4458246be21e9");
-  ScopedTrustedRoot root;
-  const auto materialized =
-      materialize_durable_native_motion_lite6_bundle(root.path(), true);
-  ASSERT_NE(materialized.bundle, nullptr);
-  ASSERT_EQ(materialized.bundle->value()
-                .compiled_products.runtime_unit_products.size(),
-            2U);
-
-  FilesystemVerifiedRetainedBundleSource bundle_source(root.path());
-  const auto reloaded =
-      bundle_source.get_verified(materialized.bundle->retained_bundle_id());
-  ASSERT_NE(reloaded, nullptr);
-  EXPECT_EQ(reloaded->canonical_bytes(),
-            materialized.bundle->canonical_bytes());
-
-  FilesystemVerifiedRetainedProductArtifactSource artifact_source(root.path());
-  std::set<std::string> product_ids;
-  std::set<std::string> configuration_identities;
-  for (const auto &group :
-       reloaded->value().compiled_products.runtime_unit_products) {
-    ASSERT_EQ(group.products.size(), 1U);
-    const auto verified = verify_runtime_unit_product(
-        *reloaded, group.runtime_unit_id, artifact_source);
-    ASSERT_TRUE(verified.has_value());
-    EXPECT_EQ(verified->retained_bundle_id(), reloaded->retained_bundle_id());
-    EXPECT_EQ(verified->runtime_unit_id(), group.runtime_unit_id);
-    EXPECT_EQ(verified->product_id(), group.products.front().product_id);
-    EXPECT_EQ(verified->product_contract_id().value(),
-              archived_native_product_contract_id);
-    EXPECT_EQ(verified->product_contract_revision(),
-              archived_native_product_contract_revision);
-    EXPECT_EQ(verified->launchable_bytes(),
-              archived_native_launch_descriptor);
-    EXPECT_EQ(verified->operating_system(), "linux");
-    EXPECT_EQ(verified->launch_environment_contract(),
-              archived_native_launch_environment_contract);
-    EXPECT_EQ(verified->runtime_role_id(),
-              archived_native_runtime_role_id);
-    EXPECT_EQ(verified->status_endpoint_role_id(),
-              archived_native_status_endpoint_role_id);
-    EXPECT_EQ(verified->status_transport(), "adapter_private");
-    EXPECT_EQ(verified->process_adapter_contract_id(),
-              archived_native_process_adapter_contract_id);
-    EXPECT_TRUE(product_ids.insert(verified->product_id().value()).second);
-    EXPECT_TRUE(configuration_identities
-                    .insert(verified->configuration_identity().value())
-                    .second);
-    EXPECT_THROW(static_cast<void>(verify_reference_runtime_unit_product(
-                     *reloaded, group.runtime_unit_id, artifact_source)),
-                 RetainedBundleError);
-  }
-}
-
-
-// -- Logic-only Programs: zero component roles on a model-free cell --------
 
 [[nodiscard]] CanonicalValue logic_only_program(std::string_view content_version) {
   test::ProgramOptions options;

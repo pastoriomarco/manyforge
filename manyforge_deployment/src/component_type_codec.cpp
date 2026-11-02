@@ -724,7 +724,15 @@ void validate_target(
 void validate_semantics(
     const core::ComponentTypeDTO& type,
     std::span<const QualifiedCapabilityDefinition> capabilities) {
-  if (type.model_roles.empty() && type.command_targets.empty()) {
+  // A machine owner (CONTRACTS §16, tag `machine`) has neither: it holds the
+  // machine's connection and process, its members the targets. Neither has
+  // a sensor (tag `sensor`): it only observes.
+  const bool target_less =
+      std::any_of(type.tags.begin(), type.tags.end(), [](const auto &tag) {
+        return tag == "machine" || tag == "sensor";
+      });
+  if (type.model_roles.empty() && type.command_targets.empty() &&
+      !target_less) {
     fail("component-type cannot be completely empty");
   }
 

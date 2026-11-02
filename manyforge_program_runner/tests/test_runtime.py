@@ -27,7 +27,6 @@ from manyforge_behavior.program_run_owner import (
     ProgramRunOwnerError,
     ProgramRunOwnerOutcomeUnknownError,
     ProgramRunOwnerRecoveryIncompleteError,
-    ProgramRunOwnerStaleRevisionError,
 )
 from manyforge_behavior.orchestration_values import ProgramValueUncertainError
 from manyforge_behavior.program_scheduling import ProgramSchedulingError
@@ -43,6 +42,7 @@ from manyforge_headless_api.models import (
     ProgramSelectionStartRequest,
     RuntimeBlackboardWriteRequest,
 )
+from manyforge_behavior.kernel_client import KernelClient
 from manyforge_program_runner.runtime import (
     ProgramRunnerConfig,
     ProgramRunnerError,
@@ -155,12 +155,6 @@ class _Headless:
         "authoring_admission",
         "commit_scene_transaction",
         "scene_transaction_status",
-        "cclc_component",
-        "cclc_component_lifecycle_snapshot",
-        "cclc_owner_identity",
-        "cclc_route_templates",
-        "component_lifecycle_status",
-        "component_lifecycle_request_result",
         "commit_program_model_attempt",
         "submit",
         "manager_graph",
@@ -179,7 +173,15 @@ class _Headless:
     def __init__(self) -> None:
         self.applied_reads = 0
         self.registered_captures: list[dict[str, Any]] = []
-        self.cclc_reads: list[str] = []
+        # CONTRACTS §10 RunReadiness and §5 CellLatch, as served by the API.
+        self.readiness: dict[str, Any] = {
+            "can_execute": True, "can_resume": True, "motion_clear": True, "blocked_reasons": []}
+        self.latch: dict[str, Any] = {"latched": False, "causes": []}
+        self.readiness_reads = 0
+        self.rule_resets = 0
+        self.rule_activations: list[tuple[str, bool]] = []
+        self.outside_clears: list[tuple[str, str]] = []
+        self.output_writes: list[tuple[str, Any]] = []
 
     def apply_tool_payload(self) -> None:
         pass
@@ -209,15 +211,13 @@ class _Headless:
             },
         }
 
-    def cclc_component_lifecycle_snapshot(self, component_id: str) -> dict[str, Any]:
-        assert component_id == "robot.1"
-        self.cclc_reads.append(component_id)
-        return {
-            "controllable_component_id": component_id,
-            "retained_bundle_id": _DIGEST_A,
-            "graph_revision": _DIGEST_B,
-            "component_lifecycle_state": "active",
-        }
+    def request(self, method: str, path: str) -> dict[str, Any]:
+        assert method == "GET"
+        if path == "/api/program/readiness":
+            self.readiness_reads += 1
+            return deepcopy(self.readiness)
+        assert path == "/api/cell/latch"
+        return deepcopy(self.latch)
 
     def identity(self) -> dict[str, Any]:
         return {
@@ -250,10 +250,22 @@ class _Headless:
             "claim_generation": body["claim_generation"],
         }
 
-    def stop_fault(self) -> dict[str, Any]:
-        """Report the normal no-latched-fault state for Reset tests."""
+    def reset_rule_activation(self) -> dict[str, Any]:
+        self.rule_resets += 1
+        return {"ok": True, "command": "reset_rule_activation"}
 
-        return {"ok": True, "stop_fault": None}
+    def set_rule_active(self, rule_id: str, active: bool) -> dict[str, Any]:
+        self.rule_activations.append((rule_id, active))
+        return {"ok": True, "command": "set_rule_active"}
+
+    def clear_outside_change(self, component_id: str, signal_name: str) -> dict[str, Any]:
+        self.outside_clears.append((component_id, signal_name))
+        return {"ok": True, "command": "clear_outside_change"}
+
+    def set_io_output(self, signal_id: str, value: Any, *, origin: str) -> dict[str, Any]:
+        assert origin == "program"
+        self.output_writes.append((signal_id, value))
+        return {"ok": True, "command": "set_io_output", "result": {"outcome": "succeeded"}}
 
     def __getattr__(self, name: str):
         if name not in self._PORT_METHODS:
@@ -265,116 +277,73 @@ class _Headless:
         return unexpected
 
 
-def test_program_component_readiness_uses_exact_cclc_state() -> None:
-    class ComponentHeadless:
-        def __init__(self) -> None:
-            self.state = "disabled"
-            self.graph = _DIGEST_B
-            self.reads: list[str] = []
+def test_run_readiness_refuses_with_its_first_reason() -> None:
+    """CONTRACTS §10: the Runner reads RunReadiness and computes nothing."""
 
-        def cclc_component_lifecycle_snapshot(self, component_id: str) -> dict[str, Any]:
-            self.reads.append(component_id)
-            return {
-                "controllable_component_id": component_id,
-                "retained_bundle_id": _DIGEST_A,
-                "graph_revision": self.graph,
-                "component_lifecycle_state": self.state,
-            }
-
-    headless = ComponentHeadless()
+    headless = _Headless()
     runtime = ProgramRuntime.__new__(ProgramRuntime)
     runtime._headless = headless  # type: ignore[assignment]
-    applied = {
-        "retained_bundle_id": _DIGEST_A,
-        "graph_revision": _DIGEST_B,
-        "program_binding": {
-            "component_role_bindings": [
-                {"controllable_component_id": "robot.1"},
-                {"controllable_component_id": "robot.1"},
-            ]
-        },
+    runtime._require_run_readiness("can_execute")
+    headless.readiness = {
+        "can_execute": False,
+        "can_resume": True,
+        "blocked_reasons": [
+            {"code": "component_not_enabled", "message": "robot.1 is prepared",
+             "component_id": "robot.1"},
+            {"code": "rule_holds", "message": "guard holds", "rule_id": "guard"},
+        ],
     }
-    with pytest.raises(ProgramRunnerError) as disabled:
-        runtime._verify_required_components_active(applied)
-    assert disabled.value.code == "program_required_component_not_active"
-    assert "robot.1" in str(disabled.value)
-    assert headless.reads == ["robot.1"]
-
-    headless.state = "active"
-    headless.graph = _DIGEST_A
+    with pytest.raises(ProgramRunnerError) as refused:
+        runtime._require_run_readiness("can_execute")
+    assert refused.value.code == "component_not_enabled"
+    assert refused.value.details == {"component_id": "robot.1"}
+    runtime._require_run_readiness("can_resume")
+    headless.readiness = {
+        "can_execute": False,
+        "can_resume": False,
+        "blocked_reasons": [{"code": "rule_holds", "message": "guard holds", "rule_id": "guard"}],
+    }
+    with pytest.raises(ProgramRunnerError) as held:
+        runtime._require_run_readiness("can_resume")
+    assert held.value.code == "rule_holds"
+    assert held.value.details == {"rule_id": "guard"}
+    # A running run with its motion group held: Execute and a stopped run's
+    # Resume are refused (run_in_progress), the held group's Run/Resume is not.
+    headless.readiness = {
+        "can_execute": False,
+        "can_resume": False,
+        "motion_clear": True,
+        "blocked_reasons": [{"code": "run_in_progress", "message": "A Program run is in progress"}],
+    }
+    runtime._require_run_readiness("motion_clear")
+    # motion_clear is refused with its own reason, never a rule hold (the
+    # kernel refuses a hold's scope itself).
+    headless.readiness = {
+        "can_execute": False, "can_resume": False, "motion_clear": False,
+        "blocked_reasons": [
+            {"code": "rule_holds", "message": "guard holds", "rule_id": "guard"},
+            {"code": "input_not_fresh", "message": "door has no fresh value", "signal_id": "door"},
+        ],
+    }
     with pytest.raises(ProgramRunnerError) as stale:
-        runtime._verify_required_components_active(applied)
-    assert stale.value.code == "program_required_component_stale"
-
-    headless.graph = _DIGEST_B
-    runtime._verify_required_components_active(applied)
-    assert headless.reads == ["robot.1", "robot.1", "robot.1"]
+        runtime._require_run_readiness("motion_clear")
+    assert stale.value.code == "input_not_fresh"
 
 
-def test_program_component_readiness_does_not_block_an_unbound_peer() -> None:
-    class Components:
-        def cclc_component_lifecycle_snapshot(self, component_id: str) -> dict[str, Any]:
-            assert component_id == "robot.enabled"
-            return {
-                "controllable_component_id": component_id,
-                "retained_bundle_id": _DIGEST_A,
-                "graph_revision": _DIGEST_B,
-                "component_lifecycle_state": "active",
-            }
-
-    runtime = ProgramRuntime.__new__(ProgramRuntime)
-    runtime._headless = Components()  # type: ignore[assignment]
-    runtime._verify_required_components_active(
-        {
-            "retained_bundle_id": _DIGEST_A,
-            "graph_revision": _DIGEST_B,
-            "program_binding": {
-                "component_role_bindings": [
-                    {"controllable_component_id": "robot.enabled"}
-                ]
-            },
-        }
-    )
-
-
-def test_logic_only_binding_has_no_component_to_check() -> None:
-    class NoComponents:
-        def cclc_component_lifecycle_snapshot(self, component_id: str) -> dict[str, Any]:
-            raise AssertionError(f"unexpected component read: {component_id}")
-
-    runtime = ProgramRuntime.__new__(ProgramRuntime)
-    runtime._headless = NoComponents()  # type: ignore[assignment]
-    applied = {
-        "retained_bundle_id": _DIGEST_A,
-        "graph_revision": _DIGEST_B,
-        "program_binding": {"component_role_bindings": []},
-    }
-    runtime._verify_required_components_active(applied)
-
-    # An absent or non-list table still fails closed; only an empty list is
-    # the logic-only shape.
-    for binding in ({}, {"component_role_bindings": None}, {"component_role_bindings": [{}] * 4097}):
-        malformed = {**applied, "program_binding": binding}
-        with pytest.raises(ProgramRunnerError) as refused:
-            runtime._verify_required_components_active(malformed)
-        assert refused.value.code == "program_run_binding_invalid"
-
-
-def test_disabled_required_component_rejects_program_before_claim(
+def test_blocked_readiness_rejects_program_before_claim(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
-    class DisabledHeadless(_Headless):
-        def cclc_component_lifecycle_snapshot(self, component_id: str) -> dict[str, Any]:
-            return {
-                **super().cclc_component_lifecycle_snapshot(component_id),
-                "component_lifecycle_state": "disabled",
-            }
-
     monkeypatch.setattr(
         "manyforge_program_runner.runtime.build_applied_program_run_admission",
         lambda *_args, **_kwargs: _PreparedRunAdmission(),
     )
-    headless = DisabledHeadless()
+    headless = _Headless()
+    headless.readiness = {
+        "can_execute": False,
+        "can_resume": False,
+        "blocked_reasons": [{"code": "cell_latched", "message": "robot.1 is in fault",
+                             "component_id": "robot.1"}],
+    }
     admission = _Admission()
     journal = ProgramCycleJournal(
         tmp_path / "cycle.sqlite3", owner_epoch="runner.1"
@@ -389,7 +358,7 @@ def test_disabled_required_component_rejects_program_before_claim(
     runtime.start()
     with pytest.raises(ProgramRunnerError) as refused:
         runtime.start_run(_start_request())
-    assert refused.value.code == "program_required_component_not_active"
+    assert refused.value.code == "cell_latched"
     assert admission.claims == []
     assert journal.read().state == "idle_after_reset"
     runtime.shutdown()
@@ -466,9 +435,6 @@ class _Snapshot:
 class _ValueStore:
     """The Run value store as the runtime uses it without global rules."""
 
-    def set_interrupt_notify_rule_reader(self, _reader: object) -> None:
-        return None
-
 
 class _Owner:
     def __init__(self) -> None:
@@ -529,11 +495,6 @@ class _Owner:
         return self.read(program_run_id), self.execution_selection_controls(
             program_run_id
         )
-
-    def execution_selection_motion_readiness_scope(
-        self, _program_run_id, _group_ids
-    ):
-        return (), _DIGEST_A, _DIGEST_B
 
     def execution_selection_controls(self, program_run_id: str) -> dict[str, Any]:
         running = self.rows[program_run_id].state == "running"
@@ -702,7 +663,6 @@ class _Host:
         self,
         program_run_id: str,
         *,
-        expected_run_revision: int,
         expected_selection_revision: int,
         request_id: str,
         group_id: str | list[str] = "all",
@@ -713,7 +673,6 @@ class _Host:
             (
                 program_run_id,
                 group_id,
-                expected_run_revision,
                 expected_selection_revision,
                 request_id,
             )
@@ -1747,16 +1706,13 @@ def _bypass_reset_scene_preparation(monkeypatch: pytest.MonkeyPatch) -> None:
         "_prepare_scene_after_reset",
         lambda _self, _request, _authorization: None,
     )
-    monkeypatch.setattr(
-        ProgramRuntime,
-        "_clear_reset_stop_fault",
-        lambda _self, _request: None,
-    )
 
 
 class _PreparedRunAdmission:
     def __init__(self) -> None:
-        self.program = SimpleNamespace(to_dict=_timer_only_program, interrupt_condition_keys=())
+        self.program = SimpleNamespace(
+            to_dict=_timer_only_program, interrupt_condition_keys=(), rule_activation_rule_ids=()
+        )
         # The run reads it for blackboard-key publication; this fixture has none.
         self.program_binding = None
         self.project_path = "/projects/cell-pick.scenario"
@@ -1915,8 +1871,6 @@ def test_applied_activation_prepares_scene_while_idle_without_run_claim(
     status = runtime.cycle_status()
     assert status["state"] == "idle_after_reset"
     availability = {row["command_kind"]: row for row in status["allowed_commands"]}
-    # An idle cell-wide Stop fault has no Program Reset to consume it.
-    assert availability["stop_recovery"]["allowed"] is True
     assert availability["execution_recovery"]["allowed"] is False
     runtime.shutdown()
 
@@ -2241,9 +2195,6 @@ class _CarriedObjectLossStore:
         if self.failure is not None:
             raise self.failure
         self.writes.append((key, value, dict(metadata)))
-
-    def set_interrupt_notify_rule_reader(self, _reader: object) -> None:
-        return None
 
 
 class _CarriedObjectLossMirrorFake:
@@ -3425,7 +3376,6 @@ def test_reset_publishes_resetting_until_motion_is_terminal(
     host = _Host(owner, owner_id=runtime.owner_id, owner_epoch=runtime.owner_epoch)
     runtime._owner = owner  # type: ignore[assignment]  # noqa: SLF001
     runtime._host = host  # type: ignore[assignment]  # noqa: SLF001
-    runtime._clear_reset_stop_fault = lambda _request: None  # type: ignore[method-assign]  # noqa: SLF001
     runtime.start()
     runtime.start_run(_start_request())
 
@@ -3791,7 +3741,7 @@ def test_repeated_run_is_state_rejected_and_keeps_one_active_product_run(
     assert host.start_admissions == [admitted]
     assert host.scheduled == [started["capture"]["program_run_id"]]
     assert headless.applied_reads == 2
-    assert headless.cclc_reads == ["robot.1", "robot.1"]
+    assert headless.readiness_reads == 1
     assert len(joins) == 1
     assert len(headless.registered_captures) == 1
     assert "table" not in headless.registered_captures[0]
@@ -3822,37 +3772,59 @@ def test_repeated_run_is_state_rejected_and_keeps_one_active_product_run(
             "correlation_id": None,
             "program_run_id": "program-cycle.1",
             "expected_owner_epoch": runtime.owner_epoch,
-            "expected_run_revision": started["run_revision"],
             "expected_selection_revision": 0,
             "group_ids": ["robot_group"],
             "reason": "initial operator motion Run",
         }
     )
-    verify_feedback = runtime._verify_selected_motion_feedback  # noqa: SLF001
-    monkeypatch.setattr(
-        runtime,
-        "_verify_selected_motion_feedback",
-        lambda _run_id, _groups: (_ for _ in ()).throw(
-            ProgramRunnerError(
-                "program_motion_component_readiness_unavailable",
-                "Measured feed is stale",
-            )
-        ),
-    )
+    ready = headless.readiness
+    headless.readiness = {
+        "can_execute": False,
+        "can_resume": False,
+        "blocked_reasons": [{"code": "rule_holds", "message": "guard holds",
+                             "rule_id": "guard"}],
+    }
     blocked_start = ProgramSelectionStartRequest.model_validate({
         **motion_start.model_dump(mode="json"),
         "request_id": "request.motion-start.blocked",
     })
     with pytest.raises(ProgramRunnerError) as blocked:
         runtime.start_motion("program-cycle.1", blocked_start)
-    assert blocked.value.code == "program_motion_component_readiness_unavailable"
+    assert blocked.value.code == "rule_holds"
     assert host.motion_start_calls == []
-    monkeypatch.setattr(runtime, "_verify_selected_motion_feedback", verify_feedback)
+    headless.readiness = ready
 
+    # N8: Run is fenced on run id, owner epoch and selection revision only.
+    for request_id, run_id, changes, code in (
+        ("stale-epoch", "program-cycle.1", {"expected_owner_epoch": "old"},
+         "program_run_owner_stale"),
+        ("stale-run", "program-cycle.9", {"program_run_id": "program-cycle.9"},
+         "program_runtime_control_stale"),
+    ):
+        with pytest.raises(ProgramRunnerError) as stale:
+            runtime.start_motion(
+                run_id,
+                ProgramSelectionStartRequest.model_validate({
+                    **motion_start.model_dump(mode="json"),
+                    "request_id": f"request.motion-start.{request_id}",
+                    **changes,
+                }),
+            )
+        assert stale.value.code == code
+    assert host.motion_start_calls == []
+    # Tree ticks right after Execute raise the run revision; Run is admitted.
+    ticked = owner.rows["program-cycle.1"]
+    owner.rows["program-cycle.1"] = _Snapshot(
+        "program-cycle.1",
+        owner_id=runtime.owner_id,
+        owner_epoch=runtime.owner_epoch,
+        state="running",
+        revision=ticked.run_revision + 3,
+    )
     motion_started = runtime.start_motion("program-cycle.1", motion_start)
     assert motion_started["state"] == "running"
     assert host.motion_start_calls == [
-        ("program-cycle.1", ["robot_group"], 1, 0, "request.motion-start.1")
+        ("program-cycle.1", ["robot_group"], 0, "request.motion-start.1")
     ]
 
     motion_stop = ProgramSelectionStopRequest.model_validate(
@@ -3972,6 +3944,22 @@ def test_repeated_run_is_state_rejected_and_keeps_one_active_product_run(
             "reason": "operator Run after Full Stop",
         }
     )
+    # Resume after Halt checks readiness like Resume (CONTRACTS §10).
+    ready = headless.readiness
+    headless.readiness = {
+        "can_execute": False,
+        "can_resume": False,
+        "blocked_reasons": [{"code": "cell_latched", "message": "Cell latched"}],
+    }
+    blocked_resume = ProgramFullStopResumeRequest.model_validate({
+        **resume_full_stop.model_dump(mode="json"),
+        "request_id": "request.resume-full-stop.blocked",
+    })
+    with pytest.raises(ProgramRunnerError) as blocked_full_resume:
+        runtime.resume_full_stop("program-cycle.1", blocked_resume)
+    assert blocked_full_resume.value.code == "cell_latched"
+    assert host.full_stop_resume_calls == []
+    headless.readiness = ready
     resumed = runtime.resume_full_stop("program-cycle.1", resume_full_stop)
     assert resumed["state"] == "running"
     assert host.full_stop_resume_calls == [
@@ -4337,7 +4325,7 @@ def test_manual_handover_requeries_kernel_and_retains_cleanup_outcome(
         runtime.shutdown()
 
 
-@pytest.mark.parametrize("case", ["unselected", "incomplete", "unknown", "stale"])
+@pytest.mark.parametrize("case", ["unselected", "incomplete", "unknown"])
 def test_default_resume_routes_only_selected_nodes_and_preserves_partial_outcomes(
     monkeypatch,
     tmp_path,
@@ -4386,12 +4374,9 @@ def test_default_resume_routes_only_selected_nodes_and_preserves_partial_outcome
 
     def selected(*_args, **_kwargs):
         calls.append("selected")
-        assert (
-            _kwargs["expected_run_revision"]
-            == owner.read("program-cycle.1").run_revision
-        )
-        if case == "stale":
-            raise ProgramRunOwnerStaleRevisionError(_kwargs["expected_run_revision"], 2)
+        # N8: Resume is fenced on the selection revision, not the run revision.
+        assert "expected_run_revision" not in _kwargs
+        assert _kwargs["expected_selection_revision"] == 4
         error = (
             ProgramRunOwnerRecoveryIncompleteError
             if case == "incomplete"
@@ -4455,10 +4440,6 @@ def test_default_resume_routes_only_selected_nodes_and_preserves_partial_outcome
                 assert rejected.value.code == "program_motion_resume_incomplete"
                 assert rejected.value.details["cleanup_accepted"] is True
                 assert rejected.value.details["recovery_offer"] == offer
-            if case == "stale":
-                assert rejected.value.code == "program_runtime_control_stale"
-                assert rejected.value.details["expected_run_revision"] == 1
-                assert rejected.value.details["current_run_revision"] == 2
     finally:
         runtime.shutdown()
 
@@ -4497,7 +4478,7 @@ def test_operator_motion_stop_reset_stops_tree_and_resets_cycle_once(
             owner_epoch="program-runner.operator-stop-reset.1",
         ),
         headless_client=_Headless(),  # type: ignore[arg-type]
-        execution_transport=_Headless(),  # type: ignore[arg-type]
+        execution_transport=(transport := _Headless()),  # type: ignore[arg-type]
         admission_client=admission,  # type: ignore[arg-type]
         cycle_journal=journal,
     )
@@ -4510,10 +4491,6 @@ def test_operator_motion_stop_reset_stops_tree_and_resets_cycle_once(
     )
     runtime._owner = owner  # type: ignore[assignment]  # noqa: SLF001
     runtime._host = host  # type: ignore[assignment]  # noqa: SLF001
-    cleared_stop_faults: list[str] = []
-    runtime._clear_reset_stop_fault = (  # type: ignore[method-assign]  # noqa: SLF001
-        lambda reset: cleared_stop_faults.append(reset.program_run_id)
-    )
     runtime.start()
     runtime.start_run(_start_request())
 
@@ -4649,7 +4626,8 @@ def test_operator_motion_stop_reset_stops_tree_and_resets_cycle_once(
         ("program-cycle.1", "operator requested Program cycle Reset")
     ]
     assert host.reset_calls == ["program-cycle.1"]
-    assert cleared_stop_faults == ["program-cycle.1"]
+    # Reset returns every global rule to its `active_at_start` (CONTRACTS §8).
+    assert transport.rule_resets >= 1
     assert len(admission.releases) == 1
     assert journal.read().state == "idle_after_reset"
     if near_revision_limit:
@@ -5283,7 +5261,6 @@ def test_tree_refinement_never_widens_reconciliation_permissions(tmp_path) -> No
     assert {kind for kind, allowed in permissions.items() if allowed} == {
         "cell_full_stop",
         "execution_recovery",
-        "stop_recovery",
         # Exact native manual retirement cannot deadlock Program recovery.
         "operation_reset",
         "operation_acknowledge_completed",
@@ -6094,174 +6071,6 @@ def test_unknown_reset_requires_resident_run_and_preserves_conflicting_request(
     assert not host.stop_calls and not host.reset_calls and not admission.releases
 
 
-def test_reset_confirmation_uses_fresh_fault_recovery_identity(uncertain_reset_runtime):
-    runtime, journal, admission, _owner, _host = uncertain_reset_runtime
-    recoveries = []
-    offer = {
-        "latch": {
-            "latch_id": "latch.1",
-            "latch_generation": 1,
-            "recovery_assessment_revision": 1,
-            "stop_certificate": {
-                "stop_certificate_id": "stop.1",
-                "stop_certificate_revision": 1,
-            },
-        },
-        "configuration_expectations": [],
-    }
-
-    def recover(intent):
-        recoveries.append(intent)
-        if len(recoveries) == 1:
-            offer["latch"]["recovery_assessment_revision"] = 2
-            raise ProgramRunOwnerOutcomeUnknownError("fault recovery response lost")
-        offer.clear()
-        return {"result": {"accepted": True}}
-
-    runtime._kernel = SimpleNamespace(
-        stop_fault=lambda: {"stop_fault": deepcopy(offer) if offer else None},
-        identity=lambda: {"identity": {"owner_epoch": "kernel.1"}},
-        recover_stop_fault=recover,
-    )
-    with pytest.raises(ProgramRunnerError) as unknown:
-        runtime.reset_cycle(_current_reset_request(runtime, journal, "reset.0"))
-    assert (
-        unknown.value.details["cause_code"] == "program_cycle_reconciliation_required"
-    )
-    assert journal.read().reconciliation_required and not admission.releases
-    assert (
-        runtime.reset_cycle(_current_reset_request(runtime, journal, "reset.1"))[
-            "idle_cycle_generation"
-        ]
-        == 2
-    )
-    assert [row["expected_recovery_assessment_revision"] for row in recoveries] == [
-        1,
-        2,
-    ]
-    assert len({row["request_context"]["request_id"] for row in recoveries}) == 2
-    assert [row["request_context"]["correlation_id"] for row in recoveries] == [
-        "reset.0",
-        "reset.1",
-    ]
-
-
-def test_reset_during_scenario_close_keeps_the_stop_fault_and_settles(
-    uncertain_reset_runtime,
-):
-    """D6 (a): Close's Reset never tries to clear the latch, whatever the order."""
-
-    runtime, journal, _admission, _owner, _host = uncertain_reset_runtime
-    recoveries = []
-    offer = {
-        "latch": {
-            "latch_id": "latch.1",
-            "latch_generation": 1,
-            "recovery_assessment_revision": 1,
-            "stop_certificate": {
-                "stop_certificate_id": "stop.1",
-                "stop_certificate_revision": 1,
-            },
-        },
-        "configuration_expectations": [],
-    }
-    runtime._kernel = SimpleNamespace(
-        stop_fault=lambda: {"stop_fault": deepcopy(offer)},
-        identity=lambda: {"identity": {"owner_epoch": "kernel.1"}},
-        recover_stop_fault=lambda intent: recoveries.append(intent)
-        or {"result": {"accepted": True}},
-    )
-    request = _current_reset_request(runtime, journal, "reset.0").model_copy(
-        update={"keep_stop_fault": True}
-    )
-    result = runtime.reset_cycle(request)
-    assert result["idle_cycle_generation"] == 2
-    assert recoveries == []
-
-
-def test_failed_close_reset_publishes_and_requires_its_keep_stop_fault(
-    uncertain_reset_runtime,
-):
-    """D6 (SX-324): a Close Reset failing in a resumable phase is published with
-    keep_stop_fault, continues only with it, and the private proof keeps two
-    selectors."""
-
-    runtime, journal, _admission, _owner, _host = uncertain_reset_runtime
-    request = _current_reset_request(runtime, journal, "reset.0").model_copy(
-        update={"keep_stop_fault": True}
-    )
-
-    recoveries = []
-    runtime._kernel = SimpleNamespace(
-        stop_fault=lambda: {"stop_fault": {
-            "latch": {"latch_id": "latch.1", "latch_generation": 1,
-                      "recovery_assessment_revision": 1,
-                      "stop_certificate": {"stop_certificate_id": "stop.1",
-                                           "stop_certificate_revision": 1}},
-            "configuration_expectations": [],
-        }},
-        identity=lambda: {"identity": {"owner_epoch": "kernel.1"}},
-        recover_stop_fault=lambda intent: recoveries.append(intent)
-        or {"result": {"accepted": True}},
-    )
-    contain = _host.contain_reset_run
-
-    def lost(_run_id, *, stop_request_id, timeout_s):
-        raise ProgramRunOwnerOutcomeUnknownError("Stop response lost")
-
-    _host.contain_reset_run = lost
-    with pytest.raises(ProgramRunnerError):
-        runtime.reset_cycle(request)
-    status = runtime.cycle_status()
-    assert status["reset_options"]["keep_stop_fault"] is True
-    status_core, accepted = runtime._cycle_status_projection()
-    assert accepted is None or "keep_stop_fault" not in accepted
-    with pytest.raises(ProgramRunnerError) as conflict:
-        runtime.reset_cycle(_current_reset_request(runtime, journal, "reset.1"))
-    assert conflict.value.code == "program_run_request_conflict"
-
-    # SX-329: a fresh confirmation with the retained value settles the Reset,
-    # and the latch is still kept (no recover call was ever made).
-    _host.contain_reset_run = contain
-    retry = _current_reset_request(runtime, journal, "reset.2").model_copy(
-        update={"keep_stop_fault": True}
-    )
-    assert runtime.reset_cycle(retry)["idle_cycle_generation"] == 2
-    assert recoveries == []
-
-
-@pytest.mark.parametrize(
-    ("accepted_keep", "continuation_keep", "refused"),
-    [(False, True, True), (True, False, True), (True, True, False), (False, False, False)],
-)
-def test_reset_continuation_compares_keep_stop_fault(
-    accepted_keep, continuation_keep, refused
-):
-    """SX-317: a retained Reset continues only with its own keep_stop_fault."""
-
-    def reset(request_id, keep):
-        return ProgramCycleResetRequest.model_validate(
-            {
-                "request_id": request_id,
-                "request_owner_epoch": "operator.1",
-                "source_label": "operator_ui",
-                "expected_owner_epoch": "runner.1",
-                "program_run_id": "run.1",
-                "expected_cycle_generation": 1,
-                "keep_stop_fault": keep,
-            }
-        )
-
-    accepted = reset("reset.accepted", accepted_keep)
-    continuation = reset("reset.continuation", continuation_keep)
-    if refused:
-        with pytest.raises(ProgramRunnerError) as conflict:
-            ProgramRuntime._require_same_reset_options(continuation, accepted)
-        assert conflict.value.code == "program_run_request_conflict"
-    else:
-        ProgramRuntime._require_same_reset_options(continuation, accepted)
-
-
 def test_recovery_reset_classifies_retained_intents_not_failure_text(
     uncertain_reset_runtime,
 ):
@@ -6907,20 +6716,19 @@ def test_failure_retry_prepares_and_releases_through_owner_before_ticking(
             # The Kernel's operator-alarm attention refuses the motion this
             # Retry would release, before any owner effect (spec 450 §5.2).
             refusal = ProgramRunOwnerError(
-                "unacknowledged operator alarms gate this motion; acknowledge them"
+                "an active operator-alarm condition interlock gates this motion"
             )
-            refusal.code = "unacknowledged_operator_alarms"  # type: ignore[attr-defined]
+            refusal.code = "operator_alarm_interlock_active"  # type: ignore[attr-defined]
             refusal.details = {  # type: ignore[attr-defined]
-                "reason": "unacknowledged_operator_alarms",
-                "interlock_alarms": "[]",
-                "unacknowledged_alarms": '[{"activation_id":"a","condition_id":"c",'
+                "reason": "operator_alarm_interlock_active",
+                "interlock_alarms": '[{"activation_id":"a","condition_id":"c",'
                 '"record_revision":1}]',
             }
             owner.attention_refusal = refusal
             with pytest.raises(ProgramRunnerError) as refused:
                 runtime.apply_recovery_action(request)
-            assert refused.value.code == "unacknowledged_operator_alarms"
-            assert refused.value.details["unacknowledged_alarms"].startswith("[{")
+            assert refused.value.code == "operator_alarm_interlock_active"
+            assert refused.value.details["interlock_alarms"].startswith("[{")
             # Only the held node's resources are tested, not the whole run.
             assert owner.attention_checks == [("program-cycle.1", "move.1", "retry.1")]
             assert calls == []
@@ -6994,13 +6802,12 @@ def test_lifecycle_failure_before_or_after_claim_is_honest_and_resettable(monkey
     class PointHeadless(_Headless):
         reads = 0
         failing = True
-        def cclc_component(self, _component_id):
-            pytest.fail("Run collected the unrelated full readiness projection")
-        def cclc_component_lifecycle_snapshot(self, component_id):
+        def program_applied(self):
+            # The Applied read before the claim (1) and its re-read after it (2).
             self.reads += 1
             if self.failing and self.reads == failure_at:
                 raise HeadlessClientError("component_lifecycle_facts_stale", "actual read failure", 409, details=details)
-            return super().cclc_component_lifecycle_snapshot(component_id)
+            return super().program_applied()
     headless = PointHeadless()
     admission = _Admission()
     journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3", owner_epoch="runner.failed-start.1")
@@ -7226,10 +7033,9 @@ class _SimulationLaneHeadless(_Headless):
 
 
 _SIMULATION_LANE_PROFILES = {
-    "mock": {"mock_profile": "lite6_lite_gripper"},
-    "isaac": {"isaac_profile": "lite6"},
-    "real": {"real_profile": "lite6_real", "device_address_ref": "lite6.address",
-             "adapter_family": "xarm"},
+    "mock": {"lane": "mock"},
+    "isaac": {"lane": "isaac"},
+    "real": {"lane": "real", "device_address_ref": "lite6.address"},
 }
 
 
@@ -7237,8 +7043,7 @@ def _set_simulation_lane(graph, component, lane):
     """Mirror one compiled profile and its Manager-derived simulator row."""
     profile = next(row for row in graph["cell_graph"]["runtime_units"][0]["configuration"]["controller_profiles"]
                    if row["controllable_component_id"] == component)
-    for key in ("mock_profile", "isaac_profile", "real_profile", "device_address_ref",
-                "adapter_family"):
+    for key in ("lane", "device_address_ref"):
         profile.pop(key, None)
     profile.update(_SIMULATION_LANE_PROFILES[lane])
     dependency = next(row for row in graph["component_simulator_dependencies"]
@@ -7358,106 +7163,22 @@ def test_simulation_dependency_follows_only_actual_used_target_components(lanes,
         runtime.shutdown()
 
 
-def test_motion_feedback_preflight_is_selected_and_leaves_simulator_play_ungated():
-    runtime, headless, _binding = _simulation_lane_fixture()
-    original_owner = runtime._owner  # noqa: SLF001
-    runtime._owner = SimpleNamespace(  # type: ignore[assignment]
-        execution_selection_motion_readiness_scope=lambda run_id, groups: (
-            (),
-            _DIGEST_A,
-            _DIGEST_B,
-        )
-    )
-    headless.program_applied = lambda: pytest.fail(  # type: ignore[method-assign]
-        "non-motion selection must not read Applied"
-    )
-    headless.cclc_component = lambda component_id: pytest.fail(  # type: ignore[method-assign]
-        f"non-motion selection must not read CCLC {component_id}"
-    )
-    try:
-        # Play/Wait selections have no motion target, so feedback is not a
-        # prerequisite for the command that can establish it.
-        runtime._verify_selected_motion_feedback("run.1", ("play_and_wait",))  # noqa: SLF001
-    finally:
-        runtime._owner = original_owner  # type: ignore[assignment]
-        runtime.shutdown()
-
-
-def test_selected_motion_feedback_preflight_blocks_stale_and_recovers_without_effect():
-    runtime, headless, binding = _simulation_lane_fixture()
-    applied = headless.program_applied()
-    original_owner = runtime._owner  # noqa: SLF001
-    runtime._owner = SimpleNamespace(  # type: ignore[assignment]
-        execution_selection_motion_readiness_scope=lambda run_id, groups: (
-            ("lite6_arm",),
-            applied["retained_bundle_id"],
-            applied["graph_revision"],
-        )
-    )
-    available = False
-    reads: list[str] = []
-
-    def component(component_id: str):
-        reads.append(component_id)
-        return {
-            "controllable_component_id": component_id,
-            "retained_bundle_id": applied["retained_bundle_id"],
-            "graph_revision": applied["graph_revision"],
-            "readiness": {
-                "measured_state": {
-                    "required": True,
-                    "available": available,
-                    "error": None if available else {
-                        "message": "Measured feed is stale",
-                    },
-                },
-            },
-        }
-
-    headless.cclc_component = component  # type: ignore[method-assign]
-    with pytest.raises(ProgramRunnerError) as stale:
-        runtime._verify_selected_motion_feedback("run.1", ("all",))  # noqa: SLF001
-    assert stale.value.code == "program_motion_component_readiness_unavailable"
-    assert reads == ["lite6_arm"]
-    controls = {"groups": [{
-        "group_id": "all",
-        "start_allowed": True,
-        "resume_allowed": True,
-        "start_unavailable_reason": None,
-        "resume_unavailable_reason": None,
-    }]}
-    blocked = runtime._motion_feedback_controls("run.1", controls)  # noqa: SLF001
-    assert blocked["groups"][0]["start_allowed"] is False
-    assert blocked["groups"][0]["resume_unavailable_reason"] == (
-        "Measured feed is stale"
-    )
-
-    available = True
-    runtime._verify_selected_motion_feedback("run.1", ("all",))  # noqa: SLF001
-    released = runtime._motion_feedback_controls("run.1", controls)  # noqa: SLF001
-    assert released["groups"][0]["start_allowed"] is True
-    assert released["groups"][0]["resume_allowed"] is True
-    assert reads == ["lite6_arm"] * 4
-    runtime._owner = original_owner  # type: ignore[assignment]
-    runtime.shutdown()
-
-
-def test_resume_motion_rechecks_feedback_before_host_effect():
+def test_resume_motion_reads_run_readiness_before_host_effect():
     runtime = ProgramRuntime.__new__(ProgramRuntime)
     runtime._control_effect = (  # type: ignore[method-assign]  # noqa: SLF001
         lambda request, *, kind, effect: effect()
     )
-    runtime._verify_selected_motion_feedback = (  # type: ignore[method-assign]  # noqa: SLF001
-        lambda _run_id, _groups: (_ for _ in ()).throw(
-            ProgramRunnerError(
-                "program_motion_component_readiness_unavailable",
-                "Measured feed is stale",
-            )
-        )
-    )
+    headless = _Headless()
+    headless.readiness = {
+        "can_execute": False,
+        "can_resume": False,
+        "blocked_reasons": [{"code": "rule_holds", "message": "guard holds",
+                             "rule_id": "guard"}],
+    }
+    runtime._headless = headless  # type: ignore[assignment]  # noqa: SLF001
     runtime._host = SimpleNamespace(  # noqa: SLF001
         resume_motion=lambda *_args, **_kwargs: pytest.fail(
-            "feedback refusal must precede the host Resume effect"
+            "a readiness refusal must precede the host Resume effect"
         )
     )
     request = ProgramSelectionResumeRequest.model_validate({
@@ -7467,26 +7188,14 @@ def test_resume_motion_rechecks_feedback_before_host_effect():
         "correlation_id": None,
         "program_run_id": "run.1",
         "expected_owner_epoch": "program-runner.test",
-        "expected_run_revision": 2,
         "expected_selection_revision": 1,
         "group_ids": ["arm"],
         "reason": "operator Resume",
     })
     with pytest.raises(ProgramRunnerError) as blocked:
         runtime.resume_motion("run.1", request)
-    assert blocked.value.code == "program_motion_component_readiness_unavailable"
-
-
-def test_used_native_runtime_does_not_become_a_mock_or_isaac_lane():
-    runtime, headless, binding = _simulation_lane_fixture()
-    unit = headless.graph["cell_graph"]["runtime_units"][0]
-    unit["runtime_profile_id"] = "manyforge.native_execution_runtime"
-    unit["configuration"] = {}
-    try:
-        assert _simulation_lane_required(runtime, binding, _simulation_lane_program("arm")) is False
-        assert headless.graph_reads == 1
-    finally:
-        runtime.shutdown()
+    assert blocked.value.code == "rule_holds"
+    assert blocked.value.details == {"rule_id": "guard"}
 
 
 def test_pure_timer_program_has_no_simulator_dependency_or_manager_read():
@@ -7710,7 +7419,7 @@ def _io_station_program(*motion_roles: str) -> dict[str, Any]:
 @pytest.mark.parametrize("lanes", [("mock", "mock"), ("isaac", "isaac")])
 def test_io_provider_target_needs_no_ros_controller_profile(lanes):
     # station_io shares the ROS runtime unit but owns a provider-kind domain:
-    # no controller profile, no simulator lane (CCLC activation gates it).
+    # no controller profile, no simulator lane (its component state gates it).
     runtime, headless, binding = _simulation_lane_fixture(lanes=lanes, simulation=_SimulationControl())
     try:
         assert _simulation_lane_requirement(runtime, binding, _io_station_program()) == (
@@ -7788,7 +7497,7 @@ def test_mixed_provider_and_controller_component_keeps_controller_profile_check(
                                       "controllable_component_id": "station_io"})
     if profile is not None:
         graph["runtime_units"][0]["configuration"]["controller_profiles"].append(
-            {"controllable_component_id": "station_io", "mock_profile": "station_mock"})
+            {"controllable_component_id": "station_io", "lane": "mock"})
         headless.graph["component_simulator_dependencies"].append(
             {"controllable_component_id": "station_io", "simulator": "none"})
     try:
@@ -7817,7 +7526,7 @@ def test_motion_target_without_profile_still_refused_with_controller_profile_rea
     {"output_mode": "commanded", "pneumatic_io": {"inputs": {}, "outputs": []}},
 ])
 def test_simulation_dependency_skips_a_lane_free_pneumatic_tool(no_output):
-    # lite6_pneumatic_mock (merge 6 D4): the mounted no-output pneumatic tool
+    # mock_lite6_pneumatic_pick_and_place (merge 6 D4): the mounted no-output pneumatic tool
     # has no controller profile; Run was refused before this fix.
     runtime, headless, binding = _simulation_lane_fixture(lanes=("mock", "mock"))
     graph = headless.graph
@@ -8054,7 +7763,7 @@ def test_real_ros_configuration_is_admitted_without_simulator_dependency(program
                                                          simulation=_SimulationControl())
     configuration = headless.graph["cell_graph"]["runtime_units"][0]["configuration"]
     assert "mode" not in configuration
-    assert all("real_profile" in row for row in configuration["controller_profiles"])
+    assert all(row["lane"] == "real" for row in configuration["controller_profiles"])
     program = (_simulation_lane_program("arm", "other_arm") if program_kind == "target" else
                _simulation_node_program("simulation.reset"))
     try:
@@ -8089,7 +7798,7 @@ def test_component_simulator_dependency_rows_must_match_ros_controller_profiles(
     elif case == "unknown_simulator":
         dependencies[0]["simulator"] = "mock"
     elif case == "open_row":
-        dependencies[0]["isaac_profile"] = "lite6"
+        dependencies[0]["lane"] = "isaac"
     elif case == "empty_component":
         dependencies[0]["controllable_component_id"] = ""
     else:
@@ -8129,7 +7838,6 @@ def test_liveness_cycle_projection_keeps_one_snapshot_across_reset(monkeypatch, 
         assert release_effect.wait(5), "test did not release the Reset effect"
 
     monkeypatch.setattr(runtime, "_prepare_scene_after_reset", scene_effect)
-    monkeypatch.setattr(runtime, "_clear_reset_stop_fault", lambda _request: None)
     runtime.start()
     request = ProgramCycleResetRequest.model_validate({
         "request_id": "reset.snapshot", "request_owner_epoch": "caller.snapshot",
@@ -8221,7 +7929,6 @@ def test_reset_selectors_order_and_plain_preservation(monkeypatch, tmp_path, idl
     monkeypatch.setattr(runtime, "_reset_active_tcp", lambda: events.append("tcp"))
     monkeypatch.setattr(runtime, "_reset_robot_position_after_reset", effect("position"))
     monkeypatch.setattr(runtime, "_require_reset_robot_position_available", lambda _request: events.append("preflight"))
-    monkeypatch.setattr(runtime, "_clear_reset_stop_fault", lambda _request: None)
     runtime.start()
     request = ProgramCycleResetRequest.model_validate({
         "request_id": "reset.options", "request_owner_epoch": "composer.1", "source_label": "operator_ui",
@@ -8303,7 +8010,6 @@ def test_idle_reload_without_applied_scenario_is_refused_before_any_effect(monke
     scenes = []
     monkeypatch.setattr(runtime, "_prepare_scene_after_reset", lambda *_args: scenes.append("scene"))
     monkeypatch.setattr(runtime, "_reset_persistent_keys_to_initial", lambda _request: scenes.append("keys"))
-    monkeypatch.setattr(runtime, "_clear_reset_stop_fault", lambda _request: None)
     runtime.start()
     request = ProgramCycleResetRequest.model_validate({
         "request_id": "reset.empty", "request_owner_epoch": "composer.1", "source_label": "operator_ui",
@@ -8360,7 +8066,6 @@ def test_selected_reset_failure_retains_phase_and_original_options(monkeypatch, 
     monkeypatch.setattr(runtime, "_prepare_scene_after_reset", effect("scene"))
     monkeypatch.setattr(runtime, "_reset_robot_position_after_reset", effect("position"))
     monkeypatch.setattr(runtime, "_require_reset_robot_position_available", lambda _request: None)
-    monkeypatch.setattr(runtime, "_clear_reset_stop_fault", lambda _request: None)
     runtime.start()
     request = ProgramCycleResetRequest.model_validate({
         "request_id": "reset.original", "request_owner_epoch": "composer.1", "source_label": "operator_ui",
@@ -8694,7 +8399,6 @@ def test_selected_reload_after_proven_never_started_run_uses_reset_claim(monkeyp
         assert journal.read().reset_effect_claim["claim"]["intent"]["claim_kind"] == "program_reset"
         effects.append("scene")
     monkeypatch.setattr(runtime, "_prepare_scene_after_reset", scene)
-    monkeypatch.setattr(runtime, "_clear_reset_stop_fault", lambda *_: None)
     runtime.start()
     request = ProgramCycleResetRequest.model_validate({"request_id": "reset.never-started", "request_owner_epoch": "caller.1",
         "source_label": "operator_ui", "correlation_id": None, "program_run_id": "never-started.1",
@@ -8841,14 +8545,27 @@ def test_continue_closes_releases_and_fails_the_held_node(monkeypatch, tmp_path)
         }
     )
     try:
+        # Continue lets held motion continue: it needs motion_clear (§10),
+        # refused with the readiness reason before any owner effect.
+        headless = runtime._headless
+        headless.readiness = {
+            "can_execute": False, "can_resume": False, "motion_clear": False,
+            "blocked_reasons": [{"code": "cell_latched", "message": "robot.1: offline"}],
+        }
+        with pytest.raises(ProgramRunnerError) as blocked:
+            runtime.apply_recovery_action(request.model_copy(update={"request_id": "continue.0"}))
+        assert blocked.value.code == "cell_latched"
+        assert owner.attention_checks == [] and calls == []
+        headless.readiness = {
+            "can_execute": True, "can_resume": True, "motion_clear": True, "blocked_reasons": []}
         # Continue releases the hold's groups like Retry, so the same
         # operator-alarm attention gate refuses it before any owner effect.
-        refusal = ProgramRunOwnerError("unacknowledged operator alarms gate this motion")
-        refusal.code = "unacknowledged_operator_alarms"  # type: ignore[attr-defined]
+        refusal = ProgramRunOwnerError("an operator-alarm condition interlock gates this motion")
+        refusal.code = "operator_alarm_interlock_active"  # type: ignore[attr-defined]
         owner.attention_refusal = refusal
         with pytest.raises(ProgramRunnerError) as refused:
             runtime.apply_recovery_action(request)
-        assert refused.value.code == "unacknowledged_operator_alarms"
+        assert refused.value.code == "operator_alarm_interlock_active"
         assert owner.attention_checks == [("program-cycle.1", "move.2", "continue.1")]
         assert calls == []
         assert journal.read().state == "running"
@@ -8870,5 +8587,81 @@ def test_continue_closes_releases_and_fails_the_held_node(monkeypatch, tmp_path)
         # Continue counts no Retry, even with the Retry budget spent.
         assert runtime._controls("program-cycle.1").retry_count("move.2") == 1
         assert not journal.read().reconciliation_required
+    finally:
+        runtime.shutdown()
+
+
+def _terminal(state: str, run_end: dict[str, Any], run_id: str = "program-cycle.1") -> dict[str, Any]:
+    return {"state": state, "capture": {"program_run_id": run_id}, "run_end": run_end}
+
+
+def _run_end_runtime(headless: _Headless) -> ProgramRuntime:
+    runtime = ProgramRuntime.__new__(ProgramRuntime)
+    runtime._headless = headless  # type: ignore[assignment]  # noqa: SLF001
+    runtime._kernel = KernelClient(headless)  # type: ignore[arg-type]  # noqa: SLF001
+    runtime._journal = None  # noqa: SLF001
+    runtime._run_ends = {}  # noqa: SLF001
+    return runtime
+
+
+def test_a_run_that_ends_while_the_cell_is_latched_ends_by_a_cell_fault() -> None:
+    """CONTRACTS §9: the latch is the error; the run end names its component.
+    Every rule returns to `active_at_start` once at the end of the run."""
+
+    headless = _Headless()
+    headless.latch = {"latched": True, "causes": [
+        {"component_id": "robot.1", "kind": "fault", "fault": {"code": "fault_estop"}}]}
+    runtime = _run_end_runtime(headless)
+    failed = {"end_reason": "failed", "details": {"node_instance_id": "move",
+              "error": {"code": "interrupt_fault", "message": "stopped"}}}
+    runtime._record_terminal_snapshot(_terminal("failed", failed))  # noqa: SLF001
+    runtime._record_terminal_snapshot(_terminal("failed", failed))  # noqa: SLF001
+    expected = {"end_reason": "cell_fault", "details": {"component_id": "robot.1"}}
+    assert runtime._project_run(_terminal("failed", failed))["run_end"] == expected  # noqa: SLF001
+    assert headless.rule_resets == 1
+
+
+@pytest.mark.parametrize(("state", "run_end"), [
+    ("succeeded", {"end_reason": "completed", "details": {}}),
+    ("stopped", {"end_reason": "stopped", "details": {"stopped_by": "rule", "rule_id": "door"}}),
+    ("failed", {"end_reason": "failed", "details": {"error": {"code": "x", "message": "y"}}}),
+])
+def test_a_run_end_without_a_latch_keeps_its_own_reason(state, run_end) -> None:
+    headless = _Headless()
+    runtime = _run_end_runtime(headless)
+    runtime._record_terminal_snapshot(_terminal(state, run_end))  # noqa: SLF001
+    assert runtime._project_run(_terminal(state, run_end))["run_end"] == run_end  # noqa: SLF001
+    assert headless.rule_resets == 1
+    # A running run has no end and starts no reset.
+    runtime._record_terminal_snapshot(_terminal("running", None, "program-cycle.2"))  # noqa: SLF001
+    assert headless.rule_resets == 1
+
+
+def test_start_refuses_a_set_rule_active_naming_an_unknown_rule(monkeypatch, tmp_path) -> None:
+    """CONTRACTS §9: a node naming a rule the Deployment lacks blocks Execute."""
+
+    admitted = _PreparedRunAdmission()
+    admitted.program.rule_activation_rule_ids = ("missing",)
+    monkeypatch.setattr(
+        "manyforge_program_runner.runtime.build_applied_program_run_admission",
+        lambda *_args, **_kwargs: admitted,
+    )
+    headless = _Headless()
+    admission = _Admission()
+    journal = ProgramCycleJournal(tmp_path / "cycle.sqlite3", owner_epoch="runner.1")
+    runtime = ProgramRuntime(
+        ProgramRunnerConfig(headless_url="http://headless.test", owner_epoch="runner.1"),
+        headless_client=headless,  # type: ignore[arg-type]
+        execution_transport=headless,  # type: ignore[arg-type]
+        admission_client=admission,  # type: ignore[arg-type]
+        cycle_journal=journal,
+    )
+    runtime.start()
+    try:
+        with pytest.raises(ProgramRunnerError) as refused:
+            runtime.start_run(_start_request())
+        assert refused.value.code == "rule_unknown"
+        assert refused.value.details == {"rule_id": "missing"}
+        assert admission.claims == []
     finally:
         runtime.shutdown()

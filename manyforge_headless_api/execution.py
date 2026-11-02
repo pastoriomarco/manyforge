@@ -42,13 +42,10 @@ from .models import (
     RuntimeScaleControlSelectorRequest,
     SHA256_PATTERN,
     SceneRevisionRequest,
-    GlobalIoRuleRecoveryIntentRequest,
-    GlobalIoRuleRecoverySelector,
-    StopFaultRecoveryIntentRequest,
     StopIntentRequest,
     TargetObservationQuery,
 )
-from .cclc import MAX_INCIDENT_EVENT_PAGE
+from .activity_history import component_action_record, record_activity
 from .global_rule_status import STATE_EVENT_KIND, GlobalRuleStatusModel
 from .native import HeadlessApiError, HeadlessCorePort, strict_json_object
 from manyforge_behavior.json_scalars import nonnegative_int64, nonnegative_int64_value
@@ -63,6 +60,16 @@ EXECUTION_SOCKET_FILE = "execution-command.sock"
 EXECUTION_CONTROL_SOCKET_FILE = "execution-control.sock"
 EXECUTION_OBSERVATION_SOCKET_FILE = "execution-observation.sock"
 ACTIVE_TCP_EVENT_KIND = "active_tcp_changed"
+# The host's component model facts in every ``events`` reply and stream
+# ``state`` (CONTRACTS §1, §5, §7, §10): a change of any wakes the control
+# state. Signal samples count by value, source and freshness, not by age.
+COMPONENT_MODEL_STATE_FIELDS = (
+    "cell_latch",
+    "component_states",
+    "execution_blocks",
+    "rule_holds",
+    "signal_samples",
+)
 EXECUTION_COMMAND_VERSION = "manyforge.execution_command.v1"
 EXECUTION_RESPONSE_VERSION = "manyforge.execution_command_response.v1"
 VOLATILE_MOTION_TRACE_VERSION = "manyforge.volatile_motion_trace.v1"
@@ -73,7 +80,6 @@ OPERATION_EVENT_KINDS = frozenset(
         "control_accepted",
         "stop_acceptance_projected",
         "stop_terminal_projected",
-        "stop_fault_cleared",
         "runtime_scale_accepted",
         "operation_prepared",
         "state_observed",
@@ -93,7 +99,6 @@ def _valid_operation_event_identity(event: dict[str, Any]) -> bool:
     operation_revision = event.get("operation_revision")
     if event.get("record_kind") in {
         "stop_acceptance_projected",
-        "stop_fault_cleared",
     }:
         request_id = event.get("request_id")
         return (
@@ -138,7 +143,6 @@ RETRY_ELIGIBILITY_REASONS = frozenset(
         "validation_not_conclusive_collision",
         "stop_owner_active",
         "stronger_authority_active",
-        "queued_latch_present",
         "latch_present",
         "stop_not_settled",
         "stop_not_nominal",
@@ -344,15 +348,12 @@ class ExecutionPort(Protocol):
         trusted_principal_id: str | None,
     ) -> dict[str, Any]: ...
 
-    def stop_fault(self) -> dict[str, Any]: ...
+    def component_model(self) -> dict[str, Any]: ...
 
-    def recover_stop_fault(
-        self,
-        request: StopFaultRecoveryIntentRequest | GlobalIoRuleRecoveryIntentRequest,
-    ) -> dict[str, Any]: ...
+    def component_action(self, component_id: str, action: str) -> dict[str, Any]: ...
 
-    def force_close(
-        self, *, step: str, stop_generation: int | None = None
+    def set_io_output(
+        self, signal_id: str, value: bool | float, *, origin: str
     ) -> dict[str, Any]: ...
 
     def set_runtime_scale_control(
@@ -384,64 +385,6 @@ def _canonical_json(value: dict[str, Any]) -> bytes:
         raise HeadlessApiError(
             "execution_command_invalid",
             f"execution command is not canonically encodable: {exc}",
-        ) from exc
-
-
-def _component_condition_facts(snapshot: dict[str, Any]) -> dict[str, Any]:
-    """The CCLC snapshot members the lifecycle-cause alarm adapter reads.
-
-    Wait timing (`waiting_since_ns`, `delayed`) is presentation only and is
-    not forwarded, so it neither changes a condition nor crosses the native
-    boundary as an unsafe integer. An open incident crosses with its
-    identity, cause, vendor codes and summary; its detection time stays in
-    the incident record.
-    """
-
-    try:
-        progress = snapshot.get("lifecycle_progress")
-        incident = None if progress is None else progress.get("incident")
-        return {
-            "component_lifecycle_state": snapshot["component_lifecycle_state"],
-            "controllable_component_id": snapshot["controllable_component_id"],
-            "domains": [
-                {
-                    "control_domain_id": domain["control_domain_id"],
-                    # Core `resource_ids()` for either domain kind.
-                    "resources": list(domain["resources"]),
-                }
-                for domain in snapshot["domains"]
-            ],
-            "graph_revision": snapshot["graph_revision"],
-            "lifecycle_progress": (
-                None
-                if progress is None
-                else {
-                    **{
-                        key: progress[key]
-                        for key in ("blocking_cause_class", "blocking_reason", "phase")
-                    },
-                    "incident": (
-                        None
-                        if incident is None
-                        else {
-                            key: incident[key]
-                            for key in (
-                                "cause_class",
-                                "incident_id",
-                                "summary",
-                                "vendor_codes",
-                            )
-                        }
-                    ),
-                }
-            ),
-            "lifecycle_target": snapshot.get("lifecycle_target"),
-            "retained_bundle_id": snapshot["retained_bundle_id"],
-        }
-    except (KeyError, TypeError) as exc:
-        raise HeadlessApiError(
-            "cclc_open_response_invalid",
-            f"CCLC component snapshot lacks a condition field: {exc}",
         ) from exc
 
 
@@ -1322,7 +1265,7 @@ class ExecutionCommandClient:
         ):
             raise HeadlessApiError(
                 "execution_command_response_invalid",
-                "native runtime fault snapshot has invalid provenance",
+                "execution host fault snapshot has invalid provenance",
             )
         return {"owner_epoch": owner_epoch, "runtime_faults": faults,
                 "execution_owner_ready": response["execution_owner_ready"]}
@@ -1464,6 +1407,15 @@ class ExecutionCommandClient:
                 "interrupt_rule_state_baseline"
             )
             page["active_tcp_baseline"] = response.get("active_tcp_baseline")
+            page["component_model"] = {
+                name: response.get(name) for name in COMPONENT_MODEL_STATE_FIELDS
+            }
+            samples = page["component_model"]["signal_samples"]
+            if samples is not None:
+                page["component_model"]["signal_samples"] = [
+                    {key: value for key, value in sample.items() if key != "age_ns"}
+                    for sample in samples
+                ]
             return page
         except Exception as error:
             error.runtime_fault_snapshot = runtime_snapshot
@@ -2131,317 +2083,53 @@ class ExecutionCommandClient:
             )
         return response
 
-    @staticmethod
-    def _valid_stop_fault_offer(offer: object) -> bool:
-        if offer is None:
-            return True
-        if not isinstance(offer, dict) or set(offer) != {
-            "configuration_expectations",
-            "latch",
-            "recovery_unavailable_reason",
-        }:
-            return False
-        unavailable_reason = offer.get("recovery_unavailable_reason")
-        if unavailable_reason is not None and (
-            not isinstance(unavailable_reason, str) or not unavailable_reason
-        ):
-            return False
-        latch = offer.get("latch")
-        expectations = offer.get("configuration_expectations")
-        if not isinstance(latch, dict) or not isinstance(expectations, list):
-            return False
-        if set(latch) != {
-            "captured_operation_ids",
-            "captured_resources",
-            "cell_id",
-            "clear_projection",
-            "evidence_refs",
-            "graph_revision",
-            "latch_generation",
-            "latch_id",
-            "observed_triggers",
-            "persistence_degraded",
-            "reason_code",
-            "recovery_assessment_revision",
-            "recovery_status",
-            "retained_bundle_id",
-            "state",
-            "stop_certificate",
-            "stop_generation",
-            "stop_id",
-            "terminal_projection",
-            "trigger",
-        }:
-            return False
-        required_text = (
-            "cell_id",
-            "graph_revision",
-            "latch_id",
-            "reason_code",
-            "retained_bundle_id",
-            "stop_id",
+    def component_model(self) -> dict[str, Any]:
+        """CONTRACTS §1/§5/§7/§8: every ComponentState, the CellLatch, every
+        SignalSample, the rule holds and the required signal ids, as the
+        execution host publishes them (an in-memory read)."""
+        return self._read_projection_on(
+            "read_component_model", self._control_socket_path
         )
-        if any(
-            not isinstance(latch.get(key), str) or not latch[key]
-            for key in required_text
-        ):
-            return False
-        if any(
-            type(latch.get(key)) is not int
-            or not 1 <= latch[key] <= MAXIMUM_SAFE_INTEGER
-            for key in (
-                "latch_generation",
-                "recovery_assessment_revision",
-                "stop_generation",
-            )
-        ):
-            return False
-        if (
-            type(latch.get("persistence_degraded")) is not bool
-            or not isinstance(latch.get("observed_triggers"), list)
-            or latch.get("trigger") not in latch.get("observed_triggers", [])
-            or not isinstance(latch.get("captured_operation_ids"), list)
-            or not isinstance(latch.get("captured_resources"), list)
-            or not isinstance(latch.get("evidence_refs"), list)
-            or not isinstance(latch.get("terminal_projection"), dict)
-            or not isinstance(latch.get("clear_projection"), dict)
-            or latch.get("state") not in {"latched", "recovery_pending"}
-            or latch.get("recovery_status")
-            not in {
-                "waiting_for_observation",
-                "waiting_for_quiescence",
-                "waiting_for_configuration",
-                "waiting_for_external_reconciliation",
-                "waiting_for_durable_record",
-                "ready",
-                "recovery_pending",
-            }
-        ):
-            return False
-        for key in ("captured_operation_ids", "captured_resources"):
-            rows = latch[key]
-            if (
-                any(not isinstance(item, str) or not item for item in rows)
-                or rows != sorted(rows)
-                or len(rows) != len(set(rows))
-            ):
-                return False
-        certificate = latch.get("stop_certificate")
-        if certificate is not None and (
-            not isinstance(certificate, dict)
-            or set(certificate)
-            != {
-                "stop_certificate_id",
-                "stop_certificate_revision",
-                "stop_generation",
-                "stop_id",
-            }
-            or any(
-                not isinstance(certificate.get(key), str) or not certificate[key]
-                for key in ("stop_certificate_id", "stop_id")
-            )
-            or any(
-                type(certificate.get(key)) is not int
-                or not 1 <= certificate[key] <= MAXIMUM_SAFE_INTEGER
-                for key in ("stop_certificate_revision", "stop_generation")
-            )
-            or certificate["stop_id"] != latch["stop_id"]
-            or certificate["stop_generation"] != latch["stop_generation"]
-        ):
-            return False
-        for key in ("terminal_projection", "clear_projection"):
-            projection = latch[key]
-            if (
-                not isinstance(projection, dict)
-                or set(projection) != {"error", "retry_generation", "state"}
-                or projection.get("state")
-                not in {"not_applicable", "pending", "recorded", "failed"}
-            ):
-                return False
-        for evidence in latch["evidence_refs"]:
-            if (
-                not isinstance(evidence, dict)
-                or set(evidence) != {"evidence_digest", "kind"}
-                or not isinstance(evidence.get("evidence_digest"), str)
-                or not evidence["evidence_digest"].startswith("sha256:")
-                or evidence.get("kind")
-                not in {
-                    "settlement",
-                    "late_quiescence",
-                    "configuration",
-                    "external_reconciliation",
-                    "backend_or_lifecycle_reset",
-                }
-            ):
-                return False
-        prior = ""
-        for row in expectations:
-            if (
-                not isinstance(row, dict)
-                or set(row)
-                != {
-                    "active_control_configuration_generation",
-                    "active_control_configuration_id",
-                    "control_domain_id",
-                }
-                or not isinstance(row.get("control_domain_id"), str)
-                or not row["control_domain_id"]
-                or row["control_domain_id"] <= prior
-                or not isinstance(row.get("active_control_configuration_id"), str)
-                or not row["active_control_configuration_id"]
-                or type(row.get("active_control_configuration_generation")) is not int
-                or not 1
-                <= row["active_control_configuration_generation"]
-                <= MAXIMUM_SAFE_INTEGER
-            ):
-                return False
-            prior = row["control_domain_id"]
-        if certificate is None:
-            return (
-                not expectations
-                and unavailable_reason is None
-                and latch["state"] == "latched"
-                and latch["recovery_status"] == "waiting_for_observation"
-                and latch["terminal_projection"]["state"] == "pending"
-                and latch["clear_projection"]["state"] == "not_applicable"
-            )
-        # A certified latch carries either a non-empty configuration proof or
-        # a named reason why recovery is unavailable; never an empty proof.
-        return bool(expectations) != (unavailable_reason is not None)
 
-    @staticmethod
-    def _valid_global_rule_recovery_offers(offers: object) -> bool:
-        """SX-2206: one closed offer per actually latched global rule."""
+    def component_action(self, component_id: str, action: str) -> dict[str, Any]:
+        """CONTRACTS §2: hand one action to the core component coordinator.
 
-        if not isinstance(offers, list):
-            return False
-        for offer in offers:
-            if not isinstance(offer, dict) or set(offer) != {
-                "current_condition",
-                "latch_cause",
-                "post_latch_disposition",
-                "selector",
-            }:
-                return False
-            condition = offer["current_condition"]
-            if (condition is not None and type(condition) is not bool) or (
-                offer["latch_cause"] not in ("condition", "source_loss")
-            ) or offer["post_latch_disposition"] not in (
-                "auto_clear_on_signal_release",
-                "await_operator_ack",
-            ):
-                return False
-            try:
-                GlobalIoRuleRecoverySelector.model_validate(offer["selector"])
-            except ValueError:
-                return False
-        return True
-
-    def stop_fault(self) -> dict[str, Any]:
-        # An in-memory Stop-progression read: served on the control socket.
+        The reply only accepts or refuses (`component_action_in_progress`,
+        `component_action_unsupported`, `component_not_found`); the result
+        arrives in the component's `last_action`.
+        """
         response = self._exchange_control(
             {
                 "api_version": EXECUTION_COMMAND_VERSION,
-                "command": "get_stop_fault",
+                "command": "component_action",
+                "request": {"component_id": component_id, "action": action},
             }
         )
-        if response.get("ok") is True and (
-            response.get("command") != "get_stop_fault"
-            or not self._valid_stop_fault_offer(response.get("stop_fault"))
-            or not self._valid_global_rule_recovery_offers(
-                response.get("global_rule_recovery_offers", [])
-            )
-        ):
-            raise HeadlessApiError(
-                "execution_command_response_invalid",
-                "Stop-fault response is invalid",
-            )
-        return response
+        return self._validate_projection_response("component_action", response)
 
-    def recover_stop_fault(
-        self,
-        request: StopFaultRecoveryIntentRequest | GlobalIoRuleRecoveryIntentRequest,
+    def set_io_output(
+        self, signal_id: str, value: bool | float, *, origin: str
     ) -> dict[str, Any]:
-        request_payload = request.model_dump(mode="json")
-        global_rule = isinstance(request, GlobalIoRuleRecoveryIntentRequest)
-        if request.reason is None and not global_rule:
-            # The original Stop/certificate request bytes stay unchanged.
-            request_payload.pop("reason")
+        """CONTRACTS §7: one output write; the reply carries SetOutputResult.
+        `origin` is `manual` (refused while motion executes) or `program`."""
         response = self._exchange(
             {
                 "api_version": EXECUTION_COMMAND_VERSION,
-                "command": "recover_stop_fault",
-                "request": request_payload,
+                "command": "set_io_output",
+                "request": {"signal_id": signal_id, "value": value, "origin": origin},
             }
         )
         result = response.get("result")
         if response.get("ok") is True and (
-            response.get("command") != "recover_stop_fault"
+            response.get("command") != "set_io_output"
             or not isinstance(result, dict)
-            or type(result.get("accepted")) is not bool
-            or (
-                not self._valid_global_rule_recovery_result(result)
-                if global_rule
-                else not isinstance(result.get("latch"), dict)
-            )
+            or result.get("outcome") not in ("succeeded", "failed", "unknown")
         ):
             raise HeadlessApiError(
                 "execution_command_response_invalid",
-                "Stop-fault recovery result has the wrong kind or shape",
+                "set_io_output result has the wrong kind or shape",
             )
         return response
-
-    def force_close(
-        self, *, step: str, stop_generation: int | None = None
-    ) -> dict[str, Any]:
-        """Item 37: one Kernel step of an operator Force close.
-
-        ``arm`` names the operator's Full Stop generation; ``close_operations``
-        moves the resident operations into history. A refusal is returned as
-        the owner's ``ok: false`` reply.
-        """
-
-        command: dict[str, Any] = {
-            "api_version": EXECUTION_COMMAND_VERSION,
-            "command": "force_close",
-            "step": step,
-        }
-        if step == "arm":
-            command["stop_generation"] = stop_generation
-        response = self._exchange(command)
-        result = response.get("result")
-        if response.get("ok") is True and (
-            response.get("command") != "force_close"
-            or not isinstance(result, dict)
-            or result.get("step") != step
-            or not isinstance(result.get("operations"), list)
-            or (step == "arm" and result.get("stop_generation") != stop_generation)
-        ):
-            raise HeadlessApiError(
-                "execution_command_response_identity_mismatch",
-                "Force close result does not match its request",
-            )
-        return response
-
-    @staticmethod
-    def _valid_global_rule_recovery_result(result: dict[str, Any]) -> bool:
-        if set(result) != {
-            "accepted",
-            "context",
-            "error",
-            "replay_status",
-            "request_id",
-            "rule",
-        }:
-            return False
-        rule = result["rule"]
-        if rule is None:
-            return result["accepted"] is False
-        return (
-            isinstance(rule, dict)
-            and set(rule) == {"rule_id", "state", "triggering_acquisition"}
-            and rule["state"] in ("clear", "tripped", "latched")
-        )
 
     def set_runtime_scale_control(
         self,
@@ -2641,17 +2329,10 @@ class ExecutionEventPump:
         execution: ExecutionPort,
         *,
         poll_seconds: float = 0.1,
-        condition_poll_seconds: float = 0.5,
         page_limit: int = 16,
-        cclc: Any | None = None,
-        component_condition_poll_seconds: float = 1.0,
     ) -> None:
         if not 0.01 <= poll_seconds <= 5.0:
             raise ValueError("operation event polling period is outside [0.01, 5]")
-        if not 0.05 <= condition_poll_seconds <= 5.0:
-            raise ValueError("operation condition polling period is outside [0.05, 5]")
-        if not 0.1 <= component_condition_poll_seconds <= 5.0:
-            raise ValueError("component condition polling period is outside [0.1, 5]")
         if not 1 <= page_limit <= 16:
             raise ValueError("operation event page limit is outside [1, 16]")
         self._core = core
@@ -2661,7 +2342,6 @@ class ExecutionEventPump:
         # Contract §8.1: identity, pages and wake-ups come from the event
         # subscription; the request/reply `events` command is never polled.
         self._stream = StreamedExecutionEvents(execution.subscribe_events, self._stop)
-        self._condition_poll_seconds = condition_poll_seconds
         self._page_limit = page_limit
         self._thread: threading.Thread | None = None
         self._last_error: str | None = None
@@ -2680,24 +2360,9 @@ class ExecutionEventPump:
         self._global_rules_sent: list[dict[str, Any]] | None = None
         self._global_rules_failing = False
         self._alarm_refresh_failing = False
-        self._cclc = cclc
-        self._component_condition_poll_seconds = component_condition_poll_seconds
-        self._next_component_condition_poll_at = float("-inf")
-        # The short retry floor: no lifecycle read starts before it, even
-        # while a read is pending.
-        self._next_component_condition_retry_at = float("-inf")
-        # The core's `component_lifecycle_observation_pending`, as last
-        # reported by the alarm-source refresh this pump offers each
-        # iteration: the lifecycle source needs an observation of the active
-        # configuration, so the next read does not wait the ordinary period.
-        self._component_lifecycle_observation_pending = False
-        self._component_conditions_failing = False
-        # CCLC incident history (addendum 2 contract item 5): cursor per CCLC
-        # owner epoch; the core deduplicates by (incident id, event kind).
-        self._incident_event_owner_epoch: str | None = None
-        self._incident_event_after_sequence = 0
-        self._next_incident_event_poll_at = float("-inf")
-        self._incident_events_failing = False
+        # Each component's last recorded `last_action`; None until the first
+        # model of this Headless (a baseline, not recorded again).
+        self._recorded_actions: dict[str, Any] | None = None
 
     def set_progress_observer(
         self, observer: Callable[[list[dict[str, Any]]], None] | None,
@@ -2794,16 +2459,7 @@ class ExecutionEventPump:
         """
 
         try:
-            result = self._core.refresh_alarm_sources()
-            # Spec 530 §7.1: a configuration change is respected without
-            # polling. The core reports, without its lock, that the lifecycle
-            # source's quality became unknown (a registry replacement by any
-            # reader's refresh, or an unreachable CCLC) and no complete
-            # observation of the active configuration has been accepted since.
-            self._component_lifecycle_observation_pending = (
-                isinstance(result, dict)
-                and result.get("component_lifecycle_observation_pending") is True
-            )
+            self._core.refresh_alarm_sources()
         except Exception:
             if not self._alarm_refresh_failing:
                 self._alarm_refresh_failing = True
@@ -2814,217 +2470,6 @@ class ExecutionEventPump:
         if self._alarm_refresh_failing:
             self._alarm_refresh_failing = False
             logging.getLogger(__name__).info("alarm source refresh recovered")
-
-    def _observe_component_lifecycle_conditions(self) -> None:
-        """Hand CCLC component snapshots to the lifecycle-cause alarm adapter.
-
-        Spec 530 §3.3 (2026-10-08): the C++ adapter derives the safety-stop
-        condition and submits only changed ones. This
-        bounded read runs at most once per period and only while the active
-        configuration names components or the lifecycle source is registered.
-        A configuration without controlled components has no CCLC owner (an
-        Apply to it removes the CCLC service), so its empty scope is observed
-        by the core alone, fenced to that configuration: the removed
-        components' conditions return to normal and the source quality is
-        reconciled without contacting CCLC. With components in scope, CCLC
-        being unreachable keeps every raised condition at unknown quality; a
-        component whose snapshot is unavailable keeps its conditions
-        unchanged. The core judges each observation against the configuration
-        Manager publishes at that moment and fences each snapshot to its
-        retained bundle and graph revision.
-
-        Unknown quality leaves the whole Alarm Lifecycle Owner unreconciled,
-        which blocks motion admission. An Apply that replaces the CCLC owner
-        makes it briefly unreachable, so until a complete observation of the
-        current scope is accepted the read repeats at the pump cadence
-        (bounded below by 0.1 s) instead of waiting a whole period after the
-        owner returns. The same short cadence applies from the moment the
-        core reports a pending lifecycle observation (a registry replacement
-        after an Apply, seen by any reader's refresh), so the read of the new
-        configuration does not wait out a period started under the old one.
-        An observation with an unread component (`incomplete`) is not
-        accepted either and is repeated at the same short cadence.
-        """
-
-        if self._cclc is None:
-            return
-        now = time.monotonic()
-        if now < self._next_component_condition_retry_at:
-            return
-        if (
-            not self._component_lifecycle_observation_pending
-            and now < self._next_component_condition_poll_at
-        ):
-            return
-        self._next_component_condition_retry_at = now + min(
-            self._component_condition_poll_seconds, max(self._poll_seconds, 0.1)
-        )
-        self._next_component_condition_poll_at = (
-            self._next_component_condition_retry_at
-        )
-        try:
-            scope = self._core.component_lifecycle_condition_scope()
-            component_ids = scope.get("component_ids")
-            source_registered = scope.get("source_registered")
-            retained_bundle_id = scope.get("retained_bundle_id")
-            graph_revision = scope.get("graph_revision")
-            if (
-                not isinstance(component_ids, list)
-                or not all(isinstance(value, str) and value for value in component_ids)
-                or type(source_registered) is not bool
-                or (retained_bundle_id is None) != (graph_revision is None)
-                or not all(
-                    value is None or (isinstance(value, str) and value)
-                    for value in (retained_bundle_id, graph_revision)
-                )
-            ):
-                raise HeadlessApiError(
-                    "headless_component_lifecycle_invalid",
-                    "component lifecycle condition scope is invalid",
-                )
-            if not component_ids and not source_registered:
-                # Nothing in scope and no source to reconcile.
-                self._component_lifecycle_observation_pending = False
-                self._next_component_condition_poll_at = (
-                    now + self._component_condition_poll_seconds
-                )
-                return
-            if not component_ids:
-                # No controlled components: no CCLC owner to read. A scope read
-                # before any publication has nothing to fence to; retry.
-                if retained_bundle_id is None:
-                    return
-                result = self._core.observe_empty_component_lifecycle_configuration(
-                    retained_bundle_id=retained_bundle_id,
-                    graph_revision=graph_revision,
-                )
-                if result.get("status") in {"observed", "empty"}:
-                    self._component_lifecycle_observation_pending = False
-                    self._next_component_condition_poll_at = (
-                        now + self._component_condition_poll_seconds
-                    )
-                return
-            try:
-                identity = self._cclc.owner_identity()
-                snapshots: list[dict[str, Any]] = []
-                unavailable: list[str] = []
-                for component_id in component_ids:
-                    try:
-                        snapshots.append(
-                            _component_condition_facts(
-                                self._cclc.component_snapshot(component_id)
-                            )
-                        )
-                    except HeadlessApiError as error:
-                        if error.code == "cclc_owner_unavailable":
-                            raise
-                        unavailable.append(component_id)
-                # A replaced owner between reads would mix two epochs.
-                if self._cclc.owner_identity() != identity:
-                    return
-            except HeadlessApiError as error:
-                if error.code != "cclc_owner_unavailable":
-                    raise
-                self._core.mark_component_lifecycle_source_unknown()
-                return
-            result = self._core.observe_component_lifecycle_conditions(
-                cclc_owner_epoch=identity["request_owner_epoch"],
-                snapshots_json=_canonical_json(snapshots).decode("utf-8"),
-                unavailable_component_ids=unavailable,
-            )
-            # `scope_changed` (an Apply between the scope read and the
-            # observation, or a snapshot CCLC took under the superseded
-            # configuration), `incomplete` (a component's snapshot could not
-            # be read, so quality is unchanged) and `configuration_unavailable`
-            # (no fresh, verified Manager publication to judge against)
-            # completed nothing; only an accepted observation waits the full
-            # period.
-            if result.get("status") in {"observed", "empty"}:
-                self._component_lifecycle_observation_pending = False
-                self._next_component_condition_poll_at = (
-                    now + self._component_condition_poll_seconds
-                )
-        except Exception:
-            if not self._component_conditions_failing:
-                self._component_conditions_failing = True
-                logging.getLogger(__name__).warning(
-                    "component lifecycle condition observation failed",
-                    exc_info=True,
-                )
-            return
-        if self._component_conditions_failing:
-            self._component_conditions_failing = False
-            logging.getLogger(__name__).info(
-                "component lifecycle condition observation recovered"
-            )
-
-    def _record_cclc_incident_events(self) -> None:
-        """Copy CCLC incident history events into the historian.
-
-        Same cadence and bounded client as the component-condition read. One
-        page per period; a full page is followed immediately by the next one.
-        Only new events are recorded: the cursor follows the CCLC owner epoch
-        and restarts from zero when it changes, and the core answers an event
-        it already holds as a duplicate, so a lost cursor never records one
-        twice. A rejected (full-queue) event is retried from the same cursor.
-        """
-
-        if self._cclc is None:
-            return
-        now = time.monotonic()
-        if now < self._next_incident_event_poll_at:
-            return
-        self._next_incident_event_poll_at = now + self._component_condition_poll_seconds
-        logger = logging.getLogger(__name__)
-        try:
-            try:
-                identity = self._cclc.owner_identity()["request_owner_epoch"]
-                if identity != self._incident_event_owner_epoch:
-                    self._incident_event_owner_epoch = identity
-                    self._incident_event_after_sequence = 0
-                page = self._cclc.incident_events(
-                    self._incident_event_after_sequence, MAX_INCIDENT_EVENT_PAGE
-                )
-                # A replaced owner between reads would mix two journals.
-                if self._cclc.owner_identity()["request_owner_epoch"] != identity:
-                    return
-            except HeadlessApiError as error:
-                if error.code == "cclc_owner_unavailable":
-                    return
-                raise
-            for event in page["events"]:
-                try:
-                    result = self._core.record_cclc_incident_event(
-                        cclc_owner_epoch=identity,
-                        event_json=_canonical_json(event).decode("utf-8"),
-                    )
-                except HeadlessApiError as error:
-                    if error.code not in {
-                        "headless_cclc_incident_event_invalid",
-                        "headless_source_invalid",
-                        "historian_event_invalid",
-                    }:
-                        raise
-                    # Never block later incidents behind one unrecordable row.
-                    logger.error(
-                        "CCLC incident event %s was not recordable: %s",
-                        event["event_sequence"],
-                        error,
-                    )
-                    result = {"status": "invalid"}
-                if result.get("status") == "rejected":
-                    return
-                self._incident_event_after_sequence = event["event_sequence"]
-            if len(page["events"]) == MAX_INCIDENT_EVENT_PAGE:
-                self._next_incident_event_poll_at = now
-        except Exception:
-            if not self._incident_events_failing:
-                self._incident_events_failing = True
-                logger.warning("CCLC incident event recording failed", exc_info=True)
-            return
-        if self._incident_events_failing:
-            self._incident_events_failing = False
-            logger.info("CCLC incident event recording recovered")
 
     def _notify_change(self) -> None:
         observer = self._change_observer
@@ -3098,8 +2543,7 @@ class ExecutionEventPump:
         if record_kind in {
             "stop_acceptance_projected",
             "stop_terminal_projected",
-            "stop_fault_cleared",
-        }:
+            }:
             # Stop projections are sparse, globally scoped owner facts.  Their
             # exact digest is the simplest complete change identity.
             return (record_kind, event["payload_digest"])
@@ -3158,6 +2602,32 @@ class ExecutionEventPump:
             ),
             scale_key,
         )
+
+    def _record_finished_actions(self, model: dict[str, Any] | None) -> None:
+        """One History event per component action the host finished.
+
+        The host publishes each finished action once as the component's
+        ``last_action``, whoever asked for it; a new one (it carries its own
+        start and finish times) is recorded once, repeated models are not.
+        """
+
+        states = (model or {}).get("component_states") or ()
+        current = {
+            state["component_id"]: state["last_action"]
+            for state in states
+            if isinstance(state, dict) and isinstance(state.get("last_action"), dict)
+        }
+        recorded, self._recorded_actions = self._recorded_actions, current
+        if recorded is None:
+            return
+        for component_id, last in current.items():
+            if recorded.get(component_id) != last:
+                record_activity(
+                    self._core,
+                    component_action_record(
+                        component_id, last["action"], last["outcome"], last.get("error")
+                    ),
+                )
 
     @staticmethod
     def _operation_is_settled(event: dict[str, Any]) -> bool:
@@ -3234,45 +2704,20 @@ class ExecutionEventPump:
         after_sequence = 0
         source_high_water_epoch: str | None = None
         source_high_water = 0
-        condition_cursor: tuple[str, int] | None = None
-        next_condition_poll_at = 0.0
-        current_condition_json: str | None = None
-        last_source_identity: tuple[str, str | None, str] | None = None
+        last_source_identity: tuple[str, str] | None = None
         operation_control_keys: dict[str, tuple[Any, ...]] = {}
         control_projection_changed = False
         admission_generation: int | None = None
+        component_model: dict[str, Any] | None = None
         source_mode = "active"
         source = self._stream
-
-        def condition_snapshot_kwargs(
-            source_owner_epoch: str, through_source_sequence: int
-        ) -> dict[str, str]:
-            nonlocal condition_cursor, current_condition_json
-            nonlocal next_condition_poll_at
-            now = time.monotonic()
-            cursor = (source_owner_epoch, through_source_sequence)
-            if cursor == condition_cursor and now < next_condition_poll_at:
-                return {}
-            response = ExecutionCommandClient.require_success(
-                self._execution.stop_fault()
-            )
-            offer = response["stop_fault"]
-            latch = offer["latch"] if isinstance(offer, dict) else None
-            condition_cursor = cursor
-            next_condition_poll_at = now + self._condition_poll_seconds
-            current_condition_json = _canonical_json(latch).decode("utf-8")
-            return {"current_stop_fault_json": current_condition_json}
 
         def publish_if_changed(
             source_owner_epoch: str,
             source_mode: str,
         ) -> None:
             nonlocal control_projection_changed, last_source_identity
-            identity = (
-                source_owner_epoch,
-                current_condition_json,
-                source_mode,
-            )
+            identity = (source_owner_epoch, source_mode)
             if identity != last_source_identity or control_projection_changed:
                 last_source_identity = identity
                 control_projection_changed = False
@@ -3280,8 +2725,6 @@ class ExecutionEventPump:
 
         while not self._stop.is_set():
             self._refresh_alarm_sources()
-            self._observe_component_lifecycle_conditions()
-            self._record_cclc_incident_events()
             try:
                 if owner_epoch is None:
                     identity_response = source.identity()
@@ -3304,6 +2747,9 @@ class ExecutionEventPump:
                                 "execution status has no owner epoch",
                             )
                     if source_high_water_epoch != next_epoch:
+                        if source_high_water_epoch is not None:
+                            # A new host starts without results: record each.
+                            self._recorded_actions = {}
                         source_high_water_epoch = next_epoch
                         source_high_water = 0
                         after_sequence = 0
@@ -3329,6 +2775,12 @@ class ExecutionEventPump:
                 if admission_generation != next_admission_generation:
                     admission_generation = next_admission_generation
                     control_projection_changed = True
+                # The host publishes component states on change (CONTRACTS
+                # §1); they reach the stream as a ``state`` message, no row.
+                if component_model != page["component_model"]:
+                    component_model = page["component_model"]
+                    control_projection_changed = True
+                    self._record_finished_actions(component_model)
                 page_had_events = bool(page["events"])
                 self._observe_global_rules(owner_epoch, page)
                 for event in page["events"]:
@@ -3362,10 +2814,13 @@ class ExecutionEventPump:
                             and len(operation_control_keys)
                             >= MAXIMUM_RESIDENT_OPERATION_CONTROL_KEYS
                         ):
-                            raise HeadlessApiError(
-                                "execution_control_projection_capacity_invalid",
-                                "native resident operations exceed the closed bound",
-                            )
+                            # Change-detection memo only, bounded by eviction:
+                            # operations retired without an ack/reset record
+                            # (closed in recovery, failed pre-dispatch) never
+                            # release their key. Dropping the oldest costs at
+                            # most one extra change notification.
+                            operation_control_keys.pop(next(iter(operation_control_keys)))
+                            control_projection_changed = True
                         if operation_control_keys.get(operation_id) != key:
                             operation_control_keys[operation_id] = key
                             control_projection_changed = True
@@ -3389,7 +2844,6 @@ class ExecutionEventPump:
                     self._core.complete_operation_event_snapshot(
                         source_owner_epoch=owner_epoch,
                         through_source_sequence=after_sequence,
-                        **condition_snapshot_kwargs(owner_epoch, after_sequence),
                     )
                     publish_if_changed(owner_epoch, source_mode)
                     if self._record_error(None):

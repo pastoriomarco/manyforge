@@ -155,14 +155,6 @@ require_array(const CanonicalValue &value, std::string_view field) {
   return *text;
 }
 
-[[nodiscard]] const CanonicalValue *
-find_member(const CanonicalValue::Object &object, std::string_view name) {
-  const auto found =
-      std::find_if(object.begin(), object.end(),
-                   [name](const auto &member) { return member.first == name; });
-  return found == object.end() ? nullptr : &found->second;
-}
-
 [[nodiscard]] const CanonicalValue &
 require_member(const CanonicalValue::Object &object, std::string_view name,
                std::string_view field) {
@@ -511,17 +503,35 @@ parse_retained_product(const CanonicalValue &value, std::string_view field,
     }
   }
   const bool has_execution_runtime = !execution_runtime_units.empty();
+  // CONTRACTS §16: a machine owner is model-free; its execution unit lists it
+  // under `machines`.
+  std::set<std::string> machine_owners;
+  for (const auto &unit : graph.runtime_units) {
+    const auto machines = unit.configuration.find("machines");
+    if (machines == unit.configuration.end()) continue;
+    const auto *rows = std::get_if<core::JsonValueDTO::Array>(&machines->second.value);
+    if (rows == nullptr) continue;
+    for (const auto &row : *rows) {
+      const auto *object = std::get_if<core::JsonObjectDTO>(&row.value);
+      if (object == nullptr) continue;
+      const auto id = object->find("controllable_component_id");
+      if (id == object->end()) continue;
+      if (const auto *text = std::get_if<std::string>(&id->second.value))
+        machine_owners.insert(*text);
+    }
+  }
 
   std::set<core::ModelInstanceId> owned_models;
   for (const auto &component : graph.controllable_components) {
     const bool model_free_provider =
         component.model_role_bindings.empty() &&
-        std::any_of(graph.control_domains.begin(), graph.control_domains.end(),
-                    [&](const auto &domain) {
-                      return domain.provider() &&
-                             domain.provider()->controllable_component_id ==
-                                 component.controllable_component_id;
-                    });
+        (machine_owners.contains(component.controllable_component_id.value()) ||
+         std::any_of(graph.control_domains.begin(), graph.control_domains.end(),
+                     [&](const auto &domain) {
+                       return domain.provider() &&
+                              domain.provider()->controllable_component_id ==
+                                  component.controllable_component_id;
+                     }));
     if ((!model_free_provider &&
          ((!component.root_pose_in_cell.has_value() &&
            !mounted.contains(component.controllable_component_id)) ||
@@ -693,11 +703,6 @@ void require_structural_catalog_closure(
     }
   }
   for (const auto &binding : provider_bindings) {
-    if (binding.capability_id.value() == "io.gpio.set_output")
-      graph_records.emplace(
-          core::CatalogRecordKind::kCommandSchema,
-          std::string(core::kIoSignalWriteCommandSchemaId),
-          std::string(core::kIoSignalWriteCommandSchemaRevision));
     graph_records.emplace(core::CatalogRecordKind::kCapabilityDefinition,
                           binding.capability_id.value(),
                           binding.capability_definition_revision.value());
@@ -993,81 +998,35 @@ void verify_node_environment_projection(const CanonicalValue &value) {
       "catalogs.node_environment.environment_digest");
 }
 
-// Normalized hard profiles contain explicit false flags that the authored
-// source grammar deliberately forbids spelling. Reconstruct only that source
-// omission; the caller requires exact normalization back to the retained rows.
-CanonicalValue interrupt_policy_source_rows(const CanonicalValue &rows) {
-  auto policies = rows.as_array();
-  for (auto &policy : policies) {
-    const auto *profile = policy.find_object_member("stop_profile");
-    if (profile == nullptr || !profile->is_object())
-      continue;
-    const auto *mode = profile->find_object_member("stop_mode");
-    if (mode == nullptr || !mode->is_string() ||
-        mode->as_string() != "hard_deceleration")
-      continue;
-    auto fields = profile->as_object();
-    fields.erase(std::remove_if(
-                     fields.begin(), fields.end(),
-                     [](const auto &field) {
-                       return (field.first ==
-                                   "allow_natural_completion_on_short_path" ||
-                               field.first == "jerk_limits_enabled") &&
-                              field.second.is_bool() && !field.second.as_bool();
-                     }),
-                 fields.end());
-    auto members = policy.as_object();
-    for (auto &[name, value] : members)
-      if (name == "stop_profile")
-        value = CanonicalValue(std::move(fields));
-    policy = CanonicalValue(std::move(members));
-  }
-  return CanonicalValue(std::move(policies));
-}
-
-void require_retained_interrupt_policy_references(
-    const CanonicalValue::Object &interrupts, const core::CellGraphDTO &graph,
-    const std::vector<core::CapabilityProviderBindingDTO> &providers) {
-  std::map<std::string, std::set<std::string>> known;
-  for (const auto &component : graph.controllable_components)
-    known["controllable_component_ids"].insert(
-        component.controllable_component_id.value());
-  for (const auto &domain : graph.control_domains)
-    known["control_domain_ids"].insert(domain.control_domain_id.value());
-  for (const auto &binding : graph.control_bindings) {
-    known["control_binding_ids"].insert(binding.control_binding_id.value());
-    known["command_target_ids"].insert(binding.command_target_id.value());
-    for (const auto &resource : binding.resource_bindings)
-      known["resource_ids"].insert(resource.resource_id.value());
-  }
-  for (const auto &provider : providers) {
-    if (const auto *target =
-            std::get_if<core::ComponentTargetCapabilityProviderTargetDTO>(
-                &provider.target))
-      known["command_target_ids"].insert(target->command_target_id.value());
-  }
+// Every signal a retained global rule reads is an exact retained input, or
+// the core-held `<output>.changed_outside` of an output that holds one.
+void require_retained_rule_signals(const CanonicalValue &rules,
+                                   const core::CellGraphDTO &graph) {
   const auto signals = ResolveRetainedIoSignalCatalog(graph);
   if (!signals.ok())
     detail::fail_retained_bundle(signals.error().message);
-  for (const auto &signal : signals.value()) {
-    known["command_target_ids"].insert(signal.command_target_id.value());
-    if (signal.descriptor.output_resource)
-      known["resource_ids"].insert(signal.descriptor.output_resource->value());
-  }
   const auto verify_condition = [&](auto &&self,
                                     const CanonicalValue &condition) -> void {
     if (const auto *compare = condition.find_object_member("compare")) {
       const auto &operand = *compare->find_object_member("operand");
       if (const auto *signal = operand.find_object_member("signal")) {
-        const auto &component =
+        const core::ControllableComponentId component(
             signal->find_object_member("controllable_component_id")
-                ->as_string();
+                ->as_string());
         const auto &name =
             signal->find_object_member("signal_name")->as_string();
+        if (const auto *output = FindChangedOutsideOutput(signals.value(),
+                                                          component, name)) {
+          if (!core::HoldsChangedOutside(output->descriptor))
+            detail::fail_retained_bundle(
+                "interrupt condition names changed_outside of an output "
+                "without it");
+          return;
+        }
         const auto found = std::find_if(
             signals.value().begin(), signals.value().end(),
             [&](const auto &row) {
-              return row.descriptor.signal_id.controllable_component_id.value() ==
+              return row.descriptor.signal_id.controllable_component_id ==
                          component &&
                      row.descriptor.signal_id.name == name;
             });
@@ -1088,24 +1047,8 @@ void require_retained_interrupt_policy_references(
     for (const auto &child : children->as_array())
       self(self, child);
   };
-  for (const auto &policy :
-       require_member(interrupts, "interrupt_policies", "interrupts")
-           .as_array()) {
-    for (const std::string_view field :
-         {"controllable_component_ids", "command_target_ids",
-          "control_domain_ids", "control_binding_ids", "resource_ids"}) {
-      for (const auto &value : policy.find_object_member(field)->as_array())
-        if (!known[std::string(field)].contains(value.as_string()))
-          detail::fail_retained_bundle(
-              "interrupt policy references unknown retained " +
-              std::string(field));
-    }
-    if (const auto *condition = policy.find_object_member("condition"))
-      verify_condition(verify_condition, *condition);
-  }
-  if (const auto *rules = find_member(interrupts, "interrupt_rules"))
-    for (const auto &rule : rules->as_array())
-      verify_condition(verify_condition, *rule.find_object_member("condition"));
+  for (const auto &rule : rules.as_array())
+    verify_condition(verify_condition, *rule.find_object_member("condition"));
 }
 
 [[nodiscard]] RevisionVerifiedDeploymentApplicabilityInputs
@@ -1117,70 +1060,33 @@ verify_structural_applicability_projection(
     const CanonicalValue *external_resources_value,
     const core::CellGraphDTO &graph,
     std::span<const QualifiedRuntimeProfile> runtime_profiles) {
-  const CanonicalValue::Object *interrupts = nullptr;
+  // The retained global-rule carrier is exactly `{interrupt_rules}` with a
+  // nonempty table; an empty table is omitted.
+  const CanonicalValue *rules = nullptr;
   if (interrupt_policy_configuration != nullptr) {
-    interrupts =
-        &require_object(*interrupt_policy_configuration,
-                        "retained_bundle.interrupt_policy_configuration");
-    auto legacy_fields = *interrupts;
-    std::erase_if(legacy_fields, [](const auto &field) {
-      return field.first == "interrupt_rules";
-    });
-    require_exact_fields(
-        legacy_fields,
-        {"interrupt_sources", "interrupt_policies", "interrupt_config"},
-        "retained_bundle.interrupt_policy_configuration");
-    const auto &sources = require_array(
-        require_member(*interrupts, "interrupt_sources", "interrupts"),
-        "interrupt_sources");
-    const auto &policies = require_array(
-        require_member(*interrupts, "interrupt_policies", "interrupts"),
-        "interrupt_policies");
-    const auto *rules = find_member(*interrupts, "interrupt_rules");
-    if (sources.empty() && policies.empty() &&
-        (rules == nullptr || require_array(*rules, "interrupt_rules").empty()))
+    const auto &interrupts =
+        require_object(*interrupt_policy_configuration,
+                       "retained_bundle.interrupt_policy_configuration");
+    require_exact_fields(interrupts, {"interrupt_rules"},
+                         "retained_bundle.interrupt_policy_configuration");
+    rules = &require_member(interrupts, "interrupt_rules", "interrupts");
+    if (require_array(*rules, "interrupt_rules").empty())
       detail::fail_retained_bundle(
           "empty interrupt_policy_configuration must be omitted");
   }
+  CanonicalValue::Object policies{
+      {"retained_policy_records", retained_policy_records_value},
+      {"stop_stage_parameters", CanonicalValue(CanonicalValue::Array{})},
+      {"commissioned_stop_interfaces", CanonicalValue(CanonicalValue::Array{})},
+  };
+  if (rules != nullptr)
+    policies.emplace_back("interrupt_rules", *rules);
   CanonicalValue::Object root_members{
       {"api_version", CanonicalValue("manyforge.deployment.v1")},
       {"desired_control_configurations", desired_value},
       {"capability_provider_bindings", provider_value},
-      {"policies",
-       CanonicalValue(CanonicalValue::Object{
-           {"retained_policy_records", retained_policy_records_value},
-           {"stop_stage_parameters", CanonicalValue(CanonicalValue::Array{})},
-           {"commissioned_stop_interfaces",
-            CanonicalValue(CanonicalValue::Array{})},
-           {"interrupt_sources",
-            interrupts == nullptr
-                ? CanonicalValue(CanonicalValue::Array{})
-                : require_member(*interrupts, "interrupt_sources",
-                                 "interrupts")},
-           {"interrupt_policies",
-            interrupts == nullptr
-                ? CanonicalValue(CanonicalValue::Array{})
-                : interrupt_policy_source_rows(require_member(
-                      *interrupts, "interrupt_policies", "interrupts"))},
-           {"interrupt_config",
-            interrupts == nullptr
-                ? CanonicalValue(CanonicalValue::Object{
-                      {"queue_depth", CanonicalValue(8.0)},
-                      {"cancel_validation_timeout_ns", CanonicalValue(1000.0)},
-                      {"motion_scope_arm_timeout_ns", CanonicalValue(1000.0)},
-                      {"supervisory_poll_rate_hz", CanonicalValue(10.0)},
-                  })
-                : require_member(*interrupts, "interrupt_config",
-                                 "interrupts")},
-       })},
+      {"policies", CanonicalValue(std::move(policies))},
   };
-  if (interrupts != nullptr) {
-    if (const auto *rules = find_member(*interrupts, "interrupt_rules")) {
-      auto policies = root_members.back().second.as_object();
-      policies.emplace_back("interrupt_rules", *rules);
-      root_members.back().second = CanonicalValue(std::move(policies));
-    }
-  }
   if (site_overlay_ref_value != nullptr) {
     root_members.emplace_back("site_overlay_ref", *site_overlay_ref_value);
   }
@@ -1226,30 +1132,14 @@ verify_structural_applicability_projection(
         "retained applicability differs from its exact revision-verified "
         "projection");
   }
-  if (interrupts != nullptr) {
-    for (const std::string_view field :
-         {"interrupt_sources", "interrupt_policies", "interrupt_config"}) {
-      if (!verified.normalized_policies().has_value() ||
-          verified.normalized_policies()->find_object_member(field) ==
-              nullptr ||
-          *verified.normalized_policies()->find_object_member(field) !=
-              require_member(*interrupts, field, "interrupts"))
-        detail::fail_retained_bundle(
-            "retained interrupt policy normalization mismatch");
-    }
-  }
-  if (interrupts != nullptr) {
-    const auto *rules = find_member(*interrupts, "interrupt_rules");
+  if (rules != nullptr) {
     const auto *normalized_rules =
         verified.normalized_policies()->find_object_member("interrupt_rules");
-    if ((rules == nullptr) != (normalized_rules == nullptr) ||
-        (rules && *rules != *normalized_rules))
+    if (normalized_rules == nullptr || *rules != *normalized_rules)
       detail::fail_retained_bundle(
           "retained global rule normalization mismatch");
+    require_retained_rule_signals(*rules, graph);
   }
-  if (interrupts != nullptr)
-    require_retained_interrupt_policy_references(
-        *interrupts, graph, verified.value().capability_provider_bindings);
   const auto &desired = verified.value().desired_control_configurations;
   const auto &providers = verified.value().capability_provider_bindings;
   if (graph.control_domains.empty()) {

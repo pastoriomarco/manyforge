@@ -1,4 +1,4 @@
-#include "native_execution_runtime_unit_internal.hpp"
+#include "execution_host_unit_internal.hpp"
 #include <manyforge_deployment/execution_runtime_contract.hpp>
 
 #include <algorithm>
@@ -41,18 +41,6 @@ invalid_settings(const execution::OrdinaryMotionJerkSettings &settings) {
         (setting.override_rad_s3 && !positive(*setting.override_rad_s3)))
       return "ordinary jerk setting has an empty/duplicate joint or invalid "
              "override";
-    if (!setting.imported)
-      continue;
-    const auto &source = *setting.imported;
-    if (!positive(source.maximum_rad_s3) || source.source_id.empty() ||
-        !core::IsExactLowercaseSha256Digest(source.source_digest.value()) ||
-        (source.machine_required && (!source.enabled || !settings.enabled)))
-      return "imported jerk limit is invalid, lacks provenance, or a required "
-             "limit is disabled";
-    if (source.enabled && setting.override_rad_s3 &&
-        *setting.override_rad_s3 > source.maximum_rad_s3)
-      return "ordinary jerk override exceeds the imported ceiling for " +
-             setting.source_joint_name;
   }
   return std::nullopt;
 }
@@ -77,18 +65,9 @@ execution::OrdinaryMotionJerkSettings detail::decode_ordinary_motion_jerk_settin
     if (!row)
       throw RetainedBundleError("ordinary jerk settings require joint records");
     execution::JointJerkSetting setting{
-        value<std::string>(*row, "source_joint_name"), {}, {}};
+        value<std::string>(*row, "source_joint_name"), {}};
     if (row->contains("override_rad_s3"))
       setting.override_rad_s3 = value<double>(*row, "override_rad_s3");
-    if (row->contains("imported")) {
-      const auto &imported = value<core::JsonObjectDTO>(*row, "imported");
-      setting.imported = execution::ImportedJointJerkLimit{
-          value<double>(imported, "maximum_rad_s3"),
-          value<bool>(imported, "enabled"),
-          value<bool>(imported, "machine_required"),
-          value<std::string>(imported, "source_id"),
-          core::ContentDigest(value<std::string>(imported, "source_digest"))};
-    }
     result.joint_limits.push_back(std::move(setting));
   }
   if (const auto error = invalid_settings(result))
@@ -114,26 +93,19 @@ execution::resolve_ordinary_motion_jerk_policy(
       return invalid("ordinary jerk setting has an unknown joint");
   }
 
-  core::OrdinaryMotionJerkPolicy policy{settings.enabled, false, {}};
+  core::OrdinaryMotionJerkPolicy policy{settings.enabled, {}};
   for (const auto &resource : resources) {
     if (!resource.source_joint_name ||
         resource.coordinate_kind != core::CoordinateKind::kAngular)
-      return invalid(
-          "ordinary native jerk limits require angular model joints");
+      return invalid("ordinary jerk limits require angular model joints");
     const auto setting = std::find_if(
         settings.joint_limits.begin(), settings.joint_limits.end(),
         [&](const auto &row) {
           return row.source_joint_name == resource.source_joint_name;
         });
     std::optional<double> maximum;
-    if (setting != settings.joint_limits.end()) {
+    if (setting != settings.joint_limits.end())
       maximum = setting->override_rad_s3;
-      if (setting->imported && setting->imported->enabled) {
-        policy.machine_required |= setting->imported->machine_required;
-        if (!maximum)
-          maximum = setting->imported->maximum_rad_s3;
-      }
-    }
     if (!maximum && settings.enabled) {
       const auto model = std::find(model_limits.joint_names.begin(),
                                    model_limits.joint_names.end(),

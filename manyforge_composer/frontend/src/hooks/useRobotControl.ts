@@ -7,7 +7,7 @@ import {
   useRef,
   useState,
 } from 'react';
-import { api, ApiError, apiErrorCode } from '../api/client';
+import { api, ApiError } from '../api/client';
 import { CommandRefusalError, commandRefusalCause } from '../state/commandRefusal';
 import { parseRuntimeScaleControlAccepted } from '../api/parsers';
 import {
@@ -29,23 +29,16 @@ import {
 import type { ComposerHeadlessState } from '../types/headless';
 import type { ProgramCycleStatus, StructuredError } from '../types/api';
 import { CommandDeliveryUnconfirmedError, type HeadlessStateSource } from './useHeadlessState';
-import {
-  cellRecoverMessage,
-  useComponentIncidents,
-} from './useComponentIncidents';
-import type { OpenComponentIncident } from './useComponentIncidents';
 import type {
   ManualCartesianDefaults,
   ManualMotionSettings,
   RobotControlState,
 } from '../state/robotControl';
 import type { PoseDragDiscard, RobotControlMode } from '../state/robotControl';
-import { acknowledgedUncertainOutputs, type UncertainOutput } from '../utils/uncertainOutputs';
 import { tcpEntryIdentityKey } from '../types/robotControl';
 import { writeManualPneumaticValves } from '../state/pneumaticManual';
 import type { CartesianMoveDraftOptions, MoveToDraftSource } from '../utils/moveTo';
 import type {
-  CellRecoverResult,
   DirectControlOperationIntent,
   DirectControlSetTcpIntent,
   DirectControlGripperStatus,
@@ -57,11 +50,6 @@ import type {
   RuntimeScaleControlStatus,
   TcpEntryIdentity,
 } from '../types/robotControl';
-
-// Recover cell keeps its press alive across HTTP timeouts by replaying its
-// request ID; a replay answering `cell_recover_in_progress` is asked again
-// after this pause.
-export const CELL_RECOVER_REPLAY_PAUSE_MS = 1000;
 
 /** Pair a robot with the component selected at its flange, including TCP-less tools. */
 export function mountedToolsFromStatus(
@@ -359,18 +347,6 @@ export interface RobotControlController {
   runtimeScaleDraft: number;
   runtimeScalePending: boolean;
   runtimeScaleError: string | null;
-  stopFaultRecoveryPending: boolean;
-  /** The press outlived one HTTP call; Headless is still running it. */
-  stopFaultRecoveryInProgress: boolean;
-  /** SX-679: the operator's abort of the running press was sent, not yet answered. */
-  stopFaultRecoveryAbortPending: boolean;
-  /** SX-679/684: why Recover cell is unavailable now (Scenario Close runs), or null. */
-  cellRecoverBlockedReason: string | null;
-  setCellRecoverBlockedReason: (reason: string | null) => void;
-  stopFaultRecoveryError: string | null;
-  /** Open component incidents (CCLC snapshots) while the cell is latched. */
-  componentIncidents: OpenComponentIncident[];
-  componentIncidentsUnavailableReason: string | null;
   selectRobot: (controllableComponentId: string, motionTargetId: string) => void;
   selectTool: (gripperTargetId: string) => void;
   /** TCP-C: move and show the selected robot at another of its TCPs. */
@@ -392,19 +368,10 @@ export interface RobotControlController {
   approve: () => Promise<void>;
   revert: () => void;
   stop: () => Promise<void>;
-  recoverStopFault: () => Promise<void>;
-  /** SX-679: abort the running Recover cell; its result then lists what was done. */
-  abortRecoverStopFault: () => Promise<void>;
   dismissRuntimeScaleError: () => void;
   dismissError: () => void;
-  /** Reset the current terminal operation; approved uncertain outputs of it are acknowledged (contract 66). */
-  reset: (approvedUncertainOutputs?: readonly UncertainOutput[]) => Promise<void>;
-  /**
-   * One targeted operation Reset per approved acceptance-unknown output's
-   * operation, each acknowledging only its own outputs. Null when every
-   * Reset was received, else why; stops at the first refusal.
-   */
-  resetUncertainOutputs: (approved: readonly UncertainOutput[]) => Promise<string | null>;
+  /** Reset the current terminal operation (never gated on unknown outputs, contract 66). */
+  reset: () => Promise<void>;
   setRuntimeScale: (scale: number) => void;
   commitRuntimeScale: () => void;
   retry: () => void;
@@ -436,20 +403,9 @@ export function useRobotControl(
   const [runtimeScaleDraft, setRuntimeScaleDraft] = useState(1);
   const [runtimeScalePending, setRuntimeScalePending] = useState(false);
   const [runtimeScaleError, setRuntimeScaleError] = useState<string | null>(null);
-  const [stopFaultRecoveryPending, setStopFaultRecoveryPending] = useState(false);
-  const [stopFaultRecoveryInProgress, setStopFaultRecoveryInProgress] = useState(false);
-  const [stopFaultRecoveryAbortPending, setStopFaultRecoveryAbortPending] = useState(false);
-  const [cellRecoverBlockedReason, setCellRecoverBlockedReason] = useState<string | null>(null);
-  const [stopFaultRecoveryError, setStopFaultRecoveryError] = useState<string | null>(null);
-  const stopFaultRecoveryRequest = useRef<{ abort: AbortController } | null>(null);
   const approveInFlight = useRef<{ ownerEpoch: string; generation: number } | null>(null);
   const pneumaticWriteAbort = useRef<AbortController | null>(null);
   useEffect(() => () => pneumaticWriteAbort.current?.abort(), []);
-  // Leaving ends the wait for a Recover cell press (Headless keeps running it).
-  useEffect(() => () => {
-    stopFaultRecoveryRequest.current?.abort.abort();
-    stopFaultRecoveryRequest.current = null;
-  }, []);
   const dragGeneration = useRef<number | null>(null);
   useLayoutEffect(() => {
     if (!state.poseDragging) dragGeneration.current = null;
@@ -592,15 +548,9 @@ export function useRobotControl(
     ? manualAvailabilityScopeFence(headlessSnapshot, state.mode, state)
     : null;
   const currentAvailability = availability?.scope === availabilityScope ? availability.result : null;
-  const mappedPneumatic = state.mode === 'gripper'
-    && selectedStatus?.directControlGripper?.targetDescriptor.pneumaticOutputs !== undefined;
-  const pneumaticNeedsIdle = mappedPneumatic
-    && (observeProgramRun || headlessSnapshot?.programCycle.state !== 'idle_after_reset');
-  const manualControlAllowed = !pneumaticNeedsIdle
-    && (!observeProgramRun || (currentAvailability?.available === true && cleanupFailure === null));
-  const manualControlUnavailableReason = manualControlAllowed ? null : pneumaticNeedsIdle
-    ? 'Mapped pneumatic manual control is available when the Program is idle after Reset.'
-    : cleanupFailure
+  const manualControlAllowed = !observeProgramRun
+    || (currentAvailability?.available === true && cleanupFailure === null);
+  const manualControlUnavailableReason = manualControlAllowed ? null : cleanupFailure
     ?? (availability?.scope === availabilityScope ? availability.error : null)
     ?? currentAvailability?.unavailableReason?.replaceAll('_', ' ')
     ?? 'Checking backend manual-control availability.';
@@ -1133,10 +1083,17 @@ export function useRobotControl(
       }
     } catch (error: unknown) {
       if (runtimeScaleInFlight.current === pending
-        && runtimeScaleContext.current?.scopeFence === pending.scopeFence) setRuntimeScaleError(errorMessage(
-        error,
-        'Runtime velocity could not be updated; owner state remains authoritative.',
-      ));
+        && runtimeScaleContext.current?.scopeFence === pending.scopeFence) {
+        setRuntimeScaleError(errorMessage(
+          error,
+          'Runtime velocity could not be updated; owner state remains authoritative.',
+        ));
+        // Show the owner value again; the merged status already carries any
+        // projection that arrived while this command was in flight.
+        if (runtimeScaleQueued.current === null) {
+          setRuntimeScaleDraft((runtimeScaleStatusRef.current ?? observed).requestedScale);
+        }
+      }
     } finally {
       if (runtimeScaleInFlight.current === pending) {
         runtimeScaleInFlight.current = null;
@@ -1294,11 +1251,6 @@ export function useRobotControl(
       const currentTarget = selectedStatusForState(state);
       if (state.mode === 'gripper' && currentTarget?.directControlGripper?.targetDescriptor.pneumaticOutputs !== undefined) {
         if (state.draftGripperPosition === null) throw new Error('Choose a gripper target.');
-        const start = latestSnapshot.current;
-        if (start === null || start.programCycle.state !== 'idle_after_reset') {
-          throw new Error('Mapped pneumatic manual control is available when the Program is idle after Reset.');
-        }
-        const cycleGeneration = start.programCycle.cycleGeneration;
         pneumaticAbort = new AbortController();
         pneumaticWriteAbort.current = pneumaticAbort;
         const abort = pneumaticAbort;
@@ -1306,26 +1258,15 @@ export function useRobotControl(
           const snapshot = latestSnapshot.current;
           const live = snapshot?.executionControlStatus;
           if (abort.signal.aborted || runtimeScaleStopActive.current || snapshot == null
-            || snapshot.programCycle.state !== 'idle_after_reset'
-            || snapshot.programCycle.cycleGeneration !== cycleGeneration
             || live == null
             || live.graphRevision !== currentTarget.graphRevision
             || live.retainedBundleId !== currentTarget.retainedBundleId) {
-            throw new Error('Manual pneumatic sequence stopped because the current Program or Deployment changed.');
+            throw new Error('Manual pneumatic sequence stopped because the Deployment changed.');
           }
         };
         await writeManualPneumaticValves(currentTarget, state.draftGripperPosition, {
-          nextRequestId: requestId,
           checkCurrent,
-          submit: async (intent) => {
-            const command = { ...intent } as Record<string, unknown>;
-            delete command.request_context;
-            return controlSource.sendExecutionCommand('operation_start', command, intent.request_context.request_id);
-          },
-          read: (operationId, intent, valve) => api.execution.readManualValveOperation(
-            operationId, intent, valve.componentId, valve.binding.commandTargetId, abort.signal,
-          ),
-          wait: () => new Promise<void>((resolve) => window.setTimeout(resolve, 100)),
+          setOutput: (signalId, value) => api.io.setOutput(signalId, value),
         });
         checkCurrent();
       }
@@ -1371,145 +1312,16 @@ export function useRobotControl(
     });
   }, [clearRuntimeScaleQueue, sendOperationControl, state]);
 
-  const cellFaultOpen = state.status?.cellStopAction.fault != null
-    && state.status.cellStopAction.fault.state !== 'cleared';
-  const statusComponents = state.status?.components;
-  const incidentComponentIds = useMemo(
-    () => (statusComponents ?? []).map((component) => component.controllableComponentId),
-    [statusComponents],
-  );
-  const componentIncidents = useComponentIncidents(enabled && cellFaultOpen, incidentComponentIds);
-  const refreshComponentIncidents = componentIncidents.refresh;
-  const shownIncidents = componentIncidents.incidents;
-  const shownIncidentsUnavailable = componentIncidents.unavailableReason;
-
-  // "Recover cell" is one operator action (addendum 2, contract item 6). One
-  // Headless call acknowledges every open component incident, waits briefly
-  // for the cell latch, and clears it only when its owner reports it ready;
-  // otherwise it returns the typed reason, shown here. A press may outlast
-  // one HTTP call (each component re-enables within its own lifecycle
-  // allowance): after an HTTP timeout the SAME request ID is sent again,
-  // replay-only, and Headless answers `cell_recover_in_progress` or the
-  // stored final result. A resend never starts a press: after a Headless
-  // restart or eviction it answers an unknown outcome, shown as such.
-  // The wait ends only on a final result or when the operator leaves.
-  const recoverStopFault = useCallback(async () => {
-    const status = state.status;
-    const fault = status?.cellStopAction.fault;
-    if (
-      !enabled
-      || status === null
-      || fault === null
-      || stopFaultRecoveryRequest.current !== null
-      || cellRecoverBlockedReason !== null
-    ) return;
-    // M6 (item 36): the press acknowledges only the incidents on screen; an
-    // unread list sends none (today's press).
-    const shownIncidentIds = cellFaultOpen && shownIncidentsUnavailable === null
-      ? shownIncidents.map(({ incident }) => incident.incidentId) : null;
-    const pending = { abort: new AbortController() };
-    const pressId = requestId();
-    stopFaultRecoveryRequest.current = pending;
-    setStopFaultRecoveryPending(true);
-    setStopFaultRecoveryInProgress(false);
-    setStopFaultRecoveryError(null);
-    try {
-      let result: CellRecoverResult;
-      for (let resend = false; ; resend = true) {
-        let reply: CellRecoverResult | null = null;
-        try {
-          reply = await api.execution.cellRecover(
-            pressId, shownIncidentIds, pending.abort.signal, resend,
-          );
-        } catch (error: unknown) {
-          if (apiErrorCode(error) !== 'headless_http_timeout') throw error;
-        }
-        if (stopFaultRecoveryRequest.current !== pending) return;
-        if (reply !== null && reply.reason?.code !== 'cell_recover_in_progress') {
-          result = reply;
-          break;
-        }
-        setStopFaultRecoveryInProgress(true);
-        if (reply !== null) {
-          // Headless answered at once that the press still runs: ask again shortly.
-          await new Promise((resolve) => window.setTimeout(resolve, CELL_RECOVER_REPLAY_PAUSE_MS));
-          if (stopFaultRecoveryRequest.current !== pending) return;
-        }
-      }
-      const message = cellRecoverMessage(result);
-      if (message !== null && stopFaultRecoveryRequest.current === pending) {
-        setStopFaultRecoveryError(message);
-      }
-    } catch (error: unknown) {
-      if (stopFaultRecoveryRequest.current === pending) {
-        setStopFaultRecoveryError(
-          errorMessage(error, 'Cell stop-fault recovery was rejected.'),
-        );
-      }
-    } finally {
-      if (stopFaultRecoveryRequest.current === pending) {
-        stopFaultRecoveryRequest.current = null;
-        setStopFaultRecoveryPending(false);
-        setStopFaultRecoveryInProgress(false);
-      }
-      refreshComponentIncidents();
-    }
-  }, [
-    cellFaultOpen, cellRecoverBlockedReason, enabled, refreshComponentIncidents, shownIncidents,
-    shownIncidentsUnavailable, state.status,
-  ]);
-
-  // SX-679: the operator's voluntary abort. Headless starts no later step of
-  // the running press; the step in flight settles within its own limit and
-  // the press then answers `cell_recover_aborted` with what was done, which
-  // the pending press above receives and shows.
-  const abortRecoverStopFault = useCallback(async () => {
-    if (stopFaultRecoveryRequest.current === null) return;
-    setStopFaultRecoveryAbortPending(true);
-    try {
-      await api.execution.cellRecoverAbort(requestId());
-    } catch (error: unknown) {
-      setStopFaultRecoveryError(errorMessage(error, 'Abort of Recover cell was rejected.'));
-    } finally {
-      setStopFaultRecoveryAbortPending(false);
-    }
-  }, []);
-
-  const reset = useCallback(async (approvedUncertainOutputs: readonly UncertainOutput[] = []) => {
+  const reset = useCallback(async () => {
     const operation = state.operation;
     if (pendingOperationControl.current !== null || state.status === null || operation === null
       || !operation.resident || !operationStateIsTerminal(operation.state)) return;
-    const acknowledged = acknowledgedUncertainOutputs(operation.operationId, approvedUncertainOutputs);
     await sendOperationControl('reset', 'operation_reset', {
       operation_id: operation.operationId,
       expected_operation_revision: operation.operationRevision,
       reason: 'operator Reset of terminal Robot Control operation',
-      ...(acknowledged === null ? {} : { acknowledged_uncertain_outputs: acknowledged }),
     });
   }, [sendOperationControl, state.operation, state.status]);
-
-  const resetUncertainOutputs = useCallback(async (approved: readonly UncertainOutput[]) => {
-    if (approved.length === 0) return null;
-    if (controlSource === null) return 'Control connection is not synchronized.';
-    const operations = new Map<string, number>();
-    for (const output of approved) {
-      operations.set(output.operationId, Math.max(operations.get(output.operationId) ?? 0, output.operationRevision));
-    }
-    for (const [operationId, revision] of [...operations.entries()].sort(([left], [right]) => (left < right ? -1 : 1))) {
-      try {
-        const receipt = await controlSource.sendExecutionCommand('operation_reset', {
-          operation_id: operationId,
-          expected_operation_revision: revision,
-          reason: 'operator Reset acknowledging outputs with unknown acceptance',
-          acknowledged_uncertain_outputs: acknowledgedUncertainOutputs(operationId, approved),
-        }, requestId());
-        if (receipt.disposition === 'rejected') return `Reset of ${operationId} was refused (${receipt.code}).`;
-      } catch (error: unknown) {
-        return `Reset of ${operationId}: ${errorMessage(error, 'rejected.')}`;
-      }
-    }
-    return null;
-  }, [controlSource]);
 
   const retry = useCallback(() => {
     if (manualControlBlocked.current) {
@@ -1549,14 +1361,6 @@ export function useRobotControl(
     runtimeScaleDraft,
     runtimeScalePending,
     runtimeScaleError,
-    stopFaultRecoveryPending,
-    stopFaultRecoveryInProgress,
-    stopFaultRecoveryAbortPending,
-    cellRecoverBlockedReason,
-    setCellRecoverBlockedReason,
-    stopFaultRecoveryError,
-    componentIncidents: componentIncidents.incidents,
-    componentIncidentsUnavailableReason: componentIncidents.unavailableReason,
     selectRobot,
     selectTool,
     selectTcp,
@@ -1577,12 +1381,9 @@ export function useRobotControl(
     approve,
     revert,
     stop,
-    recoverStopFault,
-    abortRecoverStopFault,
     dismissRuntimeScaleError,
     dismissError,
     reset,
-    resetUncertainOutputs,
     setRuntimeScale,
     commitRuntimeScale,
     retry,
@@ -1595,18 +1396,10 @@ export function useRobotControl(
     editJoint,
     editPose,
     reset,
-    resetUncertainOutputs,
     retry,
     revert,
     runtimeScaleDraft,
     runtimeScaleError,
-    stopFaultRecoveryPending,
-    stopFaultRecoveryInProgress,
-    stopFaultRecoveryAbortPending,
-    cellRecoverBlockedReason,
-    stopFaultRecoveryError,
-    componentIncidents.incidents,
-    componentIncidents.unavailableReason,
     runtimeScalePending,
     runtimeScaleStatus,
     selectMode,
@@ -1627,8 +1420,6 @@ export function useRobotControl(
     unappliedChanges,
     controlSource,
     stop,
-    recoverStopFault,
-    abortRecoverStopFault,
     selectRobot,
     selectTool,
     selectTcp,

@@ -1099,7 +1099,7 @@ def test_new_program_motion_defaults_equal_every_catalog_motion_default() -> Non
     }
     assert set(seeded) == {
         "velocity_scale", "acceleration_scale",
-        "translation_tol_m", "max_blend_deviation_rad",
+        "translation_tol_m", "blend_radius_m",
     }
     compared = 0
     for entry in catalog.entries:
@@ -1137,7 +1137,7 @@ def test_new_draft_is_fresh_empty_authoring_and_clears_saved_identity() -> None:
         row["parameter_id"]: row["default"] for row in authoring["parameters"]
     } == {
         "acceleration_scale": 1.0,
-        "max_blend_deviation_rad": 0.01,
+        "blend_radius_m": 0.0,
         "translation_tol_m": 0.005,
         "velocity_scale": 1.0,
     }
@@ -1928,7 +1928,7 @@ def test_program_motion_defaults_are_one_atomic_portable_draft_update() -> None:
         "velocity_scale": "velocity_scale",
         "acceleration_scale": "acceleration_scale",
         "translation_tol_m": "translation_tol_m",
-        "max_blend_deviation_rad": "max_blend_deviation_rad",
+        "blend_radius_m": "blend_radius_m",
     }
 
     updated = _mutate(
@@ -1939,7 +1939,7 @@ def test_program_motion_defaults_are_one_atomic_portable_draft_update() -> None:
             "velocity_scale": 0.35,
             "acceleration_scale": 0.7,
             "translation_tol_m": 0.004,
-            "max_blend_deviation_rad": 0.02,
+            "blend_radius_m": 0.02,
             "parameter_bindings": bindings,
             "conflict_resolution": "reject",
         },
@@ -1952,7 +1952,7 @@ def test_program_motion_defaults_are_one_atomic_portable_draft_update() -> None:
     assert declarations["velocity_scale"]["default"] == 0.35
     assert declarations["acceleration_scale"]["default"] == 0.7
     assert declarations["translation_tol_m"]["default"] == 0.004
-    assert declarations["max_blend_deviation_rad"]["default"] == 0.02
+    assert declarations["blend_radius_m"]["default"] == 0.02
     move = next(
         child
         for child in authoring["forest"][0]["children"]
@@ -1982,7 +1982,7 @@ def test_program_motion_defaults_are_one_atomic_portable_draft_update() -> None:
         ("acceleration_scale", 0.0),
         ("acceleration_scale", 1.01),
         ("translation_tol_m", 0.0),
-        ("max_blend_deviation_rad", -0.001),
+        ("blend_radius_m", -0.001),
     ],
 )
 def test_program_motion_defaults_reject_invalid_values_without_mutation(
@@ -1996,12 +1996,12 @@ def test_program_motion_defaults_reject_invalid_values_without_mutation(
         "velocity_scale": 0.4,
         "acceleration_scale": 1.0,
         "translation_tol_m": 0.005,
-        "max_blend_deviation_rad": 0.01,
+        "blend_radius_m": 0.01,
         "parameter_bindings": {
             "velocity_scale": "velocity_scale",
             "acceleration_scale": "acceleration_scale",
             "translation_tol_m": "translation_tol_m",
-            "max_blend_deviation_rad": "max_blend_deviation_rad",
+            "blend_radius_m": "blend_radius_m",
         },
         "conflict_resolution": "reject",
     }
@@ -2065,7 +2065,7 @@ def test_new_cartesian_node_inherits_scenario_fidelity_defaults() -> None:
             "base_frame_role": "base",
             "tcp_endpoint": {"kind": "current"},  # TCP migration: selectors carry a kind
             "translation_tol_m": 0.002,
-            "max_blend_deviation_rad": 0.03,
+            "blend_radius_m": 0.03,
         },
         "value_sources": {
             "path": {
@@ -2087,7 +2087,7 @@ def test_new_cartesian_node_inherits_scenario_fidelity_defaults() -> None:
         for child in inserted.snapshot["authoring"]["forest"][0]["children"]
         if child["instance_id"] == "new_cartesian_move"
     )
-    for field in ("translation_tol_m", "max_blend_deviation_rad"):
+    for field in ("translation_tol_m", "blend_radius_m"):
         assert field not in authored["parameters"]
         assert authored["value_sources"][field] == {
             "kind": "program_parameter",
@@ -2133,10 +2133,10 @@ def test_motion_settings_and_insert_follow_catalog_field_bindings_not_parameter_
             "velocity_scale": 0.3,
             "acceleration_scale": 0.6,
             "translation_tol_m": 0.004,
-            "max_blend_deviation_rad": 0.02,
+            "blend_radius_m": 0.02,
             "parameter_bindings": {
                 **aliases,
-                "max_blend_deviation_rad": "max_blend_deviation_rad",
+                "blend_radius_m": "blend_radius_m",
             },
             "conflict_resolution": "reject",
         },
@@ -2148,7 +2148,7 @@ def test_motion_settings_and_insert_follow_catalog_field_bindings_not_parameter_
     assert declarations["cycle_velocity"] == 0.3
     assert declarations["cycle_acceleration"] == 0.6
     assert declarations["cycle_path_tolerance"] == 0.004
-    assert declarations["max_blend_deviation_rad"] == 0.02
+    assert declarations["blend_radius_m"] == 0.02
     assert not set(aliases).intersection(declarations)
 
     node = deepcopy(updated.snapshot["authoring"]["forest"][0]["children"][1])
@@ -2620,11 +2620,13 @@ def test_new_motion_node_is_prefilled_with_the_default_tcp() -> None:
             },
         },
     )
-    program = result.snapshot["program"]
-    node = _find_node(program["tree"], "new_move")
+    # The bare node is still incomplete (no goal), so read the authoring view.
+    authoring = result.snapshot["authoring"]
+    node = _find_node(authoring["forest"][0], "new_move")
     assert node is not None
     assert node["parameters"]["tcp_endpoint"] == {"kind": "current"}
-    assert program["target_roles"]["arm"]["required_frame_roles"] == ["base", "tcp"]
+    # Current declares no frame role.
+    assert authoring["target_roles"]["arm"]["required_frame_roles"] == ["base"]
 
 
 def test_an_explicit_endpoint_is_kept_and_declared_on_insert() -> None:
@@ -2647,10 +2649,10 @@ def test_an_explicit_endpoint_is_kept_and_declared_on_insert() -> None:
             },
         },
     )
-    program = result.snapshot["program"]
-    node = _find_node(program["tree"], "flange_move")
+    authoring = result.snapshot["authoring"]
+    node = _find_node(authoring["forest"][0], "flange_move")
     assert node["parameters"]["tcp_endpoint"] == {"kind": "entry", "target_role": "arm", "frame_role": "flange"}
-    assert program["target_roles"]["arm"]["required_frame_roles"] == ["base", "flange", "tcp"]
+    assert authoring["target_roles"]["arm"]["required_frame_roles"] == ["base", "flange"]
 
 
 def test_picking_an_undeclared_tcp_declares_it_in_the_same_edit() -> None:

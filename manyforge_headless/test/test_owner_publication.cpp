@@ -430,7 +430,7 @@ TEST(ManagerSourcePublication,
           {},
           core::ApplyFenceBusyDispositionDTO::kRejectIfAffectedBusy,
           deployment::derive_apply_component_delta(
-              admission.retained_bundle(), admission.retained_bundle()),
+              admission.retained_bundle(), admission.retained_bundle(), deployment::SiteFacts{}),
       }));
 
   const auto bytes = content_identity::canonical_json(BuildManagerSourcePayload(

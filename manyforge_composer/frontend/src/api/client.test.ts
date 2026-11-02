@@ -172,13 +172,13 @@ it('reports a body read cut by the caller abort as that abort, not invalid JSON'
     throw new Error('The operation was aborted.');
   }) } as unknown as Response;
   vi.stubGlobal('fetch', vi.fn().mockResolvedValue(cut));
-  await expect(api.cclc.component('lite6_robot', controller.signal)).rejects.toBe(reason);
+  await expect(api.components.list(controller.signal)).rejects.toBe(reason);
   // A success reply whose body really is not JSON is still reported as such.
   const malformed = { ok: true, status: 200, statusText: 'OK',
     json: vi.fn().mockRejectedValue(new SyntaxError('Unexpected token <')) } as unknown as Response;
   vi.stubGlobal('fetch', vi.fn().mockResolvedValue(malformed));
-  await expect(api.cclc.component('lite6_robot', new AbortController().signal))
-    .rejects.toThrow('Invalid JSON response from /api/cclc/components/lite6_robot');
+  await expect(api.components.list(new AbortController().signal))
+    .rejects.toThrow('Invalid JSON response from /api/components');
 });
 
 it('reads the shared authoring workspace through its single endpoint', async () => {
@@ -348,232 +348,6 @@ describe('runtime-scale control reads', () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response(runtimeScaleResponse(returned))));
     await expect(api.execution.runtimeScaleControl(selector)).resolves.toMatchObject({ selector: { kind: 'group' } });
   });
-});
-
-it('accepts a certified latch that names why recovery is unavailable, never an empty proof', async () => {
-  const { parseStopFaultRecoveryOffer } = await import('./parsers');
-  const offer = (expectations: unknown[], reason: string | null) => ({
-    api_version: 'manyforge.execution_command_response.v1',
-    command: 'get_stop_fault',
-    ok: true,
-    stop_fault: {
-      recovery_unavailable_reason: reason,
-      configuration_expectations: expectations,
-      latch: {
-        cell_id: 'cell.1', graph_revision: 'sha256:graph', latch_generation: 1,
-        latch_id: 'stop-fault.1', recovery_assessment_revision: 1,
-        recovery_status: 'waiting_for_configuration', retained_bundle_id: 'sha256:bundle',
-        state: 'latched',
-        stop_certificate: {
-          stop_certificate_id: 'stop-certificate.1', stop_certificate_revision: 1,
-          stop_generation: 1, stop_id: 'stop.1',
-        },
-      },
-    },
-  });
-  const row = {
-    active_control_configuration_generation: 1,
-    active_control_configuration_id: 'active.arm',
-    control_domain_id: 'robot.arm.control',
-  };
-  const reason = 'stop_fault_recovery_installed_configuration_unavailable';
-  expect(parseStopFaultRecoveryOffer(offer([], reason))?.recoveryUnavailableReason).toBe(reason);
-  expect(parseStopFaultRecoveryOffer(offer([row], null))?.recoveryUnavailableReason).toBeNull();
-  expect(() => parseStopFaultRecoveryOffer(offer([], null))).toThrow();
-  expect(() => parseStopFaultRecoveryOffer(offer([row], reason))).toThrow();
-});
-
-it('sends Recover cell as one request carrying only its request identity', async () => {
-  const fetchMock = vi.fn().mockResolvedValue(response({
-    schema_version: 'manyforge.cell_recover_result.v1',
-    request_id: 'request.recover.1',
-    outcome: 'not_recovered',
-    acknowledged_incidents: [{
-      controllable_component_id: 'arm', incident_id: 'incident.arm.1', cause_class: 'emergency_stop',
-    }],
-    latch_cleared: false,
-    recovered_components: [],
-    reason: {
-      code: 'incident_open', message: 'open again',
-      details: { controllable_component_id: 'arm', cause_class: 'emergency_stop' },
-    },
-  }));
-  vi.stubGlobal('fetch', fetchMock);
-
-  await expect(api.execution.cellRecover('request.recover.1')).resolves.toEqual({
-    outcome: 'not_recovered',
-    acknowledgedIncidents: [{
-      controllableComponentId: 'arm', incidentId: 'incident.arm.1', causeClass: 'emergency_stop',
-    }],
-    latchCleared: false,
-    recoveredComponents: [],
-    reason: {
-      code: 'incident_open', message: 'open again',
-      details: { controllable_component_id: 'arm', cause_class: 'emergency_stop' },
-    },
-  });
-  expect(fetchMock).toHaveBeenCalledTimes(1);
-  const [url, options] = fetchMock.mock.calls[0] as [string, RequestInit];
-  expect(url).toContain('/api/execution/cell-recover');
-  expect(options.method).toBe('POST');
-  // No owner epoch, latch identity or configuration echo: Headless reads them.
-  expect(JSON.parse(String(options.body))).toEqual({
-    request_context: {
-      request_id: 'request.recover.1',
-      source_label: 'composer_ui',
-      correlation_id: null,
-    },
-  });
-  await expect(api.execution.cellRecover('request.other')).rejects.toThrow();
-});
-
-it('sends the shown incident IDs with Recover cell when given (M6 item 36)', async () => {
-  const fetchMock = vi.fn().mockResolvedValue(response({
-    schema_version: 'manyforge.cell_recover_result.v1',
-    request_id: 'request.recover.2',
-    outcome: 'not_recovered',
-    acknowledged_incidents: [],
-    latch_cleared: false,
-    recovered_components: [],
-    reason: {
-      code: 'cclc_incident_changed', message: 'changed',
-      details: { controllable_component_id: 'arm', incident_id: 'incident.b' },
-    },
-  }));
-  vi.stubGlobal('fetch', fetchMock);
-
-  const result = await api.execution.cellRecover('request.recover.2', ['incident.a']);
-  expect(result.reason?.code).toBe('cclc_incident_changed');
-  const [, options] = fetchMock.mock.calls[0] as [string, RequestInit];
-  expect(JSON.parse(String(options.body))).toEqual({
-    request_context: {
-      request_id: 'request.recover.2',
-      source_label: 'composer_ui',
-      correlation_id: null,
-    },
-    expected_incident_ids: ['incident.a'],
-  });
-
-  // RECTIME: an automatic resend is replay-only.
-  await api.execution.cellRecover('request.recover.2', ['incident.a'], undefined, true);
-  const [, resend] = fetchMock.mock.calls[1] as [string, RequestInit];
-  expect(JSON.parse(String(resend.body))).toMatchObject({
-    request_context: { request_id: 'request.recover.2' },
-    expected_incident_ids: ['incident.a'],
-    replay_only: true,
-  });
-});
-
-it('reads global-rule recovery offers and clears one with its exact selector (SX-2206)', async () => {
-  const selector = {
-    context: {
-      owner_epoch: 'kernel.1', catalog_generation: '18446744073709551615',
-      active_publication_generation: 2, bundle: 'bundle.1', graph: 'graph.1',
-    },
-    rule_id: 'door_open',
-    expected_rule_registration_id: '1',
-  };
-  const offer = {
-    selector, current_condition: false,
-    post_latch_disposition: 'await_operator_ack', latch_cause: 'source_loss',
-  };
-  const stopFault = (offers?: unknown) => ({
-    api_version: 'manyforge.execution_command_response.v1',
-    command: 'get_stop_fault',
-    ok: true,
-    stop_fault: null,
-    ...(offers === undefined ? {} : { global_rule_recovery_offers: offers }),
-  });
-  const { parseGlobalRuleRecoveryOffers } = await import('./parsers');
-  expect(parseGlobalRuleRecoveryOffers(stopFault())).toEqual([]);
-  for (const invalid of [
-    { ...offer, current_condition: 0 },
-    { ...offer, latch_cause: 'lost' },
-    { ...offer, post_latch_disposition: 'auto' },
-    { ...offer, selector: { ...selector, expected_rule_registration_id: 9 } },
-    // SX-2216: Core emits only a positive registration nonce.
-    { ...offer, selector: { ...selector, expected_rule_registration_id: '0' } },
-    { ...offer, selector: { ...selector, context: { ...selector.context, catalog_generation: '0' } } },
-    { ...offer, extra: true },
-  ]) {
-    expect(() => parseGlobalRuleRecoveryOffers(stopFault([invalid]))).toThrow();
-  }
-  const result = {
-    request_id: 'request.rule.1', replay_status: 'accepted_new', accepted: true,
-    context: selector.context,
-    rule: { rule_id: 'door_open', state: 'clear', triggering_acquisition: null },
-    error: null,
-  };
-  const fetchMock = vi.fn()
-    .mockResolvedValueOnce(response(stopFault([offer])))
-    .mockResolvedValueOnce(response({
-      api_version: 'manyforge.execution_command_response.v1',
-      command: 'recover_stop_fault', ok: true, result,
-    }))
-    .mockResolvedValueOnce(response({
-      api_version: 'manyforge.execution_command_response.v1',
-      command: 'recover_stop_fault', ok: true,
-      result: { ...result, accepted: false, rule: null, error: 'global_rule_condition_true' },
-    }));
-  vi.stubGlobal('fetch', fetchMock);
-
-  const [parsed] = await api.execution.globalRuleRecoveryOffers();
-  expect(parsed).toEqual({
-    selector, currentCondition: false,
-    postLatchDisposition: 'await_operator_ack', latchCause: 'source_loss',
-  });
-  await expect(api.execution.clearGlobalRuleLatch('owner.1', 'request.rule.1', parsed))
-    .resolves.toEqual({ accepted: true, replayStatus: 'accepted_new', ruleState: 'clear', error: null });
-  const [path, options] = fetchMock.mock.calls[1] as [string, RequestInit];
-  expect(path).toContain('/api/execution/stop-fault/recover');
-  expect(JSON.parse(String(options.body))).toEqual({
-    kind: 'global_io_rule',
-    request_context: {
-      request_id: 'request.rule.1', request_owner_epoch: 'owner.1',
-      source_label: 'composer_ui', correlation_id: null,
-    },
-    selector,
-    reason: 'operator cleared global rule latch',
-  });
-  await expect(api.execution.clearGlobalRuleLatch('owner.1', 'request.rule.1', parsed))
-    .resolves.toMatchObject({ accepted: false, ruleState: null, error: 'global_rule_condition_true' });
-});
-
-it('accepts a global-rule recovery result only for the requested selector context (SX-2216)', async () => {
-  const { parseGlobalRuleRecoveryResult } = await import('./parsers');
-  const selector = {
-    context: {
-      owner_epoch: 'kernel.1', catalog_generation: '4',
-      active_publication_generation: 2, bundle: 'bundle.1', graph: 'graph.1',
-    },
-    rule_id: 'door_open',
-    expected_rule_registration_id: '9',
-  };
-  const reply = (context: unknown, replayStatus = 'accepted_new') => ({
-    api_version: 'manyforge.execution_command_response.v1',
-    command: 'recover_stop_fault',
-    ok: true,
-    result: {
-      request_id: 'request.rule.1', replay_status: replayStatus, accepted: true, context,
-      rule: { rule_id: 'door_open', state: 'clear', triggering_acquisition: null },
-      error: null,
-    },
-  });
-  expect(parseGlobalRuleRecoveryResult(reply(selector.context), 'request.rule.1', selector))
-    .toMatchObject({ accepted: true, ruleState: 'clear' });
-  for (const patch of [
-    { owner_epoch: 'kernel.2' }, { catalog_generation: '5' },
-    { active_publication_generation: 3 }, { bundle: 'bundle.2' }, { graph: 'graph.2' },
-  ]) {
-    expect(() => parseGlobalRuleRecoveryResult(
-      reply({ ...selector.context, ...patch }), 'request.rule.1', selector,
-    )).toThrow();
-  }
-  // A historical request's replay echoes its own (no longer Applied) context.
-  const historical = { ...selector, context: { ...selector.context, active_publication_generation: 1 } };
-  expect(parseGlobalRuleRecoveryResult(
-    reply(historical.context, 'replayed_exact'), 'request.rule.1', historical,
-  )).toMatchObject({ accepted: true, replayStatus: 'replayed_exact' });
 });
 
 function response(
@@ -1020,29 +794,6 @@ describe('structural API client', () => {
     });
   });
 
-  it('references the retained Deployment preparation when confirming Apply', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(response({}));
-    vi.stubGlobal('fetch', fetchMock);
-    const fence = draftFence();
-
-    await api.deploymentWorkspace.applyDraft(fence, {
-      token: `sha256:${'c'.repeat(64)}`,
-      preparation: {
-        requestOwnerEpoch: 'browser-owner-1',
-        requestId: 'prepare-1',
-      },
-    }).catch(() => null);
-
-    const [url, options] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(url).toBe('/api/deployment/draft/apply');
-    expect(JSON.parse(String(options.body))).toEqual({
-      ...fence,
-      confirmationToken: `sha256:${'c'.repeat(64)}`,
-      preparationRequestOwnerEpoch: 'browser-owner-1',
-      preparationRequestId: 'prepare-1',
-    });
-  });
-
   it('submits exact fenced New, Discard, and Revert requests', async () => {
     const fetchMock = vi.fn()
       .mockResolvedValueOnce(response(workspaceFixture()))
@@ -1076,7 +827,7 @@ describe('structural API client', () => {
     ))).toEqual(revertFence);
   });
 
-  it('lists and saves Scenario documents, then loads through the fenced activation path', async () => {
+  it('lists, saves and exports Scenario documents', async () => {
     const index = {
       api_version: 'manyforge.scenario_document_index.v1',
       directory: '/workspace/examples',
@@ -1090,19 +841,6 @@ describe('structural API client', () => {
         scenario_id: 'cell',
         last_known_status: 'unknown',
         workspace: workspaceFixture(),
-      }))
-      .mockResolvedValueOnce(response({
-        status: 'accepted',
-        path: '/workspace/examples/cell',
-        scenario_id: 'cell',
-        incomplete: false,
-        activation: {
-          status: 'accepted', apply_id: 'apply.1', apply_generation: 1,
-        },
-        diagnostics: [],
-        source_diagnostics: [],
-        workspace: workspaceFixture(),
-        authoringWorkspace: authoringWorkspaceFixture(),
       }))
       .mockResolvedValueOnce(response({
         status: 'exported',
@@ -1122,11 +860,6 @@ describe('structural API client', () => {
       description: '',
       confirmOverwrite: true,
     });
-    await api.scenarioDocuments.load(
-      scenarioFence,
-      '/workspace/examples/cell',
-      true,
-    );
     await api.scenarioDocuments.export(
       scenarioFence,
       '/workspace/exports/cell',
@@ -1144,18 +877,11 @@ describe('structural API client', () => {
       description: '',
       confirmOverwrite: true,
     });
-    expect(JSON.parse(String(
-      (fetchMock.mock.calls[2]?.[1] as RequestInit).body,
-    ))).toEqual({
-      ...scenarioFence,
-      path: '/workspace/examples/cell',
-      confirmDiscard: true,
-    });
-    expect(fetchMock.mock.calls[3]?.[0]).toBe(
+    expect(fetchMock.mock.calls[2]?.[0]).toBe(
       '/api/scenario-documents/export',
     );
     expect(JSON.parse(String(
-      (fetchMock.mock.calls[3]?.[1] as RequestInit).body,
+      (fetchMock.mock.calls[2]?.[1] as RequestInit).body,
     ))).toEqual({
       ...scenarioFence,
       destinationPath: '/workspace/exports/cell',
@@ -1476,222 +1202,54 @@ describe('headless intent client', () => {
   });
 });
 
-it('accepts an authorization-only incident Recover only for the requested component', async () => {
-  const recovered = {
-    acceptance: null,
-    incident_recovery: {
-      acknowledged_at_ns: 9_000,
-      acknowledged_by: 'manyforge_composer',
-      cause_class: 'provider_lost',
-      controllable_component_id: 'component.arm',
-      incident_id: 'incident.component.arm.1',
-    },
-    replay_status: 'accepted_new',
-    status: null,
-  };
-  const fetchMock = vi.fn()
-    .mockResolvedValueOnce(response(recovered))
-    .mockResolvedValueOnce(response(recovered));
-  vi.stubGlobal('fetch', fetchMock);
-  const request = (controllableComponentId: string) => ({
-    request_context: {
-      request_id: 'request.recover.1',
-      request_owner_epoch: 'cclc.epoch.1',
-      source_label: 'manyforge_composer',
-      correlation_id: null,
-    },
-    controllable_component_id: controllableComponentId,
-    intent: 'recover',
-  }) as unknown as Parameters<typeof api.cclc.submitLifecycle>[0];
-
-  await expect(api.cclc.submitLifecycle(request('component.arm'))).resolves.toMatchObject({
-    transactionId: null,
-    incidentRecovery: { incidentId: 'incident.component.arm.1', controllableComponentId: 'component.arm' },
-  });
-  await expect(api.cclc.submitLifecycle(request('component.gripper')))
-    .rejects.toThrow('incident recovery does not match its request');
-});
-
-
-it('Close Recover requires the exact incident and its typed closure reason on submission and readback', async () => {
-  const request: Parameters<typeof api.cclc.submitLifecycle>[0] = {
-    request_context: { request_id: 'close.recover', request_owner_epoch: 'owner.1',
-      source_label: 'manyforge_composer', correlation_id: 'close.1' },
-    controllable_component_id: 'component.arm', intent: 'recover',
-    expected_graph_revision: 'graph.1', expected_component_lifecycle_generation: 4,
-    expected_admission_generation: 7, expected_control_domains: [],
-    reason: 'cell closed by operator', close_incident_recovery: { expected_incident_id: 'incident.1' },
-    confirmed: true,
-  };
-  const recovery = { acknowledged_at_ns: 9000, acknowledged_by: 'manyforge_composer',
-    cause_class: 'provider_lost', controllable_component_id: 'component.arm',
-    incident_id: 'incident.1', closure_reason: 'cell_closed_by_operator' };
-  const envelope = { acceptance: null, status: null, replay_status: 'accepted_new',
-    incident_recovery: recovery };
-  const fetchMock = vi.fn(); vi.stubGlobal('fetch', fetchMock);
-  fetchMock.mockResolvedValue(response(envelope));
-  await expect(api.cclc.submitLifecycle(request)).resolves.toMatchObject({
-    incidentRecovery: { incidentId: 'incident.1', closureReason: 'cell_closed_by_operator' },
-  });
-  fetchMock.mockResolvedValue(response({ result: envelope }));
-  await expect(api.cclc.lifecycleRequestResult(request)).resolves.toMatchObject({
-    incidentRecovery: { incidentId: 'incident.1', closureReason: 'cell_closed_by_operator' },
-  });
-  for (const invalid of [
-    { ...recovery, incident_id: 'incident.replaced' },
-    Object.fromEntries(Object.entries(recovery).filter(([key]) => key !== 'closure_reason')),
-  ]) {
-    fetchMock.mockResolvedValue(response({ ...envelope, incident_recovery: invalid }));
-    await expect(api.cclc.submitLifecycle(request)).rejects.toThrow('exact incident');
-    fetchMock.mockResolvedValue(response({ result: { ...envelope, incident_recovery: invalid } }));
-    await expect(api.cclc.lifecycleRequestResult(request)).rejects.toThrow('exact incident');
-  }
-  fetchMock.mockResolvedValue(response({ acceptance: null, status: null,
-    replay_status: 'stale_request_owner_epoch' }));
-  await expect(api.cclc.submitLifecycle(request)).resolves.toMatchObject({ replayStatus: 'stale_request_owner_epoch', incidentRecovery: null });
-});
-
-describe('exact lifecycle request-result read', () => {
-  const request: Parameters<typeof api.cclc.lifecycleRequestResult>[0] = {
-    request_context: { request_id: 'sent.request', request_owner_epoch: 'owner.1',
-      source_label: 'manyforge_composer', correlation_id: null },
-    controllable_component_id: 'component.arm', intent: 'prepare',
-    expected_graph_revision: 'graph.1', expected_component_lifecycle_generation: 4,
-    expected_admission_generation: 7, expected_control_domains: [],
-    reason: 'operator-confirmed Composer request', confirmed: true,
-  };
-  const result = {
-    acceptance: { accepted_at_ns: 1, component_lifecycle_generation: 4,
-      lifecycle_transaction_generation: 1, lifecycle_transaction_id: 'transaction.1',
-      request_id: request.request_context.request_id, timeout_duration_ns: 100 },
-    replay_status: 'replayed_exact', status: null,
-  };
-  it('posts the exact retained request to the read route and accepts null only as unresolved', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(response({ result: null }));
+describe('server-side Apply, Load and New (CONTRACTS §11)', () => {
+  const applied = { outcome: 'succeeded', components: [
+    { component_id: 'arm', disposition: 'replace', lifecycle_after: 'prepared' }] };
+  it.each([
+    ['new', () => api.cellApply.newScenario(), '/api/scenario/new', { discard_unsaved: true }],
+    ['load', () => api.cellApply.load('/projects/cell'), '/api/scenario/load',
+      { path: '/projects/cell', discard_unsaved: true }],
+    ['apply', () => api.cellApply.apply({ draft_revision: 3 }), '/api/deployment/apply',
+      { scope: { draft_revision: 3 } }],
+    ['revert', () => api.cellApply.revert({ saved: 'x' }), '/api/deployment/revert',
+      { scope: { saved: 'x' } }],
+  ] as const)('%s calls its endpoint once and returns the ApplyResult', async (_name, call, url, body) => {
+    const fetchMock = vi.fn().mockResolvedValue(response(applied));
     vi.stubGlobal('fetch', fetchMock);
-    await expect(api.cclc.lifecycleRequestResult(request)).resolves.toBeNull();
-    expect(fetchMock.mock.calls[0]?.[0]).toBe('/api/cclc/lifecycle/requests/result');
-    const options = fetchMock.mock.calls[0]?.[1] as RequestInit;
-    expect(options.method).toBe('POST');
-    expect(JSON.parse(options.body as string)).toEqual(request);
-    fetchMock.mockResolvedValue(response({ result }));
-    await expect(api.cclc.lifecycleRequestResult(request)).resolves.toMatchObject({ transactionId: 'transaction.1' });
-  });
-  it('rejects a foreign request acceptance and nonclosed result envelopes', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(response({ result: {
-      ...result, acceptance: { ...result.acceptance, request_id: 'another.request' },
-    } }));
-    vi.stubGlobal('fetch', fetchMock);
-    await expect(api.cclc.lifecycleRequestResult(request)).rejects.toThrow('does not match its request');
-    for (const payload of [{}, { result: null, fabricated: true }]) {
-      fetchMock.mockResolvedValue(response(payload));
-      await expect(api.cclc.lifecycleRequestResult(request)).rejects.toThrow('must contain only result');
-    }
-  });
-});
-
-
-it.each(['accepted_new', 'replayed_exact', 'stale_request_owner_epoch', 'request_id_conflict', 'request_ledger_full', 'request_result_expired'])(
-  'requires Close acknowledgement only for accepted recovery, preserving %s', async (replay) => {
-    const request: Parameters<typeof api.cclc.submitLifecycle>[0] = {
-      request_context: { request_id: 'close.1', request_owner_epoch: 'owner.1', source_label: 'composer', correlation_id: null },
-      controllable_component_id: 'component.arm', intent: 'recover', expected_graph_revision: 'graph.1',
-      expected_component_lifecycle_generation: 4, expected_admission_generation: 7, expected_control_domains: [],
-      reason: 'cell closed by operator', confirmed: true, close_incident_recovery: { expected_incident_id: 'incident.1' },
-    };
-    const result = { acceptance: null, status: null, replay_status: replay };
-    const accepted = replay === 'accepted_new' || replay === 'replayed_exact';
-    const fetchMock = vi.fn(); vi.stubGlobal('fetch', fetchMock);
-    fetchMock.mockResolvedValue(response(result));
-    if (accepted) await expect(api.cclc.submitLifecycle(request)).rejects.toThrow('exact incident');
-    else await expect(api.cclc.submitLifecycle(request)).resolves.toMatchObject({ replayStatus: replay, incidentRecovery: null });
-    fetchMock.mockResolvedValue(response({ result }));
-    if (accepted) await expect(api.cclc.lifecycleRequestResult(request)).rejects.toThrow('exact incident');
-    else await expect(api.cclc.lifecycleRequestResult(request)).resolves.toMatchObject({ replayStatus: replay, incidentRecovery: null });
-    if (!accepted) {
-      const ack = { ...result, incident_recovery: { acknowledged_at_ns: 1, acknowledged_by: 'composer',
-        cause_class: 'provider_lost', controllable_component_id: 'component.arm', incident_id: 'incident.1', closure_reason: 'cell_closed_by_operator' } };
-      fetchMock.mockResolvedValue(response(ack));
-      await expect(api.cclc.submitLifecycle(request)).rejects.toThrow();
-      fetchMock.mockResolvedValue(response({ result: ack }));
-      await expect(api.cclc.lifecycleRequestResult(request)).rejects.toThrow();
-    }
-  },
-);
-it.each([undefined, null])('ordinary Recover rejects a Close acknowledgement when Close field is %s', async (close) => {
-  const request: Parameters<typeof api.cclc.submitLifecycle>[0] = {
-    request_context: { request_id: 'recover.1', request_owner_epoch: 'owner.1', source_label: 'composer', correlation_id: null },
-    controllable_component_id: 'component.arm', intent: 'recover', expected_graph_revision: 'graph.1',
-    expected_component_lifecycle_generation: 4, expected_admission_generation: 7, expected_control_domains: [],
-    reason: 'operator recovery', confirmed: true, close_incident_recovery: close,
-  };
-  const result = { acceptance: null, status: null, replay_status: 'accepted_new', incident_recovery: {
-    acknowledged_at_ns: 1, acknowledged_by: 'composer', cause_class: 'provider_lost',
-    controllable_component_id: 'component.arm', incident_id: 'incident.1', closure_reason: 'cell_closed_by_operator',
-  } };
-  const fetchMock = vi.fn(); vi.stubGlobal('fetch', fetchMock);
-  fetchMock.mockResolvedValue(response(result));
-  await expect(api.cclc.submitLifecycle(request)).rejects.toThrow('Ordinary Recover');
-  fetchMock.mockResolvedValue(response({ result }));
-  await expect(api.cclc.lifecycleRequestResult(request)).rejects.toThrow('Ordinary Recover');
-});
-
-
-describe('canonical-empty preparation response envelope', () => {
-  const actualResponse = {
-  "prepared_activation": {
-    "assistant_mode": "optional",
-    "captured_input_digest": "sha256:c4c20c8f79a0c76ee1304bb429025afb690fd37a39f578a06cb7a8d36a9a54c5",
-    "deployment_artifact_id": "ur5e_lite6_wall.canonical_empty",
-    "deployment_revision": "sha256:a054aaab64456ed3e895b4b60ec3f3391553040e1204e9cf6c2be737ca70a2de",
-    "graph_revision": "sha256:f528d4acf2fed2bea4794c767141c2083356bd0730a20a98060a9959534d466d",
-    "node_environment_digest": "sha256:827d1febcd0154c0fd1daca27e4d02a5682de4287737cc7dbb99eb378eb1f954",
-    "origin": {
-      "admission_digest": "sha256:a21efe1461d8c6fa3ad31b0827d1796ee915e9e06b2fb68eda714349fa461204",
-      "cell_id": "ui6i_ur5e_lite6_wall_cell",
-      "deployment_artifact_id": "ur5e_lite6_wall.canonical_empty",
-      "deployment_revision": "sha256:a054aaab64456ed3e895b4b60ec3f3391553040e1204e9cf6c2be737ca70a2de",
-      "graph_revision": "sha256:f528d4acf2fed2bea4794c767141c2083356bd0730a20a98060a9959534d466d",
-      "kind": "sealed_canonical_empty",
-      "retained_bundle_id": "sha256:e42be21788712cf9227f8304f8e1d405370b57ac05f2534c4c32719d90ce7266"
-    },
-    "prepared_activation_id": "sha256:3fbca34cd16ac03f92fceea93bb031f760296e076437831f9a3b58bc294041f8",
-    "program_id": null,
-    "program_outcome": {
-      "kind": "no_program"
-    },
-    "program_revision": null,
-    "retained_bundle_id": "sha256:e42be21788712cf9227f8304f8e1d405370b57ac05f2534c4c32719d90ce7266",
-    "schema_version": "manyforge.prepared_activation_input.v6"
-  }
-};
-  it('unwraps the actual live v6 sealed preparation without changing its receipt', async () => {
-    const fetchMock = vi.fn().mockResolvedValue(response(actualResponse));
-    vi.stubGlobal('fetch', fetchMock);
-    const body = { request_owner_epoch: 'actual.manager', expected_admission_generation: 50,
-      origin: actualResponse.prepared_activation.origin };
-    const prepared = await api.manager.prepareCanonicalEmpty(body);
-    expect(prepared).toEqual(actualResponse.prepared_activation);
-    expect(prepared.prepared_activation_id).toBe(actualResponse.prepared_activation.prepared_activation_id);
-    expect(prepared.program_outcome).toEqual({ kind: 'no_program' });
+    await expect(call()).resolves.toEqual(applied);
     expect(fetchMock).toHaveBeenCalledTimes(1);
-    const [url, options] = fetchMock.mock.calls[0] as [string, RequestInit];
-    expect(url).toBe('/api/activation-preparations');
+    const [calledUrl, options] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(calledUrl).toBe(url);
     expect(options.method).toBe('POST');
     expect(JSON.parse(String(options.body))).toEqual(body);
   });
-  it.each(['bare', 'extra', 'missing', 'null-receipt', 'extra-receipt'])('rejects a malformed %s carrier', async (kind) => {
-    let payload: unknown = actualResponse;
-    if (kind === 'bare') payload = actualResponse.prepared_activation;
-    if (kind === 'extra') payload = { ...actualResponse, unexpected: true };
-    if (kind === 'missing') payload = {};
-    if (kind === 'null-receipt') payload = { prepared_activation: null };
-    if (kind === 'extra-receipt') payload = {
-      prepared_activation: { ...actualResponse.prepared_activation, unexpected: true },
-    };
-    const fetchMock = vi.fn().mockResolvedValue(response(payload));
+  const preview = { components: [
+    { component_id: 'arm', disposition: 'replace', reasons: ['description'], restarts: true },
+    { component_id: 'gripper', disposition: 'retain', reasons: [], restarts: false }],
+  scope: { deployment_draft_revision: 4 },
+  program: { executable: false, program_id: 'pick', unresolved_references: [{
+    component_role_id: 'arm', target_role_id: null, controllable_component_id: 'arm',
+    command_target_id: null, reason: 'component_removed', detail: 'arm is removed' }],
+  affected_nodes: ['move_1'], affected_execution_groups: [] },
+  attachment_changed_components: ['gripper'], detached_components: ['camera'] };
+  it.each([
+    ['preview', () => api.cellApply.preview(), '/api/deployment/preview'],
+    ['revert preview', () => api.cellApply.revertPreview(), '/api/deployment/revert/preview'],
+  ] as const)('parses the %s impact', async (_name, call, url) => {
+    const fetchMock = vi.fn().mockResolvedValue(response(preview));
     vi.stubGlobal('fetch', fetchMock);
-    await expect(api.manager.prepareCanonicalEmpty({})).rejects.toThrow();
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await expect(call()).resolves.toEqual(preview);
+    expect(fetchMock.mock.calls[0]![0]).toBe(url);
+  });
+  it('parses removed components without lifecycle_after', async () => {
+    const result = { outcome: 'succeeded', components: [
+      { component_id: 'old_arm', disposition: 'remove' },
+      { component_id: 'arm', disposition: 'add', lifecycle_after: 'prepared' }] };
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response(result)));
+    await expect(api.cellApply.apply({})).resolves.toEqual(result);
+  });
+  it('rejects a malformed ApplyResult', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(response({ outcome: 'done', components: [] })));
+    await expect(api.cellApply.apply({})).rejects.toThrow('/api/deployment/apply');
   });
 });

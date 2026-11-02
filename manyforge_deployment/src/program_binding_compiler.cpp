@@ -694,34 +694,7 @@ void validate_command_schema_target(
     const QualifiedCommandSchema &schema,
     const core::ComponentTypeCommandTargetDTO &target_type,
     const VerifiedRetainedModelMap &model_map,
-    const core::ControllableComponentId &component_id,
-    const core::CellGraphDTO &graph) {
-  if (std::holds_alternative<core::IoSignalWriteCommandValueContractDTO>(
-          schema.value().command_value)) {
-    const auto signals = ResolveRetainedIoSignalCatalog(graph);
-    if (!signals.ok())
-      fail(signals.error().details.at("reason"));
-    const bool qualified_output = std::any_of(
-        signals.value().begin(), signals.value().end(),
-        [&](const auto &signal) {
-          if (signal.descriptor.signal_id.controllable_component_id != component_id ||
-              signal.command_target_id != target_type.command_target_id ||
-              signal.descriptor.direction != core::IoSignalDirection::kOutput)
-            return false;
-          return std::any_of(
-              target_type.resource_roles.begin(),
-              target_type.resource_roles.end(), [&](const auto &role) {
-                const auto *local =
-                    std::get_if<core::ComponentTypeLocalResourceRoleDTO>(&role);
-                return local && !local->coordinate_kind &&
-                       local->resource_role_id == signal.resource_role_id;
-              });
-        });
-    if (!qualified_output)
-      fail("io_signal_unbound: output schema needs an actual non-coordinate "
-           "output");
-    return;
-  }
+    const core::ControllableComponentId &component_id) {
   const auto* contract = std::get_if<core::GripperPositionCommandValueContractDTO>(
       &schema.value().command_value);
   if (contract == nullptr) {
@@ -905,8 +878,7 @@ resolve_capability(
     selected_schema = &schema;
   }
   const bool requires_current_command_schema =
-      requirement.capability_id.value() == "tool.gripper.command" ||
-      requirement.capability_id.value() == "io.gpio.set_output";
+      requirement.capability_id.value() == "tool.gripper.command";
   if (requires_current_command_schema != (selected_schema != nullptr)) {
     fail("Program capability command-schema closure is incomplete or "
          "incompatible");
@@ -915,7 +887,7 @@ resolve_capability(
   std::optional<core::ProgramCommandSchemaRefDTO> command_schema;
   if (selected_schema != nullptr) {
     validate_command_schema_target(*selected_schema, target_type, model_map,
-                                   component.controllable_component_id, graph);
+                                   component.controllable_component_id);
     command_schema = core::ProgramCommandSchemaRefDTO{
         selected_schema->value().command_schema_id,
         selected_schema->value().command_schema_revision};

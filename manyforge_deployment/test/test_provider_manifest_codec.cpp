@@ -25,8 +25,6 @@ constexpr std::string_view kExecutionCapabilityRevision =
     "sha256:7e5958db0906b84cb4e5c68ab0ef896f74dc0ba49a9ceb4d918b386abaf9f28c";
 constexpr std::string_view kLifecycleObserveCapabilityRevision =
     "sha256:deb6815e681e8879c172e1a7dcd03a55154bc599efaa35167c9d23f54d6b9104";
-constexpr std::string_view kLifecycleSemanticDigest =
-    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
 static_assert(!std::is_aggregate_v<QualifiedProviderManifest>);
 static_assert(!std::is_default_constructible_v<QualifiedProviderManifest>);
@@ -229,10 +227,9 @@ TEST(ProviderManifestCodec,
   EXPECT_TRUE(no_contracts.value().provider_contracts.empty());
 }
 
-TEST(ProviderManifestCodec,
-     LifecycleCapabilitiesRequireOneExactSemanticCatalogAnchor) {
-  auto anchored = manifest_identity_value({"execute"}, CanonicalValue::Array{});
-  auto root = anchored.as_object();
+TEST(ProviderManifestCodec, LifecycleCapabilitiesQualifyWithoutPlanCatalog) {
+  auto value = manifest_identity_value({"execute"}, CanonicalValue::Array{});
+  auto root = value.as_object();
   auto offered = std::find_if(root.begin(), root.end(), [](const auto &member) {
     return member.first == "offered_capabilities";
   });
@@ -247,46 +244,11 @@ TEST(ProviderManifestCodec,
           {"required_endpoint_role_ids", string_set({})},
       }));
   offered->second = CanonicalValue(std::move(rows));
-  root.emplace_back(
-      "lifecycle_plan_catalog",
-      CanonicalValue(CanonicalValue::Object{
-          {"catalog_api_version",
-           CanonicalValue("manyforge.brand_lifecycle_plan_catalog.v1")},
-          {"semantic_digest",
-           CanonicalValue(std::string(kLifecycleSemanticDigest))},
-      }));
 
-  const auto qualified = qualify(CanonicalValue(root));
-  ASSERT_TRUE(qualified.value().lifecycle_plan_catalog.has_value());
-  EXPECT_EQ(
-      qualified.value().lifecycle_plan_catalog->catalog_api_version.value(),
-      "manyforge.brand_lifecycle_plan_catalog.v1");
-  EXPECT_EQ(qualified.value().lifecycle_plan_catalog->semantic_digest.value(),
-            kLifecycleSemanticDigest);
-
-  auto missing_anchor = root;
-  missing_anchor.erase(
-      std::remove_if(missing_anchor.begin(), missing_anchor.end(),
-                     [](const auto &member) {
-                       return member.first == "lifecycle_plan_catalog";
-                     }),
-      missing_anchor.end());
-  EXPECT_THROW(qualify(CanonicalValue(std::move(missing_anchor))),
-               ProviderManifestCodecError);
-
-  auto declaration_without_capability =
-      manifest_identity_value({"execute"}, CanonicalValue::Array{}).as_object();
-  declaration_without_capability.emplace_back(
-      "lifecycle_plan_catalog",
-      CanonicalValue(CanonicalValue::Object{
-          {"catalog_api_version",
-           CanonicalValue("manyforge.brand_lifecycle_plan_catalog.v1")},
-          {"semantic_digest",
-           CanonicalValue(std::string(kLifecycleSemanticDigest))},
-      }));
-  EXPECT_THROW(
-      qualify(CanonicalValue(std::move(declaration_without_capability))),
-      ProviderManifestCodecError);
+  const auto qualified = qualify(CanonicalValue(std::move(root)));
+  EXPECT_EQ(qualified.value().offered_capabilities.front().capability_id.value(),
+            "component.lifecycle.observe");
+  EXPECT_FALSE(qualified.value().lifecycle_plan_catalog.has_value());
 }
 
 TEST(ProviderManifestCodec, RequiresExactBuiltinCapabilityDefinitions) {

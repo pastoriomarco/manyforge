@@ -24,7 +24,7 @@ function componentOverview(): ComposerHeadlessState['componentOverview'] {
     overviewRevision: `sha256:${'a'.repeat(64)}`,
     readiness: 'ready',
     summaryLabel: 'Application surfaces ready',
-    profileLabel: 'native',
+    profileLabel: 'standard',
     authorityLabel: 'owner-issued scoped facts',
     userMessage: 'Current.',
     capabilities: ['Observe / Render', 'Plan / Preview', 'Execute / Control'],
@@ -579,7 +579,7 @@ function wireState(generation: number): Record<string, unknown> {
       overview_revision: `sha256:${'a'.repeat(64)}`,
       readiness: 'ready',
       summary_label: 'Application surfaces ready',
-      profile_label: 'native',
+      profile_label: 'standard',
       authority_label: 'owner-issued scoped facts',
       user_message: 'Current.',
       capabilities: ['Observe / Render', 'Plan / Preview', 'Execute / Control'],
@@ -1055,6 +1055,59 @@ describe('zero-physical-component viewer demand', () => {
     source.dispose();
   });
 
+  it('keeps one reconnecting condition while the source keeps closing the viewer', () => {
+    const { source, control, viewers } = setup(false);
+    receiveControlSnapshot(control, publication(1, false));
+    source.setViewerDemand(true);
+    const phases: string[] = [];
+    source.subscribeExecutionObservationTransport(() => {
+      phases.push(source.getExecutionObservationTransportStatus().phase);
+    });
+    viewers()[0]!.onopen?.();
+    expect(source.getExecutionObservationTransportStatus().phase).toBe('waiting');
+    viewers()[0]!.onclose?.();
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      vi.advanceTimersByTime(1000);
+      const viewer = viewers()[attempt]!;
+      viewer.onopen?.();
+      expect(source.getExecutionObservationTransportStatus().phase).toBe('reconnecting');
+      viewer.onclose?.();
+    }
+    vi.advanceTimersByTime(1000);
+    viewers()[4]!.onopen?.();
+    viewers()[4]!.receive(wireObservation(1));
+    expect(phases).toEqual(['waiting', 'reconnecting', 'live']);
+    source.dispose();
+  });
+
+  it('sends a resolution that found no session once on the next session', () => {
+    const { source, control } = setup(false);
+    const transitions = (socket: Socket) => socket.sent
+      .map((value) => JSON.parse(value) as Record<string, unknown>)
+      .filter((value) => value.message_kind === 'client_incident'
+        && value.incident_kind === 'viewer_observation_stale');
+    source.reportClientIncident('viewer_observation_stale', true, 'viewer_observation_stale');
+    expect(transitions(control).map((value) => value.phase)).toEqual(['activated']);
+    const incidentId = transitions(control)[0]!.incident_id;
+    control.close();
+    source.reportClientIncident('viewer_observation_stale', false, 'viewer_observation_stale');
+    vi.advanceTimersByTime(1000);
+    const replacement = Socket.instances
+      .filter((socket) => new URL(socket.url).pathname === '/ws/control')[1]!;
+    synchronizeControl(replacement, 'control-session.test-2');
+    expect(transitions(replacement)).toEqual([
+      expect.objectContaining({ phase: 'resolved', incident_id: incidentId }),
+    ]);
+    // Sent once: a further session does not repeat it.
+    replacement.close();
+    vi.advanceTimersByTime(1000);
+    const third = Socket.instances
+      .filter((socket) => new URL(socket.url).pathname === '/ws/control')[2]!;
+    synchronizeControl(third, 'control-session.test-3');
+    expect(transitions(third)).toEqual([]);
+    source.dispose();
+  });
+
   it.each([true, false])('removes quiet absence when the Manager proof becomes stale, canonical=%s', (canonicalEmpty) => {
     const { source, control, viewers } = setup(false);
     receiveControlSnapshot(control, publication(1, true, canonicalEmpty));
@@ -1084,7 +1137,7 @@ describe('zero-physical-component viewer demand', () => {
     const guidance = deriveTransportGuidance({
       enabled: true,
       program: { state: { controls: null, run: null }, cycleState: 'idle_after_reset',
-        cycleFailure: null, resetRobotPositionAvailability: null, commandDisabledReason: () => null },
+        cycleFailure: null, resetRobotPositionAvailability: null, runnerRefusal: () => null },
       robot: { currentStatus: null, state: { status: null } },
       motionActive: false, onReviewProgramRecovery: vi.fn(),
       observationTransport: source.getExecutionObservationTransportStatus(),
@@ -1424,16 +1477,16 @@ describe('HeadlessStateSource delivery scheduling', () => {
             received_server_sequence: '21',
             received_monotonic_ns: '121',
             disposition: 'rejected',
-            code: 'component_rearm_required',
+            code: 'cell_latched',
             semantic_owner_epoch: 'runner.epoch.1',
             execution_control_revision: 1,
           },
           result: {
             ok: false,
             error: {
-              code: 'component_rearm_required',
-              message: 'the robot was moved from its own interface',
-              details: { reason: 'moved_externally', controllable_component_id: 'arm' },
+              code: 'cell_latched',
+              message: 'the cell is latched',
+              details: {},
             },
           },
         }),
@@ -1441,7 +1494,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
       vi.stubGlobal('fetch', fetch);
       await expect(source.sendExecutionCommand(
         'program_run', { scenario_id: 'lite6' }, 'run.refused.once',
-      )).rejects.toThrow(/^component_rearm_required: Robot was moved outside ManyForge/);
+      )).rejects.toThrow(/^cell_latched: Cell latched: a component needs attention/);
       await vi.advanceTimersByTimeAsync(20_000);
       expect(fetch).toHaveBeenCalledTimes(1);
       expect(String((fetch.mock.calls[0] as unknown[])[0])).not.toContain('/cclc/');
@@ -1913,7 +1966,7 @@ describe('HeadlessStateSource delivery scheduling', () => {
 
     // Global rule states ride the same pump-only delta path; progress stays.
     expect(source.getGlobalRules()).toBeNull();
-    const rules = [{ rule_id: 'door', state: 'latched', keys: [] }];
+    const rules = [{ rule_id: 'door', state: 'tripped', keys: [] }];
     receiveControl(FakeWebSocket.shell, {
       schema_version: 'manyforge.execution_control.v2', message_kind: 'delta',
       control_session_id: CONTROL_SESSION_ID,
@@ -1926,11 +1979,36 @@ describe('HeadlessStateSource delivery scheduling', () => {
       shell: { complete: false, global_rules: rules },
     });
     vi.advanceTimersByTime(HEADLESS_SHELL_PUBLICATION_MS);
-    expect(source.getGlobalRules()).toEqual([{ ruleId: 'door', state: 'latched', keys: [] }]);
+    expect(source.getGlobalRules()).toEqual([{ ruleId: 'door', state: 'tripped', keys: [] }]);
     expect(source.getOperationProgress()).toEqual(progress);
     expect(progressChanged).toHaveBeenCalledTimes(2);
     expect(shellChanged).not.toHaveBeenCalled();
     expect(viewerChanged).not.toHaveBeenCalled();
+
+    // Cell facts: pushed values replace the last ones; null (the backend
+    // can't read the host's model) clears them, so the GUI shows
+    // "unavailable" rather than last values.
+    const cellDelta = (shell: Record<string, unknown>) => receiveControl(FakeWebSocket.shell, {
+      schema_version: 'manyforge.execution_control.v2', message_kind: 'delta',
+      control_session_id: CONTROL_SESSION_ID,
+      server_sequence: nextControlServerSequence(FakeWebSocket.shell),
+      state_sequence: '2', received_client_sequence: '2', event_class: 'cold',
+      control: {
+        receiver_incarnation: 'headless.receiver.1', semantic_owner_epoch: 'runner.epoch.1',
+        execution_control_revision: 1, freshness: controlFreshness(1),
+      },
+      shell: { complete: false, ...shell },
+    });
+    cellDelta({
+      component_state: [], cell_latch: { latched: false, causes: [] }, io_signals: [],
+      run_readiness: { can_execute: true, can_resume: false, motion_clear: true, blocked_reasons: [] },
+    });
+    vi.advanceTimersByTime(HEADLESS_SHELL_PUBLICATION_MS);
+    expect(source.getCellState().readiness?.can_execute).toBe(true);
+    expect(source.getCellState().latch).toEqual({ latched: false, causes: [] });
+    cellDelta({ component_state: null, cell_latch: null, io_signals: null, run_readiness: null });
+    vi.advanceTimersByTime(HEADLESS_SHELL_PUBLICATION_MS);
+    expect(source.getCellState()).toEqual({ components: null, latch: null, io: null, readiness: null });
 
     const cycle = structuredClone(initial.program_cycle) as Record<string, unknown>;
     cycle.execution_control_revision = 2;
@@ -2243,8 +2321,9 @@ describe('HeadlessStateSource delivery scheduling', () => {
     expect(FakeWebSocket.instances).toHaveLength(3);
     expect(getHeadlessStateQualificationSnapshot().activeSockets).toBe(0);
     FakeWebSocket.instances[2]!.open();
+    // A reopened socket is not a recovered view; only its first sample is.
     expect(source.getExecutionObservationTransportStatus()).toMatchObject({
-      phase: 'waiting',
+      phase: 'reconnecting',
     });
     expect(getHeadlessStateQualificationSnapshot()).toEqual(
       expect.objectContaining({

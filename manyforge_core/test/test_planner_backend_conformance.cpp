@@ -47,8 +47,7 @@ ErrorDTO unsupported(std::string capability) {
 
 class DeterministicPlanner final : public IPlannerBackend {
  public:
-  PlannerCapabilityProfile capabilities{
-      true, true, true, true, true, true, true};
+  PlannerCapabilityProfile capabilities{true, true, true, true};
   bool corrupt_time = false;
   bool leak_private_joint_name = false;
   bool leak_private_ik_joint_name = false;
@@ -82,23 +81,6 @@ class DeterministicPlanner final : public IPlannerBackend {
     }();
     if (!capability.first) {
       return PlanResultDTO{std::nullopt, unsupported(capability.second), {}};
-    }
-    const auto profile = [&]() -> std::pair<bool, std::string> {
-      switch (request.planning_profile) {
-        case PlanningProfileDTO::kFirstFeasible:
-          return {capabilities.profile_first_feasible,
-                  "planning.profile.first_feasible"};
-        case PlanningProfileDTO::kBalanced:
-          return {capabilities.profile_balanced,
-                  "planning.profile.balanced"};
-        case PlanningProfileDTO::kQualityBounded:
-          return {capabilities.profile_quality_bounded,
-                  "planning.profile.quality_bounded"};
-      }
-      return {false, "planning.profile.unknown"};
-    }();
-    if (!profile.first) {
-      return PlanResultDTO{std::nullopt, unsupported(profile.second), {}};
     }
 
     if (request.move_id.value() == "cancel_in_flight") {
@@ -288,14 +270,13 @@ TEST(PlannerBackendConformance,
   DeterministicPlanner planner;
   const auto report = run_planner_backend_conformance(make_input(planner));
   EXPECT_TRUE(report.passed()) << report.summary();
-  EXPECT_EQ(report.completed_cases.size(), 12U);
+  EXPECT_EQ(report.completed_cases.size(), 6U);
 }
 
 TEST(PlannerBackendConformance,
      ExplicitUnsupportedCapabilitiesRemainConformantAndStructured) {
   DeterministicPlanner planner;
   planner.capabilities.cartesian_path = false;
-  planner.capabilities.profile_quality_bounded = false;
   planner.capabilities.single_shot_ik = false;
   auto input = make_input(planner);
   input.capabilities = planner.capabilities;

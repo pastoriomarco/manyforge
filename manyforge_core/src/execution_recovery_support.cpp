@@ -131,8 +131,6 @@ const char* recovery_class_name(RecoveryClass recovery_class) {
       return "none";
     case RecoveryClass::kRuntimeCollision:
       return "runtime_collision";
-    case RecoveryClass::kStopFaultIntervention:
-      return "stop_fault_intervention";
     case RecoveryClass::kFailedValidation:
       return "failed_validation";
     case RecoveryClass::kOrdinaryOperatorStop:
@@ -223,8 +221,6 @@ const char* motion_retry_ineligibility_reason_name(MotionRetryIneligibilityReaso
       return reason_codes::kRecoveryStopOwnerActive;
     case MotionRetryIneligibilityReason::kStrongerAuthorityActive:
       return reason_codes::kRecoveryStrongerAuthorityActive;
-    case MotionRetryIneligibilityReason::kQueuedLatchPresent:
-      return reason_codes::kRecoveryQueuedLatchPresent;
     case MotionRetryIneligibilityReason::kLatchPresent:
       return "latch_present";
     case MotionRetryIneligibilityReason::kStopNotSettled:
@@ -267,8 +263,7 @@ std::uint64_t RecoveryCertificateStore::publish(KernelStopCertificateDTO certifi
   // deterministic.
   const bool same_owner_session =
       current.has_value() && certificate.stop_owner_generation == current->stop_owner_generation &&
-      certificate.execution_id == current->execution_id &&
-      certificate.latch_id == current->latch_id;
+      certificate.execution_id == current->execution_id;
   if (!current.has_value() || certificate.stop_owner_generation > current->stop_owner_generation ||
       same_owner_session) {
     current = std::move(certificate);
@@ -279,7 +274,7 @@ std::uint64_t RecoveryCertificateStore::publish(KernelStopCertificateDTO certifi
 std::optional<std::uint64_t> RecoveryCertificateStore::publish_owner_session_progress(
     KernelStopCertificateDTO certificate) {
   const auto existing = find_authoritative(certificate.stop_owner, certificate.execution_id,
-                                           certificate.latch_id, certificate.stop_owner_generation);
+                                           certificate.stop_owner_generation);
   if (existing.has_value()) {
     const bool upgrading_to_success =
         existing->completion_result != StopCertificateOutcome::kSucceeded &&
@@ -297,13 +292,12 @@ std::optional<KernelStopCertificateDTO> RecoveryCertificateStore::authoritative(
 }
 
 std::optional<KernelStopCertificateDTO> RecoveryCertificateStore::find_authoritative(
-    StopOwnerKind kind, std::uint64_t execution_id, const std::string& latch_id,
-    std::uint64_t stop_owner_generation) const {
+    StopOwnerKind kind, std::uint64_t execution_id, std::uint64_t stop_owner_generation) const {
   const auto& current = authoritative_[owner_index(kind)];
   if (!current.has_value()) {
     return std::nullopt;
   }
-  if (current->execution_id != execution_id || current->latch_id != latch_id ||
+  if (current->execution_id != execution_id ||
       current->stop_owner_generation != stop_owner_generation) {
     return std::nullopt;
   }
@@ -433,17 +427,6 @@ void finish_assessment(KernelRecoveryAssessmentDTO& assessment, std::uint64_t pr
   assessment.assessment_revision = previous_revision + 1;
 }
 
-bool certificate_matches_latch(const KernelStopCertificateDTO& certificate,
-                               const RecoveryAuthorityCapture& capture) {
-  if (!capture.active_latch.has_value()) {
-    return false;
-  }
-  const auto& latch = *capture.active_latch;
-  const auto latch_execution = latch.active_execution_id.value_or(capture.execution_id);
-  return certificate.latch_id == latch.latch_id && certificate.execution_id == latch_execution &&
-         certificate.stop_owner_generation == capture.fault_preempt_owner_generation;
-}
-
 }  // namespace
 
 MotionRetryEligibilityDTO planning_retry_eligibility(const RecoveryAuthorityCapture& capture) {
@@ -483,10 +466,6 @@ MotionRetryEligibilityDTO planning_retry_eligibility(const RecoveryAuthorityCapt
       retry.reason = MotionRetryIneligibilityReason::kStopOwnerActive;
     } else if (capture.stronger_authority_active) {
       retry.reason = MotionRetryIneligibilityReason::kStrongerAuthorityActive;
-    } else if (capture.queued_latch_present) {
-      retry.reason = MotionRetryIneligibilityReason::kQueuedLatchPresent;
-    } else if (capture.active_latch.has_value()) {
-      retry.reason = MotionRetryIneligibilityReason::kLatchPresent;
     } else if (capture.failed_validation_retryable) {
       retry.eligible = true;
       retry.cause = MotionRetryCause::kPlanningNoEffect;
@@ -499,7 +478,6 @@ MotionRetryEligibilityDTO planning_retry_eligibility(const RecoveryAuthorityCapt
 }
 
 KernelRecoveryAssessmentDTO build_recovery_assessment(const RecoveryAuthorityCapture& capture,
-                                                      const RecoveryReadinessPolicy& policy,
                                                       std::uint64_t previous_revision) {
   KernelRecoveryAssessmentDTO assessment;
   assessment.assessed_at_ns = capture.captured_at_ns;
@@ -523,7 +501,6 @@ KernelRecoveryAssessmentDTO build_recovery_assessment(const RecoveryAuthorityCap
     assessment.observed_state_at_rest = capture.observed_state_qualified && observed.at_rest;
   }
   assessment.stronger_authority_active = capture.stronger_authority_active;
-  assessment.queued_latch_present = capture.queued_latch_present;
 
   // Containment evidence and the execution's failure are independent facts.
   const auto& addressed = capture.addressed_motion_stop_evidence;
@@ -544,141 +521,23 @@ KernelRecoveryAssessmentDTO build_recovery_assessment(const RecoveryAuthorityCap
       capture.operator_stop_active || capture.motion_trip_stop_active;
   assessment.stop_owner_active = any_stop_owner_active;
 
-  const auto require_qualified_observation = [&]() -> const char* {
-    if (!policy.require_measured_observation) {
-      return nullptr;
-    }
-    if (!capture.observed_state.has_value()) {
-      return reason_codes::kRecoveryObservedStateUnavailable;
-    }
-    if (!capture.observed_state->measured_authority ||
-        capture.observed_state->authority_profile.empty()) {
-      return reason_codes::kRecoveryObservedStateAuthorityNotMeasured;
-    }
-    if (!capture.observed_state_qualified) {
-      return capture.observed_state->at_rest ? reason_codes::kRecoveryObservedStateStale
-                                             : reason_codes::kRecoveryObservedStateNotAtRest;
-    }
-    return nullptr;
-  };
-
   const auto add_reset_action = [&]() {
     assessment.allowed_actions.push_back(RecoveryAction::kResetCycle);
   };
 
   switch (capture.execution_state) {
     case ExecutionState::kInterrupted: {
-      if (!capture.active_latch.has_value()) {
-        assessment.recovery_class = RecoveryClass::kUnknownFault;
-        assessment.status = RecoveryAssessmentStatus::kResetRequired;
-        assessment.reason_code = reason_codes::kRecoveryLatchMissing;
-        add_reset_action();
-        break;
-      }
-      const auto& latch = *capture.active_latch;
-      assessment.latch_id = latch.latch_id;
-      assessment.source_id = latch.source_id;
-      assessment.policy_id = latch.policy_id;
-      assessment.preemption_result = latch.preemption_result;
-      assessment.stop_owner_generation = capture.fault_preempt_owner_generation;
-      if (latch.source_id != kRuntimeCollisionFaultSourceId) {
-        assessment.recovery_class = RecoveryClass::kUnknownFault;
-        assessment.status = RecoveryAssessmentStatus::kResetRequired;
-        assessment.reason_code = reason_codes::kRecoveryLatchNotRetryable;
-        add_reset_action();
-        break;
-      }
-      assessment.recovery_class = RecoveryClass::kRuntimeCollision;
+      assessment.recovery_class = RecoveryClass::kUnknownFault;
+      assessment.status = RecoveryAssessmentStatus::kResetRequired;
+      assessment.reason_code = reason_codes::kRecoveryLatchMissing;
       add_reset_action();
-      if (capture.stronger_authority_active) {
-        assessment.status = RecoveryAssessmentStatus::kWaiting;
-        assessment.reason_code = reason_codes::kRecoveryStrongerAuthorityActive;
-        break;
-      }
-      if (latch.preemption_result == InterruptPreemptionResult::kPending) {
-        assessment.status = RecoveryAssessmentStatus::kWaiting;
-        assessment.reason_code = reason_codes::kRecoveryStopNotCertified;
-        break;
-      }
-      if (latch.preemption_result != InterruptPreemptionResult::kSucceeded) {
-        // Failed/partial preemption escalates through the fault-preempt
-        // worker; the latch is never retry-eligible, whether or not the
-        // stop owner is still active (retryable=false dominates).
-        assessment.status = RecoveryAssessmentStatus::kWaiting;
-        assessment.reason_code = reason_codes::kRecoveryStopFailedEscalating;
-        break;
-      }
-      if (capture.queued_latch_present) {
-        assessment.status = RecoveryAssessmentStatus::kWaiting;
-        assessment.reason_code = reason_codes::kRecoveryQueuedLatchPresent;
-        break;
-      }
-      if (capture.fault_preempt_stop_active || capture.fault_preempt_worker_active) {
-        assessment.status = RecoveryAssessmentStatus::kWaiting;
-        assessment.reason_code = reason_codes::kRecoveryStopNotCertified;
-        break;
-      }
-      const auto& certificate = capture.fault_preempt_certificate;
-      if (!certificate.has_value() ||
-          certificate->completion_result != StopCertificateOutcome::kSucceeded ||
-          !certificate_matches_latch(*certificate, capture)) {
-        assessment.status = RecoveryAssessmentStatus::kWaiting;
-        assessment.reason_code = reason_codes::kRecoveryStopNotCertified;
-        break;
-      }
-      assessment.stop_certificate_id = certificate->certificate_id;
-      assessment.stop_certificate_revision = certificate->certificate_revision;
-      assessment.backend_stop_confirmed = certificate->backend_stop_confirmed;
-      if (const char* observation_reason = require_qualified_observation()) {
-        assessment.status = RecoveryAssessmentStatus::kWaiting;
-        assessment.reason_code = observation_reason;
-        break;
-      }
-      assessment.status = RecoveryAssessmentStatus::kRetryReady;
-      assessment.retry_admissible = true;
-      assessment.allowed_actions.insert(assessment.allowed_actions.begin(),
-                                        RecoveryAction::kRetryMotionFromCurrentState);
-      assessment.reason_code = reason_codes::kRecoveryStopCertified;
-      assessment.evidence_refs.push_back(certificate->certificate_id);
       break;
     }
     case ExecutionState::kInterventionRequired: {
-      if (capture.active_latch.has_value()) {
-        assessment.latch_id = capture.active_latch->latch_id;
-        assessment.source_id = capture.active_latch->source_id;
-        assessment.preemption_result = capture.active_latch->preemption_result;
-      }
-      if (!capture.stop_fault_intervention_classified) {
-        assessment.recovery_class = RecoveryClass::kUnknownFault;
-        assessment.status = RecoveryAssessmentStatus::kResetRequired;
-        assessment.reason_code = reason_codes::kRecoveryLatchNotRetryable;
-        add_reset_action();
-        break;
-      }
-      assessment.recovery_class = RecoveryClass::kStopFaultIntervention;
+      assessment.recovery_class = RecoveryClass::kUnknownFault;
+      assessment.status = RecoveryAssessmentStatus::kResetRequired;
+      assessment.reason_code = reason_codes::kRecoveryLatchNotRetryable;
       add_reset_action();
-      if (any_stop_owner_active) {
-        // A still-active stop owner defers even the explicit choice.
-        assessment.status = RecoveryAssessmentStatus::kWaiting;
-        assessment.reason_code = reason_codes::kRecoveryStopOwnerActive;
-        break;
-      }
-      if (capture.stronger_authority_active || capture.queued_latch_present) {
-        assessment.status = RecoveryAssessmentStatus::kWaiting;
-        assessment.reason_code = capture.stronger_authority_active
-                                     ? reason_codes::kRecoveryStrongerAuthorityActive
-                                     : reason_codes::kRecoveryQueuedLatchPresent;
-        break;
-      }
-      if (const char* observation_reason = require_qualified_observation()) {
-        assessment.status = RecoveryAssessmentStatus::kWaiting;
-        assessment.reason_code = observation_reason;
-        break;
-      }
-      assessment.status = RecoveryAssessmentStatus::kActionRequired;
-      assessment.reason_code = reason_codes::kRecoveryInterventionChoiceRequired;
-      assessment.allowed_actions.insert(assessment.allowed_actions.begin(),
-                                        RecoveryAction::kAcknowledgeAndContinue);
       break;
     }
     case ExecutionState::kFailed: {
@@ -691,14 +550,11 @@ KernelRecoveryAssessmentDTO build_recovery_assessment(const RecoveryAuthorityCap
       }
       assessment.recovery_class = RecoveryClass::kFailedValidation;
       add_reset_action();
-      if (any_stop_owner_active || capture.stronger_authority_active ||
-          capture.queued_latch_present) {
+      if (any_stop_owner_active || capture.stronger_authority_active) {
         assessment.status = RecoveryAssessmentStatus::kWaiting;
         assessment.reason_code = any_stop_owner_active
                                      ? reason_codes::kRecoveryStopOwnerActive
-                                     : (capture.stronger_authority_active
-                                            ? reason_codes::kRecoveryStrongerAuthorityActive
-                                            : reason_codes::kRecoveryQueuedLatchPresent);
+                                     : reason_codes::kRecoveryStrongerAuthorityActive;
         break;
       }
       assessment.status = RecoveryAssessmentStatus::kRetryReady;
@@ -714,19 +570,11 @@ KernelRecoveryAssessmentDTO build_recovery_assessment(const RecoveryAuthorityCap
       add_reset_action();
       const auto& certificate = capture.operator_stop_certificate;
       const auto& addressed = capture.addressed_motion_stop_evidence;
-      if (any_stop_owner_active || capture.stronger_authority_active ||
-          capture.queued_latch_present) {
+      if (any_stop_owner_active || capture.stronger_authority_active) {
         assessment.status = RecoveryAssessmentStatus::kWaiting;
         assessment.reason_code = any_stop_owner_active
                                      ? reason_codes::kRecoveryStopOwnerActive
-                                     : (capture.stronger_authority_active
-                                            ? reason_codes::kRecoveryStrongerAuthorityActive
-                                            : reason_codes::kRecoveryQueuedLatchPresent);
-        break;
-      }
-      if (capture.active_latch.has_value()) {
-        assessment.status = RecoveryAssessmentStatus::kWaiting;
-        assessment.reason_code = reason_codes::kRecoveryLatchNotRetryable;
+                                     : reason_codes::kRecoveryStrongerAuthorityActive;
         break;
       }
       const bool local_certificate_valid =
@@ -788,8 +636,7 @@ KernelRecoveryAssessmentDTO build_recovery_assessment(const RecoveryAuthorityCap
   assessment.eligible_close = terminal && capture.execution_id != 0U &&
       capture.terminal_cleanup_complete &&
       capture.terminal_effect != ParticipantEffectKnowledge::kEffectUncertain &&
-      !any_stop_owner_active && !capture.stronger_authority_active &&
-      !capture.queued_latch_present && !capture.active_latch;
+      !any_stop_owner_active && !capture.stronger_authority_active;
   if (capture.execution_state == ExecutionState::kFailed && addressed_contained &&
       !assessment.retry_admissible && assessment.eligible_close) {
     assessment.status = RecoveryAssessmentStatus::kActionRequired;
@@ -813,7 +660,7 @@ bool recovery_assessment_semantically_differs(const KernelRecoveryAssessmentDTO&
          previous.execution_id != next.execution_id ||
          previous.execution_state != next.execution_state ||
          previous.recovery_class != next.recovery_class || previous.status != next.status ||
-         previous.latch_id != next.latch_id || previous.source_id != next.source_id ||
+         previous.source_id != next.source_id ||
          previous.policy_id != next.policy_id ||
          previous.preemption_result != next.preemption_result ||
          previous.stop_owner_active != next.stop_owner_active ||
@@ -828,7 +675,6 @@ bool recovery_assessment_semantically_differs(const KernelRecoveryAssessmentDTO&
          previous.observed_state_authority_profile != next.observed_state_authority_profile ||
          previous.observed_state_measured != next.observed_state_measured ||
          previous.stronger_authority_active != next.stronger_authority_active ||
-         previous.queued_latch_present != next.queued_latch_present ||
          previous.retry_admissible != next.retry_admissible ||
          previous.retry_eligibility != next.retry_eligibility ||
          previous.eligible_close != next.eligible_close ||
@@ -838,9 +684,9 @@ bool recovery_assessment_semantically_differs(const KernelRecoveryAssessmentDTO&
 
 RecoveryAssessmentPublication prepare_recovery_assessment_publication(
     const KernelRecoveryAssessmentDTO& previous, const RecoveryAuthorityCapture& capture,
-    const RecoveryReadinessPolicy& policy, std::string_view trigger) {
+    std::string_view trigger) {
   RecoveryAssessmentPublication publication;
-  publication.candidate = build_recovery_assessment(capture, policy, previous.assessment_revision);
+  publication.candidate = build_recovery_assessment(capture, previous.assessment_revision);
   publication.changed = recovery_assessment_semantically_differs(previous, publication.candidate);
   if (!publication.changed) {
     return publication;
@@ -860,10 +706,8 @@ RecoveryAssessmentPublication prepare_recovery_assessment_publication(
        motion_retry_ineligibility_reason_name(next.retry_eligibility.reason)},
       {"stop_certificate_id", next.stop_certificate_id},
       {"stop_certificate_revision", std::to_string(next.stop_certificate_revision)},
-      {"latch_id", next.latch_id},
       {"source_id", next.source_id},
       {"policy_id", next.policy_id},
-      {"queued_latch_present", next.queued_latch_present ? "true" : "false"},
       {"stronger_authority_active", next.stronger_authority_active ? "true" : "false"},
       {"trigger", std::string(trigger)},
   };
@@ -922,16 +766,8 @@ RecoveryAdmissionDecision evaluate_recovery_admission(
     decision.rejection_reason = reason_codes::kRecoveryStrongerAuthorityActive;
     return decision;
   }
-  if (assessment.queued_latch_present) {
-    decision.rejection_reason = reason_codes::kRecoveryQueuedLatchPresent;
-    return decision;
-  }
   if (request.expected_execution_id != assessment.execution_id) {
     decision.rejection_reason = reason_codes::kRecoveryExecutionChanged;
-    return decision;
-  }
-  if (request.expected_latch_id != assessment.latch_id) {
-    decision.rejection_reason = reason_codes::kRecoveryLatchChanged;
     return decision;
   }
   if (request.expected_stop_certificate_id != assessment.stop_certificate_id) {
@@ -965,9 +801,6 @@ ErrorDTO recovery_action_rejection_error(const KernelRecoveryActionRequestDTO& r
       {"recovery_class", recovery_class_name(assessment.recovery_class)},
       {"execution_state", to_string(assessment.execution_state)},
   };
-  if (!assessment.latch_id.empty()) {
-    error.details["latch_id"] = assessment.latch_id;
-  }
   if (!assessment.stop_certificate_id.empty()) {
     error.details["stop_certificate_id"] = assessment.stop_certificate_id;
   }

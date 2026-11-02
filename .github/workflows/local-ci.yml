@@ -1,14 +1,19 @@
 name: local-ci
 
+# Self-hosted (maintainer machines, label manyforge-local), so never on
+# pull_request: a public repository must not run fork code on them. Manual and
+# release tags only; it carries the full ROS integration and e2e suites.
 on:
-  pull_request:
-  push:
-    branches: [main, dev]
   workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
 
 concurrency:
-  group: local-ci-${{ github.repository }}-${{ github.ref }}
-  cancel-in-progress: false
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   docker-local:
@@ -43,11 +48,14 @@ jobs:
               # Runs inside the dev image already (this whole command executes
               # in manyforge-dev:latest), so take the direct in-container path.
               INSIDE_MANYFORGE_DEV_CONTAINER=1 ./scripts/ci/check-public-contracts-fresh.sh structural-rest
+          # Both source the ROS environment (cpp: headless leg's ROS host).
           - name: core-cpp
             suite: core-cpp
+            image: manyforge-ros-lyrical-full
             command: ./scripts/test-all.sh cpp
           - name: roboplan
             suite: roboplan
+            image: manyforge-ros-lyrical-full
             command: ./scripts/test-all.sh roboplan
           - name: python-composer
             suite: python-composer

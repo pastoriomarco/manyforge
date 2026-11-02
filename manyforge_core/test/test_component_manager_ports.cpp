@@ -164,10 +164,10 @@ static_assert(!ExposesGenericStop<IManagerKernelApplyFencePort>);
   };
 }
 
-[[nodiscard]] ProjectionNativeRuntimeBindingDTO NativeBinding(
+[[nodiscard]] ProjectionExecutionHostBindingDTO NativeBinding(
     const char* provider_binding_id = "provider-binding.planner",
     const char* runtime_unit_id = "runtime.planner") {
-  return ProjectionNativeRuntimeBindingDTO{
+  return ProjectionExecutionHostBindingDTO{
       CapabilityProviderBindingId{provider_binding_id},
       CapabilityProviderBindingRevision{kDigest},
       RuntimeUnitId{runtime_unit_id},
@@ -177,7 +177,7 @@ static_assert(!ExposesGenericStop<IManagerKernelApplyFencePort>);
 
 [[nodiscard]] ProjectionHealthDTO HealthyProjection(
     const ProjectionRevisionDTO& projection,
-    ProjectionNativeRuntimeBindingDTO binding = NativeBinding()) {
+    ProjectionExecutionHostBindingDTO binding = NativeBinding()) {
   return ProjectionHealthDTO{
       std::move(binding), 1U, ProjectionHealthState::kHealthy, projection,
       1U, ContentDigest{kDigest}, std::nullopt,
@@ -590,7 +590,7 @@ TEST(ComponentManagerPortContracts, AggregateBindingEqualityRejectsOmissionExtra
   EXPECT_FALSE(EqualCanonicalProjectionHealthBindings(expected, observed));
 
   observed = expected;
-  observed.native_projection_health.front().native_runtime_binding =
+  observed.native_projection_health.front().execution_host_binding =
       NativeBinding("provider-binding.aa", "runtime.aa");
   ASSERT_TRUE(observed.valid());
   EXPECT_FALSE(EqualCanonicalProjectionHealthBindings(expected, observed));
@@ -1038,7 +1038,7 @@ TEST(ComponentManagerPortContracts, FenceAcceptanceMatchesExactScopeAndSuccessor
   EXPECT_FALSE(accepted.matches(intent));
 }
 
-TEST(ComponentManagerPortContracts, FenceReleaseRequiresExactReconciledIdleCandidateState) {
+TEST(ComponentManagerPortContracts, FenceReleaseRequiresExactReconciledIdleState) {
   auto evidence = FenceReleaseEvidence();
   EXPECT_TRUE(evidence.valid());
   auto release = FenceReleaseRequest();
@@ -1049,8 +1049,19 @@ TEST(ComponentManagerPortContracts, FenceReleaseRequiresExactReconciledIdleCandi
   evidence = FenceReleaseEvidence();
   evidence.execution_host_epoch.publication_generation = ActiveBundlePublicationGeneration{3U};
   EXPECT_FALSE(evidence.valid());
+  // A domain with no active configuration (new to the cell) has no row.
   evidence = FenceReleaseEvidence();
   evidence.active_control_configurations.clear();
+  EXPECT_TRUE(evidence.valid());
+  evidence = FenceReleaseEvidence();
+  evidence.active_control_configurations.front().control_domain_id = ControlDomainId{"domain.foreign"};
+  EXPECT_FALSE(evidence.valid());
+  evidence = FenceReleaseEvidence();
+  evidence.active_control_configurations.push_back(evidence.active_control_configurations.front());
+  EXPECT_FALSE(evidence.valid());
+  evidence = FenceReleaseEvidence();
+  evidence.active_control_configurations.front().active_control_configuration_id =
+      ActiveControlConfigurationId{""};
   EXPECT_FALSE(evidence.valid());
   evidence = FenceReleaseEvidence();
   evidence.affected_active_operation_count = 1U;

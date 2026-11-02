@@ -4,14 +4,29 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import App from './App';
+import { api } from './api/client';
 import type { HealthResponse } from './types/api';
+import type { CellState, ComponentState } from './types/components';
 import { readStyleSource } from './styles/readStyleSource';
 
 const healthProjection = vi.hoisted(() => ({ value: null as HealthResponse | null }));
+const cellStateOverride = vi.hoisted(() => ({ value: null as CellState | null }));
+
+vi.mock('./hooks/useHeadlessState', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./hooks/useHeadlessState')>();
+  return {
+    ...actual,
+    useCellState: (...args: Parameters<typeof actual.useCellState>) => {
+      const state = actual.useCellState(...args);
+      return cellStateOverride.value ?? state;
+    },
+  };
+});
 
 vi.mock('./state/structuralResource', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./state/structuralResource')>();
-  const { api } = await import('./api/client');
+  // `api` is read at render time: importing './api/client' here would wait on
+  // this very mock (the client imports structuralResource) and never settle.
   return {
     ...actual,
     useStructuralResource: (...args: Parameters<typeof actual.useStructuralResource>) => {
@@ -23,7 +38,10 @@ vi.mock('./state/structuralResource', async (importOriginal) => {
   };
 });
 
-afterEach(() => { healthProjection.value = null; });
+afterEach(() => {
+  healthProjection.value = null;
+  cellStateOverride.value = null;
+});
 
 describe('Composer shell continuity', () => {
   it('shows only the backend-projected session notice in the existing warning rail', async () => {
@@ -41,7 +59,7 @@ describe('Composer shell continuity', () => {
       sessionId: 'a'.repeat(32),
       archiveRelativePath: `previous-sessions/${'a'.repeat(32)}`,
       shutdown: 'clean', effects: 'unknown', historyCoverage: 'not_imported',
-      journalFamilies: ['program_cycle', 'scene', 'manager', 'cclc', 'kernel_operation'],
+      journalFamilies: ['program_cycle', 'scene', 'manager', 'kernel_operation'],
       message: 'Session a: journals retained; motion effects unknown. Nothing was resumed.',
     } };
     const markup = renderToStaticMarkup(<App />);
@@ -68,9 +86,9 @@ describe('Composer shell continuity', () => {
       status: 'ok', mode: 'headless_client', components: {},
       runtimeAvailability: null, headless: null, timestamp: 1,
     };
-    const message = 'Startup project /p/cell.scenario was not opened: a Scenario is still applied. Close it, then Load.';
+    const message = 'Startup project /p/cell.scenario was not opened: a Scenario is still applied. Start a New Scenario, then Load.';
     healthProjection.value = { ...health, startupScenarioNotice: {
-      path: '/p/cell.scenario', code: 'scenario_close_required', message,
+      path: '/p/cell.scenario', code: 'scenario_new_required', message,
     } };
     const markup = renderToStaticMarkup(<App />);
     expect(markup).toContain('Startup project was not opened.');
@@ -81,7 +99,7 @@ describe('Composer shell continuity', () => {
     expect(renderToStaticMarkup(<App />)).not.toContain('Startup project was not opened.');
     // A restarted backend reports a new refusal: nothing earlier hides it.
     healthProjection.value = { ...health, startupScenarioNotice: {
-      path: '/p/cell.scenario', code: 'scenario_close_required', message,
+      path: '/p/cell.scenario', code: 'scenario_new_required', message,
     } };
     expect(renderToStaticMarkup(<App />)).toContain(message);
   });
@@ -124,6 +142,46 @@ describe('Composer shell continuity', () => {
     expect(markup).not.toContain('runtime-status-overlay');
     expect(markup.match(/role="separator"/g)).toHaveLength(3);
     expect(elapsedMs).toBeLessThan(2000);
+  });
+
+  it('tints the Components tab by the worst active component, with Deployment\'s classes', () => {
+    const state = (component_id: string, lifecycle: ComponentState['lifecycle'], values: Partial<ComponentState> = {}): ComponentState => ({
+      component_id, lifecycle, activity: 'idle', streams: [], capabilities: [], observed_at_ns: 1, ...values,
+    });
+    const cell = (components: ComponentState[], latched = false): CellState => ({
+      components,
+      latch: latched ? { latched: true, causes: [{ component_id: 'lite6_robot', kind: 'fault' }] } : { latched: false, causes: [] },
+      io: null,
+      readiness: null,
+    });
+    const healthy = [
+      state('lite6', 'prepared'),
+      state('lite6_robot', 'enabled', { owner_id: 'lite6', role: 'arm' }),
+      state('plc_io', 'enabled'),
+    ];
+    expect(renderToStaticMarkup(<App />)).toContain('class="components-status-button readiness-waiting"');
+    cellStateOverride.value = cell(healthy);
+    let markup = renderToStaticMarkup(<App />);
+    expect(markup).toContain('class="components-status-button readiness-ready"');
+    expect(markup).toContain('title="All active components ready"');
+    expect(markup).toContain('aria-label="Components · All active components ready"');
+    expect(markup).toContain('>Components</button>');
+    cellStateOverride.value = cell([...healthy.slice(0, 2), state('plc_io', 'prepared')]);
+    markup = renderToStaticMarkup(<App />);
+    expect(markup).toContain('class="components-status-button readiness-degraded"');
+    expect(markup).toContain('title="plc_io: Prepared"');
+    cellStateOverride.value = cell([healthy[0]!, state('lite6_robot', 'fault', {
+      owner_id: 'lite6',
+      fault: { code: 'fault_stream_stale', message: '', clearable: true, operator_action: 'recover', since_ns: 1 },
+    }), healthy[2]!], true);
+    markup = renderToStaticMarkup(<App />);
+    expect(markup).toContain('class="components-status-button readiness-fault"');
+    expect(markup).toContain('title="lite6_robot: Fault · Device stopped reporting"');
+    // One palette: the Components tab takes Deployment's tints, no colours of its own.
+    const shell = readStyleSource();
+    for (const readiness of ['ready', 'degraded', 'fault', 'waiting']) {
+      expect(shell).toContain(`.workspace-switcher .deployment-status-button.readiness-${readiness},\n.workspace-switcher .components-status-button.readiness-${readiness} {`);
+    }
   });
 
   it('keeps the canvas fixed and gives scrolling to bounded side surfaces', () => {
@@ -241,11 +299,11 @@ describe('Composer shell continuity', () => {
       appSource.indexOf('const openRuntimeAttention'),
     );
     expect(autoOpen).toContain('errorConditions.map');
-    expect(autoOpen).toContain('blockingAlarms(headlessSnapshot?.alarms)');
+    expect(autoOpen).toContain('errorAlarms(headlessSnapshot?.alarms)');
     expect(autoOpen).not.toMatch(/clientErrors|warning/i);
     expect(appSource).toContain('if (resetReachedIdle(previous, cycleStateNow)) setWarningClearEpoch(');
-    expect(appSource).toContain('if (closed !== null) setWarningClearEpoch(');
-    // The red row holds only conditions and blocking alarms.
+    expect(appSource).toContain("if (kind === 'new') setWarningClearEpoch(");
+    // The red row holds only conditions and error alarms.
     expect(appSource).not.toContain('clientErrors={clientErrors}');
   });
 

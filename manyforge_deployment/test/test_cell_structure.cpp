@@ -793,6 +793,8 @@ struct AttachmentSpec final {
   std::string child_interface;
   // B5: the primary tool among several on one parent interface.
   bool primary = false;
+  // Authored {child_link, parent_link} pairs that never touch.
+  std::vector<std::pair<std::string, std::string>> collision_exclusions{};
 };
 
 struct BindingSpec final {
@@ -959,6 +961,16 @@ struct BindingSpec final {
     };
     if (attachment.primary)
       attachment_row.emplace_back("primary", CanonicalValue(true));
+    if (!attachment.collision_exclusions.empty()) {
+      CanonicalValue::Array pairs;
+      for (const auto& [child_link, parent_link] : attachment.collision_exclusions) {
+        pairs.emplace_back(CanonicalValue::Object{
+            {"child_link", CanonicalValue(child_link)},
+            {"parent_link", CanonicalValue(parent_link)}});
+      }
+      attachment_row.emplace_back("collision_exclusions",
+                                  CanonicalValue(std::move(pairs)));
+    }
     attachment_rows.emplace_back(std::move(attachment_row));
   }
   CanonicalValue::Array domain_rows;
@@ -1827,6 +1839,100 @@ TEST(CellComposition, AttachmentMountDisablesCollisionsBetweenRigidGroups) {
   EXPECT_TRUE(compose_cell_occurrences(unmounted, sources, types)
                   .flattened_srdf()
                   .disabled_collisions.empty());
+}
+
+// MOUNT_COLLISION_EXCLUSIONS_PLAN: the attachment's authored pairs are
+// disabled next to the mount pairs with reason Never (a pair the mount
+// already disables stays Adjacent); a link missing from either model is a
+// typed refusal.
+TEST(CellComposition, AttachmentCollisionExclusionsDisableAuthoredPairs) {
+  auto arm_source = qualify_source_with_documents(
+      AssetSpec{.id = "split_arm_asset",
+                .frames = {{"base", "base_link"},
+                           {"flange", "flange_link"}},
+                .groups = {},
+                .bodies = {{"arm_collision", {"base_link", "link6"}}}},
+      "<robot name=\"split_arm\"><link name=\"base_link\"/>"
+      "<link name=\"link6\"/><link name=\"flange_link\"/>"
+      "<joint name=\"joint1\" type=\"revolute\">"
+      "<parent link=\"base_link\"/><child link=\"link6\"/>"
+      "<axis xyz=\"0 0 1\"/><limit lower=\"-3\" upper=\"3\" "
+      "effort=\"1\" velocity=\"1\"/></joint>"
+      "<joint name=\"flange_fix\" type=\"fixed\">"
+      "<parent link=\"link6\"/><child link=\"flange_link\"/></joint>"
+      "</robot>");
+  auto tool_source = qualify_source_with_documents(
+      AssetSpec{.id = "split_tool_asset",
+                .frames = {{"base", "mount_link"}},
+                .groups = {},
+                .resources = {},
+                .bodies = {{"tool_collision", {"finger", "tool_base"}}}},
+      "<robot name=\"split_tool\"><link name=\"mount_link\"/>"
+      "<link name=\"tool_base\"/><link name=\"finger\"/>"
+      "<joint name=\"tool_fix\" type=\"fixed\">"
+      "<parent link=\"mount_link\"/><child link=\"tool_base\"/></joint>"
+      "<joint name=\"finger_joint\" type=\"prismatic\">"
+      "<parent link=\"tool_base\"/><child link=\"finger\"/>"
+      "<axis xyz=\"1 0 0\"/><limit lower=\"0\" upper=\"0.04\" "
+      "effort=\"1\" velocity=\"1\"/></joint></robot>");
+  auto arm_type = qualify_type(
+      TypeSpec{.id = "split_arm_type",
+               .tags = {"articulated-arm"},
+               .with_interface = true,
+               .interface_frame = "flange",
+               .accepts_tags = {"tool"}});
+  auto tool_type = qualify_type(
+      TypeSpec{.id = "split_tool_type",
+               .tags = {"gripper", "tool"},
+               .root_frame = "base",
+               .with_interface = true,
+               .interface_id = "mount",
+               .interface_frame = "base",
+               .accepts_tags = {"articulated-arm"}});
+  const auto sources = source_values({&arm_source, &tool_source});
+  const auto types = type_values({&arm_type, &tool_type});
+  const auto compose =
+      [&](std::vector<std::pair<std::string, std::string>> pairs) {
+        return compose_cell_occurrences(
+            graph_for({{"arm_model", &arm_source, false},
+                       {"tool_model", &tool_source, false}},
+                      {{"arm", &arm_type, {{"body", "arm_model"}}, true},
+                       {"tool", &tool_type, {{"body", "tool_model"}}, false}},
+                      {{"tool_on_arm", "arm", "flange", "tool", "mount", false,
+                        std::move(pairs)}}),
+            sources, types);
+      };
+
+  // finger x base_link and finger x link6 are new (Never); tool_base x link6
+  // is already a mount pair and stays Adjacent.
+  const auto composed = compose({{"finger", "base_link"},
+                                 {"finger", "link6"},
+                                 {"tool_base", "link6"}});
+  const auto& rows = composed.flattened_srdf().disabled_collisions;
+  ASSERT_EQ(rows.size(), 6U);
+  const auto never = std::count_if(rows.begin(), rows.end(), [](const auto& row) {
+    return row.reason == std::optional<std::string>("Never");
+  });
+  EXPECT_EQ(never, 2);
+  EXPECT_EQ(compose({}).flattened_srdf().disabled_collisions.size(), 4U);
+
+  const auto refusal = [&](std::string child, std::string parent) {
+    try {
+      (void)compose({{std::move(child), std::move(parent)}});
+    } catch (const core::TypedError& error) {
+      return error.code() + ": " + error.what();
+    }
+    return std::string{};
+  };
+  const auto unknown_child = refusal("palm", "link6");
+  EXPECT_TRUE(unknown_child.starts_with("component_attachments: "));
+  EXPECT_NE(unknown_child.find("child link 'palm'"), std::string::npos);
+  EXPECT_NE(unknown_child.find("not on tool's model"), std::string::npos);
+  const auto unknown_parent = refusal("finger", "link5");
+  EXPECT_NE(unknown_parent.find("parent link 'link5'"), std::string::npos);
+  EXPECT_NE(unknown_parent.find("not on arm's model"), std::string::npos);
+  // A tool link named as the parent link is not on the arm's model.
+  EXPECT_NE(refusal("finger", "finger").find("parent link 'finger'"), std::string::npos);
 }
 
 // TCP-A: a descriptor offset frame and a Deployment custom TCP each compose

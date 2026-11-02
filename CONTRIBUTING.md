@@ -34,6 +34,30 @@ or document their disposition, and meet applicable CI requirements before merge.
 Any temporary maintainer-only exception is defined in the development workflow,
 not by an old public recipe.
 
+## CI tiers
+
+GitHub Actions runs in two tiers. Superseded runs on the same ref are cancelled.
+
+- **Fast tier**, on every pull request and push to `dev`/`main`, with path
+  filters so unrelated changes skip jobs, about 10–12 min per job:
+  `bash-syntax`, `version-sync`, `private-spec-boundary`, `generated-checks`
+  (error catalog, `scripts/regen.py --check`), `frontend-build`
+  (`tsc -b --force`, vitest, bundle), `python-tests` (one parallel job per
+  package, `pytest -n auto` where tests are independent) and `cpp-unit`
+  (ROS-free C++ packages, Release; `manyforge_core` is built once and its
+  tests run in four shards). `python-tests` and `cpp-unit` also run nightly on
+  `dev`, which keeps their compiler cache warm for pushes and pull requests.
+- **Heavy tier**, nightly on `dev`, on release tags `v*` and on demand:
+  `cpp-asan`, `cpp-tsan`, `cpp-stability-gate` and `python-nightly` (I2
+  compiler bindings and the Python tests marked `@pytest.mark.slow`). Mark a
+  test `slow` to move it from pull requests to the nightly run; every test
+  still runs somewhere. Start a heavy workflow by hand with
+  `gh workflow run <name>.yml --ref dev` or from the Actions tab.
+- **`local-ci`** runs every lane, including the ROS integration and e2e
+  suites, in the development containers on a self-hosted runner labelled
+  `manyforge-local`. It starts on release tags and on demand only, never on
+  pull requests.
+
 ## Agent authorization
 
 Agents must read [AGENTS.md](AGENTS.md). A code-change request does not authorize
@@ -42,11 +66,22 @@ Never push directly to `main`.
 
 ## Releases
 
-Releases are maintainer-driven: update the root `VERSION` and changelog,
-validate package-version consistency and applicable gates, squash-merge
-`dev` into `main`, then tag. Agents must not perform release actions without
-explicit authorization. `scripts/ci/verify-version-sync.sh` checks the
-root version against package versions.
+Releases are maintainer-driven. Agents must not perform release actions
+without explicit authorization.
+
+1. Set the root `VERSION` and every package version;
+   `scripts/ci/verify-version-sync.sh` must pass. Regenerate the committed
+   outputs (`python3 scripts/regen.py --update`, then `--check`).
+2. Give the release its section in `CHANGELOG.md` (version and date).
+3. Check the companion pins: the xArm driver fork commit
+   (`XARM_SOURCE_COMMIT` in `Dockerfile.ros-lyrical-full`, the same commit in
+   `manyforge_xarm_control/vendor/driver.yaml`) is on the fork's
+   `lyrical-no-gazebo` branch. For `v0.2.0`:
+   `46aa1147d99963a8357b89744633db428746667b`.
+4. Run the applicable gates, squash-merge `dev` into `main` and tag
+   `vX.Y.Z` (for this release `v0.2.0`; `v0.1.0` is `main` at `8ae05265`).
+5. Tag the maintainer's private specification repository with the same `vX.Y.Z`
+   at the commit that matches the release.
 
 ## Reporting issues
 

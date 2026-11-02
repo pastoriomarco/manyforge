@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
+#include <string_view>
 #include <manyforge_core/types/typed_error.hpp>
 #include <manyforge_deployment/global_io_rule_qualification.hpp>
 #include <manyforge_deployment/prepared_activation_repository.hpp>
@@ -64,28 +65,31 @@ V rule(V scope = V("all_motion"), bool signal = false) {
            : parse(
                  R"({"compare":{"operand":{"key":"ready"},"op":"==","value":false}})")},
       {"scope", std::move(scope)},
-      {"priority", V(0.0)}});
+      {"priority", V(0.0)},
+      {"on_trip", V("stop")},
+      {"after_stop", V("hold")},
+      {"active_at_start", V(false)}});
+}
+V without(const V &root, std::string_view name) {
+  auto object = root.as_object();
+  std::erase_if(object, [&](const auto &field) { return field.first == name; });
+  return V(std::move(object));
 }
 V groups(std::string name) {
   return V(V::Object{{"execution_groups", V(V::Array{V(std::move(name))})}});
 }
 V configuration(V selected_rule) {
   return V(V::Object{
-      {"interrupt_sources", V(V::Array{})},
-      {"interrupt_policies", V(V::Array{})},
-      {"interrupt_rules", V(V::Array{std::move(selected_rule)})},
-      {"interrupt_config",
-       parse(
-           R"({"queue_depth":8,"cancel_validation_timeout_ns":1000,"motion_scope_arm_timeout_ns":1000,"supervisory_poll_rate_hz":10})")}});
+      {"interrupt_rules", V(V::Array{std::move(selected_rule)})}});
 }
 auto logical_arm(const std::filesystem::path &root, const V &config) {
   return d::test::materialize_lite6_retained_consumer_fixture_from(
       root, d::test::make_lite6_controllable_retention_fixture(
-                false, false, 1U, false, true, {}, false, true, "resource",
-                true, {}, {}, true, false, false, std::nullopt, false,
+                false, false, 1U, {}, false, true, "resource",
+                true, {}, {}, false, false, std::nullopt,
                 d::test::kLite6ArmTargetId, std::nullopt, std::nullopt, {}, true,
                 {}, "manyforge.provider.ros2_control", false, true,
-                nullptr, nullptr, true, false, "pneumatic", std::nullopt,
+                nullptr, nullptr, true, "pneumatic", std::nullopt,
                 "commanded", nullptr, &config));
 }
 auto arm(const std::filesystem::path &root, const V &config) {
@@ -96,7 +100,7 @@ TEST(RetainedTcpInventoryTest, MountedToolIsMarkedElsewhereFromTheOtherRobot) {
   Root root;
   const auto product = d::test::MaterializeMaintainedInterruptDeployment(
       root.path, parse(R"({"interrupt_rules":[]})"),
-      "examples/ur5e_lite6_wall_grouped.scenario");
+      "examples/mock_dual_arm_shared_group.scenario");
   ASSERT_TRUE(product.bundle);
   ASSERT_TRUE(product.model_map);
   const c::ControllableComponentId lite6("lite6_robot");
@@ -130,6 +134,28 @@ TEST(RetainedTcpInventoryTest, MountedToolIsMarkedElsewhereFromTheOtherRobot) {
   EXPECT_FALSE(elsewhere->mounted_here);
   EXPECT_TRUE(elsewhere->mounted_elsewhere);
   EXPECT_EQ(elsewhere->binding.frame, carried->binding.frame);
+}
+
+// MOUNT_COLLISION_EXCLUSIONS_PLAN: the maintained Lite 6 example's mount
+// pairs compile sorted onto the graph edge and compose (every link exists).
+TEST(MountCollisionExclusionsTest, MaintainedLite6MountCarriesItsSortedPairs) {
+  Root root;
+  const auto product = d::test::MaterializeMaintainedInterruptDeployment(
+      root.path, parse(R"({"interrupt_rules":[]})"));
+  ASSERT_TRUE(product.bundle);
+  const auto &edges = product.bundle->value().cell_graph.component_attachments;
+  ASSERT_EQ(edges.size(), 1U);
+  using Pair = c::ComponentAttachmentCollisionExclusionDTO;
+  EXPECT_EQ(edges.front().collision_exclusions,
+            (std::vector<Pair>{{"lite_gripper_base_link", "link5"},
+                               {"lite_gripper_left_finger", "link4"},
+                               {"lite_gripper_left_finger", "link5"},
+                               {"lite_gripper_left_finger", "link6"},
+                               {"lite_gripper_left_finger", "link_eef"},
+                               {"lite_gripper_right_finger", "link4"},
+                               {"lite_gripper_right_finger", "link5"},
+                               {"lite_gripper_right_finger", "link6"},
+                               {"lite_gripper_right_finger", "link_eef"}}));
 }
 
 TEST(RetainedTcpInventoryTest, IncludesRealUnmountedToolWithoutCarryingIt) {
@@ -198,7 +224,7 @@ V program_root(const d::RetainedBundle &bundle, bool motion, bool key = true) {
     V::Array capabilities;
     for (const auto *id :
          {"execution.feedback.phase_events", "execution.trajectory.execute",
-          "planning.motion.pose_goal", "planning.profile.balanced",
+          "planning.motion.pose_goal",
           "planning.trajectory.time_parameterized", "state.observed.current",
           "validation.trajectory.non_collision"})
       capabilities.emplace_back(V::Object{{"capability_id", V(id)},
@@ -270,6 +296,8 @@ void add_second_pneumatic_valve(V::Object &document) {
   auto rows = components->second.as_array();
   for (auto &component : rows) {
     const auto id = component.find_object_member("component_id")->as_string();
+    // Machine owner and inactive member rows carry no runtime configuration.
+    if (id != "lite_gripper" && id != "gripper_io") continue;
     auto configuration = *component.find_object_member("configuration");
     auto runtime = *configuration.find_object_member("runtime_configuration");
     if (id == "lite_gripper") {
@@ -288,7 +316,7 @@ void add_second_pneumatic_valve(V::Object &document) {
           "resource_role_id":"valve_other","signal_name":"valve_other",
           "source_id":"gripper_io.valve_other","value_type":"bool"})"));
       runtime = replace(runtime, "io_signals", V(std::move(signals)));
-    } else continue;
+    }
     configuration = replace(configuration, "runtime_configuration", std::move(runtime));
     component = replace(component, "configuration", std::move(configuration));
   }
@@ -298,7 +326,7 @@ void add_second_pneumatic_valve(V::Object &document) {
 TEST(RetainedIoPolicyCompilerTest, PneumaticMappedSignalsCompileAndReloadAcrossComponents) {
   Root root;
   const auto product = d::test::MaterializeMaintainedInterruptDeployment(
-      root.path, parse(R"({"interrupt_rules":[]})"), "examples/lite6_pneumatic_mock.scenario");
+      root.path, parse(R"({"interrupt_rules":[]})"), "examples/mock_lite6_pneumatic_pick_and_place.scenario");
   ASSERT_TRUE(product.model_map);
   const auto fixture = d::test::compile_pneumatic_program_fixture(root.path, product, 2U);
   const auto &targets = fixture.binding->value().target_role_bindings;
@@ -332,7 +360,7 @@ TEST(RetainedIoPolicyCompilerTest, PneumaticMappedSignalsCompileAndReloadAcrossC
 TEST(RetainedIoPolicyCompilerTest, PneumaticOutputReusesOneAuthoredTargetAndRefusesAmbiguity) {
   Root root;
   const auto product = d::test::MaterializeMaintainedInterruptDeployment(
-      root.path, parse(R"({"interrupt_rules":[]})"), "examples/lite6_pneumatic_mock.scenario");
+      root.path, parse(R"({"interrupt_rules":[]})"), "examples/mock_lite6_pneumatic_pick_and_place.scenario");
   const auto fixture = d::test::compile_pneumatic_program_fixture(root.path, product, 1U, 1U);
   const auto &targets = fixture.binding->value().target_role_bindings;
   const auto gripper = std::find_if(targets.begin(), targets.end(),
@@ -355,7 +383,7 @@ TEST(RetainedIoPolicyCompilerTest, PneumaticMappedCoincidentPresetsFailAtActivat
   Root root;
   try {
     (void)d::test::MaterializeMaintainedInterruptDeployment(
-        root.path, parse(R"({"interrupt_rules":[]})"), "examples/lite6_pneumatic_mock.scenario",
+        root.path, parse(R"({"interrupt_rules":[]})"), "examples/mock_lite6_pneumatic_pick_and_place.scenario",
         coincident_gripper_presets);
     FAIL() << "coincident mapped presets must be refused";
   } catch (const c::TypedError &error) {
@@ -370,7 +398,7 @@ TEST(RetainedIoPolicyCompilerTest, PneumaticMappedCoincidentPresetsFailAtActivat
 TEST(RetainedIoPolicyCompilerTest, PneumaticReloadRejectsTwoAliasesForOnePhysicalValve) {
   Root root;
   const auto product = d::test::MaterializeMaintainedInterruptDeployment(
-      root.path, parse(R"({"interrupt_rules":[]})"), "examples/lite6_pneumatic_mock.scenario",
+      root.path, parse(R"({"interrupt_rules":[]})"), "examples/mock_lite6_pneumatic_pick_and_place.scenario",
       add_second_pneumatic_valve);
   const auto fixture = d::test::compile_pneumatic_program_fixture(root.path, product);
   auto forged = fixture.binding->value();
@@ -421,75 +449,87 @@ TEST(RetainedIoPolicyCompilerTest,
 }
 
 TEST(RetainedIoPolicyCompilerTest,
-     GlobalOnTripDefaultsToGateAndSealsExplicitFullStopWithoutRun) {
-  Root default_root, gate_root, full_root;
-  auto default_rules = V(V::Array{rule(V("all_motion"), true)});
-  auto gate_rules = V(V::Array{
-      replace(rule(V("all_motion"), true), "on_trip", V("gate"))});
-  auto full_rules = V(V::Array{replace(
-      replace(rule(V("all_motion"), true), "on_trip", V("full_stop")),
-      "idle_behaviour", V("ignore"))});
+     GlobalRuleCompilesContractFieldsWithCompilerDefaults) {
+  Root default_root, explicit_root, failing_root;
+  // CONTRACTS §8: on_trip is required; after_stop defaults to hold (stop
+  // only) and active_at_start to false.
+  {
+    Root missing_root;
+    auto missing = V(V::Array{without(rule(V("all_motion"), true), "on_trip")});
+    EXPECT_THROW(d::test::materialize_boolean_io_retained_fixture(
+                     missing_root.path, true, false, false, false, false, &missing),
+                 std::exception);
+  }
+  auto default_rules = V(V::Array{without(
+      without(rule(V("all_motion"), true), "after_stop"), "active_at_start")});
+  auto explicit_rules = V(V::Array{rule(V("all_motion"), true)});
+  auto failing_rules = V(V::Array{replace(
+      replace(rule(V("all_motion"), true), "after_stop", V("fail_node")),
+      "active_at_start", V(true))});
   const auto defaults = d::test::materialize_boolean_io_retained_fixture(
       default_root.path, true, false, false, false, false, &default_rules);
-  const auto explicit_gate = d::test::materialize_boolean_io_retained_fixture(
-      gate_root.path, true, false, false, false, false, &gate_rules);
-  const auto full = d::test::materialize_boolean_io_retained_fixture(
-      full_root.path, true, false, false, false, false, &full_rules);
+  const auto explicit_stop = d::test::materialize_boolean_io_retained_fixture(
+      explicit_root.path, true, false, false, false, false, &explicit_rules);
+  const auto failing = d::test::materialize_boolean_io_retained_fixture(
+      failing_root.path, true, false, false, false, false, &failing_rules);
   EXPECT_EQ(defaults.bundle->canonical_bytes(),
-            explicit_gate.bundle->canonical_bytes());
-  EXPECT_NE(defaults.bundle->canonical_bytes(), full.bundle->canonical_bytes());
+            explicit_stop.bundle->canonical_bytes());
+  EXPECT_NE(defaults.bundle->canonical_bytes(),
+            failing.bundle->canonical_bytes());
   const auto *configuration =
       defaults.bundle->normalized_root().find_object_member(
           "interrupt_policy_configuration");
   ASSERT_NE(configuration, nullptr);
+  ASSERT_EQ(configuration->as_object().size(), 1U);
   const auto *sealed_rules =
       configuration->find_object_member("interrupt_rules");
   ASSERT_NE(sealed_rules, nullptr);
   ASSERT_EQ(sealed_rules->as_array().size(), 1U);
-  const auto *on_trip =
-      sealed_rules->as_array().front().find_object_member("on_trip");
-  ASSERT_NE(on_trip, nullptr);
-  EXPECT_EQ(on_trip->as_string(), "gate");
+  const auto &sealed = sealed_rules->as_array().front();
+  EXPECT_EQ(sealed.find_object_member("on_trip")->as_string(), "stop");
+  EXPECT_EQ(sealed.find_object_member("after_stop")->as_string(), "hold");
+  EXPECT_FALSE(sealed.find_object_member("active_at_start")->as_bool());
   const auto reloaded = d::detail::RetainedBundleReloadAuthority::reload(
-      full.bundle->canonical_bytes());
+      failing.bundle->canonical_bytes());
   ASSERT_NE(reloaded, nullptr);
-  const auto gate_compiled =
+  const auto stop_compiled =
       d::compile_retained_io_policies(nullptr, nullptr, *defaults.bundle);
-  const auto full_compiled =
+  const auto failing_compiled =
       d::compile_retained_io_policies(nullptr, nullptr, *reloaded);
-  ASSERT_TRUE(gate_compiled.ok()) << gate_compiled.error().message;
-  ASSERT_TRUE(full_compiled.ok()) << full_compiled.error().message;
-  ASSERT_EQ(gate_compiled.value().activation_policies.size(), 1U);
-  ASSERT_EQ(full_compiled.value().activation_policies.size(), 1U);
-  // gate: scoped Stop, always latched while true, released when it clears.
-  const auto &gate = gate_compiled.value().activation_policies.front();
-  EXPECT_FALSE(gate.full_stop_on_trip);
-  EXPECT_EQ(gate.idle_behaviour, c::IoRuleIdleBehaviourDTO::kLatch);
-  EXPECT_EQ(gate.post_latch_disposition,
-            c::InterruptPostLatchDisposition::kAutoClearOnSignalRelease);
-  // full_stop: cell Full Stop, authored idle behaviour, operator release.
-  const auto &full_stop = full_compiled.value().activation_policies.front();
-  EXPECT_TRUE(full_stop.full_stop_on_trip);
-  EXPECT_EQ(full_stop.idle_behaviour, c::IoRuleIdleBehaviourDTO::kIgnore);
-  EXPECT_EQ(full_stop.post_latch_disposition,
-            c::InterruptPostLatchDisposition::kAwaitOperatorAck);
+  ASSERT_TRUE(stop_compiled.ok()) << stop_compiled.error().message;
+  ASSERT_TRUE(failing_compiled.ok()) << failing_compiled.error().message;
+  ASSERT_EQ(stop_compiled.value().activation_policies.size(), 1U);
+  ASSERT_EQ(failing_compiled.value().activation_policies.size(), 1U);
+  const auto &stop = stop_compiled.value().activation_policies.front();
+  EXPECT_EQ(stop.on_trip, c::IoRuleOnTripDTO::kStop);
+  EXPECT_EQ(stop.after_stop, c::IoRuleAfterStopDTO::kHold);
+  EXPECT_FALSE(stop.active_at_start);
+  const auto &fail_node = failing_compiled.value().activation_policies.front();
+  EXPECT_EQ(fail_node.on_trip, c::IoRuleOnTripDTO::kStop);
+  EXPECT_EQ(fail_node.after_stop, c::IoRuleAfterStopDTO::kFailNode);
+  EXPECT_TRUE(fail_node.active_at_start);
 }
-
-TEST(RetainedIoPolicyCompilerTest, GlobalNotifyCompilesWithoutStopOrIdleLatch) {
+TEST(RetainedIoPolicyCompilerTest, GlobalNotifyCompilesWithoutAfterStop) {
   Root root;
-  auto rules = V(V::Array{
-      replace(rule(V("all_motion"), true), "on_trip", V("notify"))});
+  auto rules = V(V::Array{replace(
+      replace(without(rule(V("all_motion"), true), "after_stop"), "on_trip",
+              V("notify")),
+      "active_at_start", V(true))});
   const auto retained = d::test::materialize_boolean_io_retained_fixture(
       root.path, true, false, false, false, false, &rules);
+  const auto *sealed = retained.bundle->normalized_root()
+                           .find_object_member("interrupt_policy_configuration")
+                           ->find_object_member("interrupt_rules");
+  EXPECT_EQ(sealed->as_array().front().find_object_member("after_stop"),
+            nullptr);
   const auto compiled = d::compile_retained_io_policies(nullptr, nullptr, *retained.bundle);
   ASSERT_TRUE(compiled.ok()) << compiled.error().message;
   ASSERT_EQ(compiled.value().activation_policies.size(), 1U);
   const auto &notify = compiled.value().activation_policies.front();
-  EXPECT_TRUE(notify.notify_on_trip);
-  EXPECT_FALSE(notify.full_stop_on_trip);
-  EXPECT_FALSE(notify.idle_behaviour);
+  EXPECT_EQ(notify.on_trip, c::IoRuleOnTripDTO::kNotify);
+  EXPECT_TRUE(notify.active_at_start);
+  EXPECT_FALSE(notify.stop_entry_stage_id);
 }
-
 TEST(RetainedIoPolicyCompilerTest,
      ActualSelectedProgramTypesKeysAndProspectiveSystemDeclarations) {
   Root root;
@@ -748,12 +788,18 @@ TEST(RetainedIoPolicyCompilerTest,
         replace(rule(V("all_motion"), true), "on_trip", V("program_reset")),
         replace(rule(V("all_motion"), true), "on_trip", V(true)),
         replace(rule(V("all_motion"), true), "on_trip", V(nullptr)),
-        // latch_release is folded into on_trip and no longer accepted.
+        // on_trip is required (after_stop and active_at_start default).
+        without(rule(V("all_motion"), true), "on_trip"),
         replace(rule(V("all_motion"), true), "latch_release", V("operator")),
-        // Only full_stop has an idle behaviour (gate always gates).
+        // CONTRACTS §8: gate, full_stop and idle_behaviour are gone.
+        replace(rule(V("all_motion"), true), "on_trip", V("gate")),
+        replace(rule(V("all_motion"), true), "on_trip", V("full_stop")),
         replace(rule(V("all_motion"), true), "idle_behaviour", V("latch")),
-        replace(replace(rule(V("all_motion"), true), "on_trip", V("gate")),
-                "idle_behaviour", V("ignore")),
+        // after_stop belongs to on_trip stop only.
+        replace(replace(rule(V("all_motion"), true), "on_trip", V("notify")),
+                "after_stop", V("hold")),
+        replace(rule(V("all_motion"), true), "after_stop", V("resume")),
+        replace(rule(V("all_motion"), true), "active_at_start", V("yes")),
         replace(rule(V("all_motion"), true), "post_latch_disposition",
                 V("await_recovery_handler")),
         replace(rule(V("all_motion"), true), "scope",
@@ -770,22 +816,6 @@ TEST(RetainedIoPolicyCompilerTest,
   EXPECT_THROW(d::test::materialize_boolean_io_retained_fixture(
                    root.path, true, false, false, false, false, &duplicate),
                std::exception);
-}
-
-TEST(RetainedIoPolicyCompilerTest,
-     NonemptyLegacyStaticCarrierIsRefusedWithoutMigration) {
-  Root root;
-  const auto legacy = parse(
-      R"({"interrupt_sources":[],"interrupt_policies":[{"policy_id":"old","condition":{"compare":{"operand":{"key":"ready"},"op":"==","value":false}},"controllable_component_ids":["lite6_arm"],"command_target_ids":["arm"],"control_domain_ids":["lite6_arm_domain"],"control_binding_ids":["lite6_arm_binding"],"resource_ids":[],"affected_phases":["executing"],"preemption_action":"latch_faulted","post_latch_disposition":"fault_terminal","scope_kind":"static"}],"interrupt_config":{"queue_depth":8,"cancel_validation_timeout_ns":1000,"motion_scope_arm_timeout_ns":1000,"supervisory_poll_rate_hz":10}})");
-  try {
-    static_cast<void>(logical_arm(root.path, legacy));
-    FAIL() << "legacy policy was migrated or admitted";
-  } catch (const std::exception &error) {
-    EXPECT_NE(std::string(error.what())
-                  .find("legacy_interrupt_policy_runtime_unsupported"),
-              std::string::npos)
-        << error.what();
-  }
 }
 
 TEST(RetainedIoPolicyCompilerTest,
@@ -1148,7 +1178,7 @@ TEST(RetainedIoPolicyCompilerTest,
   Root root;
   const auto fixture = d::test::MaterializeMaintainedInterruptDeployment(
       root.path, parse(R"({"interrupt_rules":[]})"),
-      "examples/r5_trial_e_signal.scenario");
+      "examples/mock_lite6_signal_moves.scenario");
   const auto &bundle = *fixture.bundle;
   ASSERT_TRUE(fixture.model_map.has_value());
   EXPECT_TRUE(std::none_of(fixture.model_map->control_bindings().begin(),
@@ -1171,7 +1201,7 @@ TEST(RetainedIoPolicyCompilerTest,
       d::parse_strict_json_model_yaml(
           d::test::maintained_activation_fixture_detail::Read(
               std::filesystem::path(MANYFORGE_WORKSPACE_ROOT) /
-              "examples/r5_trial_e_signal.scenario/program.yaml"))
+              "examples/mock_lite6_signal_moves.scenario/program.yaml"))
           .root();
   V::Array children;
   for (const auto &node : scenario.find_object_member("forest")

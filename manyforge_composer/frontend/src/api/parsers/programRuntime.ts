@@ -31,6 +31,7 @@ import type {
 } from '../../types/api';
 import type { RuntimeScaleControlAccepted, RuntimeScaleControlStatus, ProgramRunAdmittedSpeeds } from '../../types/robotControl';
 import type { JsonObject } from './shared';
+import { parseProgramRunEnd } from './components';
 import {
   allowedKeysAt,
   arrayAt,
@@ -57,7 +58,7 @@ import {
 
 export function parseProgramCycleStatus(value: unknown): ProgramCycleStatus {
   const record = objectAt(value, 'programCycleStatus');
-  exactKeysAt(record, [
+  allowedKeysAt(record, [
     'program_runner_owner_epoch', 'cycle_generation', 'state', 'program_run_id',
     'cycle_claim_generation', 'terminal_or_settlement_reference',
     'run_revision', 'node_status_revision',
@@ -65,7 +66,7 @@ export function parseProgramCycleStatus(value: unknown): ProgramCycleStatus {
     'execution_control_revision', 'causal_correlation_id',
     'causal_session_id', 'causal_client_sequence', 'current_command_kind',
     'failure', 'reset_phase', 'reset_options', 'reset_robot_position', 'allowed_commands',
-  ], 'programCycleStatus');
+  ], ['run_end'], 'programCycleStatus');
   const state = stringAt(record.state, 'programCycleStatus.state');
   if (!['idle_after_reset', 'starting', 'running', 'stopping',
     'resetting', 'terminal_awaiting_reset', 'recovery_required'].includes(state)) {
@@ -136,6 +137,10 @@ export function parseProgramCycleStatus(value: unknown): ProgramCycleStatus {
     failure: record.failure === null
       ? null
       : jsonRecordAt(record.failure, 'programCycleStatus.failure'),
+    ...(record.run_end === undefined ? {} : {
+      runEnd: record.run_end === null
+        ? null : parseProgramRunEnd(record.run_end, 'programCycleStatus.run_end'),
+    }),
     resetPhase: nullableStringAt(
       record.reset_phase,
       'programCycleStatus.reset_phase',
@@ -145,13 +150,10 @@ export function parseProgramCycleStatus(value: unknown): ProgramCycleStatus {
       : (() => {
         const path = 'programCycleStatus.reset_options';
         const options = objectAt(record.reset_options, path);
-        const keep = Object.hasOwn(options, 'keep_stop_fault');
-        exactKeysAt(options, keep ? ['reload_initial_scene', 'reset_robot_position', 'keep_stop_fault']
-          : ['reload_initial_scene', 'reset_robot_position'], path);
+        exactKeysAt(options, ['reload_initial_scene', 'reset_robot_position'], path);
         return {
           reloadInitialScene: booleanAt(options.reload_initial_scene, `${path}.reload_initial_scene`),
           resetRobotPosition: booleanAt(options.reset_robot_position, `${path}.reset_robot_position`),
-          ...(keep ? { keepStopFault: booleanAt(options.keep_stop_fault, `${path}.keep_stop_fault`) } : {}),
         };
       })(),
     resetRobotPosition: (() => {
@@ -283,7 +285,9 @@ const FAILURE_DETAIL_KEYS: ReadonlySet<string> = new Set([
   // Node input failures.
   'input_problem', 'path', 'source_kind', 'source_reference',
   // Required ErrorDTO details a run may surface.
-  'latch_id', 'retryable', 'required_action',
+  'retryable', 'required_action',
+  // Run end and readiness ids (CONTRACTS §9, §10).
+  'rule_id', 'component_id',
 ]);
 
 const FAILURE_DETAIL_MAX_ENTRIES = 16;
@@ -542,7 +546,7 @@ function programOperationFailuresAt(value: unknown, path: string): ProgramRunSta
 export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
   const path = 'programRun';
   const record = objectAt(value, path);
-  exactKeysAt(
+  allowedKeysAt(
     record,
     [
       'active_operation_count',
@@ -561,6 +565,8 @@ export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
       'state',
       'tree_status',
     ],
+    // CONTRACTS §9: why the run ended, once it has.
+    ['run_end'],
     path,
   );
   const schemaVersion = stringAt(record.schema_version, `${path}.schema_version`);
@@ -737,6 +743,8 @@ export function parseProgramRunStatus(value: unknown): ProgramRunStatus {
       ? null
       : { code: reasonCode, message, ...failureContext },
     message,
+    runEnd: record.run_end === undefined || record.run_end === null
+      ? null : parseProgramRunEnd(record.run_end, `${path}.run_end`),
   };
 }
 
@@ -823,6 +831,8 @@ function parseTakeoverFallbackAuditFacts(
   if (preparationMs < 0) return fail(`${path}.preparation_ms`, 'a non-negative number');
   const budgetMs = numberAt(record.budget_ms, `${path}.budget_ms`);
   if (budgetMs <= 0) return fail(`${path}.budget_ms`, 'a positive number');
+  const planningCapMs = numberAt(record.planning_cap_ms, `${path}.planning_cap_ms`);
+  if (planningCapMs < 0) return fail(`${path}.planning_cap_ms`, 'a non-negative number');
   return {
     nodeInstanceId: nonEmptyStringAt(record.node_instance_id, `${path}.node_instance_id`),
     incumbentOperationId: nonEmptyStringAt(
@@ -835,6 +845,7 @@ function parseTakeoverFallbackAuditFacts(
     failureStage,
     preparationMs,
     budgetMs,
+    planningCapMs,
   };
 }
 
@@ -986,7 +997,7 @@ function parseCycleRecoveryOffer(
     'program_binding_id', 'node_instance_id', 'node_attempt_id',
     'participants', 'graph_revision', 'retained_bundle_id', 'cycle_generation',
     'program_generation', 'deployment_generation', 'scene_admission_epoch',
-    'pose_source_apply_generation', 'latch_id', 'stop_id', 'stop_generation',
+    'pose_source_apply_generation', 'stop_id', 'stop_generation',
     'stop_certificate_id', 'stop_certificate_revision', 'status',
     'recovery_class', 'actions', 'reason_code', 'message',
     'details', 'origin', 'evidence_refs', 'manual_result', 'policy',
@@ -1096,7 +1107,6 @@ function parseCycleRecoveryOffer(
       record.pose_source_apply_generation,
       `${path}.pose_source_apply_generation`,
     ),
-    latchId: nullableStringAt(record.latch_id, `${path}.latch_id`),
     stopId: nullableStringAt(record.stop_id, `${path}.stop_id`),
     stopGeneration: nullablePositiveIntegerAt(
       record.stop_generation,

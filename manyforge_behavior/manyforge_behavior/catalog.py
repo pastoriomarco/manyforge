@@ -35,7 +35,7 @@ EXPECTED_API_VERSION = "manyforge.node_catalog.v2"
 EXPECTED_CONTENT_VERSION = "2.9.0"
 BUILTIN_CATALOG_ID = "manyforge_builtin"
 EXPECTED_BUILTIN_CATALOG_DIGEST = (
-    "sha256:cb77330e3362a78d9ac74177a486a3a60a8c2e20c42105b6bac8dd7f9474791c"
+    "sha256:0078bbc926b924bbc3a2d00ba46f00fee2b4deb546b7462383a6a56ae22d9e78"
 )
 SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
 _COMPOSABLE_PROFILE_RE = re.compile(r"^composable-cell-v(\d+)$")
@@ -64,14 +64,13 @@ _OWNER_APIS = {
     "assistant.model_request",
     "assistant.scene_context",
     "assistant.scene_selection",
-    "cclc.control_route",
-    "cclc.lifecycle",
     "geometry.compare",
     "kernel.command_target",
     "kernel.full_stop",
     "kernel.operation",
     "kernel.recovery",
     "kernel.reset",
+    "kernel.rules",
     "kernel.runtime_scaling",
     "kernel.stop",
     "model.kinematics",
@@ -110,9 +109,6 @@ _TARGET_CAPABILITIES = {
     "planning.motion.joint_goal",
     "planning.motion.named_target",
     "planning.motion.pose_goal",
-    "planning.profile.balanced",
-    "planning.profile.first_feasible",
-    "planning.profile.quality_bounded",
     "planning.trajectory.time_parameterized",
     "scene.pose.observe",
     "state.observed.current",

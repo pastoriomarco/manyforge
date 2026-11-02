@@ -388,9 +388,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=Path,
         default=(
             REPO_ROOT
-            / "manyforge_ros_bringup"
-            / "config"
-            / "isaac_lite6_topic_based_controllers.yaml"
+            / "manyforge_example_models"
+            / "models"
+            / "lite6"
+            / "isaac_controllers.yaml"
         ),
     )
     parser.add_argument(
@@ -398,9 +399,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=Path,
         default=(
             REPO_ROOT
-            / "manyforge_ros_bringup"
-            / "config"
-            / "isaac_lite6_gripper_bridge.yaml"
+            / "manyforge_isaac_adapter"
+            / "lane"
+            / "gripper_bridges"
+            / "lite_gripper.yaml"
         ),
     )
     parser.add_argument("--json", action="store_true")

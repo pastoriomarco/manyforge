@@ -1,5 +1,4 @@
 #include <algorithm>
-#include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/stop_terminal_state.hpp>
 #include <tuple>
 
@@ -9,10 +8,6 @@ namespace {
 template <typename Identity>
 [[nodiscard]] bool identity(const Identity& value) noexcept {
   return !value.empty() && value.value().size() <= kMaximumStopIdentityBytes;
-}
-
-[[nodiscard]] bool digest(const ContentDigest& value) noexcept {
-  return manyforge::content_identity::is_sha256_digest(value.value());
 }
 
 [[nodiscard]] bool error_valid(const ErrorDTO& error) noexcept {
@@ -32,12 +27,6 @@ template <typename Row, typename Less>
     }
   }
   return true;
-}
-
-template <typename Identity>
-[[nodiscard]] bool canonical_identities(const std::vector<Identity>& rows) noexcept {
-  return canonical(rows, [](const auto& left, const auto& right) { return left < right; }) &&
-         std::all_of(rows.begin(), rows.end(), identity<Identity>);
 }
 
 [[nodiscard]] bool key_less(const StopScopeEntryKeyDTO& left,
@@ -122,51 +111,6 @@ template <typename Identity>
   return true;
 }
 
-[[nodiscard]] bool source_status_less(const StopSurveillanceSourceStatusDTO& left,
-                                      const StopSurveillanceSourceStatusDTO& right) noexcept {
-  if (key_less(left.scope_key, right.scope_key)) return true;
-  if (key_less(right.scope_key, left.scope_key)) return false;
-  return left.evidence_item_id < right.evidence_item_id;
-}
-
-[[nodiscard]] bool recovery_evidence_less(const StopFaultRecoveryEvidenceRefDTO& left,
-                                          const StopFaultRecoveryEvidenceRefDTO& right) noexcept {
-  return std::tie(left.kind, left.evidence_digest) < std::tie(right.kind, right.evidence_digest);
-}
-
-[[nodiscard]] bool recovery_evidence_valid(
-    const StopFaultRecoveryEvidenceRefDTO& evidence) noexcept {
-  switch (evidence.kind) {
-    case StopFaultRecoveryEvidenceKindDTO::kSettlement:
-    case StopFaultRecoveryEvidenceKindDTO::kLateQuiescence:
-    case StopFaultRecoveryEvidenceKindDTO::kConfiguration:
-    case StopFaultRecoveryEvidenceKindDTO::kExternalReconciliation:
-    case StopFaultRecoveryEvidenceKindDTO::kBackendOrLifecycleReset:
-      return digest(evidence.evidence_digest);
-  }
-  return false;
-}
-
-[[nodiscard]] bool source_status_valid(const StopSurveillanceSourceStatusDTO& source) noexcept {
-  if (!identity(source.scope_key.origin_stop_id) ||
-      !source.scope_key.origin_stop_generation.nonzero() || !identity(source.evidence_item_id) ||
-      (source.source_epoch.has_value() != source.source_sequence.has_value()) ||
-      (source.source_epoch.has_value() != source.source_age_ns.has_value())) {
-    return false;
-  }
-  switch (source.availability) {
-    case StopSurveillanceSourceAvailabilityDTO::kAvailable:
-      return source.source_epoch.has_value() && identity(*source.source_epoch) &&
-             *source.source_sequence > 0U && *source.source_age_ns >= 0 &&
-             !source.error.has_value();
-    case StopSurveillanceSourceAvailabilityDTO::kUnavailable:
-    case StopSurveillanceSourceAvailabilityDTO::kInvalid:
-      return !source.source_epoch.has_value() && source.error.has_value() &&
-             error_valid(*source.error);
-  }
-  return false;
-}
-
 }  // namespace
 
 std::optional<std::string_view> stop_forensic_projection_result_field_error(
@@ -186,179 +130,6 @@ std::optional<std::string_view> stop_forensic_projection_result_field_error(
   return "stop_forensic_projection_result_invalid";
 }
 
-std::string_view stop_fault_trigger_name(const StopFaultTriggerDTO trigger) noexcept {
-  switch (trigger) {
-    case StopFaultTriggerDTO::kScopePromotion:
-      return "scope_promotion";
-    case StopFaultTriggerDTO::kEscalated:
-      return "escalated";
-    case StopFaultTriggerDTO::kPartial:
-      return "partial";
-    case StopFaultTriggerDTO::kFailedUncontained:
-      return "failed_uncontained";
-    case StopFaultTriggerDTO::kPhysicalRestUnproven:
-      return "physical_rest_unproven";
-    case StopFaultTriggerDTO::kPersistenceDegraded:
-      return "persistence_degraded";
-    case StopFaultTriggerDTO::kPostReserveFenceFailed:
-      return "post_reserve_fence_failed";
-  }
-  return "unknown";
-}
-
-std::optional<std::string_view> stop_fault_latch_field_error(
-    const StopFaultLatchDTO& latch) noexcept {
-  if (!identity(latch.cell_id) || !identity(latch.stop_id) || !latch.stop_generation.nonzero() ||
-      !identity(latch.latch_id) || !latch.latch_generation.nonzero() ||
-      !identity(latch.retained_bundle_id) || !identity(latch.graph_revision) ||
-      latch.recovery_assessment_revision == 0U || latch.reason_code.empty() ||
-      latch.reason_code.size() > kMaximumStopReasonBytes ||
-      latch.captured_operation_ids.size() > kMaximumStopTerminalScopeEntries ||
-      latch.captured_resources.size() > kMaximumStopTerminalScopeEntries ||
-      latch.evidence_refs.size() > kMaximumStopFaultRecoveryEvidenceRefs ||
-      !canonical_identities(latch.captured_operation_ids) ||
-      !canonical_identities(latch.captured_resources) ||
-      !canonical(latch.evidence_refs, recovery_evidence_less) ||
-      !std::all_of(latch.evidence_refs.begin(), latch.evidence_refs.end(),
-                   recovery_evidence_valid) ||
-      !projection_status_valid(latch.terminal_projection) ||
-      !projection_status_valid(latch.clear_projection) ||
-      (latch.stop_certificate.has_value() &&
-       (!latch.stop_certificate->locally_valid() ||
-        latch.stop_certificate->stop_id != latch.stop_id ||
-        latch.stop_certificate->stop_generation != latch.stop_generation))) {
-    return "stop_fault_latch_shape_invalid";
-  }
-
-  switch (latch.trigger) {
-    case StopFaultTriggerDTO::kScopePromotion:
-    case StopFaultTriggerDTO::kEscalated:
-    case StopFaultTriggerDTO::kPartial:
-    case StopFaultTriggerDTO::kFailedUncontained:
-    case StopFaultTriggerDTO::kPhysicalRestUnproven:
-    case StopFaultTriggerDTO::kPersistenceDegraded:
-    case StopFaultTriggerDTO::kPostReserveFenceFailed:
-      break;
-    default:
-      return "stop_fault_latch_trigger_invalid";
-  }
-  const auto& observed = latch.observed_triggers;
-  if (observed.empty() || observed.size() > kStopFaultTriggerCount ||
-      std::find(observed.begin(), observed.end(), latch.trigger) == observed.end())
-    return "stop_fault_latch_observed_triggers_invalid";
-  for (auto row = observed.begin(); row != observed.end(); ++row) {
-    if (static_cast<std::size_t>(*row) >= kStopFaultTriggerCount ||
-        std::find(observed.begin(), row, *row) != row)
-      return "stop_fault_latch_observed_triggers_invalid";
-  }
-  switch (latch.state) {
-    case StopFaultLatchStateDTO::kLatched:
-    case StopFaultLatchStateDTO::kRecoveryPending:
-    case StopFaultLatchStateDTO::kCleared:
-      break;
-    default:
-      return "stop_fault_latch_state_invalid";
-  }
-  switch (latch.recovery_status) {
-    case StopFaultRecoveryStatusDTO::kWaitingForObservation:
-    case StopFaultRecoveryStatusDTO::kWaitingForQuiescence:
-    case StopFaultRecoveryStatusDTO::kWaitingForConfiguration:
-    case StopFaultRecoveryStatusDTO::kWaitingForExternalReconciliation:
-    case StopFaultRecoveryStatusDTO::kWaitingForDurableRecord:
-    case StopFaultRecoveryStatusDTO::kReady:
-    case StopFaultRecoveryStatusDTO::kRecoveryPending:
-    case StopFaultRecoveryStatusDTO::kCleared:
-      break;
-    default:
-      return "stop_fault_latch_recovery_status_invalid";
-  }
-  if ((latch.state == StopFaultLatchStateDTO::kCleared) !=
-          (latch.recovery_status == StopFaultRecoveryStatusDTO::kCleared) ||
-      (latch.state == StopFaultLatchStateDTO::kCleared &&
-       latch.clear_projection.state != StopDurableProjectionStateDTO::kRecorded) ||
-      (latch.state != StopFaultLatchStateDTO::kCleared &&
-       latch.clear_projection.state == StopDurableProjectionStateDTO::kRecorded) ||
-      (latch.trigger == StopFaultTriggerDTO::kPersistenceDegraded && !latch.persistence_degraded)) {
-    return "stop_fault_latch_presence_invalid";
-  }
-  return std::nullopt;
-}
-
-std::optional<std::string_view> stop_fault_recovery_offer_field_error(
-    const StopFaultRecoveryOfferDTO& offer) noexcept {
-  const bool recovery_unavailable = offer.recovery_unavailable_reason.has_value();
-  if (stop_fault_latch_field_error(offer.latch).has_value() ||
-      offer.latch.state == StopFaultLatchStateDTO::kCleared ||
-      (recovery_unavailable &&
-       (offer.recovery_unavailable_reason->empty() ||
-        offer.recovery_unavailable_reason->size() > kMaximumStopReasonBytes)) ||
-      (offer.latch.stop_certificate.has_value() &&
-       offer.configuration_expectations.empty() != recovery_unavailable) ||
-      (!offer.latch.stop_certificate.has_value() &&
-       (!offer.configuration_expectations.empty() || recovery_unavailable ||
-        offer.latch.state != StopFaultLatchStateDTO::kLatched ||
-        offer.latch.recovery_status != StopFaultRecoveryStatusDTO::kWaitingForObservation ||
-        offer.latch.terminal_projection.state != StopDurableProjectionStateDTO::kPending ||
-        offer.latch.clear_projection.state != StopDurableProjectionStateDTO::kNotApplicable)) ||
-      offer.configuration_expectations.size() > kMaximumStopTerminalScopeEntries ||
-      !canonical(offer.configuration_expectations,
-                 [](const auto& left, const auto& right) {
-                   return left.control_domain_id < right.control_domain_id;
-                 }) ||
-      !std::all_of(offer.configuration_expectations.begin(), offer.configuration_expectations.end(),
-                   [](const auto& row) {
-                     return identity(row.control_domain_id) &&
-                            identity(row.active_control_configuration_id) &&
-                            row.active_control_configuration_generation.nonzero();
-                   })) {
-    return "stop_fault_recovery_offer_shape_invalid";
-  }
-  return std::nullopt;
-}
-
-std::optional<std::string_view> stop_post_terminal_surveillance_field_error(
-    const StopPostTerminalSurveillanceDTO& surveillance) noexcept {
-  if (!identity(surveillance.stop_id) || !surveillance.stop_generation.nonzero() ||
-      !surveillance.stop_certificate.locally_valid() ||
-      surveillance.stop_certificate.stop_id != surveillance.stop_id ||
-      surveillance.stop_certificate.stop_generation != surveillance.stop_generation ||
-      !identity(surveillance.latch_id) || !surveillance.latch_generation.nonzero() ||
-      !identity(surveillance.owner_epoch) || surveillance.surveillance_generation == 0U ||
-      surveillance.resources.empty() ||
-      surveillance.resources.size() > kMaximumStopTerminalScopeEntries ||
-      !canonical_identities(surveillance.resources) || surveillance.source_statuses.empty() ||
-      surveillance.source_statuses.size() > kMaximumStopSurveillanceSources ||
-      !canonical(surveillance.source_statuses, source_status_less) ||
-      !std::all_of(surveillance.source_statuses.begin(), surveillance.source_statuses.end(),
-                   source_status_valid) ||
-      surveillance.policy.sample_cadence_ns <= 0 ||
-      surveillance.policy.checkpoint_interval_ns < surveillance.policy.sample_cadence_ns ||
-      surveillance.policy.retained_checkpoint_limit == 0U ||
-      surveillance.policy.retained_checkpoint_limit > kMaximumStopSurveillanceCheckpoints ||
-      surveillance.checkpoint_generation == 0U ||
-      !projection_status_valid(surveillance.checkpoint_projection)) {
-    return "stop_surveillance_shape_invalid";
-  }
-  const bool continued = surveillance.continued_motion_count > 0U;
-  if (continued != surveillance.first_continued_motion_at_ns.has_value() ||
-      continued != surveillance.last_continued_motion_at_ns.has_value() ||
-      (continued &&
-       (*surveillance.first_continued_motion_at_ns < 0 ||
-        *surveillance.last_continued_motion_at_ns < *surveillance.first_continued_motion_at_ns))) {
-    return "stop_surveillance_motion_presence_invalid";
-  }
-  const bool quiescent =
-      surveillance.state == StopPostTerminalSurveillanceStateDTO::kQuiescenceObserved;
-  if ((surveillance.state != StopPostTerminalSurveillanceStateDTO::kMonitoring && !quiescent) ||
-      quiescent != surveillance.late_quiescence_evidence_digest.has_value() ||
-      quiescent != surveillance.late_quiescence_observed_at_ns.has_value() ||
-      (quiescent && (!digest(*surveillance.late_quiescence_evidence_digest) ||
-                     *surveillance.late_quiescence_observed_at_ns < 0))) {
-    return "stop_surveillance_quiescence_presence_invalid";
-  }
-  return std::nullopt;
-}
-
 std::optional<std::string_view> stop_status_field_error(const StopStatusDTO& status) noexcept {
   if (stop_accepted_field_error(status.accepted).has_value() || !status_state_valid(status.state) ||
       status.scope_entries.size() > kMaximumStopTerminalScopeEntries ||
@@ -371,43 +142,22 @@ std::optional<std::string_view> stop_status_field_error(const StopStatusDTO& sta
           [&](const auto& stage) { return current_stage_valid(stage, status.accepted); }) ||
       !projection_status_valid(status.acceptance_projection) ||
       !projection_status_valid(status.terminal_projection) ||
-      !projection_status_valid(status.surveillance_projection) ||
       (status.stop_certificate.has_value() &&
        (!status.stop_certificate->locally_valid() ||
         status.stop_certificate->stop_id != status.accepted.stop_id ||
-        status.stop_certificate->stop_generation != status.accepted.stop_generation)) ||
-      (status.fault_latch.has_value() && stop_fault_latch_field_error(*status.fault_latch)) ||
-      (status.surveillance.has_value() &&
-       stop_post_terminal_surveillance_field_error(*status.surveillance))) {
+        status.stop_certificate->stop_generation != status.accepted.stop_generation))) {
     return "stop_status_shape_invalid";
   }
   const bool terminal = status_terminal(status.state);
   if (terminal != status.stop_certificate.has_value() ||
-      (terminal && !status.current_stages.empty()) ||
-      (status.surveillance.has_value() !=
-       (status.surveillance_projection.state != StopDurableProjectionStateDTO::kNotApplicable)) ||
-      (status.fault_latch.has_value() &&
-       (status.fault_latch->stop_id != status.accepted.stop_id ||
-        status.fault_latch->stop_generation != status.accepted.stop_generation ||
-        status.fault_latch->stop_certificate != status.stop_certificate ||
-        (!terminal && (status.fault_latch->state != StopFaultLatchStateDTO::kLatched ||
-                       status.fault_latch->recovery_status !=
-                           StopFaultRecoveryStatusDTO::kWaitingForObservation ||
-                       status.fault_latch->terminal_projection.state !=
-                           StopDurableProjectionStateDTO::kPending ||
-                       status.fault_latch->clear_projection.state !=
-                           StopDurableProjectionStateDTO::kNotApplicable)))) ||
-      (status.surveillance.has_value() &&
-       (status.surveillance->stop_id != status.accepted.stop_id ||
-        status.surveillance->stop_generation != status.accepted.stop_generation))) {
+      (terminal && !status.current_stages.empty())) {
     return "stop_status_presence_invalid";
   }
   return std::nullopt;
 }
 
 std::optional<std::string_view> stop_terminal_projection_field_error(
-    const StopStatusDTO& status, const StopCertificateDTO& certificate,
-    const std::optional<StopFaultLatchDTO>& fault_latch) noexcept {
+    const StopStatusDTO& status, const StopCertificateDTO& certificate) noexcept {
   if (stop_status_field_error(status).has_value() ||
       stop_certificate_field_error(certificate).has_value() || !status_terminal(status.state) ||
       !status.stop_certificate.has_value() ||
@@ -422,8 +172,7 @@ std::optional<std::string_view> stop_terminal_projection_field_error(
       status.scope_entries != certificate.scope_entries ||
       status.attempted_stage_results != certificate.attempted_stage_results ||
       status.evidence_items != certificate.evidence_items ||
-      status.unsettled != certificate.unsettled || status.failed != certificate.failed ||
-      status.fault_latch != fault_latch) {
+      status.unsettled != certificate.unsettled || status.failed != certificate.failed) {
     return "stop_terminal_projection_join_invalid";
   }
   const auto expected_status = [&] {
@@ -438,11 +187,7 @@ std::optional<std::string_view> stop_terminal_projection_field_error(
     }
     return StopStatusStateDTO::kFailed;
   }();
-  if (status.state != expected_status ||
-      (fault_latch.has_value() && (fault_latch->stop_id != certificate.stop_id ||
-                                   fault_latch->stop_generation != certificate.stop_generation ||
-                                   !fault_latch->stop_certificate.has_value() ||
-                                   *fault_latch->stop_certificate != *status.stop_certificate))) {
+  if (status.state != expected_status) {
     return "stop_terminal_projection_outcome_invalid";
   }
   return std::nullopt;
@@ -452,15 +197,12 @@ StopTerminalStatusRestDTO TerminalStopStatusRest(const StopStatusDTO& status) {
   return StopTerminalStatusRestDTO{status.accepted,
                                    status.current_stages,
                                    status.acceptance_projection,
-                                   status.terminal_projection,
-                                   status.surveillance_projection,
-                                   status.surveillance};
+                                   status.terminal_projection};
 }
 
 // I0 (lean Stop record): slice B owns this definition and its tests.
 StopStatusDTO TerminalStopStatusFromCertificate(const StopTerminalStatusRestDTO& rest,
-                                                const StopCertificateDTO& certificate,
-                                                const std::optional<StopFaultLatchDTO>& fault_latch) {
+                                                const StopCertificateDTO& certificate) {
   const auto state = [&] {
     switch (certificate.result) {
       case StopCertificateResultDTO::kSucceededNominal:
@@ -483,12 +225,9 @@ StopStatusDTO TerminalStopStatusFromCertificate(const StopTerminalStatusRestDTO&
                        certificate.failed,
                        rest.acceptance_projection,
                        rest.terminal_projection,
-                       rest.surveillance_projection,
                        StopCertificateRefDTO{certificate.stop_certificate_id,
                                              certificate.stop_certificate_revision,
-                                             certificate.stop_id, certificate.stop_generation},
-                       fault_latch,
-                       rest.surveillance};
+                                             certificate.stop_id, certificate.stop_generation}};
 }
 
 }  // namespace manyforge::core

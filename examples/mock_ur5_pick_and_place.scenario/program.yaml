@@ -1,0 +1,553 @@
+{
+  "api_version": "manyforge.program.v2",
+  "blackboard": {
+    "keys": [
+      {
+        "access": "read_write",
+        "description": "Intentionally simulated gripper closed/open state.",
+        "key": "gripper_closed",
+        "persistence": "run",
+        "type": "bool"
+      }
+    ],
+    "namespaces": []
+  },
+  "catalog": {
+    "api_version": "manyforge.node_catalog.v2",
+    "content_version": "2.9.0"
+  },
+  "compatibility": {
+    "assistant": "forbidden",
+    "lanes": [
+      "manyforge-only"
+    ],
+    "requires": [],
+    "tags": [
+      "pick-and-place",
+      "ur5"
+    ]
+  },
+  "component_roles": {
+    "robot": {
+      "required_component_type_tags": [
+        "articulated-arm"
+      ],
+      "required_model_roles": [
+        "arm_model"
+      ]
+    }
+  },
+  "description": "Pick-and-place demo for the UR5 source model. It preserves the original approach, pick, retreat, drop, detach, and rest motion sequence while keeping the intentionally simulated gripper state as ordinary Program data. Exact scene and attachment revisions now invalidate planning automatically.",
+  "forest": [
+    {
+      "children": [
+        {
+          "children": [],
+          "instance_id": "move_to_pick_approach",
+          "node_id": "motion.move_to_pose",
+          "parameters": {
+            "base_frame_role": "base",
+            "execution_timeout_s": 30.0,
+            "goal": {
+              "orientation": {
+                "rpy_deg": [
+                  180.0,
+                  0.0,
+                  -90.0
+                ]
+              },
+              "position_m": [
+                0.0,
+                0.0,
+                0.1
+              ]
+            },
+            "planning_timeout_s": 10.0,
+            "target_mode": "relative",
+            "target_reference": {
+              "scene_resource_id": "graspable",
+              "type": "scene_resource"
+            },
+            "target_role": "arm",
+            "tcp_endpoint": {
+              "kind": "current"
+            }
+          },
+          "value_sources": {
+            "velocity_scale": {
+              "kind": "program_parameter",
+              "reference": "velocity_scale"
+            }
+          }
+        },
+        {
+          "children": [],
+          "instance_id": "move_to_pick",
+          "node_id": "motion.move_to_pose",
+          "parameters": {
+            "base_frame_role": "base",
+            "execution_timeout_s": 30.0,
+            "goal": {
+              "orientation": {
+                "rpy_deg": [
+                  180.0,
+                  0.0,
+                  -90.0
+                ]
+              },
+              "position_m": [
+                0.0,
+                0.0,
+                0.05
+              ]
+            },
+            "planning_timeout_s": 10.0,
+            "target_mode": "relative",
+            "target_reference": {
+              "scene_resource_id": "graspable",
+              "type": "scene_resource"
+            },
+            "target_role": "arm",
+            "tcp_endpoint": {
+              "kind": "current"
+            }
+          },
+          "value_sources": {
+            "velocity_scale": {
+              "kind": "program_parameter",
+              "reference": "velocity_scale"
+            }
+          }
+        },
+        {
+          "children": [],
+          "instance_id": "close_gripper",
+          "node_id": "logic.set_value",
+          "parameters": {
+            "key": "gripper_closed",
+            "value": true
+          }
+        },
+        {
+          "children": [],
+          "instance_id": "attach_graspable",
+          "node_id": "scene.attach_carried_object",
+          "parameters": {
+            "carrier_frame_role": "tcp",
+            "scene_resource_id": "graspable",
+            "target_role": "arm",
+            "touch_body_roles": [
+              "tool_collision"
+            ]
+          }
+        },
+        {
+          "children": [],
+          "instance_id": "pick_retreat",
+          "node_id": "motion.move_to_pose",
+          "parameters": {
+            "base_frame_role": "base",
+            "execution_timeout_s": 30.0,
+            "goal": {
+              "orientation": {
+                "rpy_deg": [
+                  0.0,
+                  0.0,
+                  0.0
+                ]
+              },
+              "position_m": [
+                0.0,
+                0.0,
+                -0.05
+              ]
+            },
+            "planning_timeout_s": 10.0,
+            "target_mode": "relative",
+            "target_reference": {
+              "frame_role_id": "tcp",
+              "type": "frame_role"
+            },
+            "target_role": "arm",
+            "tcp_endpoint": {
+              "kind": "current"
+            }
+          },
+          "value_sources": {
+            "velocity_scale": {
+              "kind": "program_parameter",
+              "reference": "velocity_scale"
+            }
+          }
+        },
+        {
+          "children": [],
+          "instance_id": "move_to_drop_approach",
+          "node_id": "motion.move_to_pose",
+          "parameters": {
+            "base_frame_role": "base",
+            "execution_timeout_s": 30.0,
+            "goal": {
+              "orientation": {
+                "rpy_deg": [
+                  180.0,
+                  0.0,
+                  -90.0
+                ]
+              },
+              "position_m": [
+                0.0,
+                0.0,
+                0.05
+              ]
+            },
+            "offset_reference": {
+              "frame_role_id": "base",
+              "type": "frame_role"
+            },
+            "planning_timeout_s": 10.0,
+            "target_mode": "relative",
+            "target_reference": {
+              "pose": {
+                "frame_ref": {
+                  "frame_role": "base",
+                  "kind": "target_frame",
+                  "target_role": "arm"
+                },
+                "orientation": {
+                  "rpy_deg": [
+                    180.0,
+                    0.0,
+                    -90.0
+                  ]
+                },
+                "position_m": [
+                  0.3,
+                  0.3,
+                  0.2
+                ]
+              },
+              "type": "pose"
+            },
+            "target_role": "arm",
+            "tcp_endpoint": {
+              "kind": "current"
+            }
+          },
+          "value_sources": {
+            "velocity_scale": {
+              "kind": "program_parameter",
+              "reference": "velocity_scale"
+            }
+          }
+        },
+        {
+          "children": [],
+          "instance_id": "move_to_drop",
+          "node_id": "motion.move_to_pose",
+          "parameters": {
+            "base_frame_role": "base",
+            "execution_timeout_s": 30.0,
+            "goal": {
+              "frame_ref": {
+                "frame_role": "base",
+                "kind": "target_frame",
+                "target_role": "arm"
+              },
+              "orientation": {
+                "rpy_deg": [
+                  180.0,
+                  0.0,
+                  -90.0
+                ]
+              },
+              "position_m": [
+                0.3,
+                0.3,
+                0.2
+              ]
+            },
+            "planning_timeout_s": 10.0,
+            "target_role": "arm",
+            "tcp_endpoint": {
+              "kind": "current"
+            }
+          },
+          "value_sources": {
+            "velocity_scale": {
+              "kind": "program_parameter",
+              "reference": "velocity_scale"
+            }
+          }
+        },
+        {
+          "children": [],
+          "instance_id": "open_gripper",
+          "node_id": "logic.set_value",
+          "parameters": {
+            "key": "gripper_closed",
+            "value": false
+          }
+        },
+        {
+          "children": [],
+          "instance_id": "detach_graspable",
+          "node_id": "scene.detach_carried_object",
+          "parameters": {
+            "scene_resource_id": "graspable",
+            "target_role": "arm"
+          }
+        },
+        {
+          "children": [],
+          "instance_id": "drop_retreat",
+          "node_id": "motion.move_to_pose",
+          "parameters": {
+            "base_frame_role": "base",
+            "execution_timeout_s": 30.0,
+            "goal": {
+              "orientation": {
+                "rpy_deg": [
+                  180.0,
+                  0.0,
+                  -90.0
+                ]
+              },
+              "position_m": [
+                0.0,
+                0.0,
+                0.05
+              ]
+            },
+            "offset_reference": {
+              "frame_role_id": "base",
+              "type": "frame_role"
+            },
+            "planning_timeout_s": 10.0,
+            "target_mode": "relative",
+            "target_reference": {
+              "pose": {
+                "frame_ref": {
+                  "frame_role": "base",
+                  "kind": "target_frame",
+                  "target_role": "arm"
+                },
+                "orientation": {
+                  "rpy_deg": [
+                    180.0,
+                    0.0,
+                    -90.0
+                  ]
+                },
+                "position_m": [
+                  0.3,
+                  0.3,
+                  0.2
+                ]
+              },
+              "type": "pose"
+            },
+            "target_role": "arm",
+            "tcp_endpoint": {
+              "kind": "current"
+            }
+          },
+          "value_sources": {
+            "velocity_scale": {
+              "kind": "program_parameter",
+              "reference": "velocity_scale"
+            }
+          }
+        },
+        {
+          "children": [],
+          "instance_id": "return_rest",
+          "node_id": "motion.move_to_joint_target",
+          "parameters": {
+            "base_frame_role": "base",
+            "execution_timeout_s": 30.0,
+            "goal": [
+              {
+                "joint_name": "shoulder_pan_joint",
+                "position_rad": 0.0
+              },
+              {
+                "joint_name": "shoulder_lift_joint",
+                "position_rad": -1.57
+              },
+              {
+                "joint_name": "elbow_joint",
+                "position_rad": 1.57
+              },
+              {
+                "joint_name": "wrist_1_joint",
+                "position_rad": -1.57
+              },
+              {
+                "joint_name": "wrist_2_joint",
+                "position_rad": -1.57
+              },
+              {
+                "joint_name": "wrist_3_joint",
+                "position_rad": 0.0
+              }
+            ],
+            "planning_timeout_s": 10.0,
+            "target_role": "arm",
+            "tcp_endpoint": {
+              "kind": "current"
+            }
+          },
+          "value_sources": {
+            "velocity_scale": {
+              "kind": "program_parameter",
+              "reference": "velocity_scale"
+            }
+          }
+        }
+      ],
+      "instance_id": "pick_and_place",
+      "node_id": "sequence",
+      "parameters": {}
+    }
+  ],
+  "name": "pick_and_place_demo",
+  "parameters": [
+    {
+      "constraints": {
+        "max_inclusive": 1.0,
+        "min_exclusive": 0.0
+      },
+      "default": 0.5,
+      "description": "Velocity scale for all moves.",
+      "parameter_id": "velocity_scale",
+      "type": "float64"
+    }
+  ],
+  "positions": {},
+  "program_id": "pick_and_place_demo",
+  "program_profile": "composable-cell-v1",
+  "scene": [
+    {
+      "pose": {
+        "frame_ref": {
+          "kind": "cell_frame"
+        },
+        "orientation": {
+          "rpy_deg": [
+            0.0,
+            0.0,
+            -45.0
+          ]
+        },
+        "position_m": [
+          0.3,
+          -0.3,
+          0.15
+        ]
+      },
+      "resource_roles": [
+        "pick_object"
+      ],
+      "scene_resource_id": "graspable",
+      "shape": {
+        "box_dimensions_m": [
+          0.1,
+          0.01,
+          0.01
+        ],
+        "type": "box"
+      }
+    },
+    {
+      "pose": {
+        "frame_ref": {
+          "kind": "cell_frame"
+        },
+        "orientation": {
+          "rpy_deg": [
+            0.0,
+            0.0,
+            0.0
+          ]
+        },
+        "position_m": [
+          0.0,
+          0.0,
+          -0.11
+        ]
+      },
+      "scene_resource_id": "ground",
+      "shape": {
+        "box_dimensions_m": [
+          1.0,
+          1.0,
+          0.2
+        ],
+        "type": "box"
+      }
+    }
+  ],
+  "schema_version": "manyforge.composer_authoring_forest.v1",
+  "target_roles": {
+    "arm": {
+      "component_role": "robot",
+      "required_capabilities": [
+        {
+          "capability_id": "execution.feedback.phase_events",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "execution.trajectory.execute",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "model.kinematics.fk",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "planning.motion.joint_goal",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "planning.motion.pose_goal",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "planning.trajectory.time_parameterized",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "state.observed.current",
+          "disposition": "required",
+          "parameters": {}
+        },
+        {
+          "capability_id": "validation.trajectory.non_collision",
+          "disposition": "required",
+          "parameters": {}
+        }
+      ],
+      "required_collision_body_roles": [
+        "arm_collision",
+        "tool_collision"
+      ],
+      "required_frame_roles": [
+        "base",
+        "tcp"
+      ],
+      "required_model_roles": [
+        "arm_model"
+      ],
+      "required_resource_roles": [
+        "arm_joints"
+      ]
+    }
+  }
+}

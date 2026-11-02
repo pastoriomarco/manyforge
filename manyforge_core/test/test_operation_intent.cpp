@@ -18,7 +18,7 @@ using namespace manyforge::core;
       SpeedProfileDTO{},
       TimeoutsDTO{},
       CacheMode::kDefault,
-      PlanningProfileDTO::kBalanced,
+      PlannerOverrideDTO{},
       MotionTargetModeDTO::kAbsolute,
       std::nullopt,
       std::nullopt,
@@ -100,7 +100,7 @@ TEST(OperationIntentTest, AcceptsUnitTaggedPrismaticGripperCommand) {
           CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision)),
           GripperPositionCommandValueDTO{LinearPositionDTO{0.02}, LinearEffortDTO{8.0}},
           2.0,
-          {CommandDurationOptionDTO{CommandOptionId("command_duration_s"), 0.5}}}};
+          {CommandOptionDTO{CommandOptionId("command_duration_s"), 0.5}}}};
 
   const auto result = validate_operation_intent(operation);
   ASSERT_TRUE(result.ok()) << result.error().message;

@@ -147,7 +147,7 @@ CREATE TABLE IF NOT EXISTS logical_scene_named_apply_activation_selections (
 -- Apply remains immutable when a managed native host is replaced; this
 -- append-only overlay records the exact current runtime set that was rebuilt
 -- from the scene owner's already-active immutable snapshot.
-CREATE TABLE IF NOT EXISTS logical_scene_native_runtime_recovery_intents (
+CREATE TABLE IF NOT EXISTS logical_scene_execution_host_recovery_intents (
     recovery_generation INTEGER PRIMARY KEY CHECK (
         recovery_generation > 0 AND recovery_generation <= 256
     ),
@@ -170,7 +170,7 @@ CREATE TABLE IF NOT EXISTS logical_scene_native_runtime_recovery_intents (
         REFERENCES logical_scene_named_apply_stages (lineage_generation)
 ) STRICT;
 
-CREATE TABLE IF NOT EXISTS logical_scene_native_runtime_recovery_bindings (
+CREATE TABLE IF NOT EXISTS logical_scene_execution_host_recovery_bindings (
     recovery_generation INTEGER NOT NULL,
     binding_ordinal INTEGER NOT NULL CHECK (
         binding_ordinal >= 0 AND binding_ordinal < 256
@@ -181,12 +181,12 @@ CREATE TABLE IF NOT EXISTS logical_scene_native_runtime_recovery_bindings (
     runtime_epoch TEXT NOT NULL,
     PRIMARY KEY (recovery_generation, binding_ordinal),
     FOREIGN KEY (recovery_generation)
-        REFERENCES logical_scene_native_runtime_recovery_intents (
+        REFERENCES logical_scene_execution_host_recovery_intents (
             recovery_generation
         )
 ) WITHOUT ROWID, STRICT;
 
-CREATE TABLE IF NOT EXISTS logical_scene_native_runtime_recovery_results (
+CREATE TABLE IF NOT EXISTS logical_scene_execution_host_recovery_results (
     recovery_generation INTEGER NOT NULL,
     binding_ordinal INTEGER NOT NULL CHECK (
         binding_ordinal >= 0 AND binding_ordinal < 256
@@ -205,18 +205,18 @@ CREATE TABLE IF NOT EXISTS logical_scene_native_runtime_recovery_results (
     ),
     PRIMARY KEY (recovery_generation, binding_ordinal),
     FOREIGN KEY (recovery_generation, binding_ordinal)
-        REFERENCES logical_scene_native_runtime_recovery_bindings (
+        REFERENCES logical_scene_execution_host_recovery_bindings (
             recovery_generation, binding_ordinal
         )
 ) WITHOUT ROWID, STRICT;
 
-CREATE TABLE IF NOT EXISTS logical_scene_native_runtime_recovery_completions (
+CREATE TABLE IF NOT EXISTS logical_scene_execution_host_recovery_completions (
     recovery_generation INTEGER PRIMARY KEY,
     result_count INTEGER NOT NULL CHECK (
         result_count > 0 AND result_count <= 256
     ),
     FOREIGN KEY (recovery_generation)
-        REFERENCES logical_scene_native_runtime_recovery_intents (
+        REFERENCES logical_scene_execution_host_recovery_intents (
             recovery_generation
         )
 ) STRICT;
@@ -269,50 +269,50 @@ BEGIN
     SELECT RAISE(ABORT, 'logical_scene_named_apply_activation_selections is immutable');
 END;
 
-CREATE TRIGGER IF NOT EXISTS logical_scene_native_runtime_recovery_intents_no_update
-BEFORE UPDATE ON logical_scene_native_runtime_recovery_intents
+CREATE TRIGGER IF NOT EXISTS logical_scene_execution_host_recovery_intents_no_update
+BEFORE UPDATE ON logical_scene_execution_host_recovery_intents
 BEGIN
-    SELECT RAISE(ABORT, 'logical_scene_native_runtime_recovery_intents is immutable');
+    SELECT RAISE(ABORT, 'logical_scene_execution_host_recovery_intents is immutable');
 END;
 
-CREATE TRIGGER IF NOT EXISTS logical_scene_native_runtime_recovery_intents_no_delete
-BEFORE DELETE ON logical_scene_native_runtime_recovery_intents
+CREATE TRIGGER IF NOT EXISTS logical_scene_execution_host_recovery_intents_no_delete
+BEFORE DELETE ON logical_scene_execution_host_recovery_intents
 BEGIN
-    SELECT RAISE(ABORT, 'logical_scene_native_runtime_recovery_intents is immutable');
+    SELECT RAISE(ABORT, 'logical_scene_execution_host_recovery_intents is immutable');
 END;
 
-CREATE TRIGGER IF NOT EXISTS logical_scene_native_runtime_recovery_bindings_no_update
-BEFORE UPDATE ON logical_scene_native_runtime_recovery_bindings
+CREATE TRIGGER IF NOT EXISTS logical_scene_execution_host_recovery_bindings_no_update
+BEFORE UPDATE ON logical_scene_execution_host_recovery_bindings
 BEGIN
-    SELECT RAISE(ABORT, 'logical_scene_native_runtime_recovery_bindings is immutable');
+    SELECT RAISE(ABORT, 'logical_scene_execution_host_recovery_bindings is immutable');
 END;
 
-CREATE TRIGGER IF NOT EXISTS logical_scene_native_runtime_recovery_bindings_no_delete
-BEFORE DELETE ON logical_scene_native_runtime_recovery_bindings
+CREATE TRIGGER IF NOT EXISTS logical_scene_execution_host_recovery_bindings_no_delete
+BEFORE DELETE ON logical_scene_execution_host_recovery_bindings
 BEGIN
-    SELECT RAISE(ABORT, 'logical_scene_native_runtime_recovery_bindings is immutable');
+    SELECT RAISE(ABORT, 'logical_scene_execution_host_recovery_bindings is immutable');
 END;
 
-CREATE TRIGGER IF NOT EXISTS logical_scene_native_runtime_recovery_results_no_update
-BEFORE UPDATE ON logical_scene_native_runtime_recovery_results
+CREATE TRIGGER IF NOT EXISTS logical_scene_execution_host_recovery_results_no_update
+BEFORE UPDATE ON logical_scene_execution_host_recovery_results
 BEGIN
-    SELECT RAISE(ABORT, 'logical_scene_native_runtime_recovery_results is immutable');
+    SELECT RAISE(ABORT, 'logical_scene_execution_host_recovery_results is immutable');
 END;
 
-CREATE TRIGGER IF NOT EXISTS logical_scene_native_runtime_recovery_results_no_delete
-BEFORE DELETE ON logical_scene_native_runtime_recovery_results
+CREATE TRIGGER IF NOT EXISTS logical_scene_execution_host_recovery_results_no_delete
+BEFORE DELETE ON logical_scene_execution_host_recovery_results
 BEGIN
-    SELECT RAISE(ABORT, 'logical_scene_native_runtime_recovery_results is immutable');
+    SELECT RAISE(ABORT, 'logical_scene_execution_host_recovery_results is immutable');
 END;
 
-CREATE TRIGGER IF NOT EXISTS logical_scene_native_runtime_recovery_completions_no_update
-BEFORE UPDATE ON logical_scene_native_runtime_recovery_completions
+CREATE TRIGGER IF NOT EXISTS logical_scene_execution_host_recovery_completions_no_update
+BEFORE UPDATE ON logical_scene_execution_host_recovery_completions
 BEGIN
-    SELECT RAISE(ABORT, 'logical_scene_native_runtime_recovery_completions is immutable');
+    SELECT RAISE(ABORT, 'logical_scene_execution_host_recovery_completions is immutable');
 END;
 
-CREATE TRIGGER IF NOT EXISTS logical_scene_native_runtime_recovery_completions_no_delete
-BEFORE DELETE ON logical_scene_native_runtime_recovery_completions
+CREATE TRIGGER IF NOT EXISTS logical_scene_execution_host_recovery_completions_no_delete
+BEFORE DELETE ON logical_scene_execution_host_recovery_completions
 BEGIN
-    SELECT RAISE(ABORT, 'logical_scene_native_runtime_recovery_completions is immutable');
+    SELECT RAISE(ABORT, 'logical_scene_execution_host_recovery_completions is immutable');
 END;

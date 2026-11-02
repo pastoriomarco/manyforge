@@ -2207,8 +2207,7 @@ void verify_binding_context(const core::ProgramBindingDTO& binding,
       }
       const bool is_gripper_position_command =
           capability.capability_id.value() == "tool.gripper.command";
-      const bool is_io_output = capability.capability_id.value() == "io.gpio.set_output";
-      if ((is_gripper_position_command || is_io_output) != capability.command_schema.has_value()) {
+      if (is_gripper_position_command != capability.command_schema.has_value()) {
         fail("capability command-schema presence differs from the qualified "
              "command family");
       }
@@ -2218,12 +2217,6 @@ void verify_binding_context(const core::ProgramBindingDTO& binding,
            capability.command_schema->command_schema_revision.value() !=
                core::kGripperPositionCommandSchemaRevision)) {
         fail("gripper capability selects another command-schema family");
-      }
-      if (is_io_output &&
-          (capability.command_schema->command_schema_id.value() != core::kIoSignalWriteCommandSchemaId ||
-           capability.command_schema->command_schema_revision.value() !=
-               core::kIoSignalWriteCommandSchemaRevision)) {
-        fail("output capability selects another command-schema family");
       }
     }
   }

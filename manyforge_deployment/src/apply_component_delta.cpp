@@ -1,19 +1,13 @@
 #include "manyforge_deployment/apply_component_delta.hpp"
-#include "manyforge_deployment/scene_pose_source_policy_codec.hpp"
-#include "apply_component_delta_internal.hpp"
 
 #include <algorithm>
 #include <map>
 #include <set>
-#include <type_traits>
 #include <utility>
-#include <variant>
 
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_deployment/canonical_value.hpp>
-#include <manyforge_deployment/cell_kinematic_index.hpp>
-#include <manyforge_deployment/native_execution_runtime_contract.hpp>
-#include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
+#include <manyforge_deployment/component_spec.hpp>
 
 namespace manyforge::deployment {
 namespace {
@@ -25,25 +19,14 @@ using Object = CanonicalValue::Object;
 constexpr std::string_view kDeltaApiVersion = "manyforge.apply-component-delta.v1";
 constexpr std::string_view kDeltaIdentityDomain =
     "manyforge.apply-component-delta";
-constexpr std::string_view kRuntimeIdentityApiVersion =
-    "manyforge.apply-component-runtime-identity.v2";
-constexpr std::string_view kRuntimeIdentityDomain =
-    "manyforge.apply-component-runtime-identity";
-constexpr std::string_view kFamilyApiVersion =
-    "manyforge.apply-component-runtime-family.v1";
 
 [[noreturn]] void Fail(const std::string &detail) {
   throw ApplyComponentDeltaError(detail);
 }
 
-[[nodiscard]] const std::set<std::string_view> &KnownReasons() {
-  static const std::set<std::string_view> reasons{
-      kApplyComponentReasonComponent,   kApplyComponentReasonModelInstances,
-      kApplyComponentReasonBindings,    kApplyComponentReasonDomains,
-      kApplyComponentReasonRuntimeUnits, kApplyComponentReasonCapabilityProviders,
-      kApplyComponentReasonRetainedPolicies,
-  };
-  return reasons;
+[[nodiscard]] bool KnownReason(const std::string_view reason) {
+  return std::find(kComponentSpecSections.begin(), kComponentSpecSections.end(), reason) !=
+         kComponentSpecSections.end();
 }
 
 template <typename Value>
@@ -54,321 +37,12 @@ template <typename Value>
                             }) == values.end();
 }
 
-// -- Canonical projection access --------------------------------------------
-
-[[nodiscard]] const Array &EmptyArray() {
-  static const Array empty;
-  return empty;
-}
-
-[[nodiscard]] const Array &MemberArray(const CanonicalValue &object,
-                                       std::string_view name) {
-  if (!object.is_object()) Fail("retained projection member is not an object");
-  const auto *member = object.find_object_member(name);
-  if (member == nullptr || member->is_null()) return EmptyArray();
-  if (!member->is_array()) {
-    Fail("retained projection member " + std::string(name) + " is not an array");
-  }
-  return member->as_array();
-}
-
-[[nodiscard]] const CanonicalValue &MemberObject(const CanonicalValue &object,
-                                                 std::string_view name) {
-  if (!object.is_object()) Fail("retained projection member is not an object");
-  const auto *member = object.find_object_member(name);
-  if (member == nullptr || !member->is_object()) {
-    Fail("retained projection lacks object member " + std::string(name));
-  }
-  return *member;
-}
-
-/// Elements of `array` whose `key` member is one of `ids`, in canonical order,
-/// optionally without placement members that belong to shared Scene data.
-[[nodiscard]] CanonicalValue Select(const Array &array, std::string_view key,
-                                    const std::set<std::string> &ids,
-                                    bool strip_placement = false) {
-  Array selected;
-  for (const auto &element : array) {
-    if (!element.is_object()) Fail("retained projection record is not an object");
-    const auto *identity = element.find_object_member(key);
-    if (identity == nullptr || !identity->is_string()) {
-      Fail("retained projection record lacks string " + std::string(key));
-    }
-    if (!ids.contains(identity->as_string())) continue;
-    if (!strip_placement) {
-      selected.push_back(element);
-      continue;
-    }
-    Object stripped;
-    for (const auto &[name, value] : element.as_object()) {
-      if (name != "root_pose_in_cell") stripped.emplace_back(name, value);
-    }
-    selected.emplace_back(std::move(stripped));
-  }
-  return CanonicalValue(std::move(selected));
-}
-
-template <typename Id>
-[[nodiscard]] std::set<std::string> Strings(const std::set<Id> &ids) {
-  std::set<std::string> result;
-  for (const auto &id : ids) result.insert(id.value());
-  return result;
-}
-
-// -- Component relations from the typed bundle ------------------------------
-
-using ComponentRelations = detail::ApplyComponentRelations;
-
-[[nodiscard]] const core::ControllableComponentDTO *
-FindComponent(const core::RetainedBundleDTO &bundle,
-              const core::ControllableComponentId &id) {
+[[nodiscard]] bool HasComponent(const core::RetainedBundleDTO &bundle,
+                                const core::ControllableComponentId &id) {
   const auto &components = bundle.cell_graph.controllable_components;
-  const auto found = std::find_if(
-      components.begin(), components.end(),
-      [&](const auto &component) { return component.controllable_component_id == id; });
-  return found == components.end() ? nullptr : &*found;
-}
-
-/// `index` is built from `bundle.cell_graph` (one Apply side).
-[[nodiscard]] ComponentRelations
-Relations(const core::RetainedBundleDTO &bundle, const CellKinematicIndex &index,
-          const core::ControllableComponentDTO &component) {
-  const auto &graph = bundle.cell_graph;
-  ComponentRelations relations;
-  for (const auto &role : component.model_role_bindings) {
-    relations.model_instances.insert(role.model_instance_id);
-  }
-  // A component's launch description carries the static frames of the
-  // components mounted on it (the mount, and a process-less tool's frames),
-  // so their model occurrences are part of its runtime facts.
-  for (const auto &child_id : index.children_of(component.controllable_component_id)) {
-    if (const auto *child = FindComponent(bundle, child_id)) {
-      for (const auto &role : child->model_role_bindings)
-        relations.model_instances.insert(role.model_instance_id);
-    }
-  }
-  relations.runtime_units.insert(component.runtime_unit_ids.begin(),
-                                 component.runtime_unit_ids.end());
-  for (const auto &binding : graph.control_bindings) {
-    if (binding.controllable_component_id != component.controllable_component_id) {
-      continue;
-    }
-    relations.bindings.insert(binding.control_binding_id);
-    relations.domains.insert(binding.control_domain_id);
-    relations.runtime_units.insert(binding.provider_runtime_unit_id);
-  }
-  for (const auto &domain : graph.control_domains) {
-    if (relations.domains.contains(domain.control_domain_id)) {
-      relations.runtime_units.insert(domain.runtime_unit_ids.begin(),
-                                     domain.runtime_unit_ids.end());
-    }
-  }
-  // A component depends on every runtime unit its units depend on.
-  bool grew = true;
-  while (grew) {
-    grew = false;
-    for (const auto &unit : graph.runtime_units) {
-      if (!relations.runtime_units.contains(unit.runtime_unit_id)) continue;
-      for (const auto &dependency : unit.dependency_runtime_unit_ids) {
-        grew = relations.runtime_units.insert(dependency).second || grew;
-      }
-    }
-  }
-  for (const auto &provider : bundle.capability_provider_bindings) {
-    const bool targets_component = std::visit(
-        [&](const auto &target) {
-          using Target = std::decay_t<decltype(target)>;
-          if constexpr (std::is_same_v<Target,
-                                       core::CellGlobalCapabilityProviderTargetDTO>) {
-            return true;
-          } else if constexpr (std::is_same_v<Target, core::ComponentTargetCapabilityProviderTargetDTO>) {
-            return target.controllable_component_id == component.controllable_component_id;
-          } else if constexpr (std::is_same_v<
-                                   Target,
-                                   core::TargetBindingCapabilityProviderTargetDTO>) {
-            return relations.bindings.contains(target.control_binding_id);
-          } else {
-            static_assert(std::is_same_v<
-                          Target, core::ControlDomainCapabilityProviderTargetDTO>);
-            return relations.domains.contains(target.control_domain_id);
-          }
-        },
-        provider.target);
-    if (targets_component) {
-      relations.providers.insert(provider.capability_provider_binding_id);
-    }
-  }
-  return relations;
-}
-
-// -- Runtime identity --------------------------------------------------------
-
-// DX-753: retain exact per-component unit/source identity projection.
-[[nodiscard]] CanonicalValue RuntimeUnitProjection(
-    const RetainedBundle &bundle, const core::ControllableComponentId &component,
-    const std::set<std::string> &units) {
-  auto selected = Select(
-      MemberArray(MemberObject(bundle.normalized_root(), "cell_graph"),
-                  "runtime_units"),
-      "runtime_unit_id", units);
-  auto rows = selected.as_array();
-  for (auto &row : rows) {
-    const auto *profile = row.find_object_member("runtime_profile_id");
-    if (profile == nullptr || !profile->is_string() ||
-        (profile->as_string() != native_execution_runtime_contract::kRuntimeProfileId &&
-         profile->as_string() != ros2_control_execution_runtime_contract::kRuntimeProfileId)) {
-      continue;
-    }
-    const auto *id = row.find_object_member("runtime_unit_id");
-    if (id == nullptr || !id->is_string()) {
-      Fail("native runtime identity lacks its unit");
-    }
-    auto fields = row.as_object();
-    for (auto &[name, value] : fields) {
-      if (name == "configuration") {
-        value = profile->as_string() == native_execution_runtime_contract::kRuntimeProfileId
-            ? native_execution_runtime_contract::component_configuration_projection(
-                  bundle, core::RuntimeUnitId(id->as_string()), component)
-            : ros2_control_execution_runtime_contract::component_configuration_projection(
-                  bundle, core::RuntimeUnitId(id->as_string()), component);
-      }
-    }
-    row = CanonicalValue(std::move(fields));
-  }
-  return CanonicalValue(std::move(rows));
-}
-
-[[nodiscard]] CanonicalValue RuntimeRequirementProjection(
-    const RetainedBundle &bundle, const std::set<std::string> &units) {
-  auto selected = units;
-  for (const auto &unit : bundle.value().cell_graph.runtime_units) {
-    if (unit.runtime_profile_id.value() ==
-        native_execution_runtime_contract::kRuntimeProfileId ||
-        unit.runtime_profile_id.value() ==
-            ros2_control_execution_runtime_contract::kRuntimeProfileId) {
-      // The host's requirement is the union of all installed components.
-      // The verified host offer covers that union; each component's actual
-      // requirements are already bound by its own bindings/providers below.
-      // Hashing the derived union again would couple unrelated controllers.
-      selected.erase(unit.runtime_unit_id.value());
-    }
-  }
-  return Select(MemberArray(bundle.normalized_root(),
-                            "runtime_contract_requirements"),
-                "runtime_unit_id", selected);
-}
-
-/// The canonical fact families one component's runtime depends on, keyed by
-/// the replacement reason each family reports. `index` is built from this
-/// bundle's own graph (one Apply side).
-[[nodiscard]] std::map<std::string_view, CanonicalValue>
-RuntimeFamilies(const RetainedBundle &bundle, const CellKinematicIndex &index,
-                const core::ControllableComponentDTO &component) {
-  const auto &root = bundle.normalized_root();
-  const auto &graph = MemberObject(root, "cell_graph");
-  const auto &products = MemberObject(root, "compiled_products");
-  const auto relations = Relations(bundle.value(), index, component);
-  const auto bindings = Strings(relations.bindings);
-  const auto domains = Strings(relations.domains);
-  const auto units = Strings(relations.runtime_units);
-
-  std::map<std::string_view, CanonicalValue> families;
-  families.emplace(kApplyComponentReasonComponent,
-                   Select(MemberArray(graph, "controllable_components"),
-                          "controllable_component_id",
-                          {component.controllable_component_id.value()}, true));
-  // The mounts on this component (their poses are in its description).
-  Array mounts;
-  for (const auto &attachment : MemberArray(graph, "component_attachments")) {
-    const auto *parent = attachment.find_object_member("parent");
-    const auto *id = parent ? parent->find_object_member("controllable_component_id") : nullptr;
-    if (id != nullptr && id->is_string() &&
-        id->as_string() == component.controllable_component_id.value())
-      mounts.push_back(attachment);
-  }
-  families.emplace(kApplyComponentReasonModelInstances,
-                   CanonicalValue(Object{
-                       {"model_instances",
-                        Select(MemberArray(graph, "model_instances"), "model_instance_id",
-                               Strings(relations.model_instances), true)},
-                       {"component_attachments", CanonicalValue(std::move(mounts))},
-                   }));
-  families.emplace(
-      kApplyComponentReasonBindings,
-      CanonicalValue(Object{
-          {"control_bindings",
-           Select(MemberArray(graph, "control_bindings"), "control_binding_id", bindings)},
-      }));
-  families.emplace(
-      kApplyComponentReasonDomains,
-      CanonicalValue(Object{
-          {"control_domains",
-           Select(MemberArray(graph, "control_domains"), "control_domain_id", domains)},
-          {"desired_control_configurations",
-           Select(MemberArray(root, "desired_control_configurations"), "control_domain_id",
-                  domains)},
-          {"control_domain_products",
-           Select(MemberArray(products, "control_domain_products"), "control_domain_id",
-                  domains)},
-      }));
-  families.emplace(
-      kApplyComponentReasonRuntimeUnits,
-      CanonicalValue(Object{
-          {"runtime_units",
-           RuntimeUnitProjection(bundle, component.controllable_component_id, units)},
-          {"runtime_unit_products",
-           Select(MemberArray(products, "runtime_unit_products"), "runtime_unit_id", units)},
-          {"runtime_contract_requirements",
-           RuntimeRequirementProjection(bundle, units)},
-      }));
-  families.emplace(kApplyComponentReasonCapabilityProviders,
-                   Select(MemberArray(root, "capability_provider_bindings"),
-                          "capability_provider_binding_id",
-                          Strings(relations.providers)));
-  // Retained policy records are cell-wide catalog references; a change is an
-  // explicit, reported dependency of every component rather than a hidden
-  // cell-wide fallback.
-  // Preserve the historical family bytes when the optional budget is absent.
-  if (const auto budget = bundle.value().motion_takeover_preparation_budget_s;
-      budget.has_value() || !bundle.value().scene_pose_sources.empty()) {
-    Object policies{
-        {"retained_policy_records",
-         CanonicalValue(MemberArray(root, "retained_policy_records"))},
-    };
-    if (budget)
-      policies.emplace_back("motion_takeover_preparation_budget_s",
-                            CanonicalValue(*budget));
-    if (!bundle.value().scene_pose_sources.empty())
-      policies.emplace_back(
-          "scene_pose_sources",
-          EncodeScenePoseSources(bundle.value().scene_pose_sources));
-    if (const auto planning = bundle.value().motion_takeover_planning_budget_s)
-      policies.emplace_back("motion_takeover_planning_budget_s",
-                            CanonicalValue(*planning));
-    families.emplace(kApplyComponentReasonRetainedPolicies,
-                     CanonicalValue(std::move(policies)));
-  } else {
-    families.emplace(
-        kApplyComponentReasonRetainedPolicies,
-        CanonicalValue(MemberArray(root, "retained_policy_records")));
-  }
-  return families;
-}
-
-[[nodiscard]] core::ContentDigest
-FamiliesIdentity(const core::ControllableComponentId &id,
-                 const std::map<std::string_view, CanonicalValue> &families) {
-  Object payload{{"controllable_component_id", CanonicalValue(id.value())}};
-  for (const auto &[family, value] : families) {
-    payload.emplace_back(std::string(family), value);
-  }
-  return core::ContentDigest(content_identity::framed_sha256(
-      kRuntimeIdentityDomain, kRuntimeIdentityApiVersion,
-      CanonicalValue(std::move(payload))));
-}
-
-[[nodiscard]] std::string FamilyDigest(const CanonicalValue &value) {
-  return content_identity::framed_sha256(kRuntimeIdentityDomain, kFamilyApiVersion, value);
+  return std::any_of(components.begin(), components.end(), [&](const auto &component) {
+    return component.controllable_component_id == id;
+  });
 }
 
 // -- Shared Scene projection ------------------------------------------------
@@ -414,9 +88,18 @@ AttachmentChangedComponents(const core::CellGraphDTO &old_graph,
     changed.insert(edge.parent.controllable_component_id);
     changed.insert(edge.child.controllable_component_id);
   };
+  // The mount itself; its collision exclusions (and the revision that hashes
+  // them) only change the arm's planning model, which is cell context.
+  const auto same_mount = [](const core::ComponentAttachmentEdgeDTO &left,
+                             const core::ComponentAttachmentEdgeDTO &right) {
+    return left.parent == right.parent && left.child == right.child &&
+           left.child_interface_pose_in_parent_interface ==
+               right.child_interface_pose_in_parent_interface &&
+           left.primary == right.primary;
+  };
   for (const auto &[id, edge] : old_edges) {
     const auto found = new_edges.find(id);
-    if (found == new_edges.end() || *found->second != *edge) {
+    if (found == new_edges.end() || !same_mount(*found->second, *edge)) {
       mark(*edge);
       if (found != new_edges.end()) mark(*found->second);
     }
@@ -425,11 +108,6 @@ AttachmentChangedComponents(const core::CellGraphDTO &old_graph,
     if (!old_edges.contains(id)) mark(*edge);
   }
   return {changed.begin(), changed.end()};
-}
-
-[[nodiscard]] std::vector<core::ControlDomainId>
-SortedDomains(const std::set<core::ControlDomainId> &domains) {
-  return {domains.begin(), domains.end()};
 }
 
 // -- Codec -------------------------------------------------------------------
@@ -532,7 +210,7 @@ bool ApplyComponentChangeDTO::valid() const noexcept {
       candidate_domains.size() > kMaximumApplyComponentDeltaDomains ||
       !SortedUnique(replacement_reasons) ||
       !std::all_of(replacement_reasons.begin(), replacement_reasons.end(),
-                   [](const auto &reason) { return KnownReasons().contains(reason); })) {
+                   [](const auto &reason) { return KnownReason(reason); })) {
     return false;
   }
   switch (disposition) {
@@ -674,16 +352,16 @@ bool apply_component_delta_is_fenced(const ApplyComponentDeltaDTO &delta,
 }
 
 std::optional<core::ContentDigest> derive_component_runtime_identity(
-    const RetainedBundle &bundle, const core::ControllableComponentId &controllable_component_id) {
-  const auto *component = FindComponent(bundle.value(), controllable_component_id);
-  if (component == nullptr) return std::nullopt;
-  const CellKinematicIndex index(bundle.value().cell_graph);
-  return FamiliesIdentity(controllable_component_id,
-                          RuntimeFamilies(bundle, index, *component));
+    const RetainedBundle &bundle, const SiteFacts &site_facts,
+    const core::ControllableComponentId &controllable_component_id) {
+  if (!HasComponent(bundle.value(), controllable_component_id)) return std::nullopt;
+  return component_spec_fingerprint(
+      component_spec(bundle, site_facts, controllable_component_id));
 }
 
 ApplyComponentDeltaDTO derive_apply_component_delta(const RetainedBundle &predecessor,
-                                                    const RetainedBundle &candidate) {
+                                                    const RetainedBundle &candidate,
+                                                    const SiteFacts &site_facts) {
   if (!verify_retained_bundle_identity(predecessor) ||
       !verify_retained_bundle_identity(candidate)) {
     Fail("component delta input failed retained-bundle identity proof");
@@ -704,14 +382,9 @@ ApplyComponentDeltaDTO derive_apply_component_delta(const RetainedBundle &predec
     Fail("component delta exceeds its component bound");
   }
 
-  // One index per Apply side: the predecessor's graph and the candidate's.
-  const CellKinematicIndex old_index(old_bundle.cell_graph);
-  const CellKinematicIndex new_index(new_bundle.cell_graph);
   ApplyComponentDeltaDTO delta;
   delta.components.reserve(ids.size());
   for (const auto &id : ids) {
-    const auto *old_component = FindComponent(old_bundle, id);
-    const auto *new_component = FindComponent(new_bundle, id);
     ApplyComponentChangeDTO change{
         .controllable_component_id = id,
         .disposition = ApplyComponentDisposition::kRetain,
@@ -720,35 +393,30 @@ ApplyComponentDeltaDTO derive_apply_component_delta(const RetainedBundle &predec
         .predecessor_domains = {},
         .candidate_domains = {},
         .replacement_reasons = {}};
-    std::map<std::string_view, CanonicalValue> old_families;
-    std::map<std::string_view, CanonicalValue> new_families;
-    if (old_component != nullptr) {
-      old_families = RuntimeFamilies(predecessor, old_index, *old_component);
-      change.predecessor_runtime_identity = FamiliesIdentity(id, old_families);
-      change.predecessor_domains =
-          SortedDomains(Relations(old_bundle, old_index, *old_component).domains);
+    std::optional<ComponentSpec> old_spec;
+    std::optional<ComponentSpec> new_spec;
+    if (HasComponent(old_bundle, id)) {
+      old_spec = component_spec(predecessor, site_facts, id);
+      change.predecessor_runtime_identity = component_spec_fingerprint(*old_spec);
+      change.predecessor_domains = old_spec->control_domains;
     }
-    if (new_component != nullptr) {
-      new_families = RuntimeFamilies(candidate, new_index, *new_component);
-      change.candidate_runtime_identity = FamiliesIdentity(id, new_families);
-      change.candidate_domains =
-          SortedDomains(Relations(new_bundle, new_index, *new_component).domains);
+    if (HasComponent(new_bundle, id)) {
+      new_spec = component_spec(candidate, site_facts, id);
+      change.candidate_runtime_identity = component_spec_fingerprint(*new_spec);
+      change.candidate_domains = new_spec->control_domains;
     }
-    if (old_component == nullptr) {
+    if (!old_spec) {
       change.disposition = ApplyComponentDisposition::kAdd;
-    } else if (new_component == nullptr) {
+    } else if (!new_spec) {
       change.disposition = ApplyComponentDisposition::kRemove;
     } else if (*change.predecessor_runtime_identity == *change.candidate_runtime_identity) {
       change.disposition = ApplyComponentDisposition::kRetain;
     } else {
       change.disposition = ApplyComponentDisposition::kReplace;
-      for (const auto &[family, value] : old_families) {
-        const auto found = new_families.find(family);
-        if (found == new_families.end() || FamilyDigest(found->second) != FamilyDigest(value)) {
-          change.replacement_reasons.emplace_back(family);
-        }
-      }
-      std::sort(change.replacement_reasons.begin(), change.replacement_reasons.end());
+      // Reasons: the spec sections that differ (kComponentSpecSections is sorted).
+      for (const auto section : kComponentSpecSections)
+        if (old_spec->section(section) != new_spec->section(section))
+          change.replacement_reasons.emplace_back(section);
     }
     delta.components.push_back(std::move(change));
   }
@@ -757,13 +425,6 @@ ApplyComponentDeltaDTO derive_apply_component_delta(const RetainedBundle &predec
       AttachmentChangedComponents(old_bundle.cell_graph, new_bundle.cell_graph);
   if (!delta.valid()) Fail("derived component delta is not canonical");
   return delta;
-}
-
-detail::ApplyComponentRelations
-detail::apply_component_relations(const core::RetainedBundleDTO &bundle,
-                                  const CellKinematicIndex &index,
-                                  const core::ControllableComponentDTO &component) {
-  return Relations(bundle, index, component);
 }
 
 } // namespace manyforge::deployment

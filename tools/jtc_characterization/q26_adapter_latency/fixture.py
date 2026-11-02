@@ -122,7 +122,7 @@ def main() -> int:
                                measured_budget=50, warmup_budget=5,
                                resource_before=resource_facts())
                 try:
-                    probe.start()  # Direct fixture activation, never CCLC proof.
+                    probe.start()  # Direct fixture activation, never a component action.
                     if load:
                         load.start()
                     with (output / 'adapter-probe.log').open('w') as log:

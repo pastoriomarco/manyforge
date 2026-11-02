@@ -85,14 +85,17 @@ std::string Redigest(std::string source) {
   return source;
 }
 
+// V2-5: acknowledgement never gates work. The Program failure alarm needs
+// acknowledgement for History but gates no motion (an automatic or operator
+// Retry is never refused because it is unacknowledged).
 TEST(OperatorAlarmCatalog,
-     ProgramFailureHasDistinctProgramAuthorityAndExactMotionScope) {
+     ProgramFailureHasDistinctProgramAuthorityAndGatesNoMotion) {
   const auto catalog = OperatorAlarmCatalog::Load(PackagedCatalog());
   const auto *definition = catalog.Find("manyforge.program.operation_failure");
   ASSERT_NE(definition, nullptr);
   EXPECT_EQ(definition->priority, "high");
   EXPECT_TRUE(definition->acknowledgement_required);
-  EXPECT_TRUE(definition->requires_motion_attention);
+  EXPECT_FALSE(definition->requires_motion_attention);
   EXPECT_EQ(definition->set_authority,
             "manyforge.program_runner.failure_condition");
   EXPECT_EQ(definition->clear_authority, definition->set_authority);
@@ -105,7 +108,7 @@ TEST(OperatorAlarmCatalog, LoadsThePackagedDigestVerifiedClosedCatalog) {
   EXPECT_EQ(catalog.catalog_version(), "2.9.0");
   EXPECT_EQ(catalog.descriptor_digest(),
             "sha256:"
-            "8101bde7ece439e7cbc8d8ff1c47570d2a1c09b447d642e3a31638e2589084c6");
+            "366e2643d348456d350b638b9b2c2ab22828f2475e05f26b6d9f6b1941623413");
   ASSERT_FALSE(catalog.definitions().empty());
   // The dedicated carried-object alarm repeats its error row's compact text,
   // needs acknowledgement and gates no motion.
@@ -122,7 +125,7 @@ TEST(OperatorAlarmCatalog, LoadsThePackagedDigestVerifiedClosedCatalog) {
     ASSERT_NE(fault, nullptr);
     EXPECT_EQ(fault->priority, "high");
     EXPECT_TRUE(fault->acknowledgement_required);
-    EXPECT_TRUE(fault->requires_motion_attention);
+    EXPECT_FALSE(fault->requires_motion_attention);  // V2-5
     EXPECT_EQ(fault->adapter_id, "manyforge.alarm_adapter.runtime_fault_condition");
     EXPECT_EQ(fault->max_evidence_refs, 1U);
   }
@@ -132,7 +135,7 @@ TEST(OperatorAlarmCatalog, LoadsThePackagedDigestVerifiedClosedCatalog) {
   const auto *collision = catalog.Find("manyforge.motion.runtime_collision");
   ASSERT_NE(collision, nullptr);
   EXPECT_EQ(collision->priority, "critical");
-  EXPECT_TRUE(collision->requires_motion_attention);
+  EXPECT_FALSE(collision->requires_motion_attention);  // V2-5
   EXPECT_TRUE(collision->acknowledgement_required);
   EXPECT_EQ(collision->max_evidence_refs, 32U);
   // Lost measured robot state stops motion through the same containment;
@@ -145,7 +148,7 @@ TEST(OperatorAlarmCatalog, LoadsThePackagedDigestVerifiedClosedCatalog) {
   EXPECT_EQ(observation_lost->set_authority, collision->set_authority);
   EXPECT_EQ(observation_lost->clear_authority, collision->clear_authority);
   EXPECT_EQ(observation_lost->adapter_id, collision->adapter_id);
-  EXPECT_TRUE(observation_lost->requires_motion_attention);
+  EXPECT_FALSE(observation_lost->requires_motion_attention);  // V2-5
   EXPECT_TRUE(observation_lost->acknowledgement_required);
   EXPECT_EQ(observation_lost->max_evidence_refs, 32U);
   const auto *scope = catalog.Find("manyforge.runtime.alarm_scope_unavailable");
@@ -153,6 +156,7 @@ TEST(OperatorAlarmCatalog, LoadsThePackagedDigestVerifiedClosedCatalog) {
   EXPECT_EQ(scope->alarm_class, "runtime_health");
   EXPECT_EQ(scope->adapter_id,
             "manyforge.alarm_adapter.runtime_health_condition");
+  // The one alarm that gates motion: while active (no acknowledgement).
   EXPECT_TRUE(scope->requires_motion_attention);
   EXPECT_FALSE(scope->acknowledgement_required);
   EXPECT_FALSE(scope->acknowledgement_reason_required);
@@ -278,4 +282,19 @@ TEST(OperatorAlarmCatalog, RejectsSymlinkAndNonCatalogFiles) {
 }
 
 } // namespace
+// V2-5: acknowledgement never gates work. The loader refuses an alarm that
+// both requires acknowledgement and gates motion; only a condition interlock
+// (no acknowledgement) can gate motion.
+TEST(OperatorAlarmCatalog, RefusesAnAcknowledgementAlarmThatGatesMotion) {
+  const auto source = ReadFile(PackagedCatalog());
+  // The first definition (runtime collision) requires acknowledgement.
+  constexpr std::string_view kNoMotion = "    requires_motion_attention: false\n";
+  auto gating = source;
+  const auto field = gating.find(kNoMotion);
+  ASSERT_NE(field, std::string::npos);
+  ASSERT_LT(field, gating.find("  - definition_id:", gating.find("  - definition_id:") + 1U));
+  gating.replace(field, kNoMotion.size(), "    requires_motion_attention: true\n");
+  EXPECT_THROW(OperatorAlarmCatalog::Decode(Redigest(gating)), OperatorAlarmCatalogError);
+}
+
 } // namespace manyforge::headless

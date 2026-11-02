@@ -408,6 +408,7 @@ def _facts_for_cycle(cycle: dict[str, Any]) -> ComponentOverviewFacts:
         execution_identity_response={},
         execution_targets_response={},
         execution_control_response={},
+        component_model=None,
         errors={},
     )
 
@@ -467,7 +468,6 @@ def test_event_pump_reopens_admission_for_existing_session_without_events() -> N
             execution := SimpleNamespace(
                 identity=identity,
                 events=events,
-                stop_fault=lambda: {"ok": True, "stop_fault": None},
                 subscribe_events=lambda after_cursor, owner_epoch: paged_subscription(
                     execution, after_cursor, owner_epoch
                 ),
@@ -646,7 +646,7 @@ def test_global_rules_ride_the_shell_beside_progress_without_owner_reads() -> No
             SimpleNamespace(program_cycle_status=_cycle, component_overview_facts=lambda **_kwargs: _facts_for_cycle(_cycle())),
             ingress, program_runner_websocket_url=None,
         )
-        rules = [{"rule_id": "door", "state": "latched", "keys": []}]
+        rules = [{"rule_id": "door", "state": "inactive", "keys": []}]
         subscription = await source.subscribe()
         try:
             await asyncio.wait_for(subscription.wake.wait(), 1)
@@ -2602,34 +2602,6 @@ def test_control_source_reduces_new_cycle_from_cached_owner_facts() -> None:
         asyncio.run(exercise())
     finally:
         ingress.close()
-
-
-def test_standalone_overview_reuses_active_control_fact_reduction() -> None:
-    class NoReadService:
-        def __getattr__(self, name: str):
-            raise AssertionError(f"active Overview must not read {name}")
-
-    ingress = _ingress([])
-    source = HeadlessControlStateSource(
-        NoReadService(),  # type: ignore[arg-type]
-        ingress,
-        program_runner_websocket_url=None,
-    )
-    subscription = ControlStateSubscription(asyncio.Event())
-    source._subscriptions.add(subscription)  # noqa: SLF001
-    cycle = _cycle()
-    source._cycle = cycle  # noqa: SLF001
-    source._facts = _facts_for_cycle(cycle)  # noqa: SLF001
-    source._shell = _shell_for_cycle(cycle)  # noqa: SLF001
-    source._program_source_current = True  # noqa: SLF001
-
-    overview = source.current_component_overview()
-
-    assert overview == source._shell["component_overview"]  # noqa: SLF001
-    assert overview is not source._shell["component_overview"]  # noqa: SLF001
-    source._subscriptions.clear()  # noqa: SLF001
-    assert source.current_component_overview() is None
-    ingress.close()
 
 
 def _control_with_pose(positions: list[float]) -> tuple[dict[str, Any], dict[str, Any]]:

@@ -802,7 +802,10 @@ class AuthoringAdmissionCoordinator:
         admission = self._client.authoring_admission()
         if admission.get("authoring_allowed") is not True:
             raise refused_before_effect(
-                409, {"code": "authoring_not_ready", "message": "editing requires Idle"}
+                409, {"code": "authoring_not_ready", "message": (
+                    "Authoring is locked by the backend: a run, a manual operation or "
+                    "an unfinished Apply holds it. Nothing changed. If none is in "
+                    "progress, restart the workbench.")}
             )
         # The envelope's admission generation is claim evidence only; the
         # Kernel admits the claim on its current facts.

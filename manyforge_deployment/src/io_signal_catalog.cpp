@@ -1,10 +1,10 @@
 #include <manyforge_deployment/io_signal_catalog.hpp>
-#include <manyforge_core/component_lifecycle_budget.hpp>
 
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <limits>
+#include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/io_signal_descriptor.hpp>
 #include <manyforge_core/types/component_lifecycle.hpp>
@@ -12,13 +12,11 @@
 #include <set>
 #include <stdexcept>
 #include <tuple>
+#include <type_traits>
+#include <variant>
 
 namespace manyforge::deployment {
 namespace {
-
-// The default component lifecycle budget, in the field's seconds.
-constexpr double kDefaultDeviceLifecycleTimeoutS =
-    static_cast<double>(core::kDefaultLifecycleBudgetNs) / 1'000'000'000.0;
 
 struct InvalidConfiguration final : std::runtime_error {
   using std::runtime_error::runtime_error;
@@ -54,23 +52,26 @@ void fields(const Object &object,
   }
 }
 
+// An identity token: 1-128 bytes of `[A-Za-z0-9._-]`, starting alphanumeric.
+bool identity_token(std::string_view token) {
+  const auto alpha_numeric = [](unsigned char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+           (c >= '0' && c <= '9');
+  };
+  return !token.empty() && token.size() <= 128U &&
+         alpha_numeric(token.front()) &&
+         std::all_of(token.begin(), token.end(), [&](unsigned char c) {
+           return alpha_numeric(c) || c == '.' || c == '_' || c == '-';
+         });
+}
+
 std::string text(const Object &object, std::string_view key,
                  bool identity = true) {
   const auto &result = value<std::string>(member(object, key));
   if (result.empty() || result.size() > (identity ? 128U : 4096U) ||
-      result.find('\0') != std::string::npos)
+      result.find('\0') != std::string::npos ||
+      (identity && !identity_token(result)))
     throw InvalidConfiguration("io_signal_configuration_invalid");
-  if (identity) {
-    const auto alpha_numeric = [](unsigned char c) {
-      return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-             (c >= '0' && c <= '9');
-    };
-    if (!alpha_numeric(result.front()) ||
-        !std::all_of(result.begin(), result.end(), [&](unsigned char c) {
-          return alpha_numeric(c) || c == '.' || c == '_' || c == '-';
-        }))
-      throw InvalidConfiguration("io_signal_configuration_invalid");
-  }
   return result;
 }
 
@@ -126,23 +127,38 @@ core::ResourceId output_resource(const std::string &profile,
   return core::ResourceId("io.output." + digest.substr(7U));
 }
 
+content_identity::CanonicalValue canonical(const core::JsonValueDTO &input) {
+  using content_identity::CanonicalValue;
+  return std::visit(
+      [](const auto &typed) -> CanonicalValue {
+        using T = std::decay_t<decltype(typed)>;
+        if constexpr (std::is_same_v<T, Array>) {
+          CanonicalValue::Array rows;
+          for (const auto &row : typed) rows.push_back(canonical(row));
+          return CanonicalValue(std::move(rows));
+        } else if constexpr (std::is_same_v<T, Object>) {
+          CanonicalValue::Object rows;
+          for (const auto &[name, row] : typed) rows.emplace_back(name, canonical(row));
+          return CanonicalValue(std::move(rows));
+        } else {
+          return CanonicalValue(typed);
+        }
+      },
+      input.value);
+}
+
 core::ResourceId
 typed_output_resource(const IoSignalProviderConfiguration &address) {
   using content_identity::CanonicalValue;
   CanonicalValue::Object key{{"profile", CanonicalValue(address.profile)}};
-  if (address.profile == "ur_set_io") {
-    key.emplace_back("service", CanonicalValue(*address.service));
-    key.emplace_back("function", CanonicalValue("set_digital_out"));
-    key.emplace_back("pin", CanonicalValue(static_cast<double>(*address.pin)));
-  } else if (address.profile == "xarm_digital") {
-    key.emplace_back("robot_component_id",
-                     CanonicalValue(address.robot_component_id->value()));
-    key.emplace_back("bank", CanonicalValue(*address.bank));
-    key.emplace_back("pin", CanonicalValue(static_cast<double>(*address.pin)));
-  } else {
+  if (address.profile == "ros2_control_gpio") {
     key.emplace_back("topic", CanonicalValue(*address.topic));
     key.emplace_back("group", CanonicalValue(*address.group));
     key.emplace_back("interface_name", CanonicalValue(*address.interface_name));
+  } else {
+    // An adapter output: its whole provider object is its channel.
+    key.emplace_back("adapter_fields",
+                     canonical(core::JsonValueDTO{address.adapter_fields}));
   }
   const auto digest = content_identity::framed_sha256(
       "io-output-resource", "manyforge.io_output_channel.v1",
@@ -150,52 +166,13 @@ typed_output_resource(const IoSignalProviderConfiguration &address) {
   return core::ResourceId("io.output." + digest.substr(7U));
 }
 
-void xarm_address(const Object &provider, IoSignalProviderConfiguration &address,
-                  bool output) {
-  address.robot_component_id =
-      core::ControllableComponentId(text(provider, "robot_component_id"));
-  address.bank = text(provider, "bank");
-  if (*address.bank != "tool" && *address.bank != "controller")
-    throw InvalidConfiguration("io_xarm_bank_invalid");
-  const auto maximum = *address.bank == "tool" ? (output ? 4U : 1U) : 15U;
-  address.pin = static_cast<std::size_t>(counter(provider, "pin", maximum));
-}
-
-// V-B4: an xArm-family robot is one whose compiled controller profile names
-// the `xarm` adapter family (robot data, never implied by the profile id).
-bool has_xarm_robot(const core::CellGraphDTO &graph,
-                    const core::ControllableComponentId &robot) {
-  const auto component = std::find_if(
-      graph.controllable_components.begin(), graph.controllable_components.end(),
-      [&](const auto &row) { return row.controllable_component_id == robot; });
-  if (component == graph.controllable_components.end())
-    return false;
-  for (const auto &unit : graph.runtime_units) {
-    if (std::find(component->runtime_unit_ids.begin(), component->runtime_unit_ids.end(),
-                  unit.runtime_unit_id) == component->runtime_unit_ids.end())
-      continue;
-    const auto profiles = unit.configuration.find("controller_profiles");
-    if (profiles == unit.configuration.end())
-      continue;
-    const auto *rows = std::get_if<Array>(&profiles->second.value);
-    if (!rows)
-      continue;
-    for (const auto &item : *rows) {
-      const auto *row = std::get_if<Object>(&item.value);
-      if (!row)
-        continue;
-      const auto id = row->find("controllable_component_id");
-      const auto family = row->find("adapter_family");
-      if (id == row->end() || family == row->end())
-        continue;
-      const auto *selected_id = std::get_if<std::string>(&id->second.value);
-      const auto *selected_family = std::get_if<std::string>(&family->second.value);
-      if (selected_id && *selected_id == robot.value() && selected_family &&
-          *selected_family == "xarm")
-        return true;
-    }
-  }
-  return false;
+// An adapter profile's provider object without its `profile` (and, for an
+// input, its generic `ingress_depth`): opaque here, the adapter validates it.
+Object adapter_fields(const Object &provider) {
+  Object result = provider;
+  result.erase("profile");
+  result.erase("ingress_depth");
+  return result;
 }
 
 } // namespace
@@ -218,12 +195,8 @@ ResolveRetainedIoSignalCatalog(
                         std::optional<std::string>,
                         std::optional<core::IoSignalLivenessMode>,
                         std::optional<core::SceneResourceId>,
-                        std::optional<core::ControllableComponentId>,
-                        std::optional<std::string>>>
+                        std::optional<core::ControllableComponentId>>>
         sources;
-    std::map<std::pair<core::ControllableComponentId, std::string>,
-             std::pair<core::InterruptSourceId, core::ControllableComponentId>>
-        xarm_input_banks;
     for (const auto &unit : graph.runtime_units) {
       if (runtime_unit_id && unit.runtime_unit_id != *runtime_unit_id)
         continue;
@@ -242,7 +215,8 @@ ResolveRetainedIoSignalCatalog(
         if (output)
           fields(row, {"controllable_component_id", "command_target_id",
                        "resource_role_id", "signal_name", "source_id",
-                       "value_type", "direction", "provider"});
+                       "value_type", "direction", "provider"},
+                 {"controller_owned"});
         else
           fields(row, {"controllable_component_id", "command_target_id",
                        "resource_role_id", "signal_name", "source_id",
@@ -265,6 +239,9 @@ ResolveRetainedIoSignalCatalog(
           throw InvalidConfiguration("io_signal_owner_mismatch");
         if (text(row, "value_type") != "bool")
           throw InvalidConfiguration("io_signal_type_mismatch");
+        // `<output>.changed_outside` names the core-held signal (CONTRACTS §7).
+        if (text(row, "signal_name").ends_with(core::kChangedOutsideSignalSuffix))
+          throw InvalidConfiguration("io_system_signal_conflict");
         if (output) {
           const auto &provider = value<Object>(member(row, "provider"));
           IoSignalProviderConfiguration address{
@@ -278,25 +255,26 @@ ResolveRetainedIoSignalCatalog(
             fields(provider, {"profile", "channel"});
             address.channel = text(provider, "channel");
             channel = *address.channel;
-          } else if (address.profile == "ur_set_io") {
-            fields(provider, {"profile", "service", "pin"});
-            address.service = absolute_address(provider, "service");
-            address.pin =
-                static_cast<std::size_t>(counter(provider, "pin", 17U));
-          } else if (address.profile == "xarm_digital") {
-            fields(provider, {"profile", "robot_component_id", "bank", "pin"});
-            xarm_address(provider, address, true);
-            if (!has_xarm_robot(graph, *address.robot_component_id))
-              throw InvalidConfiguration("io_xarm_robot_not_found");
           } else if (address.profile == "ros2_control_gpio") {
             fields(provider, {"profile", "topic", "group", "interface_name"});
             address.topic = absolute_address(provider, "topic");
             address.group = provider_selector(provider, "group");
             address.interface_name =
                 provider_selector(provider, "interface_name");
+          } else if (!IsGenericIoProviderProfile(address.profile)) {
+            // An output has no ingress queue.
+            if (provider.contains("ingress_depth"))
+              throw InvalidConfiguration("io_signal_configuration_invalid");
+            address.adapter_fields = adapter_fields(provider);
           } else {
             throw InvalidConfiguration("io_signal_provider_unsupported");
           }
+          // A machine's I/O bank output (CONTRACTS §16): one channel per
+          // signal of its component.
+          const bool component_adapter =
+              address.profile == kComponentAdapterIoProfile;
+          if (component_adapter)
+            channel = component_id.value() + "/" + text(row, "signal_name");
           core::IoSignalDescriptorDTO descriptor{
               {component_id, text(row, "signal_name")},
               core::InterruptSourceId(text(row, "source_id")),
@@ -305,18 +283,25 @@ ResolveRetainedIoSignalCatalog(
               core::IoSignalUpdateMode::kChangeOnly,
               core::IoTransitionCapability::kSampledOnly,
               {core::IoFreshnessMode::kProviderValidity, {}},
-              (address.profile == "ur_set_io" || address.profile == "xarm_digital" ||
-               address.profile == "ros2_control_gpio")
+              (address.profile == "ros2_control_gpio" ||
+               (!IsGenericIoProviderProfile(address.profile) && !component_adapter))
                   ? typed_output_resource(address)
                   : output_resource(address.profile, channel)};
+          // CONTRACTS §7: `controller_owned` authored, default false.
+          // Read-back: a machine's I/O bank reports its outputs, and Mock
+          // outputs report the written value back (D2); ros_set_bool and
+          // ros2_control_gpio outputs have none.
+          descriptor.readback =
+              component_adapter || address.profile == "mock_output";
+          if (const auto owned = row.find("controller_owned"); owned != row.end())
+            descriptor.controller_owned = value<bool>(owned->second);
           if (!core::ComputeIoSignalDescriptorDigest(descriptor).ok())
             throw InvalidConfiguration("io_signal_descriptor_invalid");
           const auto owner = std::tuple{
               unit.runtime_unit_id,  address.profile, address.topic,
               address.ingress_depth, address.service, address.channel,
               descriptor.liveness,
-              address.target_scene_resource_id, address.robot_component_id,
-              address.bank};
+              address.target_scene_resource_id, address.robot_component_id};
           const auto [source, inserted] =
               sources.emplace(descriptor.source_id, owner);
           if ((!inserted && source->second != owner) ||
@@ -399,25 +384,6 @@ ResolveRetainedIoSignalCatalog(
             descriptor.liveness = core::IoSignalLivenessMode::kChangeOnly;
           else
             throw InvalidConfiguration("io_signal_liveness_unsupported");
-        } else if (address.profile == "ur_io_states") {
-          fields(provider, {"profile", "topic", "pin", "ingress_depth"});
-          address.topic = absolute_address(provider, "topic");
-          address.pin = static_cast<std::size_t>(counter(provider, "pin", 17U));
-          descriptor.liveness = core::IoSignalLivenessMode::kPeriodic;
-        } else if (address.profile == "xarm_digital") {
-          fields(provider, {"profile", "robot_component_id", "bank", "pin",
-                            "ingress_depth"});
-          xarm_address(provider, address, false);
-          if (!has_xarm_robot(graph, *address.robot_component_id))
-            throw InvalidConfiguration("io_xarm_robot_not_found");
-          if (freshness_mode != "sample_age")
-            throw InvalidConfiguration("io_signal_provider_unsupported");
-          descriptor.liveness = core::IoSignalLivenessMode::kPeriodic;
-          const auto [found, inserted] = xarm_input_banks.emplace(
-              std::pair{*address.robot_component_id, *address.bank},
-              std::pair{descriptor.source_id, component_id});
-          if (!inserted && found->second != std::pair{descriptor.source_id, component_id})
-            throw InvalidConfiguration("io_xarm_bank_multiple_sources");
         } else if (address.profile == "ros2_control_gpio") {
           fields(provider, {"profile", "topic", "group", "interface_name",
                             "ingress_depth"});
@@ -436,6 +402,11 @@ ResolveRetainedIoSignalCatalog(
               provider_selector(provider, "target_scene_resource_id"));
           if (freshness_mode != "sample_age")
             throw InvalidConfiguration("io_signal_provider_unsupported");
+          descriptor.liveness = core::IoSignalLivenessMode::kPeriodic;
+        } else if (!IsGenericIoProviderProfile(address.profile)) {
+          // An adapter input, a machine's I/O bank included: sampled
+          // periodically by its adapter (the xArm `xarm_io_states` stream).
+          address.adapter_fields = adapter_fields(provider);
           descriptor.liveness = core::IoSignalLivenessMode::kPeriodic;
         } else {
           throw InvalidConfiguration("io_signal_provider_unsupported");
@@ -465,8 +436,7 @@ ResolveRetainedIoSignalCatalog(
             unit.runtime_unit_id,  address.profile, address.topic,
             address.ingress_depth, address.service, address.channel,
             descriptor.liveness,
-            address.target_scene_resource_id, address.robot_component_id,
-            address.bank};
+            address.target_scene_resource_id, address.robot_component_id};
         const auto [source, inserted] =
             sources.emplace(descriptor.source_id, owner);
         if ((!inserted && source->second != owner) ||
@@ -506,9 +476,38 @@ ResolveRetainedIoSignalCatalog(
   }
 }
 
+bool IsGenericIoProviderProfile(const std::string_view profile) noexcept {
+  return profile == "mock" || profile == "mock_output" ||
+         profile == "ros_bool" || profile == "ros_set_bool" ||
+         profile == "ros2_control_gpio" || profile == "geometric_contact" ||
+         profile == kSystemCarriedObjectProfile;
+}
+
+bool IsAcknowledgedIoOutputProfile(const std::string_view profile) noexcept {
+  return profile == "ros_set_bool" ||
+         (!IsGenericIoProviderProfile(profile) &&
+          profile != kComponentAdapterIoProfile);
+}
+
 std::string CarriedObjectLostSignalName(const std::string_view command_target_id) {
   return std::string(kCarriedObjectLostSignalPrefix) +
          std::string(command_target_id);
+}
+
+const RetainedIoSignalConfiguration *FindChangedOutsideOutput(
+    std::span<const RetainedIoSignalConfiguration> signals,
+    const core::ControllableComponentId &component,
+    std::string_view signal_name) {
+  if (!signal_name.ends_with(core::kChangedOutsideSignalSuffix))
+    return nullptr;
+  signal_name.remove_suffix(core::kChangedOutsideSignalSuffix.size());
+  const auto found =
+      std::find_if(signals.begin(), signals.end(), [&](const auto &row) {
+        return row.descriptor.direction == core::IoSignalDirection::kOutput &&
+               row.descriptor.signal_id.controllable_component_id == component &&
+               row.descriptor.signal_id.name == signal_name;
+      });
+  return found == signals.end() ? nullptr : &*found;
 }
 
 core::Result<std::vector<RetainedIoSignalConfiguration>>
@@ -591,13 +590,6 @@ core::Result<void> MaterializeRetainedIoProviderDevices(
           const auto &row = value<Object>(item);
           const auto &provider = value<Object>(member(row, "provider"));
           const auto profile = text(provider, "profile");
-          if (profile != "mock" && profile != "ros_bool" &&
-              profile != "geometric_contact" &&
-              profile != "mock_output" && profile != "ros_set_bool" &&
-              profile != "ur_io_states" && profile != "ur_set_io" &&
-              profile != "xarm_digital" &&
-              profile != "ros2_control_gpio")
-            throw InvalidConfiguration("io_signal_provider_unsupported");
           const core::ControllableComponentId component(
               text(row, "controllable_component_id"));
           const auto owner = std::find_if(
@@ -612,8 +604,7 @@ core::Result<void> MaterializeRetainedIoProviderDevices(
           if (owner == graph.controllable_components.end())
             throw InvalidConfiguration("io_signal_owner_mismatch");
           generic_devices.insert(component);
-          if ((profile == "ros_set_bool" || profile == "ur_set_io" ||
-               profile == "xarm_digital") &&
+          if (IsAcknowledgedIoOutputProfile(profile) &&
               text(row, "direction") == "output")
             ros_output_devices.insert(component);
         }
@@ -632,7 +623,8 @@ core::Result<void> MaterializeRetainedIoProviderDevices(
           auto row = value<Object>(item);
           fields(
               row, {"controllable_component_id"},
-              {"lifecycle_command_timeout_s", "output_source_ack_timeout_s"});
+              {"lifecycle_command_timeout_s", "member_role",
+               "output_source_ack_timeout_s", "owner_component_id"});
           const core::ControllableComponentId component(
               text(row, "controllable_component_id"));
           if (!generic_devices.contains(component))
@@ -643,7 +635,7 @@ core::Result<void> MaterializeRetainedIoProviderDevices(
             throw InvalidConfiguration(
                 "io_provider_device_output_budget_unused");
           row.try_emplace("lifecycle_command_timeout_s",
-                          core::JsonValueDTO{kDefaultDeviceLifecycleTimeoutS});
+                          core::JsonValueDTO{core::kDefaultLifecycleCommandTimeoutS});
           if (!devices.emplace(component, std::move(row)).second)
             throw InvalidConfiguration(
                 "io_provider_device_configuration_invalid");
@@ -654,7 +646,7 @@ core::Result<void> MaterializeRetainedIoProviderDevices(
             component,
             Object{{"controllable_component_id",
                     core::JsonValueDTO{component.value()}},
-                   {"lifecycle_command_timeout_s", core::JsonValueDTO{kDefaultDeviceLifecycleTimeoutS}}});
+                   {"lifecycle_command_timeout_s", core::JsonValueDTO{core::kDefaultLifecycleCommandTimeoutS}}});
       if (!generic_devices.empty() || declared != unit.configuration.end()) {
         Array normalized;
         for (auto &[component, row] : devices) {
@@ -708,7 +700,8 @@ ResolveRetainedIoProviderDevices(
         const auto &row = value<Object>(item);
         fields(row,
                {"controllable_component_id", "lifecycle_command_timeout_s"},
-               {"output_source_ack_timeout_s"});
+               {"member_role", "output_source_ack_timeout_s",
+                "owner_component_id"});
         const core::ControllableComponentId component(
             text(row, "controllable_component_id"));
         const bool configured = std::any_of(
@@ -737,9 +730,7 @@ ResolveRetainedIoProviderDevices(
                      signal.descriptor.signal_id.controllable_component_id == component &&
                      signal.descriptor.direction ==
                          core::IoSignalDirection::kOutput &&
-                     (signal.provider.profile == "ros_set_bool" ||
-                      signal.provider.profile == "ur_set_io" ||
-                      signal.provider.profile == "xarm_digital");
+                     IsAcknowledgedIoOutputProfile(signal.provider.profile);
             });
         const auto output_budget = row.find("output_source_ack_timeout_s");
         if (ros_output != (output_budget != row.end()))
@@ -760,8 +751,14 @@ ResolveRetainedIoProviderDevices(
                 "io_provider_device_output_budget_invalid");
           output_budget_ns = static_cast<core::Duration>(output_ns);
         }
+        // CONTRACTS §16: a machine member's owner and role.
+        const auto optional_text = [&](std::string_view key) {
+          return row.contains(key) ? std::optional(text(row, key)) : std::nullopt;
+        };
         result.push_back({unit.runtime_unit_id, component,
-                          static_cast<core::Duration>(ns), output_budget_ns});
+                          static_cast<core::Duration>(ns), output_budget_ns,
+                          optional_text("owner_component_id"),
+                          optional_text("member_role")});
       }
     }
     std::sort(result.begin(), result.end(), [](const auto &a, const auto &b) {

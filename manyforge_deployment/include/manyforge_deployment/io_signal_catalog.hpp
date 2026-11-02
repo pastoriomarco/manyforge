@@ -3,12 +3,30 @@
 #include <manyforge_core/types/cell_graph.hpp>
 #include <manyforge_core/types/deployment_applicability.hpp>
 #include <manyforge_core/types/io_signal.hpp>
+#include <manyforge_core/types/json_value.hpp>
+#include <manyforge_core/types/robot_defaults.generated.hpp>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
 
 namespace manyforge::deployment {
+
+/// The default lifecycle step budget of every component
+/// (core::kDefaultLifecycleCommandTimeoutS, manyforge_core/resources/robot_defaults.tsv).
+/// A Deployment `lifecycle_command_timeout_s` replaces it per component.
+inline constexpr core::Duration kDefaultLifecycleBudgetNs =
+    static_cast<core::Duration>(core::kDefaultLifecycleCommandTimeoutS * 1'000'000'000.0);
+
+/// The provider manifests of the model-free components: I/O devices, pose
+/// sources and AI models.
+inline constexpr std::string_view kIoProviderManifestId =
+    "manyforge.provider.io_signals";
+inline constexpr std::string_view kPoseSourceProviderManifestId =
+    "manyforge.provider.pose_source";
+inline constexpr std::string_view kAiModelProviderManifestId =
+    "manyforge.provider.ai_model";
 
 struct IoSignalProviderConfiguration final {
   std::string profile;
@@ -21,19 +39,34 @@ struct IoSignalProviderConfiguration final {
   std::optional<std::string> service{};
   /// One actual synthetic output channel, shared by every local alias.
   std::optional<std::string> channel{};
-  std::optional<std::size_t> pin{};
   std::optional<std::string> group{};
   std::optional<std::string> interface_name{};
   std::optional<core::SceneResourceId> target_scene_resource_id{};
-  /// Robot observed by geometric contact or owning an xArm GPIO address.
+  /// Robot observed by geometric contact.
   std::optional<core::ControllableComponentId> robot_component_id{};
-  std::optional<std::string> bank{};
   /// Optional synthetic feedback from an output of this I/O component.
   std::optional<std::string> echo_output_signal_name{};
   std::optional<core::Duration> echo_delay_ns{};
+  /// An adapter profile's provider object without `profile` and
+  /// `ingress_depth`: opaque here, validated by the adapter that serves the
+  /// profile (its address, pins, banks, ranges). Empty for generic profiles.
+  core::JsonObjectDTO adapter_fields{};
   friend bool operator==(const IoSignalProviderConfiguration &,
                          const IoSignalProviderConfiguration &) = default;
 };
+
+/// The generic provider profiles validated here (`mock`, `mock_output`,
+/// `ros_bool`, `ros_set_bool`, `ros2_control_gpio`, `geometric_contact`, the
+/// compiled `system_carried_object`). Every other `profile` token names an
+/// adapter profile: its provider object is kept opaque (`adapter_fields`) and
+/// the adapter serving it validates it.
+[[nodiscard]] bool IsGenericIoProviderProfile(std::string_view profile) noexcept;
+
+/// An output whose provider acknowledges each write (`ros_set_bool` and every
+/// adapter profile but a machine's I/O bank, `component_adapter`, whose
+/// vendor family reports the write result itself); its device carries
+/// `output_source_ack_timeout_s`.
+[[nodiscard]] bool IsAcknowledgedIoOutputProfile(std::string_view profile) noexcept;
 
 /// Resolved from the owning retained runtime unit's typed configuration, never
 /// from a Program request. Addresses stay in this sealed configuration value.
@@ -52,10 +85,14 @@ struct RetainedIoProviderDeviceConfiguration final {
   /// Required after normalization for acknowledged ROS service outputs.
   /// Mock outputs have immediate synthetic acceptance and no deadline budget.
   std::optional<core::Duration> output_source_ack_timeout_ns{};
+  /// CONTRACTS §16: set on a machine's I/O member (its owner's component id
+  /// and its member role); absent otherwise.
+  std::optional<std::string> owner_component_id{};
+  std::optional<std::string> member_role{};
 };
 
 /// Applies the default component lifecycle budget (10 s,
-/// `core::kDefaultLifecycleBudgetNs`) per device before schema normalization
+/// `kDefaultLifecycleBudgetNs`) per device before schema normalization
 /// and graph identity. Ordinary configurations gain no synthetic device rows;
 /// provider-owned outputs get the same acknowledged-service policy.
 [[nodiscard]] core::Result<void> MaterializeRetainedIoProviderDevices(
@@ -98,15 +135,31 @@ inline constexpr std::string_view kGripperCommandCapabilityId =
 [[nodiscard]] std::string
 CarriedObjectLostSignalName(std::string_view command_target_id);
 
-/// The authored catalog plus the compiled system signals: input, bool,
+/// CONTRACTS §16: the provider profile of a machine's I/O bank on the real
+/// lane (`{bank}`; its vendor family serves it through the owner's
+/// connection). Inputs sampled periodically (sample-age freshness), outputs
+/// with read-back, one channel per signal.
+inline constexpr std::string_view kComponentAdapterIoProfile =
+    "component_adapter";
+
+/// The authored catalog plus the compiled system signals (input, bool,
 /// change_only, sampled_only, freshness `provider_validity`, in-process
-/// liveness, profile `system_carried_object`. Every reader of signal values
+/// liveness, profile `system_carried_object`). Every reader of signal values
 /// (node and global rule conditions, Program signal roles, the host signal
 /// installation) uses this; provider domains, devices, lifecycle and output
 /// channels keep the authored catalog. An authored row that takes a system
 /// identity is refused (`io_system_signal_conflict`).
 [[nodiscard]] core::Result<std::vector<RetainedIoSignalConfiguration>>
 ResolveCompiledIoSignalCatalog(const core::CellGraphDTO &graph);
+
+/// CONTRACTS §7 (plan V2-7): the output row whose core-held
+/// `<output name>.changed_outside` signal `signal_name` names, or nullptr when
+/// the name lacks the suffix or the component has no such output. The caller
+/// still checks `core::HoldsChangedOutside` (read-back, not controller-owned).
+[[nodiscard]] const RetainedIoSignalConfiguration *FindChangedOutsideOutput(
+    std::span<const RetainedIoSignalConfiguration> signals,
+    const core::ControllableComponentId &component,
+    std::string_view signal_name);
 
 /// CP9: one model-free pose-source row (`pose_sources`) of a runtime unit.
 struct RetainedPoseSourceConfiguration final {

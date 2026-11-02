@@ -214,7 +214,7 @@ std::shared_ptr<const AlarmMotionAttentionProjection> BuildMotionAttention(
     projection->members.push_back(
         {AlarmAcknowledgementMember{condition_id, point.record->activation_id,
                                     point.record->record_revision},
-         !point.record->acknowledgement_required, point.record->subject});
+         point.record->subject});
   }
   return projection;
 }
@@ -1166,9 +1166,6 @@ CanonicalValue OperatorAlarmMotionAttentionValue(
         {"activation_id",
          CanonicalValue(member.acknowledgement.activation_id)},
         {"condition_id", CanonicalValue(member.acknowledgement.condition_id)},
-        {"gate", CanonicalValue(member.condition_interlock
-                                    ? "condition_interlock"
-                                    : "acknowledgement")},
         {"record_revision",
          Number(member.acknowledgement.record_revision, "record_revision",
                 true)},

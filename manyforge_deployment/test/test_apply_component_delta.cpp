@@ -3,11 +3,13 @@
 #include <manyforge_deployment/apply_affected_scope.hpp>
 #include <manyforge_deployment/apply_component_delta.hpp>
 #include <manyforge_deployment/cell_kinematic_index.hpp>
-#include <manyforge_deployment/native_execution_runtime_contract.hpp>
+#include <manyforge_deployment/component_spec.hpp>
+#include <manyforge_deployment/deployment_applicability_codec.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 
 #include <algorithm>
+#include <cstdint>
 #include <memory>
 #include <optional>
 #include <set>
@@ -18,7 +20,6 @@
 #include <vector>
 
 #include "activation_deployment_compiler_internal.hpp"
-#include "apply_component_delta_internal.hpp"
 #include "content_identity_internal.hpp"
 #include "lite6_controllable_retention_fixture.hpp"
 #include "retained_bundle_internal.hpp"
@@ -63,6 +64,8 @@ constexpr std::string_view kDigestOne =
 constexpr std::string_view kDigestTwo =
     "sha256:2222222222222222222222222222222222222222222222222222222222222222";
 constexpr std::string_view kFixtureCellId = "apply_component_delta_cell";
+/// The fixtures run no Real component: no site facts.
+const SiteFacts kNoSite{};
 
 [[nodiscard]] std::shared_ptr<const RetainedBundle>
 Materialize(const test::Lite6ControllableRetentionFixture &fixture) {
@@ -78,20 +81,6 @@ Materialize(const test::Lite6ControllableRetentionFixture &fixture) {
     throw std::logic_error("test bundle did not materialize");
   }
   return bundle;
-}
-
-[[nodiscard]] const RetainedBundle &OneArm() {
-  static const auto bundle =
-      Materialize(test::make_lite6_controllable_retention_fixture(
-          false, false, 1U, false, true, kFixtureCellId));
-  return *bundle;
-}
-
-[[nodiscard]] const RetainedBundle &TwoArms() {
-  static const auto bundle =
-      Materialize(test::make_lite6_controllable_retention_fixture(
-          false, false, 2U, false, true, kFixtureCellId));
-  return *bundle;
 }
 
 [[nodiscard]] core::ControllableComponentId FirstArm() {
@@ -139,13 +128,10 @@ Change(std::string id, const ApplyComponentDisposition disposition) {
     change.candidate_domains = {core::ControlDomainId("domain")};
   }
   if (disposition == ApplyComponentDisposition::kReplace) {
-    change.replacement_reasons = {std::string(kApplyComponentReasonBindings)};
+    change.replacement_reasons = {std::string(kComponentSpecBindings)};
   }
   return change;
 }
-
-// DX-753: keep the archived Native fixture entrypoint compiled without admission.
-[[maybe_unused]] constexpr auto kHeldNativeOneArmFixture = &OneArm;
 
 [[nodiscard]] std::shared_ptr<const RetainedBundle> RosArms(
     std::size_t count, std::optional<double> first_position,
@@ -162,14 +148,14 @@ Change(std::string id, const ApplyComponentDisposition disposition) {
 }
 
 TEST(ApplyComponentDelta, UnchangedBundleRetainsEveryComponentRuntime) {
-  const auto delta = derive_apply_component_delta(RosTwoArms(), RosTwoArms());
+  const auto delta = derive_apply_component_delta(RosTwoArms(), RosTwoArms(), kNoSite);
   ASSERT_TRUE(delta.valid());
   ASSERT_EQ(delta.components.size(), 2U);
   for (const auto &row : delta.components) {
     EXPECT_EQ(row.disposition, ApplyComponentDisposition::kRetain);
     EXPECT_EQ(row.predecessor_runtime_identity, row.candidate_runtime_identity);
     EXPECT_EQ(row.candidate_runtime_identity,
-              derive_component_runtime_identity(RosTwoArms(),
+              derive_component_runtime_identity(RosTwoArms(), kNoSite,
                                                 row.controllable_component_id));
     EXPECT_FALSE(row.candidate_domains.empty());
     EXPECT_TRUE(row.replacement_reasons.empty());
@@ -181,46 +167,21 @@ TEST(ApplyComponentDelta, UnchangedBundleRetainsEveryComponentRuntime) {
 }
 
 TEST(ApplyComponentDelta, RuntimeIdentityIsPerComponentAndExact) {
-  const auto first = derive_component_runtime_identity(RosTwoArms(), FirstArm());
-  const auto second = derive_component_runtime_identity(RosTwoArms(), SecondArm());
+  const auto first = derive_component_runtime_identity(RosTwoArms(), kNoSite, FirstArm());
+  const auto second = derive_component_runtime_identity(RosTwoArms(), kNoSite, SecondArm());
   ASSERT_TRUE(first.has_value());
   ASSERT_TRUE(second.has_value());
   EXPECT_NE(*first, *second);
-  EXPECT_EQ(derive_component_runtime_identity(RosTwoArms(), FirstArm()), first);
+  EXPECT_EQ(derive_component_runtime_identity(RosTwoArms(), kNoSite, FirstArm()), first);
   EXPECT_FALSE(derive_component_runtime_identity(
-                   RosOneArm(), SecondArm())
+                   RosOneArm(), kNoSite, SecondArm())
                    .has_value());
-}
-
-TEST(ApplyComponentDelta, NativeConfigurationSelectionKeepsExactComponentSettings) {
-  GTEST_SKIP() << "held: multi-unit discussion";
-  const auto &graph = TwoArms().value().cell_graph;
-  for (const auto &component : graph.controllable_components) {
-    ASSERT_EQ(component.runtime_unit_ids.size(), 1U);
-    const auto &unit = component.runtime_unit_ids.front();
-    const auto selected = native_execution_runtime_contract::require_component_configuration(
-        TwoArms(), unit, component.controllable_component_id);
-    ASSERT_EQ(selected.initial_joint_positions_rad.size(), 6U);
-    ASSERT_EQ(selected.motion_target_limits.size(), 1U);
-    EXPECT_EQ(selected.motion_target_limits.front().controllable_component_id,
-              component.controllable_component_id);
-    for (const auto &row : selected.direct_control_joint_limits) {
-      EXPECT_EQ(row.controllable_component_id, component.controllable_component_id);
-    }
-    const auto projection = native_execution_runtime_contract::component_configuration_projection(
-        TwoArms(), unit, component.controllable_component_id);
-    EXPECT_EQ(projection.find_object_member("initial_joint_positions_rad")->as_array().size(),
-              selected.initial_joint_positions_rad.size());
-    EXPECT_THROW(native_execution_runtime_contract::require_component_configuration(
-                     TwoArms(), unit, core::ControllableComponentId("missing")),
-                 RetainedBundleError);
-  }
 }
 
 TEST(ApplyComponentDelta, RosConfigurationSelectionUsesExactBindingResources) {
   const auto fixture = test::make_lite6_controllable_retention_fixture(
-      false, false, 1U, false, true, kFixtureCellId, false, false,
-      "resource", false, {}, {}, true);
+      false, false, 1U, kFixtureCellId, false, false,
+      "resource", false, {}, {});
   const auto bundle = Materialize(fixture);
   const auto &component = bundle->value().cell_graph.controllable_components.front();
   const auto unit = component.runtime_unit_ids.front();
@@ -243,8 +204,8 @@ TEST(ApplyComponentDelta, RosConfigurationSelectionUsesExactBindingResources) {
     const std::size_t count, std::optional<double> first_position = std::nullopt,
     const std::string_view first_prefix = {}) {
   return Materialize(test::make_lite6_controllable_retention_fixture(
-      false, false, count, false, true, kFixtureCellId, false, false,
-      "resource", false, {}, {}, true, false, false, first_position, false,
+      false, false, count, kFixtureCellId, false, false,
+      "resource", false, {}, {}, false, false, first_position,
       test::kLite6ArmTargetId, std::nullopt, std::nullopt, first_prefix));
 }
 
@@ -253,12 +214,12 @@ TEST(ApplyComponentDelta, RosSharedHostRetainsUnrelatedRobotAndOwnChangesReplace
   const auto two = RosArms(2U);
   const auto changed_positions = RosArms(2U, 0.25);
   const auto changed_prefix = RosArms(2U, std::nullopt, "own/");
-  EXPECT_EQ(Row(derive_apply_component_delta(*one, *two), FirstArm()).disposition,
+  EXPECT_EQ(Row(derive_apply_component_delta(*one, *two, kNoSite), FirstArm()).disposition,
             ApplyComponentDisposition::kRetain);
-  EXPECT_EQ(Row(derive_apply_component_delta(*two, *one), FirstArm()).disposition,
+  EXPECT_EQ(Row(derive_apply_component_delta(*two, *one, kNoSite), FirstArm()).disposition,
             ApplyComponentDisposition::kRetain);
   for (const auto &changed : {changed_positions, changed_prefix}) {
-    const auto delta = derive_apply_component_delta(*two, *changed);
+    const auto delta = derive_apply_component_delta(*two, *changed, kNoSite);
     EXPECT_EQ(Row(delta, FirstArm()).disposition, ApplyComponentDisposition::kReplace);
     EXPECT_EQ(Row(delta, SecondArm()).disposition, ApplyComponentDisposition::kRetain);
   }
@@ -275,8 +236,8 @@ TEST(ApplyComponentDelta, RosSharedHostRetainsUnrelatedRobotAndOwnChangesReplace
 TEST(ApplyComponentDelta,
      RetainedActivationRefusesExclusiveIsaacTopicCollision) {
   const auto fixture = test::make_lite6_controllable_retention_fixture(
-      false, false, 2U, false, true, kFixtureCellId, false, false, "resource",
-      false, {}, {}, true, false, false, std::nullopt, false,
+      false, false, 2U, kFixtureCellId, false, false, "resource",
+      false, {}, {}, false, false, std::nullopt,
       test::kLite6ArmTargetId, std::nullopt, std::nullopt, "", false);
   const auto bundle = Materialize(fixture);
   const auto &unit = bundle->value().cell_graph.runtime_units.front();
@@ -293,33 +254,9 @@ TEST(ApplyComponentDelta,
   }
 }
 
-// S5: a robot model without a `flange` frame role is refused when the
-// Deployment compiles (Apply), typed, under `active_tcp_and_flange` (the
-// default); `active_tcp` needs no flange. The runtime host refused the same
-// robot only at activation, with untyped text.
-TEST(ApplyComponentDelta, SpeedCheckAtTheFlangeRefusesARobotWithoutFlangeAtCompile) {
-  const std::vector<core::ModelFrameRoleBindingDTO> without_flange{
-      {core::FrameRoleId("base"), "link_base"}, {core::FrameRoleId("tcp"), "link_eef"}};
-  auto with_flange = without_flange;
-  with_flange.push_back({core::FrameRoleId("flange"), "link6"});
-  try {
-    detail::require_speed_check_flange("third_party_robot", "active_tcp_and_flange",
-                                       without_flange);
-    FAIL() << "a robot without flange must be refused under active_tcp_and_flange";
-  } catch (const std::invalid_argument &error) {
-    const std::string what(error.what());
-    EXPECT_NE(what.find("robot_flange_frame_missing: third_party_robot"), std::string::npos)
-        << what;
-  }
-  EXPECT_NO_THROW(detail::require_speed_check_flange("third_party_robot", "active_tcp",
-                                                     without_flange));
-  EXPECT_NO_THROW(detail::require_speed_check_flange("lite6_robot", "active_tcp_and_flange",
-                                                     with_flange));
-}
-
 TEST(ApplyComponentDelta, EmptyRosHostHasNoFakeComponents) {
   const auto catalog = test::lite6_controllable_fixture_detail::qualify_control_catalog(
-      false, true, false, "resource", false, {}, true);
+      false, false, "resource", false, {});
   const auto &profile = *catalog.ros2_control_execution_runtime_profile;
   detail::ActivationDeploymentIntent intent{};
   intent.deployment_artifact_id = "empty_ros_compiler_regression";
@@ -341,8 +278,8 @@ TEST(ApplyComponentDelta, EmptyRosHostHasNoFakeComponents) {
             canonical_json(
                 ros2_control_execution_runtime_contract::empty_host_configuration()));
   const auto fixture = test::make_lite6_controllable_retention_fixture(
-      false, false, 0U, false, true, kFixtureCellId, false, false, "resource",
-      false, {}, {}, true, false, false, std::nullopt, false,
+      false, false, 0U, kFixtureCellId, false, false, "resource",
+      false, {}, {}, false, false, std::nullopt,
       test::kLite6ArmTargetId);
   ASSERT_TRUE(fixture.structural_preparations().empty());
   ASSERT_TRUE(fixture.qualified.compiler_ir().applicability().composition()
@@ -367,8 +304,8 @@ TEST(ApplyComponentDelta, EmptyRosHostHasNoFakeComponents) {
 
 TEST(ApplyComponentDelta, NonemptyRosHostStillRefusesEmptyRequiredRows) {
   const auto valid_fixture = test::make_lite6_controllable_retention_fixture(
-      false, false, 1U, false, true, kFixtureCellId, false, false, "resource",
-      false, {}, {}, true);
+      false, false, 1U, kFixtureCellId, false, false, "resource",
+      false, {}, {});
   const auto valid_bundle = Materialize(valid_fixture);
   const auto &graph = valid_bundle->value().cell_graph;
   for (const std::string_view field : {"controller_profiles",
@@ -377,8 +314,8 @@ TEST(ApplyComponentDelta, NonemptyRosHostStillRefusesEmptyRequiredRows) {
     SCOPED_TRACE(field);
     EXPECT_THROW(
         static_cast<void>(test::make_lite6_controllable_retention_fixture(
-            false, false, 1U, false, true, kFixtureCellId, false, false, "resource",
-            false, {}, {}, true, false, false, std::nullopt, false,
+            false, false, 1U, kFixtureCellId, false, false, "resource",
+            false, {}, {}, false, false, std::nullopt,
             test::kLite6ArmTargetId, std::nullopt, std::nullopt, "", true, field)),
         CellGraphCodecError);
     auto unit = graph.runtime_units.front();
@@ -391,37 +328,37 @@ TEST(ApplyComponentDelta, NonemptyRosHostStillRefusesEmptyRequiredRows) {
 }
 
 TEST(ApplyComponentDelta, AddedAndRemovedComponentsAreClassifiedAndFenced) {
-  const auto grow = derive_apply_component_delta(RosOneArm(), RosTwoArms());
+  const auto grow = derive_apply_component_delta(RosOneArm(), RosTwoArms(), kNoSite);
   ASSERT_TRUE(grow.valid());
   ASSERT_EQ(grow.components.size(), 2U);
   const auto added = Row(grow, SecondArm());
   EXPECT_EQ(added.disposition, ApplyComponentDisposition::kAdd);
   EXPECT_FALSE(added.predecessor_runtime_identity.has_value());
   EXPECT_EQ(added.candidate_runtime_identity,
-            derive_component_runtime_identity(RosTwoArms(), SecondArm()));
+            derive_component_runtime_identity(RosTwoArms(), kNoSite, SecondArm()));
   EXPECT_TRUE(added.predecessor_domains.empty());
   EXPECT_FALSE(added.candidate_domains.empty());
   // Adding an independent arm changes shared projections, not this arm's
   // controller configuration. Its actual producer identities must stay equal.
   const auto kept = Row(grow, FirstArm());
   EXPECT_EQ(kept.predecessor_runtime_identity,
-            derive_component_runtime_identity(RosOneArm(), FirstArm()));
+            derive_component_runtime_identity(RosOneArm(), kNoSite, FirstArm()));
   EXPECT_EQ(kept.candidate_runtime_identity,
-            derive_component_runtime_identity(RosTwoArms(), FirstArm()));
+            derive_component_runtime_identity(RosTwoArms(), kNoSite, FirstArm()));
   EXPECT_EQ(kept.disposition, ApplyComponentDisposition::kRetain);
   EXPECT_EQ(kept.predecessor_runtime_identity, kept.candidate_runtime_identity);
   EXPECT_TRUE(kept.replacement_reasons.empty());
   EXPECT_TRUE(apply_component_delta_is_fenced(
       grow, derive_apply_configuration_fence_scope(RosOneArm(), RosTwoArms())));
 
-  const auto shrink = derive_apply_component_delta(RosTwoArms(), RosOneArm());
+  const auto shrink = derive_apply_component_delta(RosTwoArms(), RosOneArm(), kNoSite);
   ASSERT_TRUE(shrink.valid());
   EXPECT_EQ(Row(shrink, FirstArm()).disposition,
             ApplyComponentDisposition::kRetain);
   const auto removed = Row(shrink, SecondArm());
   EXPECT_EQ(removed.disposition, ApplyComponentDisposition::kRemove);
   EXPECT_EQ(removed.predecessor_runtime_identity,
-            derive_component_runtime_identity(RosTwoArms(), SecondArm()));
+            derive_component_runtime_identity(RosTwoArms(), kNoSite, SecondArm()));
   EXPECT_FALSE(removed.candidate_runtime_identity.has_value());
   EXPECT_TRUE(removed.candidate_domains.empty());
   EXPECT_TRUE(apply_component_delta_is_fenced(
@@ -429,7 +366,7 @@ TEST(ApplyComponentDelta, AddedAndRemovedComponentsAreClassifiedAndFenced) {
 }
 
 TEST(ApplyComponentDelta, CodecAndDigestAreCanonicalAndExact) {
-  const auto delta = derive_apply_component_delta(RosOneArm(), RosTwoArms());
+  const auto delta = derive_apply_component_delta(RosOneArm(), RosTwoArms(), kNoSite);
   const auto encoded = EncodeApplyComponentDelta(delta);
   EXPECT_EQ(DecodeApplyComponentDelta(encoded), delta);
   EXPECT_EQ(EncodeApplyComponentDelta(DecodeApplyComponentDelta(encoded)),
@@ -437,7 +374,7 @@ TEST(ApplyComponentDelta, CodecAndDigestAreCanonicalAndExact) {
   EXPECT_EQ(DigestApplyComponentDelta(delta), DigestApplyComponentDelta(delta));
   EXPECT_NE(DigestApplyComponentDelta(delta),
             DigestApplyComponentDelta(
-                derive_apply_component_delta(RosTwoArms(), RosOneArm())));
+                derive_apply_component_delta(RosTwoArms(), RosOneArm(), kNoSite)));
 
   const ApplyComponentDeltaDTO empty;
   EXPECT_EQ(DecodeApplyComponentDelta(EncodeApplyComponentDelta(empty)), empty);
@@ -559,215 +496,30 @@ TEST(ApplyComponentDelta, EveryRuntimeChangeOwningADomainMustBeFenced) {
   EXPECT_TRUE(apply_component_delta_is_fenced({{passive}, false, {}}, {}));
 }
 
-// M7 part A (D17), equivalence oracle: the merge-6b `Relations` of
-// apply_component_delta.cpp, copied verbatim (only the result type is the
-// now-shared one). Test-local; removed at the next milestone.
-namespace m6b {
-
-[[nodiscard]] const core::ControllableComponentDTO *
-FindComponent(const core::RetainedBundleDTO &bundle,
-              const core::ControllableComponentId &id) {
-  const auto &components = bundle.cell_graph.controllable_components;
-  const auto found = std::find_if(
-      components.begin(), components.end(),
-      [&](const auto &component) { return component.controllable_component_id == id; });
-  return found == components.end() ? nullptr : &*found;
-}
-
-[[nodiscard]] detail::ApplyComponentRelations
-Relations(const core::RetainedBundleDTO &bundle,
-          const core::ControllableComponentDTO &component) {
-  const auto &graph = bundle.cell_graph;
-  detail::ApplyComponentRelations relations;
-  for (const auto &role : component.model_role_bindings) {
-    relations.model_instances.insert(role.model_instance_id);
+// Build spec plan: the takeover budgets are CellContext. A policy-only Apply
+// retains every component (each takes the new budgets on retain).
+/// `root` (a retained bundle's normalized root, edited) sealed under its new
+/// identity and reloaded through the verifier.
+[[nodiscard]] std::shared_ptr<const RetainedBundle>
+Resealed(CanonicalValue::Object root) {
+  auto projection = CanonicalValue(std::move(root));
+  const auto identity = detail::compute_content_identity(
+      projection,
+      detail::ContentIdentitySpec{
+          .identity_domain = "retained-bundle-id",
+          .api_version = std::string(core::kRetainedBundleApiVersion),
+          .own_field = "retained_bundle_id"});
+  auto sealed = projection.as_object();
+  for (auto &[name, value] : sealed) {
+    if (name == "retained_bundle_id")
+      value = CanonicalValue(identity);
   }
-  // A component's launch description carries the static frames of the
-  // components mounted on it (the mount, and a process-less tool's frames),
-  // so their model occurrences are part of its runtime facts.
-  for (const auto &attachment : graph.component_attachments) {
-    if (attachment.parent.controllable_component_id != component.controllable_component_id)
-      continue;
-    if (const auto *child = FindComponent(bundle, attachment.child.controllable_component_id)) {
-      for (const auto &role : child->model_role_bindings)
-        relations.model_instances.insert(role.model_instance_id);
-    }
-  }
-  relations.runtime_units.insert(component.runtime_unit_ids.begin(),
-                                 component.runtime_unit_ids.end());
-  for (const auto &binding : graph.control_bindings) {
-    if (binding.controllable_component_id != component.controllable_component_id) {
-      continue;
-    }
-    relations.bindings.insert(binding.control_binding_id);
-    relations.domains.insert(binding.control_domain_id);
-    relations.runtime_units.insert(binding.provider_runtime_unit_id);
-  }
-  for (const auto &domain : graph.control_domains) {
-    if (relations.domains.contains(domain.control_domain_id)) {
-      relations.runtime_units.insert(domain.runtime_unit_ids.begin(),
-                                     domain.runtime_unit_ids.end());
-    }
-  }
-  // A component depends on every runtime unit its units depend on.
-  bool grew = true;
-  while (grew) {
-    grew = false;
-    for (const auto &unit : graph.runtime_units) {
-      if (!relations.runtime_units.contains(unit.runtime_unit_id)) continue;
-      for (const auto &dependency : unit.dependency_runtime_unit_ids) {
-        grew = relations.runtime_units.insert(dependency).second || grew;
-      }
-    }
-  }
-  for (const auto &provider : bundle.capability_provider_bindings) {
-    const bool targets_component = std::visit(
-        [&](const auto &target) {
-          using Target = std::decay_t<decltype(target)>;
-          if constexpr (std::is_same_v<Target,
-                                       core::CellGlobalCapabilityProviderTargetDTO>) {
-            return true;
-          } else if constexpr (std::is_same_v<Target, core::ComponentTargetCapabilityProviderTargetDTO>) {
-            return target.controllable_component_id == component.controllable_component_id;
-          } else if constexpr (std::is_same_v<
-                                   Target,
-                                   core::TargetBindingCapabilityProviderTargetDTO>) {
-            return relations.bindings.contains(target.control_binding_id);
-          } else {
-            static_assert(std::is_same_v<
-                          Target, core::ControlDomainCapabilityProviderTargetDTO>);
-            return relations.domains.contains(target.control_domain_id);
-          }
-        },
-        provider.target);
-    if (targets_component) {
-      relations.providers.insert(provider.capability_provider_binding_id);
-    }
-  }
-  return relations;
-}
-
-} // namespace m6b
-
-[[nodiscard]] core::ControllableComponentDTO
-MountableComponent(std::string id, std::optional<std::string> model) {
-  std::vector<core::ModelRoleBindingDTO> roles;
-  if (model) roles.push_back({core::ModelRoleId("body"), core::ModelInstanceId(*model)});
-  return {core::ControllableComponentId(std::move(id)),
-          core::ComponentTypeId("partial_apply_tool"),
-          core::ComponentTypeRevision("partial_apply_tool-r1"),
-          std::move(roles),
-          {},
-          std::nullopt};
-}
-
-[[nodiscard]] core::ComponentAttachmentEdgeDTO
-EdgeOn(const core::ControllableComponentId &parent, std::string interface_id,
-       std::string child) {
-  return {core::ComponentAttachmentId(parent.value() + "." + interface_id + "->" + child),
-          core::ComponentAttachmentRevision("attachment-r1"),
-          {parent, core::AttachmentInterfaceId(std::move(interface_id))},
-          {core::ControllableComponentId(std::move(child)),
-           core::AttachmentInterfaceId("mount")},
-          core::PlacementPoseDTO{}};
-}
-
-/// One Apply side: the two retained ROS arms plus synthetic tools, a
-/// model-free tool and an unaffected station, mounted as `attachments` say.
-/// Only the typed relations read it; it is never verified or sealed.
-[[nodiscard]] core::RetainedBundleDTO
-PartialApplySide(std::vector<core::ComponentAttachmentEdgeDTO> attachments) {
-  auto bundle = RosTwoArms().value();
-  auto &components = bundle.cell_graph.controllable_components;
-  components.push_back(MountableComponent("zz_tool", "zz_tool_model"));
-  components.push_back(MountableComponent("aa_camera", "aa_camera_model"));
-  components.push_back(MountableComponent("bare_tool", std::nullopt));
-  components.push_back(MountableComponent("station", "station_model"));
-  bundle.cell_graph.component_attachments = std::move(attachments);
-  return bundle;
-}
-
-// D17 (M7 part A): each Apply side derives its relations from an index of its
-// own graph. A mount added, removed or changed, in both directions, and an
-// unaffected component: both sides equal the merge-6b relations exactly.
-TEST(ApplyComponentDelta, PartialApplyRelationsPerSideEqualMerge6b) {
-  const auto first = FirstArm();
-  const auto second = SecondArm();
-  using Edges = std::vector<core::ComponentAttachmentEdgeDTO>;
-  const Edges none;
-  const Edges tool_on_first{EdgeOn(first, "flange", "zz_tool")};
-  const Edges tool_on_second{EdgeOn(second, "flange", "zz_tool")};
-  const Edges tool_on_first_other_interface{EdgeOn(first, "tool_flange", "zz_tool")};
-  // Sibling edges in non-id order, and the same mounts in id order.
-  const Edges siblings{EdgeOn(first, "flange", "zz_tool"),
-                       EdgeOn(first, "flange", "aa_camera")};
-  const Edges siblings_id_order{EdgeOn(first, "flange", "aa_camera"),
-                                EdgeOn(first, "flange", "zz_tool")};
-  const Edges chained{EdgeOn(first, "flange", "zz_tool"),
-                      EdgeOn(core::ControllableComponentId("zz_tool"), "tool_flange",
-                             "aa_camera")};
-  const Edges model_free_tool{EdgeOn(first, "flange", "bare_tool")};
-  const Edges arm_on_arm{EdgeOn(first, "flange", second.value())};
-  const Edges missing_child{EdgeOn(first, "flange", "missing_tool")};
-
-  struct Case final {
-    const char *name;
-    const Edges &predecessor;
-    const Edges &candidate;
-    bool first_arm_changes;
-  };
-  const std::vector<Case> cases{
-      {"mount added", none, tool_on_first, true},
-      {"mount removed", tool_on_first, none, true},
-      {"mount moved to another arm", tool_on_first, tool_on_second, true},
-      {"mount moved back", tool_on_second, tool_on_first, true},
-      {"mount interface changed", tool_on_first, tool_on_first_other_interface, false},
-      {"mount interface changed back", tool_on_first_other_interface, tool_on_first, false},
-      {"second tool added", tool_on_first, siblings, true},
-      {"second tool removed", siblings, tool_on_first, true},
-      {"sibling edge order changed", siblings, siblings_id_order, false},
-      {"chained tool added", tool_on_first, chained, false},
-      {"chained tool removed", chained, tool_on_first, false},
-      {"model-free tool added", none, model_free_tool, false},
-      {"model-free tool removed", model_free_tool, none, false},
-      {"arm mounted on arm", none, arm_on_arm, true},
-      {"arm unmounted from arm", arm_on_arm, none, true},
-      {"mount to a missing component row", tool_on_first, missing_child, true},
-      {"mount from a missing component row", missing_child, tool_on_first, true},
-  };
-  for (const auto &test_case : cases) {
-    SCOPED_TRACE(test_case.name);
-    const auto predecessor = PartialApplySide(test_case.predecessor);
-    const auto candidate = PartialApplySide(test_case.candidate);
-    // One index per side, as derive_apply_component_delta builds them.
-    const CellKinematicIndex predecessor_index(predecessor.cell_graph);
-    const CellKinematicIndex candidate_index(candidate.cell_graph);
-    for (const auto *side : {&predecessor, &candidate}) {
-      const auto &index = side == &predecessor ? predecessor_index : candidate_index;
-      for (const auto &component : side->cell_graph.controllable_components) {
-        SCOPED_TRACE(component.controllable_component_id.value());
-        EXPECT_EQ(detail::apply_component_relations(*side, index, component),
-                  m6b::Relations(*side, component));
-      }
-    }
-    const auto relations = [&](const core::RetainedBundleDTO &side,
-                               const CellKinematicIndex &index,
-                               const std::string &id) {
-      const auto *component = m6b::FindComponent(side, core::ControllableComponentId(id));
-      if (component == nullptr) throw std::logic_error("partial Apply side lacks " + id);
-      return detail::apply_component_relations(side, index, *component);
-    };
-    // The unaffected component keeps its relations across the Apply.
-    EXPECT_EQ(relations(predecessor, predecessor_index, "station"),
-              relations(candidate, candidate_index, "station"));
-    EXPECT_EQ(relations(predecessor, predecessor_index, first.value()) !=
-                  relations(candidate, candidate_index, first.value()),
-              test_case.first_arm_changes);
-  }
+  return detail::RetainedBundleReloadAuthority::reload(
+      canonical_json(CanonicalValue(std::move(sealed))));
 }
 
 TEST(ApplyComponentDelta,
-     MovingTakeoverBudgetChangesEveryComponentPolicyIdentity) {
+     MovingTakeoverBudgetEditRetainsEveryComponent) {
   const auto with_budget = [](const RetainedBundle &source, double budget_s,
                               std::optional<double> planning_s = std::nullopt) {
     auto root = source.normalized_root().as_object();
@@ -784,46 +536,378 @@ TEST(ApplyComponentDelta,
     if (planning_s)
       root.emplace_back("motion_takeover_planning_budget_s",
                         CanonicalValue(*planning_s));
-    auto projection = CanonicalValue(std::move(root));
-    const auto identity = detail::compute_content_identity(
-        projection,
-        detail::ContentIdentitySpec{
-            .identity_domain = "retained-bundle-id",
-            .api_version = std::string(core::kRetainedBundleApiVersion),
-            .own_field = "retained_bundle_id"});
-    auto sealed = projection.as_object();
-    for (auto &[name, value] : sealed) {
-      if (name == "retained_bundle_id")
-        value = CanonicalValue(identity);
-    }
-    return detail::RetainedBundleReloadAuthority::reload(
-        canonical_json(CanonicalValue(std::move(sealed))));
+    return Resealed(std::move(root));
   };
   const auto selected = with_budget(RosTwoArms(), 3.5);
   const auto changed = with_budget(*selected, 7.0);
   const auto planning = with_budget(*selected, 3.5, 1.25);
   const auto changed_planning = with_budget(*planning, 3.5, 2.0);
   for (const auto &delta :
-       {derive_apply_component_delta(RosTwoArms(), *selected),
-        derive_apply_component_delta(*selected, *changed),
-        derive_apply_component_delta(*selected, RosTwoArms()),
-        derive_apply_component_delta(*selected, *planning),
-        derive_apply_component_delta(*planning, *changed_planning),
-        derive_apply_component_delta(*planning, *selected)}) {
+       {derive_apply_component_delta(RosTwoArms(), *selected, kNoSite),
+        derive_apply_component_delta(*selected, *changed, kNoSite),
+        derive_apply_component_delta(*selected, RosTwoArms(), kNoSite),
+        derive_apply_component_delta(*selected, *planning, kNoSite),
+        derive_apply_component_delta(*planning, *changed_planning, kNoSite),
+        derive_apply_component_delta(*planning, *selected, kNoSite)}) {
     ASSERT_TRUE(delta.valid());
     ASSERT_EQ(delta.components.size(), 2U);
     for (const auto &row : delta.components) {
-      EXPECT_EQ(row.disposition, ApplyComponentDisposition::kReplace);
-      EXPECT_EQ(row.replacement_reasons,
-                (std::vector<std::string>{
-                    std::string(kApplyComponentReasonRetainedPolicies)}));
-      EXPECT_NE(row.predecessor_runtime_identity,
+      EXPECT_EQ(row.disposition, ApplyComponentDisposition::kRetain);
+      EXPECT_TRUE(row.replacement_reasons.empty());
+      EXPECT_EQ(row.predecessor_runtime_identity,
                 row.candidate_runtime_identity);
     }
+    EXPECT_TRUE(apply_component_delta_is_fenced(delta, {}));
   }
-  const auto unchanged = derive_apply_component_delta(*selected, *selected);
-  for (const auto &row : unchanged.components) {
+  EXPECT_NE(cell_context(*selected).value(), cell_context(*changed).value());
+  EXPECT_NE(cell_context(*planning).value(), cell_context(*changed_planning).value());
+}
+
+// N17 R4: an arm's in-motion staleness budget (its Kernel participant's
+// `controller_state_max_age_ns`) is its effective `measured_joints` budget,
+// which a `policies.component_streams` row overrides. The host bakes it into
+// the arm at construction, so an edit of the arm's own override must rebuild
+// that arm, fenced, and leave every other component retained.
+TEST(ApplyComponentDelta, OwnMeasuredJointsOverrideEditReachesThatArmsInMotionBudget) {
+  const auto with_override = [](const RetainedBundle &source,
+                                const core::ControllableComponentId &component,
+                                const std::int64_t budget_ns) {
+    auto root = source.normalized_root().as_object();
+    root.erase(std::remove_if(root.begin(), root.end(),
+                              [](const auto &row) { return row.first == "component_streams"; }),
+               root.end());
+    root.emplace_back(
+        "component_streams",
+        encode_component_stream_overrides({core::StreamParameterOverrideDTO{
+            component,
+            std::string(ros2_control_execution_runtime_contract::kMeasuredJointsStreamId),
+            budget_ns, std::nullopt, std::nullopt}}));
+    return Resealed(std::move(root));
+  };
+  const auto before = with_override(RosTwoArms(), FirstArm(), 300'000'000);
+  const auto after = with_override(*before, FirstArm(), 150'000'000);
+  ASSERT_EQ(ComponentStreamParameterOverrides(*after).front().budget_ns, 150'000'000);
+
+  const auto delta = derive_apply_component_delta(*before, *after, kNoSite);
+  ASSERT_TRUE(delta.valid());
+  const auto first_arm = FirstArm();
+  const auto &edited = Row(delta, first_arm);
+  // Its own override rows are its spec `adapter` configuration.
+  EXPECT_EQ(edited.disposition, ApplyComponentDisposition::kReplace);
+  EXPECT_EQ(edited.replacement_reasons,
+            (std::vector<std::string>{std::string(kComponentSpecAdapter)}));
+  // The other arm's budget did not change: it is retained either way.
+  EXPECT_EQ(Row(delta, SecondArm()).disposition, ApplyComponentDisposition::kRetain);
+  EXPECT_TRUE(apply_component_delta_is_fenced(
+      delta, derive_apply_configuration_fence_scope(*before, *after)));
+  // N17 S4: the host builds the arm's budget from its spec's own override.
+  const auto spec = component_spec(*after, kNoSite, first_arm);
+  ASSERT_EQ(spec.stream_overrides.size(), 1U);
+  EXPECT_EQ(spec.stream_overrides.front().budget_ns, 150'000'000);
+  EXPECT_TRUE(component_spec(*after, kNoSite, SecondArm()).stream_overrides.empty());
+}
+
+// -- CONTRACTS §11: one Draft -> Apply path for every structural change ------
+
+/// Two ROS arms on the shared host, as RosTwoArms(), with the first arm's lane
+/// and graph optionally changed the way a Draft edit changes them.
+[[nodiscard]] std::shared_ptr<const RetainedBundle> RosTwoArmsEdited(
+    const bool first_arm_on_mock,
+    void (*graph_edit)(CanonicalValue::Object &) = nullptr) {
+  return Materialize(test::make_lite6_controllable_retention_fixture(
+      false, false, 2U, kFixtureCellId, false, false, "resource", false,
+      {}, {}, false, false, std::nullopt, test::kLite6ArmTargetId,
+      std::nullopt, std::nullopt, {}, true, {}, "lite6_arm_provider", false,
+      first_arm_on_mock, nullptr, graph_edit));
+}
+
+void MoveFirstArmBase(CanonicalValue::Object &graph) {
+  for (auto &[name, value] : graph) {
+    if (name != "controllable_components") continue;
+    auto components = value.as_array();
+    for (auto &component : components) {
+      if (component.find_object_member("controllable_component_id")->as_string() !=
+          FirstArm().value())
+        continue;
+      auto fields = component.as_object();
+      for (auto &[field, pose] : fields) {
+        if (field == "root_pose_in_cell")
+          pose = test::lite6_controllable_fixture_detail::translated_pose(0.5);
+      }
+      component = CanonicalValue(std::move(fields));
+    }
+    value = CanonicalValue(std::move(components));
+  }
+}
+
+[[nodiscard]] bool HasReason(const ApplyComponentChangeDTO &row,
+                             const std::string_view reason) {
+  return std::find(row.replacement_reasons.begin(), row.replacement_reasons.end(),
+                   reason) != row.replacement_reasons.end();
+}
+
+// CONTRACTS §16: make the second arm a member of the first (its controller
+// profile names the owner and a role), as the compiler writes a machine's
+// members.
+void SecondArmMemberOfFirstAs(CanonicalValue::Object &graph, const std::string &role);
+
+void SecondArmMemberOfFirst(CanonicalValue::Object &graph) {
+  SecondArmMemberOfFirstAs(graph, "tool_io");
+}
+
+void SecondArmMemberOfFirstAs(CanonicalValue::Object &graph, const std::string &role) {
+  for (auto &[name, value] : graph) {
+    if (name != "runtime_units") continue;
+    auto units = value.as_array();
+    for (auto &unit : units) {
+      auto unit_fields = unit.as_object();
+      for (auto &[field, configuration] : unit_fields) {
+        if (field != "configuration") continue;
+        auto rows = configuration.as_object();
+        for (auto &[row_name, profiles] : rows) {
+          if (row_name != "controller_profiles") continue;
+          auto items = profiles.as_array();
+          for (auto &item : items) {
+            if (item.find_object_member("controllable_component_id")->as_string() !=
+                SecondArm().value())
+              continue;
+            auto profile = item.as_object();
+            profile.emplace_back("owner_component_id",
+                                 CanonicalValue(FirstArm().value()));
+            profile.emplace_back("member_role", CanonicalValue(role));
+            item = CanonicalValue(std::move(profile));
+          }
+          profiles = CanonicalValue(std::move(items));
+        }
+        configuration = CanonicalValue(std::move(rows));
+      }
+      unit = CanonicalValue(std::move(unit_fields));
+    }
+    value = CanonicalValue(std::move(units));
+  }
+}
+
+TEST(ApplyComponentDelta, ReplacingAnOwnerReplacesItsMembersWithTheOwnerReason) {
+  const auto members = RosTwoArmsEdited(false, &SecondArmMemberOfFirst);
+  const auto owner_on_mock = RosTwoArmsEdited(true, &SecondArmMemberOfFirst);
+  const auto delta = derive_apply_component_delta(*members, *owner_on_mock, kNoSite);
+  ASSERT_TRUE(delta.valid());
+  const auto owner_id = FirstArm();
+  const auto &owner = Row(delta, owner_id);
+  EXPECT_EQ(owner.disposition, ApplyComponentDisposition::kReplace);
+  EXPECT_FALSE(HasReason(owner, kComponentSpecOwner));
+  const auto member_id = SecondArm();
+  const auto &member = Row(delta, member_id);
+  EXPECT_EQ(member.disposition, ApplyComponentDisposition::kReplace);
+  EXPECT_EQ(member.replacement_reasons,
+            (std::vector<std::string>{std::string(kComponentSpecOwner)}));
+  // Without the relation the peer is retained (as before).
+  EXPECT_EQ(Row(derive_apply_component_delta(RosTwoArms(), *RosTwoArmsEdited(true), kNoSite),
+                SecondArm())
+                .disposition,
+            ApplyComponentDisposition::kRetain);
+  // An unchanged machine retains both.
+  const auto same = derive_apply_component_delta(*members, *members, kNoSite);
+  for (const auto &row : same.components)
     EXPECT_EQ(row.disposition, ApplyComponentDisposition::kRetain);
+}
+
+// CONTRACTS §11, §16: the second arm as the first's `arm` member.
+void SecondArmIsTheArmOfFirst(CanonicalValue::Object &graph) {
+  SecondArmMemberOfFirstAs(graph, "arm");
+}
+
+// The same machine with a custom TCP (a runtime-editable arm field) on the
+// arm member's model occurrence.
+void SecondArmIsTheArmOfFirstWithACustomTcp(CanonicalValue::Object &graph) {
+  SecondArmIsTheArmOfFirst(graph);
+  std::string model_instance;
+  for (const auto &[name, value] : graph) {
+    if (name != "controllable_components") continue;
+    for (const auto &component : value.as_array())
+      if (component.find_object_member("controllable_component_id")->as_string() ==
+          SecondArm().value())
+        model_instance = component.find_object_member("model_role_bindings")
+                             ->as_array()
+                             .front()
+                             .find_object_member("model_instance_id")
+                             ->as_string();
+  }
+  for (auto &[name, value] : graph) {
+    if (name != "model_instances") continue;
+    auto instances = value.as_array();
+    for (auto &instance : instances) {
+      if (instance.find_object_member("model_instance_id")->as_string() != model_instance)
+        continue;
+      auto fields = instance.as_object();
+      fields.emplace_back(
+          "custom_tcps",
+          CanonicalValue(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
+              {"frame_role_id", CanonicalValue("pen")},
+              {"parent_link_name", CanonicalValue("link_eef")},
+              {"pose_in_parent_link",
+               test::lite6_controllable_fixture_detail::translated_pose(0.12)}})}));
+      instance = CanonicalValue(std::move(fields));
+    }
+    value = CanonicalValue(std::move(instances));
+  }
+}
+
+// The owner's identity holds what its process is launched with from its arm:
+// a custom TCP on the arm is a static frame of the launched description, so
+// it replaces the machine (and, through it, the arm).
+TEST(ApplyComponentDelta, AnArmCustomTcpReplacesItsMachine) {
+  const auto machine = RosTwoArmsEdited(false, &SecondArmIsTheArmOfFirst);
+  const auto edited = RosTwoArmsEdited(false, &SecondArmIsTheArmOfFirstWithACustomTcp);
+  const auto delta = derive_apply_component_delta(*machine, *edited, kNoSite);
+  ASSERT_TRUE(delta.valid());
+  const auto owner_id = FirstArm();
+  const auto &owner = Row(delta, owner_id);
+  EXPECT_EQ(owner.disposition, ApplyComponentDisposition::kReplace);
+  EXPECT_TRUE(HasReason(owner, kComponentSpecDescription));
+  const auto arm_id = SecondArm();
+  const auto &arm = Row(delta, arm_id);
+  EXPECT_EQ(arm.disposition, ApplyComponentDisposition::kReplace);
+  EXPECT_TRUE(HasReason(arm, kComponentSpecDescription));
+  EXPECT_TRUE(HasReason(arm, kComponentSpecOwner));
+}
+
+// The same machine with the arm member's initial joint positions edited (a
+// launch row of the arm only; the host joins every motion target's rows in
+// cell order, the second arm's after the first's).
+void SecondArmIsTheArmOfFirstWithEditedInitialPositions(CanonicalValue::Object &graph) {
+  SecondArmIsTheArmOfFirst(graph);
+  for (auto &[name, value] : graph) {
+    if (name != "runtime_units") continue;
+    auto units = value.as_array();
+    for (auto &unit : units) {
+      auto unit_fields = unit.as_object();
+      for (auto &[field, configuration] : unit_fields) {
+        if (field != "configuration") continue;
+        auto rows = configuration.as_object();
+        for (auto &[row_name, positions] : rows) {
+          if (row_name != "initial_joint_positions_rad") continue;
+          auto joints = positions.as_array();
+          joints.at(6U) = CanonicalValue(0.3);
+          positions = CanonicalValue(std::move(joints));
+        }
+        configuration = CanonicalValue(std::move(rows));
+      }
+      unit = CanonicalValue(std::move(unit_fields));
+    }
+    value = CanonicalValue(std::move(units));
+  }
+}
+
+[[nodiscard]] std::shared_ptr<const RetainedBundle> RosThreeArmsEdited(
+    void (*graph_edit)(CanonicalValue::Object &)) {
+  return Materialize(test::make_lite6_controllable_retention_fixture(
+      false, false, 3U, kFixtureCellId, false, false, "resource", false,
+      {}, {}, false, false, std::nullopt, test::kLite6ArmTargetId,
+      std::nullopt, std::nullopt, {}, true, {}, "lite6_arm_provider", false,
+      false, nullptr, graph_edit));
+}
+
+// The host rebuilds a machine's owner with its arm member (the owner's
+// process is the arm's launch), so an arm-only launch edit replaces the owner
+// too (and the owner's members through it); other components are retained.
+TEST(ApplyComponentDelta, AnArmLaunchEditReplacesItsMachine) {
+  const auto machine = RosThreeArmsEdited(&SecondArmIsTheArmOfFirst);
+  const auto edited = RosThreeArmsEdited(&SecondArmIsTheArmOfFirstWithEditedInitialPositions);
+  const auto delta = derive_apply_component_delta(*machine, *edited, kNoSite);
+  ASSERT_TRUE(delta.valid());
+  ASSERT_EQ(delta.components.size(), 3U);
+  const auto owner_id = FirstArm();
+  const auto &owner = Row(delta, owner_id);
+  EXPECT_EQ(owner.disposition, ApplyComponentDisposition::kReplace);
+  EXPECT_EQ(owner.replacement_reasons,
+            (std::vector<std::string>{std::string(kComponentSpecLaunch)}));
+  const auto arm_id = SecondArm();
+  const auto &arm = Row(delta, arm_id);
+  EXPECT_EQ(arm.disposition, ApplyComponentDisposition::kReplace);
+  EXPECT_TRUE(HasReason(arm, kComponentSpecLaunch));
+  EXPECT_TRUE(HasReason(arm, kComponentSpecOwner));
+  const core::ControllableComponentId other(
+      test::lite6_controllable_fixture_detail::indexed_id(
+          test::kLite6ControllableComponentId, 2U));
+  EXPECT_EQ(Row(delta, other).disposition, ApplyComponentDisposition::kRetain);
+  // The arm's identity cites the owner's: no cycle, and an unchanged machine
+  // retains both.
+  for (const auto &row : derive_apply_component_delta(*edited, *edited, kNoSite).components)
+    EXPECT_EQ(row.disposition, ApplyComponentDisposition::kRetain);
+}
+
+TEST(ApplyComponentDelta, SettingsChangeReplacesOnlyThatComponentWithItsReason) {
+  const auto changed = RosArms(2U, 0.25);
+  const auto delta = derive_apply_component_delta(RosTwoArms(), *changed, kNoSite);
+  ASSERT_TRUE(delta.valid());
+  const auto first_arm = FirstArm();
+  const auto &first = Row(delta, first_arm);
+  EXPECT_EQ(first.disposition, ApplyComponentDisposition::kReplace);
+  EXPECT_TRUE(HasReason(first, kComponentSpecLaunch));
+  EXPECT_EQ(Row(delta, SecondArm()).disposition, ApplyComponentDisposition::kRetain);
+  EXPECT_TRUE(apply_component_delta_is_fenced(
+      delta, derive_apply_configuration_fence_scope(RosTwoArms(), *changed)));
+}
+
+// The lane is component data on the execution host (its controller profile
+// row), so a lane change replaces exactly that component, never its peer.
+TEST(ApplyComponentDelta, LaneChangeReplacesThatComponentWithTheRuntimeReason) {
+  const auto mock_first = RosTwoArmsEdited(true);
+  for (const auto &delta : {derive_apply_component_delta(RosTwoArms(), *mock_first, kNoSite),
+                            derive_apply_component_delta(*mock_first, RosTwoArms(), kNoSite)}) {
+    ASSERT_TRUE(delta.valid());
+    const auto first_arm = FirstArm();
+    const auto &first = Row(delta, first_arm);
+    EXPECT_EQ(first.disposition, ApplyComponentDisposition::kReplace);
+    EXPECT_TRUE(HasReason(first, kComponentSpecLaunch));
+    EXPECT_EQ(first.predecessor_domains, first.candidate_domains);
+    EXPECT_EQ(Row(delta, SecondArm()).disposition, ApplyComponentDisposition::kRetain);
+    EXPECT_TRUE(delta.attachment_changed_components.empty());
+  }
+}
+
+// A base pose is shared Scene data: it moves the planning model, not the
+// controller, so the component keeps running and the Scene is reprojected.
+TEST(ApplyComponentDelta, BasePoseChangeRetainsTheComponentAndReprojectsTheScene) {
+  const auto moved = RosTwoArmsEdited(false, &MoveFirstArmBase);
+  const auto delta = derive_apply_component_delta(RosTwoArms(), *moved, kNoSite);
+  ASSERT_TRUE(delta.valid());
+  EXPECT_TRUE(delta.shared_scene_projection_changed);
+  for (const auto &row : delta.components) {
+    EXPECT_EQ(row.disposition, ApplyComponentDisposition::kRetain)
+        << row.controllable_component_id.value();
+  }
+  EXPECT_TRUE(delta.attachment_changed_components.empty());
+}
+
+// Close and New are an ordinary Apply of the empty cell: the empty Deployment
+// compiles like any other, every predecessor component is removed, and every
+// removal is inside the Apply's fence.
+TEST(ApplyComponentDelta, CloseIsAnApplyOfTheEmptyCellThatRemovesEveryComponent) {
+  const auto empty = Materialize(test::make_lite6_controllable_retention_fixture(
+      false, false, 0U, kFixtureCellId, false, false, "resource",
+      false, {}, {}, false, false, std::nullopt, test::kLite6ArmTargetId));
+  ASSERT_TRUE(empty->value().cell_graph.controllable_components.empty());
+  const auto close = derive_apply_component_delta(RosTwoArms(), *empty, kNoSite);
+  ASSERT_TRUE(close.valid());
+  ASSERT_EQ(close.components.size(), 2U);
+  for (const auto &row : close.components) {
+    EXPECT_EQ(row.disposition, ApplyComponentDisposition::kRemove)
+        << row.controllable_component_id.value();
+    EXPECT_EQ(row.predecessor_runtime_identity,
+              derive_component_runtime_identity(RosTwoArms(), kNoSite,
+                                                row.controllable_component_id));
+    EXPECT_FALSE(row.candidate_runtime_identity.has_value());
+  }
+  EXPECT_TRUE(close.shared_scene_projection_changed);
+  EXPECT_TRUE(apply_component_delta_is_fenced(
+      close, derive_apply_configuration_fence_scope(RosTwoArms(), *empty)));
+  // New after Close, and a Close of an empty cell, change no component.
+  EXPECT_TRUE(derive_apply_component_delta(*empty, *empty, kNoSite).components.empty());
+  // Load after Close adds every component of the file.
+  for (const auto &row : derive_apply_component_delta(*empty, RosTwoArms(), kNoSite).components) {
+    EXPECT_EQ(row.disposition, ApplyComponentDisposition::kAdd);
   }
 }
 

@@ -112,11 +112,14 @@ RUN pip install --no-cache-dir --upgrade pip setuptools && \
     && CMEEL_LIB=$(python3 -c "import site; print(site.getsitepackages()[0])")/cmeel.prefix/lib \
     && if [ -d "$CMEEL_LIB" ]; then echo "$CMEEL_LIB" > /etc/ld.so.conf.d/cmeel.conf && ldconfig; fi
 
-# Exact RoboPlan 0.7 source closure with source-built ProxSuite and TOPPRA.
+# Exact RoboPlan 0.8 source closure with source-built ProxSuite (configured by
+# exact jrl-cmakemodules, no serialization) and TOPPRA, and exact nanoflann.
 # Prepared on the host by scripts/setup-docker.sh.
 COPY .docker/roboplan/ /tmp/roboplan/
 COPY .docker/proxsuite/ /tmp/proxsuite/
+COPY .docker/jrl-cmakemodules/ /tmp/jrl-cmakemodules/
 COPY .docker/toppra/ /tmp/toppra/
+COPY .docker/nanoflann/ /tmp/nanoflann/
 COPY third_party/roboplan/ /tmp/roboplan-manifest/
 COPY scripts/ci/build-roboplan-source-stack.sh /tmp/build-roboplan-source-stack.sh
 COPY scripts/ci/build-roboplan-source-closure.sh /tmp/build-roboplan-source-closure.sh
@@ -128,7 +131,7 @@ RUN PINOCCHIO_CMAKE_DIR=$(find /usr -name "pinocchioConfig.cmake" -printf '%h\n'
     && if [ "$ROBOPLAN_SOURCE_MODE" = qualified ]; then \
          python3 /tmp/verify-external-source-closure.py \
            --ledger /tmp/external-delta-ledger.v1.json \
-           --source-id roboplan_0_7_0_ua1_foundation --root /tmp/roboplan \
+           --source-id roboplan_0_8_0_foundation --root /tmp/roboplan \
            --content-kind source --allow-stripped-git; \
        elif [ "$ROBOPLAN_SOURCE_MODE" = development_override ]; then \
          echo "RoboPlan development override: exact-source qualification disabled" >&2; \
@@ -149,11 +152,11 @@ RUN PINOCCHIO_CMAKE_DIR=$(find /usr -name "pinocchioConfig.cmake" -printf '%h\n'
     && if [ "$ROBOPLAN_SOURCE_MODE" = qualified ]; then DEVELOPMENT_SOURCE=0; else DEVELOPMENT_SOURCE=1; fi \
     && ROBOPLAN_SOURCE_LEDGER=/tmp/external-delta-ledger.v1.json \
        ROBOPLAN_SOURCE_VERIFIER=/tmp/verify-external-source-closure.py \
-       ROBOPLAN_SOURCE_ID=roboplan_0_7_0_ua1_foundation \
+       ROBOPLAN_SOURCE_ID=roboplan_0_8_0_foundation \
        ROBOPLAN_ALLOW_STRIPPED_GIT=1 \
        ROBOPLAN_ALLOW_DEVELOPMENT_SOURCE="$DEVELOPMENT_SOURCE" \
        bash /tmp/build-roboplan-source-closure.sh \
-         /tmp/proxsuite /tmp/toppra /tmp/roboplan \
+         /tmp/proxsuite /tmp/jrl-cmakemodules /tmp/toppra /tmp/nanoflann /tmp/roboplan \
          -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
          -DBUILD_PYTHON_BINDINGS=OFF \
     && CLOSURE_INSTALL=/tmp/roboplan-install-closure \
@@ -167,7 +170,7 @@ RUN PINOCCHIO_CMAKE_DIR=$(find /usr -name "pinocchioConfig.cmake" -printf '%h\n'
     && ROBOPLAN_SITE_PACKAGES=$(python3 -c "import site; print(site.getsitepackages()[0])") \
     && export CMAKE_PREFIX_PATH="${ROBOPLAN_SITE_PACKAGES}:/usr/local:${PINOCCHIO_PREFIX}" \
     && export LD_LIBRARY_PATH="${ROBOPLAN_SITE_PACKAGES}/lib:/usr/local/lib:${PINOCCHIO_PREFIX}/lib" \
-    && export CMAKE_ARGS="-DFETCHCONTENT_FULLY_DISCONNECTED=ON -DFETCHCONTENT_UPDATES_DISCONNECTED=ON" \
+    && export CMAKE_ARGS="-DFETCHCONTENT_FULLY_DISCONNECTED=ON -DFETCHCONTENT_UPDATES_DISCONNECTED=ON -DFETCHCONTENT_SOURCE_DIR_NANOFLANN=/tmp/nanoflann -DCMAKE_DISABLE_FIND_PACKAGE_nanoflann=ON -DCMAKE_DISABLE_FIND_PACKAGE_tl-expected=ON" \
     && for py_pkg in roboplan_common roboplan_example_models roboplan_core roboplan_simple_ik roboplan_oink roboplan_toppra roboplan_rrt roboplan_cartesian_planning roboplan; do \
          cd "/tmp/roboplan/${py_pkg}"; \
          pip install --no-build-isolation --no-deps --no-cache-dir -v . || exit 1; \
@@ -175,7 +178,8 @@ RUN PINOCCHIO_CMAKE_DIR=$(find /usr -name "pinocchioConfig.cmake" -printf '%h\n'
     && printf '%s\n' "${ROBOPLAN_SITE_PACKAGES}/lib" > /etc/ld.so.conf.d/manyforge-roboplan.conf \
     && ldconfig \
     && pip check \
-    && rm -rf /tmp/roboplan /tmp/proxsuite /tmp/toppra /tmp/roboplan-manifest \
+    && rm -rf /tmp/roboplan /tmp/proxsuite /tmp/jrl-cmakemodules /tmp/toppra /tmp/nanoflann \
+         /tmp/roboplan-manifest \
          /tmp/roboplan-build-closure /tmp/roboplan-install-closure \
          /tmp/build-roboplan-source-stack.sh /tmp/build-roboplan-source-closure.sh \
          /tmp/verify-external-source-closure.py /tmp/external-delta-ledger.v1.json

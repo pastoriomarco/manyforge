@@ -105,15 +105,11 @@ std::vector<double> get_numbers(const CanonicalValue& value) {
 [[nodiscard]] CanonicalValue cartesian_fidelity_value(const CartesianFidelityMetricsDTO& value) {
   if (!valid_cartesian_fidelity_metrics(value)) fail("trajectory_cartesian_fidelity_invalid");
   return CanonicalValue(CanonicalValue::Object{
-      {"accepted_max_blend_deviation_rad", CanonicalValue(value.accepted_max_blend_deviation_rad)},
       {"certified_max_rotation_error_rad", CanonicalValue(value.certified_max_rotation_error_rad)},
       {"certified_max_translation_error_m",
        CanonicalValue(value.certified_max_translation_error_m)},
       {"measured_max_rotation_error_rad", CanonicalValue(value.measured_max_rotation_error_rad)},
       {"measured_max_translation_error_m", CanonicalValue(value.measured_max_translation_error_m)},
-      {"planning_attempt_count", CanonicalValue(static_cast<double>(value.planning_attempt_count))},
-      {"requested_max_blend_deviation_rad",
-       CanonicalValue(value.requested_max_blend_deviation_rad)},
       {"requested_rotation_tolerance_rad", CanonicalValue(value.requested_rotation_tolerance_rad)},
       {"requested_translation_tolerance_m",
        CanonicalValue(value.requested_translation_tolerance_m)},
@@ -123,13 +119,10 @@ std::vector<double> get_numbers(const CanonicalValue& value) {
 }
 
 [[nodiscard]] CartesianFidelityMetricsDTO get_cartesian_fidelity(const CanonicalValue& value) {
-  exact(value, {"accepted_max_blend_deviation_rad", "certified_max_rotation_error_rad",
-                "certified_max_translation_error_m", "measured_max_rotation_error_rad",
-                "measured_max_translation_error_m", "planning_attempt_count",
-                "requested_max_blend_deviation_rad", "requested_rotation_tolerance_rad",
-                "requested_translation_tolerance_m", "unsampled_rotation_bound_rad",
-                "unsampled_translation_bound_m"});
-  const double attempts = number(member(value, "planning_attempt_count"));
+  exact(value, {"certified_max_rotation_error_rad", "certified_max_translation_error_m",
+                "measured_max_rotation_error_rad", "measured_max_translation_error_m",
+                "requested_rotation_tolerance_rad", "requested_translation_tolerance_m",
+                "unsampled_rotation_bound_rad", "unsampled_translation_bound_m"});
   CartesianFidelityMetricsDTO result{number(member(value, "requested_translation_tolerance_m")),
                                      number(member(value, "requested_rotation_tolerance_rad")),
                                      number(member(value, "measured_max_translation_error_m")),
@@ -137,12 +130,8 @@ std::vector<double> get_numbers(const CanonicalValue& value) {
                                      number(member(value, "unsampled_translation_bound_m")),
                                      number(member(value, "unsampled_rotation_bound_rad")),
                                      number(member(value, "certified_max_translation_error_m")),
-                                     number(member(value, "certified_max_rotation_error_rad")),
-                                     number(member(value, "requested_max_blend_deviation_rad")),
-                                     number(member(value, "accepted_max_blend_deviation_rad")),
-                                     static_cast<std::uint32_t>(attempts)};
-  if (attempts != static_cast<double>(result.planning_attempt_count) ||
-      !valid_cartesian_fidelity_metrics(result))
+                                     number(member(value, "certified_max_rotation_error_rad"))};
+  if (!valid_cartesian_fidelity_metrics(result))
     fail("trajectory_cartesian_fidelity_invalid");
   return result;
 }
@@ -591,20 +580,6 @@ ResolvedFrameDTO get_frame(const CanonicalValue& v) {
   }
   fail("frame_tag_invalid");
 }
-// Speed-check frame sets are emitted only when non-empty, so requests that
-// check the TCP alone keep their previous encoding.
-CanonicalValue frames_value(const std::vector<ResolvedFrameDTO>& frames) {
-  CanonicalValue::Array result;
-  result.reserve(frames.size());
-  for (const auto& frame : frames) result.push_back(frame_value(frame));
-  return CanonicalValue(std::move(result));
-}
-std::vector<ResolvedFrameDTO> get_frames(const CanonicalValue& v) {
-  std::vector<ResolvedFrameDTO> result;
-  for (const auto& frame : v.as_array()) result.push_back(get_frame(frame));
-  if (result.empty()) fail("speed_check_frames_invalid");
-  return result;
-}
 CanonicalValue coordinate_position(const CoordinatePositionDTO& v) {
   return std::visit(
       [](const auto& x) {
@@ -714,22 +689,38 @@ ControlledStateDTO get_state(const CanonicalValue& v) {
           std::move(p),
           std::move(vel)};
 }
-std::string planning_profile(PlanningProfileDTO x) {
-  switch (x) {
-    case PlanningProfileDTO::kFirstFeasible:
-      return "first_feasible";
-    case PlanningProfileDTO::kBalanced:
-      return "balanced";
-    case PlanningProfileDTO::kQualityBounded:
-      return "quality_bounded";
-  }
-  fail("planning_profile_invalid");
+CanonicalValue planner_override_value(const PlannerOverrideDTO& x) {
+  CanonicalValue::Object f;
+  if (x.search) f.emplace_back("search", CanonicalValue(std::string(to_string(*x.search))));
+  if (x.optimize) f.emplace_back("optimize", CanonicalValue(std::string(to_string(*x.optimize))));
+  if (x.n) f.emplace_back("n", CanonicalValue(static_cast<double>(*x.n)));
+  if (x.collision_check_step_rad)
+    f.emplace_back("collision_check_step_rad", CanonicalValue(*x.collision_check_step_rad));
+  if (x.max_nodes) f.emplace_back("max_nodes", CanonicalValue(static_cast<double>(*x.max_nodes)));
+  return CanonicalValue(std::move(f));
 }
-PlanningProfileDTO get_planning_profile(std::string_view x) {
-  if (x == "first_feasible") return PlanningProfileDTO::kFirstFeasible;
-  if (x == "balanced") return PlanningProfileDTO::kBalanced;
-  if (x == "quality_bounded") return PlanningProfileDTO::kQualityBounded;
-  fail("planning_profile_invalid");
+PlannerOverrideDTO get_planner_override(const CanonicalValue& v) {
+  exact(v, {}, {"search", "optimize", "n", "collision_check_step_rad", "max_nodes"});
+  PlannerOverrideDTO r;
+  if (const auto* x = v.find_object_member("search")) {
+    r.search = planner_search_from_string(text(*x));
+    if (!r.search) fail("planner_override_invalid");
+  }
+  if (const auto* x = v.find_object_member("optimize")) {
+    r.optimize = planner_optimize_from_string(text(*x));
+    if (!r.optimize) fail("planner_override_invalid");
+  }
+  const auto u32 = [](const CanonicalValue& x) {
+    const auto item = safe_unsigned(x);
+    if (item > std::numeric_limits<std::uint32_t>::max()) fail("planner_override_invalid");
+    return static_cast<std::uint32_t>(item);
+  };
+  if (const auto* x = v.find_object_member("n")) r.n = u32(*x);
+  if (const auto* x = v.find_object_member("collision_check_step_rad"))
+    r.collision_check_step_rad = number(*x);
+  if (const auto* x = v.find_object_member("max_nodes")) r.max_nodes = u32(*x);
+  if (!valid_planner_override(r)) fail("planner_override_invalid");
+  return r;
 }
 CanonicalValue motion_value(const ResolvedMotionSpecDTO& m) {
   return std::visit(
@@ -746,22 +737,24 @@ CanonicalValue motion_value(const ResolvedMotionSpecDTO& m) {
         else if constexpr (std::is_same_v<X, CartesianPathDTO>) {
           CanonicalValue::Array w;
           for (const auto& p : x.waypoints) w.push_back(pose_value(p));
+          CanonicalValue::Object path{
+              {"waypoints", CanonicalValue(std::move(w))},
+              {"max_translation_step_m", CanonicalValue(x.max_translation_step_m)},
+              {"max_rotation_step_rad", CanonicalValue(x.max_rotation_step_rad)},
+              {"max_angular_speed_rad_s", CanonicalValue(x.max_angular_speed_rad_s)},
+              {"max_linear_acceleration_mps2", CanonicalValue(x.max_linear_acceleration_mps2)},
+              {"max_angular_acceleration_rad_s2",
+               CanonicalValue(x.max_angular_acceleration_rad_s2)},
+              {"blend_radii_m", numbers(x.blend_radii_m)},
+              {"fallback_policy",
+               CanonicalValue(x.fallback_policy == CartesianFallbackPolicyDTO::kFailClosed
+                                  ? "fail_closed"
+                                  : "allow_joint_space_fallback")}};
+          if (x.speed_mode)
+            path.emplace_back("speed_mode",
+                         CanonicalValue(std::string(cartesian_speed_mode_name(*x.speed_mode))));
           return CanonicalValue(CanonicalValue::Object{
-              {"cartesian_path",
-               CanonicalValue(CanonicalValue::Object{
-                   {"waypoints", CanonicalValue(std::move(w))},
-                   {"max_translation_step_m", CanonicalValue(x.max_translation_step_m)},
-                   {"max_rotation_step_rad", CanonicalValue(x.max_rotation_step_rad)},
-                   {"speed_mode", CanonicalValue("bounded")},
-                   {"max_angular_speed_rad_s", CanonicalValue(x.max_angular_speed_rad_s)},
-                   {"max_linear_acceleration_mps2", CanonicalValue(x.max_linear_acceleration_mps2)},
-                   {"max_angular_acceleration_rad_s2",
-                    CanonicalValue(x.max_angular_acceleration_rad_s2)},
-                   {"max_blend_deviation_rad", CanonicalValue(x.max_blend_deviation_rad)},
-                   {"fallback_policy",
-                    CanonicalValue(x.fallback_policy == CartesianFallbackPolicyDTO::kFailClosed
-                                       ? "fail_closed"
-                                       : "allow_joint_space_fallback")}})}});
+              {"cartesian_path", CanonicalValue(std::move(path))}});
         } else
           fail("unresolved_named_target_forbidden");
       },
@@ -777,16 +770,20 @@ ResolvedMotionSpecDTO get_motion(const CanonicalValue& v) {
   }
   if (const auto* x = v.find_object_member("pose_goal")) return PoseGoalDTO{get_pose(*x)};
   if (const auto* x = v.find_object_member("cartesian_path")) {
-    const auto* blend = x->find_object_member("max_blend_deviation_rad");
-    if (blend)
+    const auto* speed_mode = x->find_object_member("speed_mode");
+    if (speed_mode)
       exact(*x, {"waypoints", "max_translation_step_m", "max_rotation_step_rad", "speed_mode",
                  "max_angular_speed_rad_s", "max_linear_acceleration_mps2",
-                 "max_angular_acceleration_rad_s2", "fallback_policy", "max_blend_deviation_rad"});
+                 "max_angular_acceleration_rad_s2", "blend_radii_m", "fallback_policy"});
     else
-      exact(*x, {"waypoints", "max_translation_step_m", "max_rotation_step_rad", "speed_mode",
+      exact(*x, {"waypoints", "max_translation_step_m", "max_rotation_step_rad",
                  "max_angular_speed_rad_s", "max_linear_acceleration_mps2",
-                 "max_angular_acceleration_rad_s2", "fallback_policy"});
-    if (text(member(*x, "speed_mode")) != "bounded") fail("cartesian_speed_mode_invalid");
+                 "max_angular_acceleration_rad_s2", "blend_radii_m", "fallback_policy"});
+    std::optional<CartesianSpeedModeDTO> mode;
+    if (speed_mode) {
+      mode = parse_cartesian_speed_mode(text(*speed_mode));
+      if (!mode) fail("cartesian_speed_mode_invalid");
+    }
     std::vector<Pose3DTO> w;
     for (const auto& p : member(*x, "waypoints").as_array()) w.push_back(get_pose(p));
     const auto fp = text(member(*x, "fallback_policy"));
@@ -795,14 +792,14 @@ ResolvedMotionSpecDTO get_motion(const CanonicalValue& v) {
     CartesianPathDTO result{std::move(w),
                             number(member(*x, "max_translation_step_m")),
                             number(member(*x, "max_rotation_step_rad")),
-                            CartesianSpeedModeDTO::kBounded,
+                            mode,
                             number(member(*x, "max_angular_speed_rad_s")),
                             number(member(*x, "max_linear_acceleration_mps2")),
                             number(member(*x, "max_angular_acceleration_rad_s2")),
                             fp == "fail_closed"
                                 ? CartesianFallbackPolicyDTO::kFailClosed
-                                : CartesianFallbackPolicyDTO::kAllowJointSpaceFallback};
-    if (blend) result.max_blend_deviation_rad = number(*blend);
+                                : CartesianFallbackPolicyDTO::kAllowJointSpaceFallback,
+                            get_numbers(member(*x, "blend_radii_m"))};
     return result;
   }
   fail("motion_tag_invalid");
@@ -935,8 +932,6 @@ CanonicalValue replacement_value(const MovingReplacementInputDTO& m) {
   if (m.remaining_planning_budget_s)
     fields.emplace_back("remaining_planning_budget_s",
                         CanonicalValue(*m.remaining_planning_budget_s));
-  if (!m.source_speed_check_frames.empty())
-    fields.emplace_back("source_speed_check_frames", frames_value(m.source_speed_check_frames));
   return CanonicalValue(std::move(fields));
 }
 MovingReplacementInputDTO get_replacement(const CanonicalValue& v) {
@@ -945,7 +940,7 @@ MovingReplacementInputDTO get_replacement(const CanonicalValue& v) {
          "divergence_cursor_s", "suffix_start_state", "source_base_frame", "source_tcp_frame",
          "source_speed_profile", "source_per_resource_dynamics_limits",
          "remaining_preparation_budget_s"},
-        {"remaining_planning_budget_s", "source_speed_check_frames"});
+        {"remaining_planning_budget_s"});
   const auto& goal = member(v, "source_goal");
   exact(goal, {"controller_goal_id", "controller_goal_generation"});
   MovingReplacementInputDTO result{
@@ -963,8 +958,6 @@ MovingReplacementInputDTO get_replacement(const CanonicalValue& v) {
       number(member(v, "remaining_preparation_budget_s"))};
   if (const auto* budget = v.find_object_member("remaining_planning_budget_s"))
     result.remaining_planning_budget_s = number(*budget);
-  if (const auto* frames = v.find_object_member("source_speed_check_frames"))
-    result.source_speed_check_frames = get_frames(*frames);
   validate_replacement_input(result);
   return result;
 }
@@ -1042,7 +1035,7 @@ CanonicalValue plan_request_value(const PlanRequestDTO& r) {
            {"translation_tol_m", CanonicalValue(r.tolerances.translation_tol_m)},
            {"rotation_tol_rad", CanonicalValue(r.tolerances.rotation_tol_rad)}})},
       {"speed_profile", speed_value(r.speed_profile)},
-      {"planning_profile", CanonicalValue(planning_profile(r.planning_profile))},
+      {"planner", planner_override_value(r.planner)},
       {"per_resource_dynamics_limits", dynamics_value(r.per_resource_dynamics_limits)},
       {"planning_timeout_s", CanonicalValue(r.planning_timeout_s)},
       {"planning_attempt_index", CanonicalValue(static_cast<double>(r.planning_attempt_index))},
@@ -1067,17 +1060,14 @@ CanonicalValue plan_request_value(const PlanRequestDTO& r) {
     f.emplace_back("contact_policy_id", CanonicalValue(*r.contact_policy_id));
   if (r.moving_replacement)
     f.emplace_back("moving_replacement", replacement_value(*r.moving_replacement));
-  if (!r.speed_check_frames.empty())
-    f.emplace_back("speed_check_frames", frames_value(r.speed_check_frames));
   return CanonicalValue(std::move(f));
 }
 PlanRequestDTO get_plan_request(const CanonicalValue& v) {
   const bool ha = v.find_object_member("action_span") != nullptr;
   const bool hc = v.find_object_member("contact_policy_id") != nullptr;
   const bool hm = v.find_object_member("moving_replacement") != nullptr;
-  const bool hs = v.find_object_member("speed_check_frames") != nullptr;
   if (object(v).size() !=
-      47U + (ha ? 1U : 0U) + (hc ? 1U : 0U) + (hm ? 1U : 0U) + (hs ? 1U : 0U))
+      47U + (ha ? 1U : 0U) + (hc ? 1U : 0U) + (hm ? 1U : 0U))
     fail("plan_request_member_count_invalid");
   PlanRequestDTO r{
       OperationId(text(member(v, "operation_id"))),
@@ -1126,7 +1116,7 @@ PlanRequestDTO get_plan_request(const CanonicalValue& v) {
       get_motion(member(v, "motion")),
       TolerancesDTO{0.0, 0.0, 0.0},
       SpeedProfileDTO{},
-      PlanningProfileDTO::kFirstFeasible,
+      PlannerOverrideDTO{},
       std::nullopt,
       {},
       1.0,
@@ -1203,7 +1193,7 @@ PlanRequestDTO get_plan_request(const CanonicalValue& v) {
   r.tolerances = {number(member(t, "joint_position_tol_rad")),
                   number(member(t, "translation_tol_m")), number(member(t, "rotation_tol_rad"))};
   r.speed_profile = get_speed(member(v, "speed_profile"));
-  r.planning_profile = get_planning_profile(text(member(v, "planning_profile")));
+  r.planner = get_planner_override(member(v, "planner"));
   r.per_resource_dynamics_limits = get_dynamics(member(v, "per_resource_dynamics_limits"));
   r.planning_timeout_s = number(member(v, "planning_timeout_s"));
   const auto attempt = safe_unsigned(member(v, "planning_attempt_index"));
@@ -1232,7 +1222,6 @@ PlanRequestDTO get_plan_request(const CanonicalValue& v) {
                                   text(member(a, "parent_node_attempt_id"))};
   }
   if (hm) r.moving_replacement = get_replacement(member(v, "moving_replacement"));
-  if (hs) r.speed_check_frames = get_frames(member(v, "speed_check_frames"));
   validate_replacement_request(r);
   return r;
 }

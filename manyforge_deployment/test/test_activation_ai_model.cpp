@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <exception>
 #include <filesystem>
-#include <manyforge_core/io_provider_lifecycle_catalog.hpp>
 #include <manyforge_deployment/assistant_settings_codec.hpp>
 #include <manyforge_deployment/io_signal_catalog.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
@@ -99,7 +98,7 @@ TEST(ActivationAiModel, ModelFreeComponentCompilesToOneProviderDomain) {
   const auto *provider = graph.control_domains.front().provider();
   ASSERT_NE(provider, nullptr);
   EXPECT_EQ(provider->provider_manifest_id.value(),
-            c::kAiModelLifecycleManifestId);
+            d::kAiModelProviderManifestId);
   EXPECT_EQ(provider->controllable_component_id.value(), "assistant_model");
   EXPECT_EQ(provider->signal_names,
             (std::vector<std::string>{std::string(contract::kAiModelStreamId)}));
@@ -117,7 +116,7 @@ TEST(ActivationAiModel, ModelFreeComponentCompilesToOneProviderDomain) {
   EXPECT_EQ(std::count_if(providers.begin(), providers.end(),
                           [](const auto &row) {
                             return row.provider_manifest_id.value() ==
-                                   c::kAiModelLifecycleManifestId;
+                                   d::kAiModelProviderManifestId;
                           }),
             6);
   EXPECT_FALSE(bundle.value().assistant.has_value());
@@ -257,9 +256,8 @@ Value WithBudget(Value component, Value seconds) {
 }
 
 // Per-component time budget: an authored `lifecycle_command_timeout_s`
-// compiles to the component's own `lifecycle_command_timeouts` row, which is
-// what CCLC and the composition exchange read. Without one nothing is added
-// (defaults unchanged).
+// compiles to the component's own `lifecycle_command_timeouts` row. Without
+// one nothing is added (defaults unchanged).
 TEST(ActivationAiModel, LifecycleBudgetCompilesToTheComponentsOwnRow) {
   const auto plain = Materialize(Intent(Array{
       AiModel("chat_model", "chat"), AiModel("selection_model", "select")}));

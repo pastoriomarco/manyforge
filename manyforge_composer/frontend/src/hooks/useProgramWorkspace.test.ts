@@ -10,8 +10,6 @@ import type {
 import type { ComposerHeadlessState } from '../types/headless';
 
 const apiMock = vi.hoisted(() => ({
-  programs: { sceneClearStatus: vi.fn() },
-  manager: { applyStatus: vi.fn() },
   programWorkspace: {
     get: vi.fn(),
     mutate: vi.fn(),
@@ -19,8 +17,10 @@ const apiMock = vi.hoisted(() => ({
   },
   scenarioDocuments: {
     save: vi.fn(),
+  },
+  cellApply: {
     load: vi.fn(),
-    new: vi.fn(),
+    newScenario: vi.fn(),
   },
 }));
 
@@ -36,6 +36,7 @@ import {
   authoringUnavailableReason,
   authoringWorkspaceIdentity,
   draftEditUnavailableReason,
+  scenarioReplacementUnavailableReason,
   projectFacts,
   publicationIsCurrent,
   type PublishedAuthoringWorkspace,
@@ -64,10 +65,12 @@ function testAuthoringController(
     current: publicationIsCurrent(published, snapshot),
     unavailableReason: authoringUnavailableReason(published, snapshot),
     editUnavailableReason: draftEditUnavailableReason(published, snapshot),
+    replaceUnavailableReason: scenarioReplacementUnavailableReason(published, snapshot),
     project: projectFacts(published),
     reading: false,
     error: null,
     refresh: testRefresh,
+    operation: null,
     beginMutation: testBeginMutation,
     finishMutation: testFinishMutation,
     observeApply: () => undefined,
@@ -348,7 +351,7 @@ function authoringSnapshot(
       overviewRevision: `sha256:${'a'.repeat(64)}`,
       readiness: 'ready',
       summaryLabel: 'Ready',
-      profileLabel: 'native',
+      profileLabel: 'standard',
       authorityLabel: 'owner-issued scoped facts',
       userMessage: 'Current.',
       capabilities: [],
@@ -715,68 +718,70 @@ describe('useProgramWorkspace Draft policy interaction', () => {
     expect(apiMock.programWorkspace.apply).toHaveBeenCalledOnce();
   });
 
-  it('New loads Untitled with the shared fence and follows the exact accepted Apply without a second command', async () => {
+  it('New is the server Apply of the empty cell: one call, then the workspace is read', async () => {
     const initial = deferred<ProgramWorkspaceResponse>();
     await mountHarness(initial, authoringSnapshot(workspace(1)), testPublication(workspace(1)));
     await act(async () => initial.resolve(workspace(1)));
-    apiMock.scenarioDocuments.new.mockResolvedValue({
-      status: 'accepted', workspace: workspace(1),
-      activation: { status: 'accepted', apply_id: 'apply.new', apply_generation: 9 },
-    });
-    apiMock.programs.sceneClearStatus.mockResolvedValue({ applyId: 'apply.new', applyGeneration: 9, state: 'succeeded', remaining: [], reason: null });
-    const confirmedAuthoring = {
-      workspaceEpoch: 'confirmed.workspace', workspaceRevision: 5,
-      programDraftId: 'confirmed.program', programDraftRevision: 8,
-      deploymentDraftId: 'confirmed.deployment', deploymentDraftRevision: 13,
-    };
-    await act(async () => { await latest?.newScenarioDocument(true, confirmedAuthoring); });
-    expect(apiMock.scenarioDocuments.new).toHaveBeenCalledExactlyOnceWith(
-      expect.objectContaining({
-        expectedWorkspaceEpoch: 'confirmed.workspace', expectedWorkspaceRevision: 5,
-        draftId: 'confirmed.program', expectedDraftRevision: 8,
-        deploymentDraftId: 'confirmed.deployment', expectedDeploymentDraftRevision: 13,
-      }), true,
-    );
-    expect(latest?.acceptedApply).toEqual({ applyId: 'apply.new', applyGeneration: 9 });
-    expect(latest?.state.message).toContain('New Scenario accepted (apply.new)');
-    expect(latest?.state.message).toContain('Motion does not start automatically');
-    expect(apiMock.scenarioDocuments.load).not.toHaveBeenCalled();
-  });
-
-  it('New waits for the correlated clear and opens its workspace after a partial result', async () => {
-    const initial = deferred<ProgramWorkspaceResponse>();
-    await mountHarness(initial, authoringSnapshot(workspace(1)), testPublication(workspace(1)));
-    await act(async () => initial.resolve(workspace(1)));
-    apiMock.scenarioDocuments.new.mockResolvedValue({ status: 'accepted', workspace: workspace(2),
-      activation: { status: 'accepted', apply_id: 'apply.new', apply_generation: 9 } });
-    const clearing = deferred<{ applyId: string; applyGeneration: number; state: string; remaining: string[]; reason: object }>();
-    apiMock.programs.sceneClearStatus.mockReturnValueOnce(clearing.promise);
-    let result: unknown;
-    await act(async () => { void latest!.newScenarioDocument(true).then((value) => { result = value; }); });
-    expect(result).toBeUndefined();
-    expect(latest?.newSceneClearApply).toEqual({ applyId: 'apply.new', applyGeneration: 9 });
-    await act(async () => { clearing.resolve({ applyId: 'apply.new', applyGeneration: 9, state: 'partial',
-      remaining: ['held'], reason: { code: 'scene_clear_partial', message: 'Detach refused', details: {} } }); });
-    expect(result).toBeDefined();
+    apiMock.cellApply.newScenario.mockResolvedValue({ outcome: 'succeeded',
+      components: [{ component_id: 'arm', disposition: 'remove', lifecycle_after: 'offline' }] });
+    apiMock.programWorkspace.get.mockResolvedValueOnce(workspace(2));
+    await act(async () => { await latest?.newScenarioDocument(); });
+    expect(apiMock.cellApply.newScenario).toHaveBeenCalledOnce();
+    expect(apiMock.cellApply.load).not.toHaveBeenCalled();
     expect(latest?.state.workspace?.draft.draftRevision).toBe(2);
+    expect(latest?.state.message).toContain('New Scenario');
+    expect(scenarioOpened).toHaveBeenCalledOnce();
   });
 
-  it('New opens its workspace when the Scene clear status times out', async () => {
+  it('a failed New shows its typed refusal and is not retried', async () => {
     const initial = deferred<ProgramWorkspaceResponse>();
     await mountHarness(initial, authoringSnapshot(workspace(1)), testPublication(workspace(1)));
     await act(async () => initial.resolve(workspace(1)));
-    apiMock.scenarioDocuments.new.mockResolvedValue({ status: 'accepted', workspace: workspace(2),
-      activation: { status: 'accepted', apply_id: 'apply.new', apply_generation: 9 } });
-    apiMock.programs.sceneClearStatus.mockReturnValue(new Promise(() => {}));
-    vi.useFakeTimers();
-    try {
-      let result: unknown;
-      await act(async () => { void latest!.newScenarioDocument(true).then((value) => { result = value; }); });
-      expect(result).toBeUndefined();
-      await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
-      expect(result).toBeDefined();
-      expect(latest?.state.workspace?.draft.draftRevision).toBe(2);
-    } finally { vi.useRealTimers(); }
+    apiMock.cellApply.newScenario.mockRejectedValueOnce(new ApiError('A run is in progress.', 409, {
+      detail: { code: 'apply_refused_run_in_progress', message: 'A run is in progress.' },
+    }));
+    let result: unknown;
+    await act(async () => { result = await latest?.newScenarioDocument(); });
+    expect(result).toBeNull();
+    expect(apiMock.cellApply.newScenario).toHaveBeenCalledOnce();
+    expect(latest?.state.error).toContain('New Scenario refused');
+    expect(scenarioOpened).not.toHaveBeenCalled();
+  });
+
+  it('a dropped Load connection is no refusal: it shows the current Scenario and is not retried', async () => {
+    const initial = deferred<ProgramWorkspaceResponse>();
+    await mountHarness(initial, authoringSnapshot(workspace(1)), testPublication(workspace(1)));
+    await act(async () => initial.resolve(workspace(1)));
+    const digest = `sha256:${'b'.repeat(64)}`;
+    const fetchMock = vi.fn(async (_url: string) => ({ ok: true, status: 200, json: async () => ({
+      schema_version: 'manyforge.current_scenario.v1', ready: true, unavailable_reasons: [],
+      current_scenario: {
+        scenario_id: 'mock_lite6_motion_preemption', source_document_digest: digest,
+        deployment_artifact_id: 'mock_lite6_motion_preemption', deployment_revision: digest,
+        retained_bundle_id: digest, graph_revision: digest, program_id: 'program',
+        program_revision: digest, program_binding_id: digest,
+      },
+    }) }));
+    vi.stubGlobal('fetch', fetchMock);
+    apiMock.cellApply.load.mockRejectedValueOnce(
+      new TypeError('NetworkError when attempting to fetch resource.'));
+    let refusal: string | null = null;
+    await act(async () => {
+      await latest?.loadScenarioDocument('/workspace/cell', (message) => { refusal = message; });
+    });
+    expect(apiMock.cellApply.load).toHaveBeenCalledOnce();
+    expect(fetchMock).toHaveBeenCalledExactlyOnceWith('/api/scenarios/current', expect.anything());
+    expect(refusal).toBe('Scenario Load: the connection dropped before the reply arrived. '
+      + 'Current Scenario: mock_lite6_motion_preemption, applied. Nothing was retried.');
+    expect(refusal).not.toContain('refused');
+    expect(scenarioOpened).not.toHaveBeenCalled();
+
+    // The current Scenario cannot be read either: said so, still no refusal.
+    fetchMock.mockRejectedValueOnce(new TypeError('NetworkError when attempting to fetch resource.'));
+    apiMock.cellApply.newScenario.mockRejectedValueOnce(new TypeError('Failed to fetch'));
+    await act(async () => { await latest?.newScenarioDocument((message) => { refusal = message; }); });
+    expect(refusal).toBe('New Scenario: the connection dropped before the reply arrived. '
+      + 'The current Scenario could not be read: NetworkError when attempting to fetch resource. Nothing was retried.');
   });
 
   it('shows a written-but-not-adopted Scenario Save with its path and refreshes once', async () => {
@@ -818,7 +823,7 @@ describe('useProgramWorkspace Draft policy interaction', () => {
     expect(latest?.state.message).toContain('/workspace/cell');
   });
 
-  it('fences Scenario Save and Load with both current authored documents', async () => {
+  it('fences Scenario Save with both current authored documents; Load is one server call', async () => {
     const initial = deferred<ProgramWorkspaceResponse>();
     await mountHarness(
       initial,
@@ -833,20 +838,6 @@ describe('useProgramWorkspace Draft policy interaction', () => {
       lastKnownStatus: 'unknown',
       workspace: workspace(1),
     });
-    apiMock.scenarioDocuments.load.mockResolvedValue({
-      status: 'accepted',
-      path: '/workspace/cell',
-      scenarioId: 'cell',
-      activation: {
-        status: 'accepted', apply_id: 'apply.1', apply_generation: 1,
-      },
-      diagnostics: [],
-      sourceDiagnostics: [],
-      incomplete: false,
-      workspace: workspace(1),
-      authoringWorkspace: authoringSnapshot(workspace(1)),
-    });
-
     await act(async () => {
       latest?.saveScenarioDocument({
         directory: '/workspace',
@@ -866,67 +857,22 @@ describe('useProgramWorkspace Draft policy interaction', () => {
       }),
       expect.objectContaining({ directory: '/workspace', name: 'cell' }),
     );
-    expect(latest?.scenarioDocumentPath).toBe('/workspace/cell');
 
-    const confirmedAuthoring = {
-      workspaceEpoch: 'load.confirmed', workspaceRevision: 6,
-      programDraftId: 'program.confirmed', programDraftRevision: 7,
-      deploymentDraftId: 'deployment.confirmed', deploymentDraftRevision: 10,
-    };
-    await act(async () => {
-      latest?.loadScenarioDocument(
-        '/workspace/cell',
-        true,
-        confirmedAuthoring,
-      );
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-    expect(apiMock.scenarioDocuments.load).toHaveBeenCalledWith(
-      expect.objectContaining({
-        expectedWorkspaceEpoch: 'load.confirmed', expectedWorkspaceRevision: 6,
-        draftId: 'program.confirmed', expectedDraftRevision: 7,
-        deploymentDraftId: 'deployment.confirmed', expectedDeploymentDraftRevision: 10,
-      }),
-      '/workspace/cell',
-      true,
-    );
-    expect(latest?.state.message).toContain('Scenario Load accepted');
-    expect(latest?.state.message).toContain('Motion does not start automatically');
-    expect(latest?.state.message).not.toContain('Check Runtime / history');
-    // Activity follows the exact accepted Manager operation, not any newer one.
-    expect(latest?.acceptedApply?.applyId).toBe('apply.1');
-    // A successful Load reply asks the page to read health again.
+    apiMock.cellApply.load.mockResolvedValueOnce({ outcome: 'succeeded',
+      components: [{ component_id: 'arm', disposition: 'add', lifecycle_after: 'prepared' }] });
+    apiMock.programWorkspace.get.mockResolvedValueOnce(workspace(1));
+    await act(async () => { await latest?.loadScenarioDocument('/workspace/cell'); });
+    expect(apiMock.cellApply.load).toHaveBeenCalledExactlyOnceWith('/workspace/cell');
+    expect(latest?.state.message).toContain('arm prepared');
+    expect(latest?.state.message).toContain('Enable the components to run');
     expect(scenarioOpened).toHaveBeenCalledTimes(1);
 
-    apiMock.scenarioDocuments.load.mockResolvedValueOnce({
-      status: 'applied',
-      path: '/workspace/cell',
-      scenarioId: 'cell',
-      activation: { status: 'applied', apply_id: null },
-      diagnostics: [],
-      sourceDiagnostics: [],
-      incomplete: false,
-      workspace: workspace(1),
-      authoringWorkspace: authoringSnapshot(workspace(1)),
-    });
-    await act(async () => {
-      latest?.loadScenarioDocument('/workspace/cell', false);
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-    expect(latest?.state.message).toContain('already match the Applied configuration');
-    expect(latest?.state.message).toContain('No configuration change was needed');
-    expect(latest?.state.transitionStatus).toBe('applied');
-    expect(scenarioOpened).toHaveBeenCalledTimes(2);
-
-    // A refused or unconfirmed Load does not.
-    apiMock.scenarioDocuments.load.mockRejectedValueOnce(new Error('activation not confirmed'));
-    await act(async () => {
-      latest?.loadScenarioDocument('/workspace/cell', false);
-      await Promise.resolve();
-      await Promise.resolve();
-    });
-    expect(scenarioOpened).toHaveBeenCalledTimes(2);
+    // A failed Load (ApplyResult outcome failed) is shown and does not count as opened.
+    apiMock.cellApply.load.mockResolvedValueOnce({ outcome: 'failed', components: [],
+      error: { code: 'scenario_source_invalid', message: 'bad file' } });
+    await act(async () => { await latest?.loadScenarioDocument('/workspace/cell'); });
+    expect(apiMock.cellApply.load).toHaveBeenCalledTimes(2);
+    expect(latest?.state.error).toContain('Apply failed');
+    expect(scenarioOpened).toHaveBeenCalledTimes(1);
   });
 });

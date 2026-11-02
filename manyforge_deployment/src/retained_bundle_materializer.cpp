@@ -538,23 +538,11 @@ catalogs_projection(std::span<const core::CatalogRecordRefDTO> records,
   if (const auto &policies =
           deployment.applicability_inputs().normalized_policies();
       policies.has_value()) {
-    const auto *sources = policies->find_object_member("interrupt_sources");
-    const auto *rules = policies->find_object_member("interrupt_policies");
-    const auto *config = policies->find_object_member("interrupt_config");
-    if (sources == nullptr || rules == nullptr || config == nullptr)
-      throw std::logic_error(
-          "qualified interrupt policy projection is incomplete");
-    const auto *globals = policies->find_object_member("interrupt_rules");
-    if (!sources->as_array().empty() || !rules->as_array().empty() ||
-        (globals && !globals->as_array().empty())) {
-      CanonicalValue::Object configuration{{"interrupt_sources", *sources},
-                                           {"interrupt_policies", *rules},
-                                           {"interrupt_config", *config}};
-      if (globals && !globals->as_array().empty())
-        configuration.emplace_back("interrupt_rules", *globals);
+    // The codec emits interrupt_rules only when nonempty.
+    if (const auto *rules = policies->find_object_member("interrupt_rules"))
       root.emplace_back("interrupt_policy_configuration",
-                        CanonicalValue(std::move(configuration)));
-    }
+                        CanonicalValue(CanonicalValue::Object{
+                            {"interrupt_rules", *rules}}));
   }
   const auto &applicability = qualified.compiler_ir().applicability();
   if (applicability.selected_site_overlay_ref().has_value()) {

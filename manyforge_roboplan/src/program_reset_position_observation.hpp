@@ -3,6 +3,7 @@
 #include <manyforge_core/ports/iexecution_port.hpp>
 #include <manyforge_core/types/coordinate_state.hpp>
 #include <manyforge_roboplan/retained_observed_state_channel.hpp>
+#include <manyforge_roboplan/controller_launch_artifacts.hpp>
 #include <chrono>
 #include <functional>
 #include <stop_token>
@@ -28,6 +29,18 @@ inline bool ExactMockResetMeasuredTarget(const core::ObservedStateSnapshotDTO& s
       return false;
   }
   return true;
+}
+
+// Isaac (RP-1b): one hardware command sample received after the writer's
+// publication, newer than the pre-publication one, carrying exactly the
+// target acknowledges the write. Like Mock's loopback it proves the command
+// interface holds the target, not that the robot is there.
+inline bool ExactResetCommandEcho(const ResetCommandEcho& echo,
+                                  std::span<const double> target,
+                                  std::uint64_t after_sequence,
+                                  std::int64_t published_at_ns) {
+  return echo.sequence > after_sequence && echo.received_ns > published_at_ns &&
+         std::equal(echo.positions.begin(), echo.positions.end(), target.begin(), target.end());
 }
 
 // Wait only on existing source publications. The deadline is the approved

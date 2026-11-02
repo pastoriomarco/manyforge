@@ -15,6 +15,8 @@ from typing import Any
 
 import rfc8785
 
+from .component_model import ComponentModel, owner_ids
+
 
 COMPONENT_OVERVIEW_VERSION = "manyforge.component_overview.v2"
 
@@ -83,11 +85,19 @@ class ComponentOverviewFacts:
     execution_identity_response: Mapping[str, Any] | None
     execution_targets_response: Mapping[str, Any] | None
     execution_control_response: Mapping[str, Any] | None
+    # Component model v2: the host's published component model (or None).
+    component_model: ComponentModel | None
     errors: Mapping[str, Mapping[str, Any]]
+    # Read for Execute readiness (§10) only; the Overview doesn't use it.
+    applied_program_status: Mapping[str, Any] | None = None
 
     def reduce(self) -> dict[str, Any]:
         return build_component_overview(
-            **{field.name: getattr(self, field.name) for field in fields(self)}
+            **{
+                field.name: getattr(self, field.name)
+                for field in fields(self)
+                if field.name != "applied_program_status"
+            }
         )
 
 
@@ -165,6 +175,71 @@ def _component(
         "scope": scope,
         "contributor_ids": list(contributor_ids),
     }
+
+
+_LIFECYCLE_STATUS = {
+    "enabled": _HEALTHY,
+    "prepared": _WAITING,
+    "not_prepared": _WAITING,
+    "fault": _FAULT,
+    "offline": _OFFLINE,
+}
+
+
+def _component_state_tiles(
+    components: list[dict[str, Any]],
+    model: ComponentModel | None,
+    errors: Mapping[str, Mapping[str, Any]],
+) -> tuple[str, ...]:
+    """Append `component:<id>` tiles (or one `components` tile when the
+    model can't be read) and return their ids."""
+
+    if model is None:
+        error = _fact_error(errors, "component_model")
+        components.append(
+            _component(
+                "components",
+                "Components",
+                _OFFLINE,
+                "component states are unavailable",
+                required=True,
+                required_for=("Execute / Control",),
+                reason_code=_bounded_reason(
+                    error.get("code"), "component_model_unavailable"
+                ),
+                scope="component",
+            )
+        )
+        return ("components",)
+    tile_ids: list[str] = []
+    owners = owner_ids(model.component_states)
+    for state in model.component_states:
+        lifecycle = state["lifecycle"]
+        if lifecycle == "fault":
+            reason = state.get("fault", {}).get("code")
+            detail = state.get("fault", {}).get("message", "fault")
+        else:
+            reason = state.get("reason", {}).get("code")
+            detail = state.get("reason", {}).get("message", lifecycle.replace("_", " "))
+        tile_id = f"component:{state['component_id']}"
+        components.append(
+            _component(
+                tile_id,
+                state["component_id"],
+                # An owner has no Enable: `prepared` is its usable state (§16).
+                _HEALTHY
+                if lifecycle == "prepared" and state["component_id"] in owners
+                else _LIFECYCLE_STATUS[lifecycle],
+                detail,
+                required=True,
+                required_for=("Execute / Control",),
+                owner_id=state["component_id"],
+                reason_code=reason,
+                scope="component",
+            )
+        )
+        tile_ids.append(tile_id)
+    return tuple(tile_ids)
 
 
 def _response_payload(
@@ -281,6 +356,7 @@ def build_component_overview(
     execution_identity_response: Mapping[str, Any] | None,
     execution_targets_response: Mapping[str, Any] | None,
     execution_control_response: Mapping[str, Any] | None,
+    component_model: ComponentModel | None = None,
     errors: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build one bounded, read-only Component Overview projection.
@@ -399,67 +475,15 @@ def build_component_overview(
         )
     )
 
-    observed_units = {
-        row.get("runtime_unit_id"): row
-        for row in _sequence(manager_runtime.get("observed_units"))
-        if isinstance(row, Mapping) and isinstance(row.get("runtime_unit_id"), str)
-    }
     runtime_profiles: list[str] = []
     for desired in _sequence(manager_runtime.get("desired_units")):
-        if not isinstance(desired, Mapping):
-            continue
-        runtime_unit_id = desired.get("runtime_unit_id")
-        if not isinstance(runtime_unit_id, str) or not runtime_unit_id:
-            continue
-        profile = desired.get("runtime_profile_id")
+        profile = _mapping(desired).get("runtime_profile_id")
         if isinstance(profile, str) and profile and profile not in runtime_profiles:
             runtime_profiles.append(profile)
-        observed = _mapping(observed_units.get(runtime_unit_id))
-        converged = observed.get("converged") is True
-        observed_offer = observed.get("observed_runtime_contract_offer_digest")
-        desired_offer = desired.get("selected_runtime_contract_offer_digest")
-        offer_matches = (
-            isinstance(desired_offer, str)
-            and desired_offer
-            and observed_offer == desired_offer
-        )
-        unit_status = _HEALTHY if converged and offer_matches else _WAITING
-        reason_codes = [
-            reason
-            for reason in _sequence(observed.get("reason_codes"))
-            if isinstance(reason, str) and reason
-        ]
-        if (
-            maintenance_operation is not None
-            and runtime_unit_id
-            in maintenance_operation["affected_runtime_unit_ids"]
-            and not converged
-        ):
-            unit_status = _WAITING
-            reason_codes = ["planned_maintenance_in_progress"]
-        elif observed and observed.get("source_health") not in (None, "healthy"):
-            unit_status = _FAULT
-        elif reason_codes and not converged:
-            unit_status = _WARNING
-        components.append(
-            _component(
-                f"runtime_unit:{runtime_unit_id}",
-                runtime_unit_id,
-                unit_status,
-                (
-                    "required runtime contract is present and converged"
-                    if unit_status == _HEALTHY
-                    else "required runtime unit has not converged to its selected contract"
-                ),
-                required=True,
-                required_for=("Plan / Preview", "Execute / Control"),
-                owner_id=runtime_unit_id,
-                owner_epoch=observed.get("runtime_epoch"),
-                generation=observed.get("critical_progress_sequence"),
-                reason_code=(reason_codes[0] if reason_codes else "runtime_unit_converging"),
-                scope="component",
-            )
-        )
+
+    # Component model v2 (R4): one tile per component, taken from its
+    # ComponentState as the execution host publishes it; nothing re-derived.
+    component_tile_ids = _component_state_tiles(components, component_model, errors)
 
     applied_error = _fact_error(errors, "applied_program")
     applied_source = _mapping(applied_program.get("source"))
@@ -863,7 +887,7 @@ def build_component_overview(
     # present; in particular, no missing or unexpected error proves absence.
     empty_prerequisites = {
         "applied_program", "execution_owner", "execution_target",
-        "planner_collision", "stop_capability",
+        "planner_collision", "stop_capability", "components",
     }
     absent_empty_owner = (
         all(
@@ -891,7 +915,6 @@ def build_component_overview(
         and control_state.get("manual_operations") == []
         and control_state.get("runtime_scale_control", False) is None
         and cell_stop_action.get("available") is True
-        and cell_stop_action.get("fault", False) is None
     )
     quiet_empty = (
         _current_empty_physical_graph(runtime, manager_section, manager_payload)
@@ -954,6 +977,7 @@ def build_component_overview(
                 "execution_owner",
                 "execution_target",
                 "stop_capability",
+                *component_tile_ids,
             ),
         ),
     )

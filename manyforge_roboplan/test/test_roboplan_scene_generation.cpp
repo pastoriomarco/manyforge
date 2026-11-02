@@ -270,7 +270,7 @@ TEST(RoboPlanSceneGenerationTest,
   ASSERT_TRUE(scene);
   const Eigen::VectorXd query = scene->getCurrentJointPositions();
 
-  // RoboPlan 0.7 SceneContext is deliberately nonmovable: its broadphase
+  // RoboPlan 0.8 SceneContext is deliberately nonmovable: its broadphase
   // manager retains pointers into its own scratch.  Heap ownership keeps each
   // context at one address, while this shared Scene outlives both borrowed
   // model references.

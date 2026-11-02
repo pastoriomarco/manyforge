@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <manyforge_core/component_stream_health.hpp>
 #include <manyforge_core/ports/iio_signal_ingress.hpp>
 #include <memory>
 #include <optional>
@@ -76,6 +77,8 @@ public:
   /// Reversible gates use the actual driver owner's observation generation.
   bool Pause(std::uint64_t driver_observation_generation);
   bool Resume(std::uint64_t driver_observation_generation);
+  /// IO-1: every received message records an arrival (none: no stream).
+  void SetArrivalRecorder(std::shared_ptr<core::StreamRecorder> arrivals);
   void Shutdown();
 
 private:

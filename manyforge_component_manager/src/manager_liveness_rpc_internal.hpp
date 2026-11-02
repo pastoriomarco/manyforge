@@ -50,7 +50,6 @@ enum class NativeShutdownPhase : unsigned {
   kFailedCompositionDestruction,
   kProjectionDestruction,
   kLivenessReceiverDestruction,
-  kStopSurveillanceDestruction,
   kSchedulerOwnerRelease,
   kFenceOwnerDestruction,
   kServicingLaneDrain

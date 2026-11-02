@@ -13,7 +13,7 @@ import {
 import type { ManagerApplyStatus } from '../types/api';
 import type { HeadlessSourceSection } from '../types/headless';
 import type { ControlTransportStatus } from './useHeadlessState';
-import { browserRequestIdentity } from './useCCLC';
+import { browserRequestIdentity } from '../utils/requestIdentity';
 
 interface ManagerApplyStatusResult {
   status: ManagerApplyStatus | null;

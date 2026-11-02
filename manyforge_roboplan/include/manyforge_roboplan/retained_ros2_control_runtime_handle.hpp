@@ -15,16 +15,15 @@
 #include <manyforge_core/configured_robot_measured_state.hpp>
 #include <manyforge_core/execution_port_participant.hpp>
 #include <manyforge_core/types/component_lifecycle.hpp>
-#include <manyforge_core/types/lifecycle_cause.hpp>
 #include <manyforge_core/types/tcp_entry.hpp>
 #include <manyforge_core/types/tool_context.hpp>
 #include <manyforge_core/types/logical_scene_snapshot.hpp>
 #include <manyforge_roboplan/active_tcp.hpp>
 #include <manyforge_roboplan/controller_launch_artifacts.hpp>
-#include <manyforge_roboplan/retained_externally_managed_lifecycle_ports.hpp>
 #include <manyforge_roboplan/retained_observed_state_channel.hpp>
 #include <manyforge_roboplan/retained_ros2_control_statistics_monitor.hpp>
-#include <manyforge_roboplan/vendor_device_adapter.hpp>
+#include <manyforge_roboplan/ros2_control_component_state.hpp>
+#include <manyforge_roboplan/tool_context_hook.hpp>
 #include <manyforge_ros2_control_execution/ros2_control_execution_backend.hpp>
 #include <manyforge_ros2_control_execution/ros2_gripper_command_backend.hpp>
 #include <manyforge_ros2_control_execution/ros2_transport_resources.hpp>
@@ -33,6 +32,24 @@
 namespace manyforge::roboplan_backend {
 
 class RetainedPlannerSceneProjection;
+struct DisplayJointSource;
+
+/// The outcome of one controller-manager step of the lane (a switch, a
+/// hardware-state request): `kUncertain` when its effect is unknown (never
+/// resent).
+enum class RetainedRos2ControlSwitchOutcome {
+  kNotSent,
+  kSucceeded,
+  kFailed,
+  kFailedNoEffect,
+  kFailedEffectObserved,
+  kUncertain,
+};
+
+struct RetainedRos2ControlSwitchResult final {
+  RetainedRos2ControlSwitchOutcome outcome{RetainedRos2ControlSwitchOutcome::kNotSent};
+  std::optional<core::ErrorDTO> error{};
+};
 
 /// Controller-manager identity of the arm's trajectory controller (lane
 /// profile facts).
@@ -60,7 +77,8 @@ struct RetainedRos2ControlArmActivity final {
   bool controller_active{false};
   bool hardware_active{false};
   /// The joint state broadcaster (`kJointStateBroadcasterControllerName`) is
-  /// active. Reported as a fact only for a Real arm (R7 package 4).
+  /// loaded (inactive or active), and active.
+  bool broadcaster_loaded{false};
   bool broadcaster_active{false};
 
   friend bool operator==(const RetainedRos2ControlArmActivity &,
@@ -69,24 +87,11 @@ struct RetainedRos2ControlArmActivity final {
 
 /// The joint state broadcaster of every generated controllers file. A vendor
 /// driver that deactivates all controllers while its robot is not ready
-/// deactivates it too; ManyForge never does (R7 §3.3). A Real arm's Prepare
-/// switches it back on alone when the driver's reactivation did not.
+/// deactivates it too; ManyForge never does (R7 §3.3). `SwitchArmHardware`
+/// switches it back on with the hardware when the driver's reactivation did
+/// not.
 inline constexpr std::string_view kJointStateBroadcasterControllerName =
     "joint_state_broadcaster";
-
-/// M6 XADAPT, pure: the outcome of a Real arm step the controller manager
-/// refused, from the status queried before the step and after its answer:
-/// the controller manager's listed states (`list_controllers`,
-/// `list_hardware_components`) and a vendor report received after each
-/// query started. With all four, the same vendor facts and the same
-/// hardware, controller and broadcaster states are `kFailedNoEffect`, any
-/// difference `kFailedEffectObserved`. A missing one (the manager or the
-/// robot unreachable) is `kFailed`, a possible effect.
-[[nodiscard]] RetainedRos2ControlSwitchOutcome refused_step_outcome(
-    const std::optional<std::vector<core::LifecycleFactDTO>> &report_before,
-    const std::optional<std::vector<core::LifecycleFactDTO>> &report_after,
-    const std::optional<RetainedRos2ControlArmActivity> &states_before,
-    const std::optional<RetainedRos2ControlArmActivity> &states_after);
 
 enum class MockResetPositionPhase {
   kSwitchingToWriter,
@@ -126,7 +131,7 @@ struct RetainedRos2ControlArmGuardHooks final {
   /// Q43: every motion path of the arm (goals and replacements) is admitted
   /// only while this holds.
   std::function<bool()> motion_admitted;
-  /// Run before every CCLC activation; an error refuses it before effect.
+  /// Run before every activation; an error refuses it before effect.
   std::function<core::Result<void>()> before_activation;
   /// The operator's Recover of the arm (Q41: the Reset after a trip).
   std::function<void()> on_recover;
@@ -136,20 +141,6 @@ struct RetainedRos2ControlArmGuardHooks final {
   /// handle. The last external owner calls it first, off that worker.
   std::function<void()> stop{};
 };
-
-/// M6: a vendor joint-state sample mapped onto an arm binding's compiled
-/// names, for the display only.
-struct VendorJointDisplaySample final {
-  std::vector<std::string> compiled_names;
-  std::vector<double> positions;
-};
-/// Shape and names only: one position per name, every bound joint named
-/// exactly once (by its source name) with a finite value; otherwise
-/// nothing. Whether the values are a pose is the vendor adapter's check
-/// (`VendorJointSampleUse`).
-[[nodiscard]] std::optional<VendorJointDisplaySample>
-vendor_joint_display_sample(const core::RuntimeParticipantBinding &binding,
-                            const sensor_msgs::msg::JointState &message);
 
 /// TOOLCTX: the robot's tool context with the TCP at a compiled frame, or at
 /// its default TCP (D1) when absent (the flange without one, B-run-1).
@@ -248,7 +239,8 @@ struct RetainedRos2ControlArmTransport final {
   std::optional<RetainedRos2ControlArmController> gripper_controller{};
   /// Absent is unavailable, never a zero-robot or commanded-state fallback.
   std::optional<RetainedMeasuredJointStateLane> measured_joint_state_lane;
-  /// Supplied only from the installed Mock graph's generated artifacts.
+  /// The launch's reset-position writer (the Mock and Isaac lanes' generated
+  /// artifacts); with a `command_echo_topic` the handle subscribes to it.
   std::optional<MockResetPositionTarget> mock_reset_position{};
 };
 
@@ -300,10 +292,9 @@ public:
   RetainedRos2ControlRuntimeHandle &
   operator=(const RetainedRos2ControlRuntimeHandle &) = delete;
 
-  /// Binds once: constructs the initial adapter, the participant over it and
-  /// takes the gripper adapter. Fails closed (everything shut down) on any
-  /// mismatch. Selected bring-up consumes the exact owner-computed successor;
-  /// absent seed preserves epoch 1 and the ordinary first observation.
+  /// Binds once: constructs the initial adapter (binding epoch 1), the
+  /// participant over it and takes the gripper adapter. Fails closed
+  /// (everything shut down) on any mismatch.
   /// An optional genuine clock owner must name this same receiver clock and
   /// remains alive through child and transport teardown.
   [[nodiscard]] core::Result<void> Bind(
@@ -314,8 +305,6 @@ public:
           gripper,
       const core::RuntimeParticipantBinding &motion_binding,
       const std::optional<core::RuntimeParticipantBinding> &gripper_binding,
-      const std::optional<core::SelectedControllerOccurrenceDTO>
-          &successor_occurrence = std::nullopt,
       std::shared_ptr<core::IClock> clock_owner = {});
 
   /// Bind a gripper-only component to its actual transport and controller.
@@ -326,15 +315,18 @@ public:
       std::unique_ptr<ros2_control_execution::Ros2GripperCommandBackend> gripper,
       const core::RuntimeParticipantBinding& binding,
       RetainedRos2ControlArmController controller,
-      const std::optional<core::SelectedControllerOccurrenceDTO>& successor_occurrence = {},
       std::shared_ptr<core::IClock> clock_owner = {},
       std::optional<RetainedMeasuredJointStateLane> measured_lane = {});
 
-  /// Exact owned arm epoch and canonical domain observation floors, including
-  /// zero before an ordinary first observation. Unbound handles have no
-  /// domains.
-  [[nodiscard]] core::SelectedControllerOccurrenceDTO
-  ReadOwnedControllerOccurrence() const;
+  /// CONTRACTS §16: a machine's process with its arm deactivated (the owner
+  /// runs it; no arm, no gripper). Only the controller manager and its
+  /// hardware are observed (`controller` names no controller), so the
+  /// observation is the process's: its exit, and the controller manager
+  /// present or not. Nothing is ever switched.
+  [[nodiscard]] core::Result<void> BindProcessOnly(
+      std::unique_ptr<ros2_control_execution::Ros2TransportResources> resources,
+      core::IClock &clock, RetainedRos2ControlArmController controller,
+      std::shared_ptr<core::IClock> clock_owner = {});
 
   [[nodiscard]] std::shared_ptr<core::ExecutionPortParticipant>
   participant() const;
@@ -380,24 +372,25 @@ public:
   /// Installs the lane guard's hooks; only before `StartBackend`.
   void InstallGuardHooks(RetainedRos2ControlArmGuardHooks hooks);
 
-  /// R7 package 3: a Real arm's vendor adapter. A vendor intervention cause
-  /// (emergency stop, collision, fault, external control) faults the motion
-  /// domain with that cause and its vendor codes; stale or missing vendor
-  /// status is `availability`; its device facts join the domain's facts,
-  /// with the hardware, broadcaster and controller activity and the measured
-  /// joints' validity (package 4). It enables the hardware primitives, the
-  /// Enable gate and the vendor primitives. Once, before `StartBackend` (it
-  /// may precede `Bind`); never for Mock or Isaac.
-  void InstallDeviceStatusAdapter(
-      std::shared_ptr<IRetainedDeviceStatusAdapter> adapter);
-
-  /// TOOLCTX: the robot's tool context source, which the vendor adapter
-  /// applies at Enable (default TCP) and before every new motion goal (that
-  /// motion's TCP). Once, before `StartBackend`; only with a vendor adapter.
-  void InstallToolContextSource(RetainedToolContextSourceFn source);
-  void InstallCommittedToolContextSource(CommittedToolContextSourceFn source);
-  void InstallCommittedEnableToolContextSource(CommittedToolContextSourceFn source);
+  /// TOOLCTX (CONTRACTS §6): the vendor family's tool-context hook and the
+  /// robot's tool context sources, which the hook applies at Enable (the
+  /// Active TCP) and before every new motion goal (that motion's TCP). Once,
+  /// at any time (the family's adapters are made after the backend starts);
+  /// never for a lane without a vendor driver (Mock, Isaac).
+  void InstallToolContext(ToolContextHook hook, RetainedToolContextSourceFn source,
+                          CommittedToolContextSourceFn committed_source,
+                          CommittedToolContextSourceFn enable_source);
   void InstallCommittedSceneSource(CommittedSceneSourceFn source);
+  /// CONTRACTS §6 display joint source (the vendor family's own joint
+  /// topic): the arm's display channel follows it in every mode. A sample
+  /// naming each bound joint exactly once (by its source name), finite, that
+  /// the family's check does not ignore moves the display; any other keeps
+  /// the last valid pose. A leading sample also refreshes the
+  /// `measured_joints` stream's liveness (a dead driver still goes stale) and
+  /// leads planning previews. Never the addressed state, the planning scene
+  /// or the Enable gate's joints. Once, at any time, on a measured arm.
+  void InstallDisplayJointSource(const DisplayJointSource &source,
+                                 std::shared_ptr<RetainedObservedStateChannel> channel);
 
   /// Active TCP (M7, design 2): the robot's TCP list (TCP-A1 rows), its
   /// Active TCP starting at the End-effector row (none under C-P2), and the
@@ -410,15 +403,16 @@ public:
                         bool controller_tcp_offset_sync,
                         std::optional<core::ProgramBindingId> direct_control_binding = {});
 
-  [[nodiscard]] bool HasToolContextSource() const;
+  [[nodiscard]] bool HasToolContext() const;
 
-  /// Install already-staged candidate facts after publication under the Apply fence.
+  /// Install already-staged candidate facts after publication under the Apply
+  /// fence. With a tool-context hook, an enabled robot gets the new offset.
   core::Result<void> RebindRetainedToolContext(
       std::vector<RobotTcp> rows,
       std::optional<core::ProgramBindingId> direct_control_binding,
       RetainedToolContextSourceFn source, CommittedToolContextSourceFn committed_source,
       std::function<std::optional<core::Pose3DTO>(const std::string &)> fixed_pose,
-      bool real_vendor_lane, CommittedSceneSourceFn scene_source = {},
+      CommittedSceneSourceFn scene_source = {},
       CommittedToolContextSourceFn enable_source = {});
 
   /// Active TCP: where confirmed changes are appended (the host's events
@@ -436,7 +430,7 @@ public:
   /// Active TCP (M7, T-MQ15, A2a-1): Set TCP, a Program's or Robot
   /// control's. `entry` not in the list: `active_tcp_unknown`. The same
   /// entry: Ok, nothing sent. Otherwise, with the robot enabled, the
-  /// checkbox on and a vendor adapter, the confirmed TCP step (offset,
+  /// checkbox on and a tool-context hook, the confirmed TCP step (offset,
   /// settle, check); then the commit and its event. Not enabled: the commit
   /// alone, and the next Enable re-syncs. A step error leaves the Active TCP
   /// unchanged. Serialized with the lifecycle switches.
@@ -459,7 +453,7 @@ public:
   /// Active TCP (M7, T-MQ3, T-MQ9, T-MQ9b): reset to the End-effector TCP
   /// (Program Reset with "reload initial scene", `simulation.reset`, an
   /// Isaac world reload). Already there: Ok, nothing sent. Otherwise, with
-  /// the robot enabled, the checkbox on and a vendor adapter, the End-effector
+  /// the robot enabled, the checkbox on and a tool-context hook, the End-effector
   /// offset is sent through the same step; if the controller cannot take it,
   /// the reset still completes and the next Enable re-syncs. Always Ok.
   [[nodiscard]] core::Result<void> ResetActiveTcp();
@@ -468,27 +462,22 @@ public:
   [[nodiscard]] core::Result<void> ApplyCommittedToolPayload(
       const CommittedSceneSourceFn &read);
 
-  /// M6 ADAPTERM: the participant's pre-planning sync of an admitted motion
-  /// (nothing in flight, the robot at rest). When the vendor adapter
-  /// re-engages the robot after a move from its own interface, this waits
-  /// (bounded by the adapter's transient) until the vendor driver has
-  /// reactivated the trajectory controller and the broadcaster, a measured
-  /// sample after it agrees with the robot's own angles, and then binds the
-  /// reactivated controller on a new epoch, as an Enable does, without a
-  /// CCLC switch. A failure refuses
-  /// the motion before effect: `motion_reengage_failed` with the cause.
-  /// Ok without a vendor adapter (Mock, Isaac) or with nothing to re-engage.
-  [[nodiscard]] core::Result<void> ReengageMotionAtRest();
+  /// The participant's pre-planning sync of an admitted motion: after a
+  /// tool-context send that may have re-armed the robot, binds the
+  /// controllers its driver reactivated (see `RebindAfterRearm`) before the
+  /// motion is planned. Ok with nothing pending. A failure refuses the motion
+  /// before effect.
+  [[nodiscard]] core::Result<void> RebindPendingRearm();
 
 private:
   [[nodiscard]] core::Result<void> ApplyCommittedToolPayloadLocked(
       const CommittedSceneSourceFn &read);
-  /// M6 ADAPTERM: after an own re-arm (the re-engage, or a TCP offset send
-  /// and its re-arm): wait (the adapter's transient bound) for the
-  /// controllers the vendor driver reactivated, a fresh measured sample at
-  /// rest that agrees with the robot, then bind a new epoch and end the
-  /// re-arm. Caller holds `switch_mutex_`.
-  [[nodiscard]] core::Result<void> RebindAfterOwnRearm(IRetainedDeviceStatusAdapter &device);
+  /// After a re-arm by the tool-context hook (the vendor driver then
+  /// reactivates the controllers itself): wait, at most the hook's
+  /// `rearm_bound`, for the controller manager to report the hardware, the
+  /// trajectory controller and the broadcaster active, then bind the
+  /// reactivated controller on a new epoch. Caller holds `switch_mutex_`.
+  [[nodiscard]] core::Result<void> RebindAfterRearm(std::chrono::nanoseconds bound);
   /// Active TCP: with `send`, the vendor adapter's TCP step at `tcp_frame`
   /// (none: no TCP) and its settle; then the commit of `entry` (none: the
   /// reset) and its event. `send_failure_completes`: a failed step still
@@ -498,18 +487,16 @@ private:
                   const std::optional<std::string> &tcp_frame,
                   core::ActiveTcpChangeSource source, bool send,
                   bool send_failure_completes);
-  /// Active TCP: the vendor adapter's TCP step (TOOLCTX, M6 ADAPTERM): Ok(true)
-  /// when it sent an offset (and the rebind after its re-arm succeeded).
-  /// Without an adapter, a source or the checkbox: Ok(false). Caller holds
-  /// `switch_mutex_`.
+  /// Active TCP: the tool-context hook's TCP step (TOOLCTX): Ok(true) when it
+  /// sent an offset (and the rebind after its re-arm succeeded). Without a
+  /// hook, a source or the checkbox: Ok(false). Caller holds `switch_mutex_`.
   [[nodiscard]] core::Result<bool>
   SendToolContextAtRest(const std::optional<std::string> &tcp_frame);
-  [[nodiscard]] core::Result<bool> SendPreparedToolOffset(
-      const std::shared_ptr<IRetainedDeviceStatusAdapter> &device,
-      const VendorToolOffsetCommand &offset);
-  /// T-N1: `effect_possible` sets `tool_context_fault_` (persistent);
-  /// `unresponsive` alone is D8's self-clearing mark.
-  void ReportToolContextFailure(const VendorCallResult &applied);
+  [[nodiscard]] core::Result<bool> SendPreparedToolOffset(const ToolContextHook &hook,
+                                                          const core::Pose3DTO &offset);
+  /// T-N1: a failed call whose effect may remain (`details.effect`) sets
+  /// `tool_context_fault_` (persistent until Recover).
+  void ReportToolContextFailure(const core::ErrorDTO &error);
 
 public:
 
@@ -524,6 +511,26 @@ public:
       std::function<std::optional<std::string>()> source,
       std::function<core::Result<std::optional<std::string>>()> health_source =
           {});
+  /// M7's bring-up bound: the component's controller launch, started at
+  /// `started_at`, has `settled` (every spawner it started has exited) within
+  /// `span`. A Prepare first waits for it (`WaitForControllerLaunch`); only
+  /// then does the component's lifecycle command time apply. Only before
+  /// `StartBackend`; at most once.
+  void InstallControllerLaunchSettle(std::function<bool()> settled,
+                                     std::chrono::steady_clock::time_point started_at,
+                                     std::chrono::steady_clock::duration span);
+  /// CONTRACTS §6 driver restart: the restarted launch (started at
+  /// `started_at`) settles within the installed span. Nothing without an
+  /// installed settle source.
+  void ReplaceControllerLaunchSettle(std::function<bool()> settled,
+                                     std::chrono::steady_clock::time_point started_at);
+  /// Waits until the installed launch has settled; `component_launch_not_settled`
+  /// at its bound. Nothing to wait for without an installed launch.
+  [[nodiscard]] std::optional<RetainedRos2ControlSwitchResult>
+  WaitForControllerLaunch(std::stop_token cancellation) const;
+  /// Whether the installed launch is still starting: not settled, its process
+  /// not exited, and within its bound. False without an installed launch.
+  [[nodiscard]] bool ControllerLaunchSettling() const;
   /// Cache the already captured diagnostic of this exact process occurrence.
   /// The host checks its installed handle/process under the existing fence;
   /// construction/encoding occurs outside all observation/control locks.
@@ -549,6 +556,12 @@ public:
   void InstallMeasuredStateObserver(
       std::function<void(const sensor_msgs::msg::JointState &)> observer);
 
+  /// CONTRACTS §6 driver restart: the component's controller launch was
+  /// restarted; its exit is now read from the new process's sources.
+  void ReplaceControllerProcessFaultSource(
+      std::function<std::optional<std::string>()> source,
+      std::function<core::Result<std::optional<std::string>>()> health_source);
+
   /// Verify the live factory-bound participant and its current sealed physical
   /// bindings.
   [[nodiscard]] bool
@@ -571,19 +584,6 @@ public:
   [[nodiscard]] core::Result<void> BindGripperDisplayChannel(
       const std::shared_ptr<RetainedObservedStateChannel>& channel);
   [[nodiscard]] core::Result<void> PublishGripperDisplayPosition(double position);
-  /// M6: a measured Real arm's display channel. With a vendor joint topic,
-  /// the display always follows it: every valid sample (the arm's exact
-  /// joint names, see `vendor_joint_display_sample`, that the vendor
-  /// adapter's gate does not ignore) updates this channel's render
-  /// coordinates, any other keeps the last valid pose. While the vendor
-  /// adapter's gate lets a sample lead it also refreshes the
-  /// `measured_joints` stream liveness; CCLC reads that liveness as its
-  /// stream verdict, so while admitted vendor samples arrive a dead
-  /// joint-state broadcaster does not go stale. Never the addressed state,
-  /// the planning scene or the Prepare/Enable sample cache. Only before start.
-  [[nodiscard]] core::Result<void> BindMotionDisplayChannel(
-      const std::shared_ptr<RetainedObservedStateChannel>& channel);
-
   [[nodiscard]] core::Result<void>
   RebindGripperRoute(core::RuntimeParticipantBinding binding,
                      std::shared_ptr<IRetainedObservedStateChannel> channel);
@@ -597,78 +597,60 @@ public:
   /// exception is retained; observing it never retries startup.
   void StartBackend();
 
-  /// CCLC Prepare primitive: no controller-manager effect; the loaded
-  /// (inactive) controller on active hardware is the prepared state.
-  [[nodiscard]] RetainedRos2ControlSwitchResult PrepareArmController();
-
-  /// R7 package 4, Real arm only (`ros2_control.hardware.activate`): set the
-  /// arm's hardware component active through the controller manager's stock
-  /// `set_hardware_component_state`; the vendor driver's activation arms the
-  /// robot. Refused before effect when the adapter's `CheckArmable` refuses,
-  /// with an active controller or no loaded controller. Already active
-  /// hardware succeeds without a request. One request bounded by the call
-  /// cap; no answer is an uncertain outcome. The lifecycle state stays
-  /// unarmed until `PrepareArmController`. Measured joints received before
-  /// the answer plus one freshness budget are never valid again (the
-  /// driver's activation may stall the loop right after one more sample; the
-  /// cutoff is on receipt time). After a success it returns once the
-  /// measured joints are valid as Prepare requires them (after the cutoff,
-  /// fresh, complete, finite), at most after the adapter's
-  /// `ActivationTransientBound`, without holding the switch lock. M6 XADAPT (SX-675, D8): the request is allowed
-  /// min(the call cap, `step_deadline`) and the transient wait never runs
-  /// past `step_deadline` (the lifecycle step's remaining budget).
+  /// The adapter's `prepare`: the loaded (inactive) controller on active
+  /// hardware with the joint state broadcaster active is the prepared state.
+  /// Until `deadline` (the component's lifecycle command time) it waits for
+  /// its own endpoints (the controller manager reporting the loaded
+  /// controller). The hardware is left as it is: a vendor adapter switches
+  /// it on at its Enable (`SwitchArmHardware`, XPW-1).
   [[nodiscard]] RetainedRos2ControlSwitchResult
-  ActivateArmHardware(std::stop_token cancellation,
-                      std::optional<MockResetPositionStepDeadline> step_deadline = std::nullopt);
+  PrepareArmController(std::stop_token cancellation, MockResetPositionStepDeadline deadline);
 
-  /// Real arm only (`ros2_control.broadcaster.activate`): switch the joint
-  /// state broadcaster on alone (`switch_controller`, strict) when it is off
-  /// on active hardware (a vendor driver's reactivation may leave it off).
-  /// An already active broadcaster succeeds without a request.
-  [[nodiscard]] RetainedRos2ControlSwitchResult
-  ActivateJointStateBroadcaster(
-      std::stop_token cancellation,
-      std::optional<MockResetPositionStepDeadline> deadline = {});
-
-  /// R7 package 4 (`ros2_control.hardware.deactivate`, D4): set it inactive
-  /// (the vendor driver's deactivation disarms the robot); the arm is then
-  /// Disabled, not armed. Refused while the trajectory controller is active; already
-  /// inactive hardware succeeds without a request. M6 XADAPT (SX-675): the
-  /// request's call cap never runs past `step_deadline`.
-  [[nodiscard]] RetainedRos2ControlSwitchResult
-  DeactivateArmHardware(std::stop_token cancellation,
-                        std::optional<MockResetPositionStepDeadline> step_deadline = std::nullopt);
-
-  /// CCLC Enable primitive: activate the arm's trajectory controller
-  /// (`switch_controller`, strict). Waits for the answer until `cancellation`.
-  /// A Real arm passes the Enable gate first (R7 §3.6): fresh, finite
-  /// measured joints and the vendor adapter's readiness and agreement check.
-  /// V-B2 §2.4: its tool-context re-sync before the switch is the nested
-  /// substep `device.tool_context.sync`, reported to `feedback`. Active TCP
+  /// The adapter's `enable`: activate the arm's trajectory controller
+  /// (`switch_controller`, strict). Waits for the answer until `cancellation` or `deadline`.
+  /// With a tool-context hook its re-sync runs before the switch. Active TCP
   /// (M7, design 3.3): the re-sync is at the Active TCP, which Enable keeps.
   [[nodiscard]] RetainedRos2ControlSwitchResult
-  ActivateArmController(std::stop_token cancellation,
-                        std::optional<MockResetPositionStepDeadline> deadline = {},
-                        const core::LifecycleSubstepFeedbackSink &feedback = {});
+  ActivateArmController(std::stop_token cancellation, MockResetPositionStepDeadline deadline);
 
-  /// CCLC Disable primitive: deactivate it. Known success without a request
+  /// The adapter's `disable`: deactivate it. Known success without a request
   /// when the controller manager already reports it inactive.
   [[nodiscard]] RetainedRos2ControlSwitchResult
-  DeactivateArmController(
-      std::stop_token cancellation,
-      std::optional<MockResetPositionStepDeadline> deadline = {});
+  DeactivateArmController(std::stop_token cancellation, MockResetPositionStepDeadline deadline);
 
-  /// CCLC Recover primitive (the operator's Reset of an incident, Q41): the
-  /// guard hook first, then the controller is left inactive and prepared; the
-  /// target driver's next Enable activates it on a new binding epoch.
+  /// The adapter's `recover` (Q41): an active controller is switched off, the
+  /// guard hook runs and the controller is left inactive and prepared (the
+  /// hardware as it is); the next Enable activates it on a new binding
+  /// epoch.
   [[nodiscard]] RetainedRos2ControlSwitchResult
-  RecoverArmController(std::stop_token cancellation,
-                       std::optional<MockResetPositionStepDeadline> deadline = {});
+  RecoverArmController(std::stop_token cancellation, MockResetPositionStepDeadline deadline);
+
+  /// A vendor adapter's arming (xArm Enable and Disable, XPW-1): the arm's
+  /// hardware component set active or inactive through the controller
+  /// manager's stock `set_hardware_component_state`, with the trajectory
+  /// controller off (a vendor driver arms its robot on activation). Switched
+  /// on, the joint state broadcaster too when the controller manager reports
+  /// it loaded but off. Known success without a request when the controller
+  /// manager already reports it so. Each request once, never retried.
+  [[nodiscard]] RetainedRos2ControlSwitchResult
+  SwitchArmHardware(bool active, std::stop_token cancellation);
 
   /// The guard trip's containment (Q41): deactivate the controller through
   /// the same switch path CCLC uses, without changing the requested state.
   [[nodiscard]] RetainedRos2ControlSwitchResult
   DeactivateArmControllerForFault(std::stop_token cancellation);
+
+  /// A gripper's `prepare`: its controller loaded inactive on active
+  /// hardware (or its configured local owner, or, for an Isaac gripper
+  /// without a controller manager, its ready command bridge). Until
+  /// `deadline` it waits for its own endpoints, as the arm's does.
+  [[nodiscard]] RetainedRos2ControlSwitchResult
+  PrepareGripperController(std::stop_token cancellation, MockResetPositionStepDeadline deadline);
+  /// A gripper's `enable` / `disable`: switch its controller (or its local
+  /// owner) on or off.
+  [[nodiscard]] RetainedRos2ControlSwitchResult
+  SwitchGripperController(bool activate, std::stop_token cancellation,
+                          MockResetPositionStepDeadline deadline);
 
   [[nodiscard]] std::optional<MockResetPositionTarget>
   mock_reset_position_target() const;
@@ -677,37 +659,28 @@ public:
   [[nodiscard]] bool mock_reset_successor_ready() const;
   [[nodiscard]] std::shared_ptr<RetainedObservationWake>
   mock_reset_observation_wake() const noexcept;
+  /// The latest sample on the target's `command_echo_topic` (it also wakes
+  /// `mock_reset_observation_wake`); none before the first one or without
+  /// an echo topic.
+  [[nodiscard]] std::optional<ResetCommandEcho> reset_command_echo() const;
   /// Owner-private transport primitive. The CCLC owner pins the exact Reset
   /// claim/product before calling; callbacks run without a handle state lock.
   /// The callback arms the existing Core scope with the supplied actual step
   /// deadline before SDK effects or waits; no driver lock spans SDK calls.
   /// A switching callback runs before send, then again only after positive
   /// ACK; that second callback waits for exact CM destination observation.
-  /// SettingState(target_published=true) proves one fresh exact loopback ACK
-  /// and publishes/projects backend command before returning Ok. It performs
+  /// SettingState(target_published=true) proves one fresh exact ACK (the
+  /// hardware's loopback state, or its command echo) and publishes/projects
+  /// backend command before returning Ok. It performs
   /// no measured velocity, reference, convergence or dwell verification.
   /// No caller-supplied coordinates or blind rollback.
   [[nodiscard]] RetainedRos2ControlSwitchResult
   ResetMockPosition(std::stop_token cancellation,
                     const MockResetPositionPhaseCallback &phase);
 
-  [[nodiscard]] RetainedExternallyManagedDomainSnapshotSource
-  lifecycle_snapshot_source();
-
-  /// CCLC substeps of the ros2_control catalog for the bound domains, each
-  /// with the handle's own outcome (the port maps it, V-B2 §2.2).
-  [[nodiscard]] RetainedExternallyManagedPrimitiveDispatcher
-  lifecycle_primitive_dispatcher();
-
-  [[nodiscard]] core::Result<RetainedExternallyManagedDomainSnapshot>
-  ReadLifecycleSnapshot(const core::ControlDomainId &control_domain_id,
-                        core::TimePoint now_ns);
-
-  /// Pure projection of the same continuously maintained health inputs.
-  /// No lifecycle generation/signature/intervention/discovery commit.
-  [[nodiscard]] core::Result<core::LifecycleDomainHealthDTO>
-  ReadLifecycleHealth(const core::ControlDomainId &control_domain_id,
-                      core::TimePoint now_ns) const;
+  /// What the controller manager and the controllers report now
+  /// (`ros2_control_component_state` maps it). A pure read.
+  [[nodiscard]] Ros2ControlObservation ReadObservation(core::TimePoint now_ns) const;
 
   [[nodiscard]] RetainedRos2ControlArmActivity arm_activity() const;
 
@@ -728,20 +701,7 @@ private:
   friend class RetainedRos2ControlRuntimeHandleTestAccess;
   struct ArmState;
   struct GripperOnlyState;
-  struct LifecycleHealthInputs;
-  struct LifecycleClassification;
   class ArmPort;
-
-  [[nodiscard]] core::Result<LifecycleHealthInputs>
-  CaptureLifecycleHealthInputs(const core::ControlDomainId &domain,
-                               core::TimePoint now_ns) const;
-  static void ReadLifecycleMonitorFacts(LifecycleHealthInputs &inputs);
-  [[nodiscard]] static LifecycleClassification
-  ComputeLifecycleHealth(const LifecycleHealthInputs &inputs);
-  [[nodiscard]] core::Result<RetainedExternallyManagedDomainSnapshot>
-  CommitLifecycleObservation(const core::ControlDomainId &domain,
-                             LifecycleHealthInputs inputs,
-                             LifecycleClassification classification);
 
   void ObserveActivity(
       RetainedRos2ControlArmActivity activity,
@@ -750,103 +710,46 @@ private:
   /// only consumes the maintained endpoint facts.
   void RefreshEndpointFacts();
   [[nodiscard]] std::optional<core::ErrorDTO> ReadEndpointDiagnostic() const;
-  [[nodiscard]] RetainedRos2ControlSwitchResult PrepareGripperController();
-  [[nodiscard]] RetainedRos2ControlSwitchResult
-  SwitchGripperController(
-      bool activate, std::stop_token cancellation,
-      std::optional<MockResetPositionStepDeadline> deadline = {});
   void PublishReadinessLocked();
+  /// The lifecycle of a gripper without a controller manager (the Isaac
+  /// command bridge), as M7's command-bridge domain: `prepare`, `activate`
+  /// or `deactivate` through the gripper backend.
+  [[nodiscard]] RetainedRos2ControlSwitchResult
+  RunGripperBridgeLifecycle(core::ComponentLifecycleStateDTO target, std::stop_token cancellation);
   [[nodiscard]] core::Result<void> RotateEpochLocked();
-  /// A Real arm's measured joints in controller joint order: fresh within the
-  /// measured lane's budget, every joint present and finite.
-  [[nodiscard]] core::Result<std::vector<double>>
-  MeasuredJointsLocked(core::TimePoint now_ns) const;
-  /// M6 ADAPTERM: the latest measured velocities show the arm at rest.
-  [[nodiscard]] core::Result<void> MeasuredAtRestLocked() const;
   /// One hardware-state request, allowed min(the call cap, `step_deadline`):
   /// no answer within it is `ros2_control_hardware_state_timeout` (D8: the
   /// connection lost).
   [[nodiscard]] RetainedRos2ControlSwitchResult
   SendHardwareState(bool active, std::stop_token cancellation,
-                    IRetainedDeviceStatusAdapter &device,
                     std::optional<MockResetPositionStepDeadline> step_deadline);
-  /// M6 XADAPT: a Real arm's status as queried now: the controller
-  /// manager's listed states (each query allowed min(the call cap,
-  /// `wait_until`)) and the vendor facts of a report received after the
-  /// query started (0.5 s, freshness). Either missing marks the arm
-  /// unresponsive (D8: the connection lost; not on cancellation); both
-  /// answered end an earlier unresponsive fault.
-  struct RealArmStatus final {
-    std::optional<RetainedRos2ControlArmActivity> states;
-    std::optional<std::vector<core::LifecycleFactDTO>> report;
-    /// SX-690/695: why a query was not sent (no time left, or the service
-    /// not discovered); never a fault.
-    std::optional<core::ErrorDTO> not_sent;
-  };
-  [[nodiscard]] RealArmStatus
-  QueryRealArmStatus(const IRetainedDeviceStatusAdapter &device,
-                     std::optional<MockResetPositionStepDeadline> wait_until,
-                     std::stop_token cancellation) const;
-  /// `list_controllers` and `list_hardware_components`, one request each.
-  [[nodiscard]] std::optional<RetainedRos2ControlArmActivity>
-  QueryArmStates(std::optional<MockResetPositionStepDeadline> wait_until,
-                 std::stop_token cancellation,
-                 std::optional<core::ErrorDTO> &not_sent_error) const;
-  /// M6 XADAPT: one step of a Real arm, after a baseline status query and,
-  /// after a failure, a second one (SX-691: under the same rule; with no time
-  /// left it is not sent and a refusal's effect stays unknown). No time left
-  /// before any send refuses it before effect
-  /// (`component_lifecycle_deadline_expired`, no fault); query services not
-  /// yet discovered refuse it without a fault; an unanswered baseline
-  /// refuses it with the fault. A refusal (or an adapter's no-effect proof)
-  /// is a known failure whose effect the two queries decide
-  /// (`refused_step_outcome`); a second query cut short by cancellation
-  /// leaves it uncertain. D8: no answer within the time a call was allowed,
-  /// min(the call cap, the remaining time), has a known result, the lost
-  /// connection: `*_unresponsive`, a known failure whose observed effect is
-  /// the component fault it raises; its physical consequences stay unknown.
-  /// Every failure carries the queried status (`vendor_status`,
-  /// `ros2_control_status`).
-  [[nodiscard]] RetainedRos2ControlSwitchResult
-  RealArmStep(const std::function<RetainedRos2ControlSwitchResult()> &step,
-              const IRetainedDeviceStatusAdapter &device,
-              std::optional<MockResetPositionStepDeadline> step_deadline,
-              std::stop_token cancellation) const;
-  void MarkUnresponsive(core::ErrorDTO error) const;
-  /// M6 XADAPT: adds a queried status to a failed Real arm step's error.
-  static void AddCurrentStatus(RetainedRos2ControlSwitchResult &result,
-                               const RealArmStatus &status);
-  /// One strict switch of one controller. `bounded` (every lifecycle
-  /// primitive): no answer by `lifecycle_deadline` (the CCLC transaction's
-  /// remaining command time; 10 s when absent) is an uncertain outcome
-  /// (SX-291/SX-297); the guard trip's containment keeps its unbounded wait.
-  /// M6 XADAPT (D8): a Real arm's lifecycle switch (with a vendor adapter)
-  /// is allowed min(the call cap, the remaining time), as its other
-  /// controller-manager calls, and asks the manager for the same `timeout`.
-  /// No answer within it is `ros2_control_switch_timeout` (the connection
-  /// lost); none left refuses it before dispatch
-  /// (`component_lifecycle_deadline_expired`).
+  /// One strict switch of one controller. Every lifecycle action passes
+  /// `lifecycle_deadline` (the component's lifecycle command time): no answer
+  /// by it is an uncertain outcome (SX-291/SX-297); the guard trip's
+  /// containment passes none and keeps its unbounded wait.
   [[nodiscard]] RetainedRos2ControlSwitchResult
   SendSwitch(bool activate, std::stop_token cancellation,
-             std::optional<std::string> selected_controller = {},
-             bool bounded = true,
-             std::optional<MockResetPositionStepDeadline> lifecycle_deadline = {});
+             std::optional<std::string> selected_controller,
+             std::optional<MockResetPositionStepDeadline> lifecycle_deadline);
+  /// CONTRACTS §6: after an answered switch or hardware transition, waits
+  /// until `deadline` for the controller manager's activity report to show
+  /// the `activate`/`deactivate` controllers and, if given, the arm hardware
+  /// in the requested states. A report that doesn't come by then (or a Stop
+  /// meanwhile) is `component_action_result_not_observed`. Controllers this
+  /// handle doesn't observe are not waited for.
+  [[nodiscard]] std::optional<RetainedRos2ControlSwitchResult>
+  WaitForReportedActivity(const std::vector<std::string> &activate,
+                          const std::vector<std::string> &deactivate,
+                          std::optional<bool> hardware_active,
+                          const std::stop_token &cancellation,
+                          std::chrono::steady_clock::time_point deadline);
   [[nodiscard]] RetainedRos2ControlSwitchResult
   SendControllerSwitch(std::vector<std::string> activate,
                        std::vector<std::string> deactivate,
                        std::stop_token cancellation,
                        std::optional<MockResetPositionStepDeadline> response_deadline = {},
                        std::optional<MockResetPositionStepDeadline> lifecycle_deadline = {},
-                       std::optional<std::chrono::nanoseconds> request_timeout = {});
-
-  struct DomainGenerationState final {
-    std::uint64_t publication_generation{};
-    bool first_observation_pending{true};
-    std::string source_signature;
-    core::LifecycleBlockingCauseClassDTO last_intervention_cause{
-        core::LifecycleBlockingCauseClassDTO::kNone};
-    bool exact_configuration_seen{false};
-  };
+                       bool best_effort = false);
 
   /// Guard stop, child shutdown and transport quiescence. Idempotent; run by
   /// the last external owner and again by the destructor.
@@ -855,7 +758,7 @@ private:
   /// Set once by Create(): owners handed out by the handle are external.
   std::weak_ptr<RetainedRos2ControlRuntimeHandle> external_owner_;
   mutable std::mutex mutex_;
-  /// Serializes CCLC switch primitives (one controller switch at a time).
+  /// Serializes the switch primitives (one controller switch at a time).
   std::mutex switch_mutex_;
   const std::shared_ptr<RetainedObservationWake> reset_observation_wake_{
       std::make_shared<RetainedObservationWake>()};
@@ -870,21 +773,17 @@ private:
   std::unique_ptr<ros2_control_execution::Ros2GripperCommandBackend> gripper_;
   std::optional<core::RuntimeParticipantBinding> motion_binding_;
   std::optional<core::RuntimeParticipantBinding> gripper_binding_;
-  /// CP9 `measured_joints` stream of the bound component, declared with the
-  /// first staged measured source and recorded by every staged subscription.
+  /// CP9 `measured_joints` stream of the bound component instance, declared
+  /// at bind (a replacement of the same component id starts from its own
+  /// fresh slot) and recorded by every staged subscription.
   std::shared_ptr<core::StreamRecorder> measured_stream_;
   /// CP9 Mock `gripper_feedback` stream (lane `gripper_feedback_stream`),
   /// declared and recorded the same way.
   std::shared_ptr<core::StreamRecorder> gripper_feedback_stream_;
   std::weak_ptr<RetainedObservedStateChannel> gripper_display_channel_;
-  std::weak_ptr<RetainedObservedStateChannel> motion_display_channel_;
   std::optional<RetainedRos2ControlArmGuardHooks> guard_hooks_;
-  std::shared_ptr<IRetainedDeviceStatusAdapter> device_status_adapter_;
-  /// M6 XADAPT: a Real arm's controller manager or robot did not answer
-  /// within a call's bound (`controller_manager_unresponsive`,
-  /// `robot_controller_unresponsive`): reported as a component fault (an
-  /// incident) until a later status query is answered by both.
-  mutable std::optional<core::ErrorDTO> unresponsive_;
+  /// The vendor family's tool-context hook; none without a vendor driver.
+  std::optional<ToolContextHook> tool_context_hook_;
   RetainedToolContextSourceFn tool_context_source_;
   CommittedToolContextSourceFn committed_tool_context_source_;
   CommittedToolContextSourceFn committed_enable_tool_context_source_;
@@ -898,24 +797,24 @@ private:
   std::optional<core::ProgramBindingId> active_tcp_direct_binding_;
   /// T-N1 (A2b rev 2): a tool-context call that may have changed the
   /// controller without confirmation (`effect_possible`): the controller's TCP
-  /// or payload may differ from the Active TCP. A component fault that, unlike
-  /// `unresponsive_`, no answered status query ends: only the operator's
-  /// Recover does, and the Enable after it re-syncs.
+  /// or payload may differ from the Active TCP. A component fault only the
+  /// operator's Recover ends; the Enable after it re-syncs.
   std::optional<core::ErrorDTO> tool_context_fault_;
   ActiveTcpEventSink active_tcp_events_;
   std::uint64_t active_tcp_registration_generation_{};
   std::uint64_t active_tcp_sequence_{};
   /// T-MQ16: the total payload the controller last confirmed (Enable or a
   /// payload update); a payload update with the same total sends nothing.
-  std::optional<VendorToolLoadSet> last_tool_load_;
-  /// Last controller-confirmed offset, for post-Apply re-sync.
-  std::optional<VendorToolOffsetCommand> last_tool_offset_;
-  /// A Real arm's latest measured JointState (the Enable gate's input).
-  struct DeviceMeasuredJoints;
-  std::shared_ptr<DeviceMeasuredJoints> device_measured_joints_;
+  std::optional<core::ToolContextPointMassDTO> last_tool_load_;
+  /// Last controller-confirmed offset (the identity pose: no TCP), for the
+  /// post-Apply re-sync.
+  std::optional<core::Pose3DTO> last_tool_offset_;
   std::function<std::optional<std::string>()> process_fault_source_;
   std::function<core::Result<std::optional<std::string>>()>
       process_health_source_;
+  std::function<bool()> launch_settled_;
+  std::chrono::steady_clock::time_point launch_settle_bound_{};
+  std::chrono::steady_clock::duration launch_settle_span_{};
   std::string process_diagnostic_incident_id_;
   std::shared_ptr<const content_identity::CanonicalValue>
       process_diagnostic_snapshot_;
@@ -925,14 +824,11 @@ private:
   std::function<void(const sensor_msgs::msg::JointState &)>
       measured_state_observer_;
   rclcpp::SubscriptionBase::SharedPtr measured_state_subscription_;
-  /// M6: the vendor driver's joint states: the display (see above).
-  rclcpp::SubscriptionBase::SharedPtr vendor_joint_display_subscription_;
-  /// M6 ADAPTERM: a re-engage call was sent and may still take effect, or a
-  /// re-engage has not finished its rebind: the next admitted motion waits
-  /// for the reactivated controllers and binds a new epoch even when the
-  /// adapter has nothing left to re-engage. Cleared by that rebind or by a
-  /// CCLC Enable.
-  bool reengage_rebind_required_{false};
+  rclcpp::SubscriptionBase::SharedPtr display_joint_subscription_;
+  /// A tool-context send that re-armed the robot, or may still, has not been
+  /// followed by its rebind: the next admitted motion binds the reactivated
+  /// controller first. Cleared by that rebind or by an Enable.
+  bool rearm_rebind_required_{false};
   std::optional<std::pair<std::uint64_t, std::uint64_t>> last_observed_sample_;
   bool start_attempted_{false};
   std::exception_ptr start_failure_;
@@ -942,7 +838,6 @@ private:
   RetainedRos2ControlArmActivity gripper_activity_{};
   core::ComponentLifecycleStateDTO gripper_requested_{
       core::ComponentLifecycleStateDTO::kDeclared};
-  std::map<core::ControlDomainId, DomainGenerationState> domain_generations_;
 };
 
 } // namespace manyforge::roboplan_backend

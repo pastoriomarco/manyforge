@@ -1,6 +1,6 @@
 #include <manyforge_core/time/manual_scheduler.hpp>
 #include <manyforge_roboplan/controller_launch_process.hpp>
-#include <manyforge_roboplan/native_runtime_support.hpp>
+#include <manyforge_roboplan/execution_host_support.hpp>
 #include <manyforge_roboplan/simulated_plc_launch.hpp>
 
 #include <gtest/gtest.h>
@@ -66,7 +66,7 @@ mock_artifacts(const std::filesystem::path &directory,
                const std::string &description_sha = "sha256:aa",
                const std::string &component = "ui6i_lite6") {
   ControllerLaunchArtifacts value;
-  value.lane = ControllerLaunchLane::kMock;
+  value.lane = ControllerLaunchLane::kRos2Control;
   value.controllable_component_id = component;
   value.controller_profile = "lite6_lite_gripper";
   value.directory = directory / component;
@@ -110,24 +110,41 @@ isaac_artifacts(const std::filesystem::path &directory,
   return value;
 }
 
-[[nodiscard]] IsaacControllerLane isaac_lane() {
-  return IsaacControllerLane{"IsaacUR10eTopicBasedSystem",
-                             "/isaac_joint_commands",
-                             "/isaac_joint_states",
-                             {0.0, 0.0, 0.0, 0.0, 0.0, 0.0}};
+[[nodiscard]] ModelLaneRow isaac_tool_row() {
+  ModelLaneRow row;
+  row.adapter = "isaac";
+  row.controller = "robotiq_gripper_controller";
+  return row;
+}
+
+// Live 2026-11-01 (dual-arm cell on Orin): a spawner still starting means the
+// launch has not settled; its own exit report settles it, in any chunking.
+TEST(ControllerLaunchSpawnerTracker, SettlesWhenEveryStartedSpawnerHasExited) {
+  ControllerLaunchSpawnerTracker tracker;
+  EXPECT_FALSE(tracker.settled());  // nothing started yet
+  tracker.observe("[INFO] [ros2_control_node-2]: process started with pid [1055]\n"
+                  "[INFO] [spawner-3]: process started with pid [1056]\n[INFO] [spaw");
+  tracker.observe("ner-4]: process started with pid [1057]\n");
+  EXPECT_FALSE(tracker.settled());
+  tracker.observe("[spawner-3] [INFO] [1.0] [spawner_joint_state_broadcaster]: process has "
+                  "finished loading\n");  // a spawner's own log line is no launch event
+  tracker.observe("[INFO] [spawner-3]: process has finished cleanly [pid 1056]\n");
+  EXPECT_FALSE(tracker.settled());
+  tracker.observe("[ERROR] [spawner-4]: process has died [pid 1057, exit code 1]\n");
+  EXPECT_TRUE(tracker.settled());
 }
 
 TEST(ControllerLaunchCommand, MockCommandIsTheTrack2LaunchWithTheArtifactArguments) {
   TemporaryRoot root;
   const auto artifacts = mock_artifacts(root.path());
-  const auto command = mock_controller_launch_command(artifacts);
+  const auto command = ros2_control_launch_command(artifacts);
   std::vector<std::string> expected{"ros2", "launch", "manyforge_ros_bringup",
-                                    "mock_control.launch.py"};
+                                    "ros2_control.launch.py"};
   expected.insert(expected.end(), artifacts.launch_arguments.begin(),
                   artifacts.launch_arguments.end());
   EXPECT_EQ(command.argv, expected);
   EXPECT_EQ(command.controllable_component_id, "ui6i_lite6");
-  EXPECT_EQ(command.lane, ControllerLaunchLane::kMock);
+  EXPECT_EQ(command.lane, ControllerLaunchLane::kRos2Control);
   EXPECT_EQ(command.controller_profile, artifacts.controller_profile);
   EXPECT_EQ(command.runtime_namespace, artifacts.runtime_namespace);
   EXPECT_EQ(command.arm_controller_name, artifacts.arm_controller_name);
@@ -140,16 +157,16 @@ TEST(ControllerLaunchCommand, MockCommandIsTheTrack2LaunchWithTheArtifactArgumen
 TEST(ControllerLaunchCommand, MockIdentityFollowsContentNotTheActivationPaths) {
   TemporaryRoot first;
   TemporaryRoot second;
-  const auto a = mock_controller_launch_command(mock_artifacts(first.path()));
-  const auto b = mock_controller_launch_command(mock_artifacts(second.path()));
+  const auto a = ros2_control_launch_command(mock_artifacts(first.path()));
+  const auto b = ros2_control_launch_command(mock_artifacts(second.path()));
   EXPECT_NE(a.argv, b.argv);
   EXPECT_EQ(a.identity, b.identity);
-  const auto changed = mock_controller_launch_command(
+  const auto changed = ros2_control_launch_command(
       mock_artifacts(second.path(), "sha256:other"));
   EXPECT_NE(a.identity, changed.identity);
   auto prefixed = mock_artifacts(second.path());
   prefixed.frame_prefix.clear();
-  EXPECT_NE(a.identity, mock_controller_launch_command(prefixed).identity);
+  EXPECT_NE(a.identity, ros2_control_launch_command(prefixed).identity);
 }
 
 // CP8 step 2a characterization: the exact Mock argv and launch identity,
@@ -157,11 +174,11 @@ TEST(ControllerLaunchCommand, MockIdentityFollowsContentNotTheActivationPaths) {
 TEST(ControllerLaunchCommand, MockArgvAndIdentityArePinned) {
   TemporaryRoot root;
   const auto artifacts = mock_artifacts(root.path());
-  const auto command = mock_controller_launch_command(artifacts);
+  const auto command = ros2_control_launch_command(artifacts);
   const auto directory = (root.path() / "ui6i_lite6").string();
   EXPECT_EQ(command.argv,
             (std::vector<std::string>{
-                "ros2", "launch", "manyforge_ros_bringup", "mock_control.launch.py",
+                "ros2", "launch", "manyforge_ros_bringup", "ros2_control.launch.py",
                 "robot_description_file:=" + directory + "/robot_description.urdf",
                 "controllers_file:=" + directory + "/controllers.yaml",
                 "runtime_namespace:=/manyforge/ui6i_lite6",
@@ -170,7 +187,7 @@ TEST(ControllerLaunchCommand, MockArgvAndIdentityArePinned) {
                 "gripper_controller_name:=lite_gripper_controller",
                 "frame_prefix:=ui6i_lite6/"}));
   EXPECT_EQ(command.identity,
-            "mock\nui6i_lite6\nlite6_lite_gripper\n/manyforge/ui6i_lite6\n"
+            "ros2_control\nui6i_lite6\nlite6_lite_gripper\n/manyforge/ui6i_lite6\n"
             "lite6_traj_controller\nlite_gripper_controller\nui6i_lite6/\n"
             "sha256:aa\nsha256:bb\n");
 }
@@ -179,7 +196,7 @@ TEST(ControllerLaunchCommand, MockArgvAndIdentityArePinned) {
 real_artifacts(const std::filesystem::path &directory,
                const std::string &driver_sha = "sha256:ee") {
   ControllerLaunchArtifacts value;
-  value.lane = ControllerLaunchLane::kMock;
+  value.lane = ControllerLaunchLane::kRos2Control;
   value.controllable_component_id = "real_lite6";
   value.controller_profile = "lite6_real";
   value.directory = directory / value.controllable_component_id;
@@ -211,89 +228,53 @@ TEST(ControllerLaunchCommand, RealUsesTheSharedBuilderAndItsHardwareJoinsTheIden
   TemporaryRoot first;
   TemporaryRoot second;
   const auto artifacts = real_artifacts(first.path());
-  const auto command = mock_controller_launch_command(artifacts);
+  const auto command = ros2_control_launch_command(artifacts);
   std::vector<std::string> expected{"ros2", "launch", "manyforge_ros_bringup",
-                                    "mock_control.launch.py"};
+                                    "ros2_control.launch.py"};
   expected.insert(expected.end(), artifacts.launch_arguments.begin(),
                   artifacts.launch_arguments.end());
   EXPECT_EQ(command.argv, expected);
-  EXPECT_EQ(command.lane, ControllerLaunchLane::kMock);
+  EXPECT_EQ(command.lane, ControllerLaunchLane::kRos2Control);
   EXPECT_TRUE(command.keep_across_apply);
   EXPECT_EQ(command.identity,
-            "mock\nreal_lite6\nlite6_real\n/manyforge/real_lite6\n"
+            "ros2_control\nreal_lite6\nlite6_real\n/manyforge/real_lite6\n"
             "lite6_traj_controller\n\n\nsha256:aa\nsha256:bb\n"
             "hardware_plugin:=uf_robot_hardware/UFRobotSystemHardware\n"
             "hardware_remappings:=/controller_manager/list_controllers="
             "/manyforge/real_lite6/controller_manager/list_controllers\n"
             "sha256:ee\n");
   EXPECT_EQ(command.identity,
-            mock_controller_launch_command(real_artifacts(second.path())).identity);
+            ros2_control_launch_command(real_artifacts(second.path())).identity);
   EXPECT_NE(command.identity,
-            mock_controller_launch_command(real_artifacts(first.path(), "sha256:ff"))
+            ros2_control_launch_command(real_artifacts(first.path(), "sha256:ff"))
                 .identity);
 }
 
 TEST(ControllerLaunchCommand, MockCommandFailsClosed) {
   TemporaryRoot root;
   auto isaac = isaac_artifacts(root.path());
-  EXPECT_THROW(static_cast<void>(mock_controller_launch_command(isaac)),
+  EXPECT_THROW(static_cast<void>(ros2_control_launch_command(isaac)),
                ControllerLaunchProcessError);
   auto empty = mock_artifacts(root.path());
   empty.launch_arguments.clear();
-  EXPECT_THROW(static_cast<void>(mock_controller_launch_command(empty)),
+  EXPECT_THROW(static_cast<void>(ros2_control_launch_command(empty)),
                ControllerLaunchProcessError);
   auto repeated = mock_artifacts(root.path());
   repeated.launch_arguments.push_back("frame_prefix:=x/");
-  EXPECT_THROW(static_cast<void>(mock_controller_launch_command(repeated)),
+  EXPECT_THROW(static_cast<void>(ros2_control_launch_command(repeated)),
                ControllerLaunchProcessError);
   // An empty value (e.g. a gripper-less arm's `gripper_controller_name:=`)
   // is never passed: ros2 launch rejects it before the controller starts.
   auto empty_value = mock_artifacts(root.path());
   empty_value.launch_arguments.back() = "frame_prefix:=";
-  EXPECT_THROW(static_cast<void>(mock_controller_launch_command(empty_value)),
+  EXPECT_THROW(static_cast<void>(ros2_control_launch_command(empty_value)),
                ControllerLaunchProcessError);
   auto unhashed = mock_artifacts(root.path());
   unhashed.controllers_sha256.clear();
-  EXPECT_THROW(static_cast<void>(mock_controller_launch_command(unhashed)),
+  EXPECT_THROW(static_cast<void>(ros2_control_launch_command(unhashed)),
                ControllerLaunchProcessError);
 }
 
-TEST(ControllerLaunchCommand, IsaacCommandCarriesTheContractArguments) {
-  TemporaryRoot root;
-  const auto artifacts = isaac_artifacts(root.path(), "isaac_ur10e_light_robot/");
-  const auto command = isaac_controller_launch_command(artifacts, isaac_lane());
-  const std::vector<std::string> expected{
-      "ros2", "launch", "manyforge_ros_bringup",
-      "isaac_topic_based_control.launch.py",
-      "robot_description_file:=" + artifacts.robot_description_file.string(),
-      "controllers_file:=" + artifacts.controllers_file.string(),
-      "isaac_profile:=ur10e",
-      "runtime_namespace:=/manyforge/isaac_ur10e_light_robot",
-      "controller_manager_name:=controller_manager",
-      "arm_controller_name:=isaac_arm_controller",
-      "joint_commands_topic:=/isaac_joint_commands",
-      "joint_states_topic:=/isaac_joint_states",
-      "frame_prefix:=isaac_ur10e_light_robot/"};
-  EXPECT_EQ(command.argv, expected);
-  EXPECT_EQ(command.controller_profile, artifacts.controller_profile);
-  EXPECT_EQ(command.runtime_namespace, artifacts.runtime_namespace);
-  EXPECT_EQ(command.arm_controller_name, artifacts.arm_controller_name);
-  EXPECT_EQ(command.gripper_controller_name, artifacts.gripper_controller_name);
-  EXPECT_EQ(command.frame_prefix, artifacts.frame_prefix);
-  EXPECT_EQ(command.controllers_yaml, artifacts.controllers_yaml);
-  EXPECT_TRUE(command.keep_across_apply);
-  // An empty retained deployment prefix passes no frame-prefix argument (Q82).
-  const auto single = isaac_controller_launch_command(
-      isaac_artifacts(root.path()), isaac_lane());
-  for (const auto &argument : single.argv) {
-    EXPECT_NE(argument.rfind("frame_prefix:=", 0), 0U) << argument;
-  }
-  // Merge 6: the arm's launch carries no gripper argument; a gripper is its
-  // own tool component with its own launch.
-  for (const auto &argument : single.argv) {
-    EXPECT_EQ(argument.find("gripper"), std::string::npos) << argument;
-  }
-}
 
 // Merge 6: an Isaac tool (gripper-only) component runs its own launch: its
 // description in its own namespace and, for an action transport, the bridge
@@ -303,7 +284,7 @@ TEST(ControllerLaunchCommand, IsaacToolCommandCarriesItsDescriptionAndBridge) {
   TemporaryRoot first;
   TemporaryRoot second;
   const auto artifacts = write_isaac_gripper_launch_artifacts(
-      first.path(), "ur10e_gripper", "ur10e", "<robot name=\"tool\"/>", "tool/");
+      first.path(), "ur10e_gripper", isaac_tool_row(), "<robot name=\"tool\"/>", "tool/");
   EXPECT_EQ(artifacts.lane, ControllerLaunchLane::kIsaac);
   EXPECT_EQ(artifacts.runtime_namespace, "/manyforge/ur10e_gripper");
   EXPECT_TRUE(artifacts.controllers_file.empty());
@@ -326,7 +307,7 @@ TEST(ControllerLaunchCommand, IsaacToolCommandCarriesItsDescriptionAndBridge) {
   EXPECT_EQ(command.controllable_component_id, "ur10e_gripper");
   EXPECT_TRUE(command.keep_across_apply);
   const auto same = isaac_gripper_launch_command(
-      write_isaac_gripper_launch_artifacts(second.path(), "ur10e_gripper", "ur10e",
+      write_isaac_gripper_launch_artifacts(second.path(), "ur10e_gripper", isaac_tool_row(),
                                            "<robot name=\"tool\"/>", "tool/"),
       bridge, 0.75);
   EXPECT_NE(same.argv, command.argv);
@@ -346,75 +327,6 @@ TEST(ControllerLaunchCommand, IsaacToolCommandCarriesItsDescriptionAndBridge) {
                ControllerLaunchProcessError);
 }
 
-TEST(ControllerLaunchCommand,
-     IsaacIdentityKeepsOnlyTheSameArtifactsAndLiteralPrefix) {
-  TemporaryRoot first;
-  TemporaryRoot second;
-  const auto original = isaac_controller_launch_command(
-      isaac_artifacts(first.path(), "authored//custom"), isaac_lane());
-  const auto same = isaac_controller_launch_command(
-      isaac_artifacts(second.path(), "authored//custom"), isaac_lane());
-  EXPECT_NE(original.argv, same.argv);
-  EXPECT_EQ(original.identity, same.identity);
-  EXPECT_TRUE(same.keep_across_apply);
-  EXPECT_EQ(
-      decide_controller_launch(
-          ControllerLaunchObservation{original.identity, true, true}, same),
-      ControllerLaunchDecision::kKeep);
-
-  auto changed_description = isaac_artifacts(second.path(), "authored//custom");
-  changed_description.robot_description_sha256 = "sha256:new-description";
-  auto changed_controllers = isaac_artifacts(second.path(), "authored//custom");
-  changed_controllers.controllers_sha256 = "sha256:new-controllers";
-  for (const auto &changed :
-       {isaac_controller_launch_command(changed_description, isaac_lane()),
-        isaac_controller_launch_command(changed_controllers, isaac_lane()),
-        isaac_controller_launch_command(
-            isaac_artifacts(second.path(), "authored/custom"), isaac_lane())}) {
-    EXPECT_NE(changed.identity, original.identity);
-    EXPECT_EQ(decide_controller_launch(
-                  ControllerLaunchObservation{original.identity, true, true},
-                  changed),
-              ControllerLaunchDecision::kRestart);
-  }
-}
-
-TEST(ControllerLaunchCommand, IsaacCommandRequiresAttachLaneFacts) {
-  TemporaryRoot root;
-  const auto artifacts = isaac_artifacts(root.path());
-  auto no_topics = isaac_lane();
-  no_topics.joint_states_topic.clear();
-  EXPECT_THROW(static_cast<void>(isaac_controller_launch_command(
-                   artifacts, no_topics)),
-               ControllerLaunchProcessError);
-  EXPECT_THROW(static_cast<void>(isaac_controller_launch_command(
-                   mock_artifacts(root.path()), isaac_lane())),
-               ControllerLaunchProcessError);
-}
-
-TEST(ControllerLaunchDecision, StartKeepAndRestartRules) {
-  TemporaryRoot root;
-  const auto mock = mock_controller_launch_command(mock_artifacts(root.path()));
-  EXPECT_EQ(decide_controller_launch(std::nullopt, mock),
-            ControllerLaunchDecision::kStart);
-  EXPECT_EQ(decide_controller_launch(
-                ControllerLaunchObservation{mock.identity, true, true}, mock),
-            ControllerLaunchDecision::kKeep);
-  // The process exited: the next activation starts a new one.
-  EXPECT_EQ(decide_controller_launch(
-                ControllerLaunchObservation{mock.identity, true, false}, mock),
-            ControllerLaunchDecision::kRestart);
-  // The description or controllers changed.
-  EXPECT_EQ(decide_controller_launch(
-                ControllerLaunchObservation{"other", true, true}, mock),
-            ControllerLaunchDecision::kRestart);
-  // DX224.3: unchanged Isaac identity keeps its launch across Apply.
-  const auto isaac = isaac_controller_launch_command(
-      isaac_artifacts(root.path()), isaac_lane());
-  EXPECT_EQ(decide_controller_launch(
-                ControllerLaunchObservation{isaac.identity, true, true}, isaac),
-            ControllerLaunchDecision::kKeep);
-}
 
 /// A fake `ros2` on PATH: records its argv and descriptors, then runs until
 /// interrupted (or exits at once when FAKE_LAUNCH_EXIT is set).
@@ -606,9 +518,9 @@ void check_parent_death(const std::string &role, const std::string &selector,
     } else {
       auto command =
           host_role == "isaac"
-              ? isaac_controller_launch_command(isaac_artifacts(root),
-                                                 isaac_lane())
-              : mock_controller_launch_command(mock_artifacts(root));
+              ? isaac_gripper_launch_command(isaac_artifacts(root), std::nullopt,
+                                             std::nullopt)
+              : ros2_control_launch_command(mock_artifacts(root));
       if (host_role == "other")
         command.argv[3] = "other_control.launch.py";
       if (host_role == "foreign_package")
@@ -827,6 +739,21 @@ public:
     }
   }
   [[nodiscard]] bool running() const { return ::kill(pid_, 0) == 0; }
+  // SIGSTOP and wait until the child is stopped (`T`), as a hung node.
+  [[nodiscard]] bool stop() const {
+    if (::kill(pid_, SIGSTOP) != 0)
+      return false;
+    for (int attempt = 0; attempt < 200; ++attempt) {
+      std::ifstream stat("/proc/" + std::to_string(pid_) + "/stat");
+      std::string line;
+      std::getline(stat, line);
+      const auto end = line.rfind(')');
+      if (end != std::string::npos && end + 2U < line.size() && line[end + 2U] == 'T')
+        return true;
+      std::this_thread::sleep_for(5ms);
+    }
+    return false;
+  }
   [[nodiscard]] bool reap_killed() { return reap_signal(SIGKILL); }
   [[nodiscard]] bool reap_signal(const int expected_signal) {
     int status = 0;
@@ -853,7 +780,7 @@ TEST(ControllerLaunchSupervisor, StartsKeepsAndRestartsOneLaunchPerComponent) {
   ControllerLaunchSupervisor supervisor(2s);
   const auto log = fake.root() / "launch.artifacts";
   const auto first_command =
-      mock_controller_launch_command(mock_artifacts(fake.root() / "epoch-1"));
+      ros2_control_launch_command(mock_artifacts(fake.root() / "epoch-1"));
   const auto first = supervisor.ensure(first_command, log);
   EXPECT_EQ(first.decision, ControllerLaunchDecision::kStart);
   ASSERT_TRUE(fake.wait_for(fake.out(first.process->pid(), ".args")));
@@ -868,7 +795,7 @@ TEST(ControllerLaunchSupervisor, StartsKeepsAndRestartsOneLaunchPerComponent) {
   // Q21: same robot and description at the next activation keeps the process
   // even though the artifacts were written below another epoch.
   const auto kept = supervisor.ensure(
-      mock_controller_launch_command(mock_artifacts(fake.root() / "epoch-2")),
+      ros2_control_launch_command(mock_artifacts(fake.root() / "epoch-2")),
       log);
   EXPECT_EQ(kept.decision, ControllerLaunchDecision::kKeep);
   EXPECT_EQ(kept.process, first.process);
@@ -876,7 +803,7 @@ TEST(ControllerLaunchSupervisor, StartsKeepsAndRestartsOneLaunchPerComponent) {
 
   // A changed description replaces it: the predecessor ends first (Q66).
   const auto changed = supervisor.ensure(
-      mock_controller_launch_command(
+      ros2_control_launch_command(
           mock_artifacts(fake.root() / "epoch-3", "sha256:changed")),
       log);
   EXPECT_EQ(changed.decision, ControllerLaunchDecision::kRestart);
@@ -893,39 +820,6 @@ TEST(ControllerLaunchSupervisor, StartsKeepsAndRestartsOneLaunchPerComponent) {
   EXPECT_FALSE(supervisor.observe("ui6i_lite6").has_value());
 }
 
-TEST(ControllerLaunchSupervisor, UnchangedIsaacApplyKeepsTheExactProcess) {
-  FakeLaunch fake;
-  ControllerLaunchSupervisor supervisor(2s);
-  const auto log = fake.root() / "launch.artifacts";
-  const auto first = supervisor.ensure(
-      isaac_controller_launch_command(isaac_artifacts(fake.root() / "epoch-1"),
-                                      isaac_lane()),
-      log);
-  ASSERT_TRUE(fake.wait_for(fake.out(first.process->pid(), ".args")));
-  const auto same = supervisor.ensure(
-      isaac_controller_launch_command(isaac_artifacts(fake.root() / "epoch-2"),
-                                      isaac_lane()),
-      log);
-  EXPECT_EQ(same.decision, ControllerLaunchDecision::kKeep);
-  EXPECT_EQ(same.process, first.process);
-  EXPECT_EQ(same.process->command().argv, first.process->command().argv);
-  EXPECT_NE(same.process->command().argv[4].find("epoch-1"), std::string::npos);
-  EXPECT_EQ(same.process->command().controllers_yaml,
-            isaac_artifacts(fake.root()).controllers_yaml);
-  EXPECT_FALSE(supervisor.discard_candidate(same));
-  EXPECT_TRUE(alive(first.process->pid()));
-
-  const auto changed = supervisor.ensure(
-      isaac_controller_launch_command(
-          isaac_artifacts(fake.root() / "epoch-3", "authored/custom"),
-          isaac_lane()),
-      log);
-  EXPECT_EQ(changed.decision, ControllerLaunchDecision::kRestart);
-  EXPECT_NE(changed.process, first.process);
-  EXPECT_TRUE(first.process->exited().has_value());
-  EXPECT_FALSE(supervisor.discard_candidate(first));
-  EXPECT_TRUE(supervisor.observe("isaac_ur10e_light_robot")->running);
-}
 
 TEST(ControllerLaunchSupervisor,
      PrivateRosLogEnvironmentFollowsActualOccurrence) {
@@ -951,7 +845,7 @@ TEST(ControllerLaunchSupervisor,
                               ? std::optional<std::string>()
                               : std::optional<std::string>(inherited);
   const auto command =
-      mock_controller_launch_command(mock_artifacts(fake.root()));
+      ros2_control_launch_command(mock_artifacts(fake.root()));
   const auto first_root = fake.root() / "first-artifacts";
   const auto second_root = fake.root() / "second-artifacts";
   const auto first = supervisor.ensure(command, first_root);
@@ -991,7 +885,7 @@ TEST(ControllerLaunchSupervisor,
   FakeLaunch fake;
   ControllerLaunchSupervisor supervisor(100ms);
   const auto command =
-      mock_controller_launch_command(mock_artifacts(fake.root()));
+      ros2_control_launch_command(mock_artifacts(fake.root()));
   EXPECT_THROW(static_cast<void>(supervisor.ensure(command, {})),
                ControllerLaunchProcessError);
   EXPECT_THROW(
@@ -1027,7 +921,7 @@ TEST(ControllerLaunchSupervisor,
   ControllerLaunchSupervisor supervisor(2s);
   const auto log = fake.root() / "launch.artifacts";
   const auto command =
-      mock_controller_launch_command(mock_artifacts(fake.root()));
+      ros2_control_launch_command(mock_artifacts(fake.root()));
   const auto candidate = supervisor.ensure(command, log);
   ASSERT_TRUE(fake.wait_for(fake.out(candidate.process->pid(), ".args")));
   const auto borrowed = supervisor.ensure(command, log);
@@ -1038,7 +932,7 @@ TEST(ControllerLaunchSupervisor,
   EXPECT_TRUE(alive(candidate.process->pid()));
 
   const auto peer =
-      supervisor.ensure(mock_controller_launch_command(mock_artifacts(
+      supervisor.ensure(ros2_control_launch_command(mock_artifacts(
                             fake.root(), "sha256:aa", "ui6i_ur5e")),
                         fake.root() / "peer.artifacts");
   ASSERT_TRUE(fake.wait_for(fake.out(peer.process->pid(), ".args")));
@@ -1067,15 +961,15 @@ TEST(ControllerLaunchSupervisor,
   ControllerLaunchSupervisor supervisor(2s);
   const auto log = fake.root() / "launch.artifacts";
   const auto first = supervisor.ensure(
-      mock_controller_launch_command(mock_artifacts(fake.root())), log);
+      ros2_control_launch_command(mock_artifacts(fake.root())), log);
   const auto restarted =
-      supervisor.ensure(mock_controller_launch_command(
+      supervisor.ensure(ros2_control_launch_command(
                             mock_artifacts(fake.root(), "sha256:changed")),
                         log);
   ASSERT_EQ(restarted.decision, ControllerLaunchDecision::kRestart);
   ASSERT_TRUE(fake.wait_for(fake.out(restarted.process->pid(), ".args")));
   const auto peer =
-      supervisor.ensure(mock_controller_launch_command(mock_artifacts(
+      supervisor.ensure(ros2_control_launch_command(mock_artifacts(
                             fake.root(), "sha256:peer", "ui6i_ur5e")),
                         fake.root() / "failed-replace-peer.artifacts");
   ASSERT_TRUE(fake.wait_for(fake.out(peer.process->pid(), ".args")));
@@ -1104,7 +998,7 @@ TEST(ControllerLaunchSupervisor, AnExitedLaunchIsAFaultAndIsNeverRestartedByItse
   FakeLaunch fake;
   ControllerLaunchSupervisor supervisor(2s);
   const auto command =
-      mock_controller_launch_command(mock_artifacts(fake.root()));
+      ros2_control_launch_command(mock_artifacts(fake.root()));
   const auto started =
       supervisor.ensure(command, fake.root() / "launch.artifacts");
   const auto fault = ControllerLaunchSupervisor::fault_source(started.process);
@@ -1137,7 +1031,7 @@ TEST(ControllerLaunchSupervisor, AnExitedLaunchIsAFaultAndIsNeverRestartedByItse
 TEST(ControllerLaunchSupervisor, StartHeaderBoundsDisplayButRetainsFullLaunchIdentity) {
   FakeLaunch fake;
   ControllerLaunchSupervisor supervisor(100ms);
-  auto command = mock_controller_launch_command(mock_artifacts(fake.root()));
+  auto command = ros2_control_launch_command(mock_artifacts(fake.root()));
   command.identity.clear();
   for (int repeat = 0; repeat < 1000; ++repeat) command.identity += "Café\\\"\n";
   const auto started = supervisor.ensure(command, fake.root() / "launch.artifacts");
@@ -1174,7 +1068,7 @@ TEST(ControllerLaunchSupervisor,
   ControllerLaunchSupervisor supervisor(100ms);
   const auto log = fake.root() / "launch.artifacts";
   const auto command =
-      mock_controller_launch_command(mock_artifacts(fake.root()));
+      ros2_control_launch_command(mock_artifacts(fake.root()));
   const auto started =
       supervisor.ensure(command, log, "Bootstrap runtime_epoch=epoch.1");
   ASSERT_TRUE(fake.wait_for(fake.out(started.process->pid(), ".args")));
@@ -1333,7 +1227,7 @@ TEST(ControllerLaunchSupervisor,
   stalled.restore();
   const auto log = fake.root() / "launch.artifacts";
   const auto started = supervisor.ensure(
-      mock_controller_launch_command(mock_artifacts(fake.root())), log);
+      ros2_control_launch_command(mock_artifacts(fake.root())), log);
   ASSERT_TRUE(fake.wait_for(fake.out(started.process->pid(), ".args")));
   EXPECT_FALSE(std::filesystem::exists(log / "controller_launch.log"));
   EXPECT_TRUE(started.process->append_incident_correlation(
@@ -1373,7 +1267,7 @@ TEST(ControllerLaunchSupervisor, MemoryOutputCapsRecentLinesAndRawBytes) {
   ControllerLaunchSupervisor supervisor(100ms);
   stalled.restore();
   const auto started = supervisor.ensure(
-      mock_controller_launch_command(mock_artifacts(fake.root())),
+      ros2_control_launch_command(mock_artifacts(fake.root())),
       fake.root() / "unused-controller-output.artifacts");
   ASSERT_TRUE(fake.wait_for(fake.out(started.process->pid(), ".args")));
   for (int index = 0; index < 2100; ++index)
@@ -1440,7 +1334,7 @@ TEST(ControllerLaunchSupervisor, RegularForwardSinkDropsWithoutWritingFile) {
   redirected.restore();
   supervisor.enqueue_host_log("INFO closed incident pruning count=1");
   const auto started = supervisor.ensure(
-      mock_controller_launch_command(mock_artifacts(fake.root())),
+      ros2_control_launch_command(mock_artifacts(fake.root())),
       fake.root() / "regular-sink-artifacts");
   ASSERT_TRUE(fake.wait_for(fake.out(started.process->pid(), ".args")));
   EXPECT_TRUE(started.process->append_incident_correlation(
@@ -1538,7 +1432,7 @@ TEST(ControllerLaunchSupervisor,
   EXPECT_EQ(stalled.flags(), flags);
   stalled.restore();
   const auto started = supervisor.ensure(
-      mock_controller_launch_command(mock_artifacts(fake.root())),
+      ros2_control_launch_command(mock_artifacts(fake.root())),
       fake.root() / "socket-sink-artifacts");
   ASSERT_TRUE(fake.wait_for(fake.out(started.process->pid(), ".args")));
   std::string forwarded;
@@ -1612,7 +1506,7 @@ TEST(ControllerLaunchSupervisor, PartialSocketSendCountsOnlyUnsentSuffix) {
   ControllerLaunchSupervisor supervisor(100ms);
   sink.restore();
   const auto started = supervisor.ensure(
-      mock_controller_launch_command(mock_artifacts(fake.root())),
+      ros2_control_launch_command(mock_artifacts(fake.root())),
       fake.root() / "partial-socket-artifacts");
   ASSERT_TRUE(fake.wait_for(fake.out(started.process->pid(), ".args")));
   std::string initial;
@@ -1723,7 +1617,7 @@ TEST(ControllerLaunchSupervisor,
   EXPECT_EQ(sink.flags(), flags);
   sink.restore();
   const auto started = supervisor.ensure(
-      mock_controller_launch_command(mock_artifacts(fake.root())),
+      ros2_control_launch_command(mock_artifacts(fake.root())),
       fake.root() / "terminal-artifacts");
   ASSERT_TRUE(fake.wait_for(fake.out(started.process->pid(), ".args")));
   std::string forwarded;
@@ -1768,7 +1662,7 @@ TEST(ControllerLaunchSupervisor,
   ControllerLaunchSupervisor supervisor(100ms);
   sink.restore();
   auto started = supervisor.ensure(
-      mock_controller_launch_command(mock_artifacts(fake.root())),
+      ros2_control_launch_command(mock_artifacts(fake.root())),
       fake.root() / "released-output-artifacts");
   ASSERT_TRUE(fake.wait_for(fake.out(started.process->pid(), ".args")));
   ASSERT_TRUE(started.process->append_incident_correlation(
@@ -1808,14 +1702,14 @@ TEST(ControllerLaunchSupervisor,
   FakeLaunch fake;
   ControllerLaunchSupervisor supervisor(100ms);
   const auto first = supervisor.ensure(
-      mock_controller_launch_command(mock_artifacts(fake.root())),
+      ros2_control_launch_command(mock_artifacts(fake.root())),
       fake.root() / "first-retired-artifacts");
-  auto replacement_command = mock_controller_launch_command(
+  auto replacement_command = ros2_control_launch_command(
       mock_artifacts(fake.root(), "sha256:changed"));
   const auto replacement = supervisor.ensure(
       replacement_command, fake.root() / "replacement-artifacts");
   const auto peer =
-      supervisor.ensure(mock_controller_launch_command(mock_artifacts(
+      supervisor.ensure(ros2_control_launch_command(mock_artifacts(
                             fake.root(), "sha256:peer", "other_robot")),
                         fake.root() / "peer-artifacts");
   EXPECT_FALSE(supervisor.retire_exact(first.process));
@@ -1842,8 +1736,8 @@ TEST(ControllerLaunchSupervisor, HostShutdownSignalsAllGroups) {
                                         root +
                                         "/release ]; do sleep 0.02; done"};
   };
-  auto a = mock_controller_launch_command(mock_artifacts(fake.root()));
-  auto b = mock_controller_launch_command(
+  auto a = ros2_control_launch_command(mock_artifacts(fake.root()));
+  auto b = ros2_control_launch_command(
       mock_artifacts(fake.root(), "sha256:peer", "peer"));
   a.argv = probe("a");
   b.argv = probe("b");
@@ -1883,7 +1777,7 @@ TEST(ControllerLaunchSupervisor,
      AggregateDoesNotRenewConcurrentExactRetirementGrace) {
   FakeLaunch fake;
   ControllerLaunchSupervisor supervisor(10s);
-  auto command = mock_controller_launch_command(mock_artifacts(fake.root()));
+  auto command = ros2_control_launch_command(mock_artifacts(fake.root()));
   const auto root = fake.root().string();
   command.argv = {"sh", "-c",
                   "trap 'printf int > " + root +
@@ -1930,7 +1824,7 @@ TEST(ControllerLaunchSupervisor,
   EXPECT_FALSE(
       supervisor.component_output_counters("never_launched").has_value());
   auto first = supervisor.ensure(
-      mock_controller_launch_command(mock_artifacts(fake.root())),
+      ros2_control_launch_command(mock_artifacts(fake.root())),
       fake.root() / "counter-first-artifacts");
   ASSERT_TRUE(fake.wait_for(fake.out(first.process->pid(), ".args")));
   for (int attempt = 0;
@@ -1941,7 +1835,7 @@ TEST(ControllerLaunchSupervisor,
   const auto first_loss = first.process->output_counters();
   ASSERT_GT(first_loss.dropped_forward_bytes, 0U);
   auto replacement = supervisor.ensure(
-      mock_controller_launch_command(mock_artifacts(fake.root(), "sha256:new")),
+      ros2_control_launch_command(mock_artifacts(fake.root(), "sha256:new")),
       fake.root() / "counter-replacement-artifacts");
   ASSERT_TRUE(fake.wait_for(fake.out(replacement.process->pid(), ".args")));
   for (int attempt = 0;
@@ -1975,7 +1869,7 @@ TEST(ControllerLaunchSupervisor,
   ASSERT_TRUE(removed.has_value());
   EXPECT_GE(removed->dropped_forward_bytes, after_late->dropped_forward_bytes);
   const auto readded = supervisor.ensure(
-      mock_controller_launch_command(mock_artifacts(fake.root())),
+      ros2_control_launch_command(mock_artifacts(fake.root())),
       fake.root() / "counter-readded-artifacts");
   ASSERT_TRUE(fake.wait_for(fake.out(readded.process->pid(), ".args")));
   for (int attempt = 0;
@@ -2025,7 +1919,7 @@ TEST(ControllerLaunchSupervisor, PureFaultProjectionDoesNotObserveOrCacheExit) {
   ::setenv("FAKE_LAUNCH_EXIT", "7", 1);
   ControllerLaunchSupervisor supervisor(100ms);
   const auto started = supervisor.ensure(
-      mock_controller_launch_command(mock_artifacts(fake.root())),
+      ros2_control_launch_command(mock_artifacts(fake.root())),
       fake.root() / "pure-fault-artifacts", "apply_id=pure.fault");
   ASSERT_TRUE(wait_for_unreaped_exit(started.process->pid()));
   const auto &process = *started.process;
@@ -2091,16 +1985,16 @@ TEST(ControllerLaunchSupervisor,
   FakeLaunch fake;
   ControllerLaunchSupervisor supervisor(2s);
   const auto original = supervisor.ensure(
-      mock_controller_launch_command(mock_artifacts(fake.root())),
+      ros2_control_launch_command(mock_artifacts(fake.root())),
       fake.root() / "unlocked-stop-original.artifacts");
   ASSERT_TRUE(fake.wait_for(fake.out(original.process->pid(), ".args")));
   const auto peer =
-      supervisor.ensure(mock_controller_launch_command(mock_artifacts(
+      supervisor.ensure(ros2_control_launch_command(mock_artifacts(
                             fake.root(), "sha256:peer", "ui6i_ur5e")),
                         fake.root() / "unlocked-stop-peer.artifacts");
   ASSERT_TRUE(fake.wait_for(fake.out(peer.process->pid(), ".args")));
   auto blocker = std::make_unique<GroupChild>(original.process->pid());
-  const auto command = mock_controller_launch_command(
+  const auto command = ros2_control_launch_command(
       mock_artifacts(fake.root(), "sha256:replacement"));
   auto first = std::async(std::launch::async, [&] {
     return supervisor.ensure(command,
@@ -2150,20 +2044,20 @@ TEST(ControllerLaunchSupervisor,
   FakeLaunch fake;
   ControllerLaunchSupervisor supervisor(2s);
   const auto original = supervisor.ensure(
-      mock_controller_launch_command(mock_artifacts(fake.root())),
+      ros2_control_launch_command(mock_artifacts(fake.root())),
       fake.root() / "stop-all-original.artifacts");
   ASSERT_TRUE(fake.wait_for(fake.out(original.process->pid(), ".args")));
   auto blocker = std::make_unique<GroupChild>(original.process->pid());
   auto stopped = std::async(std::launch::async, [&] { supervisor.stop_all(); });
   EXPECT_TRUE(wait_for_unreaped_exit(original.process->pid()));
-  const auto command = mock_controller_launch_command(
+  const auto command = ros2_control_launch_command(
       mock_artifacts(fake.root(), "sha256:later"));
   auto replacement = std::async(std::launch::async, [&] {
     return supervisor.ensure(command,
                              fake.root() / "stop-all-replacement.artifacts");
   });
   auto peer = std::async(std::launch::async, [&] {
-    return supervisor.ensure(mock_controller_launch_command(mock_artifacts(
+    return supervisor.ensure(ros2_control_launch_command(mock_artifacts(
                                  fake.root(), "sha256:peer", "ui6i_ur5e")),
                              fake.root() / "stop-all-later-peer.artifacts");
   });
@@ -2194,7 +2088,7 @@ TEST(ControllerLaunchSupervisor, PartialForwardWriteCountsOnlyUnsentBytes) {
   ControllerLaunchSupervisor supervisor(100ms);
   stalled.restore();
   const auto started = supervisor.ensure(
-      mock_controller_launch_command(mock_artifacts(fake.root())),
+      ros2_control_launch_command(mock_artifacts(fake.root())),
       fake.root() / "partial-write-artifacts");
   ASSERT_TRUE(fake.wait_for(fake.out(started.process->pid(), ".args")));
   for (int attempt = 0;
@@ -2271,7 +2165,7 @@ TEST(ControllerLaunchSupervisor, BlockingChildOutputDrainsWhileHostSinkIsFull) {
                                        "controller_launch.log"));
   // A competing spawn still receives a turn after the bounded drain batch.
   const auto peer = supervisor.ensure(
-      mock_controller_launch_command(mock_artifacts(fake.root())),
+      ros2_control_launch_command(mock_artifacts(fake.root())),
       fake.root() / "peer-unused.artifacts");
   ASSERT_TRUE(fake.wait_for(fake.out(peer.process->pid(), ".args")));
   EXPECT_TRUE(supervisor.discard_candidate(started));
@@ -2286,7 +2180,7 @@ TEST(ControllerLaunchSupervisor, BoundedFaultContextPreservesUtf8Characters) {
   for (int count = 0; count < 300; ++count)
     context += "\xc3\xa9";
   const auto started = supervisor.ensure(
-      mock_controller_launch_command(mock_artifacts(fake.root())),
+      ros2_control_launch_command(mock_artifacts(fake.root())),
       fake.root() / "utf8-fault-artifacts", context);
   const auto source = ControllerLaunchSupervisor::fault_source(started.process);
   std::optional<std::string> reason;
@@ -2316,7 +2210,7 @@ TEST(ControllerLaunchSupervisor,
   ::setenv("FAKE_LAUNCH_EXIT", "3", 1);
   ControllerLaunchSupervisor supervisor(100ms);
   const auto started = supervisor.ensure(
-      mock_controller_launch_command(mock_artifacts(fake.root())),
+      ros2_control_launch_command(mock_artifacts(fake.root())),
       fake.root() / "launch.artifacts", "apply_id=apply.8");
   int reads = 0;
   const auto source = ControllerLaunchSupervisor::fault_source(
@@ -2345,13 +2239,13 @@ TEST(ControllerLaunchSupervisor,
   FakeLaunch fake;
   ControllerLaunchSupervisor supervisor(100ms);
   const auto command =
-      mock_controller_launch_command(mock_artifacts(fake.root()));
+      ros2_control_launch_command(mock_artifacts(fake.root()));
   const auto crashed =
       supervisor.ensure(command, fake.root() / "crashed.artifacts");
   ASSERT_TRUE(fake.wait_for(fake.out(crashed.process->pid(), ".args")));
   GroupChild orphan(crashed.process->pid());
   const auto peer =
-      supervisor.ensure(mock_controller_launch_command(mock_artifacts(
+      supervisor.ensure(ros2_control_launch_command(mock_artifacts(
                             fake.root(), "sha256:aa", "ui6i_ur5e")),
                         fake.root() / "peer.artifacts");
   ASSERT_TRUE(fake.wait_for(fake.out(peer.process->pid(), ".args")));
@@ -2383,11 +2277,46 @@ TEST(ControllerLaunchSupervisor,
   EXPECT_TRUE(alive(peer.process->pid()));
 }
 
+TEST(ControllerLaunchSupervisor, StopInterruptsOnlyTheRunningLeader) {
+  // The running launch interrupts its own nodes; a second SIGINT from the
+  // group signal could kill a node mid-shutdown (stale DDS endpoints).
+  FakeLaunch fake;
+  ControllerLaunchSupervisor supervisor(200ms);
+  const auto started = supervisor.ensure(
+      ros2_control_launch_command(mock_artifacts(fake.root())),
+      fake.root() / "launch.artifacts");
+  ASSERT_TRUE(fake.wait_for(fake.out(started.process->pid(), ".args")));
+  GroupChild group_child(started.process->pid(), false);
+  started.process->stop(200ms);
+  // Not interrupted by the stop; only the group SIGKILL after the grace.
+  EXPECT_TRUE(group_child.reap_killed());
+}
+
+TEST(ControllerLaunchSupervisor, StoppedNodeDrainsAfterTheKill) {
+  // A hung node (here SIGSTOPped) ignores the interrupt; the group SIGKILL
+  // after the grace ends it a moment later. The stop waits for that drain:
+  // a scan racing the kill left the group Unknown and every later Apply
+  // refused "old component group has not drained".
+  FakeLaunch fake;
+  ControllerLaunchSupervisor supervisor(200ms);
+  const auto started = supervisor.ensure(
+      ros2_control_launch_command(mock_artifacts(fake.root())),
+      fake.root() / "launch.artifacts");
+  ASSERT_TRUE(fake.wait_for(fake.out(started.process->pid(), ".args")));
+  GroupChild hung(started.process->pid());
+  ASSERT_TRUE(hung.stop());
+  started.process->stop(200ms);
+  const auto cleanup = started.process->cleanup_observation();
+  EXPECT_EQ(cleanup.state, ControllerLaunchCleanupState::kDrained);
+  EXPECT_TRUE(cleanup.receipt.has_value());
+  EXPECT_TRUE(hung.reap_killed());
+}
+
 TEST(ControllerLaunchSupervisor, LostLeaderOwnershipNeverSignalsItsOldGroup) {
   FakeLaunch fake;
   ControllerLaunchSupervisor supervisor(100ms);
   const auto started = supervisor.ensure(
-      mock_controller_launch_command(mock_artifacts(fake.root())),
+      ros2_control_launch_command(mock_artifacts(fake.root())),
       fake.root() / "launch.artifacts");
   ASSERT_TRUE(fake.wait_for(fake.out(started.process->pid(), ".args")));
   GroupChild group_child(started.process->pid());
@@ -2423,7 +2352,7 @@ TEST(ControllerLaunchSupervisor,
       output << "prior line " << index << "\n";
   }
   const auto started = supervisor.ensure(
-      mock_controller_launch_command(mock_artifacts(fake.root())), log);
+      ros2_control_launch_command(mock_artifacts(fake.root())), log);
   const auto fault = ControllerLaunchSupervisor::fault_source(started.process);
   std::optional<std::string> reason;
   for (int attempt = 0; attempt < 200 && !reason.has_value(); ++attempt) {
@@ -2445,7 +2374,7 @@ TEST(ControllerLaunchSupervisor, AMissingLauncherFailsTheActivation) {
   ::setenv("PATH", (root.path() / "empty").string().c_str(), 1);
   ControllerLaunchSupervisor supervisor(2s);
   EXPECT_THROW(static_cast<void>(supervisor.ensure(
-                   mock_controller_launch_command(mock_artifacts(root.path())),
+                   ros2_control_launch_command(mock_artifacts(root.path())),
                    root.path() / "launch.artifacts")),
                ControllerLaunchProcessError);
   ::setenv("PATH", previous.c_str(), 1);
@@ -2461,10 +2390,10 @@ TEST(ControllerLaunchSupervisor,
   ASSERT_EQ(::dup2(host_fd, 77), 77);
   ControllerLaunchSupervisor supervisor(2s);
   const auto lite6 = supervisor.ensure(
-      mock_controller_launch_command(mock_artifacts(fake.root())),
+      ros2_control_launch_command(mock_artifacts(fake.root())),
       fake.root() / "lite6.artifacts");
   const auto ur5e =
-      supervisor.ensure(mock_controller_launch_command(mock_artifacts(
+      supervisor.ensure(ros2_control_launch_command(mock_artifacts(
                             fake.root(), "sha256:aa", "ui6i_ur5e")),
                         fake.root() / "ur5e.artifacts");
   ASSERT_TRUE(fake.wait_for(fake.out(lite6.process->pid(), ".fds")));
@@ -2491,11 +2420,11 @@ TEST(ControllerLaunchSupervisor,
   manyforge::core::ManualScheduler scheduler;
   ControllerLaunchSupervisor supervisor(2s);
   const auto command =
-      mock_controller_launch_command(mock_artifacts(fake.root()));
+      ros2_control_launch_command(mock_artifacts(fake.root()));
   const auto crashed =
       supervisor.ensure(command, fake.root() / "crashed.artifacts");
   const auto peer =
-      supervisor.ensure(mock_controller_launch_command(
+      supervisor.ensure(ros2_control_launch_command(
                             mock_artifacts(fake.root(), "sha256:peer", "peer")),
                         fake.root() / "peer.artifacts");
   ASSERT_TRUE(fake.wait_for(fake.out(crashed.process->pid(), ".args")));
@@ -2594,7 +2523,7 @@ TEST(ControllerLaunchSupervisor,
   ASSERT_EQ(warmed.wait_for(2s), std::future_status::ready);
   ControllerLaunchSupervisor supervisor(10s);
   const auto crashed = supervisor.ensure(
-      mock_controller_launch_command(mock_artifacts(fake.root())),
+      ros2_control_launch_command(mock_artifacts(fake.root())),
       fake.root() / "crashed.artifacts");
   ASSERT_TRUE(fake.wait_for(fake.out(crashed.process->pid(), ".args")));
   GroupChild child(crashed.process->pid());
@@ -2631,10 +2560,9 @@ TEST(ControllerLaunchSupervisor,
   ASSERT_EQ(completed.wait_for(12s), std::future_status::ready);
   EXPECT_TRUE(child.reap_killed());
   const auto outcome = crashed.process->cleanup_observation();
-  EXPECT_TRUE(outcome.state == ControllerLaunchCleanupState::kDrained ||
-              outcome.state == ControllerLaunchCleanupState::kUnknown);
-  EXPECT_EQ(outcome.receipt.has_value(),
-            outcome.state == ControllerLaunchCleanupState::kDrained);
+  // The post-KILL drain is awaited, never a one-shot scan racing the kill.
+  EXPECT_EQ(outcome.state, ControllerLaunchCleanupState::kDrained);
+  EXPECT_TRUE(outcome.receipt.has_value());
   EXPECT_EQ(fault(), first_fault);
 }
 
@@ -2647,7 +2575,7 @@ TEST(ControllerLaunchSupervisor,
     ControllerLaunchSupervisor supervisor(2s);
     auto scheduler = std::make_unique<manyforge::core::ManualScheduler>();
     const auto started = supervisor.ensure(
-        mock_controller_launch_command(mock_artifacts(fake.root())),
+        ros2_control_launch_command(mock_artifacts(fake.root())),
         fake.root() / "launch.artifacts");
     process = started.process;
     ASSERT_TRUE(fake.wait_for(fake.out(process->pid(), ".args")));
@@ -2678,7 +2606,7 @@ TEST(ControllerLaunchSupervisor,
   manyforge::core::ManualScheduler scheduler;
   ControllerLaunchSupervisor supervisor(100ms);
   const auto started = supervisor.ensure(
-      mock_controller_launch_command(mock_artifacts(fake.root())),
+      ros2_control_launch_command(mock_artifacts(fake.root())),
       fake.root() / "launch.artifacts");
   ASSERT_TRUE(fake.wait_for(fake.out(started.process->pid(), ".args")));
   GroupChild child(started.process->pid());
@@ -2711,7 +2639,7 @@ TEST(ControllerLaunchSupervisor,
   FakeLaunch fake;
   ControllerLaunchSupervisor supervisor(100ms);
   const auto started = supervisor.ensure(
-      mock_controller_launch_command(mock_artifacts(fake.root())),
+      ros2_control_launch_command(mock_artifacts(fake.root())),
       fake.root() / "launch.artifacts");
   ASSERT_TRUE(fake.wait_for(fake.out(started.process->pid(), ".args")));
   ASSERT_EQ(::kill(started.process->pid(), SIGKILL), 0);
@@ -2772,14 +2700,9 @@ TEST(SimulatedPlcPlan, OnlyGenericRosDevicesGetOne) {
                                   "/cfg"));
   EXPECT_FALSE(plan_simulated_plc(true, "plc_io", {}, "/cfg"));
   // Robot-provided I/O is served by the robot's own peer, never a sim PLC.
-  for (const auto *profile :
-       {"ur_io_states", "ur_set_io", "ros2_control_gpio",
-        "xarm_controller_input"}) {
-    SCOPED_TRACE(profile);
-    auto rows = plc_rows();
-    rows.push_back({profile, "/io_states", std::nullopt});
-    EXPECT_FALSE(plan_simulated_plc(true, "plc_io", rows, "/cfg"));
-  }
+  auto rows = plc_rows();
+  rows.push_back({"ros2_control_gpio", "/io_states", std::nullopt});
+  EXPECT_FALSE(plan_simulated_plc(true, "plc_io", rows, "/cfg"));
   // A generic row without its address is not a generic ROS endpoint.
   EXPECT_FALSE(plan_simulated_plc(true, "plc_io",
                                   {{"ros_bool", std::nullopt, std::nullopt}},
@@ -2959,7 +2882,7 @@ TEST(SimulatedPlcSupervisor, ARebuiltDeviceKeepsItsPlcWhileTheLaunchIdentityHold
   EXPECT_FALSE(simulated_plc_launch_survives(started.process.get(), plan));
   // Another lane's process never survives as a simulated PLC.
   const auto mock = supervisor.ensure(
-      mock_controller_launch_command(mock_artifacts(fake.root())),
+      ros2_control_launch_command(mock_artifacts(fake.root())),
       fake.root() / "launch.artifacts");
   EXPECT_FALSE(simulated_plc_launch_survives(mock.process.get(), plan));
   supervisor.stop_all();

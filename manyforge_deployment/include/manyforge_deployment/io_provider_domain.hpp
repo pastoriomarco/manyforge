@@ -24,9 +24,7 @@ struct IoProviderDomainDerivation final {
 };
 
 /// Requires normalized runtime configuration and exact qualified manifests,
-/// runtime profiles. The real configured-policy lifecycle catalog is rebuilt
-/// from its exact qualified manifest. The catalog's complete own
-/// digest, not its manifest's semantic anchor, enters the provider payload.
+/// runtime profiles.
 [[nodiscard]] core::Result<IoProviderDomainDerivation> DeriveIoProviderDomains(
     const core::CellGraphDTO &graph,
     std::span<const core::CapabilityProviderBindingDTO> provider_bindings,
@@ -46,10 +44,7 @@ IoProviderDomainRecord(const core::ControlDomainDTO &domain);
     std::span<const QualifiedRuntimeProfile> runtime_profiles,
     std::span<const QualifiedProviderManifest> provider_manifests);
 
-/// Closed structural readback only: recomputes ownership, member rows and the
-/// real configured-policy catalog own hash from its exact manifest pair.
-/// The manifest semantic anchor still requires ordinary qualification and the
-/// authoritative manifest point-read before lifecycle admission.
+/// Closed structural readback only: recomputes ownership and member rows.
 [[nodiscard]] core::Result<void> ValidateIoProviderDomainProjection(
     const core::CellGraphDTO &graph,
     std::span<const core::CapabilityProviderBindingDTO> provider_bindings,

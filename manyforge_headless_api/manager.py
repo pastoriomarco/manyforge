@@ -9,13 +9,10 @@ from typing import Any, Protocol
 import unicodedata
 
 import rfc8785
-from pydantic import ValidationError
 
 from .models import (
     ManagerApplyRequest,
     ManagerApplyAcknowledgementContext,
-    ComponentProcessStopRequest,
-    ComponentProcessStopResult,
     ManagerApplyStatus,
     ManagerDeploymentCandidatePreviewRequest,
     ProjectionRevisionRequest,
@@ -32,7 +29,6 @@ from .private_transport import (
     PinnedRunRoot,
     PrivateTransportCapabilityError,
 )
-from .close_wire import CanonicalEmptySelection
 
 
 MANAGER_SOCKET_FILE = "manager-command.sock"
@@ -60,14 +56,6 @@ _SCENE_UPDATE_STATUSES = {"geometry_changed", "freshness_only", "no_op"}
 
 class ManagerPort(Protocol):
     def scene_runtime_owner(self) -> dict[str, Any]: ...
-
-    def component_process_stop_offer(self, component_id: str) -> dict[str, Any]: ...
-
-    def canonical_empty_selection(self) -> dict[str, Any]: ...
-
-    def stop_component_process(self, request: ComponentProcessStopRequest) -> dict[str, Any]: ...
-
-    def component_process_stop_result(self, request: ComponentProcessStopRequest) -> dict[str, Any]: ...
 
     def preview_deployment_candidate(
         self, request: ManagerDeploymentCandidatePreviewRequest
@@ -249,32 +237,6 @@ class ManagerCommandClient:
             )
         return response
 
-    def _component_process_stop(
-        self, command: str, request: ComponentProcessStopRequest,
-    ) -> dict[str, Any]:
-        response = self._exchange({
-            "api_version": MANAGER_COMMAND_VERSION,
-            "command": command,
-            "request": request.model_dump(mode="json"),
-        })
-        if response["ok"] is False:
-            error = response.get("error")
-            typed = _manager_error(error)
-            if (set(response) not in ({"api_version", "ok", "error"}, {"api_version", "ok", "error", "result"})
-                    or response.get("result") is not None or typed is None
-                    or ("result" in response and "details" not in error)):
-                raise HeadlessApiError("manager_command_response_invalid", "Process Stop error envelope is invalid")
-            raise typed
-        if set(response) != {"api_version", "ok", "error", "result"}:
-            raise HeadlessApiError("manager_command_response_invalid", "Process Stop response envelope is invalid")
-        if response["error"] is not None:
-            raise HeadlessApiError("manager_command_response_invalid", "Successful process Stop response carries an error")
-        try:
-            ComponentProcessStopResult.model_validate(response["result"])
-        except ValidationError as error:
-            raise HeadlessApiError("manager_command_response_invalid", "Process Stop result is invalid") from error
-        return response["result"]
-
     def scene_runtime_owner(self) -> dict[str, Any]:
         """Read the existing Scene owner identity when a viewer source starts."""
         response = self._exchange({"api_version": MANAGER_COMMAND_VERSION,
@@ -293,45 +255,6 @@ class ManagerCommandClient:
                 or not isinstance(response.get("runtime_identity"), dict)):
             raise HeadlessApiError("manager_command_response_invalid", "Scene runtime owner response is invalid")
         return response
-
-    def component_process_stop_offer(self, component_id: str) -> dict[str, Any]:
-        response = self._exchange({"api_version": MANAGER_COMMAND_VERSION,
-            "command": "component_process_stop_offer", "controllable_component_id": component_id})
-        if response["ok"] is False:
-            typed = _manager_error(response.get("error"))
-            if typed is None:
-                raise HeadlessApiError("manager_command_response_invalid", "Process Stop offer error is invalid")
-            raise typed
-        result = response.get("result")
-        if (set(response) != {"api_version", "ok", "error", "result"} or response["error"] is not None
-                or not isinstance(result, dict) or set(result) != {"controllable_component_id", "process_inventories"}
-                or result["controllable_component_id"] != component_id or not isinstance(result["process_inventories"], list)):
-            raise HeadlessApiError("manager_command_response_invalid", "Process Stop offer is invalid")
-        return result
-
-    def stop_component_process(self, request: ComponentProcessStopRequest) -> dict[str, Any]:
-        return self._component_process_stop("stop_component_process", request)
-
-    def canonical_empty_selection(self) -> dict[str, Any]:
-        response = self._exchange({
-            "api_version": MANAGER_COMMAND_VERSION,
-            "command": "canonical_empty_selection",
-        })
-        if response["ok"] is False:
-            typed = _manager_error(response.get("error"))
-            if set(response) != {"api_version", "ok", "error"} or typed is None:
-                raise HeadlessApiError("manager_command_response_invalid", "Canonical-empty selection error is invalid")
-            raise typed
-        if set(response) != {"api_version", "ok", "canonical_empty_selection"}:
-            raise HeadlessApiError("manager_command_response_invalid", "Canonical-empty selection envelope is invalid")
-        try:
-            CanonicalEmptySelection.model_validate(response["canonical_empty_selection"])
-        except ValidationError as error:
-            raise HeadlessApiError("manager_command_response_invalid", "Canonical-empty selection is invalid") from error
-        return response["canonical_empty_selection"]
-
-    def component_process_stop_result(self, request: ComponentProcessStopRequest) -> dict[str, Any]:
-        return self._component_process_stop("component_process_stop_result", request)
 
     def preview_deployment_candidate(
         self, request: ManagerDeploymentCandidatePreviewRequest
@@ -467,6 +390,51 @@ class ManagerCommandClient:
             apply_generation,
             request_context,
         )
+
+    def release_failed_apply_for_new(
+        self, request_context: ManagerApplyAcknowledgementContext
+    ) -> dict[str, Any]:
+        """New (R3, N7): release whatever failed Apply still holds the cell.
+
+        ``released`` names that Apply, or is ``None`` when none holds it.
+        """
+
+        response = self._exchange(
+            {
+                "api_version": MANAGER_COMMAND_VERSION,
+                "command": "apply_release_for_new",
+                "request_context": request_context.model_dump(
+                    mode="json", exclude_none=True
+                ),
+            }
+        )
+        if response.get("ok") is False:
+            if (
+                set(response) != {"api_version", "error", "ok"}
+                or _manager_error(response.get("error")) is None
+            ):
+                raise HeadlessApiError(
+                    "manager_command_response_invalid",
+                    "Manager Apply release for New rejection is malformed",
+                )
+            return response
+        released = response.get("released")
+        if (
+            set(response) != {"api_version", "error", "ok", "released"}
+            or response.get("error") is not None
+            or released is not None
+            and (
+                not isinstance(released, dict)
+                or set(released) != {"apply_id", "apply_generation"}
+                or not isinstance(released["apply_id"], str)
+                or type(released["apply_generation"]) is not int
+            )
+        ):
+            raise HeadlessApiError(
+                "manager_command_response_invalid",
+                "Manager Apply release for New response is malformed",
+            )
+        return response
 
     @staticmethod
     def _validate_scene_response(response: dict[str, Any]) -> None:

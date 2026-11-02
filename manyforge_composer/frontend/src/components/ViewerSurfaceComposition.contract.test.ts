@@ -116,7 +116,7 @@ describe('UI4 application and viewport composition', () => {
     expect(transport).not.toContain("robot.fullStop()");
     expect(transport).not.toContain('transport-stop-disclosure');
     expect(transport).not.toContain("motionPaused ? robot.resume() : robot.pause()");
-    expect(transport).toContain('robot.recoverStopFault()');
+    expect(transport).not.toContain('recoverStopFault');
     expect(transport).toContain('Closing or reloading Composer only stops watching');
     expect(transport).toContain('program.setGroupRuntimeScale');
     expect(robotControl).toContain("sendExecutionCommand(");
@@ -153,26 +153,14 @@ describe('UI4 application and viewport composition', () => {
     expect(styles).toMatch(/\.transport-unique-icons \{[\s\S]*?grid-template-columns: repeat\(2, minmax\(0, 1fr\)\);/);
   });
 
-  it('locates lifecycle control under Components and binds selection to Manager Applied identities', () => {
+  it('locates component state and actions under Components, read from the pushed component states', () => {
     const app = source('../App.tsx');
-    const deployment = source('./DeploymentCompositionPanel.tsx');
     const components = source('./ComponentsWorkspace.tsx');
-    const lifecycle = source('./CCLCPanel.tsx');
-
-    expect(app).not.toContain('<CCLCPanel');
-    expect(deployment).not.toContain('<CCLCPanel');
-    // Activate all above the list; the selected component's lifecycle on its page.
-    expect(components).toContain('<CCLCPanelView part="cell"');
-    expect(components).toContain('<CCLCPanelView part="component"');
-    // The panel uses App's shared CCLC controller; App binds it to the admission generation.
-    expect(components).toContain('controller={cclc}');
-    expect(app).toContain('headlessSnapshot?.authoringAdmission.admissionGeneration ?? null, appliedDeploymentIdentity?.componentIds');
-    expect(app).toContain('lifecycleIds={configuredComponentIds}');
-    // The page selects its component in CCLC, never while a request is in flight.
-    expect(components).toContain('setControllableComponentId(selectedId)');
-    expect(components).toContain('!cclcBusy');
-    expect(lifecycle).toContain('aria-pressed={selected}');
-    expect(lifecycle).toContain('setControllableComponentId(id)');
-    expect(lifecycle).not.toContain('placeholder="lite6-arm"');
+    // Enable all above the list; the selected component's state and actions on its page.
+    expect(components).toContain('<CellComponentsCard states={cellState.components}');
+    expect(components).toContain('<ComponentStatePanel state={state}');
+    // App passes the one pushed cell state (CONTRACTS §1); no polling hook.
+    expect(app).toContain('const cellState = useCellState(headlessStateSource);');
+    expect(app).not.toContain('useCCLC');
   });
 });

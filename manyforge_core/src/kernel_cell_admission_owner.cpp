@@ -70,7 +70,6 @@ template <typename Value>
              settlement == CellAdmissionSettlementKindDTO::kProvenNoEffect ||
              settlement == CellAdmissionSettlementKindDTO::kReconciled;
     case CellAdmissionClaimKindDTO::kManagerApply:
-    case CellAdmissionClaimKindDTO::kComponentLifecycle:
     case CellAdmissionClaimKindDTO::kInterventionOrRecovery:
     case CellAdmissionClaimKindDTO::kManualOperation:
       return settlement == CellAdmissionSettlementKindDTO::kTerminalEffectsSettled ||
@@ -96,10 +95,8 @@ KernelCellAdmissionOwner::KernelCellAdmissionOwner(
     std::optional<ManagerLivenessRequiredSetDTO> manager_liveness_required_set,
     CellAdmissionClaimGeneration recovered_claim_generation_high_water,
     CellAdmissionProgramNodeValidator program_node_validator,
-    std::function<bool()> stop_fault_active,
     CellAdmissionProgramResetStatusSource program_reset_status_source,
-    std::function<Result<void>(std::shared_ptr<IIoSignalService>*)> required_health_loss_observer,
-    std::function<StopFaultAdmissionScope()> stop_fault_scope)
+    std::function<Result<void>(std::shared_ptr<IIoSignalService>*)> required_health_loss_observer)
     : kernel_owner_epoch_(std::move(kernel_owner_epoch)),
       capacity_(capacity),
       clock_(clock),
@@ -109,8 +106,6 @@ KernelCellAdmissionOwner::KernelCellAdmissionOwner(
       program_reset_status_source_(std::move(program_reset_status_source)),
       reconcile_validator_(std::move(reconcile_validator)),
       program_node_validator_(std::move(program_node_validator)),
-      stop_fault_active_(std::move(stop_fault_active)),
-      stop_fault_scope_(std::move(stop_fault_scope)),
       required_health_loss_observer_(std::move(required_health_loss_observer)),
       manager_liveness_required_set_(std::move(manager_liveness_required_set)),
       membership_(std::move(recovered_membership)),
@@ -291,33 +286,6 @@ bool KernelCellAdmissionOwner::BaseReadinessLocked() const noexcept {
   return NonCycleReadinessLocked() && readiness_.program_cycle_status_current &&
          readiness_.program_cycle_status.has_value() &&
          readiness_.program_cycle_status->state == ProgramCycleStateDTO::kIdleAfterReset;
-}
-
-std::optional<std::string_view> KernelCellAdmissionOwner::LifecycleBlockingReasonLocked()
-    const noexcept {
-  // An intentionally disabled required component is not execution-ready, but
-  // must still be eligible for an explicit idle-time Enable. All other cell
-  // freshness, convergence and fault requirements remain mandatory. The first
-  // failing condition is reported so the caller knows what must settle.
-  if (!manager_liveness_required_set_.has_value() ||
-      manager_liveness_current_unfenced_count_ != manager_liveness_rows_.size()) {
-    return "component_lifecycle_manager_liveness_not_current";
-  }
-  if (!readiness_.required_component_status_current || !readiness_.deployment_status_current) {
-    return "component_lifecycle_status_not_current";
-  }
-  if (!readiness_.deployment_converged) return "component_lifecycle_deployment_not_converged";
-  if (readiness_.blocking_fault_count != 0U) return "component_lifecycle_blocking_fault";
-  if (readiness_.unresolved_owner_count != 0U) return "component_lifecycle_owner_unresolved";
-  if (readiness_.unsettled_effect_count != 0U) return "component_lifecycle_effects_not_settled";
-  if (!readiness_.program_cycle_status_current || !readiness_.program_cycle_status.has_value()) {
-    return "component_lifecycle_program_status_not_current";
-  }
-  if (readiness_.program_cycle_status->state != ProgramCycleStateDTO::kIdleAfterReset) {
-    return "component_lifecycle_program_not_idle_after_reset";
-  }
-  if (held_claim_count_ != 0U) return "component_lifecycle_conflicting_claim_held";
-  return std::nullopt;
 }
 
 bool KernelCellAdmissionOwner::ManualParentReadyLocked(const Entry* parent) const noexcept {
@@ -516,8 +484,7 @@ Result<ProgramCycleStatusDTO> KernelCellAdmissionOwner::CurrentResetLocked(
       manager_liveness_current_unfenced_count_ != manager_liveness_rows_.size() ||
       proof.purpose != purpose ||
       proof.intent != intent || proof.claim != claim || !proof.status ||
-      persistence_outcome_unknown_ || published_stop_fault_active_ ||
-      (stop_fault_active_ && stop_fault_active_()) || route_recovery_pending_) {
+      persistence_outcome_unknown_ || route_recovery_pending_) {
     return AuthoringNotReady<ProgramCycleStatusDTO>(generation_, "program_reset_dependencies_changed");
   }
   const auto current = Result<ProgramCycleStatusDTO>::Ok(*proof.status);
@@ -581,9 +548,8 @@ Result<void> KernelCellAdmissionOwner::AdvanceGenerationLocked() {
 }
 
 AuthoringAdmissionDTO KernelCellAdmissionOwner::AdmissionLocked() const noexcept {
-  return AuthoringAdmissionDTO{!persistence_outcome_unknown_ && !StopFaultClosesCellLocked() &&
-                                   !route_recovery_pending_ && BaseReadinessLocked() &&
-                                   held_claim_count_ == 0U,
+  return AuthoringAdmissionDTO{!persistence_outcome_unknown_ && !route_recovery_pending_ &&
+                                   BaseReadinessLocked() && held_claim_count_ == 0U,
                                generation_};
 }
 
@@ -606,18 +572,6 @@ void KernelCellAdmissionOwner::CloseForPersistenceUnknownLocked(
       static_cast<unsigned long long>(claim.claim_generation.value()));
 }
 
-Result<void> KernelCellAdmissionOwner::RefreshStopFaultAdmission() {
-  std::lock_guard transition_lock(liveness_transition_mutex_);
-  std::lock_guard lock(mutex_);
-  const bool active = stop_fault_active_ && stop_fault_active_();
-  if (active == published_stop_fault_active_) return Result<void>::Ok();
-  published_stop_fault_active_ = true;
-  auto advanced = AdvanceGenerationLocked();
-  if (!advanced.ok()) return advanced;
-  published_stop_fault_active_ = active;
-  return Result<void>::Ok();
-}
-
 Result<void> KernelCellAdmissionOwner::SetRouteRecoveryPending(bool pending) {
   std::lock_guard transition_lock(liveness_transition_mutex_);
   std::lock_guard lock(mutex_);
@@ -635,16 +589,15 @@ bool KernelCellAdmissionOwner::route_recovery_pending() const {
   return route_recovery_pending_;
 }
 
+bool KernelCellAdmissionOwner::manager_liveness_lost() const {
+  std::lock_guard lock(mutex_);
+  return std::any_of(manager_liveness_rows_.begin(), manager_liveness_rows_.end(),
+                     [](const ManagerLivenessRow& row) { return row.direct_loss_inhibited; });
+}
+
 AuthoringAdmissionDTO KernelCellAdmissionOwner::GetAuthoringAdmission() const {
   std::lock_guard lock(mutex_);
   return AdmissionLocked();
-}
-
-bool KernelCellAdmissionOwner::AuthoringClosedOnlyByClosing() const {
-  std::lock_guard lock(mutex_);
-  return !persistence_outcome_unknown_ &&
-         StopFaultScopeLocked() == StopFaultAdmissionScope::kClosing &&
-         !route_recovery_pending_ && BaseReadinessLocked() && held_claim_count_ == 0U;
 }
 
 Result<void> KernelCellAdmissionOwner::ValidateProgramRunnerContactLossSource(
@@ -747,9 +700,8 @@ Result<void> KernelCellAdmissionOwner::Publish(
   }
   const bool next_current =
       status.state == ManagerLivenessStateDTO::kCurrent && !status.command_fenced;
-  if (next_current && found->direct_loss_inhibited) {
-    return Reject<void>("invalid_state_transition", "manager_liveness_loss_inhibited");
-  }
+  // A newer current status after a loss: the Manager is alive again.
+  if (next_current) found->direct_loss_inhibited = false;
   const auto token = status.receiver_status_sequence;
   bool transition_required = retry_pending_fence;
   if (!retry_pending_fence) {
@@ -983,7 +935,7 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireCellAdmissionClai
 
 Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquirePreparedProgramResetClaim(
     const CellAdmissionClaimIntentDTO& intent, const PreparedProgramResetStatus& proof) {
-  return AcquireClaim(intent, intervention_validator_, false, {}, &proof);
+  return AcquireClaim(intent, intervention_validator_, {}, &proof);
 }
 
 Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireManualCellAdmissionClaim(
@@ -995,60 +947,9 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireManualCellAdmissi
   return AcquireClaim(intent, validate_offer);
 }
 
-Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireRouteRecoveryClaim(
-    const CellAdmissionClaimIntentDTO& intent,
-    const CellAdmissionInterventionValidator& validate_offer) {
-  if (intent.claim_kind != CellAdmissionClaimKindDTO::kInterventionOrRecovery ||
-      intent.owner_role != CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner ||
-      !intent.owner_transaction_id.starts_with("route-selection.") ||
-      !intent.scope.resources.empty() || intent.scope.configurations.size() != 1U ||
-      !validate_offer) {
-    return Reject<CellAdmissionClaimDTO>("invalid_request", "route_recovery_validator_required");
-  }
-  return AcquireClaim(intent, validate_offer);
-}
-
-Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireSelectedBringUpClaim(
-    const CellAdmissionClaimIntentDTO& intent,
-    const CellAdmissionInterventionValidator& validate_offer) {
-  if (intent.claim_kind != CellAdmissionClaimKindDTO::kInterventionOrRecovery ||
-      intent.owner_role != CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner ||
-      !intent.owner_transaction_id.starts_with("selected-lifecycle.") || !validate_offer) {
-    return Reject<CellAdmissionClaimDTO>("invalid_request", "selected_bring_up_validator_required");
-  }
-  return AcquireClaim(intent, validate_offer);
-}
-
-Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireApplyBringUpClaim(
-    const CellAdmissionClaimIntentDTO& intent,
-    const CellAdmissionApplyBringUpValidator& validate_plan) {
-  if (intent.claim_kind != CellAdmissionClaimKindDTO::kManagerApply ||
-      intent.owner_role != CellAdmissionOwnerRoleDTO::kManager ||
-      !intent.scope.resources.empty() || !intent.scope.configurations.empty() ||
-      intent.program_cycle_evidence || intent.intervention_evidence || intent.program_node_evidence ||
-      !validate_plan) {
-    return Reject<CellAdmissionClaimDTO>("invalid_request", "apply_bring_up_validator_required");
-  }
-  return AcquireClaim(intent, [&](const auto& checked, const auto&) {
-    // AcquireClaim invokes this synchronously under this owner's mutex. The
-    // composing Kernel joins permitted selected deficits to these actual
-    // published counts, rather than trusting caller-supplied readiness flags.
-    return validate_plan(checked, readiness_, manager_liveness_required_set_->manager_runtime_epoch);
-  }, true);
-}
-
-Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireCloseDisableLifecycleClaim(
-    const CellAdmissionClaimIntentDTO& intent) {
-  if (intent.claim_kind != CellAdmissionClaimKindDTO::kComponentLifecycle ||
-      intent.owner_role != CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner ||
-      intent.program_node_evidence || intent.intervention_evidence)
-    return Reject<CellAdmissionClaimDTO>("invalid_request", "close_disable_claim_invalid");
-  return AcquireClaim(intent, intervention_validator_, false, {}, nullptr, {}, true);
-}
-
 Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireConfigurationApplyClaim(
     const CellAdmissionClaimIntentDTO& intent,
-    const CellAdmissionConfigurationApplyValidator& validate, const bool canonical_empty_candidate) {
+    const CellAdmissionConfigurationApplyValidator& validate) {
   if (intent.claim_kind != CellAdmissionClaimKindDTO::kManagerApply ||
       intent.owner_role != CellAdmissionOwnerRoleDTO::kManager || !intent.scope.resources.empty() ||
       !intent.scope.configurations.empty() || intent.program_cycle_evidence ||
@@ -1056,74 +957,14 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireConfigurationAppl
     return Reject<CellAdmissionClaimDTO>("invalid_request",
                                          "configuration_apply_validator_required");
   }
-  return AcquireClaim(intent, {}, false, validate, nullptr, {}, canonical_empty_candidate);
-}
-
-StopFaultAdmissionScope KernelCellAdmissionOwner::StopFaultScopeLocked() const {
-  if (stop_fault_scope_) return stop_fault_scope_();
-  return stop_fault_active_ && stop_fault_active_() ? StopFaultAdmissionScope::kCell
-                                                    : StopFaultAdmissionScope::kNone;
-}
-
-bool KernelCellAdmissionOwner::StopFaultClosesCellLocked() const {
-  const auto scope = StopFaultScopeLocked();
-  // A carried latch opens the cell at once; any other stale publication of an
-  // active latch keeps it closed until RefreshStopFaultAdmission (unchanged).
-  return scope == StopFaultAdmissionScope::kCell || scope == StopFaultAdmissionScope::kClosing ||
-         (published_stop_fault_active_ && scope != StopFaultAdmissionScope::kCarried);
-}
-
-bool KernelCellAdmissionOwner::IoOutputRecoveryDependenciesReadyLocked() const noexcept {
-  return !persistence_outcome_unknown_ && !published_stop_fault_active_ &&
-         !(stop_fault_active_ && stop_fault_active_()) && !route_recovery_pending_ &&
-         manager_liveness_required_set_ &&
-         manager_liveness_current_unfenced_count_ == manager_liveness_rows_.size() &&
-         readiness_.required_component_status_current && readiness_.deployment_status_current &&
-         readiness_.deployment_converged && readiness_.blocking_fault_count == 0U &&
-         readiness_.unresolved_owner_count == 0U && readiness_.unsettled_effect_count == 0U &&
-         readiness_.program_cycle_status_current && readiness_.program_cycle_status &&
-         !readiness_.program_runner_loss;
-}
-
-Result<void> KernelCellAdmissionOwner::ValidateHeldIoOutputRecoveryLifecycleClaim(
-    const LifecycleTransactionId& transaction,
-    const CellAdmissionIoOutputRecoveryValidator& validate) const {
-  std::lock_guard lock(mutex_);
-  if (!validate || !IoOutputRecoveryDependenciesReadyLocked())
-    return AuthoringNotReady<void>(generation_, "io_output_recovery_dependencies_not_current");
-  const auto claim = std::find_if(entries_.begin(), entries_.end(), [&](const auto& entry) {
-    return !entry.release && !entry.reconcile_settlement &&
-           entry.claim.intent.claim_kind == CellAdmissionClaimKindDTO::kComponentLifecycle &&
-           entry.claim.intent.owner_transaction_id == transaction.value();
-  });
-  if (claim == entries_.end())
-    return AuthoringNotReady<void>(generation_, "io_output_recovery_lifecycle_claim_not_held");
-  std::vector<CellAdmissionClaimDTO> held;
-  held.reserve(held_claim_count_);
-  for (const auto& entry : entries_)
-    if (!entry.release && !entry.reconcile_settlement && &entry != &*claim)
-      held.push_back(entry.claim);
-  return validate(claim->claim.intent, held, readiness_,
-                  manager_liveness_required_set_->manager_runtime_epoch);
-}
-
-Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireIoOutputRecoveryLifecycleClaim(
-    const CellAdmissionClaimIntentDTO& intent,
-    const CellAdmissionIoOutputRecoveryValidator& validate) {
-  if (intent.claim_kind != CellAdmissionClaimKindDTO::kComponentLifecycle ||
-      intent.owner_role != CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner ||
-      intent.program_node_evidence || intent.intervention_evidence || !validate)
-    return Reject<CellAdmissionClaimDTO>("invalid_request", "io_output_recovery_claim_invalid");
-  return AcquireClaim(intent, {}, false, {}, nullptr, validate);
+  return AcquireClaim(intent, {}, validate);
 }
 
 Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireClaim(
     const CellAdmissionClaimIntentDTO& intent,
-    const CellAdmissionInterventionValidator& validate_offer, const bool selected_apply_bring_up,
+    const CellAdmissionInterventionValidator& validate_offer,
     const CellAdmissionConfigurationApplyValidator& configuration_apply_validator,
-    const PreparedProgramResetStatus* reset_proof,
-    const CellAdmissionIoOutputRecoveryValidator& io_output_recovery_validator,
-    const bool close_step_claim) {
+    const PreparedProgramResetStatus* reset_proof) {
   detail::AdmissionTiming timing(false, intent.request_id.value());
   const bool configuration_apply = static_cast<bool>(configuration_apply_validator);
   auto wait_start = detail::AdmissionTiming::Clock::now();
@@ -1171,31 +1012,6 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireClaim(
   // refusal.
   // Exact replay above remains observable during a fault. The private Q91
   // parent alternative still requires its positive plan validation below.
-  // D6: Close of a latched Scenario admits its motion-free steps, and a latch
-  // carried past Close refuses only claims that lead to motion; the latch
-  // itself stays until the operator's Recover cell clears it.
-  const auto fault_scope = StopFaultScopeLocked();
-  const bool latch_exempt =
-      selected_apply_bring_up ||
-      (intent.claim_kind == CellAdmissionClaimKindDTO::kInterventionOrRecovery &&
-       intent.owner_role == CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner);
-  const bool motion_intent = intent.claim_kind == CellAdmissionClaimKindDTO::kProgramCycle ||
-                             intent.claim_kind == CellAdmissionClaimKindDTO::kManualOperation ||
-                             intent.claim_kind == CellAdmissionClaimKindDTO::kInterventionOrRecovery;
-  // Only Close's own claims: the Kernel-verified Disable and the exact
-  // canonical-empty Apply. Close's Program Reset selects no Scene or position
-  // effect and so takes no Reset claim; every kProgramReset claim is refused.
-  const bool close_step = fault_scope == StopFaultAdmissionScope::kClosing && close_step_claim;
-  // While Close runs (kClosing) only its own steps pass, ahead of every other
-  // latch exemption: the canonical-empty Apply composes no component, so it
-  // needs no bring-up, route-recovery or selected bring-up claim.
-  if (fault_scope == StopFaultAdmissionScope::kClosing
-          ? !close_step
-          : !latch_exempt && (StopFaultClosesCellLocked() ||
-                              (fault_scope != StopFaultAdmissionScope::kNone && motion_intent))) {
-    return AuthoringNotReady<CellAdmissionClaimDTO>(generation_,
-                                                    "active_stop_fault_requires_recovery");
-  }
   if (route_recovery_pending_ &&
       intent.claim_kind != CellAdmissionClaimKindDTO::kInterventionOrRecovery) {
     return AuthoringNotReady<CellAdmissionClaimDTO>(generation_, "route_recovery_pending");
@@ -1238,13 +1054,6 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireClaim(
     return AuthoringNotReady<CellAdmissionClaimDTO>(generation_, "program_cycle_resetting");
   }
   if (intent.program_node_evidence.has_value()) {
-    // A Program runs under a held cycle claim. Component lifecycle changes
-    // are explicit idle-time configuration operations, so no Program child
-    // claim may acquire their authority, even with valid node evidence.
-    if (intent.claim_kind == CellAdmissionClaimKindDTO::kComponentLifecycle) {
-      return AuthoringNotReady<CellAdmissionClaimDTO>(
-          generation_, "component_lifecycle_requires_idle_cell");
-    }
     const auto& evidence = *intent.program_node_evidence;
     const auto& cycle = readiness_.program_cycle_status;
     if (parent == nullptr || !program_node_validator_ ||
@@ -1344,28 +1153,6 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireClaim(
         configuration_apply_validator(intent, configuration_held, readiness_,
                                       manager_liveness_required_set_->manager_runtime_epoch);
     if (!validated.ok()) return Result<CellAdmissionClaimDTO>::Err(validated.error());
-  } else if (selected_apply_bring_up) {
-    if (held_claim_count_ != 0U || !validate_offer) {
-      return AuthoringNotReady<CellAdmissionClaimDTO>(generation_,
-                                                      "apply_bring_up_claim_conflict");
-    }
-    if (!manager_liveness_required_set_.has_value() ||
-        intent.owner_epoch != manager_liveness_required_set_->manager_owner_epoch ||
-        manager_liveness_current_unfenced_count_ != manager_liveness_rows_.size() ||
-        !readiness_.required_component_status_current || !readiness_.deployment_status_current ||
-        !readiness_.program_cycle_status_current || !readiness_.program_cycle_status ||
-        readiness_.program_cycle_status->state != ProgramCycleStateDTO::kIdleAfterReset ||
-        readiness_.unresolved_owner_count != 0U || readiness_.unsettled_effect_count != 0U) {
-      return AuthoringNotReady<CellAdmissionClaimDTO>(generation_,
-                                                      "apply_bring_up_dependencies_not_current");
-    }
-    // Validate while the existing owner serializes acquisition. This callback
-    // is supplied only by the composing Kernel, never by a public request or
-    // restored status, and creates no second pending-plan registry.
-    const auto validated = validate_offer(intent, std::nullopt);
-    if (!validated.ok()) {
-      return Result<CellAdmissionClaimDTO>::Err(validated.error());
-    }
   } else if (intent.claim_kind == CellAdmissionClaimKindDTO::kInterventionOrRecovery ||
              (intent.claim_kind == CellAdmissionClaimKindDTO::kManualOperation &&
               intent.intervention_evidence.has_value())) {
@@ -1392,28 +1179,6 @@ Result<CellAdmissionClaimDTO> KernelCellAdmissionOwner::AcquireClaim(
                                                              ? evidence.error().code
                                                              : reason->second);
       return Result<CellAdmissionClaimDTO>::Err(std::move(error));
-    }
-  } else if (io_output_recovery_validator) {
-    // Preserve every unrelated health/Apply/Scene fault. These counters come
-    // from those actual owners, not from the retained output operation.
-    if (!IoOutputRecoveryDependenciesReadyLocked())
-      return AuthoringNotReady<CellAdmissionClaimDTO>(
-          generation_, "io_output_recovery_dependencies_not_current");
-    std::vector<CellAdmissionClaimDTO> held;
-    held.reserve(held_claim_count_);
-    for (const auto& entry : entries_)
-      if (!entry.release && !entry.reconcile_settlement) held.push_back(entry.claim);
-    const auto checked = io_output_recovery_validator(
-        intent, held, readiness_, manager_liveness_required_set_->manager_runtime_epoch);
-    if (!checked.ok()) return Result<CellAdmissionClaimDTO>::Err(checked.error());
-  } else if (intent.claim_kind == CellAdmissionClaimKindDTO::kComponentLifecycle) {
-    const auto blocking = LifecycleBlockingReasonLocked();
-    if (intent.intervention_evidence.has_value() || blocking.has_value() ||
-        route_recovery_pending_) {
-      return AuthoringNotReady<CellAdmissionClaimDTO>(
-          generation_, blocking.has_value()                ? std::string(*blocking)
-                       : route_recovery_pending_          ? "component_lifecycle_route_recovery_pending"
-                                                          : "component_lifecycle_requires_idle_cell");
     }
   } else if (intent.claim_kind == CellAdmissionClaimKindDTO::kProgramReset) {
     if (!reset_proof || !MatchingProgramResetLocked(intent, *reset_proof)) {

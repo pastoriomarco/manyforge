@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(manyforge_deployment VERSION 0.1.0 LANGUAGES CXX)
+project(manyforge_deployment VERSION 0.2.0 LANGUAGES CXX)
 
 if(CMAKE_CONFIGURATION_TYPES)
   message(FATAL_ERROR
@@ -59,12 +59,8 @@ set(
   MANYFORGE_MAINTAINED_DEPLOYMENT_OCCURRENCE_GENERATOR
   "${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_maintained_deployment_occurrences.py")
 set(
-  MANYFORGE_UI6I_DUAL_ROBOT_SCENARIO_GENERATOR
-  "${_MANYFORGE_WORKSPACE_ROOT}/scripts/qualification/generate_ui6i_dual_robot_scenario.py")
-# V-A (A7): the xArm-owned Real arm plans the occurrence generator reads.
-set(
-  MANYFORGE_XARM_ROS2_CONTROL_LIFECYCLE_PLANS
-  "${_MANYFORGE_WORKSPACE_ROOT}/manyforge_xarm_control/resources/xarm_ros2_control_lifecycle_plans.json")
+  MANYFORGE_ACTIVATION_PACKAGE_PRODUCER
+  "${CMAKE_CURRENT_SOURCE_DIR}/test/produce_activation_package.py")
 if(NOT EXISTS "${MANYFORGE_NODE_ENVIRONMENT_MANIFEST}" OR
    NOT EXISTS "${MANYFORGE_NODE_ENVIRONMENT_CHECK}" OR
    NOT EXISTS "${MANYFORGE_STRUCTURAL_PREPARATION_TOOL}" OR
@@ -75,9 +71,7 @@ if(NOT EXISTS "${MANYFORGE_NODE_ENVIRONMENT_MANIFEST}" OR
    NOT EXISTS "${MANYFORGE_ASSISTANT_INSTRUMENT_SOURCE}" OR
    NOT EXISTS "${MANYFORGE_ASSISTANT_INSTRUMENT_GENERATOR}" OR
    NOT EXISTS "${MANYFORGE_NODE_CATALOG_SOURCE}" OR
-   NOT EXISTS "${MANYFORGE_MAINTAINED_DEPLOYMENT_OCCURRENCE_GENERATOR}" OR
-   NOT EXISTS "${MANYFORGE_UI6I_DUAL_ROBOT_SCENARIO_GENERATOR}" OR
-   NOT EXISTS "${MANYFORGE_XARM_ROS2_CONTROL_LIFECYCLE_PLANS}")
+   NOT EXISTS "${MANYFORGE_MAINTAINED_DEPLOYMENT_OCCURRENCE_GENERATOR}")
   message(FATAL_ERROR
     "manyforge_deployment production retention requires the node-environment "
     "closure, structural-model preparation tool, and maintained N6 source "
@@ -127,9 +121,7 @@ set_property(
   "${MANYFORGE_ASSISTANT_INSTRUMENT_SOURCE}"
   "${MANYFORGE_ASSISTANT_INSTRUMENT_GENERATOR}"
   "${MANYFORGE_NODE_CATALOG_SOURCE}"
-  "${MANYFORGE_MAINTAINED_DEPLOYMENT_OCCURRENCE_GENERATOR}"
-  "${MANYFORGE_UI6I_DUAL_ROBOT_SCENARIO_GENERATOR}"
-  "${MANYFORGE_XARM_ROS2_CONTROL_LIFECYCLE_PLANS}")
+  "${MANYFORGE_MAINTAINED_DEPLOYMENT_OCCURRENCE_GENERATOR}")
 
 file(READ
   "${MANYFORGE_NODE_ENVIRONMENT_MANIFEST}"
@@ -580,12 +572,6 @@ manyforge_embed_closed_schema(
   empty_runtime_configuration
   resources/closed_schema/value/manyforge.value_schema.runtime.empty.v1.yaml
   mf_empty_cfg)
-# DX-753: archival Draft/import validation retains the Native value schema.
-manyforge_embed_closed_schema(
-  kEmbeddedNativeExecutionRuntimeConfigurationSchema
-  native_execution_runtime_configuration
-  resources/closed_schema/value/manyforge.value_schema.runtime.native_execution.v1.yaml
-  mf_native_cfg)
 manyforge_embed_closed_schema(
   kEmbeddedRos2ControlExecutionRuntimeConfigurationSchema
   ros2_control_execution_runtime_configuration
@@ -640,9 +626,7 @@ else()
     "${_MANYFORGE_WORKSPACE_ROOT}/manyforge_core/src/io_signal_descriptor.cpp"
     "${_MANYFORGE_WORKSPACE_ROOT}/manyforge_core/src/io_condition_evaluator.cpp"
     "${_MANYFORGE_WORKSPACE_ROOT}/manyforge_core/src/io_rule_stop_response.cpp"
-    "${_MANYFORGE_WORKSPACE_ROOT}/manyforge_core/src/io_provider_lifecycle_catalog.cpp"
-    "${_MANYFORGE_WORKSPACE_ROOT}/manyforge_core/src/component_lifecycle_plan_catalog_codec.cpp"
-    "${_MANYFORGE_WORKSPACE_ROOT}/manyforge_core/src/component_lifecycle_plan_validity.cpp")
+    "${_MANYFORGE_WORKSPACE_ROOT}/manyforge_core/src/component_lifecycle.cpp")
   set_target_properties(manyforge_deployment_runtime_contract_codec
     PROPERTIES POSITION_INDEPENDENT_CODE ON)
   target_include_directories(manyforge_deployment_runtime_contract_codec
@@ -676,6 +660,7 @@ add_library(manyforge_deployment_verification_core
   src/assistant_settings_codec.cpp
   src/apply_affected_scope.cpp
   src/apply_component_delta.cpp
+  src/component_spec.cpp
   src/artifact_codec.cpp
   src/composed_model_symbol_role_map_verifier.cpp
   src/control_domain_control_internal.cpp
@@ -694,10 +679,9 @@ add_library(manyforge_deployment_verification_core
   src/model_asset_codec.cpp
   src/model_source.cpp
   src/execution_runtime_contract.cpp
-  src/native_execution_runtime_unit_internal.cpp
+  src/execution_host_unit_internal.cpp
   src/native_component_configuration.cpp
   src/ordinary_motion_jerk.cpp
-  src/deployment_jerk_import.cpp
   src/initial_scene_projection.cpp
   src/io_signal_catalog.cpp
   src/io_provider_domain.cpp
@@ -782,8 +766,7 @@ if(MANYFORGE_BUILD_RESOLVED_STOP_BASE_PLAN_RESOLVER)
       "manyforge_core target")
   endif()
   add_library(manyforge_deployment_resolved_stop_base_plan_resolver
-    src/resolved_stop_base_plan_resolver.cpp
-    src/route_configuration_publication.cpp)
+    src/resolved_stop_base_plan_resolver.cpp)
   add_library(
     manyforge::deployment_resolved_stop_base_plan_resolver ALIAS
     manyforge_deployment_resolved_stop_base_plan_resolver)
@@ -810,84 +793,6 @@ add_library(manyforge_deployment_program_io_condition_compiler ALIAS
 add_library(manyforge::deployment_program_io_condition_compiler ALIAS
   manyforge_deployment_verification_core)
 
-# Verified lifecycle/route-current snapshot composition is independently
-# read-only and has no dependency on the Stop-plan repository adapter. Keep
-# the target separate so minimal Manager compositions do not inherit
-# unrelated storage or mutation surfaces.
-set(_MANYFORGE_LIFECYCLE_CURRENT_SNAPSHOT_SOURCE_DEFAULT OFF)
-if(TARGET manyforge_core)
-  set(_MANYFORGE_LIFECYCLE_CURRENT_SNAPSHOT_SOURCE_DEFAULT ON)
-endif()
-option(
-  MANYFORGE_BUILD_COMPONENT_LIFECYCLE_CURRENT_SNAPSHOT_SOURCE
-  "Build the verified Deployment-to-Core lifecycle current-snapshot source"
-  ${_MANYFORGE_LIFECYCLE_CURRENT_SNAPSHOT_SOURCE_DEFAULT})
-if(MANYFORGE_BUILD_COMPONENT_LIFECYCLE_CURRENT_SNAPSHOT_SOURCE)
-  if(NOT TARGET manyforge_core)
-    message(FATAL_ERROR
-      "component lifecycle current-snapshot composition requires an existing "
-      "manyforge_core target")
-  endif()
-  add_library(manyforge_deployment_component_lifecycle_current_snapshot_source
-    src/component_lifecycle_current_snapshot_source.cpp
-    src/route_selection_current_snapshot_source.cpp)
-  add_library(
-    manyforge::deployment_component_lifecycle_current_snapshot_source ALIAS
-    manyforge_deployment_component_lifecycle_current_snapshot_source)
-  target_include_directories(
-    manyforge_deployment_component_lifecycle_current_snapshot_source PUBLIC
-    ${MANYFORGE_DEPLOYMENT_PUBLIC_INCLUDE_DIRECTORIES})
-  target_link_libraries(
-    manyforge_deployment_component_lifecycle_current_snapshot_source PUBLIC
-    manyforge_deployment_verified_controller_lifecycle_expected_domain
-    manyforge_deployment_verification_core
-    manyforge_core)
-  set_target_properties(
-    manyforge_deployment_component_lifecycle_current_snapshot_source
-    PROPERTIES POSITION_INDEPENDENT_CODE ON)
-endif()
-
-# Complete CCLC runtime ownership is an effectful production composition. Keep
-# it outside the compiler/verifier and require every independently qualified
-# Core/Deployment dependency explicitly; standalone compiler builds remain
-# free of runtime journals and mutable repositories.
-set(_MANYFORGE_CCLC_RUNTIME_COMPOSITION_DEFAULT OFF)
-if(TARGET manyforge_core_sqlite_cclc_journal AND
-   TARGET manyforge_deployment_resolved_stop_base_plan_resolver AND
-   TARGET manyforge_deployment_component_lifecycle_current_snapshot_source)
-  set(_MANYFORGE_CCLC_RUNTIME_COMPOSITION_DEFAULT ON)
-endif()
-option(
-  MANYFORGE_BUILD_CCLC_RUNTIME_COMPOSITION
-  "Build the complete Deployment-owned CCLC runtime composition"
-  ${_MANYFORGE_CCLC_RUNTIME_COMPOSITION_DEFAULT})
-if(MANYFORGE_BUILD_CCLC_RUNTIME_COMPOSITION)
-  if(NOT TARGET manyforge_core_sqlite_cclc_journal OR
-     NOT TARGET manyforge_deployment_resolved_stop_base_plan_resolver OR
-     NOT TARGET manyforge_deployment_component_lifecycle_current_snapshot_source)
-    message(FATAL_ERROR
-      "CCLC runtime composition requires the Core journal and "
-      "Deployment current-source/Stop-plan targets")
-  endif()
-  add_library(manyforge_deployment_cclc_runtime_composition
-    src/cclc_runtime_composition.cpp
-    src/cclc_open_request_server.cpp)
-  add_library(
-    manyforge::deployment_cclc_runtime_composition ALIAS
-    manyforge_deployment_cclc_runtime_composition)
-  target_include_directories(
-    manyforge_deployment_cclc_runtime_composition PUBLIC
-    ${MANYFORGE_DEPLOYMENT_PUBLIC_INCLUDE_DIRECTORIES})
-  target_link_libraries(
-    manyforge_deployment_cclc_runtime_composition PUBLIC
-    manyforge_deployment_component_lifecycle_current_snapshot_source
-    manyforge_deployment_resolved_stop_base_plan_resolver
-    manyforge_core_sqlite_cclc_journal)
-  set_target_properties(
-    manyforge_deployment_cclc_runtime_composition
-    PROPERTIES POSITION_INDEPENDENT_CODE ON)
-endif()
-
 # Full offline compiler and writer surface. The read-only admission target is
 # defined separately below; producer manifests remain content-addressed
 # provenance and are not interpreted as current-reader compatibility profiles.
@@ -908,6 +813,7 @@ add_library(manyforge_deployment
   src/cell_compiler.cpp
   src/cell_composition.cpp
   src/cell_structure.cpp
+  src/component_static_frames.cpp
   src/component_type_codec.cpp
   src/composed_model_symbol_role_map_internal.cpp
   src/mf2_joint_name_internal.cpp
@@ -970,16 +876,6 @@ target_link_libraries(
   manyforge_maintained_model_catalog PRIVATE
   manyforge::deployment)
 
-add_executable(
-  manyforge_maintained_deployment_occurrences
-  tools/maintained_deployment_occurrences_main.cpp)
-target_include_directories(
-  manyforge_maintained_deployment_occurrences PRIVATE
-  "${CMAKE_CURRENT_SOURCE_DIR}/src")
-target_link_libraries(
-  manyforge_maintained_deployment_occurrences PRIVATE
-  manyforge::deployment)
-
 add_library(manyforge_deployment_admission
   src/canonical_empty_admission.cpp
   src/package_admission_profile.cpp
@@ -1012,8 +908,6 @@ target_include_directories(manyforge_preparation_support PRIVATE
 target_link_libraries(manyforge_preparation_support PRIVATE
   manyforge::deployment
   manyforge_deployment_canonical_package_generator)
-target_link_libraries(manyforge_maintained_deployment_occurrences PRIVATE
-  manyforge_preparation_support)
 
 add_executable(manyforge_prepare_activation
   tools/prepare_activation.cpp)
@@ -1112,25 +1006,9 @@ if(BUILD_TESTING)
       --check
       --description "${MANYFORGE_MAINTAINED_DEPLOYMENT_SOURCE_DESCRIPTION}"
       --assistant-profiles "${MANYFORGE_MAINTAINED_ASSISTANT_PROFILES}"
-      --workspace-root "${_MANYFORGE_WORKSPACE_ROOT}"
-      --revision-tool "$<TARGET_FILE:manyforge_deployment_revision>")
+      --workspace-root "${_MANYFORGE_WORKSPACE_ROOT}")
   set_tests_properties(
     MaintainedDeploymentOccurrenceSources
-    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
-
-  add_test(
-    NAME Ui6iDualRobotScenarioSources
-    COMMAND
-      "${CMAKE_COMMAND}" -E env
-      "PYTHONPATH=${_MANYFORGE_WORKSPACE_ROOT}/manyforge_behavior:${_MANYFORGE_WORKSPACE_ROOT}"
-      "${Python3_EXECUTABLE}"
-      "${MANYFORGE_UI6I_DUAL_ROBOT_SCENARIO_GENERATOR}"
-      --check
-      --workspace-root "${_MANYFORGE_WORKSPACE_ROOT}"
-      --deployment-revision-tool "$<TARGET_FILE:manyforge_deployment_revision>"
-      --program-revision-tool "$<TARGET_FILE:manyforge_program_revision>")
-  set_tests_properties(
-    Ui6iDualRobotScenarioSources
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_test(
@@ -1312,6 +1190,36 @@ if(BUILD_TESTING)
     manyforge_preparation_support manyforge_deployment GTest::gtest_main)
   gtest_discover_tests(test_activation_ai_model PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  add_executable(test_activation_component_lane test/test_activation_component_lane.cpp)
+  target_compile_definitions(test_activation_component_lane PRIVATE
+    MANYFORGE_WORKSPACE_ROOT="${_MANYFORGE_WORKSPACE_ROOT}")
+  target_include_directories(test_activation_component_lane PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(test_activation_component_lane PRIVATE
+    manyforge_preparation_support manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_activation_component_lane
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_activation_machine test/test_activation_machine.cpp)
+  target_compile_definitions(test_activation_machine PRIVATE
+    MANYFORGE_WORKSPACE_ROOT="${_MANYFORGE_WORKSPACE_ROOT}")
+  target_include_directories(test_activation_machine PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(test_activation_machine PRIVATE
+    manyforge_preparation_support manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_activation_machine
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  add_executable(test_activation_sensor test/test_activation_sensor.cpp)
+  target_compile_definitions(test_activation_sensor PRIVATE
+    MANYFORGE_WORKSPACE_ROOT="${_MANYFORGE_WORKSPACE_ROOT}")
+  target_include_directories(test_activation_sensor PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(test_activation_sensor PRIVATE
+    manyforge_preparation_support manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_activation_sensor
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   add_executable(test_io_signal_catalog test/test_io_signal_catalog.cpp)
   target_include_directories(test_io_signal_catalog PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src")
@@ -1381,7 +1289,6 @@ if(BUILD_TESTING)
     target_link_libraries(test_program_io_condition_compiler PRIVATE
       manyforge_preparation_support
       manyforge_deployment_program_io_condition_compiler manyforge_deployment GTest::gtest_main)
-    add_dependencies(test_program_io_condition_compiler manyforge_maintained_deployment_occurrences)
     gtest_discover_tests(test_program_io_condition_compiler
       PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS}
         FIXTURES_REQUIRED ProgramCapturePackage)
@@ -1396,7 +1303,6 @@ if(BUILD_TESTING)
       "${CMAKE_CURRENT_SOURCE_DIR}/src")
     target_link_libraries(test_program_io_stop_response_validation PRIVATE
       manyforge_deployment_program_io_condition_compiler manyforge_deployment GTest::gtest_main)
-    add_dependencies(test_program_io_stop_response_validation manyforge_maintained_deployment_occurrences)
     gtest_discover_tests(test_program_io_stop_response_validation
       PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS}
         FIXTURES_REQUIRED ProgramCapturePackage)
@@ -1417,21 +1323,21 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_program_contract
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS}
       FIXTURES_REQUIRED ProgramCapturePackage)
-  add_dependencies(test_program_contract manyforge_maintained_deployment_occurrences)
+  # The prepared activation of the Lite6 pick-and-place Scenario under the cell
+  # the capture tests read, produced by the ordinary activation preparer.
   add_test(NAME ProgramCapturePackage
-    COMMAND "${CMAKE_COMMAND}"
-      "-DTOOL=$<TARGET_FILE:manyforge_maintained_deployment_occurrences>"
-      "-DWORKSPACE=${_MANYFORGE_WORKSPACE_ROOT}"
-      "-DBUILD_ROOT=${CMAKE_CURRENT_BINARY_DIR}"
-      -P "${CMAKE_CURRENT_SOURCE_DIR}/test/program_capture_package.cmake")
+    COMMAND "${CMAKE_COMMAND}" -E env
+      "PYTHONPATH=${_MANYFORGE_WORKSPACE_ROOT}/manyforge_behavior:${_MANYFORGE_WORKSPACE_ROOT}"
+      "${Python3_EXECUTABLE}" "${MANYFORGE_ACTIVATION_PACKAGE_PRODUCER}"
+      --tool "$<TARGET_FILE:manyforge_prepare_activation>"
+      --workspace "${_MANYFORGE_WORKSPACE_ROOT}"
+      --package-root "${CMAKE_CURRENT_BINARY_DIR}/program_capture_package"
+      --scenario "examples/mock_lite6_pick_and_place.scenario=lite6_pick_place_cell")
   set_tests_properties(ProgramCapturePackage PROPERTIES
     FIXTURES_SETUP ProgramCapturePackage TIMEOUT 120)
 
   add_executable(test_program_binding_compiler
-    test/test_program_binding_compiler.cpp
-    # A1's genuine gripper-only fixture uses the same pure lifecycle anchor.
-    "${MANYFORGE_CORE_SOURCE_DIR}/src/component_lifecycle_plan_catalog_codec.cpp"
-    "${MANYFORGE_CORE_SOURCE_DIR}/src/component_lifecycle_plan_validity.cpp")
+    test/test_program_binding_compiler.cpp)
   target_compile_definitions(test_program_binding_compiler PRIVATE
     MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${CMAKE_CURRENT_BINARY_DIR}/generated/lite6_lite_gripper_structural"
     MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_example_models/models/lite6_lite_gripper")
@@ -1504,10 +1410,7 @@ if(BUILD_TESTING)
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_closed_schema
-    test/test_closed_schema.cpp
-    # The genuine gripper fixture shares the pure lifecycle anchor/validation.
-    "${MANYFORGE_CORE_SOURCE_DIR}/src/component_lifecycle_plan_catalog_codec.cpp"
-    "${MANYFORGE_CORE_SOURCE_DIR}/src/component_lifecycle_plan_validity.cpp")
+    test/test_closed_schema.cpp)
   target_compile_definitions(test_closed_schema PRIVATE
     MANYFORGE_CLOSED_SCHEMA_RESOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}/resources/closed_schema"
     MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${CMAKE_CURRENT_BINARY_DIR}/generated/lite6_lite_gripper_structural"
@@ -1720,15 +1623,28 @@ if(BUILD_TESTING)
   endforeach()
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${MANYFORGE_MAINTAINED_DEPLOYMENT_SOURCE_DESCRIPTION}")
-  # The fixtures several tests name directly.
+  # The fixtures several tests name directly: the combined example models
+  # (kept for their meshes), prepared for structural tests only. They are no
+  # maintained family; the split Lite6 roots are this root's
+  # `generated/<asset>_structural` siblings.
   set(MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT
     "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_example_models/models/lite6_lite_gripper")
   set(MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_SOURCE_ROOT
     "${CMAKE_CURRENT_SOURCE_DIR}/../manyforge_example_models/models/ur10e_robotiq_2f_140")
-  set(MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT
-    "${MANYFORGE_STRUCTURAL_FIXTURE_ROOT_lite6_lite_gripper}")
-  set(MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_FIXTURE_ROOT
-    "${MANYFORGE_STRUCTURAL_FIXTURE_ROOT_ur10e_robotiq_2f_140}")
+  manyforge_prepare_maintained_model(
+    lite6_lite_gripper "lite6_lite_gripper"
+    "${MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT}/lite6_lite_gripper.urdf"
+    "${MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT}/lite6_lite_gripper.srdf"
+    "package://manyforge_example_models/models/lite6_lite_gripper/"
+    "${MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT}"
+    MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT)
+  manyforge_prepare_maintained_model(
+    ur10e_robotiq_2f_140 "ur10e_robotiq_2f_140"
+    "${MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_SOURCE_ROOT}/ur10e_robotiq_2f_140.structural.urdf"
+    "${MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_SOURCE_ROOT}/ur10e_robotiq_2f_140.structural.srdf"
+    "package://manyforge_example_models/models/ur10e_robotiq_2f_140/"
+    "${MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_SOURCE_ROOT}"
+    MANYFORGE_UR10E_ROBOTIQ_STRUCTURAL_FIXTURE_ROOT)
 
   # UI6-I process qualification needs the exact cell-scoped empty predecessor
   # before it can exercise ordinary project-folder activation. This generated
@@ -1743,31 +1659,30 @@ if(BUILD_TESTING)
   file(GLOB_RECURSE MANYFORGE_UI6I_DUAL_SCENARIO_INPUTS
     CONFIGURE_DEPENDS LIST_DIRECTORIES false
     "${CMAKE_CURRENT_SOURCE_DIR}/resources/maintained/*"
-    "${_MANYFORGE_WORKSPACE_ROOT}/examples/*.scenario/*"
-    "${_MANYFORGE_WORKSPACE_ROOT}/examples/*.deployment.yaml"
-    "${_MANYFORGE_WORKSPACE_ROOT}/examples/*.program.yaml")
+    "${_MANYFORGE_WORKSPACE_ROOT}/examples/mock_dual_arm_shared_group.scenario/*")
   add_custom_command(
     OUTPUT "${MANYFORGE_UI6I_DUAL_SCENARIO_STAMP}"
     COMMAND "${CMAKE_COMMAND}" -E remove_directory
       "${MANYFORGE_UI6I_DUAL_SCENARIO_FIXTURE_ROOT}"
     COMMAND "${CMAKE_COMMAND}" -E make_directory
       "${MANYFORGE_UI6I_DUAL_SCENARIO_PACKAGE_ROOT}"
-    COMMAND "$<TARGET_FILE:manyforge_maintained_deployment_occurrences>"
-      --check
-      --workspace-root "${_MANYFORGE_WORKSPACE_ROOT}"
+    COMMAND "${CMAKE_COMMAND}" -E env
+      "PYTHONPATH=${_MANYFORGE_WORKSPACE_ROOT}/manyforge_behavior:${_MANYFORGE_WORKSPACE_ROOT}"
+      "${Python3_EXECUTABLE}" "${MANYFORGE_ACTIVATION_PACKAGE_PRODUCER}"
+      --tool "$<TARGET_FILE:manyforge_prepare_activation>"
+      --workspace "${_MANYFORGE_WORKSPACE_ROOT}"
       --package-root "${MANYFORGE_UI6I_DUAL_SCENARIO_PACKAGE_ROOT}"
-      ${MANYFORGE_MAINTAINED_PREPARED_ARGUMENTS}
+      --publish-canonical-empty
+      --scenario "examples/mock_dual_arm_shared_group.scenario=ui6i_ur5e_lite6_wall_cell"
     COMMAND "${CMAKE_COMMAND}" -E touch
       "${MANYFORGE_UI6I_DUAL_SCENARIO_STAMP}"
     DEPENDS
-      manyforge_maintained_deployment_occurrences
+      manyforge_prepare_activation
+      "${MANYFORGE_ACTIVATION_PACKAGE_PRODUCER}"
       ${MANYFORGE_UI6I_DUAL_SCENARIO_INPUTS}
-      # Compiled into the tool; listed so the fixture names its whole closure.
       "${MANYFORGE_NODE_ENVIRONMENT_MANIFEST}"
       "${MANYFORGE_NODE_CATALOG_SOURCE}"
-      "${CMAKE_CURRENT_SOURCE_DIR}/resources/catalog/gripper.command_position.v1.yaml"
       ${MANYFORGE_MAINTAINED_MODEL_SOURCE_INPUTS}
-      ${MANYFORGE_MAINTAINED_PREPARATION_MANIFESTS}
     VERBATIM)
   # Part of the default test build, like the other process fixtures: the
   # process tests consume this tree directly and must never see a stale one.
@@ -1786,14 +1701,6 @@ if(BUILD_TESTING)
       "$<TARGET_FILE:manyforge_maintained_model_catalog>"
       --check
       --description "${MANYFORGE_MAINTAINED_DEPLOYMENT_SOURCE_DESCRIPTION}"
-      --workspace-root "${_MANYFORGE_WORKSPACE_ROOT}"
-      ${MANYFORGE_MAINTAINED_PREPARED_ARGUMENTS})
-
-  add_test(
-    NAME MaintainedDeploymentOccurrenceCompilation
-    COMMAND
-      "$<TARGET_FILE:manyforge_maintained_deployment_occurrences>"
-      --check
       --workspace-root "${_MANYFORGE_WORKSPACE_ROOT}"
       ${MANYFORGE_MAINTAINED_PREPARED_ARGUMENTS})
 
@@ -1817,63 +1724,63 @@ if(BUILD_TESTING)
 
   manyforge_add_prepare_activation_test(
     PrepareActivationSingleDocument
-    "examples/lite6_pick_and_place.scenario")
+    "examples/mock_lite6_pick_and_place.scenario")
   manyforge_add_prepare_activation_test(
     PrepareActivationNoProgram
-    "examples/lite6_pick_and_place.scenario"
+    "examples/mock_lite6_pick_and_place.scenario"
     --no-program)
   manyforge_add_prepare_activation_test(
     PrepareActivationMovingTakeoverBudget
-    "examples/lite6_pick_and_place.scenario"
+    "examples/mock_lite6_pick_and_place.scenario"
     --takeover-budget)
   manyforge_add_prepare_activation_test(
     PrepareActivationRuntimeIdentity
-    "examples/lite6_pick_and_place.scenario"
+    "examples/mock_lite6_pick_and_place.scenario"
     --runtime-identity)
   manyforge_add_prepare_activation_test(
     PrepareActivationDualDocument
-    "examples/ur5e_lite6_wall_grouped.scenario")
+    "examples/mock_dual_arm_shared_group.scenario")
   # Merge 6 (item 47): UF850 on Mock, with the xArm gripper mounted as its own
   # tool component.
   manyforge_add_prepare_activation_test(
     PrepareActivationUf850MockSplit
-    "examples/uf850_xarm_gripper_mock.scenario")
+    "examples/mock_uf850_xarm_gripper.scenario")
   manyforge_add_prepare_activation_test(
     PrepareActivationAssignmentRejections
-    "examples/ur5e_lite6_wall_grouped.scenario"
+    "examples/mock_dual_arm_shared_group.scenario"
     --negative-matrix)
   manyforge_add_prepare_activation_test(
     PrepareActivationSourceClosureRejections
-    "examples/ur5e_lite6_wall_grouped.scenario"
+    "examples/mock_dual_arm_shared_group.scenario"
     --source-closure-rejections)
   manyforge_add_prepare_activation_test(
     PrepareActivationIntentRejections
-    "examples/ur5e_lite6_wall_grouped.scenario"
+    "examples/mock_dual_arm_shared_group.scenario"
     --intent-rejections)
   manyforge_add_prepare_activation_test(
     PrepareActivationStopLimitNames
-    "examples/lite6_pick_and_place.scenario"
+    "examples/mock_lite6_pick_and_place.scenario"
     --stop-limit-names)
   manyforge_add_prepare_activation_test(
     PrepareActivationRealMeasured
-    "examples/lite6_real_arm_observation.scenario"
+    "examples/real_lite6_arm_observation.scenario"
     --real-measured)
   manyforge_add_prepare_activation_test(
     PrepareActivationRos2Control
-    "examples/isaac-ur10e-light-scene.scenario"
+    "examples/sim_ur10e_pick_and_place.scenario"
     --ros2-control)
   # Merge 6 slice B: the mounted lane-free pneumatic tool of the split
   # Scenario (slices A and D).
   manyforge_add_prepare_activation_test(
     PrepareActivationToolSplit
-    "examples/lite6_pneumatic_mock.scenario"
+    "examples/mock_lite6_pneumatic_pick_and_place.scenario"
     --tool-split)
   manyforge_add_prepare_activation_test(
     PrepareActivationVisionBinPick
-    "examples/ur5_vision_guided_bin_pick.scenario")
+    "examples/mock_ur5_vision_bin_pick.scenario")
   manyforge_add_prepare_activation_test(
     PrepareActivationVisionPosePick
-    "examples/ur5_vision_guided_pose_pick.scenario")
+    "examples/mock_ur5_vision_pose_pick.scenario")
 
   add_executable(test_model_source
     test/test_model_source.cpp)
@@ -2009,6 +1916,64 @@ if(BUILD_TESTING)
   gtest_discover_tests(test_apply_component_delta
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
+  # Build spec plan (M9 slice 1): every example Scenario's Deployment compiled
+  # into its sealed retained bundle (no Program), for the component spec
+  # tests: parity with the M8 hand-list identity and attachment edits.
+  set(MANYFORGE_EXAMPLE_BUNDLE_ROOT "${CMAKE_CURRENT_BINARY_DIR}/example-bundles")
+  set(MANYFORGE_EXAMPLE_BUNDLE_STAMP "${CMAKE_CURRENT_BINARY_DIR}/example-bundles.stamp")
+  file(GLOB_RECURSE MANYFORGE_EXAMPLE_SCENARIO_INPUTS
+    CONFIGURE_DEPENDS LIST_DIRECTORIES false
+    "${_MANYFORGE_WORKSPACE_ROOT}/examples/*.scenario/*")
+  add_custom_command(
+    OUTPUT "${MANYFORGE_EXAMPLE_BUNDLE_STAMP}"
+    COMMAND "${CMAKE_COMMAND}" -E env
+      "PYTHONPATH=${_MANYFORGE_WORKSPACE_ROOT}/manyforge_behavior:${_MANYFORGE_WORKSPACE_ROOT}"
+      "${Python3_EXECUTABLE}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/test/produce_example_bundles.py"
+      --tool "$<TARGET_FILE:manyforge_prepare_activation>"
+      --workspace "${_MANYFORGE_WORKSPACE_ROOT}"
+      --output "${MANYFORGE_EXAMPLE_BUNDLE_ROOT}"
+    COMMAND "${CMAKE_COMMAND}" -E touch "${MANYFORGE_EXAMPLE_BUNDLE_STAMP}"
+    DEPENDS
+      manyforge_prepare_activation
+      "${CMAKE_CURRENT_SOURCE_DIR}/test/produce_example_bundles.py"
+      "${CMAKE_CURRENT_SOURCE_DIR}/test/prepare_activation_tool.py"
+      ${MANYFORGE_EXAMPLE_SCENARIO_INPUTS}
+      "${MANYFORGE_NODE_ENVIRONMENT_MANIFEST}"
+      "${MANYFORGE_NODE_CATALOG_SOURCE}"
+      ${MANYFORGE_MAINTAINED_MODEL_SOURCE_INPUTS}
+    VERBATIM)
+  add_custom_target(manyforge_example_bundles ALL
+    DEPENDS "${MANYFORGE_EXAMPLE_BUNDLE_STAMP}")
+
+  add_executable(test_component_spec
+    test/test_component_spec.cpp)
+  add_dependencies(test_component_spec manyforge_example_bundles)
+  target_compile_definitions(test_component_spec PRIVATE
+    MANYFORGE_EXAMPLE_BUNDLE_ROOT="${MANYFORGE_EXAMPLE_BUNDLE_ROOT}"
+    MANYFORGE_HOST_CONFIGURATION_SCHEMA="${CMAKE_CURRENT_SOURCE_DIR}/resources/closed_schema/value/manyforge.value_schema.runtime.ros2_control_execution.v1.yaml")
+  target_include_directories(test_component_spec PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(test_component_spec PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_component_spec
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
+  # N17 S2: the compiled launch description and joint lists, their parity
+  # with the M9 host-built ones on every example (the examples' retained
+  # packages are kept under example-bundles/packages), and the static frames.
+  add_executable(test_component_description
+    test/test_component_description.cpp)
+  add_dependencies(test_component_description manyforge_example_bundles)
+  target_compile_definitions(test_component_description PRIVATE
+    MANYFORGE_EXAMPLE_BUNDLE_ROOT="${MANYFORGE_EXAMPLE_BUNDLE_ROOT}")
+  target_include_directories(test_component_description PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_link_libraries(test_component_description PRIVATE
+    manyforge_deployment GTest::gtest_main)
+  gtest_discover_tests(test_component_description
+    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+
   # M7 U1/U2: the cell kinematic index and its equivalence oracle against
   # verbatim copies of the merge-6b helpers it replaces.
   add_executable(test_cell_kinematic_index
@@ -2068,57 +2033,6 @@ if(BUILD_TESTING)
       PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
   endif()
 
-  if(TARGET manyforge_deployment_component_lifecycle_current_snapshot_source)
-    add_executable(test_component_lifecycle_current_snapshot_source
-      test/test_component_lifecycle_current_snapshot_source.cpp)
-    target_compile_definitions(
-      test_component_lifecycle_current_snapshot_source PRIVATE
-      MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT}"
-      MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT}")
-    target_include_directories(
-      test_component_lifecycle_current_snapshot_source PRIVATE
-      "${CMAKE_CURRENT_SOURCE_DIR}/src")
-    target_link_libraries(test_component_lifecycle_current_snapshot_source PRIVATE
-      manyforge_deployment
-      manyforge_deployment_component_lifecycle_current_snapshot_source
-      GTest::gtest_main)
-    if(TARGET manyforge_core_sqlite_cclc_journal)
-      target_link_libraries(test_component_lifecycle_current_snapshot_source PRIVATE
-        manyforge_core_sqlite_cclc_journal)
-      target_compile_definitions(test_component_lifecycle_current_snapshot_source PRIVATE
-        MANYFORGE_SNAPSHOT_TEST_HAS_SQLITE_CCLC=1)
-    endif()
-    gtest_discover_tests(test_component_lifecycle_current_snapshot_source
-      PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
-  endif()
-
-  if(TARGET manyforge_deployment_cclc_runtime_composition)
-    add_executable(test_cclc_open_request_server
-      test/test_cclc_open_request_server.cpp)
-    target_link_libraries(test_cclc_open_request_server PRIVATE
-      manyforge_deployment_cclc_runtime_composition
-      GTest::gtest_main)
-    gtest_discover_tests(test_cclc_open_request_server
-      PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
-
-    add_executable(test_cclc_runtime_composition
-      test/test_cclc_runtime_composition.cpp)
-    target_compile_definitions(
-      test_cclc_runtime_composition PRIVATE
-      MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT}"
-      MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT}")
-    target_include_directories(test_cclc_runtime_composition PRIVATE
-      "${CMAKE_CURRENT_SOURCE_DIR}/src")
-    target_link_libraries(test_cclc_runtime_composition PRIVATE
-      manyforge_deployment
-      manyforge_deployment_cclc_runtime_composition
-      manyforge_deployment_admission
-      manyforge_deployment_canonical_package_generator
-      GTest::gtest_main)
-    gtest_discover_tests(test_cclc_runtime_composition
-      PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
-  endif()
-
   add_executable(test_catalog_artifact_store
     test/test_catalog_artifact_store.cpp)
   target_include_directories(test_catalog_artifact_store PRIVATE
@@ -2129,13 +2043,7 @@ if(BUILD_TESTING)
     PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
 
   add_executable(test_retained_bundle_materializer
-    test/test_retained_bundle_materializer.cpp
-    # The gripper-only fixture derives the same maintained lifecycle semantic
-    # digest as the production native catalog. Compile the shared pure
-    # lifecycle DTO validation and catalog codec rather than the full Core
-    # Kernel.
-    "${MANYFORGE_CORE_SOURCE_DIR}/src/component_lifecycle_plan_catalog_codec.cpp"
-    "${MANYFORGE_CORE_SOURCE_DIR}/src/component_lifecycle_plan_validity.cpp")
+    test/test_retained_bundle_materializer.cpp)
   target_compile_definitions(test_retained_bundle_materializer PRIVATE
     MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT}"
     MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT="${MANYFORGE_LITE6_STRUCTURAL_SOURCE_ROOT}")
@@ -2227,7 +2135,6 @@ if(BUILD_TESTING)
       "${CMAKE_COMMAND}"
       "-DMANYFORGE_GENERATOR=$<TARGET_FILE:manyforge_generate_canonical_empty_package>"
       "-DMANYFORGE_TEST_ROOT=${CMAKE_CURRENT_BINARY_DIR}/canonical_empty_cli_package"
-      "-DMANYFORGE_NATIVE_PROFILE=${CMAKE_CURRENT_SOURCE_DIR}/resources/maintained/catalog/runtime_profile/manyforge.native_execution_runtime.json"
       "-DMANYFORGE_ROS_PROFILE=${CMAKE_CURRENT_SOURCE_DIR}/resources/maintained/catalog/runtime_profile/manyforge.ros2_control_execution_runtime.json"
       -P
       "${CMAKE_CURRENT_SOURCE_DIR}/test/canonical_empty_generator_cli.cmake")

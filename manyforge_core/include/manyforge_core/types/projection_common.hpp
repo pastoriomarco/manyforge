@@ -121,7 +121,7 @@ struct ProjectionLeaseBindingDTO final {
 };
 
 /// One exact native planner/collision projection process incarnation.
-struct ProjectionNativeRuntimeBindingDTO final {
+struct ProjectionExecutionHostBindingDTO final {
   CapabilityProviderBindingId provider_binding_id;
   CapabilityProviderBindingRevision provider_binding_revision;
   RuntimeUnitId runtime_unit_id;
@@ -132,14 +132,14 @@ struct ProjectionNativeRuntimeBindingDTO final {
            !runtime_unit_id.empty() && !runtime_epoch.empty();
   }
 
-  friend bool operator==(const ProjectionNativeRuntimeBindingDTO&,
-                         const ProjectionNativeRuntimeBindingDTO&) = default;
+  friend bool operator==(const ProjectionExecutionHostBindingDTO&,
+                         const ProjectionExecutionHostBindingDTO&) = default;
 };
 
 /// Canonical native-binding order required by specs 210 and 220.
 [[nodiscard]] inline bool CanonicalProjectionNativeBindingLess(
-    const ProjectionNativeRuntimeBindingDTO& lhs,
-    const ProjectionNativeRuntimeBindingDTO& rhs) noexcept {
+    const ProjectionExecutionHostBindingDTO& lhs,
+    const ProjectionExecutionHostBindingDTO& rhs) noexcept {
   if (lhs.provider_binding_id != rhs.provider_binding_id) {
     return lhs.provider_binding_id < rhs.provider_binding_id;
   }
@@ -191,7 +191,7 @@ to_string(ProjectionHealthState state) noexcept {
 }
 
 struct ProjectionHealthDTO final {
-  ProjectionNativeRuntimeBindingDTO native_runtime_binding;
+  ProjectionExecutionHostBindingDTO execution_host_binding;
   std::uint64_t source_sequence;
   ProjectionHealthState state;
   std::optional<ProjectionRevisionDTO> active_projection_revision;
@@ -200,7 +200,7 @@ struct ProjectionHealthDTO final {
   std::optional<ErrorDTO> error;
 
   [[nodiscard]] bool valid() const noexcept {
-    return native_runtime_binding.valid() &&
+    return execution_host_binding.valid() &&
            IsKnownProjectionHealthState(state) &&
            (!active_projection_revision.has_value() ||
             active_projection_revision->valid()) &&
@@ -285,8 +285,8 @@ struct ProjectionAggregateHealthDTO final {
       }
       if (index != 0U &&
           !CanonicalProjectionNativeBindingLess(
-              native_projection_health[index - 1U].native_runtime_binding,
-              health.native_runtime_binding)) {
+              native_projection_health[index - 1U].execution_host_binding,
+              health.execution_host_binding)) {
         return false;
       }
     }
@@ -352,8 +352,8 @@ struct ProjectionAggregateHealthDTO final {
   }
   for (std::size_t index = 0U;
        index < lhs.native_projection_health.size(); ++index) {
-    if (lhs.native_projection_health[index].native_runtime_binding !=
-        rhs.native_projection_health[index].native_runtime_binding) {
+    if (lhs.native_projection_health[index].execution_host_binding !=
+        rhs.native_projection_health[index].execution_host_binding) {
       return false;
     }
   }

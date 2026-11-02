@@ -1,19 +1,22 @@
 import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
-import { lifecycleTimeoutProblem } from '../utils/ioSignalConfiguration';
+import { effectiveField } from '../hooks/useEffectiveValues';
+import type { EffectiveValues } from '../types/components';
+import { LIFECYCLE_TIMEOUT_HELP, lifecycleTimeoutProblem } from '../utils/ioSignalConfiguration';
 import { jsonObject } from '../utils/poseSourceAuthoring';
 import { DraftTextInput } from './common/DraftInputs';
 
 /**
  * A component's lifecycle time budget, `configuration.lifecycle_command_timeout_s`
- * of its Scenario row: the maximum time one of its lifecycle steps may take,
- * and its share of the wait of an Apply that installs or replaces it.
- * Individual controller calls keep their own short response limits. Blank
- * keeps the default (10 s, every component). Like any
- * other setting it goes into the Draft and takes effect at the confirmed
- * Apply. An I/O device edits its own in its I/O device section.
+ * of its Scenario row: the time Prepare, Enable and Disable may each take.
+ * Shown with its effective value and default from `GET /api/deployment/effective`
+ * (CONTRACTS §11): writing it adds it to the Draft, blank or Reset to default
+ * removes it. The GUI keeps no copy of the default. Like any other setting it
+ * takes effect at the confirmed Apply. An I/O device edits its own in its I/O
+ * device section.
  */
-export function LifecycleBudgetField({ controller, componentIndex, componentId, disabled }: {
+export function LifecycleBudgetField({ controller, effective, componentIndex, componentId, disabled }: {
   controller: DeploymentWorkspaceController;
+  effective: EffectiveValues | null;
   componentIndex: number;
   componentId: string;
   disabled: boolean;
@@ -21,23 +24,40 @@ export function LifecycleBudgetField({ controller, componentIndex, componentId, 
   const document = controller.workspace?.draft.document ?? null;
   const rows = Array.isArray(document?.components) ? document.components : [];
   const stored = jsonObject(jsonObject(rows[componentIndex])?.configuration)?.lifecycle_command_timeout_s;
-  const current = typeof stored === 'number' && Number.isFinite(stored) ? stored : null;
+  const storedValue = typeof stored === 'number' && Number.isFinite(stored) ? stored : null;
+  const set = storedValue !== null;
   const path = ['components', componentIndex, 'configuration', 'lifecycle_command_timeout_s'];
+  const row = effectiveField(effective, path);
+  const shown = row !== null && typeof row.value === 'number' ? row.value : storedValue;
+  const label = `${componentId} lifecycle command time limit`;
   return (
-    <label className="deployment-focused-field"
-      title="Maximum time a lifecycle step may take; individual controller calls must still answer within a few seconds. Blank: the default, 10 s.">
-      <span>Lifecycle command time limit</span>
-      <span className="deployment-number-with-unit">
-        <DraftTextInput aria-label={`${componentId} lifecycle command time limit`} inputMode="decimal"
-          value={current} placeholder="default" disabled={disabled}
-          validate={(text) => (text.trim() === '' ? null : lifecycleTimeoutProblem(text))}
-          onCommit={(text) => {
-            // A refusal shows once, in the yellow Deployment notice row.
-            if (text.trim() !== '') void controller.mutate(path, 'set', Number(text.trim()));
-            else if (current !== null) void controller.mutate(path, 'remove');
-          }} />
-        <small>s</small>
-      </span>
-    </label>
+    <div className="deployment-effective-field">
+      <label className="deployment-focused-field" title={LIFECYCLE_TIMEOUT_HELP}>
+        <span>Lifecycle command time limit</span>
+        <span className="deployment-number-with-unit">
+          <DraftTextInput aria-label={label} inputMode="decimal"
+            value={shown} placeholder="default" disabled={disabled}
+            validate={(text) => (text.trim() === '' ? null : lifecycleTimeoutProblem(text))}
+            onCommit={(text) => {
+              // A refusal shows once, in the yellow Deployment notice row.
+              const trimmed = text.trim();
+              if (trimmed === '') {
+                if (set) void controller.mutate(path, 'remove');
+                return;
+              }
+              const value = Number(trimmed);
+              if (value !== shown) void controller.mutate(path, 'set', value);
+            }} />
+          <small>s</small>
+        </span>
+      </label>
+      {row !== null && <small>{row.set ? `Set · default ${String(row.default)} s` : 'Default'}</small>}
+      {set && (
+        <button type="button" className="quiet-button" disabled={disabled}
+          aria-label={`Reset ${label} to default`}
+          title={row === null ? undefined : `Default: ${String(row.default)} s`}
+          onClick={() => { void controller.mutate(path, 'remove'); }}>Reset to default</button>
+      )}
+    </div>
   );
 }

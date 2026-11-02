@@ -26,4 +26,7 @@ export PYTHONPYCACHEPREFIX="${PYTHONPYCACHEPREFIX:-/tmp/manyforge-pycache}"
 export PYTHONPATH="${WORKSPACE}/manyforge_ros:${WORKSPACE}/manyforge_behavior:${WORKSPACE}/manyforge_medkit_adapter:${WORKSPACE}:${PYTHONPATH:-}"
 
 cd "$WORKSPACE"
-pytest manyforge_ros/tests/ manyforge_medkit_adapter/tests/ -v
+# The run gets its own ROS domain (Fast DDS #6599, N16).
+ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST \
+    "/opt/ros/${ROS_DISTRO}/lib/rmw_test_fixture_implementation/run_rmw_isolated" \
+    pytest manyforge_ros/tests/ manyforge_medkit_adapter/tests/ -v

@@ -8,8 +8,9 @@
 #include <manyforge_deployment/closed_schema.hpp>
 #include <manyforge_deployment/io_signal_catalog.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
-#include <manyforge_core/component_lifecycle_budget.hpp>
 #include <map>
+#include <set>
+#include <tuple>
 
 namespace {
 using namespace manyforge::core;
@@ -65,58 +66,55 @@ Object &provider(Object &row) {
   return std::get<Object>(row.at("provider").value);
 }
 
-CellGraphDTO with_xarm_robot(CellGraphDTO graph) {
-  graph.controllable_components.push_back(
-      {ControllableComponentId("robot.arm"), ComponentTypeId("robot"),
-       ComponentTypeRevision("revision.robot"), {}, {RuntimeUnitId("host.io")}, {}});
-  graph.runtime_units.front().configuration["controller_profiles"] = JsonValueDTO{
-      Array{JsonValueDTO{Object{
-          {"controllable_component_id", JsonValueDTO{std::string("robot.arm")}},
-          {"real_profile", JsonValueDTO{std::string("lite6_real")}},
-          {"adapter_family", JsonValueDTO{std::string("xarm")}}}}}};
-  return graph;
-}
+// An adapter profile: any profile token but the generic ones. Its provider
+// object is opaque here; the adapter serving it validates it.
+constexpr const char *kAdapterProfile = "vendor_digital";
 
-Object xarm_input(std::string name, std::string source, double pin) {
+Object adapter_input(std::string name, std::string source, double pin) {
   auto row = input_row(std::move(name), std::move(source));
   row["update_mode"] = JsonValueDTO{std::string("sampled")};
   row["freshness"] = JsonValueDTO{Object{
       {"mode", JsonValueDTO{std::string("sample_age")}},
       {"maximum_age_ns", JsonValueDTO{250'000'000.0}}}};
-  provider(row) = {{"profile", JsonValueDTO{std::string("xarm_digital")}},
-                   {"robot_component_id", JsonValueDTO{std::string("robot.arm")}},
+  provider(row) = {{"profile", JsonValueDTO{std::string(kAdapterProfile)}},
                    {"bank", JsonValueDTO{std::string("tool")}},
                    {"pin", JsonValueDTO{pin}}, {"ingress_depth", JsonValueDTO{4.0}}};
   return row;
 }
 
-TEST(IoSignalCatalogTest, XArmBankRequiresOneSourceAndDriverExposedPins) {
-  const auto first = xarm_input("first", "source.bank", 0.0);
-  auto second = xarm_input("second", "source.bank", 1.0);
-  auto graph = with_xarm_robot(io_graph({JsonValueDTO{first}, JsonValueDTO{second}}));
-  auto result = ResolveRetainedIoSignalCatalog(graph);
-  ASSERT_TRUE(result.ok());
+TEST(IoSignalCatalogTest, AdapterInputKeepsItsProviderOpaqueUnderGenericRules) {
+  const auto first = adapter_input("first", "source.bank", 0.0);
+  const auto second = adapter_input("second", "source.bank", 7.0);
+  auto result = ResolveRetainedIoSignalCatalog(
+      io_graph({JsonValueDTO{first}, JsonValueDTO{second}}));
+  ASSERT_TRUE(result.ok()) << result.error().message;
   ASSERT_EQ(result.value().size(), 2U);
-  EXPECT_EQ(result.value().front().provider.bank, "tool");
-  second["source_id"] = JsonValueDTO{std::string("source.other")};
-  graph = with_xarm_robot(io_graph({JsonValueDTO{first}, JsonValueDTO{second}}));
-  result = ResolveRetainedIoSignalCatalog(graph);
+  const auto &signal = result.value().front();
+  EXPECT_EQ(signal.provider.profile, kAdapterProfile);
+  EXPECT_EQ(signal.provider.ingress_depth, 4U);
+  EXPECT_EQ(signal.provider.adapter_fields,
+            (Object{{"bank", JsonValueDTO{std::string("tool")}},
+                    {"pin", JsonValueDTO{0.0}}}));
+  EXPECT_EQ(signal.descriptor.liveness, IoSignalLivenessMode::kPeriodic);
+  // The generic rules still hold: an ingress queue, sampled updates and one
+  // depth per source.
+  auto no_depth = first;
+  provider(no_depth).erase("ingress_depth");
+  EXPECT_FALSE(ResolveRetainedIoSignalCatalog(io_graph({JsonValueDTO{no_depth}})).ok());
+  auto change_only = first;
+  change_only["update_mode"] = JsonValueDTO{std::string("change_only")};
+  result = ResolveRetainedIoSignalCatalog(io_graph({JsonValueDTO{change_only}}));
   ASSERT_FALSE(result.ok());
-  EXPECT_EQ(result.error().details.at("reason"), "io_xarm_bank_multiple_sources");
-  second = xarm_input("second", "source.bank", 2.0);
+  EXPECT_EQ(result.error().details.at("reason"), "io_signal_transition_unsupported");
+  auto other_depth = second;
+  provider(other_depth)["ingress_depth"] = JsonValueDTO{8.0};
   EXPECT_FALSE(ResolveRetainedIoSignalCatalog(
-      with_xarm_robot(io_graph({JsonValueDTO{second}}))).ok());
-  EXPECT_FALSE(ResolveRetainedIoSignalCatalog(io_graph({JsonValueDTO{first}})).ok());
-  // V-B4: the xArm bank needs a robot of the `xarm` adapter family; the
-  // real profile alone does not imply it.
-  EXPECT_TRUE(ResolveRetainedIoSignalCatalog(
-      with_xarm_robot(io_graph({JsonValueDTO{first}}))).ok());
-  auto other_family = with_xarm_robot(io_graph({JsonValueDTO{first}}));
-  auto &rows = std::get<Array>(
-      other_family.runtime_units.front().configuration["controller_profiles"].value);
-  std::get<Object>(rows.front().value)["adapter_family"] =
-      JsonValueDTO{std::string("other_family")};
-  EXPECT_FALSE(ResolveRetainedIoSignalCatalog(other_family).ok());
+                   io_graph({JsonValueDTO{first}, JsonValueDTO{other_depth}}))
+                   .ok());
+  // A generic profile keeps its own closed provider shape.
+  auto generic = first;
+  provider(generic)["profile"] = JsonValueDTO{std::string("ros_bool")};
+  EXPECT_FALSE(ResolveRetainedIoSignalCatalog(io_graph({JsonValueDTO{generic}})).ok());
 }
 
 ControlBindingDTO capability_binding(std::string component, std::string target,
@@ -209,80 +207,73 @@ TEST(IoSignalCatalogTest, CompiledCatalogDeclaresOneLostSignalPerGripperTarget) 
             "io_system_signal_conflict");
 }
 
-// Per-component time budget: a composition counts each component's authored
-// budget, else the one default component budget (10 s) that every plan uses,
-// for every kind and lane. CCLC reads only authored budgets.
-TEST(IoSignalCatalogTest, CompositionBudgetsDefaultToTheOneComponentBudget) {
-  namespace contract = manyforge::deployment::ros2_control_execution_runtime_contract;
-  auto graph = io_graph();
-  const auto component = [](std::string id) {
-    return ControllableComponentDTO{ControllableComponentId(std::move(id)),
-                                    ComponentTypeId("robot"),
-                                    ComponentTypeRevision("revision.robot"),
-                                    {}, {RuntimeUnitId("host.io")}, {}};
-  };
-  for (const auto *id : {"robot.real", "robot.mock", "tool.free"})
-    graph.controllable_components.push_back(component(id));
-  graph.control_bindings = {
-      capability_binding("robot.real", "arm", "execution.trajectory.execute"),
-      capability_binding("robot.mock", "arm", "execution.trajectory.execute")};
-  const std::map<std::string, std::int64_t, std::less<>> defaults{
-      {"device.io", 10'000'000'000LL}, {"robot.mock", 10'000'000'000LL},
-      {"robot.real", 10'000'000'000LL}, {"tool.free", 10'000'000'000LL}};
-  EXPECT_EQ(kDefaultLifecycleBudgetNs, 10'000'000'000LL);
-  EXPECT_TRUE(contract::component_lifecycle_budgets_ns(graph).empty());
-  EXPECT_EQ(contract::component_composition_budgets_ns(graph), defaults);
-
-  graph.runtime_units.front().configuration["lifecycle_command_timeouts"] =
-      JsonValueDTO{Array{JsonValueDTO{Object{
-          {"controllable_component_id", JsonValueDTO{std::string("robot.mock")}},
-          {"lifecycle_command_timeout_s", JsonValueDTO{120.0}}}}}};
-  auto authored = defaults;
-  authored["robot.mock"] = 120'000'000'000LL;
-  EXPECT_EQ(contract::component_lifecycle_budgets_ns(graph),
-            (std::map<std::string, std::int64_t, std::less<>>{
-                {"robot.mock", 120'000'000'000LL}}));
-  EXPECT_EQ(contract::component_composition_budgets_ns(graph), authored);
-}
-
-TEST(IoSignalCatalogTest, MockEchoRequiresDeclaredSameDeviceMockOutput) {
-  auto sensor = input_row();
-  provider(sensor)["echo"] = JsonValueDTO{Object{
-      {"output_signal_name", JsonValueDTO{std::string("valve")}},
-      {"delay_ms", JsonValueDTO{50.0}}}};
-  auto valve = sensor;
+// CONTRACTS §7: `controller_owned` is authored per output (default false);
+// Mock outputs report the written value back (D2), so they have read-back.
+TEST(IoSignalCatalogTest, OutputControllerOwnedIsAuthoredAndMockOutputsReadBack) {
+  auto valve = input_row("valve", "source.valve");
   valve["direction"] = JsonValueDTO{std::string("output")};
-  valve["signal_name"] = JsonValueDTO{std::string("valve")};
-  valve["resource_role_id"] = JsonValueDTO{std::string("valve")};
-  valve["source_id"] = JsonValueDTO{std::string("source.valve")};
   valve.erase("update_mode");
   valve.erase("transition_capability");
   valve.erase("freshness");
   provider(valve) = {{"profile", JsonValueDTO{std::string("mock_output")}},
                      {"channel", JsonValueDTO{std::string("valve")}}};
-  auto result = ResolveRetainedIoSignalCatalog(
-      io_graph({JsonValueDTO{sensor}, JsonValueDTO{valve}}));
-  ASSERT_TRUE(result.ok());
-  EXPECT_EQ(result.value().front().provider.echo_delay_ns, 50'000'000);
-  result = ResolveRetainedIoSignalCatalog(io_graph({JsonValueDTO{sensor}}));
-  ASSERT_FALSE(result.ok());
-  EXPECT_EQ(result.error().details.at("reason"), "io_mock_echo_output_not_found");
+  auto owned = valve;
+  owned["signal_name"] = JsonValueDTO{std::string("owned")};
+  owned["resource_role_id"] = JsonValueDTO{std::string("owned")};
+  owned["source_id"] = JsonValueDTO{std::string("source.owned")};
+  owned["controller_owned"] = JsonValueDTO{true};
+  provider(owned)["channel"] = JsonValueDTO{std::string("owned")};
+  const auto result = ResolveRetainedIoSignalCatalog(
+      io_graph({JsonValueDTO{valve}, JsonValueDTO{owned}}));
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  ASSERT_EQ(result.value().size(), 2U);
+  for (const auto &row : result.value()) {
+    EXPECT_TRUE(row.descriptor.readback);
+    EXPECT_EQ(HoldsChangedOutside(row.descriptor),
+              row.descriptor.signal_id.name != "owned");
+    EXPECT_EQ(row.descriptor.controller_owned,
+              row.descriptor.signal_id.name == "owned");
+  }
+  const auto *found = manyforge::deployment::FindChangedOutsideOutput(
+      result.value(), ControllableComponentId("device.io"),
+      "valve.changed_outside");
+  ASSERT_NE(found, nullptr);
+  EXPECT_EQ(found->descriptor.signal_id.name, "valve");
+  EXPECT_EQ(manyforge::deployment::FindChangedOutsideOutput(
+                result.value(), ControllableComponentId("device.io"), "valve"),
+            nullptr);
+
+  owned["controller_owned"] = JsonValueDTO{std::string("yes")};
+  const auto invalid = ResolveRetainedIoSignalCatalog(
+      io_graph({JsonValueDTO{valve}, JsonValueDTO{owned}}));
+  ASSERT_FALSE(invalid.ok());
+  EXPECT_EQ(invalid.error().details.at("reason"), "io_signal_configuration_invalid");
+  auto input = input_row();
+  input["controller_owned"] = JsonValueDTO{false};
+  EXPECT_FALSE(ResolveRetainedIoSignalCatalog(io_graph({JsonValueDTO{input}})).ok());
 }
 
-TEST(IoSignalCatalogTest, XArmOutputAliasesShareResourceAndUseAckBudget) {
+// The `.changed_outside` suffix names the core-held signal of an output.
+TEST(IoSignalCatalogTest, AuthoredSignalNamesCannotTakeTheChangedOutsideSuffix) {
+  const auto result = ResolveRetainedIoSignalCatalog(
+      io_graph({JsonValueDTO{input_row("valve.changed_outside")}}));
+  ASSERT_FALSE(result.ok());
+  EXPECT_EQ(result.error().details.at("reason"), "io_system_signal_conflict");
+}
+
+TEST(IoSignalCatalogTest, AdapterOutputAliasesShareResourceAndUseAckBudget) {
   auto output = input_row("valve", "source.valve");
   output["direction"] = JsonValueDTO{std::string("output")};
   output.erase("update_mode");
   output.erase("transition_capability");
   output.erase("freshness");
-  provider(output) = {{"profile", JsonValueDTO{std::string("xarm_digital")}},
-                      {"robot_component_id", JsonValueDTO{std::string("robot.arm")}},
+  provider(output) = {{"profile", JsonValueDTO{std::string(kAdapterProfile)}},
                       {"bank", JsonValueDTO{std::string("tool")}},
                       {"pin", JsonValueDTO{4.0}}};
   auto alias = output;
   alias["signal_name"] = JsonValueDTO{std::string("valve_alias")};
   alias["resource_role_id"] = JsonValueDTO{std::string("valve_alias")};
-  auto graph = with_xarm_robot(io_graph({JsonValueDTO{output}, JsonValueDTO{alias}}));
+  auto graph = io_graph({JsonValueDTO{output}, JsonValueDTO{alias}});
   ASSERT_TRUE(manyforge::deployment::MaterializeRetainedIoProviderDevices(graph).ok());
   const auto signals = ResolveRetainedIoSignalCatalog(graph);
   ASSERT_TRUE(signals.ok());
@@ -293,9 +284,14 @@ TEST(IoSignalCatalogTest, XArmOutputAliasesShareResourceAndUseAckBudget) {
   ASSERT_TRUE(devices.ok());
   ASSERT_EQ(devices.value().size(), 1U);
   EXPECT_EQ(devices.value().front().output_source_ack_timeout_ns, 500'000'000);
-  provider(output)["pin"] = JsonValueDTO{5.0};
-  EXPECT_FALSE(ResolveRetainedIoSignalCatalog(
-      with_xarm_robot(io_graph({JsonValueDTO{output}}))).ok());
+  // Another address is another channel; an output has no ingress queue.
+  provider(alias)["pin"] = JsonValueDTO{5.0};
+  const auto other = ResolveRetainedIoSignalCatalog(io_graph({JsonValueDTO{alias}}));
+  ASSERT_TRUE(other.ok());
+  EXPECT_NE(other.value().front().descriptor.output_resource,
+            signals.value()[0].descriptor.output_resource);
+  provider(output)["ingress_depth"] = JsonValueDTO{4.0};
+  EXPECT_FALSE(ResolveRetainedIoSignalCatalog(io_graph({JsonValueDTO{output}})).ok());
 }
 
 TEST(IoSignalCatalogTest,
@@ -718,8 +714,7 @@ TEST(IoSignalCatalogTest,
       SchemaRevision(std::string(
           detail::kRos2ControlExecutionRuntimeConfigurationSchemaRevision)));
   ASSERT_NE(schema, nullptr);
-  for (const auto *profile :
-       {"ros_bool", "ur_io_states", "ros2_control_gpio"}) {
+  for (const auto *profile : {"ros_bool", "ros2_control_gpio"}) {
     auto configuration =
         ros2_control_execution_runtime_contract::empty_host_configuration()
             .as_object();
@@ -741,8 +736,6 @@ TEST(IoSignalCatalogTest,
         address.emplace_back("liveness",
                              CanonicalValue(CanonicalValue::Object{
                                  {"mode", CanonicalValue("periodic")}}));
-      if (std::string_view(profile) == "ur_io_states")
-        address.emplace_back("pin", CanonicalValue(0.0));
       if (std::string_view(profile) == "ros2_control_gpio") {
         address.emplace_back("group", CanonicalValue("gpio"));
         address.emplace_back("interface_name", CanonicalValue("in"));
@@ -860,28 +853,12 @@ TEST(IoSignalCatalogTest,
       manyforge::deployment::ResolveRetainedIoProviderDevices(graph).ok());
 }
 
-TEST(IoSignalCatalogTest,
-     DeviceDefaultsLeaveOrdinaryConfigurationsInertAndRefuseDeferredXarm) {
+TEST(IoSignalCatalogTest, DeviceDefaultsLeaveOrdinaryConfigurationsInert) {
   using manyforge::deployment::MaterializeRetainedIoProviderDevices;
   auto ordinary = io_graph({});
   const auto original = ordinary.runtime_units.front().configuration;
   ASSERT_TRUE(MaterializeRetainedIoProviderDevices(ordinary).ok());
   EXPECT_EQ(ordinary.runtime_units.front().configuration, original);
-  auto row = input_row();
-  row["update_mode"] = JsonValueDTO{std::string("sampled")};
-  row["freshness"] =
-      JsonValueDTO{Object{{"mode", JsonValueDTO{std::string("sample_age")}},
-                          {"maximum_age_ns", JsonValueDTO{20.0}}}};
-  provider(row) = {
-      {"profile", JsonValueDTO{std::string("xarm_controller_input")}},
-      {"topic", JsonValueDTO{std::string("/arm/gpio")}},
-      {"input_bit", JsonValueDTO{0.0}},
-      {"ingress_depth", JsonValueDTO{4.0}}};
-  auto arm = io_graph({JsonValueDTO{row}});
-  const auto arm_original = arm.runtime_units.front().configuration;
-  EXPECT_FALSE(MaterializeRetainedIoProviderDevices(arm).ok());
-  EXPECT_EQ(arm.runtime_units.front().configuration, arm_original);
-  EXPECT_FALSE(ResolveRetainedIoSignalCatalog(arm).ok());
 }
 
 TEST(IoSignalCatalogTest,
@@ -1002,7 +979,7 @@ Object cyclic_input(std::string profile) {
   if (profile == "ros_bool")
     provider(row)["liveness"] =
         JsonValueDTO{Object{{"mode", JsonValueDTO{std::string("periodic")}}}};
-  else if (profile == "ur_io_states")
+  else if (profile == kAdapterProfile)
     provider(row)["pin"] = JsonValueDTO{17.0};
   else {
     provider(row)["group"] = JsonValueDTO{std::string("module/1")};
@@ -1131,7 +1108,7 @@ TEST(IoSignalCatalogTest,
 
 Object typed_output(std::string profile, std::string name = "lamp") {
   auto row = output_row(std::move(name));
-  if (profile == "ur_set_io")
+  if (profile == kAdapterProfile)
     provider(row) = {{"profile", JsonValueDTO{profile}},
                      {"service", JsonValueDTO{std::string("/device/set_io")}},
                      {"pin", JsonValueDTO{17.0}}};
@@ -1151,15 +1128,15 @@ TEST(IoSignalCatalogTest,
   EXPECT_EQ(mock.value().front().descriptor.liveness,
             IoSignalLivenessMode::kInProcess);
   for (const auto *profile :
-       {"ros_bool", "ur_io_states", "ros2_control_gpio"}) {
+       {"ros_bool", kAdapterProfile, "ros2_control_gpio"}) {
     const auto result = ResolveRetainedIoSignalCatalog(
         io_graph({JsonValueDTO{cyclic_input(profile)}}));
     ASSERT_TRUE(result.ok()) << profile;
     const auto &signal = result.value().front();
     EXPECT_EQ(signal.descriptor.liveness, IoSignalLivenessMode::kPeriodic);
     EXPECT_EQ(signal.descriptor.freshness.maximum_age_ns, 20);
-    if (std::string_view(profile) == "ur_io_states") {
-      EXPECT_EQ(signal.provider.pin, 17U);
+    if (std::string_view(profile) == kAdapterProfile) {
+      EXPECT_EQ(signal.provider.adapter_fields.at("pin"), JsonValueDTO{17.0});
     }
     if (std::string_view(profile) == "ros2_control_gpio") {
       EXPECT_EQ(signal.provider.group, "module/1");
@@ -1190,13 +1167,13 @@ TEST(IoSignalCatalogTest,
 
 TEST(IoSignalCatalogTest,
      ExistingSourcesAllowSelectorAliasesButKeepProviderAndDepthCoherent) {
-  for (const auto *profile : {"ur_io_states", "ros2_control_gpio"}) {
+  for (const auto *profile : {kAdapterProfile, "ros2_control_gpio"}) {
     auto first = cyclic_input(profile);
     auto second = cyclic_input(profile);
     second["resource_role_id"] = JsonValueDTO{std::string("other")};
     second["signal_name"] = JsonValueDTO{std::string("other")};
     second["source_id"] = JsonValueDTO{std::string("source.io")};
-    if (std::string_view(profile) == "ur_io_states") {
+    if (std::string_view(profile) == kAdapterProfile) {
       provider(second)["pin"] = JsonValueDTO{16.0};
     } else {
       provider(second)["group"] = JsonValueDTO{std::string("module/2")};
@@ -1234,21 +1211,6 @@ TEST(IoSignalCatalogTest,
       JsonValueDTO{Object{{"mode", JsonValueDTO{std::string("change_only")}}}};
   EXPECT_FALSE(
       ResolveRetainedIoSignalCatalog(io_graph({JsonValueDTO{row}})).ok());
-  row = cyclic_input("ur_io_states");
-  for (const double pin : {-1.0, 18.0, 0.5}) {
-    provider(row)["pin"] = JsonValueDTO{pin};
-    EXPECT_FALSE(
-        ResolveRetainedIoSignalCatalog(io_graph({JsonValueDTO{row}})).ok());
-  }
-  row = cyclic_input("ur_io_states");
-  provider(row)["topic"] = JsonValueDTO{std::string("relative/topic")};
-  EXPECT_FALSE(
-      ResolveRetainedIoSignalCatalog(io_graph({JsonValueDTO{row}})).ok());
-  row = cyclic_input("ur_io_states");
-  provider(row)["liveness"] =
-      JsonValueDTO{Object{{"mode", JsonValueDTO{std::string("periodic")}}}};
-  EXPECT_FALSE(
-      ResolveRetainedIoSignalCatalog(io_graph({JsonValueDTO{row}})).ok());
   row = cyclic_input("ros2_control_gpio");
   provider(row)["interface_name"] = JsonValueDTO{std::string("")};
   EXPECT_FALSE(
@@ -1262,7 +1224,7 @@ TEST(IoSignalCatalogTest,
 
 TEST(IoSignalCatalogTest,
      TypedOutputCanonicalResourcesBindEveryActualChannelSelector) {
-  for (const auto *profile : {"ur_set_io", "ros2_control_gpio"}) {
+  for (const auto *profile : {kAdapterProfile, "ros2_control_gpio"}) {
     auto row = typed_output(profile);
     auto alias = typed_output(profile, "alias");
     const auto result = ResolveRetainedIoSignalCatalog(
@@ -1272,7 +1234,7 @@ TEST(IoSignalCatalogTest,
     EXPECT_EQ(result.value()[0].descriptor.output_resource,
               result.value()[1].descriptor.output_resource);
     EXPECT_FALSE(result.value().front().descriptor.liveness);
-    if (std::string_view(profile) == "ur_set_io")
+    if (std::string_view(profile) == kAdapterProfile)
       provider(alias)["pin"] = JsonValueDTO{16.0};
     else
       provider(alias)["interface_name"] = JsonValueDTO{std::string("other")};
@@ -1291,9 +1253,9 @@ TEST(IoSignalCatalogTest,
 }
 
 TEST(IoSignalCatalogTest,
-     UrSourceAcknowledgementUsesDevicePolicyAndGpioHasNoAckBudget) {
+     AdapterSourceAcknowledgementUsesDevicePolicyAndGpioHasNoAckBudget) {
   using namespace manyforge::deployment;
-  auto graph = io_graph({JsonValueDTO{typed_output("ur_set_io")}});
+  auto graph = io_graph({JsonValueDTO{typed_output(kAdapterProfile)}});
   ASSERT_TRUE(MaterializeRetainedIoProviderDevices(graph).ok());
   auto devices = ResolveRetainedIoProviderDevices(graph);
   ASSERT_TRUE(devices.ok());
@@ -1343,7 +1305,7 @@ TEST(IoSignalCatalogTest,
      "resource_role_id":"ready","signal_name":"ready","source_id":"source.input",
      "value_type":"bool","direction":"input","update_mode":"sampled",
      "transition_capability":"sampled_only","freshness":{"mode":"sample_age","maximum_age_ns":20},
-     "provider":{"profile":"ur_io_states","topic":"/device/io","pin":17}},
+     "provider":{"profile":"component_adapter","bank":"tool"}},
     {"controllable_component_id":"device.io","command_target_id":"gpio",
      "resource_role_id":"lamp","signal_name":"lamp","source_id":"source.output",
      "value_type":"bool","direction":"output",
@@ -1381,10 +1343,11 @@ TEST(IoSignalCatalogTest,
   for (const auto &row : rows) {
     const auto &address = *row.find_object_member("provider");
     EXPECT_EQ(address.find_object_member("min_rate_hz"), nullptr);
-    if (address.find_object_member("profile")->as_string() == "ur_io_states") {
+    if (address.find_object_member("profile")->as_string() ==
+        "component_adapter") {
       input_seen = true;
-      EXPECT_EQ(address.find_object_member("pin")->as_number(), 17.0);
-      EXPECT_EQ(address.find_object_member("ingress_depth")->as_number(), 64.0);
+      EXPECT_EQ(address.find_object_member("bank")->as_string(), "tool");
+      EXPECT_EQ(address.find_object_member("ingress_depth")->as_number(), 16.0);
       EXPECT_EQ(address.find_object_member("liveness"), nullptr);
     }
   }
@@ -1443,6 +1406,85 @@ TEST(IoSignalCatalogTest, PoseStreamIdsAreObjectLinksOrOverlays) {
   EXPECT_EQ(PoseSourceStreamId("cheese_box", "scene"), "poses/cheese_box");
   EXPECT_EQ(PoseSourceStreamId("robot", "viewer.measured_tcp"),
             "poses/robot/viewer.measured_tcp");
+}
+
+// CONTRACTS §16: a machine's I/O bank on the real lane (the rows the
+// compiler writes for an I/O member): periodic inputs with a sample-age
+// budget, outputs with read-back, one channel per output, no
+// source-acknowledgement budget.
+TEST(IoSignalCatalogTest, MachineIoBankRowsReadBackWithOneChannelPerOutput) {
+  using namespace manyforge::deployment;
+  auto input = input_row("CI0", "robot_controller_io.CI0");
+  input["controllable_component_id"] = JsonValueDTO{std::string("device.io")};
+  input["update_mode"] = JsonValueDTO{std::string("sampled")};
+  input["freshness"] = JsonValueDTO{Object{
+      {"mode", JsonValueDTO{std::string("sample_age")}},
+      {"maximum_age_ns", JsonValueDTO{100'000'000.0}}}};
+  provider(input) = {{"profile", JsonValueDTO{std::string("component_adapter")}},
+                     {"bank", JsonValueDTO{std::string("controller")}},
+                     {"ingress_depth", JsonValueDTO{16.0}}};
+  // The stream is periodic: an input without a sample-age budget is refused.
+  {
+    auto unbudgeted = input;
+    unbudgeted["freshness"] = JsonValueDTO{
+        Object{{"mode", JsonValueDTO{std::string("provider_validity")}}}};
+    const auto refused =
+        ResolveRetainedIoSignalCatalog(io_graph({JsonValueDTO{unbudgeted}}));
+    ASSERT_FALSE(refused.ok());
+    EXPECT_EQ(refused.error().details.at("reason"),
+              "io_signal_liveness_freshness_mismatch");
+  }
+  const auto output = [&](std::string name) {
+    auto row = output_row(name);
+    row["source_id"] = JsonValueDTO{"robot_controller_io." + name};
+    provider(row) = {{"profile", JsonValueDTO{std::string("component_adapter")}},
+                     {"bank", JsonValueDTO{std::string("controller")}}};
+    return row;
+  };
+  auto graph = io_graph({JsonValueDTO{input}, JsonValueDTO{output("CO0")},
+                         JsonValueDTO{output("CO1")}});
+  ASSERT_TRUE(MaterializeRetainedIoProviderDevices(graph).ok());
+  const auto signals = ResolveRetainedIoSignalCatalog(graph);
+  ASSERT_TRUE(signals.ok()) << signals.error().message;
+  ASSERT_EQ(signals.value().size(), 3U);
+  std::set<std::string> resources;
+  for (const auto &row : signals.value()) {
+    EXPECT_EQ(row.provider.adapter_fields.at("bank"),
+              JsonValueDTO{std::string("controller")});
+    if (row.descriptor.direction == IoSignalDirection::kInput) {
+      EXPECT_EQ(row.descriptor.liveness, IoSignalLivenessMode::kPeriodic);
+      EXPECT_EQ(row.descriptor.freshness.maximum_age_ns,
+                std::optional<Duration>(100'000'000));
+      EXPECT_FALSE(row.descriptor.readback);
+    } else {
+      EXPECT_TRUE(row.descriptor.readback);
+      EXPECT_TRUE(HoldsChangedOutside(row.descriptor));
+      ASSERT_TRUE(row.descriptor.output_resource.has_value());
+      resources.insert(row.descriptor.output_resource->value());
+    }
+  }
+  EXPECT_EQ(resources.size(), 2U);
+  const auto devices = ResolveRetainedIoProviderDevices(graph);
+  ASSERT_TRUE(devices.ok());
+  ASSERT_EQ(devices.value().size(), 1U);
+  EXPECT_FALSE(devices.value().front().output_source_ack_timeout_ns);
+}
+
+// CONTRACTS §16: an I/O member's device row names its owner and role.
+TEST(IoSignalCatalogTest, MemberDeviceRowsCarryOwnerAndRole) {
+  using namespace manyforge::deployment;
+  auto graph = io_graph();
+  graph.runtime_units.front().configuration["io_provider_devices"] =
+      JsonValueDTO{Array{JsonValueDTO{Object{
+          {"controllable_component_id", JsonValueDTO{std::string("device.io")}},
+          {"owner_component_id", JsonValueDTO{std::string("lite6")}},
+          {"member_role", JsonValueDTO{std::string("controller_io")}}}}}};
+  ASSERT_TRUE(MaterializeRetainedIoProviderDevices(graph).ok());
+  const auto devices = ResolveRetainedIoProviderDevices(graph);
+  ASSERT_TRUE(devices.ok()) << devices.error().message;
+  ASSERT_EQ(devices.value().size(), 1U);
+  EXPECT_EQ(devices.value().front().owner_component_id, "lite6");
+  EXPECT_EQ(devices.value().front().member_role, "controller_io");
 }
 
 } // namespace

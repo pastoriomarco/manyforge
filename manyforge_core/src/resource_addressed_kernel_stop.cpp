@@ -130,233 +130,6 @@ StopScopeResolverSnapshotDTO ResourceAddressedExecutionKernel::capture_stop_scop
   return snapshot;
 }
 
-void ResourceAddressedExecutionKernel::ScheduleStopSurveillance(
-    StopCertificateId certificate_id, const std::int64_t deadline_ns) noexcept {
-  if (!config_.stop_surveillance.has_value()) {
-    return;
-  }
-  std::uint64_t generation = 0U;
-  {
-    std::lock_guard state_lock(state_mutex_);
-    if (stop_surveillance_shutting_down_) {
-      return;
-    }
-    const auto found = std::find_if(
-        stop_terminal_history_.begin(), stop_terminal_history_.end(), [&](const auto& record) {
-          return record != nullptr && record->certificate.stop_certificate_id == certificate_id;
-        });
-    if (found == stop_terminal_history_.end() || (*found)->surveillance_state == nullptr ||
-        (*found)->surveillance_state->projection.state !=
-            StopPostTerminalSurveillanceStateDTO::kMonitoring ||
-        (*found)->surveillance_callback_pending ||
-        (*found)->surveillance_schedule_generation == std::numeric_limits<std::uint64_t>::max()) {
-      return;
-    }
-    generation = ++(*found)->surveillance_schedule_generation;
-    (*found)->surveillance_callback_pending = true;
-    ++stop_surveillance_schedule_publications_;
-  }
-
-  std::optional<ScheduleHandle> handle;
-  try {
-    handle = scheduler_.schedule(
-        deadline_ns,
-        [this, certificate_id, generation] { RunStopSurveillance(certificate_id, generation); },
-        SchedulerPriority::Monitoring);
-  } catch (...) {
-    // The publication boundary itself is infrastructure, not source truth.
-  }
-
-  bool cancel_late_handle = false;
-  {
-    std::lock_guard state_lock(state_mutex_);
-    if (stop_surveillance_schedule_publications_ == 0U) {
-      std::terminate();
-    }
-    --stop_surveillance_schedule_publications_;
-    const auto found = std::find_if(
-        stop_terminal_history_.begin(), stop_terminal_history_.end(), [&](const auto& record) {
-          return record != nullptr && record->certificate.stop_certificate_id == certificate_id;
-        });
-    if (!handle.has_value() || found == stop_terminal_history_.end() ||
-        (*found)->surveillance_schedule_generation != generation ||
-        !(*found)->surveillance_callback_pending || stop_surveillance_shutting_down_) {
-      cancel_late_handle = handle.has_value();
-      if (found != stop_terminal_history_.end() &&
-          (*found)->surveillance_schedule_generation == generation) {
-        (*found)->surveillance_callback_pending = false;
-        (*found)->surveillance_schedule_handle.reset();
-      }
-      if (!handle.has_value()) {
-        motion_admission_closed_ = true;
-      }
-    } else {
-      (*found)->surveillance_schedule_handle = *handle;
-    }
-    stop_surveillance_schedule_cv_.notify_all();
-  }
-  if (cancel_late_handle) {
-    try {
-      scheduler_.cancel(*handle);
-    } catch (...) {
-      std::terminate();
-    }
-  }
-}
-
-void ResourceAddressedExecutionKernel::RunStopSurveillance(
-    StopCertificateId certificate_id, const std::uint64_t schedule_generation) noexcept {
-  try {
-    std::int64_t next_deadline_ns = 0;
-    {
-      std::lock_guard state_lock(state_mutex_);
-      const auto found = std::find_if(
-          stop_terminal_history_.begin(), stop_terminal_history_.end(), [&](const auto& record) {
-            return record != nullptr && record->certificate.stop_certificate_id == certificate_id;
-          });
-      if (found == stop_terminal_history_.end() ||
-          (*found)->surveillance_schedule_generation != schedule_generation ||
-          !(*found)->surveillance_callback_pending) {
-        return;
-      }
-      (*found)->surveillance_callback_pending = false;
-      (*found)->surveillance_schedule_handle.reset();
-      if (stop_surveillance_shutting_down_ || (*found)->surveillance_state == nullptr ||
-          (*found)->surveillance_state->projection.state !=
-              StopPostTerminalSurveillanceStateDTO::kMonitoring) {
-        return;
-      }
-    }
-
-    const auto now = clock_.now();
-    if (now < 0) {
-      std::lock_guard state_lock(state_mutex_);
-      motion_admission_closed_ = true;
-      return;
-    }
-    std::size_t source_count = 0U;
-    {
-      std::lock_guard state_lock(state_mutex_);
-      const auto found = std::find_if(
-          stop_terminal_history_.begin(), stop_terminal_history_.end(), [&](const auto& record) {
-            return record != nullptr && record->certificate.stop_certificate_id == certificate_id;
-          });
-      if (found == stop_terminal_history_.end() || (*found)->surveillance_state == nullptr) {
-        return;
-      }
-      source_count = (*found)->surveillance_state->source_plans.size();
-    }
-    for (std::size_t source_index = 0U; source_index < source_count; ++source_index) {
-      std::optional<StopSurveillanceObservationQueryDTO> query;
-      {
-        std::lock_guard state_lock(state_mutex_);
-        const auto found = std::find_if(
-            stop_terminal_history_.begin(), stop_terminal_history_.end(), [&](const auto& record) {
-              return record != nullptr && record->certificate.stop_certificate_id == certificate_id;
-            });
-        if (found == stop_terminal_history_.end() || (*found)->surveillance_state == nullptr ||
-            (*found)->surveillance_state->projection.state !=
-                StopPostTerminalSurveillanceStateDTO::kMonitoring) {
-          break;
-        }
-        auto made =
-            MakeStopSurveillanceObservationQuery(*(*found)->surveillance_state, source_index, now);
-        if (!made.ok()) {
-          motion_admission_closed_ = true;
-          continue;
-        }
-        query = std::move(made.value());
-      }
-      auto sample = config_.stop_surveillance->observer->Observe(*query);
-      {
-        std::lock_guard state_lock(state_mutex_);
-        const auto found = std::find_if(
-            stop_terminal_history_.begin(), stop_terminal_history_.end(), [&](const auto& record) {
-              return record != nullptr && record->certificate.stop_certificate_id == certificate_id;
-            });
-        if (found == stop_terminal_history_.end() || (*found)->surveillance_state == nullptr ||
-            (*found)->surveillance_state->projection.state !=
-                StopPostTerminalSurveillanceStateDTO::kMonitoring) {
-          break;
-        }
-        auto reduced =
-            ReduceStopSurveillanceObservation(*(*found)->surveillance_state, *query, sample);
-        if (!reduced.ok()) {
-          motion_admission_closed_ = true;
-          continue;
-        }
-        *(*found)->surveillance_state = std::move(reduced.value());
-        (*found)->status.surveillance = (*found)->surveillance_state->projection;
-        if ((*found)->fault_latch.has_value()) {
-          (*found)->status.fault_latch = (*found)->fault_latch;
-        }
-      }
-    }
-
-    std::optional<StopControlWorkToken> checkpoint_token;
-    bool reschedule = false;
-    {
-      std::lock_guard state_lock(state_mutex_);
-      const auto found = std::find_if(
-          stop_terminal_history_.begin(), stop_terminal_history_.end(), [&](const auto& record) {
-            return record != nullptr && record->certificate.stop_certificate_id == certificate_id;
-          });
-      if (found == stop_terminal_history_.end() || (*found)->surveillance_state == nullptr) {
-        return;
-      }
-      auto& record = **found;
-      const auto& policy = record.surveillance_state->projection.policy;
-      if (now >= record.next_surveillance_checkpoint_ns && record.fault_latch.has_value() &&
-          !record.surveillance_projection_token.has_value()) {
-        auto checkpoint = MakeStopSurveillanceCheckpoint(*record.surveillance_state);
-        if (checkpoint.ok()) {
-          checkpoint_token = allocate_stop_projection_job_locked();
-          if (checkpoint_token.has_value()) {
-            auto& projection = *stop_projection_jobs_[checkpoint_token->slot];
-            projection.surveillance_checkpoint = std::move(checkpoint.value());
-            projection.surveillance_fault_latch = *record.fault_latch;
-            record.surveillance_projection_token = checkpoint_token;
-            if (now <= std::numeric_limits<std::int64_t>::max() - policy.checkpoint_interval_ns) {
-              record.next_surveillance_checkpoint_ns = now + policy.checkpoint_interval_ns;
-            }
-          } else {
-            motion_admission_closed_ = true;
-          }
-        }
-      }
-      reschedule = record.surveillance_state->projection.state ==
-                   StopPostTerminalSurveillanceStateDTO::kMonitoring;
-      if (reschedule) {
-        if (now > std::numeric_limits<std::int64_t>::max() - policy.sample_cadence_ns) {
-          motion_admission_closed_ = true;
-          reschedule = false;
-        } else {
-          const auto elapsed = std::max<std::int64_t>(0, now - record.next_surveillance_sample_ns);
-          const auto skipped = elapsed / policy.sample_cadence_ns + 1;
-          if (skipped >
-              (std::numeric_limits<std::int64_t>::max() - record.next_surveillance_sample_ns) /
-                  policy.sample_cadence_ns) {
-            motion_admission_closed_ = true;
-            reschedule = false;
-          } else {
-            record.next_surveillance_sample_ns += skipped * policy.sample_cadence_ns;
-            next_deadline_ns = record.next_surveillance_sample_ns;
-          }
-        }
-      }
-    }
-    if (checkpoint_token.has_value()) {
-      stop_projection_worker_->Publish(*checkpoint_token);
-    }
-    if (reschedule) {
-      ScheduleStopSurveillance(std::move(certificate_id), next_deadline_ns);
-    }
-  } catch (...) {
-    std::lock_guard state_lock(state_mutex_);
-    motion_admission_closed_ = true;
-  }
-}
-
 Result<StopStatusDTO> ResourceAddressedExecutionKernel::get_stop_status(
     const StopId& stop_id) const {
   if (stop_id.empty()) {
@@ -433,24 +206,13 @@ Result<StopStatusDTO> ResourceAddressedExecutionKernel::get_stop_status(
                        projection,
                        StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kPending,
                                                       std::nullopt, std::nullopt},
-                       StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kNotApplicable,
-                                                      std::nullopt, std::nullopt},
-                       std::nullopt,
-                       transaction.fault_latch,
                        std::nullopt};
   return Result<StopStatusDTO>::Ok(std::move(status));
 }
 
 CellStopActionProjectionDTO ResourceAddressedExecutionKernel::cell_stop_action_projection() const {
   std::lock_guard state_lock(state_mutex_);
-  CellStopActionProjectionDTO projection{cell_stop_generation_, std::nullopt, std::nullopt};
-  if (is_active_stop_fault_latch(active_stop_fault_latch_)) {
-    const auto& latch = *active_stop_fault_latch_;
-    projection.fault = CellStopFaultSummaryDTO{
-        latch.latch_id,        latch.latch_generation, latch.state,           latch.trigger,
-        latch.recovery_status, latch.reason_code,      latch.stop_certificate,
-        latch.observed_triggers};
-  }
+  CellStopActionProjectionDTO projection{cell_stop_generation_, std::nullopt};
   if (stop_terminal_history_.empty() || stop_terminal_history_.back() == nullptr) {
     return projection;
   }
@@ -506,348 +268,10 @@ Result<StopCertificateDTO> ResourceAddressedExecutionKernel::get_stop_certificat
   return Result<StopCertificateDTO>::Ok((*found)->certificate);
 }
 
-std::optional<StopFaultLatchDTO> ResourceAddressedExecutionKernel::get_stop_fault_latch() const {
-  std::lock_guard state_lock(state_mutex_);
-  return active_stop_fault_latch_;
-}
-
-StopFaultLatchOriginDTO ResourceAddressedExecutionKernel::get_stop_fault_latch_origin(
-    const StopFaultLatchDTO& latch) const {
-  std::lock_guard state_lock(state_mutex_);
-  for (const auto& stop : attributed_containment_stops_) {
-    if (stop.stop_id == latch.stop_id && stop.stop_generation == latch.stop_generation) {
-      return stop.origin;
-    }
-  }
-  for (const auto& record : stop_terminal_history_) {
-    if (record != nullptr && record->certificate.stop_id == latch.stop_id &&
-        record->certificate.stop_generation == latch.stop_generation) {
-      return stop_fault_latch_certificate_origin(record->certificate);
-    }
-  }
-  return StopFaultLatchOriginDTO::kUnattributed;
-}
-
-Result<std::optional<StopFaultRecoveryOfferDTO>>
-ResourceAddressedExecutionKernel::get_stop_fault_recovery_offer() const {
-  // Owner before state lock (the owner's scope callback takes the state lock).
-  const bool closing_only = cell_admission_owner_->AuthoringClosedOnlyByClosing();
-  std::lock_guard state_lock(state_mutex_);
-  if (!active_stop_fault_latch_.has_value() ||
-      active_stop_fault_latch_->state == StopFaultLatchStateDTO::kCleared) {
-    return Result<std::optional<StopFaultRecoveryOfferDTO>>::Ok(std::nullopt);
-  }
-  if (!active_stop_fault_latch_->stop_certificate.has_value()) {
-    // Publish the real fault immediately, but no actionable recovery context
-    // before terminal containment. The current response already carries its
-    // waiting status; an empty expectation table cannot authorize recovery.
-    return Result<std::optional<StopFaultRecoveryOfferDTO>>::Ok(
-        StopFaultRecoveryOfferDTO{*active_stop_fault_latch_, {}, std::nullopt});
-  }
-  const auto terminal = std::find_if(
-      stop_terminal_history_.begin(), stop_terminal_history_.end(), [&](const auto& record) {
-        return record != nullptr &&
-               record->certificate.stop_id == active_stop_fault_latch_->stop_id &&
-               record->certificate.stop_generation == active_stop_fault_latch_->stop_generation &&
-               record->status.fault_latch.has_value() &&
-               *record->status.fault_latch == *active_stop_fault_latch_;
-      });
-  if (terminal == stop_terminal_history_.end()) {
-    return reject<std::optional<StopFaultRecoveryOfferDTO>>(
-        "active Stop fault latch has no exact resident terminal status",
-        "stop_fault_recovery_offer_terminal_missing", ErrorCode::kInvariantViolation);
-  }
-
-  // One shared owner derives this table and the native facts table. A
-  // cell-wide Stop that captured no participant configuration (for example
-  // a recognized-malformed Stop promoted to Full while idle) is offered the
-  // installed control domains' active configurations. When no such proof
-  // exists the latch is still published, explicitly unavailable.
-  std::vector<const RuntimeParticipantBinding*> installed_bindings;
-  installed_bindings.reserve(registrations_.size());
-  for (const auto& registration : registrations_) {
-    installed_bindings.push_back(&registration.binding);
-  }
-  auto expectations =
-      StopFaultRecoveryConfigurationExpectations((*terminal)->status, installed_bindings);
-  if (!expectations.ok() &&
-      expectations.error().code == kStopFaultRecoveryTerminalConfigurationConflict) {
-    return reject<std::optional<StopFaultRecoveryOfferDTO>>(
-        "Stop terminal status contains conflicting control-domain configuration truth",
-        "stop_fault_recovery_offer_configuration_conflict", ErrorCode::kInvariantViolation);
-  }
-  StopFaultRecoveryOfferDTO offer{*active_stop_fault_latch_, {}, std::nullopt};
-  if (stop_fault_admission_scope_locked() == StopFaultAdmissionScope::kClosing) {
-    // D6: Scenario Close keeps the latch; recovery is unavailable until Close
-    // ends. `stop_fault_recovery_closing` also says that authoring is closed
-    // only by the closing scope (SX-370): the one fact the canonical-empty
-    // preparation may waive. Any other blocker reports `_not_ready`.
-    offer.recovery_unavailable_reason =
-        closing_only ? "stop_fault_recovery_closing" : "stop_fault_recovery_closing_not_ready";
-  } else if (expectations.ok()) {
-    offer.configuration_expectations = std::move(expectations.value());
-  } else {
-    offer.recovery_unavailable_reason = expectations.error().code;
-  }
-  if (stop_fault_recovery_offer_field_error(offer).has_value()) {
-    return reject<std::optional<StopFaultRecoveryOfferDTO>>(
-        "Stop fault-recovery offer is not a complete canonical owner projection",
-        "stop_fault_recovery_offer_invalid", ErrorCode::kInvariantViolation);
-  }
-  return Result<std::optional<StopFaultRecoveryOfferDTO>>::Ok(std::move(offer));
-}
-
-Result<void> ResourceAddressedExecutionKernel::publish_stop_fault_assessment_locked(
-    const StopStatusDTO& expected, const StopFaultLatchDTO& assessed) {
-  const auto found = std::find_if(
-      stop_terminal_history_.begin(), stop_terminal_history_.end(),
-      [&](const auto& record) { return record != nullptr && record->status == expected; });
-  if (found == stop_terminal_history_.end() || active_stop_fault_latch_ != expected.fault_latch) {
-    return Result<void>::Err(error("stop_fault_recovery_assessment_conflict",
-                                   "Stop fault truth changed during assessment",
-                                   "stop_fault_recovery_assessment_conflict"));
-  }
-  (*found)->fault_latch = assessed;
-  (*found)->status.fault_latch = assessed;
-  active_stop_fault_latch_ = assessed;
-  return Result<void>::Ok();
-}
-
-Result<void> ResourceAddressedExecutionKernel::refresh_stop_fault_recovery_assessment() {
-  std::lock_guard recovery_lock(stop_fault_recovery_mutex_);
-  const auto admission = cell_admission_owner_->RefreshStopFaultAdmission();
-  if (!admission.ok()) return admission;
-  std::optional<StopStatusDTO> status;
-  {
-    std::lock_guard state_lock(state_mutex_);
-    if (!is_active_stop_fault_latch(active_stop_fault_latch_) ||
-        !active_stop_fault_latch_->stop_certificate.has_value()) {
-      return Result<void>::Ok();
-    }
-    const auto found = std::find_if(
-        stop_terminal_history_.begin(), stop_terminal_history_.end(), [&](const auto& record) {
-          return record != nullptr && record->fault_latch == active_stop_fault_latch_;
-        });
-    if (found == stop_terminal_history_.end()) {
-      return Result<void>::Err(error("stop_fault_recovery_terminal_missing",
-                                     "Stop terminal truth is not resident",
-                                     "stop_fault_recovery_terminal_missing"));
-    }
-    status = (*found)->status;
-  }
-  if (!config_.stop_fault_recovery_facts_resolver) {
-    return Result<void>::Err(error("stop_fault_recovery_facts_unavailable",
-                                   "Stop recovery facts owner is not installed",
-                                   "stop_fault_recovery_facts_unavailable"));
-  }
-  auto facts = config_.stop_fault_recovery_facts_resolver(*status, clock_.now());
-  if (!facts.ok()) return Result<void>::Err(facts.error());
-  auto assessed = AssessStopFaultRecovery(*status, facts.value());
-  if (!assessed.ok()) return Result<void>::Err(assessed.error());
-  std::lock_guard state_lock(state_mutex_);
-  return publish_stop_fault_assessment_locked(*status, assessed.value());
-}
-
-namespace {
-
-[[nodiscard]] Result<StopFaultRecoveryResultDTO> stop_fault_recovery_closing() {
-  return Result<StopFaultRecoveryResultDTO>::Err(
-      error("stop_fault_recovery_closing",
-            "Scenario Close keeps the Stop fault; use Recover cell after Close",
-            "stop_fault_kept_by_close"));
-}
-
-}  // namespace
-
-Result<StopFaultRecoveryResultDTO> ResourceAddressedExecutionKernel::recover_stop_fault(
-    const StopFaultRecoveryIntentDTO& intent) {
-  if (stop_fault_recovery_intent_field_error(intent).has_value()) {
-    return reject<StopFaultRecoveryResultDTO>("Stop fault-recovery intent is invalid",
-                                              "stop_fault_recovery_intent_invalid",
-                                              ErrorCode::kInvalidRequest);
-  }
-  if (intent.request_context.request_owner_epoch != config_.request_owner_epoch) {
-    return Result<StopFaultRecoveryResultDTO>::Err(
-        error("stale_request_owner_epoch", "Stop fault recovery names a stale owner epoch",
-              "stale_request_owner_epoch"));
-  }
-
-  // Recovery is an ordinary, durable control path. Serialize it independently
-  // from emergency Stop so two clear attempts cannot both evaluate one latch
-  // and race their post-commit publication.
-  std::lock_guard recovery_lock(stop_fault_recovery_mutex_);
-
-  std::optional<StopStatusDTO> status;
-  {
-    std::lock_guard state_lock(state_mutex_);
-    const auto replay = std::find_if(
-        stop_fault_recovery_replay_ledger_.begin(), stop_fault_recovery_replay_ledger_.end(),
-        [&](const auto& row) {
-          return row.request_id() == intent.request_context.request_id;
-        });
-    if (replay != stop_fault_recovery_replay_ledger_.end()) {
-      if (!std::holds_alternative<StopFaultRecoveryIntentDTO>(replay->intent) ||
-          std::get<StopFaultRecoveryIntentDTO>(replay->intent) != intent) {
-        return Result<StopFaultRecoveryResultDTO>::Err(
-            error("request_id_conflict", "Stop fault-recovery request ID conflicts",
-                  "request_id_conflict"));
-      }
-      auto result = std::get<StopFaultRecoveryResultDTO>(replay->result);
-      result.replay_status = RequestReplayStatusDTO::kReplayedExact;
-      return Result<StopFaultRecoveryResultDTO>::Ok(std::move(result));
-    }
-    // D6: no recovery clears the latch while Scenario Close runs (Recover
-    // cell clears it after Close). Rechecked before the durable clear below.
-    if (stop_fault_admission_scope_locked() == StopFaultAdmissionScope::kClosing)
-      return stop_fault_recovery_closing();
-    if (std::any_of(stop_fault_recovery_replay_ledger_.begin(),
-          stop_fault_recovery_replay_ledger_.end(),
-          [](const auto& row) { return row.pending_global_record.has_value(); }))
-      return Result<StopFaultRecoveryResultDTO>::Err(
-          error("invalid_state_transition", "A durable global recovery is unresolved",
-                "io_global_rule_recovery_pending"));
-    const auto request_id = intent.request_context.request_id;
-    const bool request_id_used_elsewhere =
-        emergency_stop_reserve_.find(request_id.value()).has_value() ||
-        std::any_of(replay_ledger_.begin(), replay_ledger_.end(),
-                    [&](const ReplayEntry& row) {
-                      return row.intent.request_context.request_id == request_id;
-                    }) ||
-        std::any_of(control_replay_ledger_.begin(), control_replay_ledger_.end(),
-                    [&](const ControlReplayEntry& row) {
-                      return row.request.request_context.request_id == request_id;
-                    }) ||
-        std::any_of(runtime_scale_replay_ledger_.begin(), runtime_scale_replay_ledger_.end(),
-                    [&](const RuntimeScaleReplayEntry& row) {
-                      return row.request.request_context.request_id == request_id;
-                    }) ||
-        std::any_of(runtime_scale_control_replay_ledger_.begin(),
-                    runtime_scale_control_replay_ledger_.end(),
-                    [&](const RuntimeScaleControlReplayEntry& row) {
-                      return row.request.request_context.request_id == request_id;
-                    });
-    if (request_id_used_elsewhere) {
-      return Result<StopFaultRecoveryResultDTO>::Err(
-          error("request_id_conflict", "Stop fault-recovery request ID is already retained",
-                "request_id_conflict"));
-    }
-    if (!is_active_stop_fault_latch(active_stop_fault_latch_) ||
-        active_stop_fault_latch_->latch_id != intent.expected_latch_id ||
-        active_stop_fault_latch_->latch_generation != intent.expected_latch_generation ||
-        !active_stop_fault_latch_->stop_certificate.has_value()) {
-      return reject<StopFaultRecoveryResultDTO>("Stop fault latch is not current",
-                                                "stop_fault_recovery_latch_stale",
-                                                ErrorCode::kInvalidStateTransition);
-    }
-    const auto found = std::find_if(
-        stop_terminal_history_.begin(), stop_terminal_history_.end(), [&](const auto& record) {
-          return record != nullptr && record->fault_latch.has_value() &&
-                 record->fault_latch->latch_id == intent.expected_latch_id &&
-                 record->fault_latch->latch_generation == intent.expected_latch_generation;
-        });
-    if (found == stop_terminal_history_.end()) {
-      return reject<StopFaultRecoveryResultDTO>("Stop terminal truth is not resident",
-                                                "stop_fault_recovery_terminal_missing",
-                                                ErrorCode::kMissingReference);
-    }
-    status = (*found)->status;
-  }
-  // Preserve exact recovery replay even if admission-generation publication is
-  // temporarily unavailable. New recovery work still requires the current
-  // Stop restriction to be durably reflected before evaluation proceeds.
-  const auto admission = cell_admission_owner_->RefreshStopFaultAdmission();
-  if (!admission.ok()) return Result<StopFaultRecoveryResultDTO>::Err(admission.error());
-  if (!config_.stop_fault_recovery_facts_resolver) {
-    return reject<StopFaultRecoveryResultDTO>("Stop recovery facts owner is not installed",
-                                              "stop_fault_recovery_facts_unavailable",
-                                              ErrorCode::kMissingReference);
-  }
-  auto facts = config_.stop_fault_recovery_facts_resolver(*status, clock_.now());
-  const auto closing = [&] {
-    std::lock_guard state_lock(state_mutex_);
-    return stop_fault_admission_scope_locked() == StopFaultAdmissionScope::kClosing;
-  };
-  // Close may have retired the latched Scenario while facts were resolved.
-  if (closing()) return stop_fault_recovery_closing();
-  if (!facts.ok()) {
-    return Result<StopFaultRecoveryResultDTO>::Err(facts.error());
-  }
-  auto evaluated = EvaluateStopFaultRecovery(intent, *status, facts.value());
-  if (!evaluated.ok()) {
-    return Result<StopFaultRecoveryResultDTO>::Err(evaluated.error());
-  }
-  if (!evaluated.value().result.accepted) {
-    std::lock_guard state_lock(state_mutex_);
-    // A current-facts assessment is owner truth even when the caller's
-    // revision is stale. Publish the newest non-cleared latch so the next
-    // exact request can name it; this performs no clear and no external
-    // effect.
-    auto published = publish_stop_fault_assessment_locked(*status, evaluated.value().result.latch);
-    if (!published.ok()) return Result<StopFaultRecoveryResultDTO>::Err(published.error());
-    stop_fault_recovery_replay_ledger_.clear();
-    stop_fault_recovery_replay_ledger_.push_back(
-        StopFaultRecoveryReplayEntry{intent, evaluated.value().result});
-    return Result<StopFaultRecoveryResultDTO>::Ok(std::move(evaluated.value().result));
-  }
-  // D6 (no new lock): the last check before the durable clear. A Close that
-  // retires between this check and the write still finds the latch cleared.
-  if (closing()) return stop_fault_recovery_closing();
-  const auto persisted = journal_.RecordStopFaultCleared(
-      config_.request_owner_epoch, intent, evaluated.value().result, evaluated.value().result.latch,
-      *evaluated.value().resulting_stop_status);
-  if (!persisted.ok()) {
-    return Result<StopFaultRecoveryResultDTO>::Err(persisted.error());
-  }
-  std::unique_lock state_lock(state_mutex_);
-  const auto found = std::find_if(
-      stop_terminal_history_.begin(), stop_terminal_history_.end(), [&](const auto& record) {
-        return record != nullptr && record->fault_latch.has_value() &&
-               record->fault_latch->latch_id == intent.expected_latch_id &&
-               record->fault_latch->latch_generation == intent.expected_latch_generation;
-      });
-  if (found == stop_terminal_history_.end()) {
-    motion_admission_closed_ = true;
-    return reject<StopFaultRecoveryResultDTO>("Stop fault truth changed after durable clear",
-                                              "stop_fault_recovery_postcommit_conflict",
-                                              ErrorCode::kInvariantViolation);
-  }
-  (*found)->fault_latch = evaluated.value().result.latch;
-  (*found)->status = *evaluated.value().resulting_stop_status;
-  (*found)->surveillance_state.reset();
-  if (active_stop_fault_latch_.has_value() &&
-      active_stop_fault_latch_->latch_id == intent.expected_latch_id &&
-      active_stop_fault_latch_->latch_generation == intent.expected_latch_generation) {
-    active_stop_fault_latch_ = evaluated.value().result.latch;
-  }
-  refresh_stop_fault_latch_locked();
-  stop_fault_recovery_replay_ledger_.clear();
-  stop_fault_recovery_replay_ledger_.push_back(
-      StopFaultRecoveryReplayEntry{intent, evaluated.value().result});
-  // Orphan fences are resource-scoped and enforced by the slot table. A
-  // successful durable fault clear removes the cell-wide Stop latch without
-  // weakening any remaining orphan resource.
-  // A containment can begin after the external recovery facts read, before
-  // its Stop is accepted (or acceptance can fail). Its existing pending row
-  // is already restrictive truth. Keep the historical clear/replay truthful
-  // without reopening admission under that newer incident.
-  // A restart-only fault (internal or journal write) keeps it closed.
-  motion_admission_closed_ =
-      restart_required_fault_locked() || manager_liveness_motion_inhibited_ ||
-      is_active_stop_fault_latch(active_stop_fault_latch_) ||
-      std::any_of(incident_containments_.begin(), incident_containments_.end(),
-                  [](const auto& row) { return !row.receipt.has_value(); });
-  state_lock.unlock();
-  // The clear result is already durable. A failed generation publication keeps
-  // authoring closed and is retried by the existing reconciliation lane.
-  static_cast<void>(cell_admission_owner_->RefreshStopFaultAdmission());
-  return Result<StopFaultRecoveryResultDTO>::Ok(std::move(evaluated.value().result));
-}
-
 Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop(
     EmergencyStopProjectedIntentDTO projected_intent,
     const PartialDispatchStopScope* partial_dispatch_scope,
     const MalformedStopIngressDTO* malformed_ingress,
-    const std::optional<StopFaultTriggerDTO> required_fault_latch,
     const MotionTakeoverStopSelection* takeover_selection,
     const InterruptStopSelection* interrupt_selection,
     std::span<const InterruptStopSelection> disjoint_interrupt_selections) {
@@ -858,7 +282,7 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop(
     // Neither ordinary admission nor its durable journal is on this lane.
     std::lock_guard state_lock(state_mutex_);
     return accept_stop_locked(std::move(projected_intent), handoff, accepted_at_ns,
-                              partial_dispatch_scope, malformed_ingress, required_fault_latch,
+                              partial_dispatch_scope, malformed_ingress,
                               takeover_selection, interrupt_selection,
                               disjoint_interrupt_selections);
   }();
@@ -866,6 +290,19 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop(
 }
 
 void ResourceAddressedExecutionKernel::publish_stop_work(const StopWorkHandoff& handoff) noexcept {
+  if (handoff.accepted) {
+    try {
+      std::function<void()> listener;
+      {
+        std::lock_guard state_lock(state_mutex_);
+        listener = stop_listener_;
+      }
+      if (listener) listener();
+    } catch (...) {
+      // The Stop itself is accepted; an action it couldn't interrupt ends by
+      // itself and reports its own outcome.
+    }
+  }
   if (handoff.control.has_value()) {
     stop_control_executor_->Publish(*handoff.control);
   }
@@ -876,12 +313,7 @@ void ResourceAddressedExecutionKernel::publish_stop_work(const StopWorkHandoff& 
 
 bool ResourceAddressedExecutionKernel::ordinary_request_id_retained_locked(
     const RequestId& request_id) const {
-  return std::any_of(stop_fault_recovery_replay_ledger_.begin(),
-                     stop_fault_recovery_replay_ledger_.end(), [&](const auto& row) {
-                       return std::holds_alternative<IoGlobalRuleRecoveryIntentDTO>(row.intent) &&
-                              row.request_id() == request_id;
-                     }) ||
-         std::any_of(replay_ledger_.begin(), replay_ledger_.end(),
+  return std::any_of(replay_ledger_.begin(), replay_ledger_.end(),
                      [&](const auto& row) {
                        return row.intent.request_context.request_id == request_id;
                      }) ||
@@ -903,7 +335,6 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
     EmergencyStopProjectedIntentDTO projected_intent, StopWorkHandoff& handoff,
     const TimePoint accepted_at_ns, const PartialDispatchStopScope* partial_dispatch_scope,
     const MalformedStopIngressDTO* malformed_ingress,
-    const std::optional<StopFaultTriggerDTO> required_fault_latch,
     const MotionTakeoverStopSelection* takeover_selection,
     const InterruptStopSelection* primary_interrupt_selection,
     std::span<const InterruptStopSelection> disjoint_interrupt_selections,
@@ -1049,8 +480,11 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
   const auto* ordinary = std::get_if<StopIntentDTO>(&projected_intent);
   const auto* full = std::get_if<FullStopIntentDTO>(&projected_intent);
   // Only the Kernel's own rule responses pass a rule selection; a public Stop
-  // never does.
-  const bool kernel_rule_selection = global_selection != nullptr || !interrupt_selections.empty();
+  // never does. A global rule's Stop is the Program's own only with
+  // `after_stop: fail_node`; with `hold` it is the operator's Stop.
+  const bool kernel_rule_selection =
+      (global_selection != nullptr && global_selection->fail_node && !global_selection->watch_lost) ||
+      !interrupt_selections.empty();
   const auto* program_run_targets =
       ordinary == nullptr ? nullptr
                           : std::get_if<std::vector<StopProgramRunTargetDTO>>(&ordinary->selector);
@@ -1929,7 +1363,6 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
         resolution.value().full_stop};
     outcome = emergency_stop_reserve_.reserve_or_join(candidate, fence_rows_held);
     if (outcome.error == EmergencyStopReserveError::kPrecommitRefused) {
-      motion_admission_closed_ = true;
       return reject<StopAcceptedDTO>(precommit_refusal_message, precommit_refusal_code,
                                      ErrorCode::kInvariantViolation);
     }
@@ -2000,10 +1433,6 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
         for (const auto& joined_id : stop_operation_snapshot_ids(transaction))
           if (auto* joined = find_active_operation_locked(joined_id))
             joined->program_requested_stop = false;
-      // A containment that joins a resident Stop still latches its outcome.
-      if (required_fault_latch.has_value() && !transaction.certificate.has_value()) {
-        latch_stop_fault_locked(transaction, *required_fault_latch);
-      }
       if (malformed_ingress != nullptr) {
         accepted->resolution_disposition = StopResolutionDispositionDTO::kPromotedToFull;
         accepted->resolution_reason = resolution.value().reason;
@@ -2234,11 +1663,9 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
                     slot_snapshot.operation_resource_generation, outcome.stop_generation,
                     std::move(owner_rows), orphan_resources, std::move(revision_only_rows)});
       // Accepted-degraded: the reserve already linearized this Stop, so a
-      // fence failure no longer rejects it. Its work is still handed off;
-      // admission closes and the transaction latches a typed Stop fault.
+      // fence failure no longer rejects it. Its work is still handed off.
       const bool fence_failed = !fenced.ok();
       if (fence_failed) {
-        motion_admission_closed_ = true;
         (void)std::fprintf(stderr,
                            "manyforge_fault code=stop_post_reserve_fence_failed error=%s\n",
                            fenced.error().details.contains("reason")
@@ -2365,7 +1792,6 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
           StopId(std::string(outcome.stop_id())),
           outcome.stop_generation,
           outcome.full_stop,
-          false,
           EmergencyStopProjectionStateDTO::kPending,
           false,
           false,
@@ -2386,7 +1812,6 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
           std::nullopt,
           malformed_ingress != nullptr ? std::optional<std::string>(malformed_ingress->reason)
                                        : std::nullopt,
-          std::nullopt,
           {}};
       transaction.proof_predecessor_scopes = proof_predecessor_scopes;
       transaction.predecessor_certificates.insert(transaction.predecessor_certificates.end(),
@@ -2407,17 +1832,6 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
         transaction.motion_takeover_candidate_id = takeover_selection->candidate_id;
         transaction.force_spring_return = takeover_selection->force_spring_return;
       }
-      if (accepted->resolution_disposition == StopResolutionDispositionDTO::kPromotedToFull) {
-        latch_stop_fault_locked(transaction, StopFaultTriggerDTO::kScopePromotion);
-      }
-      // Incident containment latches even a nominal Stop of an idle cell:
-      // physical rest after an unexpected loss is not yet proven.
-      if (required_fault_latch.has_value()) {
-        latch_stop_fault_locked(transaction, *required_fault_latch);
-      }
-      if (fence_failed) {
-        latch_stop_fault_locked(transaction, StopFaultTriggerDTO::kPostReserveFenceFailed);
-      }
       if (outcome.correlation_retained) {
         stop_correlations_[outcome.correlation_slot] = *accepted;
       }
@@ -2429,9 +1843,6 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
       // stage completion.
       next_stop_id_ = proposed_number + 1U;
       cell_stop_generation_ = std::max(cell_stop_generation_, outcome.stop_generation);
-      // Item 37: a newer Stop ends the operator's Force close arm.
-      if (force_close_stop_generation_ && *force_close_stop_generation_ != cell_stop_generation_)
-        force_close_stop_generation_.reset();
     }
 
     if (outcome.replay_status == RequestReplayStatusDTO::kAcceptedNew &&
@@ -2439,13 +1850,11 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
       projection_token = allocate_stop_projection_job_locked();
       if (!projection_token.has_value()) {
         // The containment effect is already linearized and handed to the
-        // prequalified StopControl owner. Forensic projection capacity may
-        // therefore degrade admission, but it must never reject, widen, pin,
-        // or terminate an accepted Stop.
+        // prequalified StopControl owner. Exhausted forensic projection
+        // capacity is recorded; it never rejects, widens, pins, or terminates
+        // an accepted Stop.
         auto& transaction = *stop_transactions_[outcome.work_token.slot];
-        transaction.persistence_degraded = true;
         transaction.acceptance_projection_state = EmergencyStopProjectionStateDTO::kFailed;
-        motion_admission_closed_ = true;
       } else {
         auto& projection = *stop_projection_jobs_[projection_token->slot];
         projection.intent = projected_intent;
@@ -2530,6 +1939,12 @@ Result<StopAcceptedDTO> ResourceAddressedExecutionKernel::accept_stop_locked(
                                    ErrorCode::kInvariantViolation);
   }
   post_reserve_guard.armed = false;
+  // CONTRACTS §5: an accepted Stop arms the cell latch condition; §2: it
+  // interrupts every component action in progress (after the lock).
+  if (accepted->replay_status != RequestReplayStatusDTO::kReplayedExact) {
+    refresh_cell_latch_locked(true);
+    handoff.accepted = true;
+  }
   return Result<StopAcceptedDTO>::Ok(std::move(*accepted));
 }
 
@@ -2539,7 +1954,6 @@ void ResourceAddressedExecutionKernel::ProjectStop(const StopControlWorkToken to
     {
       std::lock_guard state_lock(state_mutex_);
       if (!token.locally_valid() || token.slot >= stop_projection_jobs_.size()) {
-        motion_admission_closed_ = true;
         return;
       }
       auto& retained = *stop_projection_jobs_[token.slot];
@@ -2553,7 +1967,6 @@ void ResourceAddressedExecutionKernel::ProjectStop(const StopControlWorkToken to
     if (job.terminal_status.has_value()) {
       if (!job.terminal_certificate.has_value()) {
         std::lock_guard state_lock(state_mutex_);
-        motion_admission_closed_ = true;
         return;
       }
       std::optional<ErrorDTO> operation_state_projection_error;
@@ -2571,30 +1984,8 @@ void ResourceAddressedExecutionKernel::ProjectStop(const StopControlWorkToken to
           operation_state_projection_error = recorded.error();
         }
       }
-      if (!job.terminal_fault_latch.has_value() &&
-          (operation_state_projection_error.has_value() ||
-           job.terminal_status->acceptance_projection.state ==
-               StopDurableProjectionStateDTO::kFailed)) {
-        std::lock_guard state_lock(state_mutex_);
-        if (!stop_retained_bundle_id_.has_value() || !stop_graph_revision_.has_value() ||
-            cell_stop_fault_latch_generation_.value() >= kMaximumKernelJsonInteger) {
-          motion_admission_closed_ = true;
-          return;
-        }
-        cell_stop_fault_latch_generation_ =
-            StopFaultLatchGeneration(cell_stop_fault_latch_generation_.value() + 1U);
-        job.terminal_fault_latch = persistence_fault_latch(
-            config_.cell_id, config_.request_owner_epoch, *stop_retained_bundle_id_,
-            *stop_graph_revision_, *job.terminal_certificate, cell_stop_fault_latch_generation_,
-            StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kPending, std::nullopt,
-                                           std::nullopt});
-        job.terminal_status->fault_latch = job.terminal_fault_latch;
-        active_stop_fault_latch_ = job.terminal_fault_latch;
-        motion_admission_closed_ = true;
-      }
-      auto projected =
-          journal_.RecordStopTerminal(config_.request_owner_epoch, *job.terminal_status,
-                                      *job.terminal_certificate, job.terminal_fault_latch);
+      auto projected = journal_.RecordStopTerminal(config_.request_owner_epoch,
+                                                   *job.terminal_status, *job.terminal_certificate);
       if (operation_state_projection_error.has_value() &&
           projected.state == StopForensicProjectionStateDTO::kRecorded) {
         projected = StopForensicProjectionResultDTO{StopForensicProjectionStateDTO::kFailed,
@@ -2610,140 +2001,29 @@ void ResourceAddressedExecutionKernel::ProjectStop(const StopControlWorkToken to
                        job.terminal_certificate->stop_generation;
           });
       if (record == stop_terminal_history_.end()) {
-        motion_admission_closed_ = true;
         return;
       }
       if ((*record)->terminal_projection_token == token) {
         (*record)->terminal_projection_token.reset();
       }
-      if (job.terminal_fault_latch.has_value() && !(*record)->fault_latch.has_value()) {
-        (*record)->fault_latch = job.terminal_fault_latch;
-        (*record)->status.fault_latch = job.terminal_fault_latch;
-      }
-      if (projected.state == StopForensicProjectionStateDTO::kRecorded) {
-        (*record)->status.terminal_projection = StopDurableProjectionStatusDTO{
-            StopDurableProjectionStateDTO::kRecorded, std::nullopt, std::nullopt};
-        if ((*record)->fault_latch.has_value()) {
-          (*record)->fault_latch->terminal_projection = StopDurableProjectionStatusDTO{
-              StopDurableProjectionStateDTO::kRecorded, std::nullopt, std::nullopt};
-          (*record)->status.fault_latch = (*record)->fault_latch;
-          if (active_stop_fault_latch_.has_value() &&
-              active_stop_fault_latch_->latch_id == (*record)->fault_latch->latch_id) {
-            active_stop_fault_latch_ = (*record)->fault_latch;
-          }
-        }
-      } else {
-        motion_admission_closed_ = true;
-        const auto failure =
-            projected.error.value_or(ErrorDTO{"operation_journal_stop_terminal_projection_failed",
-                                              "Stop terminal forensic projection failed",
-                                              {}});
-        (*record)->status.terminal_projection = StopDurableProjectionStatusDTO{
-            StopDurableProjectionStateDTO::kFailed, failure, kStopJournalProjectionAttempt};
-        if (!(*record)->fault_latch.has_value() && stop_retained_bundle_id_.has_value() &&
-            stop_graph_revision_.has_value() &&
-            cell_stop_fault_latch_generation_.value() < kMaximumKernelJsonInteger) {
-          cell_stop_fault_latch_generation_ =
-              StopFaultLatchGeneration(cell_stop_fault_latch_generation_.value() + 1U);
-          (*record)->fault_latch = persistence_fault_latch(
-              config_.cell_id, config_.request_owner_epoch, *stop_retained_bundle_id_,
-              *stop_graph_revision_, (*record)->certificate, cell_stop_fault_latch_generation_,
-              StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kFailed, failure,
-                                             kStopJournalProjectionAttempt});
-          (*record)->status.fault_latch = (*record)->fault_latch;
-          active_stop_fault_latch_ = (*record)->fault_latch;
-        }
-        if ((*record)->fault_latch.has_value()) {
-          (*record)->fault_latch->terminal_projection = StopDurableProjectionStatusDTO{
-              StopDurableProjectionStateDTO::kFailed, failure, kStopJournalProjectionAttempt};
-          (*record)->status.fault_latch = (*record)->fault_latch;
-          if (active_stop_fault_latch_.has_value() &&
-              active_stop_fault_latch_->latch_id == (*record)->fault_latch->latch_id) {
-            active_stop_fault_latch_ = (*record)->fault_latch;
-          }
-        }
-      }
-      return;
-    }
-
-    if (job.surveillance_checkpoint.has_value()) {
-      if (!job.surveillance_fault_latch.has_value()) {
-        std::lock_guard state_lock(state_mutex_);
-        motion_admission_closed_ = true;
-        return;
-      }
-      const auto projected_at_ns = clock_.now();
-      const auto projected = journal_.RecordStopSurveillanceCheckpoint(
-          config_.request_owner_epoch, *job.surveillance_checkpoint, *job.surveillance_fault_latch,
-          projected_at_ns);
-      std::lock_guard state_lock(state_mutex_);
-      const auto record = std::find_if(
-          stop_terminal_history_.begin(), stop_terminal_history_.end(), [&](const auto& candidate) {
-            return candidate != nullptr &&
-                   candidate->certificate.stop_id == job.surveillance_checkpoint->stop_id &&
-                   candidate->certificate.stop_generation ==
-                       job.surveillance_checkpoint->stop_generation;
-          });
-      if (record == stop_terminal_history_.end()) {
-        motion_admission_closed_ = true;
-        return;
-      }
-      if ((*record)->surveillance_projection_token == token) {
-        (*record)->surveillance_projection_token.reset();
-      }
-      if ((*record)->surveillance_state == nullptr) {
-        // M6b: Recover cleared the latch on current rest while this
-        // checkpoint was being written; surveillance ended with the clear.
-        return;
-      }
-      auto checkpoint_status = StopDurableProjectionStatusDTO{
-          StopDurableProjectionStateDTO::kRecorded, std::nullopt, std::nullopt};
-      if (projected.state != StopForensicProjectionStateDTO::kRecorded) {
-        const auto failure = projected.error.value_or(
-            ErrorDTO{"operation_journal_stop_surveillance_projection_failed",
-                     "Stop surveillance checkpoint projection failed",
-                     {}});
-        checkpoint_status = StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kFailed,
-                                                           failure, kStopJournalProjectionAttempt};
-        motion_admission_closed_ = true;
-        if ((*record)->fault_latch.has_value()) {
-          auto& latch = *(*record)->fault_latch;
-          const bool assessment_changed =
-              !latch.persistence_degraded ||
-              latch.recovery_status != StopFaultRecoveryStatusDTO::kWaitingForDurableRecord ||
-              latch.reason_code != "stop_fault_recovery_waiting_for_durable_record";
-          latch.persistence_degraded = true;
-          latch.recovery_status = StopFaultRecoveryStatusDTO::kWaitingForDurableRecord;
-          latch.reason_code = "stop_fault_recovery_waiting_for_durable_record";
-          if (assessment_changed &&
-              latch.recovery_assessment_revision < std::numeric_limits<std::uint64_t>::max()) {
-            ++latch.recovery_assessment_revision;
-          }
-          (*record)->status.fault_latch = latch;
-          if (active_stop_fault_latch_.has_value() &&
-              active_stop_fault_latch_->latch_id == latch.latch_id &&
-              active_stop_fault_latch_->latch_generation == latch.latch_generation) {
-            active_stop_fault_latch_ = latch;
-          }
-        }
-      }
-      auto& current = (*record)->surveillance_state->projection;
-      if (current.surveillance_generation == job.surveillance_checkpoint->surveillance_generation &&
-          current.checkpoint_generation == job.surveillance_checkpoint->checkpoint_generation) {
-        current.checkpoint_projection = checkpoint_status;
-      }
-      (*record)->status.surveillance = current;
-      (*record)->status.surveillance_projection = current.checkpoint_projection;
-      if ((*record)->fault_latch.has_value()) {
-        (*record)->status.fault_latch = (*record)->fault_latch;
-      }
+      // A failed forensic write is recorded in the status; it faults nothing.
+      (*record)->status.terminal_projection =
+          projected.state == StopForensicProjectionStateDTO::kRecorded
+              ? StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kRecorded,
+                                               std::nullopt, std::nullopt}
+              : StopDurableProjectionStatusDTO{
+                    StopDurableProjectionStateDTO::kFailed,
+                    projected.error.value_or(
+                        ErrorDTO{"operation_journal_stop_terminal_projection_failed",
+                                 "Stop terminal forensic projection failed",
+                                 {}}),
+                    kStopJournalProjectionAttempt};
       return;
     }
 
     if (!job.acceptance.has_value() || !job.intent.has_value() || !job.accepted.has_value() ||
         !job.affected_state.has_value()) {
       std::lock_guard state_lock(state_mutex_);
-      motion_admission_closed_ = true;
       return;
     }
 
@@ -2769,9 +2049,9 @@ void ResourceAddressedExecutionKernel::ProjectStop(const StopControlWorkToken to
     const bool publishes_acceptance_status =
         job.acceptance->acceptance_path != EmergencyStopAcceptancePathDTO::kJoinedResident ||
         state == EmergencyStopProjectionStateDTO::kFailed;
-    const bool marked =
-        !publishes_acceptance_status ||
-        emergency_stop_reserve_.mark_projection(job.acceptance->stop_id.value(), state);
+    if (publishes_acceptance_status)
+      static_cast<void>(
+          emergency_stop_reserve_.mark_projection(job.acceptance->stop_id.value(), state));
     std::optional<StopControlWorkToken> terminal_projection;
     {
       std::lock_guard state_lock(state_mutex_);
@@ -2812,14 +2092,6 @@ void ResourceAddressedExecutionKernel::ProjectStop(const StopControlWorkToken to
           }
         }
       }
-      if (state == EmergencyStopProjectionStateDTO::kFailed ||
-          (!marked && transaction == stop_transactions_.end() &&
-           terminal_record == stop_terminal_history_.end())) {
-        motion_admission_closed_ = true;
-        if (transaction != stop_transactions_.end()) {
-          (*transaction)->persistence_degraded = true;
-        }
-      }
     }
     if (terminal_projection.has_value()) {
       stop_projection_worker_->Publish(*terminal_projection);
@@ -2827,52 +2099,6 @@ void ResourceAddressedExecutionKernel::ProjectStop(const StopControlWorkToken to
   } catch (...) {
     std::optional<StopControlWorkToken> terminal_projection;
     std::lock_guard state_lock(state_mutex_);
-    motion_admission_closed_ = true;
-    if (job.surveillance_checkpoint.has_value()) {
-      const auto record = std::find_if(
-          stop_terminal_history_.begin(), stop_terminal_history_.end(), [&](const auto& candidate) {
-            return candidate != nullptr &&
-                   candidate->certificate.stop_id == job.surveillance_checkpoint->stop_id &&
-                   candidate->certificate.stop_generation ==
-                       job.surveillance_checkpoint->stop_generation;
-          });
-      if (record != stop_terminal_history_.end()) {
-        if ((*record)->surveillance_projection_token == token) {
-          (*record)->surveillance_projection_token.reset();
-        }
-        const ErrorDTO failure{"operation_journal_stop_surveillance_projection_failed",
-                               "Stop surveillance checkpoint projection failed",
-                               {}};
-        (*record)->status.surveillance_projection =
-            StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kFailed, failure, 1U};
-        if ((*record)->surveillance_state != nullptr) {
-          (*record)->surveillance_state->projection.checkpoint_projection =
-              (*record)->status.surveillance_projection;
-          (*record)->status.surveillance = (*record)->surveillance_state->projection;
-        }
-        if ((*record)->fault_latch.has_value()) {
-          auto& latch = *(*record)->fault_latch;
-          const bool assessment_changed =
-              !latch.persistence_degraded ||
-              latch.recovery_status != StopFaultRecoveryStatusDTO::kWaitingForDurableRecord ||
-              latch.reason_code != "stop_fault_recovery_waiting_for_durable_record";
-          latch.persistence_degraded = true;
-          latch.recovery_status = StopFaultRecoveryStatusDTO::kWaitingForDurableRecord;
-          latch.reason_code = "stop_fault_recovery_waiting_for_durable_record";
-          if (assessment_changed &&
-              latch.recovery_assessment_revision < std::numeric_limits<std::uint64_t>::max()) {
-            ++latch.recovery_assessment_revision;
-          }
-          (*record)->status.fault_latch = latch;
-          if (active_stop_fault_latch_.has_value() &&
-              active_stop_fault_latch_->latch_id == latch.latch_id &&
-              active_stop_fault_latch_->latch_generation == latch.latch_generation) {
-            active_stop_fault_latch_ = latch;
-          }
-        }
-      }
-      return;
-    }
     if (job.acceptance.has_value()) {
       static_cast<void>(emergency_stop_reserve_.mark_projection(
           job.acceptance->stop_id.value(), EmergencyStopProjectionStateDTO::kFailed));
@@ -2883,7 +2109,6 @@ void ResourceAddressedExecutionKernel::ProjectStop(const StopControlWorkToken to
           });
       if (transaction != stop_transactions_.end()) {
         (*transaction)->acceptance_projection_state = EmergencyStopProjectionStateDTO::kFailed;
-        (*transaction)->persistence_degraded = true;
         if ((*transaction)->terminal && (*transaction)->terminal_projection_token.has_value()) {
           terminal_projection = (*transaction)->terminal_projection_token;
         }
@@ -2964,8 +2189,6 @@ void ResourceAddressedExecutionKernel::StageAttemptCompleted(
       static_cast<void>(stop_stage_attempt_executor_->Release(handle));
     }
   } catch (...) {
-    std::lock_guard state_lock(state_mutex_);
-    motion_admission_closed_ = true;
   }
 }
 
@@ -2988,90 +2211,6 @@ ResourceAddressedExecutionKernel::allocate_stop_projection_job_locked() noexcept
     return token;
   }
   return std::nullopt;
-}
-
-void ResourceAddressedExecutionKernel::latch_stop_fault_locked(StopTransaction& transaction,
-                                                               const StopFaultTriggerDTO trigger) {
-  motion_admission_closed_ = true;
-  if (transaction.fault_latch.has_value()) {
-    auto& latch = *transaction.fault_latch;
-    if (fault_trigger_priority(trigger) > fault_trigger_priority(latch.trigger)) {
-      latch.trigger = trigger;
-      latch.reason_code = fault_trigger_reason(trigger);
-      ++latch.recovery_assessment_revision;
-    }
-    observe_fault_trigger(latch, trigger);
-    latch.persistence_degraded = latch.persistence_degraded || transaction.persistence_degraded;
-    if (active_stop_fault_latch_.has_value() &&
-        active_stop_fault_latch_->latch_id == latch.latch_id)
-      active_stop_fault_latch_ = latch;
-    return;
-  }
-  if (!transaction.accepted.has_value() || !transaction.stop_id.has_value() ||
-      !stop_retained_bundle_id_.has_value() || !stop_graph_revision_.has_value() ||
-      cell_stop_fault_latch_generation_.value() >= kMaximumKernelJsonInteger)
-    return;
-  const auto generation = StopFaultLatchGeneration(cell_stop_fault_latch_generation_.value() + 1U);
-  std::vector<OperationId> operations;
-  operations.reserve(transaction.accepted->affected_operation_revisions.size());
-  for (const auto& affected : transaction.accepted->affected_operation_revisions)
-    operations.push_back(affected.operation_id);
-  StopFaultLatchDTO latch{
-      config_.cell_id,
-      *transaction.stop_id,
-      transaction.stop_generation,
-      std::nullopt,
-      StopFaultLatchId("stop-fault." + config_.request_owner_epoch.value() + "." +
-                       std::to_string(generation.value())),
-      generation,
-      trigger,
-      transaction.persistence_degraded,
-      std::move(operations),
-      transaction.resources,
-      *stop_retained_bundle_id_,
-      *stop_graph_revision_,
-      {StopDurableProjectionStateDTO::kPending, std::nullopt, std::nullopt},
-      {StopDurableProjectionStateDTO::kNotApplicable, std::nullopt, std::nullopt},
-      StopFaultLatchStateDTO::kLatched,
-      1U,
-      StopFaultRecoveryStatusDTO::kWaitingForObservation,
-      fault_trigger_reason(trigger),
-      {},
-      {trigger}};
-  if (stop_fault_latch_field_error(latch).has_value()) return;
-  cell_stop_fault_latch_generation_ = generation;
-  transaction.fault_latch = latch;
-  active_stop_fault_latch_ = std::move(latch);
-}
-
-void ResourceAddressedExecutionKernel::refresh_stop_fault_latch_locked() {
-  // Recovery of one exact fault must not clear another. Reuse the bounded
-  // resident transaction/history tables; no additional ledger or timer.
-  const auto retain_newest = [&](const auto& latch) {
-    if (is_active_stop_fault_latch(latch) &&
-        (!is_active_stop_fault_latch(active_stop_fault_latch_) ||
-         active_stop_fault_latch_->latch_generation <= latch->latch_generation))
-      active_stop_fault_latch_ = latch;
-  };
-  for (const auto& transaction : stop_transactions_)
-    if (transaction != nullptr && transaction->active && !transaction->terminal)
-      retain_newest(transaction->fault_latch);
-  for (const auto& record : stop_terminal_history_)
-    if (record != nullptr) retain_newest(record->fault_latch);
-}
-
-StopFaultAdmissionScope ResourceAddressedExecutionKernel::stop_fault_admission_scope_locked()
-    const noexcept {
-  if (!is_active_stop_fault_latch(active_stop_fault_latch_)) return StopFaultAdmissionScope::kNone;
-  // D6: the latch names the product it latched. Once Close replaced that
-  // product, the latch stays (a fact about its robots) but blocks only motion.
-  const auto& latch = *active_stop_fault_latch_;
-  if (stop_retained_bundle_id_.has_value() && stop_graph_revision_.has_value() &&
-      (latch.retained_bundle_id != *stop_retained_bundle_id_ ||
-       latch.graph_revision != *stop_graph_revision_))
-    return StopFaultAdmissionScope::kCarried;
-  return close_retired_product_ ? StopFaultAdmissionScope::kClosing
-                                : StopFaultAdmissionScope::kCell;
 }
 
 bool ResourceAddressedExecutionKernel::commit_stop_terminal_locked(
@@ -3177,38 +2316,6 @@ bool ResourceAddressedExecutionKernel::commit_stop_terminal_locked(
         break;
       }
     }
-    // Escalated, partial or uncontained Stops end their operations
-    // Stopped/InterventionRequired without a cell-wide Stop-fault latch
-    // (items 25, Q29; `main` had none). Only scope promotion, persistence
-    // degradation, newly captured idle resources and a containment that
-    // requested its latch at acceptance keep one.
-    const bool known_latch_required =
-        transaction.fault_latch.has_value() || transaction.persistence_degraded ||
-        transaction.accepted->resolution_disposition ==
-            StopResolutionDispositionDTO::kPromotedToFull ||
-        !transaction.newly_captured_resources.empty();
-    std::optional<StopFaultLatchId> latch_id =
-        transaction.fault_latch.has_value() ? std::optional(transaction.fault_latch->latch_id)
-                                            : std::nullopt;
-    std::optional<StopFaultLatchGeneration> latch_generation =
-        transaction.fault_latch.has_value()
-            ? std::optional(transaction.fault_latch->latch_generation)
-            : std::nullopt;
-    const auto assign_latch_identity = [&]() {
-      if (latch_id.has_value()) {
-        return true;
-      }
-      if (cell_stop_fault_latch_generation_.value() >= kMaximumKernelJsonInteger) {
-        return false;
-      }
-      latch_generation = StopFaultLatchGeneration(cell_stop_fault_latch_generation_.value() + 1U);
-      latch_id = StopFaultLatchId("stop-fault." + config_.request_owner_epoch.value() + "." +
-                                  std::to_string(latch_generation->value()));
-      return true;
-    };
-    if (known_latch_required && !assign_latch_identity()) {
-      return false;
-    }
     StopTerminalReductionInputDTO reduction{
         StopCertificateId("stop-certificate." + transaction.stop_id->value()),
         StopCertificateRevision(1U),
@@ -3234,11 +2341,8 @@ bool ResourceAddressedExecutionKernel::commit_stop_terminal_locked(
                   transaction.interrupt_selection->registration.policy_id,
                   std::get<IoOperationRuleScopeDTO>(
                       transaction.interrupt_selection->registration.scope)
-                      .motion_interrupt_scope_id,
-                  std::nullopt})
+                      .motion_interrupt_scope_id})
             : std::nullopt,
-        latch_id,
-        latch_generation,
         completed_at_ns,
         terminal_error};
     for (const auto& participant : transaction.participants) {
@@ -3259,19 +2363,6 @@ bool ResourceAddressedExecutionKernel::commit_stop_terminal_locked(
                        ? ReduceStopTerminal(reduction)
                        : internal::ReduceStopTerminalWithProofScopes(
                              reduction, transaction.proof_predecessor_scopes);
-    // The reducer owns the authoritative nominal/escalated/partial outcome.
-    // Pre-classification above avoids a second reduction in the common case,
-    // while this exact retry closes outcomes (for example evidence-derived
-    // partial containment) that cannot be guessed before reduction.
-    if (!reduced.ok() && reduced.error().code == "stop_terminal_fault_latch_required" &&
-        !latch_id.has_value() && assign_latch_identity()) {
-      reduction.fault_latch_id = latch_id;
-      reduction.fault_latch_generation = latch_generation;
-      reduced = transaction.proof_predecessor_scopes.empty()
-                    ? ReduceStopTerminal(reduction)
-                    : internal::ReduceStopTerminalWithProofScopes(
-                          reduction, transaction.proof_predecessor_scopes);
-    }
     if (!reduced.ok()) {
       return false;
     }
@@ -3290,11 +2381,6 @@ bool ResourceAddressedExecutionKernel::commit_stop_terminal_locked(
           ErrorDTO{"operation_journal_stop_terminal_projection_capacity_exhausted",
                    "Stop terminal forensic projection capacity is exhausted",
                    {}};
-      transaction.persistence_degraded = true;
-      motion_admission_closed_ = true;
-      if (!assign_latch_identity()) {
-        return false;
-      }
     }
     const auto terminal_projection_status =
         projection_capacity_error.has_value()
@@ -3302,75 +2388,6 @@ bool ResourceAddressedExecutionKernel::commit_stop_terminal_locked(
                                              projection_capacity_error, 1U}
             : StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kPending, std::nullopt,
                                              std::nullopt};
-    std::optional<StopFaultLatchDTO> latch;
-    if (transaction.fault_latch.has_value() ||
-        terminal_fault_required(certificate, transaction.persistence_degraded)) {
-      if (!latch_id.has_value() || !latch_generation.has_value() ||
-          !stop_retained_bundle_id_.has_value() || !stop_graph_revision_.has_value()) {
-        return false;
-      }
-      const StopCertificateRefDTO reference{certificate.stop_certificate_id,
-                                            certificate.stop_certificate_revision,
-                                            certificate.stop_id, certificate.stop_generation};
-      auto [operations, resources] = fault_latch_capture(certificate);
-      const auto certificate_trigger =
-          primary_fault_trigger(certificate, transaction.persistence_degraded);
-      auto trigger = certificate_trigger;
-      if (transaction.fault_latch.has_value() &&
-          fault_trigger_priority(transaction.fault_latch->trigger) >
-              fault_trigger_priority(trigger))
-        trigger = transaction.fault_latch->trigger;
-      latch = StopFaultLatchDTO{
-          config_.cell_id,
-          certificate.stop_id,
-          certificate.stop_generation,
-          reference,
-          *latch_id,
-          *latch_generation,
-          trigger,
-          transaction.persistence_degraded,
-          std::move(operations),
-          std::move(resources),
-          *stop_retained_bundle_id_,
-          *stop_graph_revision_,
-          terminal_projection_status,
-          StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kNotApplicable,
-                                         std::nullopt, std::nullopt},
-          StopFaultLatchStateDTO::kLatched,
-          transaction.fault_latch.has_value()
-              ? transaction.fault_latch->recovery_assessment_revision + 1U
-              : 1U,
-          StopFaultRecoveryStatusDTO::kWaitingForObservation,
-          fault_trigger_reason(trigger),
-          {},
-          transaction.fault_latch.has_value() ? transaction.fault_latch->observed_triggers
-                                              : std::vector<StopFaultTriggerDTO>{}};
-      observe_fault_trigger(*latch, trigger);
-      observe_fault_trigger(*latch, certificate_trigger);
-      if (stop_fault_latch_field_error(*latch).has_value()) {
-        return false;
-      }
-    }
-    std::unique_ptr<StopSurveillanceReducerState> surveillance_state;
-    if (latch.has_value() && stop_requires_surveillance(certificate, *latch)) {
-      if (!config_.stop_surveillance.has_value()) {
-        motion_admission_closed_ = true;
-      } else {
-        auto source_plans = stop_surveillance_source_plans(certificate);
-        if (!source_plans.ok()) {
-          motion_admission_closed_ = true;
-        } else {
-          auto seeded = MakeStopSurveillanceReducerState(
-              config_.request_owner_epoch, 1U, certificate, *latch,
-              config_.stop_surveillance->policy, std::move(source_plans.value()));
-          if (!seeded.ok()) {
-            return false;
-          }
-          surveillance_state =
-              std::make_unique<StopSurveillanceReducerState>(std::move(seeded.value()));
-        }
-      }
-    }
     const auto terminal_state = [&] {
       switch (certificate.result) {
         case StopCertificateResultDTO::kSucceededNominal:
@@ -3403,12 +2420,6 @@ bool ResourceAddressedExecutionKernel::commit_stop_terminal_locked(
           StopDurableProjectionStateDTO::kFailed,
           ErrorDTO{"stop_projection_state_invalid", "Stop projection state is invalid", {}}, 1U};
     }();
-    const auto surveillance_projection =
-        surveillance_state != nullptr
-            ? StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kPending, std::nullopt,
-                                             std::nullopt}
-            : StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kNotApplicable,
-                                             std::nullopt, std::nullopt};
     StopStatusDTO status{*transaction.accepted,
                          terminal_state,
                          certificate.scope_entries,
@@ -3419,15 +2430,10 @@ bool ResourceAddressedExecutionKernel::commit_stop_terminal_locked(
                          certificate.failed,
                          acceptance_projection,
                          terminal_projection_status,
-                         surveillance_projection,
                          StopCertificateRefDTO{certificate.stop_certificate_id,
                                                certificate.stop_certificate_revision,
-                                               certificate.stop_id, certificate.stop_generation},
-                         latch,
-                         surveillance_state != nullptr
-                             ? std::optional(surveillance_state->projection)
-                             : std::nullopt};
-    if (stop_terminal_projection_field_error(status, certificate, latch).has_value()) {
+                                               certificate.stop_id, certificate.stop_generation}};
+    if (stop_terminal_projection_field_error(status, certificate).has_value()) {
       return false;
     }
     if (stop_terminal_history_.size() == kMaximumResidentStopTerminalRecords) {
@@ -3451,11 +2457,6 @@ bool ResourceAddressedExecutionKernel::commit_stop_terminal_locked(
             return record != nullptr &&
                    record->status.terminal_projection.state ==
                        StopDurableProjectionStateDTO::kRecorded &&
-                   (!record->fault_latch.has_value() ||
-                    record->fault_latch->state == StopFaultLatchStateDTO::kCleared) &&
-                   (!record->status.surveillance.has_value() ||
-                    record->status.surveillance->state ==
-                        StopPostTerminalSurveillanceStateDTO::kQuiescenceObserved) &&
                    !referenced_by_live_aggregate(*record);
           });
       if (compactable == stop_terminal_history_.end()) {
@@ -3472,7 +2473,6 @@ bool ResourceAddressedExecutionKernel::commit_stop_terminal_locked(
       auto& projection = *stop_projection_jobs_[projection_token->slot];
       projection.terminal_status = status;
       projection.terminal_certificate = certificate;
-      projection.terminal_fault_latch = latch;
       const auto snapshot_ids = stop_operation_snapshot_ids(transaction);
       projection.terminal_operation_states.reserve(snapshot_ids.size());
       for (const auto& operation_id : snapshot_ids) {
@@ -3496,22 +2496,8 @@ bool ResourceAddressedExecutionKernel::commit_stop_terminal_locked(
         projection.terminal_operation_states.push_back(operation->state);
       }
     }
-    std::int64_t first_surveillance_sample_ns = 0;
-    std::int64_t first_surveillance_checkpoint_ns = 0;
-    if (surveillance_state != nullptr) {
-      const auto& policy = config_.stop_surveillance->policy;
-      if (completed_at_ns > std::numeric_limits<std::int64_t>::max() - policy.sample_cadence_ns ||
-          completed_at_ns >
-              std::numeric_limits<std::int64_t>::max() - policy.checkpoint_interval_ns) {
-        return false;
-      }
-      first_surveillance_sample_ns = completed_at_ns + policy.sample_cadence_ns;
-      first_surveillance_checkpoint_ns = completed_at_ns + policy.checkpoint_interval_ns;
-    }
-    auto record = std::make_unique<StopTerminalRecord>(StopTerminalRecord{
-        status, certificate, latch, projection_token, std::move(surveillance_state), std::nullopt,
-        0U, false, std::nullopt, first_surveillance_sample_ns, first_surveillance_checkpoint_ns,
-        transaction.accepted});
+    auto record = std::make_unique<StopTerminalRecord>(
+        StopTerminalRecord{status, certificate, projection_token, transaction.accepted});
     transaction.certificate = certificate;
     finalize_io_rule_stop_locked(transaction, certificate);
     if (projection_token) {
@@ -3521,7 +2507,6 @@ bool ResourceAddressedExecutionKernel::commit_stop_terminal_locked(
         if (operation) state = operation->state;
       }
     }
-    transaction.fault_latch = latch;
     transaction.terminal_projection_token = projection_token;
     stop_terminal_history_.push_back(std::move(record));
     for (const auto& operation_id : transaction.operations) {
@@ -3610,14 +2595,6 @@ bool ResourceAddressedExecutionKernel::commit_stop_terminal_locked(
       }
     }
     reduce_program_selection_stop_locked(certificate);
-    if (latch.has_value()) {
-      cell_stop_fault_latch_generation_ =
-          std::max(cell_stop_fault_latch_generation_, *latch_generation);
-      if (!is_active_stop_fault_latch(active_stop_fault_latch_) ||
-          active_stop_fault_latch_->latch_generation <= *latch_generation)
-        active_stop_fault_latch_ = *latch;
-      motion_admission_closed_ = true;
-    }
     static_cast<void>(
         emergency_stop_reserve_.release_after_terminal_handoff(transaction.stop_id->value()));
     return true;
@@ -3633,8 +2610,6 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
       if (!takeover_source_wakeup) return;
       try { static_cast<void>(advance_motion_takeover(*takeover_source_wakeup)); }
       catch (...) {
-        std::lock_guard lock(state_mutex_);
-        motion_admission_closed_ = true;
       }
     });
     // Q60: late cancellation replies of never-dispatched participants whose
@@ -3661,12 +2636,10 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
     std::vector<AddressedParticipantStopSettlement> participant_settlements;
     std::vector<OperationControlEffectRequest> reset_effects;
     std::optional<StopControlWorkToken> terminal_projection;
-    std::optional<std::pair<StopCertificateId, std::int64_t>> surveillance_schedule;
     bool transaction_became_terminal = false;
     {
       std::lock_guard state_lock(state_mutex_);
       if (!token.locally_valid() || token.slot >= stop_transactions_.size()) {
-        motion_admission_closed_ = true;
         return;
       }
       auto& transaction = *stop_transactions_[token.slot];
@@ -3700,7 +2673,6 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
           const auto* operation = find_active_operation_locked(operation_id);
           if (operation == nullptr ||
               operation->state.participants.size() != operation->participants.size()) {
-            motion_admission_closed_ = true;
             continue;
           }
           const auto accepted_revision =
@@ -3711,7 +2683,6 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                                });
           if (accepted_revision == transaction.accepted->affected_operation_revisions.end() ||
               accepted_revision->operation_id != operation_id) {
-            motion_admission_closed_ = true;
             continue;
           }
           for (std::size_t index = 0U; index < operation->participants.size(); ++index) {
@@ -3741,7 +2712,6 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                     : active_participant.ordinary_stop_plan;
             if (selected_active_stop_plan == nullptr ||
                 active_participant.slot_owner.participant_id != participant_state.participant_id) {
-              motion_admission_closed_ = true;
               continue;
             }
             const auto* effective_plan = selected_active_stop_plan.get();
@@ -3816,7 +2786,6 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                                      std::nullopt};
             if (initial_interrupt) {
               if (!VerifyPreparedIoRuleStopEntry(work.plan, initial_interrupt->stop_entry).ok()) {
-                motion_admission_closed_ = true;
                 continue;
               }
               work.current_stage_index =
@@ -3825,7 +2794,6 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
             }
             if (initial_global) {
               if (!VerifyPreparedIoRuleStopEntry(work.plan, initial_global->stop_entry).ok()) {
-                motion_admission_closed_ = true;
                 continue;
               }
               work.current_stage_index =
@@ -3899,7 +2867,7 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
           if (!item.terminal && !item.cancelled_pre_dispatch && collision_error.has_value()) {
             if (!item.stop_path_collision.has_value()) item.stop_path_collision = collision_error;
             // Q29: the participant ends InterventionRequired with the
-            // collision; no cell-wide Stop-fault latch (as `main`).
+            // collision (as `main`).
             const auto strongest = item.plan.stage_commands.empty()
                                        ? std::size_t{0}
                                        : item.plan.stage_commands.size() - 1U;
@@ -3975,7 +2943,6 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
           } else if (item.unclassified_prepared_terminal.has_value()) {
             if (item.prepared_motion_engine == nullptr || item.prepared_execution_id == 0U) {
               fail_prepared_cancellation(item, *item.unclassified_prepared_terminal);
-              motion_admission_closed_ = true;
             } else {
               if (!item.prepared_classification_requested) {
                 item.prepared_classification_requested = true;
@@ -4043,10 +3010,7 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
             continue;
           }
           attempt.result_consumed = true;
-          const auto released = stop_stage_attempt_executor_->Release(*attempt.handle);
-          if (released != StopStageAttemptReleaseStatus::kReleased) {
-            motion_admission_closed_ = true;
-          }
+          static_cast<void>(stop_stage_attempt_executor_->Release(*attempt.handle));
           if (result.status == StopStageAttemptTakeStatus::kCompleted &&
               result.result.has_value()) {
             auto valid = ValidateParticipantStopStageResult(
@@ -4202,7 +3166,6 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
         auto* operation = find_active_operation_locked(item.operation_id);
         if (operation == nullptr || operation->state.active_stop_id != stop_id ||
             operation->state.active_stop_generation != stop_generation) {
-          motion_admission_closed_ = true;
           continue;
         }
         const auto participant_state =
@@ -4217,7 +3180,6 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                          });
         if (participant_state == operation->state.participants.end() ||
             active_participant == operation->participants.end()) {
-          motion_admission_closed_ = true;
           continue;
         }
         const bool participant_settlement_required = !item.settlement_not_required();
@@ -4239,7 +3201,6 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                   error(std::string(to_string(ErrorCode::kInvariantViolation)),
                         "Stopped participant lost its local execution owner",
                         "participant_stop_settlement_authority_missing");
-              motion_admission_closed_ = true;
             } else {
               std::optional<ParticipantStopStageResultDTO> settlement_evidence;
               if (item.cancelled_pre_dispatch) {
@@ -4264,7 +3225,6 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                 } else {
                   item.participant_settlement_complete = true;
                   item.participant_settlement_error = stage.error();
-                  motion_admission_closed_ = true;
                 }
               } else {
                 const auto containment = std::find_if(
@@ -4285,7 +3245,6 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                     error(std::string(to_string(ErrorCode::kInvariantViolation)),
                           "Contained participant has no exact containment result",
                           "participant_stop_containment_result_missing");
-                motion_admission_closed_ = true;
               } else if (settlement_evidence.has_value()) {
                 AddressedParticipantStopSettlementRequestDTO settlement_request{
                     item.prepared_execution_id,
@@ -4318,7 +3277,6 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
         }
         const auto rules_retired = retire_participant_io_rules_locked(*active_participant);
         if (!rules_retired.ok()) {
-          motion_admission_closed_ = true;
           item.participant_settlement_error = rules_retired.error();
         }
         const bool io_source_failed = std::any_of(
@@ -4426,7 +3384,6 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
           if (transitioned.ok()) {
             active_participant->slot_state = ResourceSlotState::kTerminal;
           } else {
-            motion_admission_closed_ = true;
             operation->state.state = OperationStateKind::kInterventionRequired;
             participant_state->state = OperationStateKind::kInterventionRequired;
             participant_state->terminal_error = transitioned.error();
@@ -4498,7 +3455,6 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
           // fresh-scope truth has been reduced and retained locally.
           if (!commit_stop_terminal_locked(transaction, now)) {
             transaction.progress_in_flight = false;
-            motion_admission_closed_ = true;
             return;
           }
           transaction.terminal = true;
@@ -4549,10 +3505,8 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                   // Reuse this Stop's already-reserved durable projection;
                   // never perform ordinary fault I/O on the Stop worker.
                   retain_terminal_capture(fault);
-                } else if (!settle_control_operation_locked(operation_id,
-                                                            OperationControlKind::kReset)
-                                .ok()) {
-                  motion_admission_closed_ = true;
+                } else {
+                  (void)settle_control_operation_locked(operation_id, OperationControlKind::kReset);
                 }
               }
               continue;
@@ -4564,7 +3518,6 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
               operation->state.state = OperationStateKind::kInterventionRequired;
               operation->state.updated_at_ns = now;
               operation->pending_control.reset();
-              motion_admission_closed_ = true;
               continue;
             }
             pending.superseded_by_stop = false;
@@ -4574,10 +3527,7 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
             pending.expected_effects = requests.value().size();
             pending.effects_dispatched = true;
             if (requests.value().empty()) {
-              if (!settle_control_operation_locked(operation_id, OperationControlKind::kReset)
-                       .ok()) {
-                motion_admission_closed_ = true;
-              }
+              (void)settle_control_operation_locked(operation_id, OperationControlKind::kReset);
               continue;
             }
             reset_effects.insert(reset_effects.end(),
@@ -4587,19 +3537,6 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
           if (transaction.acceptance_projection_state !=
               EmergencyStopProjectionStateDTO::kPending) {
             terminal_projection = transaction.terminal_projection_token;
-          }
-          const auto terminal_record = std::find_if(
-              stop_terminal_history_.begin(), stop_terminal_history_.end(),
-              [&](const auto& record) {
-                return record != nullptr &&
-                       record->certificate.stop_id == transaction.certificate->stop_id &&
-                       record->certificate.stop_generation ==
-                           transaction.certificate->stop_generation;
-              });
-          if (terminal_record != stop_terminal_history_.end() &&
-              (*terminal_record)->surveillance_state != nullptr) {
-            surveillance_schedule = std::pair((*terminal_record)->certificate.stop_certificate_id,
-                                              (*terminal_record)->next_surveillance_sample_ns);
           }
           for (const auto& candidate : stop_transactions_) {
             if (candidate == nullptr || !candidate->active || candidate->terminal) {
@@ -4683,7 +3620,6 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
       }
       std::lock_guard state_lock(state_mutex_);
       if (token.slot >= stop_transactions_.size()) {
-        motion_admission_closed_ = true;
         continue;
       }
       auto& transaction = *stop_transactions_[token.slot];
@@ -4699,7 +3635,6 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
       if (item == transaction.participants.end() ||
           item->prepared_execution_id != handoff.request.execution_id ||
           !item->participant_settlement_requested) {
-        motion_admission_closed_ = true;
         continue;
       }
       item->participant_settlement_complete = true;
@@ -4762,7 +3697,6 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
       {
         std::lock_guard state_lock(state_mutex_);
         if (token.slot >= stop_transactions_.size()) {
-          motion_admission_closed_ = true;
           continue;
         }
         auto& transaction = *stop_transactions_[token.slot];
@@ -4777,7 +3711,6 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
                          });
         if (item == transaction.participants.end() ||
             item->prepared_execution_id != cancellation.execution_id) {
-          motion_admission_closed_ = true;
           continue;
         }
         item->prepared_cancel_complete = true;
@@ -4792,7 +3725,6 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
           observe_prepared_cancellation_terminal(
               *item, current->execution_id, participant_operation_state(*current),
               participant_fact_error(*current).value_or(status_error(current->last_error)));
-          if (item->terminal_error.has_value()) motion_admission_closed_ = true;
         }
       }
     }
@@ -4809,7 +3741,6 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
       }
       std::lock_guard state_lock(state_mutex_);
       if (token.slot >= stop_transactions_.size()) {
-        motion_admission_closed_ = true;
         continue;
       }
       auto& transaction = *stop_transactions_[token.slot];
@@ -4823,7 +3754,6 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
       if (item == transaction.participants.end() ||
           item->prepared_execution_id != classification.execution_id ||
           !item->unclassified_prepared_terminal.has_value()) {
-        motion_admission_closed_ = true;
         continue;
       }
       if (prepared.has_value() && prepared->execution_id == classification.execution_id &&
@@ -4833,7 +3763,6 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
             *item, prepared->error.value_or(*item->unclassified_prepared_terminal));
       } else {
         fail_prepared_cancellation(*item, *item->unclassified_prepared_terminal);
-        motion_admission_closed_ = true;
       }
     }
     if (!prepared_cancellations.empty() || !prepared_classifications.empty() ||
@@ -4850,10 +3779,6 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
       auto started = operation_control_executor_->TryStart(std::move(effect));
       if (started.status == OperationControlEffectStartStatus::kStarted) {
         continue;
-      }
-      {
-        std::lock_guard state_lock(state_mutex_);
-        motion_admission_closed_ = true;
       }
       CompleteOperationControlEffect(OperationControlEffectResult{
           identity.operation_id, identity.participant_id, identity.operation_revision,
@@ -4883,14 +3808,8 @@ void ResourceAddressedExecutionKernel::ProgressStop(const StopControlWorkToken t
       for (const auto& dependent : dependents) {
         stop_control_executor_->Publish(dependent);
       }
-      if (surveillance_schedule.has_value()) {
-        ScheduleStopSurveillance(std::move(surveillance_schedule->first),
-                                 surveillance_schedule->second);
-      }
     }
   } catch (...) {
-    std::lock_guard state_lock(state_mutex_);
-    motion_admission_closed_ = true;
     if (token.locally_valid() && token.slot < stop_transactions_.size()) {
       auto& transaction = *stop_transactions_[token.slot];
       if (transaction.active && transaction.token == token) {

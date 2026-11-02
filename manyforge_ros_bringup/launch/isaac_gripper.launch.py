@@ -17,7 +17,6 @@ from launch.actions import DeclareLaunchArgument, EmitEvent, OpaqueFunction
 from launch.events import Shutdown
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
-from launch_ros.substitutions import FindPackageShare
 
 from manyforge_ros_bringup.launch_signals import keep_sigint_out_of_tasks
 
@@ -38,8 +37,9 @@ def generate_launch_description() -> LaunchDescription:
                 "gripper_bridge_parameters",
                 default_value="",
                 description=(
-                    "The bridge parameters file in this package's config "
-                    "directory; empty (a direct transport) starts no bridge."
+                    "The absolute bridge parameters file (the Isaac lane's "
+                    "gripper_bridges/); empty (a direct transport) starts no "
+                    "bridge."
                 ),
             ),
             DeclareLaunchArgument("gripper_action_name", default_value=""),
@@ -90,9 +90,11 @@ def _launch_setup(context, *_, **__) -> list[object]:
     ]
     bridge_parameters = value("gripper_bridge_parameters")
     if bridge_parameters:
-        package_share = Path(
-            FindPackageShare("manyforge_ros_bringup").find("manyforge_ros_bringup")
-        )
+        bridge_path = Path(bridge_parameters)
+        if not bridge_path.is_absolute() or not bridge_path.is_file():
+            raise ValueError(
+                f"gripper_bridge_parameters must be an absolute file: {bridge_path}"
+            )
         actions.append(
             Node(
                 package="manyforge_ros_bringup",
@@ -102,7 +104,7 @@ def _launch_setup(context, *_, **__) -> list[object]:
                 output="screen",
                 ros_arguments=["--disable-external-lib-logs"],
                 parameters=[
-                    str(package_share / "config" / bridge_parameters),
+                    str(bridge_path),
                     {
                         "action_name": f"{namespace}/{value('gripper_action_name')}",
                         "command_topic": value("gripper_command_topic"),

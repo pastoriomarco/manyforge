@@ -51,11 +51,10 @@ def _intervention(
         "control_command_epoch": 8,
         "evidence_refs": ["event.1"],
         "execution_id": 9,
-        "latch_id": "latch.1",
         "observed_state_valid_until_ns": 0,
         "operation_revision": 10,
         "participants": [{"operation_participant_id": "participant.1"}],
-        "recovery_class": "stop_fault_intervention",
+        "recovery_class": "ordinary_operator_stop",
         "status": "action_required",
         "stop_certificate_id": "certificate.1",
         "stop_certificate_revision": 2,
@@ -743,7 +742,6 @@ def test_never_dispatched_owner_failure_offers_retry_under_captured_policy() -> 
         "control_command_epoch": 0,
         "evidence_refs": [],
         "execution_id": 22,
-        "latch_id": "",
         "observed_state_valid_until_ns": 0,
         "operation_revision": 1,
         "participants": [{"operation_participant_id": "participant.1"}],
@@ -853,7 +851,6 @@ def test_f6a_program_stop_failure_hold_offers_retry_continue_and_reset() -> None
         **held.owner_assessment,
         "allowed_actions": ["replan_from_stopped_state", "reset_cycle"],
         "eligible_close": True,
-        "latch_id": "",
         "recovery_class": "ordinary_program_stop",
         "status": "retry_ready",
     }
@@ -876,50 +873,6 @@ def test_f6a_program_stop_failure_hold_offers_retry_continue_and_reset() -> None
     assert retry["enabled"] is False
     assert retry["disabled_reason_code"] == "recovery_retry_limit_reached"
     assert _continue_action(exhausted)["enabled"] is True
-
-
-def test_item11_unconfirmed_stop_hold_offers_continue_as_its_acknowledge() -> None:
-    """Item 11: an unconfirmed Program Stop holds whatever the node's policy,
-    on an undecided assessment. Its Continue (the operator's Acknowledge) is
-    enabled anyway, still with confirmation, and still waits for confirmed
-    containment like any Continue."""
-
-    controls = ProgramRuntimeControls(_capture(), recovery_fences=_fences())
-    held = _intervention()
-    held.reason_code = "program_stop_settlement_unconfirmed"
-    held.owner_assessment = {
-        **held.owner_assessment,
-        "eligible_close": False,
-        "observed_state_valid_until_ns": time.monotonic_ns() - 1,
-        "recovery_class": "ordinary_program_stop",
-        "status": "waiting",
-    }
-    default_policy = {"allow_intervention": False, "max_retries": 0}
-    offer = controls.recovery_offer(
-        cycle_generation=6, owner_epoch="runner.epoch.1", intervention=held, policy=default_policy
-    )
-    action = _continue_action(offer)
-    assert action["enabled"] is True
-    assert action["disabled_reason_code"] is None
-    assert action["requires_confirmation"] is True
-    assert offer["reason_code"] == "program_stop_settlement_unconfirmed"
-    pending = controls.recovery_offer(
-        cycle_generation=6,
-        owner_epoch="runner.epoch.1",
-        intervention=held,
-        policy=default_policy,
-        containment_pending=True,
-    )
-    assert _continue_action(pending)["enabled"] is False
-    assert _continue_action(pending)["disabled_reason_code"] == (
-        "failure_pause_containment_unconfirmed"
-    )
-    # Any other hold keeps its policy and close gates.
-    held.reason_code = "interrupt_fault"
-    other = controls.recovery_offer(
-        cycle_generation=6, owner_epoch="runner.epoch.1", intervention=held, policy=default_policy
-    )
-    assert _continue_action(other)["enabled"] is False
 
 
 def test_each_held_node_keeps_its_own_stable_offer() -> None:

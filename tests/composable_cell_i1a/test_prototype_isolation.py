@@ -17,12 +17,10 @@ PRODUCTION_ROOTS = (
     "manyforge_medkit_adapter",
     "manyforge_nodes",
     "manyforge_roboplan",
-    "manyforge_cclc_msgs",
     "manyforge_ros",
     "manyforge_ros2_control_execution",
     "manyforge_ros_bringup",
     "manyforge_supervision",
-    "manyforge_xarm_adapter",
     "manyforge_xarm_control",
     "scripts",
 )

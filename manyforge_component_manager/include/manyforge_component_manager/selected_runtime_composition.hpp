@@ -2,14 +2,14 @@
 
 #include <cstdint>
 #include <manyforge_component_manager/runtime_observation.hpp>
-#include <manyforge_core/ports/icclc_journal.hpp>
 #include <manyforge_core/types/active_bundle_publication.hpp>
+#include <manyforge_core/types/component_lifecycle.hpp>
 #include <manyforge_core/types/configuration_fence.hpp>
 #include <manyforge_core/types/controller_launch_group_drain.hpp>
-#include <manyforge_core/types/lifecycle_target.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/types/projection_common.hpp>
 #include <manyforge_deployment/apply_component_delta.hpp>
+#include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -17,189 +17,64 @@
 
 namespace manyforge::component_manager {
 
-enum class ManagerSelectedRuntimeCompositionPhase {
-  kPrepare,
-  kFinalize,
-};
-
 /// The native host's clean refusal of one prepared candidate: composing it
 /// found a data or setup inconsistency. The candidate was never installed or
 /// published; `details.cause` carries the original message. Its effects are
 /// known, so the Apply ends `failed`, never `unknown_effect`.
 inline constexpr std::string_view kScenarioCompositionRefusedCode =
     "scenario_composition_refused";
-/// The producer of that refusal (the native execution host).
+/// The producer of that refusal (the execution host).
 inline constexpr std::string_view kExecutionHostProducer = "execution_host";
 
-/// Exact Manager-to-managed-host request to install the already selected
-/// product composition while its durable Kernel configuration fence is held.
-/// This is a private Apply effect, not caller authorization or a command
-/// session.
-struct ManagerSelectedRuntimeCompositionRequestDTO final {
-  manyforge::core::ContentDigest authoritative_scene_snapshot_digest;
-  manyforge::core::ApplyId apply_id;
-  manyforge::core::ApplyGeneration apply_generation;
-  manyforge::core::ProjectionRevisionDTO candidate_projection_revision;
-  manyforge::core::ActiveBundlePublicationGeneration
-      expected_predecessor_publication_generation;
-  manyforge::core::ContentDigest expected_predecessor_public_pointer_digest;
-  manyforge::core::ContentDigest retained_bundle_canonical_content_digest;
-  std::uint64_t retained_bundle_canonical_byte_size{};
-  manyforge::core::RuntimeUnitId runtime_unit_id;
-  manyforge::core::RuntimeEpoch runtime_epoch;
-  manyforge::core::RuntimeEpoch manager_runtime_epoch;
-  manyforge::core::ConfigurationFenceId configuration_fence_id;
-  manyforge::core::ConfigurationFenceGeneration configuration_fence_generation;
-  manyforge::core::ConfigurationFenceScopeDTO configuration_fence_scope;
-  ManagerSelectedRuntimeCompositionPhase phase{
-      ManagerSelectedRuntimeCompositionPhase::kFinalize};
-  /// The exact per-component decision Manager persisted with the fence scope
-  /// before any effect. The host changes only the non-retained components.
-  ///
-  /// kRetain keeps the component's controller lifetime: engines, controller
-  /// connections, observed-state source, owner epoch, eligibility and
-  /// lifecycle/route generations. Its product-bound participant bindings and
-  /// Kernel registrations are still re-sealed to the candidate bundle and
-  /// graph revision whenever the product identity changes; equal runtime
-  /// identities prove that the re-seal changes no runtime-defining fact. The
-  /// host derives the candidate bindings from the verified candidate bundle;
-  /// the delta carries no second Deployment representation.
-  manyforge::deployment::ApplyComponentDeltaDTO component_delta;
-  /// The active product the retained controllers are currently sealed to.
-  /// The host verifies its live registrations against it before re-sealing.
-  manyforge::core::ProjectionRevisionDTO predecessor_projection_revision;
+/// CONTRACTS §15: the Manager's one Apply call to the execution host, made
+/// while the Apply's Kernel configuration fence is held. The host refuses
+/// `apply_requires_inactive_component` for an enabled replaced or removed
+/// component (dead or faulted ones are accepted, and so is one whose Disable
+/// failed, N28), stops removed and replaced
+/// components, installs the candidate bundle, hands the new component set to
+/// its component runtime and closes the routes of removed domains.
+struct HostApplyRequest final {
+  manyforge::core::NamedApplyPublicationTransactionDTO apply;
+  manyforge::core::RetainedBundleId candidate_retained_bundle_id;
+  manyforge::core::GraphRevision candidate_graph_revision;
+  /// Every candidate component, sorted.
+  std::vector<manyforge::core::ControllableComponentId> components;
+  /// The subset of `components` the Apply keeps (delta kRetain), sorted.
+  std::vector<manyforge::core::ControllableComponentId> retained_components;
+  /// Predecessor components the candidate drops, sorted.
+  std::vector<manyforge::core::ControllableComponentId> removed_components;
+  /// Predecessor control domains the candidate drops, sorted.
+  std::vector<manyforge::core::ControlDomainId> removed_domains;
 
   [[nodiscard]] bool valid() const noexcept;
-
-  friend bool
-  operator==(const ManagerSelectedRuntimeCompositionRequestDTO &,
-             const ManagerSelectedRuntimeCompositionRequestDTO &) = default;
+  friend bool operator==(const HostApplyRequest &, const HostApplyRequest &) = default;
 };
 
-/// The host's live-owner evidence for one non-removed delta row after
-/// installation. A retained component reports the predecessor runtime it
-/// kept; an added or replaced one reports the runtime it installed.
-struct ManagerRuntimeComponentReceiptDTO final {
-  manyforge::core::ControllableComponentId controllable_component_id;
-  manyforge::deployment::ApplyComponentDisposition disposition{
-      manyforge::deployment::ApplyComponentDisposition::kRetain};
-  std::optional<manyforge::core::ContentDigest> installed_runtime_identity;
-  std::vector<manyforge::core::RuntimeUnitEpochBindingDTO> runtime_unit_epochs;
-  bool predecessor_runtime_retained{false};
-  /// For kRetain: the retained controller's product-bound bindings and
-  /// registrations were re-sealed to the candidate product without engine
-  /// reconstruction. Always false for added/replaced components, which are
-  /// installed fresh against the candidate.
-  bool product_binding_resealed{false};
-
-  [[nodiscard]] bool valid() const noexcept;
-
-  friend bool operator==(const ManagerRuntimeComponentReceiptDTO &,
-                         const ManagerRuntimeComponentReceiptDTO &) = default;
+enum class HostApplyOutcome : std::uint8_t {
+  kSucceeded = 0,
+  kFailed = 1,
 };
 
-/// Exact receipt check against the request: one receipt per non-removed
-/// delta row in delta order, the planned identity, exactly the request's
-/// managed runtime unit at its runtime epoch. Disposition echoes the authored
-/// delta; retention reports the actual retained owner. A re-seal is required
-/// exactly for actual retained owners when the product changes. Removed rows
-/// have no receipt.
-[[nodiscard]] bool ComponentReceiptsMatchRequest(
-    const ManagerSelectedRuntimeCompositionRequestDTO &request,
-    const std::vector<ManagerRuntimeComponentReceiptDTO> &receipts) noexcept;
+struct HostApplyResult final {
+  HostApplyOutcome outcome{HostApplyOutcome::kFailed};
+  /// Present exactly when `outcome` is kFailed.
+  std::optional<manyforge::core::ErrorDTO> error{};
 
-enum class ManagerSelectedRuntimeCompositionState {
-  kPreparing,
-  kInstalled,
+  [[nodiscard]] bool valid() const noexcept {
+    return (outcome == HostApplyOutcome::kSucceeded) != error.has_value() &&
+           (!error || (!error->code.empty() && !error->message.empty()));
+  }
+  friend bool operator==(const HostApplyResult &, const HostApplyResult &) = default;
 };
 
-struct ManagerSelectedRuntimeCompositionResultDTO final {
-  ManagerSelectedRuntimeCompositionRequestDTO request;
-  ManagerSelectedRuntimeCompositionState state;
-  /// Canonical per-component receipts, sorted by component id. Required and
-  /// checked by Manager once a finalize request reports kInstalled.
-  std::vector<ManagerRuntimeComponentReceiptDTO> component_receipts;
+/// Derive the request from the exact sealed bundles and the Apply's durable
+/// per-component delta.
+[[nodiscard]] HostApplyRequest MakeHostApplyRequest(
+    const manyforge::core::NamedApplyPublicationTransactionDTO &apply,
+    const manyforge::deployment::RetainedBundle &predecessor,
+    const manyforge::deployment::RetainedBundle &candidate,
+    const manyforge::deployment::ApplyComponentDeltaDTO &delta);
 
-  [[nodiscard]] bool valid() const noexcept;
-
-  friend bool
-  operator==(const ManagerSelectedRuntimeCompositionResultDTO &,
-             const ManagerSelectedRuntimeCompositionResultDTO &) = default;
-};
-
-/// Private selected Enable expectations. CCLC owns transaction/claim/fence
-/// identities; these references and epochs never authorize an effect.
-struct ManagerSelectedComponentBringUpRequestDTO final {
-  manyforge::core::ComponentLifecycleIntentDTO intent;
-  manyforge::core::ProjectionRevisionDTO candidate_projection_revision;
-  manyforge::core::ContentDigest candidate_retained_bundle_digest;
-  std::uint64_t candidate_retained_bundle_bytes{};
-  manyforge::core::RuntimeUnitId runtime_unit_id;
-  manyforge::core::RuntimeEpoch runtime_epoch;
-  manyforge::core::RuntimeEpoch manager_runtime_epoch;
-
-  [[nodiscard]] bool valid() const noexcept;
-
-  friend bool
-  operator==(const ManagerSelectedComponentBringUpRequestDTO &,
-             const ManagerSelectedComponentBringUpRequestDTO &) = default;
-};
-
-struct ManagerSelectedComponentBringUpReadRequestDTO final {
-  ManagerSelectedComponentBringUpRequestDTO request;
-
-  [[nodiscard]] bool valid() const noexcept;
-
-  friend bool
-  operator==(const ManagerSelectedComponentBringUpReadRequestDTO &,
-             const ManagerSelectedComponentBringUpReadRequestDTO &) = default;
-};
-
-struct ManagerSelectedComponentBringUpResultDTO final {
-  ManagerSelectedComponentBringUpRequestDTO request;
-  /// Absence is an unknown READ only. The SUBMIT caller/dispatcher must
-  /// require a present result; absence never means unsupported or accepted.
-  std::optional<manyforge::core::CCLCLifecycleRequestResultDTO> result;
-
-  [[nodiscard]] bool valid() const;
-};
-
-/// Private Prepare/Enable delegation by an existing Apply parent. These
-/// values are evidence references, not proof of a live held continuation.
-struct ManagerApplyComponentBringUpRequestDTO final {
-  manyforge::core::ComponentLifecycleIntentDTO intent;
-  manyforge::core::ProjectionRevisionDTO candidate_projection_revision;
-  manyforge::core::ContentDigest candidate_retained_bundle_digest;
-  std::uint64_t candidate_retained_bundle_bytes{};
-  manyforge::core::RuntimeUnitId runtime_unit_id;
-  manyforge::core::RuntimeEpoch runtime_epoch;
-  manyforge::core::RuntimeEpoch manager_runtime_epoch;
-  manyforge::core::ApplyComponentBringUpAuthorityDTO parent_authority;
-
-  [[nodiscard]] bool valid() const noexcept;
-
-  friend bool operator==(const ManagerApplyComponentBringUpRequestDTO &,
-                         const ManagerApplyComponentBringUpRequestDTO &) = default;
-};
-
-struct ManagerApplyComponentBringUpReadRequestDTO final {
-  ManagerApplyComponentBringUpRequestDTO request;
-  [[nodiscard]] bool valid() const noexcept;
-
-  friend bool operator==(const ManagerApplyComponentBringUpReadRequestDTO &,
-                         const ManagerApplyComponentBringUpReadRequestDTO &) = default;
-};
-
-struct ManagerApplyComponentBringUpResultDTO final {
-  ManagerApplyComponentBringUpRequestDTO request;
-  /// Absence is an unknown READ only; SUBMIT must require a present result.
-  std::optional<manyforge::core::CCLCLifecycleRequestResultDTO> result;
-  [[nodiscard]] bool valid() const;
-};
-
-/// Read-only candidate preflight. No Apply or CCLC identity is minted here.
-/// Manager binds the genuine predecessor and original process epochs; the host
-/// verifies the whole candidate and reports actual component process presence.
 /// Current installed-owner read; independent of any candidate component list.
 struct ManagerComponentProcessInventoryRequestDTO final {
   manyforge::core::ProjectionRevisionDTO predecessor_projection_revision;
@@ -257,24 +132,16 @@ struct ManagerComponentProcessOccurrenceDTO final {
 /// Uses the existing MFNSRC4 collection bound, never a truncated union.
 inline constexpr std::size_t kMaximumComponentProcessInventoryEntries = 4096U;
 
-/// D6 (D-M4-4b, SX-365/374): an Apply of the verified canonical-empty
-/// candidate, from any caller, may remove a component that still reads Active
-/// (its provider is gone, so no Disable step is eligible) only when it has
-/// launch processes and every one is a drained process group (cleanup-proven,
-/// not merely an exited leader). No process (for example a processless I/O
-/// owner), any I/O provider domain (its I/O effects are not proven settled),
-/// a local no-output owner, any other candidate, or a replacement keeps M3's
-/// "deactivate first".
-[[nodiscard]] inline bool ActiveComponentRemovableWithoutLiveProcess(
-    const manyforge::deployment::ApplyComponentChangeDTO &change,
-    const std::vector<ManagerComponentProcessOccurrenceDTO> &occurrences,
-    const bool canonical_empty_candidate, const bool has_io_provider_domain) noexcept {
-  if (!canonical_empty_candidate || has_io_provider_domain ||
-      change.disposition != manyforge::deployment::ApplyComponentDisposition::kRemove)
-    return false;
+/// CONTRACTS §11: a component whose process is gone is removed or replaced
+/// without a clean Disable. Gone means it has launch processes and every one
+/// is a drained process group (cleanup-proven, not merely an exited leader).
+/// A component with no launch process or with a local owner is not gone.
+[[nodiscard]] inline bool ComponentLaunchProcessesDrained(
+    const manyforge::core::ControllableComponentId &component,
+    const std::vector<ManagerComponentProcessOccurrenceDTO> &occurrences) noexcept {
   bool any = false;
   for (const auto &row : occurrences) {
-    if (row.controllable_component_id != change.controllable_component_id) continue;
+    if (row.controllable_component_id != component) continue;
     if (row.process_owner_kind != ManagerComponentProcessOwnerKindDTO::kControllerLaunch ||
         row.cleanup_state != manyforge::core::ControllerLaunchCleanupState::kDrained)
       return false;
@@ -282,7 +149,7 @@ inline constexpr std::size_t kMaximumComponentProcessInventoryEntries = 4096U;
   }
   return any;
 }
-/// Current installed CCLC facts, bound to the inventory's exact predecessor.
+/// Current installed lifecycle facts, bound to the inventory's exact predecessor.
 /// These are observation only, never permission to deactivate or replace.
 struct ManagerComponentLifecycleObservationDTO final {
   manyforge::core::ControllableComponentId controllable_component_id;
@@ -302,64 +169,6 @@ struct ManagerComponentProcessInventoryResultDTO final {
   friend bool
   operator==(const ManagerComponentProcessInventoryResultDTO &,
              const ManagerComponentProcessInventoryResultDTO &) = default;
-};
-
-struct ManagerComponentBringUpInspectionRequestDTO final {
-  manyforge::core::ProjectionRevisionDTO candidate_projection_revision;
-  manyforge::core::ContentDigest candidate_retained_bundle_digest;
-  std::uint64_t candidate_retained_bundle_bytes{};
-  manyforge::core::ProjectionRevisionDTO predecessor_projection_revision;
-  manyforge::core::ActiveBundlePublicationGeneration expected_predecessor_publication_generation;
-  manyforge::core::ContentDigest expected_predecessor_public_pointer_digest;
-  manyforge::core::RuntimeUnitId runtime_unit_id;
-  manyforge::core::RuntimeEpoch runtime_epoch;
-  manyforge::core::RuntimeEpoch manager_runtime_epoch;
-  /// Read-only facts for exactly this verified candidate component, when requested.
-  std::optional<manyforge::core::ControllableComponentId> planning_component_id{};
-  [[nodiscard]] bool valid() const noexcept;
-  friend bool operator==(const ManagerComponentBringUpInspectionRequestDTO &,
-                         const ManagerComponentBringUpInspectionRequestDTO &) = default;
-};
-
-struct ManagerComponentProcessObservationDTO final {
-  manyforge::core::ControllableComponentId controllable_component_id;
-  ProcessPresenceState process_presence{ProcessPresenceState::kUnknown};
-  ManagerComponentProcessOwnerKindDTO process_owner_kind{
-      ManagerComponentProcessOwnerKindDTO::kControllerLaunch};
-  std::optional<ManagerPneumaticNoneProcessOwnerDTO> pneumatic_none_owner{};
-  /// Actual installed predecessor identity only; never a candidate promise.
-  /// Required for local None, absent for physical observations.
-  std::optional<manyforge::core::ContentDigest> installed_runtime_identity{};
-  [[nodiscard]] bool valid() const noexcept;
-  friend bool operator==(const ManagerComponentProcessObservationDTO &,
-                         const ManagerComponentProcessObservationDTO &) = default;
-};
-
-/// Original owner preview and verified candidate compiler input only. This is
-/// neither installed readback nor parent/fence/acceptance authority.
-struct ManagerComponentBringUpPlanningFactsDTO final {
-  manyforge::core::ControllableComponentId component_id;
-  manyforge::core::RequestOwnerEpoch owner_epoch;
-  manyforge::core::ApplyComponentGenerationSelectionDTO generation_selection;
-  std::vector<manyforge::core::ExpectedControlDomainRevisionDTO> candidate_expected_domains;
-  /// The actual requested target and its next permitted action are distinct
-  /// from that action's postcondition and do not assert readiness.
-  manyforge::core::LifecycleTargetStateDTO requested_target;
-  manyforge::core::ComponentLifecycleIntentKindDTO next_intent;
-  [[nodiscard]] bool valid() const noexcept;
-  friend bool operator==(const ManagerComponentBringUpPlanningFactsDTO &,
-                         const ManagerComponentBringUpPlanningFactsDTO &) = default;
-};
-
-struct ManagerComponentBringUpInspectionResultDTO final {
-  ManagerComponentBringUpInspectionRequestDTO request;
-  /// Exactly the verified candidate's configured components, sorted by ID.
-  /// Presence is observation only; it grants no lifecycle or effect permission.
-  std::vector<ManagerComponentProcessObservationDTO> configured_components;
-  std::optional<ManagerComponentBringUpPlanningFactsDTO> planning_facts{};
-  [[nodiscard]] bool valid() const noexcept;
-  friend bool operator==(const ManagerComponentBringUpInspectionResultDTO &,
-                         const ManagerComponentBringUpInspectionResultDTO &) = default;
 };
 
 /// Operator request for the exact predecessor launch occurrence. The existing
@@ -423,51 +232,12 @@ public:
         {"component_process_stop_unavailable", "component process Stop result is not composed", {}});
   }
 
-  [[nodiscard]] virtual manyforge::core::Result<ManagerComponentBringUpInspectionResultDTO>
-  InspectComponentBringUp(const ManagerComponentBringUpInspectionRequestDTO &) {
-    return manyforge::core::Result<ManagerComponentBringUpInspectionResultDTO>::Err(
-        {"component_bring_up_inspection_unavailable",
-         "component process inspection is not composed", {}});
-  }
-
-
-  [[nodiscard]] virtual ManagerSelectedRuntimeCompositionResultDTO
-  InstallOrObserve(
-      const ManagerSelectedRuntimeCompositionRequestDTO &request) = 0;
-
-  [[nodiscard]] virtual manyforge::core::Result<
-      ManagerSelectedComponentBringUpResultDTO>
-  SubmitSelectedComponentBringUp(
-      const ManagerSelectedComponentBringUpRequestDTO &) {
-    return manyforge::core::Result<ManagerSelectedComponentBringUpResultDTO>::
-        Err({"selected_component_bring_up_unavailable",
-             "selected component bring-up is not composed",
-             {}});
-  }
-
-  [[nodiscard]] virtual manyforge::core::Result<
-      ManagerSelectedComponentBringUpResultDTO>
-  ReadSelectedComponentBringUp(
-      const ManagerSelectedComponentBringUpReadRequestDTO &) {
-    return manyforge::core::Result<ManagerSelectedComponentBringUpResultDTO>::
-        Err({"selected_component_bring_up_unavailable",
-             "selected component bring-up is not composed",
-             {}});
-  }
-
-  [[nodiscard]] virtual manyforge::core::Result<ManagerApplyComponentBringUpResultDTO>
-  SubmitApplyComponentBringUp(const ManagerApplyComponentBringUpRequestDTO &) {
-    return manyforge::core::Result<ManagerApplyComponentBringUpResultDTO>::Err(
-        {"apply_component_bring_up_unavailable",
-         "Apply component bring-up is not composed", {}});
-  }
-
-  [[nodiscard]] virtual manyforge::core::Result<ManagerApplyComponentBringUpResultDTO>
-  ReadApplyComponentBringUp(const ManagerApplyComponentBringUpReadRequestDTO &) {
-    return manyforge::core::Result<ManagerApplyComponentBringUpResultDTO>::Err(
-        {"apply_component_bring_up_unavailable",
-         "Apply component bring-up is not composed", {}});
-  }
+  /// Send one Apply to the execution host occurrence `runtime_unit_id`. A
+  /// transport error or a lost reply is an Err (effects unknown); a host
+  /// decision is an Ok result.
+  [[nodiscard]] virtual manyforge::core::Result<HostApplyResult>
+  ApplyOnHost(const manyforge::core::RuntimeUnitId &runtime_unit_id,
+              const HostApplyRequest &request) = 0;
 
 };
 

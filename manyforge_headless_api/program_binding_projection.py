@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import posixpath
 from typing import Any
-import unicodedata
 
 from .program_binding_transport import (
     ProgramBindingTransportError,
@@ -241,18 +240,8 @@ def validate_prepared_activation_origin(
         _text(value["scenario_id"], f"{label}.scenario_id", 256)
         _sha256(value["source_document_digest"], f"{label}.source_document_digest")
         validate_project_path(value["project_path"], f"{label}.project_path")
-    elif value.get("kind") == "sealed_canonical_empty":
-        if set(value) != {"kind", "cell_id", "deployment_artifact_id", "deployment_revision",
-                          "retained_bundle_id", "graph_revision", "admission_digest"}:
-            _fail(label, "the closed sealed canonical-empty origin")
-        for name in ("cell_id", "deployment_artifact_id"):
-            text = _text(value[name], f"{label}.{name}", 128)
-            if unicodedata.normalize("NFC", text) != text:
-                _fail(f"{label}.{name}", "NFC identity")
-        for name in ("deployment_revision", "retained_bundle_id", "graph_revision", "admission_digest"):
-            _sha256(value[name], f"{label}.{name}")
     else:
-        _fail(f"{label}.kind", "scenario or sealed_canonical_empty")
+        _fail(f"{label}.kind", "scenario")
     return value
 
 
@@ -283,8 +272,9 @@ def validate_committed_scenario_activation(
     """Validate Manager's current committed Scenario activation.
 
     Publication 1 is the canonical-empty bootstrap and every later one is
-    one committed named Apply, so the committed Applies must account for
-    every publication and include the current one.
+    one committed named Apply. Manager's journal is bounded by eviction, so
+    the committed Applies are the retained ones: never more than the Apply
+    publications, and always including the current one.
     """
 
     if not isinstance(value, dict) or set(value) != _COMMITTED_ACTIVATION_FIELDS:
@@ -299,11 +289,9 @@ def validate_committed_scenario_activation(
     current = _committed_apply(value, label)
     if value.get("program") is not None and not isinstance(value.get("program"), dict):
         _fail(f"{label}.program", "an object or null")
-    if value["origin"]["kind"] == "sealed_canonical_empty" and value["program"] is not None:
-        _fail(f"{label}.program", "null for sealed canonical-empty origin")
     committed = value.get("committed_applies")
-    if not isinstance(committed, list) or len(committed) != generation - 1:
-        _fail(f"{label}.committed_applies", "one record per Apply publication")
+    if not isinstance(committed, list) or len(committed) > generation - 1:
+        _fail(f"{label}.committed_applies", "at most one record per Apply publication")
     applies: list[tuple[str, dict[str, Any], str, int, str]] = []
     for index, row in enumerate(committed):
         row_label = f"{label}.committed_applies[{index}]"

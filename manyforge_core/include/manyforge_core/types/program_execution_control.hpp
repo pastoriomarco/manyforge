@@ -94,6 +94,8 @@ struct ProgramExecutionScopeStateDTO final {
   std::vector<ProgramNodeHoldDTO> held_nodes;
   std::vector<ProgramNodeStopEffectDTO> pending_effects;
   std::optional<ProgramSelectionReleaseBlockReasonDTO> selection_release_block_reason{};
+  /// A global rule's `hold` trip held the run (stopped_by: rule, AUD-6).
+  std::optional<std::string> stopped_by_rule_id{};
 };
 
 struct ProgramExecutionSelectionAcceptedDTO final {

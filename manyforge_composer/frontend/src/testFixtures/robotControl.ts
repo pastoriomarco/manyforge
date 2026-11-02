@@ -184,7 +184,6 @@ export function statusFixture(ownerEpoch = 'execution-owner-1'): ExecutionOwnerS
       unavailableReason: null,
       expectedStopGeneration: 0,
       latestTerminal: null,
-      fault: null,
     },
     components: [],
     directControlTargets: [],

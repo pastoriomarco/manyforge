@@ -187,7 +187,9 @@ def _wait_provider_alarm(client: TestClient) -> tuple[dict, dict]:
 def test_native_http_owner_works_without_composer_and_fences_replay(
     tmp_path: Path,
 ) -> None:
-    assert "manyforge_composer" not in sys.modules
+    # Other process tests in this session may load the Composer; this owner
+    # must not load any of it.
+    loaded_before = {name for name in sys.modules if name.startswith("manyforge_composer")}
     app = create_app(_config(tmp_path, "api.epoch.1"))
     with TestClient(app) as client:
         runtime = client.get("/api/runtime")
@@ -211,7 +213,8 @@ def test_native_http_owner_works_without_composer_and_fences_replay(
         )
 
         assert client.get("/api/health").json()["status"] == "degraded"
-    assert "manyforge_composer" not in sys.modules
+    loaded_after = {name for name in sys.modules if name.startswith("manyforge_composer")}
+    assert loaded_after == loaded_before
 
 
 def test_native_failure_capture_protects_context_and_reports_its_limits(tmp_path: Path) -> None:
@@ -240,8 +243,9 @@ def test_native_failure_capture_protects_context_and_reports_its_limits(tmp_path
     with TestClient(create_app(replace(config, owner_epoch="capture.epoch.2"))) as client:
         page = client.get("/api/execution/history/captures")
         assert page.status_code == 200, page.text
-        capture, = page.json()["captures"]
-        assert capture["capture_id"] == "1"
+        # The restarted app (no Program runner here) may open its own capture
+        # for its unavailable Program control source; this one is the first.
+        capture, = [row for row in page.json()["captures"] if row["capture_id"] == "1"]
         assert capture["first_sequence"] == 1
         assert capture["trigger_sequence"] == 4
         assert capture["last_sequence"] == 5

@@ -107,8 +107,8 @@
         "media_type": "application/xml"
       },
       {
-        "byte_size": 8472,
-        "content_digest": "sha256:1f3ebca49812973406c55a72ad85c67e2ac87c4348b49963e1f1c1bfa41fe17e",
+        "byte_size": 8603,
+        "content_digest": "sha256:56accfa8c31cf39e136f2d9da30e0099c4432119c9840334e90168f8dfe4ce4b",
         "logical_uri": "asset://ur10e/model.urdf",
         "media_type": "application/xml"
       }
@@ -134,7 +134,7 @@
       "source_group_name": "arm"
     }
   ],
-  "model_revision": "sha256:7a1c756e854600a56cbb1cfbe81b6f92ec2a07e288128205c9fefc2dc0101f80",
+  "model_revision": "sha256:4d5eac92cf13634032aa1a55621458c0d5b429038c5cbcdec60abc1fc73dc344",
   "resource_role_bindings": [
     {
       "resource_role_id": "arm_joints",

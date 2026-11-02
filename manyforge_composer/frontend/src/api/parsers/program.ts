@@ -232,10 +232,10 @@ function parseWorkbenchSessionNotice(value: unknown): WorkbenchSessionNotice {
     return fail(`${path}.history_coverage`, 'not_imported');
   }
   const journalFamilies = stringArrayAt(record.journal_families, `${path}.journal_families`);
-  const expectedFamilies = ['program_cycle', 'scene', 'manager', 'cclc', 'kernel_operation'];
+  const expectedFamilies = ['program_cycle', 'scene', 'manager', 'kernel_operation'];
   if (journalFamilies.length !== expectedFamilies.length
     || journalFamilies.some((family, index) => family !== expectedFamilies[index])) {
-    return fail(`${path}.journal_families`, 'the five ordered journal families');
+    return fail(`${path}.journal_families`, 'the four ordered journal families');
   }
   const message = stringAt(record.message, `${path}.message`);
   const messageBytes = new TextEncoder().encode(message);

@@ -65,7 +65,7 @@ export function pendingManagerApply(payload: Record<string, unknown>): boolean |
   return false;
 }
 
-/** Current identity-verified Applied cell graph, independent of Scenario/Close origin. */
+/** Current identity-verified Applied cell graph, independent of its Scenario origin. */
 function verifiedAppliedCellGraph(
   snapshot: ComposerHeadlessState | null,
   transportStatus: ControlTransportStatus,
@@ -108,7 +108,7 @@ export function verifiedAppliedGraphHasNoModels(
   return Array.isArray(models) && models.length === 0;
 }
 
-/** Current zero-physical graph evidence, independent of its Scenario/Close origin. */
+/** Current zero-physical graph evidence, independent of its Scenario origin. */
 export function verifiedNoPhysicalComponents(
   snapshot: ComposerHeadlessState | null,
   transportStatus: ControlTransportStatus,

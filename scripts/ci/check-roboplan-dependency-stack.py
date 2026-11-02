@@ -16,15 +16,15 @@ EXPECTED_DISTRIBUTIONS = {
     "libpinocchio": "4.1.0",
     "coal": "3.0.3",
     "libcoal": "3.0.3",
-    "roboplan": "0.7.0",
-    "roboplan-common": "0.7.0",
-    "roboplan-core": "0.7.0",
-    "roboplan-example-models": "0.7.0",
-    "roboplan-simple-ik": "0.7.0",
-    "roboplan-oink": "0.7.0",
-    "roboplan-rrt": "0.7.0",
-    "roboplan-toppra": "0.7.0",
-    "roboplan-cartesian-planning": "0.7.0",
+    "roboplan": "0.8.0",
+    "roboplan-common": "0.8.0",
+    "roboplan-core": "0.8.0",
+    "roboplan-example-models": "0.8.0",
+    "roboplan-simple-ik": "0.8.0",
+    "roboplan-oink": "0.8.0",
+    "roboplan-rrt": "0.8.0",
+    "roboplan-toppra": "0.8.0",
+    "roboplan-cartesian-planning": "0.8.0",
 }
 REQUIRED_MODULES = (
     "pinocchio",
@@ -263,7 +263,7 @@ def main() -> int:
         return 1
 
     print(
-        "RoboPlan dependency stack verified: RoboPlan 0.7.0, "
+        "RoboPlan dependency stack verified: RoboPlan 0.8.0, "
         "Pinocchio 4.1.0, Coal 3.0.3, one recorded planner ABI"
     )
     return 0

@@ -214,13 +214,12 @@ TEST(ContractsCompile, MotionSpecVariant) {
   relative_pose_request.target_mode = MotionTargetModeDTO::kRelative;
   relative_pose_request.target_reference = pose_ref;
   relative_pose_request.offset_reference = pose_ref;
-  relative_pose_request.planning_profile = PlanningProfileDTO::kBalanced;
+  relative_pose_request.planner.search = PlannerSearchDTO::kRrt;
   EXPECT_TRUE(std::holds_alternative<PoseGoalDTO>(
       relative_pose_request.motion));
   EXPECT_EQ(relative_pose_request.target_mode,
             MotionTargetModeDTO::kRelative);
-  EXPECT_EQ(relative_pose_request.planning_profile,
-            PlanningProfileDTO::kBalanced);
+  EXPECT_EQ(relative_pose_request.planner.search, PlannerSearchDTO::kRrt);
 
   // Cartesian path
   CartesianPathDTO cartesian_path;

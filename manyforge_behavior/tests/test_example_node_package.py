@@ -28,6 +28,9 @@ from manyforge_behavior.orchestration_values import (
 from manyforge_behavior.program import Program
 from manyforge_behavior.program_runtime import ProgramRunAttemptSource
 
+# The Runner's execution transport timeout handed to owner task nodes.
+_TRANSPORT_TIMEOUT_S = 30.0
+
 
 def _adapter(port, *, minimum=0.0, maximum=1.0):
     environment = build_node_environment()
@@ -67,7 +70,7 @@ def _adapter(port, *, minimum=0.0, maximum=1.0):
         api_version="manyforge.program.v2",
     )
     program = Program.from_dict(document, environment.catalog)
-    context = NodeAdapterBuildContext(
+    context = NodeAdapterBuildContext(transport_timeout_s=_TRANSPORT_TIMEOUT_S,
         name="height",
         node_instance_id="height",
         parameters=parameters,

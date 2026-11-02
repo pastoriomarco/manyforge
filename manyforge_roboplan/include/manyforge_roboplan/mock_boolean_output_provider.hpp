@@ -14,8 +14,10 @@
 
 #pragma once
 
-#include <manyforge_core/ports/iio_output_provider.hpp>
+#include <manyforge_core/time/iclock.hpp>
+#include <manyforge_core/types/io_signal.hpp>
 #include <manyforge_roboplan/io_output_alias_identity.hpp>
+#include <manyforge_roboplan/io_output_writer.hpp>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -49,26 +51,20 @@ struct MockBooleanOutputChannel final {
 /// timer or thread. Preserve this provider
 /// across Disable/Enable. Each actual new Apply resets the model unwritten
 /// under the channel mutex; replay of that publication cannot reset it again.
-/// Immediate model acceptance requires no deadline. The existing Kernel/session
-/// owns admission, CCLC generation, policy and post-retirement replay fencing.
-/// This leaf retains one correlation record.
 /// Quiesce host calls before releasing this provider or its injected clock.
-class MockBooleanOutputProvider final : public core::IIoOutputProvider {
+class MockBooleanOutputProvider final {
 public:
   [[nodiscard]] static core::Result<std::unique_ptr<MockBooleanOutputProvider>>
   Create(core::IClock &clock, MockBooleanOutputChannel channel);
-  ~MockBooleanOutputProvider() override;
+  ~MockBooleanOutputProvider();
   MockBooleanOutputProvider(const MockBooleanOutputProvider &) = delete;
   MockBooleanOutputProvider &
   operator=(const MockBooleanOutputProvider &) = delete;
 
-  core::IoOutputEvidence StrongestOutputEvidence() const noexcept override;
-  core::Result<core::IoOutputObservationDTO>
-  SubmitOutput(const core::IoOutputWriteRequestDTO &request) override;
-  core::Result<core::IoOutputObservationDTO> ObserveOutputResult(
-      const core::IoOutputCommandIdentityDTO &identity) const override;
-  core::Result<void>
-  RetireOutput(const core::IoOutputCommandIdentityDTO &identity) override;
+  /// CONTRACTS §6, §7: the one write of one alias, behind its
+  /// component's output-writer interface: the model takes the value at once
+  /// while the alias's occurrence is enabled, with the same echo.
+  [[nodiscard]] SetOutputResult WriteOutput(const core::IoSignalId &signal, bool value);
 
   /// Called only under the existing host delivery/domain lifecycle lock after
   /// full expected-observation checks. These are transport fences, not another

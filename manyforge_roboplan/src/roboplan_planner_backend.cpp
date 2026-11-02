@@ -374,6 +374,12 @@ RoboPlanPlannerBackend::ReplaceRetainedModel(const RoboPlanWorkerModelDTO &model
   return candidate_client_->replace_retained_model(model);
 }
 
+core::Result<void> RoboPlanPlannerBackend::ReplaceRetainedSettings(
+    const RoboPlanCandidateComputerConfig &settings) {
+  std::unique_lock lock(projection_mutex_);
+  return candidate_client_->replace_retained_settings(settings);
+}
+
 core::PlanResultDTO
 RoboPlanPlannerBackend::plan(const core::PlanRequestDTO &request) {
   const auto setup_started = std::chrono::steady_clock::now();
@@ -414,13 +420,12 @@ RoboPlanPlannerBackend::plan(const core::PlanRequestDTO &request) {
                                         request.motion,
                                         request.tolerances,
                                         request.speed_profile,
-                                        request.planning_profile,
+                                        request.planner,
                                         request.per_resource_dynamics_limits,
                                         request.planning_timeout_s,
                                         request.planning_attempt_index,
                                         request.action_span,
-                                        request.moving_replacement,
-                                        request.speed_check_frames};
+                                        request.moving_replacement};
   if (candidate.moving_replacement) {
     const auto setup_elapsed = std::chrono::duration<double>(
                                    std::chrono::steady_clock::now() - setup_started)

@@ -25,7 +25,7 @@ export const INTERRUPT_NODE_OUTCOME_VALUES = [
  */
 export const INTERRUPT_STATE_NAMESPACE = 'interrupt_state';
 
-export const INTERRUPT_STATE_VALUES = ['clear', 'tripped', 'latched'] as const;
+export const INTERRUPT_STATE_VALUES = ['inactive', 'clear', 'tripped'] as const;
 
 /** The system namespaces: never a user key, namespace or Program parameter name (contract 105(c)). */
 export const SYSTEM_NAMESPACES: readonly string[] = [NODE_OUTCOME_NAMESPACE, INTERRUPT_STATE_NAMESPACE];

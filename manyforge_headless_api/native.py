@@ -86,7 +86,6 @@ class HeadlessApiConfig:
     # ambiguous timeout after the mutation has committed.
     manager_timeout_seconds: float = DEFAULT_MANAGER_COMMAND_TIMEOUT_SECONDS
     execution_timeout_seconds: float = 10.0
-    cclc_timeout_seconds: float = 5.0
     execution_event_poll_milliseconds: int = 100
     maximum_request_body_bytes: int = MAX_STANDARD_REQUEST_BODY_BYTES
     program_runner_url: str | None = None
@@ -164,8 +163,6 @@ class HeadlessApiConfig:
             raise ValueError("manager_timeout_seconds must be in (0, 60]")
         if not 0 < self.execution_timeout_seconds <= 30:
             raise ValueError("execution_timeout_seconds must be in (0, 30]")
-        if not 0 < self.cclc_timeout_seconds <= 30:
-            raise ValueError("cclc_timeout_seconds must be in (0, 30]")
         # The event pump also drives the alarm-source refresh (period R =
         # 250 ms); a slower pump would let alarm sources exceed their
         # currency bound and hold Program motion unreconciled.
@@ -292,7 +289,7 @@ class HeadlessCorePort(Protocol):
 
     def record_program_diagnostic(self, record: Mapping[str, Any]) -> dict[str, Any]: ...
 
-    def record_scenario_force_close(self, record: Mapping[str, Any]) -> dict[str, Any]: ...
+    def record_activity(self, record: Mapping[str, Any]) -> dict[str, Any]: ...
 
     def historian_health(self) -> dict[str, Any]: ...
 
@@ -326,23 +323,6 @@ class HeadlessCorePort(Protocol):
         **kwargs: Any,
     ) -> dict[str, Any]: ...
 
-    def component_lifecycle_condition_scope(self) -> dict[str, Any]: ...
-
-    def observe_component_lifecycle_conditions(
-        self,
-        **kwargs: Any,
-    ) -> dict[str, Any]: ...
-
-    def observe_empty_component_lifecycle_configuration(
-        self, *, retained_bundle_id: str, graph_revision: str
-    ) -> dict[str, Any]: ...
-
-    def mark_component_lifecycle_source_unknown(self) -> dict[str, Any]: ...
-
-    def record_cclc_incident_event(
-        self, *, cclc_owner_epoch: str, event_json: str
-    ) -> dict[str, Any]: ...
-
     def shutdown(self) -> None: ...
 
 
@@ -359,12 +339,12 @@ def _object_without_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     return result
 
 
-def strict_json_object(
+def strict_json_value(
     payload: str,
     *,
     label: str,
     maximum_bytes: int = MAX_NATIVE_RESPONSE_BYTES,
-) -> dict[str, Any]:
+) -> Any:
     if len(payload.encode("utf-8")) > maximum_bytes:
         raise HeadlessApiError(
             "headless_projection_response_oversized",
@@ -381,6 +361,16 @@ def strict_json_object(
             "headless_projection_response_invalid",
             f"{label} is not strict JSON: {exc}",
         ) from exc
+    return value
+
+
+def strict_json_object(
+    payload: str,
+    *,
+    label: str,
+    maximum_bytes: int = MAX_NATIVE_RESPONSE_BYTES,
+) -> dict[str, Any]:
+    value = strict_json_value(payload, label=label, maximum_bytes=maximum_bytes)
     if not isinstance(value, dict):
         raise HeadlessApiError(
             "headless_projection_response_invalid",
@@ -867,12 +857,17 @@ class NativeHeadlessCore:
             method="record_program_diagnostic",
         )
 
-    def record_scenario_force_close(self, record: Mapping[str, Any]) -> dict[str, Any]:
+    def record_activity(self, record: Mapping[str, Any]) -> dict[str, Any]:
+        """One component action or Apply terminal (``activity_history``)."""
+
+        encoded = rfc8785.dumps(dict(record))
+        if len(encoded) > 64 * 1024:
+            raise HeadlessApiError(
+                "activity_record_invalid", "activity record exceeds its byte bound"
+            )
         return self._require_object(
-            self._invoke(
-                "record_scenario_force_close", rfc8785.dumps(dict(record)).decode("utf-8")
-            ),
-            method="record_scenario_force_close",
+            self._invoke("record_activity", encoded.decode("utf-8")),
+            method="record_activity",
         )
 
     def historian_health(self) -> dict[str, Any]:
@@ -953,51 +948,6 @@ class NativeHeadlessCore:
         return self._require_object(
             self._invoke("mark_operation_event_source_unknown", **kwargs),
             method="mark_operation_event_source_unknown",
-        )
-
-    def component_lifecycle_condition_scope(self) -> dict[str, Any]:
-        return self._require_object(
-            self._invoke("component_lifecycle_condition_scope"),
-            method="component_lifecycle_condition_scope",
-        )
-
-    def observe_component_lifecycle_conditions(
-        self,
-        **kwargs: Any,
-    ) -> dict[str, Any]:
-        return self._require_object(
-            self._invoke("observe_component_lifecycle_conditions", **kwargs),
-            method="observe_component_lifecycle_conditions",
-        )
-
-    def observe_empty_component_lifecycle_configuration(
-        self, *, retained_bundle_id: str, graph_revision: str
-    ) -> dict[str, Any]:
-        return self._require_object(
-            self._invoke(
-                "observe_empty_component_lifecycle_configuration",
-                retained_bundle_id=retained_bundle_id,
-                graph_revision=graph_revision,
-            ),
-            method="observe_empty_component_lifecycle_configuration",
-        )
-
-    def mark_component_lifecycle_source_unknown(self) -> dict[str, Any]:
-        return self._require_object(
-            self._invoke("mark_component_lifecycle_source_unknown"),
-            method="mark_component_lifecycle_source_unknown",
-        )
-
-    def record_cclc_incident_event(
-        self, *, cclc_owner_epoch: str, event_json: str
-    ) -> dict[str, Any]:
-        return self._require_object(
-            self._invoke(
-                "record_cclc_incident_event",
-                cclc_owner_epoch=cclc_owner_epoch,
-                event_json=event_json,
-            ),
-            method="record_cclc_incident_event",
         )
 
     def shutdown(self) -> None:

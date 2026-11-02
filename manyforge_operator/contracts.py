@@ -107,7 +107,7 @@ class LaunchOperation(StrEnum):
 
 
 class LaunchProfile(StrEnum):
-    NATIVE = "native"
+    STANDARD = "standard"
     ISAAC = "isaac"
 
 
@@ -606,9 +606,9 @@ class LaunchConfiguration(StrictOperatorContract):
         roles = {host.role for host in self.hosts}
         if HostRole.RUNTIME not in roles:
             raise ValueError("launch configuration requires one runtime host")
-        if self.profile is LaunchProfile.NATIVE:
+        if self.profile is LaunchProfile.STANDARD:
             if self.ros_topology is not None:
-                raise ValueError("native configuration requires ros_topology=None")
+                raise ValueError("standard configuration requires ros_topology=None")
         else:
             if self.ros_topology is None:
                 raise ValueError("isaac configuration requires a ros topology")

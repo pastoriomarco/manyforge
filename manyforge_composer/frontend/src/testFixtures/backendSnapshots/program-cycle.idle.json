@@ -189,16 +189,6 @@
         "program_run_id": null,
         "program_runner_owner_epoch": "program-runner.epoch.1"
       }
-    },
-    {
-      "allowed": true,
-      "command_kind": "stop_recovery",
-      "disabled_reason": null,
-      "semantic_target": {
-        "cycle_generation": 1,
-        "program_run_id": null,
-        "program_runner_owner_epoch": "program-runner.epoch.1"
-      }
     }
   ],
   "causal_client_sequence": null,
@@ -220,6 +210,7 @@
     "reason": "The active Deployment has no qualified simulator position-reset capability"
   },
   "run": null,
+  "run_end": null,
   "run_revision": null,
   "runtime_control_revision": null,
   "runtime_controls": null,

@@ -10,132 +10,119 @@ from manyforge_behavior.program import Program
 
 
 ROOT = Path(__file__).resolve().parents[2]
-DEPLOYMENT = ROOT / "examples/ur5e_lite6_wall.deployment.yaml"
 PROGRAMS = {
     "grouped": ROOT / "examples/ur5e_lite6_wall_grouped.program.yaml",
     "isolation": ROOT / "examples/ur5e_lite6_wall_isolation.program.yaml",
 }
+SCENARIO_NAMES = {
+    "grouped": "mock_dual_arm_shared_group",
+    "isolation": "mock_dual_arm_separate_groups",
+}
 SCENARIOS = {
-    variant: ROOT / f"examples/ur5e_lite6_wall_{variant}.scenario"
-    for variant in PROGRAMS
+    variant: ROOT / f"examples/{name}.scenario" for variant, name in SCENARIO_NAMES.items()
 }
 
 
-def test_dual_deployment_has_exact_models_placements_and_cross_revisions() -> None:
-    deployment = load_strict_json_yaml(DEPLOYMENT)
-    graph = deployment["graph"]
-    components = {
-        row["controllable_component_id"]: row
-        for row in graph["controllable_components"]
-    }
-    # Merge 6: each robot carries its own tool, mounted on its flange; a
-    # mounted tool has no cell pose of its own.
-    assert {
-        component: row["root_pose_in_cell"]["position_m"]
-        for component, row in components.items()
-        if "root_pose_in_cell" in row
-    } == {"lite6_robot": [0, 0, 0], "ur5e_robot": [0, 1, 0]}
-    assert set(components) == {"lite6_robot", "lite_gripper", "robotiq_2f_85", "ur5e_robot"}
-    assert {
-        row["model_asset_id"] for row in graph["model_instances"]
-    } == {"lite6", "lite_gripper", "robotiq_2f_85", "ur5e"}
-    assert len(graph["runtime_units"]) == 1
-    runtime = graph["runtime_units"][0]
-    # Q63-Q68: both robots run on the offline mock lane in one ROS runtime
-    # unit, each with its own controller profile.
-    assert runtime["runtime_unit_id"] == "robot_cell.ros2_control_execution"
-    assert runtime["runtime_profile_id"] == "manyforge.ros2_control_execution_runtime"
-    assert runtime["configuration"]["controller_profiles"] == [
-        {"controllable_component_id": "lite6_robot", "frame_prefix": "", "mock_profile": "lite6"},
-        {"controllable_component_id": "lite_gripper", "frame_prefix": "", "mock_profile": "lite_gripper"},
-        {"controllable_component_id": "robotiq_2f_85", "frame_prefix": "", "mock_profile": "robotiq_2f_85"},
-        {"controllable_component_id": "ur5e_robot", "frame_prefix": "", "mock_profile": "ur5e"},
-    ]
-    assert {
-        row["controllable_component_id"]
-        for row in runtime["configuration"]["motion_target_limits"]
-    } == {"lite6_robot", "ur5e_robot"}
-    grippers = {
-        row["controllable_component_id"]: row
-        for row in runtime["configuration"]["gripper_target_configurations"]
-    }
-    assert set(grippers) == {"lite_gripper", "robotiq_2f_85"}
-    # CP9: each Mock robot declares its measured joints; each Mock tool its
-    # measured joints and gripper feedback.
-    assert sorted(
-        (row["controllable_component_id"], row["stream_id"], row["budget_ns"],
-         row["severity"], row["recovery"])
-        for row in runtime["configuration"]["component_streams"]
-    ) == [
-        ("lite6_robot", "measured_joints", 250000000, "fault", "ack"),
-        ("lite_gripper", "gripper_feedback", 1000000000, "fault", "ack"),
-        ("lite_gripper", "measured_joints", 250000000, "fault", "ack"),
-        ("robotiq_2f_85", "gripper_feedback", 1000000000, "fault", "ack"),
-        ("robotiq_2f_85", "measured_joints", 250000000, "fault", "ack"),
-        ("ur5e_robot", "measured_joints", 250000000, "fault", "ack"),
-    ]
-    # Gripper model A1: the Lite6 lite gripper is pneumatic, the Robotiq
-    # 2F-85 is position commanded.
-    assert {
-        component_id: row["actuation_kind"] for component_id, row in grippers.items()
-    } == {"lite_gripper": "pneumatic", "robotiq_2f_85": "position_commanded"}
-    assert all(
-        row["command_target_id"] == "gripper"
-        and row["open_state_ref"] == "open"
-        and row["closed_state_ref"] == "closed"
-        and row["mount_frame"]
-        and row["attach_frame"]
-        and row["tcp_frame"]
-        and row["touch_links"]
-        for row in grippers.values()
-    )
-    assert all(
-        row["runtime_unit_ids"] == ["robot_cell.ros2_control_execution"]
-        for row in components.values()
-    )
-
-    bindings = {
-        row["control_binding_id"]: row for row in graph["control_bindings"]
-    }
-    domains = {row["control_domain_id"]: row for row in graph["control_domains"]}
-    for provider in deployment["capability_provider_bindings"]:
-        runtime_sources = {
-            endpoint["source_id"]
-            for endpoint in provider["endpoint_bindings"]
-            if endpoint["source_kind"] == "runtime_unit"
+def test_dual_deployment_has_exact_models_and_placements() -> None:
+    for path in SCENARIOS.values():
+        deployment = load_strict_json_yaml(path / "deployment.yaml")
+        rows = {row["component_id"]: row for row in deployment["components"]}
+        # AUD-5: the Lite 6 is a machine; its arm keeps the robot's id and
+        # its I/O members are deactivated (the scenario uses none).
+        assert {
+            component: (row["component_profile_id"], row.get("owner"), row.get("active", True))
+            for component, row in rows.items() if "model_source" not in row
+        } == {
+            "lite6": ("ufactory.lite6_machine", None, True),
+            "lite6_robot_controller_io": ("ufactory.lite6_controller_io", "lite6", False),
+            "lite6_robot_tool_io": ("ufactory.lite6_tool_io", "lite6", False),
         }
-        if runtime_sources:
-            assert runtime_sources == {"robot_cell.ros2_control_execution"}
-        if provider["scope"] != "target_binding":
-            continue
-        target = provider["target"]
-        assert target["component_type_revision"] == components[
-            target["controllable_component_id"]
-        ]["component_type_revision"]
-        assert target["control_binding_revision"] == bindings[
-            target["control_binding_id"]
-        ]["control_binding_revision"]
-    for desired in deployment["desired_control_configurations"]:
-        assert desired["control_domain_revision"] == domains[
-            desired["control_domain_id"]
-        ]["control_domain_revision"]
-        for route in desired["binding_routes"]:
-            assert route["control_binding_revision"] == bindings[
-                route["control_binding_id"]
-            ]["control_binding_revision"]
-    for row in deployment["policies"]["stop_stage_parameters"]:
-        assert row["control_binding_revision"] == bindings[
-            row["control_binding_id"]
-        ]["control_binding_revision"]
-        assert row["control_domain_revision"] == domains[row["control_domain_id"]][
-            "control_domain_revision"
+        assert (rows["lite6_robot"]["owner"], rows["lite6_robot"]["role"]) == ("lite6", "arm")
+        components = {
+            component: row for component, row in rows.items() if "model_source" in row}
+        # Merge 6: each robot carries its own tool, mounted on its flange; a
+        # mounted tool has no cell pose of its own.
+        assert {
+            component: row["root_pose_in_cell"]["position_m"]
+            for component, row in components.items()
+            if "root_pose_in_cell" in row
+        } == {"lite6_robot": [0.0, 0.0, 0.0], "ur5e_robot": [0.0, 1.0, 0.0]}
+        # Mount collision exclusions are checked by the mount-exclusion tests.
+        assert [
+            {key: value for key, value in row.items() if key != "collision_exclusions"}
+            for row in deployment["attachments"]
+        ] == [
+            {"child": {"component_id": "lite_gripper", "interface": "mount"},
+             "parent": {"component_id": "lite6_robot", "interface": "flange"}},
+            {"child": {"component_id": "robotiq_2f_85", "interface": "mount"},
+             "parent": {"component_id": "ur5e_robot", "interface": "flange"}},
         ]
-
-    assert deployment["policies"]["retained_policy_records"] == []
-    assert all(
-        row["record_kind"] != "runtime_policy"
-        for row in deployment["catalogs"]["records"]
-    )
+        assert {
+            component: row["component_profile_id"]
+            for component, row in components.items()
+        } == {
+            "lite6_robot": "ufactory.lite6",
+            "lite_gripper": "ufactory.lite_gripper",
+            "robotiq_2f_85": "robotiq.robotiq_2f_85",
+            "ur5e_robot": "universal_robots.ur5e",
+        }
+        assert {
+            component: row["model_source"]["urdf"]["project_path"]
+            for component, row in components.items()
+        } == {
+            component: f"../../manyforge_example_models/models/{model}/{model}.urdf"
+            for component, model in (
+                ("lite6_robot", "lite6"),
+                ("lite_gripper", "lite_gripper"),
+                ("robotiq_2f_85", "robotiq_2f_85"),
+                ("ur5e_robot", "ur5e"),
+            )
+        }
+        # Q63-Q68: every component runs on the offline mock lane.
+        assert {rows[row.get("owner", component)]["lane"]
+                for component, row in components.items()} == {"mock"}
+        assert {
+            component for component, row in components.items()
+            if "arm" in row["target_settings"]
+        } == {"lite6_robot", "ur5e_robot"}
+        # CP9: each Mock robot declares its measured joints; each Mock tool its
+        # measured joints and gripper feedback.
+        assert sorted(
+            (stream["controllable_component_id"], stream["stream_id"], stream["budget_ns"])
+            for row in components.values()
+            for stream in row["configuration"]["runtime_configuration"]["component_streams"]
+        ) == [
+            ("lite6_robot", "measured_joints", 250000000),
+            ("lite_gripper", "gripper_feedback", 1000000000),
+            ("lite_gripper", "measured_joints", 250000000),
+            ("robotiq_2f_85", "gripper_feedback", 1000000000),
+            ("robotiq_2f_85", "measured_joints", 250000000),
+            ("ur5e_robot", "measured_joints", 250000000),
+        ]
+        # Gripper model A1: the Lite6 lite gripper is pneumatic, the Robotiq
+        # 2F-85 is position commanded.
+        grippers = {
+            component: row["configuration"]["runtime_configuration"][
+                "gripper_target_configurations"]
+            for component, row in components.items()
+            if "gripper_target_configurations"
+            in row["configuration"]["runtime_configuration"]
+        }
+        assert {
+            component: [gripper["actuation_kind"] for gripper in rows]
+            for component, rows in grippers.items()
+        } == {"lite_gripper": ["pneumatic"], "robotiq_2f_85": ["position_commanded"]}
+        assert all(
+            row["command_target_id"] == "gripper"
+            and row["open_state_ref"] == "open"
+            and row["closed_state_ref"] == "closed"
+            and row["mount_frame"]
+            and row["attach_frame"]
+            and row["tcp_frame"]
+            and row["touch_links"]
+            for rows in grippers.values()
+            for row in rows
+        )
 
 
 def test_program_variants_keep_one_noninteracting_wall_scenario() -> None:
@@ -194,13 +181,17 @@ def test_program_variants_keep_one_noninteracting_wall_scenario() -> None:
 def test_both_variants_are_registered_as_qualified_scenarios() -> None:
     for variant, path in SCENARIOS.items():
         manifest = load_strict_json_yaml(path / "scenario.yaml")
-        assert manifest["scenario_id"] == f"ur5e_lite6_wall_{variant}"
+        assert manifest["scenario_id"] == SCENARIO_NAMES[variant]
         deployment = load_strict_json_yaml(path / "deployment.yaml")
         assert deployment["api_version"] == "manyforge.deployment_intent.v2"
         assert deployment["deployment_artifact_id"] == "ur5e_lite6_wall"
         # M6 tool split: each robot's gripper is its own mounted component.
+        # The Lite 6 is a machine (CONTRACTS §16): its owner and every member.
         assert {row["component_id"] for row in deployment["components"]} == {
+            "lite6",
             "lite6_robot",
+            "lite6_robot_controller_io",
+            "lite6_robot_tool_io",
             "lite_gripper",
             "robotiq_2f_85",
             "ur5e_robot",

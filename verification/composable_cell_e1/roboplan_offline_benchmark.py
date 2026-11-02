@@ -317,8 +317,8 @@ def _cartesian_workload(scene: Scene) -> dict[str, Any]:
     options.group_name = _GROUP
     options.dt = 0.01
     options.speed_mode = CartesianSpeedMode.TimeOptimal
-    options.max_position_error = 0.01
-    options.max_orientation_error = 0.05
+    options.position_tolerance = 0.01
+    options.orientation_tolerance = 0.05
     planner = CartesianPathPlanner(scene, options)
     trajectory = planner.plan(path, q_start)
     if trajectory is None or len(trajectory.positions) < 2:
@@ -329,7 +329,7 @@ def _cartesian_workload(scene: Scene) -> dict[str, Any]:
     final_q = scene.toFullJointPositions(_GROUP, trajectory.positions[-1])
     achieved = scene.forwardKinematics(final_q, _TIP, _BASE)
     position_error = float(np.linalg.norm(achieved[:3, 3] - waypoints[-1][:3, 3]))
-    if position_error > options.max_position_error + 1e-6:
+    if position_error > options.position_tolerance + 1e-6:
         raise RuntimeError("Cartesian result violates the position tolerance")
     velocity_ratio, acceleration_ratio = planner.compute_peak_limit_ratios(trajectory)
     if not all(

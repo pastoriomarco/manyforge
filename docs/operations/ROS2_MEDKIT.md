@@ -5,8 +5,7 @@
 > effectful entrypoints, `python3 -m manyforge_medkit_adapter.adapter` and
 > `python3 -m manyforge_ros.diagnostics_bridge`, exit 78
 > (`composable_cell_runtime_unavailable`) before they parse arguments or touch
-> the network or ROS. No ManyForge image includes ros2_medkit. Medkit
-> integration is planned after publication.
+> the network or ROS. No ManyForge image includes ros2_medkit.
 
 ManyForge core stays medkit-free. Only `manyforge_medkit_adapter` may depend
 on medkit, one-way.
@@ -19,9 +18,6 @@ on medkit, one-way.
 | `manyforge_ros.diagnostics_bridge` | Pure mapping from ManyForge faults to `diagnostic_msgs` statuses plus an OK heartbeat. Its process entrypoint exits 78. |
 | `manyforge_behavior.fault_taxonomy` | Fault classes and their external codes `MANYFORGE_<REASON_CODE>` (UPPER_SNAKE, ≤64 characters). Severities INFO/WARN/ERROR/CRITICAL map to medkit 0–3. |
 | `GET /api/debug/export/ros2-medkit` | A ManyForge-native trace export (schema `manyforge.ros2_medkit_trace.v2`). No medkit tool reads it; medkit has no trace import. |
-
-The planned adapter will read the alarm snapshot `GET /api/execution/alarms`
-from the Headless API and report the changes to the medkit fault manager.
 
 ## Running ros2_medkit next to ManyForge
 
@@ -54,18 +50,6 @@ ros2 run ros2_medkit_fault_manager fault_manager_node --ros-args \
 > client of the gateway can then move or reconfigure the robot outside
 > ManyForge's Stop, attribution and Apply checks. If you run the gateway,
 > bind it to `127.0.0.1` or enable authentication with viewer-only clients.
-
-## Notes for the planned integration
-
-- Medkit aggregates faults by `fault_code` across sources. `source_id`
-  should name the cell and the alarm subject, not a Composer.
-- A `MedkitDiscoveryHint` on `/ros2_medkit/discovery` only enriches an entity
-  that already exists. Its `stamp` drives a TTL, so the hint must be
-  republished periodically, and the gateway needs the topic_beacon plugin.
-- Medkit's own `diagnostic_bridge` maps `/diagnostics` ERROR and CRITICAL
-  alike, so CRITICAL faults lose their debounce bypass on that path.
-- Clearing a fault in medkit must never clear or acknowledge a ManyForge
-  alarm.
 
 ## Tests
 

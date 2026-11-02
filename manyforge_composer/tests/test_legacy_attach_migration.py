@@ -13,7 +13,7 @@ def facts(monkeypatch):
               "frameTargets": [{"commandTargetId": "gripper", "frameRoleIds": ["tip"]}],
               "tcpTargets": [{"commandTargetId": "gripper", "tcpFrameRoleIds": ["tip"],
                               "defaultTcpFrameRoleId": "tip"}]}
-    monkeypatch.setattr(migration, "_profiles", lambda: (["tool"], {"tool": "family"}, {"family": family}))
+    monkeypatch.setattr(migration, "_profiles", lambda: (["tool"], {"tool": "family"}, {"tool": family}))
     authoring = {
         "target_roles": {"hand": {"component_role": "tool", "required_frame_roles": ["tcp", "tip"]}},
         "forest": [{"node_id": "scene.attach_carried_object", "instance_id": "attach",
@@ -55,7 +55,7 @@ def _legacy_example():
     from pathlib import Path
 
     root = Path(__file__).resolve().parents[2]
-    source = root / "examples/lite6_pick_and_place.scenario"
+    source = root / "examples/mock_lite6_pick_and_place.scenario"
     authoring = json.loads((source / "program.yaml").read_text(encoding="utf-8"))
     authoring["catalog"]["content_version"] = "2.8.0"
     authoring["target_roles"]["gripper"]["required_frame_roles"] = ["tcp"]
@@ -79,7 +79,7 @@ def _fixture_profile(monkeypatch, deployment):
              "frameTargets": [{"commandTargetId": "gripper", "frameRoleIds": ["tip"]}],
              "tcpTargets": [{"commandTargetId": "gripper", "tcpFrameRoleIds": ["tip"],
                              "defaultTcpFrameRoleId": "tip"}]}
-    monkeypatch.setattr(migration, "_profiles", lambda: ([profile], {profile: "tool"}, {"tool": facts}))
+    monkeypatch.setattr(migration, "_profiles", lambda: ([profile], {profile: "tool"}, {profile: facts}))
 
 
 def _assert_converted(authoring):
@@ -172,9 +172,7 @@ def test_scenario_load_converts_candidate_before_derive_without_applied_facts(tm
         seen.append(deepcopy(value))
         return derive(value, catalog)
     monkeypatch.setattr(routes_scenario_documents, "derive_candidate", record_derive)
-    response = client.post("/api/scenario-documents/load", json={
-        **_fence(state), "path": str(target), "confirmDiscard": False,
-    })
+    response = client.post("/api/scenario/load", json={"path": str(target)})
     # The real candidate derivation runs; this fixture has no Manager for Apply.
     assert response.status_code == 503, response.text
     assert seen

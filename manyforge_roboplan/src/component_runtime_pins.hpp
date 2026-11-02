@@ -4,8 +4,8 @@
 #include <vector>
 
 namespace manyforge::roboplan_backend {
-struct RetainedNativeRuntime;
-class RetainedNativeGripperRuntime;
+struct RetainedExecutionHost;
+class RetainedGripperRuntime;
 
 namespace host_detail {
 class IoProviderDriverRecord;
@@ -16,13 +16,13 @@ using IoProviderDriverGroup =
 // Physical-only components retain their established identity. When I/O joins
 // a component, retention must preserve every member of this immutable group.
 struct ComponentRuntimePins final {
-  std::shared_ptr<RetainedNativeRuntime> runtime;
-  std::shared_ptr<RetainedNativeGripperRuntime> gripper_runtime;
+  std::shared_ptr<RetainedExecutionHost> runtime;
+  std::shared_ptr<RetainedGripperRuntime> gripper_runtime;
   std::shared_ptr<const IoProviderDriverGroup> io_provider_drivers;
 
   [[nodiscard]] bool
-  matches(const std::shared_ptr<RetainedNativeRuntime> &motion,
-          const std::shared_ptr<RetainedNativeGripperRuntime> &gripper,
+  matches(const std::shared_ptr<RetainedExecutionHost> &motion,
+          const std::shared_ptr<RetainedGripperRuntime> &gripper,
           const std::shared_ptr<const IoProviderDriverGroup> &drivers)
       const noexcept {
     return runtime == motion && gripper_runtime == gripper &&

@@ -343,15 +343,6 @@ TEST(ContactPolicyCodec,
            {"stop_stage_parameters", CanonicalValue(CanonicalValue::Array{})},
            {"commissioned_stop_interfaces",
             CanonicalValue(CanonicalValue::Array{})},
-           {"interrupt_sources", CanonicalValue(CanonicalValue::Array{})},
-           {"interrupt_policies", CanonicalValue(CanonicalValue::Array{})},
-           {"interrupt_config",
-            CanonicalValue(CanonicalValue::Object{
-                {"queue_depth", CanonicalValue(8.0)},
-                {"cancel_validation_timeout_ns", CanonicalValue(1000.0)},
-                {"motion_scope_arm_timeout_ns", CanonicalValue(1000.0)},
-                {"supervisory_poll_rate_hz", CanonicalValue(10.0)},
-            })},
        })},
   });
   const auto inputs = compute_capability_provider_binding_revisions(

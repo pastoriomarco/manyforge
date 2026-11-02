@@ -61,6 +61,152 @@
   }
 }
 
+/* The components as one tree (CONTRACTS §16): members under their owner, a
+   mounted tool under its parent. The house row (Scene objects, Catalog): the
+   id over its kind and model, both on one line, the state badge at the right,
+   never wrapped; depth indents the whole row; selected = tint + accent bar. */
+.dcard > .drows.component-list {
+  margin: 0;
+}
+
+.component-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.12rem 0.5rem;
+  min-width: 0;
+  padding: 0.48rem 0.65rem 0.48rem calc(0.65rem + var(--component-depth, 0) * 1rem);
+  border: 0;
+  border-radius: 0;
+  text-align: left;
+}
+
+.component-row.selected {
+  box-shadow: inset 0.2rem 0 var(--mf-shadow-accent-58);
+}
+
+.component-row > strong {
+  grid-column: 1;
+  overflow: hidden;
+  color: var(--mf-text-neutral-90);
+  font-size: var(--mf-font-size-076);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.component-row > span:not(.status-pill) {
+  display: grid;
+  grid-column: 1;
+  min-width: 0;
+}
+
+.component-row > span:not(.status-pill) > small {
+  overflow: hidden;
+  color: var(--mf-text-neutral-57);
+  font-size: var(--mf-font-size-068);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.component-row > .status-pill {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  white-space: nowrap;
+}
+
+.component-tree-item {
+  margin-left: calc(var(--component-depth, 0) * 1rem);
+}
+
+/* A machine (CONTRACTS §16): one card, no nested cards. Header: name, model
+   (ellipsised), state badge. Fields stacked with help under each. */
+.machine-card > header:first-child {
+  min-width: 0;
+}
+
+.machine-card > header:first-child > h3 {
+  flex: 0 0 auto;
+  max-width: 100%;
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-size: var(--mf-font-size-080);
+}
+
+.machine-card-model {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--mf-text-neutral-63);
+  font-size: var(--mf-font-size-068);
+  font-weight: 400;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.machine-card > header:first-child > .status-pill {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.machine-card .deployment-focused-field > small {
+  color: var(--mf-text-neutral-63);
+  font-size: var(--mf-font-size-068);
+}
+
+.component-state-rows {
+  display: grid;
+  gap: 0.4rem;
+}
+
+.machine-members-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.machine-members-heading > small {
+  color: var(--mf-text-neutral-57);
+  font-size: var(--mf-font-size-065);
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+/* A member: switch | house row | badge; its messages and actions below. */
+.machine-member {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.3rem 0.5rem;
+}
+
+.machine-member > .component-row {
+  padding: 0.3rem 0.45rem;
+}
+
+.machine-member-body {
+  display: grid;
+  grid-column: 2 / -1;
+  gap: 0.25rem;
+  min-width: 0;
+  padding-left: 0.45rem;
+}
+
+.machine-member-body > .inline-message {
+  overflow-wrap: anywhere;
+}
+
+.machine-member-actions > button {
+  flex: 0 1 auto;
+  min-height: 1.6rem;
+  padding: 0.15rem 0.55rem;
+  font-size: var(--mf-font-size-068);
+}
+
+.component-inactive {
+  opacity: 0.55;
+}
+
 .deployment-candidate-summary {
   display: grid;
   grid-template-columns: auto minmax(10rem, 1fr) minmax(8rem, auto);
@@ -251,7 +397,9 @@
   gap: 0.3rem;
 }
 
-.deployment-row-actions button {
+.deployment-row-actions button,
+.deployment-effective-field > button,
+:is(.deployment-focused-form-grid, .deployment-runtime-unit) :is(.deployment-focused-field, .toggle-control) > button {
   min-height: 1.65rem;
   padding: 0.2rem 0.42rem;
   font-size: var(--mf-font-size-065);
@@ -425,21 +573,17 @@
   background: var(--mf-bg-neutral-11);
 }
 
+/* Field rows (as the card panels): the label takes a third, the field two
+   thirds, one setting per row on hairlines; a checkbox row keeps its label
+   beside the box, and a hint stays under its row (no hairline above it). */
 .deployment-target-limit .deployment-focused-field,
-.deployment-stop-form .deployment-focused-field {
+.deployment-focused-form-grid .deployment-focused-field,
+.deployment-runtime-unit .deployment-focused-field,
+:is(.deployment-focused-body, .deployment-gripper-editor) > .deployment-focused-field {
   grid-template-columns: minmax(0, 1fr) minmax(0, 2fr);
-  gap: 0.6rem;
+  gap: 0.25rem 0.6rem;
   padding: 0.45rem 0;
   font-size: var(--mf-font-size-072);
-}
-
-.deployment-target-limit .deployment-focused-form-grid {
-  grid-template-columns: minmax(0, 1fr);
-  gap: 0;
-}
-
-.deployment-target-limit .deployment-focused-form-grid > * + * {
-  border-top: 1px solid var(--mf-border-neutral-19);
 }
 
 .deployment-target-limit :is(.field-help, .deployment-applied-comparison, .muted),
@@ -450,20 +594,65 @@
   line-height: 1.45;
 }
 
-/* Stop settings: the same label | field rows, one setting per row; a
-   checkbox row keeps its label beside the box, and a hint stays under its
-   row (no hairline above it). */
-.deployment-focused-form-grid.deployment-stop-form {
-  grid-template-columns: minmax(0, 1fr);
-  gap: 0;
-}
-
-.deployment-stop-form > * + :not(.field-help) {
+.deployment-focused-form-grid > :not(legend) + :not(.field-help) {
   border-top: 1px solid var(--mf-border-neutral-19);
 }
 
-.deployment-stop-form > .toggle-control {
+.deployment-focused-form-grid > .toggle-control {
   padding: 0.45rem 0;
+  flex-wrap: wrap;
+}
+
+/* A group of checkboxes in a row: its legend, then the boxes below. */
+.deployment-focused-form-grid fieldset.deployment-focused-field {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+/* A checkbox in a field row: the box in the field column, at its own size. */
+.deployment-focused-form-grid label.deployment-focused-field:has(> input[type='checkbox']) {
+  display: grid;
+  color: var(--mf-text-neutral-64b);
+  font-size: var(--mf-font-size-072);
+}
+
+.deployment-focused-form-grid .deployment-focused-field input[type='checkbox'] {
+  width: auto;
+  min-height: 0;
+  justify-self: start;
+  accent-color: var(--mf-text-accent-63);
+}
+
+/* A row's hint, error, default line and Reset to default sit under its
+   field, in the field column. */
+.deployment-focused-form-grid .deployment-effective-field {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 2fr);
+  column-gap: 0.6rem;
+  padding-bottom: 0.45rem;
+}
+
+.deployment-focused-form-grid .deployment-effective-field > .deployment-focused-field {
+  grid-column: 1 / -1;
+  padding-bottom: 0;
+}
+
+.deployment-focused-form-grid .deployment-effective-field > :is(small, button),
+:is(.deployment-target-limit, .deployment-focused-form-grid, .deployment-runtime-unit, .deployment-gripper-editor) :is(label, div).deployment-focused-field > :not(:first-child),
+.deployment-focused-body > :is(label, div).deployment-focused-field > :not(:first-child) {
+  grid-column: 2;
+}
+
+:is(.deployment-target-limit, .deployment-focused-form-grid, .deployment-runtime-unit, .deployment-gripper-editor) .deployment-focused-field > button,
+.deployment-focused-body > .deployment-focused-field > button {
+  justify-self: start;
+}
+
+/* Initial joint state: one joint per row, on the same hairlines. */
+.deployment-runtime-unit > fieldset.deployment-initial-joints {
+  gap: 0;
+}
+
+.deployment-runtime-unit > fieldset.deployment-initial-joints > .deployment-focused-field + .deployment-focused-field {
+  border-top: 1px solid var(--mf-border-neutral-19);
 }
 
 /* Stop fallbacks: one group row; its checkbox rows keep the same hairlines. */
@@ -552,8 +741,8 @@
 
 .deployment-focused-form-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
-  gap: 0.45rem;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0;
 }
 
 .deployment-focused-field {
@@ -581,6 +770,22 @@
 
 .deployment-focused-field.wide {
   grid-column: 1 / -1;
+}
+
+/* A field with an effective value (CONTRACTS §11): the field, whether the
+   Draft sets it, and its Reset to default. */
+.deployment-effective-field {
+  display: grid;
+  gap: 0.2rem;
+}
+
+.deployment-effective-field > small {
+  color: var(--mf-text-neutral-64b);
+  font-size: var(--mf-font-size-068);
+}
+
+.deployment-effective-field > button {
+  justify-self: start;
 }
 
 .deployment-gripper-editor,
@@ -624,7 +829,7 @@
 
 .deployment-initial-joints {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr));
+  grid-template-columns: minmax(0, 1fr);
   gap: 0.45rem;
   margin: 0.55rem 0 0;
   padding: 0.5rem;

@@ -20,7 +20,7 @@ inline constexpr std::int64_t kManagerBootstrapJournalSchemaVersion = 1;
 inline constexpr std::int64_t kManagerBootstrapJournalSqliteApplicationId =
     1296450122;
 inline constexpr std::size_t kMaximumBootstrapAttempts = 64U;
-inline constexpr std::size_t kMaximumBootstrapNativeRuntimeBindings = 64U;
+inline constexpr std::size_t kMaximumBootstrapExecutionHostBindings = 64U;
 inline constexpr std::size_t kMaximumBootstrapJournalIdentifierBytes = 256U;
 inline constexpr std::int64_t
     kMaximumBootstrapJournalDatabasePageImageBytes =
@@ -72,8 +72,8 @@ struct ManagerBootstrapIntentDTO final {
   manyforge::core::CellId cell_id;
   manyforge::core::RetainedBundleId canonical_empty_retained_bundle_id;
   manyforge::core::GraphRevision canonical_empty_graph_revision;
-  std::vector<manyforge::core::ProjectionNativeRuntimeBindingDTO>
-      native_runtime_bindings;
+  std::vector<manyforge::core::ProjectionExecutionHostBindingDTO>
+      execution_host_bindings;
 
   [[nodiscard]] bool valid() const noexcept;
 
@@ -148,7 +148,7 @@ struct ManagerBootstrapJournalIntegrityReport final {
   std::int64_t schema_version;
   std::string schema_artifact_digest;
   std::int64_t bootstrap_attempt_count;
-  std::int64_t native_runtime_binding_row_count;
+  std::int64_t execution_host_binding_row_count;
   std::int64_t accepted_target_count;
   std::optional<manyforge::core::BootstrapId> bootstrap_id;
   std::optional<manyforge::core::BootstrapGeneration>

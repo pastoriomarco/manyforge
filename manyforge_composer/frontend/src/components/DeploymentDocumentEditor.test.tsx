@@ -2,9 +2,12 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
+import type { ResetApplyController } from '../hooks/useResetApply';
+import { applyPreviewFixture } from '../test/applyPreview';
 import { DeploymentDocumentEditor } from './DeploymentDocumentEditor';
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
 import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
+import { authoringOperation } from '../state/busyOperation';
 import { ScenarioActionControls } from './ScenarioActionControls';
 
 function controller(): DeploymentWorkspaceController {
@@ -48,11 +51,10 @@ function controller(): DeploymentWorkspaceController {
     error: null,
     errorCauseCode: null,
     feedback: null,
-    acceptedApply: null,
-    acceptedApplyCorrelationId: null,
-    activationScope: null,
-    pendingApplyConfirmation: null,
-    pendingConfirmationAction: null,
+    busyOperation: null,
+    applyConfirmationOpen: false,
+    applyPreview: null,
+    applyPreviewKind: 'apply',
     comparisonUnavailableReason: null,
     mutationAvailable: true,
     mutationUnavailableReason: null,
@@ -69,8 +71,9 @@ function controller(): DeploymentWorkspaceController {
     saveAs: vi.fn(),
     discard: vi.fn(),
     applyDraft: vi.fn(),
+    applyConfirmedScope: vi.fn(),
     addComponents: vi.fn(),
-    previewDraft: vi.fn(),
+    previewApply: vi.fn(),
     confirmApply: vi.fn(),
     cancelApplyConfirmation: vi.fn(),
   };
@@ -186,5 +189,80 @@ describe('DeploymentDocumentEditor', () => {
     expect(scenarioActions(unsaved)).toMatch(
       /<button[^>]*disabled=""[^>]*title="Nothing to revert: the Saved Scenario matches Applied\."[^>]*>Revert<\/button>/,
     );
+  });
+
+  it('shows the Preview\'s per-component impact in the Apply confirmation (CONTRACTS §11)', () => {
+    const previewed = controller();
+    previewed.applyConfirmationOpen = true;
+    previewed.applyPreview = applyPreviewFixture([
+      { component_id: 'lite6_robot', disposition: 'replace', reasons: ['mount'], restarts: true },
+      { component_id: 'lite_gripper', disposition: 'replace', reasons: ['mount'], restarts: true },
+      { component_id: 'camera', disposition: 'retain', reasons: [], restarts: false },
+    ]);
+    const markup = scenarioActions(previewed);
+    expect(markup).toContain('Apply Deployment configuration change?');
+    expect(markup).toContain('Restarts lite6_robot and lite_gripper; the others keep running.');
+    expect(markup).toContain('Affected components come back prepared');
+    expect(markup).toContain('Confirm apply');
+    expect(markup).not.toContain('Deactivate');
+  });
+
+  it('offers Reset run and Apply when a stopped or held run blocks the Deployment Apply (AUD-4)', () => {
+    const previewed = controller();
+    previewed.applyConfirmationOpen = true;
+    previewed.applyPreview = applyPreviewFixture([
+      { component_id: 'lite6_robot', disposition: 'replace', reasons: ['mount'], restarts: true },
+    ]);
+    const resetApply = {
+      runExists: true, deploymentRunReset: true, unavailableReason: () => null, confirm: vi.fn(),
+    } as unknown as ResetApplyController;
+    const held = renderToStaticMarkup(
+      <ScenarioActionControls program={settledProgram} deployment={previewed} runtime={runtime} resetApply={resetApply} />,
+    );
+    expect(held).toContain('Applying Resets the current run.');
+    expect(held).toContain('Reset run and Apply');
+    // A finished run awaiting Reset: the server's Apply resets it itself.
+    const finished = renderToStaticMarkup(
+      <ScenarioActionControls program={settledProgram} deployment={previewed} runtime={runtime}
+        resetApply={{ ...resetApply, deploymentRunReset: false }} />,
+    );
+    expect(finished).not.toContain('Reset run and Apply');
+    expect(finished).toContain('Confirm apply');
+  });
+
+  it('confirms a Deployment Revert through its Preview, with the Program warning (CONTRACTS §11)', () => {
+    const previewed = controller();
+    previewed.applyConfirmationOpen = true;
+    previewed.applyPreviewKind = 'revert';
+    previewed.applyPreview = applyPreviewFixture([
+      { component_id: 'lite6_robot', disposition: 'remove', reasons: [], restarts: false },
+    ], { program: { executable: false, program_id: 'pick', unresolved_references: [{
+      component_role_id: 'arm', target_role_id: null, controllable_component_id: 'lite6_robot',
+      command_target_id: null, reason: 'component_removed', detail: '' }],
+    affected_nodes: [], affected_execution_groups: [] } });
+    const markup = scenarioActions(previewed);
+    expect(markup).toContain('Revert Deployment to saved?');
+    expect(markup).toContain('Removes lite6_robot.');
+    expect(markup).toContain('will not be executable after this Apply');
+    expect(markup).toContain('Confirm revert');
+  });
+
+  it('opens the Apply confirmation at once with "Previewing impact…" and holds every Scenario action', () => {
+    const previewing = controller();
+    const operation = authoringOperation('apply_preview');
+    Object.assign(previewing, { busy: true, busyOperation: operation, applyConfirmationOpen: true });
+    // The shared authoring gate names the operation to the Program too.
+    const program = { ...settledProgram, busyOperation: operation,
+      documentUnavailableReason: 'Apply preview is in progress.',
+      mutationUnavailableReason: 'Apply preview is in progress.' } as unknown as ProgramWorkspaceController;
+    const markup = renderToStaticMarkup(
+      <ScenarioActionControls program={program} deployment={previewing} runtime={runtime} />,
+    );
+    expect(markup).toContain('Apply Deployment configuration change?');
+    expect(markup).toContain('Previewing impact…');
+    expect(markup).toMatch(/<button[^>]*disabled=""[^>]*>Previewing…<\/button>/);
+    expect(markup).toMatch(/<button[^>]*disabled=""[^>]*title="Previewing impact…"[^>]*>Confirm apply<\/button>/);
+    expect(markup).toMatch(/<button[^>]*disabled=""[^>]*>Discard<\/button>/);
+    expect(markup).toMatch(/<button[^>]*disabled=""[^>]*>Revert<\/button>/);
   });
 });

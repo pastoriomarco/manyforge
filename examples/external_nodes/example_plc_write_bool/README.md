@@ -2,8 +2,7 @@
 
 > **Non-operative example:** this folder is not an installable external node.
 > It contains no `node.py`, no v1 descriptor, and no executable-package
-> manifest. Implementation resolution is unavailable until I5/H0 and addressed
-> execution is unavailable until I6/N.
+> manifest. ManyForge has no external-node loader.
 
 The historical example demonstrated a nonblocking Python leaf that obtained a
 deployment-owned PLC client from the blackboard. That mechanism was deleted
@@ -38,19 +37,3 @@ blackboard values.
 Do not add this directory to a runtime path, invoke the removed
 `manyforge nodes validate` command, or uncomment `node.yaml` and claim it is a
 valid extension package.
-
-## Restoration mapping
-
-The exact historical source is parent commit
-`153195a692c50e606f50e40bd755da6081dd24c5`, tree
-`c0daa2440275c2635f022c90dd9d71bff5d43b6d`:
-
-- `node.py` and its `ExamplePlcWriteBool` class are evidence for the future
-  thin NRT client; they are not retained as dormant executable code.
-- `node.yaml` is evidence for user-facing name/description, boolean value,
-  bounded cancellation, and I/O capability intent. Its v0 runtime/module/class,
-  provider alias, local Stop policy, and unscoped capability fields never
-  return.
-- the four historical fake-PLC tests map to the pure reducer here and to I6/N
-  owner-client integration; Kernel Stop behavior is separately requalified at
-  I8/P5.

@@ -348,7 +348,8 @@ def test_relative_motion_authoring_types_remain_available():
     assert ref.id == "base"
     assert motion.goal.position_m.x_m == 0.1
     assert manyforge_core_py.MotionTargetMode.kRelative is not None
-    assert manyforge_core_py.PlanningProfile.kBalanced is not None
+    assert manyforge_core_py.PlannerSearch.kRrtConnect is not None
+    assert manyforge_core_py.PlannerOptimize.kBestOfN is not None
 
 
 def test_cartesian_path_dto():

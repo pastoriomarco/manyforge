@@ -9,6 +9,19 @@ folder (absolute when the Draft has none). Tags come from the component-type
 catalog of the row's model family, for Program role compatibility; a family
 tagged ``tool`` is a tool, mounted on a robot's ``flange`` by an attachment row.
 
+Machines (CONTRACTS §16) come from their models instead (the description's
+``component_models``): one ``kind: machine`` entry per machine model, snake_case
+(BOUNDARY §5), after the others, with ready owner and member rows;
+adding one posts the owner row plus one member row per member. Example rows of
+a machine (owner or member), and rows whose assembly reaches one, are not
+offered on their own.
+
+Sensors (``kind: sensor``, e.g. the point-cloud source) also come from their
+models in ``component_models``: one ordinary ``kind: sensor`` entry per model
+with a ready row under the model id's last segment (without ``topic`` and
+``source_frame_id``, which the Add panel asks for); a sensor has no lane, so its
+profile facts' ``lanes`` are empty.
+
 Nothing here compiles or changes a Draft: the Add component Draft route adds
 the rows (and a tool's attachment row), and the Apply compiler checks them.
 """
@@ -20,6 +33,8 @@ import json
 import logging
 from pathlib import Path
 from typing import Any
+
+import yaml
 
 from manyforge_behavior.canonical_artifact import (
     StrictArtifactError,
@@ -45,12 +60,13 @@ _COMPONENT_TYPES = _MAINTAINED / "catalog/component_type"
 
 # runtime_kind -> catalog kind; every other row carries a model: a tool when
 # its component type is tagged ``tool``, otherwise a robot.
-_MODEL_FREE_KINDS = {
+_RUNTIME_KINDS = {
     "io_provider": "io_device",
     "pose_source": "pose_source",
     "ai_model": "ai_model",
+    "sensor": "sensor",
 }
-_KIND_ORDER = ("robot", "tool", "io_device", "pose_source", "ai_model")
+_KIND_ORDER = ("robot", "tool", "io_device", "pose_source", "ai_model", "sensor")
 
 
 def _kind(row: dict[str, Any], tags: list[str]) -> str:
@@ -58,8 +74,8 @@ def _kind(row: dict[str, Any], tags: list[str]) -> str:
     runtime_kind = (
         configuration.get("runtime_kind") if isinstance(configuration, dict) else None
     )
-    if runtime_kind in _MODEL_FREE_KINDS:
-        return _MODEL_FREE_KINDS[runtime_kind]
+    if runtime_kind in _RUNTIME_KINDS:
+        return _RUNTIME_KINDS[runtime_kind]
     return "tool" if "tool" in tags else "robot"
 
 
@@ -90,6 +106,155 @@ def _assembly(component_id: str, rows: dict[str, dict[str, Any]]) -> list[str]:
             sorted(_referenced_components(rows[current]) & rows.keys())
         )
     return sorted(members)
+
+
+def _machine_rows(rows: dict[str, dict[str, Any]]) -> set[str]:
+    """The ids of a Scenario's machine rows: members (`owner`) and their owners."""
+
+    members = {cid for cid, row in rows.items() if "owner" in row}
+    return members | {rows[cid]["owner"] for cid in members}
+
+
+def _descriptor(path: str) -> dict[str, Any]:
+    return yaml.safe_load((_REPOSITORY / path).read_text(encoding="utf-8"))
+
+
+def _arm_row(
+    model: dict[str, Any], family_row: dict[str, Any], project_root: Path | None,
+    component_id: str,
+) -> dict[str, Any]:
+    """A machine's arm member row from its model, as a new robot is added:
+    the model's sources, an identity base pose, its default joints and TCP
+    speed, its measured-joints stream, all under its default id. Without
+    `owner`, `role` and lane."""
+
+    source = family_row["source"]
+    package = source["accepted_package_uri_prefix"].removeprefix("package://").split("/")[0]
+    defaults = model.get("defaults") or {}
+    row: dict[str, Any] = {
+        "component_id": component_id,
+        "component_profile_id": model["id"],
+        "model_source": {
+            "urdf": {"project_path": source["urdf_path"]},
+            "srdf": {"project_path": source["srdf_path"]},
+            "package_roots": {package: {"project_path": package}},
+        },
+        "root_pose_in_cell": {"position_m": [0.0, 0.0, 0.0],
+                              "orientation_xyzw": [0.0, 0.0, 0.0, 1.0]},
+        "frame_prefix": "",
+        "target_settings": {"arm": {
+            "maximum_tcp_linear_speed_mps": defaults.get(
+                "maximum_tcp_linear_speed_mps", model["limits"]["max_tcp_linear_speed_mps"]),
+        }},
+        "configuration": {
+            "runtime_kind": "ros2_control",
+            "runtime_configuration": {
+                "component_streams": [
+                    {"budget_ns": 250000000, "controllable_component_id": component_id,
+                     "stream_id": "measured_joints"}
+                ],
+                **({"initial_joint_positions_rad": list(defaults["initial_joint_positions_rad"])}
+                   if "initial_joint_positions_rad" in defaults else {}),
+            },
+        },
+    }
+    [located] = _located_rows([row], [], scenario_root=_REPOSITORY, project_root=project_root)
+    return located
+
+
+def _machine_entries(
+    sources: dict[str, Any], project_root: Path | None
+) -> list[dict[str, Any]]:
+    """BOUNDARY §5 (amended): `{kind: machine, model_id, title, lanes[],
+    default_owner_id, owner_row, members: [{role, model_id, title, row}]}`.
+    Rows are ready Deployment rows under the default ids (owner:
+    `default_owner_id`, member: `<default_owner_id>_<role>`, inner references
+    too), without `owner`, the members' `role` and the owner's `lane`; a
+    machine runs on its robot member's lanes."""
+
+    models: dict[str, dict[str, Any]] = {}
+    families: dict[str, dict[str, Any]] = {}
+    for family_row in sources["model_families"]:
+        if "component_descriptor" in family_row:
+            descriptor = _descriptor(family_row["component_descriptor"])
+            models[descriptor["id"]] = descriptor
+            families[descriptor["id"]] = family_row
+    for path in sources.get("component_models", []):
+        descriptor = _descriptor(path)
+        models[descriptor["id"]] = descriptor
+    entries = []
+    for model_id, machine in sorted(models.items()):
+        if machine.get("kind") != "machine":
+            continue
+        arm = next(
+            (member for member in machine["members"]
+             if models.get(member["model"], {}).get("kind") == "robot"),
+            None,
+        )
+        owner_id = machine["default_owner_id"]
+        members = []
+        for member in machine["members"]:
+            model = models[member["model"]]
+            member_id = f"{owner_id}_{member['role']}"
+            members.append({
+                "role": member["role"],
+                "model_id": member["model"],
+                "title": model.get("title"),
+                "row": (_arm_row(model, families[member["model"]], project_root, member_id)
+                        if model.get("kind") == "robot"
+                        else {"component_id": member_id,
+                              "component_profile_id": member["model"]}),
+            })
+        entries.append({
+            "kind": "machine",
+            "model_id": model_id,
+            "title": machine["title"],
+            "lanes": sorted(models[arm["model"]].get("lanes") or {}) if arm else [],
+            "default_owner_id": owner_id,
+            "owner_row": {"component_id": owner_id, "component_profile_id": model_id,
+                          "configuration": {}},
+            "members": members,
+        })
+    return entries
+
+
+def _sensor_models(sources: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """(descriptor path, descriptor) of every `kind: sensor` component model."""
+
+    models = []
+    for path in sources.get("component_models", []):
+        descriptor = _descriptor(path)
+        if descriptor.get("kind") == "sensor":
+            models.append((path, descriptor))
+    return sorted(models, key=lambda item: item[1]["id"])
+
+
+def _sensor_entries(sources: dict[str, Any]) -> list[dict[str, Any]]:
+    """One ordinary catalog entry per sensor model: its ready row (default id
+    the model id's last segment) without the sensor's `topic` and
+    `source_frame_id`; a sensor has no lane."""
+
+    entries = []
+    for path, model in _sensor_models(sources):
+        component_id = model["id"].rsplit(".", 1)[-1]
+        entries.append({
+            "entryId": f"model/{model['id']}",
+            "kind": "sensor",
+            "componentId": component_id,
+            "componentProfileId": model["id"],
+            "modelFamilyId": None,
+            "tags": [],
+            "lane": None,
+            "description": model["title"],
+            "sources": [path],
+            "components": [{
+                "component_id": component_id,
+                "component_profile_id": model["id"],
+                "target_settings": {},
+                "configuration": {"runtime_kind": "sensor", "runtime_configuration": {}},
+            }],
+        })
+    return entries
 
 
 def _model_payload(family_row: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -152,51 +317,69 @@ def _has_motion_target(component_type: dict[str, Any]) -> bool | None:
     return "execution.trajectory.execute" in capabilities
 
 
-def _profiles() -> tuple[list[str], dict[str, str], dict[str, dict[str, Any]]]:
-    """Every component profile, profile -> model family, family -> type facts.
+# Model-free components name these constant ids (no model, no family).
+_MODEL_FREE_PROFILES = ("ai_model_v0", "io_device_v0", "pose_source_v0")
 
-    The facts of a component type are its tags, the ids of its attachment
-    interfaces (a robot's ``flange``), its targets with TCPs and, when its
-    model asset defines one, the model's payload (read-only package data).
+
+def _profiles() -> tuple[list[str], dict[str, str], dict[str, dict[str, Any]]]:
+    """Every component model, model -> model family, model -> type facts.
+
+    The models are the descriptors the maintained families name
+    (``component_descriptor``), keyed by the descriptor's ``id``. The facts
+    of a model are its lanes (``lanes.<lane>`` of its descriptor), its
+    component type's tags, the ids of its attachment interfaces (a robot's
+    ``flange``), its targets with TCPs and, when its model asset defines one,
+    the model's payload (read-only package data).
     """
 
     sources = json.loads(_SOURCES.read_text(encoding="utf-8"))
-    rows = sources["runtime_restoration_profiles"]
-    families = {
-        row["runtime_restoration_profile_id"]: row["model_family_id"]
-        for row in rows
-        if isinstance(row.get("model_family_id"), str)
-    }
-    family_rows = {
-        row["model_family_id"]: row for row in sources.get("model_families", [])
-    }
+    families: dict[str, str] = {}
     facts: dict[str, dict[str, Any]] = {}
-    for family in set(families.values()):
+    for family_row in sources["model_families"]:
+        if "component_descriptor" not in family_row:
+            continue
+        descriptor = yaml.safe_load(
+            (_REPOSITORY / family_row["component_descriptor"]).read_text(encoding="utf-8")
+        )
+        model = descriptor["id"]
+        family = family_row["model_family_id"]
+        families[model] = family
         path = _COMPONENT_TYPES / f"{family}.component.json"
-        if path.is_file():
-            component_type = json.loads(path.read_text(encoding="utf-8"))
-            facts[family] = {
-                "tags": sorted(component_type.get("tags", [])),
-                "attachmentInterfaces": sorted(
-                    interface["attachment_interface_id"]
-                    for interface in component_type.get("attachment_interfaces", [])
-                ),
-                "tcpTargets": _tcp_targets(component_type),
-                "frameTargets": sorted([
-                    {"commandTargetId": target["command_target_id"],
-                     "frameRoleIds": sorted(row["frame_role_id"]
-                                            for row in target["frame_roles"])}
-                    for target in component_type.get("command_targets", [])
-                    if isinstance(target.get("frame_roles"), list)
-                ], key=lambda target: target["commandTargetId"]),
-            }
-            has_motion_target = _has_motion_target(component_type)
-            if has_motion_target is not None:
-                facts[family]["hasMotionTarget"] = has_motion_target
-            payload = _model_payload(family_rows.get(family))
-            if payload is not None:
-                facts[family]["payload"] = payload
-    return sorted(row["runtime_restoration_profile_id"] for row in rows), families, facts
+        if not path.is_file():
+            continue  # no component type generated yet: no facts to offer
+        component_type = json.loads(path.read_text(encoding="utf-8"))
+        model_facts: dict[str, Any] = {
+            "lanes": sorted(descriptor.get("lanes") or {}),
+            "tags": sorted(component_type.get("tags", [])),
+            "attachmentInterfaces": sorted(
+                interface["attachment_interface_id"]
+                for interface in component_type.get("attachment_interfaces", [])
+            ),
+            "tcpTargets": _tcp_targets(component_type),
+            "frameTargets": sorted([
+                {"commandTargetId": target["command_target_id"],
+                 "frameRoleIds": sorted(row["frame_role_id"]
+                                        for row in target["frame_roles"])}
+                for target in component_type.get("command_targets", [])
+                if isinstance(target.get("frame_roles"), list)
+            ], key=lambda target: target["commandTargetId"]),
+        }
+        has_motion_target = _has_motion_target(component_type)
+        if has_motion_target is not None:
+            model_facts["hasMotionTarget"] = has_motion_target
+        payload = _model_payload(family_row)
+        if payload is not None:
+            model_facts["payload"] = payload
+        facts[model] = model_facts
+    # Sensor models have no model family, component type or lane.
+    for _path, descriptor in _sensor_models(sources):
+        facts[descriptor["id"]] = {
+            "lanes": [],
+            "tags": [],
+            "attachmentInterfaces": [],
+            "tcpTargets": [],
+        }
+    return sorted([*families, *_MODEL_FREE_PROFILES]), families, facts
 
 
 def _located_rows(
@@ -245,7 +428,7 @@ def _located_rows(
 def component_catalog(project_root: str | None) -> dict[str, Any]:
     """The addable component rows of the curated example Scenarios."""
 
-    profiles, families, family_facts = _profiles()
+    profiles, families, model_facts = _profiles()
     destination = None if project_root is None else Path(project_root)
     entries: dict[bytes, dict[str, Any]] = {}
     for deployment_path in sorted(_EXAMPLES.glob("*.scenario/deployment.yaml")):
@@ -268,6 +451,7 @@ def component_catalog(project_root: str | None) -> dict[str, Any]:
             )
             continue
         rows = {row["component_id"]: row for row in intent["components"]}
+        machine_rows = _machine_rows(rows)
         compatibility = intent.get("compatibility")
         lane = (
             compatibility.get("lane")
@@ -277,6 +461,9 @@ def component_catalog(project_root: str | None) -> dict[str, Any]:
         )
         for component_id, row in rows.items():
             members = _assembly(component_id, rows)
+            # A machine is added whole, from its machine entry.
+            if machine_rows & set(members):
+                continue
             located = _located_rows(
                 [deepcopy(rows[member]) for member in members],
                 [
@@ -294,7 +481,7 @@ def component_catalog(project_root: str | None) -> dict[str, Any]:
                 continue
             profile = row["component_profile_id"]
             family = families.get(profile)
-            tags = family_facts.get(family, {}).get("tags", [])
+            tags = model_facts.get(profile, {}).get("tags", [])
             entries[key] = {
                 "entryId": f"{scenario_root.name}/{component_id}",
                 "kind": _kind(row, tags),
@@ -316,7 +503,11 @@ def component_catalog(project_root: str | None) -> dict[str, Any]:
             entry["entryId"],
         ),
     )
+    sources = json.loads(_SOURCES.read_text(encoding="utf-8"))
+    ordered += _sensor_entries(sources)
     offered = {entry["componentProfileId"] for entry in ordered}
+    # BOUNDARY §5: one entry per machine model (owner plus member rows).
+    ordered += _machine_entries(sources, destination)
     return {
         "schemaVersion": "manyforge.composer_component_catalog.v1",
         "projectRoot": project_root,
@@ -324,12 +515,8 @@ def component_catalog(project_root: str | None) -> dict[str, Any]:
         "profilesWithoutEntry": [
             profile for profile in profiles if profile not in offered
         ],
-        # Type facts of every profile with a component type, for the Draft's
-        # rows too: tool or robot, the robots a tool can mount on, its TCPs
-        # per target, and the model's own payload when it defines one.
-        "componentProfiles": {
-            profile: family_facts[families[profile]]
-            for profile in profiles
-            if families.get(profile) in family_facts
-        },
+        # Facts of every component model, for the Draft's rows too: its
+        # lanes, tool or robot, the robots a tool can mount on, its TCPs per
+        # target, and the model's own payload when it defines one.
+        "componentProfiles": model_facts,
     }

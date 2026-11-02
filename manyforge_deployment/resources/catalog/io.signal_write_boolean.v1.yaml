@@ -1,8 +1,0 @@
-api_version: manyforge.io_signal_write_command_schema.v1
-command_schema_id: io.signal_write_boolean
-command_schema_revision: sha256:2a0823f3255907443875c1428495eac7ab3945280477b95332f67fccd5ace9ea
-compatible_capabilities:
-  - capability_id: io.gpio.set_output
-    capability_definition_revision: sha256:b7f9e3ae6ed12dd59fd78193db902c6ad09528372ad0f5e2423f936833cb49f8
-command_value:
-  value_kind: io_signal_write

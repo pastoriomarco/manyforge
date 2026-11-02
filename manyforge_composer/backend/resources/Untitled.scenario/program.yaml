@@ -22,9 +22,9 @@
       "constraints": {
         "min_inclusive": 0.0
       },
-      "default": 0.01,
-      "description": "Default maximum Cartesian blend deviation.",
-      "parameter_id": "max_blend_deviation_rad",
+      "default": 0.0,
+      "description": "Default Cartesian corner blend radius (m); 0 keeps exact corners.",
+      "parameter_id": "blend_radius_m",
       "type": "float64"
     },
     {

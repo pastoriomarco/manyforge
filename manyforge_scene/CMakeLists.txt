@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(manyforge_scene VERSION 0.1.0 LANGUAGES CXX)
+project(manyforge_scene VERSION 0.2.0 LANGUAGES CXX)
 
 cmake_policy(SET CMP0077 NEW)
 
@@ -354,7 +354,8 @@ if(BUILD_TESTING OR MANYFORGE_SCENE_BUILD_TESTS_IN_CONSUMER)
     manyforge::deployment_admission
     SQLite::SQLite3
     GTest::gtest_main)
+  # The maintenance-history bound test runs 256 + 8 full maintenance cycles.
   gtest_discover_tests(test_canonical_empty_scene_owner
-    PROPERTIES TIMEOUT ${MANYFORGE_SCENE_GTEST_TIMEOUT_SECONDS})
+    PROPERTIES TIMEOUT 300)
 
 endif()

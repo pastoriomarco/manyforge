@@ -58,8 +58,6 @@ inline constexpr char kRecoveryNoneActive[] = "no_recovery_active";
 inline constexpr char kRecoveryStopNotCertified[] = "stop_not_certified";
 inline constexpr char kRecoveryStopCertified[] = "stop_certified";
 inline constexpr char kRecoveryTerminalCleanupPending[] = "terminal_cleanup_pending";
-inline constexpr char kRecoveryStopFailedEscalating[] =
-    "stop_failed_escalating";
 inline constexpr char kRecoveryStopOwnerActive[] = "stop_owner_active";
 inline constexpr char kRecoveryObservedStateUnavailable[] =
     "observed_state_unavailable";
@@ -70,7 +68,6 @@ inline constexpr char kRecoveryObservedStateAuthorityNotMeasured[] =
     "observed_state_authority_not_measured";
 inline constexpr char kRecoveryStrongerAuthorityActive[] =
     "stronger_authority_active";
-inline constexpr char kRecoveryQueuedLatchPresent[] = "queued_latch_present";
 inline constexpr char kRecoveryLatchMissing[] = "recovery_latch_missing";
 inline constexpr char kRecoveryLatchNotRetryable[] =
     "recovery_latch_not_retryable";
@@ -83,7 +80,6 @@ inline constexpr char kRecoveryFailedNotRetryable[] =
 inline constexpr char kRecoveryStaleAssessment[] = "assessment_stale";
 inline constexpr char kRecoveryStaleEpoch[] = "control_epoch_changed";
 inline constexpr char kRecoveryExecutionChanged[] = "execution_changed";
-inline constexpr char kRecoveryLatchChanged[] = "latch_changed";
 inline constexpr char kRecoveryStopCertificateChanged[] =
     "stop_certificate_changed";
 inline constexpr char kRecoveryStopOwnerGenerationChanged[] =
@@ -95,7 +91,5 @@ inline constexpr char kRecoveryPrincipalMissing[] =
     "principal_id_missing";
 inline constexpr char kRecoveryRequestIdMissing[] =
     "request_id_missing";
-inline constexpr char kRecoveryQueuedLatchReplayed[] =
-    "queued_latch_replayed";
 
 }  // namespace manyforge::core::reason_codes

@@ -43,14 +43,10 @@ DeploymentDraftValue(const deployment::CompiledDeploymentDraft &compiled) {
   return result;
 }
 
-py::dict CompileDeploymentDraft(const std::string &source,
-                                std::optional<bool> migrate_jerk = {}) {
+py::dict CompileDeploymentDraft(const std::string &source) {
   const auto compiled = [&]() {
     py::gil_scoped_release release;
-    return migrate_jerk.has_value()
-               ? deployment::migrate_controlled_stop_jerk_choice(source,
-                                                                 *migrate_jerk)
-               : deployment::compile_deployment_draft(source);
+    return deployment::compile_deployment_draft(source);
   }();
   return DeploymentDraftValue(compiled);
 }
@@ -530,11 +526,15 @@ public:
     });
   }
 
-  std::string RecordScenarioForceClose(const std::string& record_json) {
+  std::string RecordActivity(const std::string& record_json) {
     py::gil_scoped_release release;
     return Invoke([this, &record_json]() {
+      if (record_json.size() > 64U * 1024U) {
+        throw OperatorAlarmError("activity_record_invalid",
+                                 "activity record exceeds its byte bound");
+      }
       auto record = deployment::parse_strict_json_model_yaml(record_json).root();
-      return core_->RecordScenarioForceClose(std::move(record));
+      return core_->RecordActivity(std::move(record));
     });
   }
 
@@ -599,35 +599,12 @@ public:
 
   std::string CompleteOperationEventSnapshot(
       std::string source_owner_epoch,
-      const std::uint64_t through_source_sequence,
-      std::optional<std::string> current_stop_fault_json) {
+      const std::uint64_t through_source_sequence) {
     py::gil_scoped_release release;
     return Invoke([this, source_owner_epoch = std::move(source_owner_epoch),
-                   through_source_sequence,
-                   current_stop_fault_json =
-                       std::move(current_stop_fault_json)]() mutable {
-      std::optional<CanonicalValue> current_stop_fault;
-      if (current_stop_fault_json.has_value()) {
-        try {
-          current_stop_fault =
-              deployment::parse_strict_json_model_yaml(*current_stop_fault_json)
-                  .root();
-        } catch (const std::exception &error) {
-          throw OperatorAlarmError(
-              "headless_operation_event_invalid",
-              "current Stop-fault condition is not strict JSON: " +
-                  std::string(error.what()));
-        }
-        if (content_identity::canonical_json(*current_stop_fault) !=
-            *current_stop_fault_json) {
-          throw OperatorAlarmError(
-              "headless_operation_event_invalid",
-              "current Stop-fault condition is not canonical JSON");
-        }
-      }
-      return core_->CompleteOperationEventSnapshot(
-          std::move(source_owner_epoch), through_source_sequence,
-          std::move(current_stop_fault));
+                   through_source_sequence]() mutable {
+      return core_->CompleteOperationEventSnapshot(std::move(source_owner_epoch),
+                                                   through_source_sequence);
     });
   }
 
@@ -679,81 +656,6 @@ std::string ObserveProgramFailureCondition(std::string condition_json) {
           return core_->MarkOperationEventSourceUnknown(
               std::move(source_owner_epoch));
         });
-  }
-
-  std::string ComponentLifecycleConditionScope() {
-    py::gil_scoped_release release;
-    return Invoke(
-        [this]() { return core_->ComponentLifecycleConditionScope(); });
-  }
-
-  std::string
-  ObserveComponentLifecycleConditions(std::string cclc_owner_epoch,
-                                      std::string snapshots_json,
-                                      std::vector<std::string> unavailable) {
-    py::gil_scoped_release release;
-    return Invoke([this, cclc_owner_epoch = std::move(cclc_owner_epoch),
-                   snapshots_json = std::move(snapshots_json),
-                   unavailable = std::move(unavailable)]() mutable {
-      CanonicalValue snapshots;
-      try {
-        snapshots = deployment::parse_strict_json_model_yaml(snapshots_json)
-                        .root();
-      } catch (const std::exception &error) {
-        throw OperatorAlarmError(
-            "headless_component_lifecycle_invalid",
-            "CCLC component snapshots are not strict JSON: " +
-                std::string(error.what()));
-      }
-      if (content_identity::canonical_json(snapshots) != snapshots_json) {
-        throw OperatorAlarmError(
-            "headless_component_lifecycle_invalid",
-            "CCLC component snapshots are not canonical JSON");
-      }
-      return core_->ObserveComponentLifecycleConditions(
-          std::move(cclc_owner_epoch), std::move(snapshots),
-          std::move(unavailable));
-    });
-  }
-
-  std::string
-  ObserveEmptyComponentLifecycleConfiguration(std::string retained_bundle_id,
-                                              std::string graph_revision) {
-    py::gil_scoped_release release;
-    return Invoke([this, retained_bundle_id = std::move(retained_bundle_id),
-                   graph_revision = std::move(graph_revision)]() mutable {
-      return core_->ObserveEmptyComponentLifecycleConfiguration(
-          std::move(retained_bundle_id), std::move(graph_revision));
-    });
-  }
-
-  std::string MarkComponentLifecycleSourceUnknown() {
-    py::gil_scoped_release release;
-    return Invoke(
-        [this]() { return core_->MarkComponentLifecycleSourceUnknown(); });
-  }
-
-  std::string RecordCCLCIncidentEvent(std::string cclc_owner_epoch,
-                                      std::string event_json) {
-    py::gil_scoped_release release;
-    return Invoke([this, cclc_owner_epoch = std::move(cclc_owner_epoch),
-                   event_json = std::move(event_json)]() mutable {
-      if (event_json.size() > 256U * 1024U) {
-        throw OperatorAlarmError("headless_cclc_incident_event_invalid",
-                                 "CCLC incident event exceeds its byte bound");
-      }
-      CanonicalValue event;
-      try {
-        event = deployment::parse_strict_json_model_yaml(event_json).root();
-      } catch (const std::exception &error) {
-        throw OperatorAlarmError(
-            "headless_cclc_incident_event_invalid",
-            "CCLC incident event is not strict JSON: " +
-                std::string(error.what()));
-      }
-      return core_->RecordCCLCIncidentEvent(std::move(cclc_owner_epoch),
-                                            std::move(event));
-    });
   }
 
   void Shutdown() {
@@ -1103,29 +1005,6 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
       },
       py::arg("source"));
   module.def(
-      "migrate_controlled_stop_jerk_choice",
-      [](const std::string &source, bool enabled) {
-        return manyforge::headless::CompileDeploymentDraft(source, enabled);
-      },
-      py::arg("source"), py::arg("enabled").noconvert());
-  module.def(
-      "import_moveit_angular_jerk_limits",
-      [](const std::string &source, const std::string &moveit_source,
-         const std::string &source_id, const std::string &runtime_unit_id,
-         const std::string &component_id, const std::string &target_id,
-         const std::vector<std::string> &source_joint_names) {
-        const auto compiled = [&] {
-          py::gil_scoped_release release;
-          return manyforge::deployment::import_moveit_angular_jerk_limits(
-              source, moveit_source, source_id, runtime_unit_id, component_id,
-              target_id, source_joint_names);
-        }();
-        return manyforge::headless::DeploymentDraftValue(compiled);
-      },
-      py::arg("source"), py::arg("moveit_source"), py::arg("source_id"),
-      py::arg("runtime_unit_id"), py::arg("component_id"), py::arg("target_id"),
-      py::arg("source_joint_names"));
-  module.def(
       "read_control_source_file_hint",
       [](const std::string &path) {
         return manyforge::headless::ReadControlSourceFileHint(path);
@@ -1243,8 +1122,8 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
            py::arg("report_json"))
       .def("record_program_diagnostic",
            &HeadlessApiBridge::RecordProgramDiagnostic, py::arg("record_json"))
-      .def("record_scenario_force_close",
-           &HeadlessApiBridge::RecordScenarioForceClose, py::arg("record_json"))
+      .def("record_activity", &HeadlessApiBridge::RecordActivity,
+           py::arg("record_json"))
       .def("commit_program_model_attempt",
            &HeadlessApiBridge::CommitProgramModelAttempt,
            py::arg("record_json"))
@@ -1266,8 +1145,7 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
            py::arg("payload_digest"))
       .def("complete_operation_event_snapshot",
            &HeadlessApiBridge::CompleteOperationEventSnapshot,
-           py::arg("source_owner_epoch"), py::arg("through_source_sequence"),
-           py::arg("current_stop_fault_json") = std::nullopt)
+           py::arg("source_owner_epoch"), py::arg("through_source_sequence"))
       .def("mark_operation_event_source_unknown",
            &HeadlessApiBridge::MarkOperationEventSourceUnknown,
            py::arg("source_owner_epoch"))
@@ -1277,19 +1155,5 @@ PYBIND11_MODULE(manyforge_headless_py, module) {
       .def("observe_runtime_fault_conditions",
            &HeadlessApiBridge::ObserveRuntimeFaultConditions,
            py::arg("source_owner_epoch"), py::arg("current_runtime_faults_json"))
-      .def("component_lifecycle_condition_scope",
-           &HeadlessApiBridge::ComponentLifecycleConditionScope)
-      .def("observe_component_lifecycle_conditions",
-           &HeadlessApiBridge::ObserveComponentLifecycleConditions,
-           py::arg("cclc_owner_epoch"), py::arg("snapshots_json"),
-           py::arg("unavailable_component_ids"))
-      .def("observe_empty_component_lifecycle_configuration",
-           &HeadlessApiBridge::ObserveEmptyComponentLifecycleConfiguration,
-           py::arg("retained_bundle_id"), py::arg("graph_revision"))
-      .def("mark_component_lifecycle_source_unknown",
-           &HeadlessApiBridge::MarkComponentLifecycleSourceUnknown)
-      .def("record_cclc_incident_event",
-           &HeadlessApiBridge::RecordCCLCIncidentEvent,
-           py::arg("cclc_owner_epoch"), py::arg("event_json"))
       .def("shutdown", &HeadlessApiBridge::Shutdown);
 }

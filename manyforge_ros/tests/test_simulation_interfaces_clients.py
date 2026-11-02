@@ -1,4 +1,4 @@
-"""In-container ROS service transport test for the selected Isaac clients."""
+"""In-container ROS service transport test for the simulation_interfaces clients."""
 
 from __future__ import annotations
 

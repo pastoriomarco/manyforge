@@ -264,14 +264,6 @@ class _SubscribedExecution:
 
         yield _Subscription()
 
-    def stop_fault(self) -> dict[str, Any]:
-        return {
-            "api_version": "manyforge.execution_command_response.v1",
-            "command": "get_stop_fault",
-            "ok": True,
-            "stop_fault": None,
-        }
-
 
 def test_event_pump_ingests_rows_and_progress_from_the_subscription_only() -> None:
     core = _RecordingCore()

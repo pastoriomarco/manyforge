@@ -361,6 +361,41 @@ def test_manager_client_sends_one_exact_apply_acknowledgement(
     }]
 
 
+def test_manager_client_sends_one_exact_apply_release_for_new(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = ManagerCommandClient(tmp_path)
+    commands: list[dict[str, object]] = []
+    released = {
+        "api_version": MANAGER_RESPONSE_VERSION, "error": None, "ok": True,
+        "released": {"apply_id": "apply.3", "apply_generation": 3},
+    }
+
+    def exchange(command: dict[str, object]) -> dict[str, object]:
+        commands.append(command)
+        return released
+
+    monkeypatch.setattr(client, "_exchange", exchange)
+    context = ManagerApplyAcknowledgementContext.model_validate({
+        "request_id": "composer-new.request.4", "source_label": "manyforge_composer",
+    })
+    assert client.release_failed_apply_for_new(context) == released
+    assert commands == [{
+        "api_version": "manyforge.manager_command.v1",
+        "command": "apply_release_for_new",
+        "request_context": {
+            "request_id": "composer-new.request.4",
+            "source_label": "manyforge_composer",
+        },
+    }]
+    monkeypatch.setattr(client, "_exchange", lambda _command: {**released, "released": None})
+    assert client.release_failed_apply_for_new(context)["released"] is None
+    monkeypatch.setattr(client, "_exchange", lambda _command: {**released, "released": "apply.3"})
+    with pytest.raises(HeadlessApiError) as captured:
+        client.release_failed_apply_for_new(context)
+    assert captured.value.code == "manager_command_response_invalid"
+
+
 def test_apply_acknowledgement_preserves_pre_attempt_refusal_details(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -812,148 +847,6 @@ def test_scene_pose_client_fences_and_validates_the_owner_projection(
     }
 
 
-def _process_stop_request():
-    from manyforge_headless_api.models import ComponentProcessStopRequest
-    return ComponentProcessStopRequest.model_validate({
-        "request_context": {"request_id": "stop.1", "request_owner_epoch": "owner.1",
-                            "source_label": "composer", "correlation_id": "close.1"},
-        "predecessor_projection_revision": {
-            "retained_bundle_id": "sha256:" + "a" * 64,
-            "graph_revision": "sha256:" + "b" * 64,
-            "scene_revision": {"scene_id": "sha256:" + "c" * 64,
-                               "revision_id": 1, "content_hash": "sha256:" + "d" * 64}},
-        "expected_predecessor_publication_generation": 4,
-        "expected_predecessor_public_pointer_digest": "sha256:" + "e" * 64,
-        "runtime_unit_id": "host.1", "runtime_epoch": "host.epoch.1",
-        "manager_runtime_epoch": "manager.epoch.1", "controllable_component_id": "arm",
-        "launch_identity": "launch.1", "leader_pid": 42,
-    })
-
-
-def _process_stop_response(request, state="drained"):
-    return {"api_version": "manyforge.manager_command_response.v1", "ok": True, "error": None,
-            "result": {"request": request.model_dump(mode="json"), "state": state,
-                       "receipt": {"leader_pid": 42, "controllable_component_id": "arm",
-                                   "launch_identity": "launch.1", "observed_utc": "2026-10-13T10:00:00Z"}
-                                  if state == "drained" else None, "error": None}}
-
-
-@pytest.mark.parametrize("method,command", [
-    ("stop_component_process", "stop_component_process"),
-    ("component_process_stop_result", "component_process_stop_result"),
-])
-def test_process_stop_forwards_exact_request_and_reads_without_resending(tmp_path, monkeypatch, method, command):
-    request = _process_stop_request()
-    client = ManagerCommandClient(tmp_path)
-    observed = []
-    response = _process_stop_response(request)
-    def exchange(value):
-        observed.append(value)
-        return response
-    monkeypatch.setattr(client, "_exchange", exchange)
-    assert getattr(client, method)(request) == response["result"]
-    assert observed == [{"api_version": "manyforge.manager_command.v1", "command": command,
-                         "request": request.model_dump(mode="json")}]
-
-
-@pytest.mark.parametrize("launch_identity", ['mock\nlite6_robot\nlite6_lite_gripper\n/manyforge/lite6_robot\nlite6_traj_controller\nlite_gripper_controller\n\nsha256:948e121935a4e7d66ca927d1945438e48332cce2bd820f60488fc049bb18d4b1\nsha256:61f01507a85d3a8d6539b8488d9a525dbaf115dca33338dc0d1702168d3b34a4\n', 'mock\nur5e_robot\nur5e_robotiq_2f_85\n/manyforge/ur5e_robot\njoint_trajectory_controller\nrobotiq_gripper_controller\n\nsha256:02e2b9e7733647dc75eea1a518dda0289aa07603d668d07e16dc87c79ab970fc\nsha256:d5e2658bd13c5f16c8f23c699c70fc200a4e4b904e995571c3eda1718faffec6\n'])
-@pytest.mark.parametrize("method", ["stop_component_process", "component_process_stop_result"])
-def test_process_stop_preserves_actual_multiline_mock_launch_identity(tmp_path, monkeypatch, launch_identity, method):
-    from manyforge_headless_api.models import ComponentProcessStopRequest
-    body = _process_stop_request().model_dump(mode="json")
-    body["launch_identity"] = launch_identity
-    body["controllable_component_id"] = launch_identity.split("\n")[1]
-    request = ComponentProcessStopRequest.model_validate(body)
-    assert len(launch_identity.encode("utf-8")) in (250, 257)
-    response = _process_stop_response(request)
-    response["result"]["receipt"]["launch_identity"] = launch_identity
-    response["result"]["receipt"]["controllable_component_id"] = request.controllable_component_id
-    client = ManagerCommandClient(tmp_path)
-    calls = []
-    def exchange(value):
-        calls.append(value)
-        return response
-    monkeypatch.setattr(client, "_exchange", exchange)
-    assert getattr(client, method)(request) == response["result"]
-    assert calls[0]["request"]["launch_identity"] == launch_identity
-    response["result"]["receipt"]["launch_identity"] += "foreign"
-    with pytest.raises(HeadlessApiError, match="result is invalid"):
-        getattr(client, method)(request)
-
-
-def test_process_stop_launch_ceiling_preserves_receipt_bounds_and_nfc():
-    from pydantic import ValidationError
-    from manyforge_headless_api.models import ComponentProcessStopRequest, ComponentProcessDrainReceipt
-    request = _process_stop_request().model_dump(mode="json")
-    receipt = _process_stop_response(_process_stop_request())["result"]["receipt"]
-    for model, body in [(ComponentProcessStopRequest, request), (ComponentProcessDrainReceipt, receipt)]:
-        body["launch_identity"] = "x" * (256 * 1024)
-        assert model.model_validate(body).launch_identity == body["launch_identity"]
-        for value in ("", "x" * (256 * 1024 + 1), "e\u0301"):
-            body["launch_identity"] = value
-            with pytest.raises(ValidationError): model.model_validate(body)
-        body["launch_identity"] = "valid"
-        body["controllable_component_id"] = "x" * 129
-        with pytest.raises(ValidationError): model.model_validate(body)
-    receipt["controllable_component_id"] = "arm"
-    receipt["observed_utc"] = "x" * 129
-    with pytest.raises(ValidationError): ComponentProcessDrainReceipt.model_validate(receipt)
-
-
-@pytest.mark.parametrize("mutation", ["no_receipt", "wrong_launch", "wrong_pid", "pending_receipt", "missing_error"])
-def test_process_stop_requires_exact_positive_drain_receipt(tmp_path, monkeypatch, mutation):
-    request = _process_stop_request()
-    response = _process_stop_response(request)
-    result = response["result"]
-    if mutation == "no_receipt": result["receipt"] = None
-    elif mutation == "wrong_launch": result["receipt"]["launch_identity"] = "foreign"
-    elif mutation == "wrong_pid": result["receipt"]["leader_pid"] = 43
-    elif mutation == "pending_receipt": result["state"] = "pending"
-    elif mutation == "missing_error": del result["error"]
-    client = ManagerCommandClient(tmp_path)
-    monkeypatch.setattr(client, "_exchange", lambda _: response)
-    with pytest.raises(HeadlessApiError, match="result is invalid"):
-        client.component_process_stop_result(request)
-
-
-@pytest.mark.parametrize("with_result", [False, True])
-def test_process_stop_preserves_existing_manager_refusal_envelopes(tmp_path, monkeypatch, with_result):
-    request = _process_stop_request()
-    response = {"api_version": "manyforge.manager_command_response.v1", "ok": False,
-                "error": {"code": "stale_generation", "message": "publication changed", "details": {"expected": "4"}}}
-    if with_result: response["result"] = None
-    client = ManagerCommandClient(tmp_path)
-    monkeypatch.setattr(client, "_exchange", lambda _: response)
-    with pytest.raises(HeadlessApiError) as caught:
-        client.stop_component_process(request)
-    assert caught.value.code == "stale_generation"
-    assert caught.value.details == {"expected": "4"}
-
-
-@pytest.mark.parametrize("field,value", [("leader_pid", True), ("leader_pid", 0),
-    ("leader_pid", 2_147_483_648), ("launch_identity", "x" * (256 * 1024 + 1)),
-    ("controllable_component_id", "x" * 129), ("launch_identity", ""),
-    ("expected_predecessor_publication_generation", 0)])
-def test_process_stop_request_preserves_existing_bounds(field, value):
-    from pydantic import ValidationError
-    from manyforge_headless_api.models import ComponentProcessStopBody
-    body = {"request": _process_stop_request().model_dump(mode="json")}
-    body["request"][field] = value
-    with pytest.raises(ValidationError): ComponentProcessStopBody.model_validate(body)
-
-
-
-def test_process_stop_preserves_legacy_two_field_parse_error(tmp_path, monkeypatch):
-    request = _process_stop_request()
-    client = ManagerCommandClient(tmp_path)
-    response = {"api_version": "manyforge.manager_command_response.v1", "ok": False,
-                "error": {"code": "manager_command_rejected", "message": "request is malformed"}}
-    monkeypatch.setattr(client, "_exchange", lambda _: response)
-    with pytest.raises(HeadlessApiError) as caught: client.stop_component_process(request)
-    assert caught.value.code == "manager_command_rejected" and caught.value.details == {}
-    assert caught.value.producer == "component_manager"
-
-
 @pytest.mark.parametrize("producer", ["component_manager", "kernel"])
 def test_manager_refusal_keeps_its_typed_producer(tmp_path, monkeypatch, producer):
     client = ManagerCommandClient(tmp_path)
@@ -962,7 +855,7 @@ def test_manager_refusal_keeps_its_typed_producer(tmp_path, monkeypatch, produce
                           "message": "cell-admission request rejected", "producer": producer}}
     monkeypatch.setattr(client, "_exchange", lambda _: response)
     with pytest.raises(HeadlessApiError) as caught:
-        client.canonical_empty_selection()
+        client.scene_runtime_owner()
     assert caught.value.code == "stale_generation"
     assert caught.value.details == {"reason": "expected_generation_stale"}
     assert caught.value.producer == producer
@@ -978,57 +871,8 @@ def test_manager_refusal_with_malformed_producer_is_invalid(tmp_path, monkeypatc
     response = {"api_version": "manyforge.manager_command_response.v1", "ok": False, "error": error}
     monkeypatch.setattr(client, "_exchange", lambda _: response)
     with pytest.raises(HeadlessApiError) as caught:
-        client.canonical_empty_selection()
+        client.scene_runtime_owner()
     assert caught.value.code == "manager_command_response_invalid"
-
-
-def test_process_stop_keeps_existing_error_grammar_without_readiness_caps(tmp_path, monkeypatch):
-    request = _process_stop_request()
-    response = _process_stop_response(request, "unknown")
-    response["result"]["error"] = {"code": "cleanup_unknown", "message": "x" * 1800,
-        "details": {str(index): "y" * 300 for index in range(70)}}
-    client = ManagerCommandClient(tmp_path)
-    monkeypatch.setattr(client, "_exchange", lambda _: response)
-    assert client.component_process_stop_result(request) == response["result"]
-
-
-@pytest.mark.parametrize("mutation", ["unknown_state", "drained_error", "extra_result", "extra_receipt", "extra_error", "success_error", "missing_outer_error"])
-def test_process_stop_rejects_malformed_or_contradictory_results(tmp_path, monkeypatch, mutation):
-    request = _process_stop_request(); response = _process_stop_response(request)
-    error = {"code": "unknown", "message": "not established", "details": {}}
-    if mutation == "unknown_state": response["result"]["state"] = "stopped"
-    if mutation == "drained_error": response["result"]["error"] = error
-    if mutation == "extra_result": response["result"]["confirmed"] = True
-    if mutation == "extra_receipt": response["result"]["receipt"]["runtime_epoch"] = "other"
-    if mutation == "extra_error":
-        response["result"].update(state="unknown", receipt=None, error={**error, "effect": "none"})
-    if mutation == "success_error": response["error"] = error
-    if mutation == "missing_outer_error":
-        response = {"api_version": MANAGER_RESPONSE_VERSION, "ok": False}
-    client = ManagerCommandClient(tmp_path); monkeypatch.setattr(client, "_exchange", lambda _: response)
-    with pytest.raises(HeadlessApiError) as caught: client.component_process_stop_result(request)
-    assert caught.value.code == "manager_command_response_invalid"
-
-
-@pytest.mark.parametrize("correlation", [None, "absent"])
-@pytest.mark.parametrize("method", ["stop_component_process", "component_process_stop_result"])
-def test_process_stop_omits_no_correlation_at_manager_boundary(tmp_path, monkeypatch, correlation, method):
-    from manyforge_headless_api.models import ComponentProcessStopRequest
-    raw = _process_stop_request().model_dump(mode="json")
-    if correlation == "absent": raw["request_context"].pop("correlation_id")
-    else: raw["request_context"]["correlation_id"] = None
-    request = ComponentProcessStopRequest.model_validate(raw)
-    canonical = request.model_dump(mode="json")
-    assert set(canonical["request_context"]) == {"request_id", "request_owner_epoch", "source_label"}
-    observed = []
-    client = ManagerCommandClient(tmp_path)
-    def exchange(command):
-        observed.append(command)
-        assert "correlation_id" not in command["request"]["request_context"]
-        return _process_stop_response(request)
-    monkeypatch.setattr(client, "_exchange", exchange)
-    assert getattr(client, method)(request)["request"] == canonical
-    assert observed == [{"api_version": "manyforge.manager_command.v1", "command": method, "request": canonical}]
 
 
 @pytest.mark.parametrize("purpose", ["preserve", "initialize"])

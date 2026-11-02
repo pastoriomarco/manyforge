@@ -747,8 +747,21 @@ TEST(RuntimeCollisionLookaheadSessionTest,
   EXPECT_EQ(terminal_violation->second, "final_sample_not_separated");
 }
 
-TEST(RuntimeCollisionLookaheadSessionTest,
-     TransfersEnteringSeparatedStateAndRejectsFutureRecontact) {
+CollisionResult clear_lookahead_result() {
+  CollisionResult result;
+  result.engine_status = CollisionEngineStatus::kOk;
+  result.decision = CollisionDecisionResult::kPass;
+  return result;
+}
+
+// Runs one release lookahead from cursor 0 with the monitor's entering state
+// and one engine result per local sample index (the last entry repeats).
+RuntimeCollisionLookaheadResult run_release_handoff_case(
+    SupportContactPolicyEntry release,
+    const std::function<RuntimeContactReleaseStateSnapshot(
+        const RuntimeCollisionQueryBundlePtr&)>& entering_state,
+    std::vector<std::optional<double>> clearances_by_sample,
+    std::int64_t horizon_ns, std::size_t max_samples) {
   const CollisionPairId pair{"gripper", "object"};
   FakeClock clock;
   clock.set(1'000'000'000);
@@ -757,26 +770,28 @@ TEST(RuntimeCollisionLookaheadSessionTest,
   CollisionPolicySnapshot policy;
   policy.policy_id = "contact-release";
   policy.revision = {9, "lookahead-entering-release-state"};
-  SupportContactPolicyEntry release;
   release.pair = pair;
-  release.max_start_penetration_m = 0.01;
-  release.require_separation_by_end = false;
-  release.require_strictly_decreasing_penetration = false;
   policy.support_contacts.push_back(release);
   publisher.bundle = make_bundle(10, std::move(policy));
 
   ExecutionProgressPublication progress(
       ExecutionProgressSourceKind::kBackendCommanded,
       ExecutionProgressAuthorityProfile::kCommandedSimulation, "isaac", 0);
-  ASSERT_TRUE(progress.publish(3, 0, clock.now(), clock.now()).published);
-  auto engine =
-      std::make_shared<TestLookaheadEngine>("lookahead-entering-state");
-  engine->forced_result = support_contact_result(pair, -0.001);
+  EXPECT_TRUE(progress.publish(3, 0, clock.now(), clock.now()).published);
+  auto engine = std::make_shared<TestLookaheadEngine>("lookahead-entering-state");
+  engine->result_for_query =
+      [pair, clearances_by_sample](const CollisionQuery& query) -> std::optional<CollisionResult> {
+    const auto index = std::min<std::size_t>(
+        static_cast<std::size_t>(std::max<std::int64_t>(query.waypoint_index.value_or(0), 0)),
+        clearances_by_sample.size() - 1);
+    const auto clearance = clearances_by_sample[index];
+    return clearance ? support_contact_result(pair, *clearance) : clear_lookahead_result();
+  };
   ResultSink sink;
   RuntimeCollisionLookaheadSession::Config config;
   config.workers = 1;
-  config.horizon_ns = 150'000'000;
-  config.max_samples = 2;
+  config.horizon_ns = horizon_ns;
+  config.max_samples = max_samples;
   RuntimeCollisionLookaheadSession session(
       config, clock, scheduler, publisher, progress, {engine},
       [&sink](const RuntimeCollisionLookaheadSession*,
@@ -785,20 +800,76 @@ TEST(RuntimeCollisionLookaheadSessionTest,
       },
       accept_test_authority());
   session.arm(42, 3, std::make_shared<const TrajectoryDTO>(trajectory()), "");
-  const auto contact_state =
-      separated_contact_release_state(publisher.bundle, 0.004, 0.002);
-  ASSERT_TRUE(contact_state.valid);
-  ASSERT_TRUE(request_until_started(session, clock, publisher, contact_state));
+  const auto contact_state = entering_state(publisher.bundle);
+  EXPECT_TRUE(contact_state.valid);
+  if (!request_until_started(session, clock, publisher, contact_state)) {
+    ADD_FAILURE() << "lookahead request did not start";
+    return RuntimeCollisionLookaheadResult{};
+  }
+  return sink.wait();
+}
 
-  const auto result = sink.wait();
-  EXPECT_EQ(result.termination,
-            RuntimeCollisionLookaheadTermination::kTimeHorizon);
-  EXPECT_EQ(result.status, RuntimeCollisionLookaheadResultStatus::kCollision);
-  EXPECT_EQ(result.reason, "runtime_lookahead_collision");
-  const auto violation = result.failure_details.find(
-      "collision_result_contact_release_violation");
-  ASSERT_NE(violation, result.failure_details.end());
-  EXPECT_EQ(violation->second, "recontact_after_release");
+std::optional<std::string> release_violation(const RuntimeCollisionLookaheadResult& result) {
+  const auto violation = result.failure_details.find("collision_result_contact_release_violation");
+  if (violation == result.failure_details.end()) {
+    return std::nullopt;
+  }
+  return violation->second;
+}
+
+TEST(RuntimeCollisionLookaheadSessionTest,
+     SeedsSeparationFromFirstPlannedSampleAndRejectsPlannedRecontact) {
+  // LKA-1: the monitor observed separation, but the cursor trails it; the
+  // planned samples from the cursor are still in contact. That is the plan's
+  // own continued contact, not a recontact.
+  SupportContactPolicyEntry release;
+  release.max_start_penetration_m = 0.01;
+  release.require_separation_by_end = false;
+  release.require_strictly_decreasing_penetration = false;
+  const auto separated = [](const RuntimeCollisionQueryBundlePtr& bundle) {
+    return separated_contact_release_state(bundle, 0.004, 0.002);
+  };
+  const auto lagging = run_release_handoff_case(release, separated, {-0.001}, 150'000'000, 3);
+  EXPECT_EQ(lagging.termination, RuntimeCollisionLookaheadTermination::kTimeHorizon);
+  EXPECT_EQ(lagging.status, RuntimeCollisionLookaheadResultStatus::kClear);
+  EXPECT_FALSE(release_violation(lagging).has_value());
+
+  // A recontact within the plan itself is still rejected.
+  const auto planned = run_release_handoff_case(
+      release, separated, {-0.001, std::nullopt, -0.001}, 150'000'000, 3);
+  EXPECT_EQ(planned.status, RuntimeCollisionLookaheadResultStatus::kCollision);
+  EXPECT_EQ(planned.reason, "runtime_lookahead_collision");
+  EXPECT_EQ(release_violation(planned), std::optional<std::string>{"recontact_after_release"});
+}
+
+TEST(RuntimeCollisionLookaheadSessionTest,
+     WithdrawalObservedAfterMotionStartWithCursorAtZeroIsNotStopped) {
+  // mock_lite6_signal_moves end_rest: the monitor's first tick observed the
+  // withdrawal 0-40 ms in (0.8 mm), while the cursor is still 0, so the first
+  // planned samples are deeper (0.98 mm) than that observation. The plan
+  // itself withdraws strictly and separates by its end.
+  SupportContactPolicyEntry release;
+  release.max_start_penetration_m = 0.002;
+  const auto observed = [](const RuntimeCollisionQueryBundlePtr& bundle) {
+    return active_contact_release_state(bundle, 0.0008);
+  };
+  const auto withdrawal = run_release_handoff_case(
+      release, observed, {-0.00098, -0.00083, -0.00047, std::nullopt}, 1'000'000'000, 4);
+  EXPECT_EQ(withdrawal.termination, RuntimeCollisionLookaheadTermination::kTrajectoryEnd);
+  EXPECT_EQ(withdrawal.status, RuntimeCollisionLookaheadResultStatus::kClear);
+  EXPECT_FALSE(release_violation(withdrawal).has_value());
+
+  // A planned increase beyond the tolerance is still rejected.
+  const auto increase = run_release_handoff_case(
+      release, observed, {-0.00098, -0.00100, -0.00047, std::nullopt}, 1'000'000'000, 4);
+  EXPECT_EQ(increase.status, RuntimeCollisionLookaheadResultStatus::kCollision);
+  EXPECT_EQ(release_violation(increase), std::optional<std::string>{"penetration_increased"});
+
+  // The plan must still separate by its end.
+  const auto stays = run_release_handoff_case(
+      release, observed, {-0.00098, -0.00083, -0.00047, -0.0002}, 1'000'000'000, 4);
+  EXPECT_EQ(stays.status, RuntimeCollisionLookaheadResultStatus::kCollision);
+  EXPECT_EQ(release_violation(stays), std::optional<std::string>{"final_sample_not_separated"});
 }
 
 TEST(RuntimeCollisionLookaheadSessionTest,

@@ -12,18 +12,18 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <iomanip>
 #include <iterator>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/sqlite_operation_journal.hpp>
-#include <manyforge_core/sqlite_cclc_journal.hpp>
 #include <manyforge_core/io_rule_outcome_codec.hpp>
 #include <manyforge_core/types/io_rule_state.hpp>
-#include <manyforge_core/types/component_incident.hpp>
 #include <manyforge_deployment/canonical_empty_admission.hpp>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -383,34 +383,7 @@ StopAcceptanceProjectionPayload(const std::string &owner_epoch,
 CanonicalValue
 StopTerminalProjectionPayload(const std::string &owner_epoch,
                               const std::string &result = "succeeded_nominal",
-                              const std::string &state = "succeeded",
-                              const bool stop_fault = false) {
-  const auto fault_latch =
-      stop_fault
-          ? CanonicalValue(CanonicalValue::Object{
-                {"captured_operation_count", CanonicalValue(1.0)},
-                {"captured_resource_count", CanonicalValue(1.0)},
-                {"cell_id", CanonicalValue(std::string(kCellId))},
-                {"latch_generation", CanonicalValue(1.0)},
-                {"latch_id", CanonicalValue("stop-fault.test.1")},
-                {"persistence_degraded", CanonicalValue(false)},
-                {"reason_code", CanonicalValue("stop_escalated")},
-                {"recovery_assessment_revision", CanonicalValue(1.0)},
-                {"recovery_status", CanonicalValue("waiting_for_observation")},
-                {"state", CanonicalValue("latched")},
-                {"stop_certificate",
-                 CanonicalValue(CanonicalValue::Object{
-                     {"stop_certificate_id",
-                      CanonicalValue("stop-certificate.test.1")},
-                     {"stop_certificate_revision", CanonicalValue(1.0)},
-                     {"stop_generation", CanonicalValue(1.0)},
-                     {"stop_id", CanonicalValue("stop.test.1")},
-                 })},
-                {"stop_generation", CanonicalValue(1.0)},
-                {"stop_id", CanonicalValue("stop.test.1")},
-                {"trigger", CanonicalValue("escalated")},
-            })
-          : CanonicalValue(nullptr);
+                              const std::string &state = "succeeded") {
   return CanonicalValue(CanonicalValue::Object{
       {"acceptance", CanonicalValue(CanonicalValue::Object{
                          {"accepted_at_ns", CanonicalValue(100.0)},
@@ -444,7 +417,6 @@ StopTerminalProjectionPayload(const std::string &owner_epoch,
       {"details_truncated", CanonicalValue(false)},
       {"durable_projection_digest", CanonicalValue(Digest('8'))},
       {"escalated", CanonicalValue(result == "succeeded_escalated")},
-      {"fault_latch", fault_latch},
       {"hard_stop_floor_used", CanonicalValue(false)},
       {"owner_epoch", CanonicalValue(owner_epoch)},
       {"participant_settlement",
@@ -458,50 +430,6 @@ StopTerminalProjectionPayload(const std::string &owner_epoch,
       {"request_id", CanonicalValue("stop-request.1")},
       {"result", CanonicalValue(result)},
       {"state", CanonicalValue(state)},
-      {"stop_certificate_id", CanonicalValue("stop-certificate.test.1")},
-      {"stop_certificate_revision", CanonicalValue(1.0)},
-      {"stop_generation", CanonicalValue(1.0)},
-      {"stop_id", CanonicalValue("stop.test.1")},
-  });
-}
-
-CanonicalValue StopFaultClearProjectionPayload(const std::string &owner_epoch) {
-  return CanonicalValue(CanonicalValue::Object{
-      {"api_version",
-       CanonicalValue("manyforge.stop_fault_clear_projection.v1")},
-      {"fault_latch",
-       CanonicalValue(CanonicalValue::Object{
-           {"captured_operation_count", CanonicalValue(1.0)},
-           {"captured_resource_count", CanonicalValue(1.0)},
-           {"cell_id", CanonicalValue(std::string(kCellId))},
-           {"latch_generation", CanonicalValue(1.0)},
-           {"latch_id", CanonicalValue("stop-fault.test.1")},
-           {"persistence_degraded", CanonicalValue(false)},
-           {"reason_code", CanonicalValue("stop_fault_recovery_cleared")},
-           {"recovery_assessment_revision", CanonicalValue(2.0)},
-           {"recovery_status", CanonicalValue("cleared")},
-           {"state", CanonicalValue("cleared")},
-           {"stop_certificate",
-            CanonicalValue(CanonicalValue::Object{
-                {"stop_certificate_id",
-                 CanonicalValue("stop-certificate.test.1")},
-                {"stop_certificate_revision", CanonicalValue(1.0)},
-                {"stop_generation", CanonicalValue(1.0)},
-                {"stop_id", CanonicalValue("stop.test.1")},
-            })},
-           {"stop_generation", CanonicalValue(1.0)},
-           {"stop_id", CanonicalValue("stop.test.1")},
-           {"trigger", CanonicalValue("escalated")},
-       })},
-      {"owner_epoch", CanonicalValue(owner_epoch)},
-      {"record_kind", CanonicalValue("stop_fault_cleared")},
-      {"request_id", CanonicalValue("stop-fault-reset.test.1")},
-      {"result", CanonicalValue(CanonicalValue::Object{
-                     {"accepted", CanonicalValue(true)},
-                     {"error", CanonicalValue(nullptr)},
-                     {"replay_status", CanonicalValue("accepted_new")},
-                     {"request_id", CanonicalValue("stop-fault-reset.test.1")},
-                 })},
       {"stop_certificate_id", CanonicalValue("stop-certificate.test.1")},
       {"stop_certificate_revision", CanonicalValue(1.0)},
       {"stop_generation", CanonicalValue(1.0)},
@@ -580,50 +508,6 @@ CanonicalValue ManagerPayloadWithIncompleteApply(
            })},
           {"unavailable_reason_code", CanonicalValue(nullptr)},
       }));
-}
-
-CanonicalValue CurrentStopFaultLatch() {
-  return CanonicalValue(CanonicalValue::Object{
-      {"captured_operation_ids", CanonicalValue(CanonicalValue::Array{
-                                     CanonicalValue("operation.test.1"),
-                                 })},
-      {"captured_resources", CanonicalValue(CanonicalValue::Array{
-                                 CanonicalValue("resource.arm.a"),
-                             })},
-      {"cell_id", CanonicalValue(std::string(kCellId))},
-      {"clear_projection", CanonicalValue(CanonicalValue::Object{
-                               {"error", CanonicalValue(nullptr)},
-                               {"retry_generation", CanonicalValue(nullptr)},
-                               {"state", CanonicalValue("not_applicable")},
-                           })},
-      {"evidence_refs", CanonicalValue(CanonicalValue::Array{})},
-      {"graph_revision", CanonicalValue(Digest('6'))},
-      {"latch_generation", CanonicalValue(1.0)},
-      {"latch_id", CanonicalValue("stop-fault.test.1")},
-      {"observed_triggers",
-       CanonicalValue(CanonicalValue::Array{CanonicalValue("escalated")})},
-      {"persistence_degraded", CanonicalValue(false)},
-      {"reason_code", CanonicalValue("stop_escalated")},
-      {"recovery_assessment_revision", CanonicalValue(1.0)},
-      {"recovery_status", CanonicalValue("waiting_for_observation")},
-      {"retained_bundle_id", CanonicalValue(Digest('7'))},
-      {"state", CanonicalValue("latched")},
-      {"stop_certificate",
-       CanonicalValue(CanonicalValue::Object{
-           {"stop_certificate_id", CanonicalValue("stop-certificate.test.1")},
-           {"stop_certificate_revision", CanonicalValue(1.0)},
-           {"stop_generation", CanonicalValue(1.0)},
-           {"stop_id", CanonicalValue("stop.test.1")},
-       })},
-      {"stop_generation", CanonicalValue(1.0)},
-      {"stop_id", CanonicalValue("stop.test.1")},
-      {"terminal_projection", CanonicalValue(CanonicalValue::Object{
-                                  {"error", CanonicalValue(nullptr)},
-                                  {"retry_generation", CanonicalValue(nullptr)},
-                                  {"state", CanonicalValue("recorded")},
-                              })},
-      {"trigger", CanonicalValue("escalated")},
-  });
 }
 
 CanonicalValue RuntimeCollisionStopAcceptanceProjectionPayload(
@@ -1214,7 +1098,7 @@ TEST(HeadlessApiCore, ActiveApplyFromTheRemovedOverrideVersionIsRefused) {
 namespace {
 
 CanonicalValue CommittedApplyRecord(const std::string &apply_id,
-                                    const char digest,
+                                    const std::string &digest,
                                     const std::string &scenario_id,
                                     const bool committed,
                                     const CanonicalValue &active) {
@@ -1224,7 +1108,7 @@ CanonicalValue CommittedApplyRecord(const std::string &apply_id,
       {"committed", CanonicalValue(committed)},
       {"terminal_state", CanonicalValue(committed ? "succeeded" : "failed")},
       {"incomplete", CanonicalValue(false)},
-      {"intent_digest", CanonicalValue(Digest(digest))},
+      {"intent_digest", CanonicalValue(digest)},
       {"scene_initialization", CanonicalValue("initialize")},
       {"prepared_activation",
        CanonicalValue(CanonicalValue::Object{
@@ -1249,10 +1133,11 @@ CanonicalValue CommittedApplyRecord(const std::string &apply_id,
   });
 }
 
+/// The active Apply, a refused one, and `older_applies` older committed
+/// Applies the journal still retains (the first one of `other_cell`).
 CanonicalValue CommittedActivationCore(TemporaryDirectory &directory,
                                        const double publication_generation,
-                                       const bool include_older_apply,
-                                       const bool sealed_current = false) {
+                                       const std::size_t older_applies) {
   PublishHealthySources(directory, "open");
   auto payload = ManagerPayload();
   auto active = Member(payload, "active");
@@ -1265,33 +1150,18 @@ CanonicalValue CommittedActivationCore(TemporaryDirectory &directory,
       })},
   }));
   CanonicalValue::Array records{
-      CommittedApplyRecord("apply.new", 'd', "cell_pick", true, active),
-      CommittedApplyRecord("apply.refused", 'e', "cell_pick", false, active),
+      CommittedApplyRecord("apply.new", Digest('d'), "cell_pick", true, active),
+      CommittedApplyRecord("apply.refused", Digest('e'), "cell_pick", false,
+                           active),
   };
-  if (include_older_apply) {
-    records.push_back(
-        CommittedApplyRecord("apply.old", 'c', "other_cell", true, active));
-  }
-  if (sealed_current) {
-    auto prepared = Member(records.front(), "prepared_activation");
-    auto sealed_prepared_fields = prepared.as_object();
-    sealed_prepared_fields.emplace_back("deployment_artifact_id",
-                                       CanonicalValue("deployment.empty"));
-    sealed_prepared_fields.emplace_back("deployment_revision",
-                                       CanonicalValue(Digest('a')));
-    prepared = CanonicalValue(std::move(sealed_prepared_fields));
-    prepared = JournalField(prepared, "origin", CanonicalValue(CanonicalValue::Object{
-        {"kind", CanonicalValue("sealed_canonical_empty")},
-        {"cell_id", CanonicalValue(std::string(kCellId))},
-        {"deployment_artifact_id", CanonicalValue("deployment.empty")},
-        {"deployment_revision", CanonicalValue(Digest('a'))},
-        {"retained_bundle_id", Member(active, "retained_bundle_id")},
-        {"graph_revision", Member(active, "graph_revision")},
-        {"admission_digest", CanonicalValue(Digest('f'))},
-    }));
-    records.front() = JournalField(records.front(), "prepared_activation", prepared);
-    records.front() = JournalField(records.front(), "scene_initialization",
-                                CanonicalValue("preserve"));
+  for (std::size_t index = 0U; index < older_applies; ++index) {
+    std::ostringstream digest;
+    digest << "sha256:" << std::setw(64) << std::setfill('0') << index;
+    records.push_back(CommittedApplyRecord(
+        index == 0U ? std::string("apply.old")
+                    : "apply.old." + std::to_string(index),
+        index == 0U ? Digest('c') : digest.str(),
+        index == 0U ? "other_cell" : "cell_pick", true, active));
   }
   payload = JournalField(payload, "active", active);
   payload = JournalField(payload, "apply", CanonicalValue(CanonicalValue::Object{
@@ -1310,7 +1180,7 @@ CanonicalValue CommittedActivationCore(TemporaryDirectory &directory,
 
 TEST(HeadlessApiCore, CommittedActivationNamesEveryCommittedApplyOfItsHistory) {
   TemporaryDirectory directory;
-  const auto activation = CommittedActivationCore(directory, 3.0, true);
+  const auto activation = CommittedActivationCore(directory, 3.0, 1U);
   EXPECT_EQ(Text(activation, "schema_version"),
             "manyforge.committed_scenario_activation.v3");
   EXPECT_EQ(Text(activation, "scene_initialization"), "initialize");
@@ -1342,37 +1212,25 @@ TEST(HeadlessApiCore, CommittedActivationNamesEveryCommittedApplyOfItsHistory) {
   EXPECT_EQ(committed[1].as_object().size(), 5U);
 }
 
-TEST(HeadlessApiCore, SealedEmptyApplyRemainsInTheCompleteCommittedHistory) {
+TEST(HeadlessApiCore, CommittedActivationFollowsTheRetainedHistoryAfterEviction) {
+  // F7: after more Applies than the Manager journal retains (256), the
+  // evicted older Applies are gone; the retained ones are the history.
   TemporaryDirectory directory;
-  const auto activation = CommittedActivationCore(directory, 3.0, true, true);
-  EXPECT_EQ(Text(Member(activation, "origin"), "kind"), "sealed_canonical_empty");
-  EXPECT_EQ(activation.find_object_member("scenario_id"), nullptr);
-  EXPECT_TRUE(Member(activation, "program").is_null());
-  const auto &history = Array(activation, "committed_applies");
-  ASSERT_EQ(history.size(), 2U);
-  EXPECT_EQ(Text(Member(history[0], "origin"), "kind"), "scenario");
-  EXPECT_EQ(Text(Member(history[1], "origin"), "kind"), "sealed_canonical_empty");
-  EXPECT_EQ(history[1].find_object_member("scenario_id"), nullptr);
-  HeadlessApiCore core(Config(directory, "api.epoch.status"), Clocks());
-  const auto status = core.AppliedProgramStatus();
-  EXPECT_EQ(Text(Member(status, "origin"), "kind"), "sealed_canonical_empty");
-  EXPECT_EQ(status.find_object_member("scenario_id"), nullptr);
-  EXPECT_FALSE(std::get<bool>(Member(status, "executable").storage()));
-  EXPECT_TRUE(Member(status, "program_id").is_null());
-  try {
-    static_cast<void>(core.AppliedProgramSelection());
-    FAIL() << "sealed empty Apply returned an executable Program";
-  } catch (const OperatorAlarmError &error) {
-    EXPECT_EQ(error.code(), "program_not_selected");
-  }
+  const auto activation = CommittedActivationCore(directory, 400.0, 255U);
+  EXPECT_EQ(std::get<double>(Member(activation, "publication_generation").storage()),
+            400.0);
+  EXPECT_EQ(Text(activation, "record_digest"), Digest('d'));
+  EXPECT_EQ(Array(activation, "committed_applies").size(), 256U);
 }
 
-TEST(HeadlessApiCore, CommittedActivationRefusesAHistoryThatMissesAPublication) {
+TEST(HeadlessApiCore, CommittedActivationRefusesMoreAppliesThanPublications) {
+  // Eviction only removes Applies: more committed Applies than Apply
+  // publications pairs the publication with a newer journal.
   TemporaryDirectory directory;
   try {
-    // Three publications (bootstrap and two Applies) but one committed Apply.
-    static_cast<void>(CommittedActivationCore(directory, 3.0, false));
-    FAIL() << "an incomplete publication history was reported";
+    // Two publications (bootstrap and one Apply) but two committed Applies.
+    static_cast<void>(CommittedActivationCore(directory, 2.0, 1U));
+    FAIL() << "a history newer than its publication was reported";
   } catch (const OperatorAlarmError &error) {
     EXPECT_EQ(error.code(), "program_activation_history_incomplete");
   }
@@ -2385,6 +2243,85 @@ TEST(HeadlessApiCore, ViewerClientIncidentsAreErrorsWithTheirClosedKinds) {
   }
 }
 
+TEST(HeadlessApiCore, ComponentActionAndApplyOutcomesAreRecordedOnce) {
+  TemporaryDirectory directory;
+  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
+  const auto error = [](const std::string &code) {
+    return CanonicalValue(CanonicalValue::Object{
+        {"code", CanonicalValue(code)},
+        {"message", CanonicalValue("Joint angles unavailable")}});
+  };
+  const auto action = [&](const std::string &outcome, CanonicalValue failure) {
+    return CanonicalValue(CanonicalValue::Object{
+        {"schema_version", CanonicalValue("manyforge.activity_event.v1")},
+        {"kind", CanonicalValue("component_action")},
+        {"subject", CanonicalValue("lite6_arm")},
+        {"action", CanonicalValue("enable")},
+        {"outcome", CanonicalValue(outcome)},
+        {"error", std::move(failure)},
+        {"components", CanonicalValue(CanonicalValue::Array{})},
+        {"message", CanonicalValue("Enable lite6_arm " + outcome)}});
+  };
+  EXPECT_TRUE(std::get<bool>(
+      Member(core.RecordActivity(action("failed",
+                                        error("xarm_joint_angles_unavailable"))),
+             "recorded")
+          .storage()));
+  EXPECT_TRUE(std::get<bool>(
+      Member(core.RecordActivity(action("succeeded", CanonicalValue(nullptr))),
+             "recorded")
+          .storage()));
+  EXPECT_TRUE(std::get<bool>(
+      Member(core.RecordActivity(CanonicalValue(CanonicalValue::Object{
+                 {"schema_version", CanonicalValue("manyforge.activity_event.v1")},
+                 {"kind", CanonicalValue("apply")},
+                 {"subject", CanonicalValue("scenario_load")},
+                 {"action", CanonicalValue(nullptr)},
+                 {"outcome", CanonicalValue("failed")},
+                 {"error", error("execution_owner_unavailable")},
+                 {"components",
+                  CanonicalValue(CanonicalValue::Array{CanonicalValue(
+                      CanonicalValue::Object{
+                          {"component_id", CanonicalValue("lite6")},
+                          {"disposition", CanonicalValue("add")},
+                          {"error", error("execution_owner_unavailable")}})})},
+                 {"message", CanonicalValue("Scenario load failed")}})),
+             "recorded")
+          .storage()));
+  // A failure needs its typed error, and an unknown outcome is refused.
+  for (auto invalid : {action("failed", CanonicalValue(nullptr)),
+                       action("exploded", error("x"))}) {
+    try {
+      static_cast<void>(core.RecordActivity(std::move(invalid)));
+      FAIL() << "an invalid activity record was accepted";
+    } catch (const OperatorAlarmError &failure) {
+      EXPECT_EQ(failure.code(), "activity_record_invalid");
+    }
+  }
+
+  HistorianQuery query;
+  query.event_types = {"component_action_finished", "apply_finished"};
+  const auto deadline = std::chrono::steady_clock::now() + 2s;
+  CanonicalValue page;
+  do {
+    page = core.HistoryPage(query);
+    if (Array(page, "events").size() == 3U) break;
+    std::this_thread::yield();
+  } while (std::chrono::steady_clock::now() < deadline);
+  ASSERT_EQ(Array(page, "events").size(), 3U);
+  std::map<std::string, std::string> severities;
+  for (const auto &stored : Array(page, "events")) {
+    const auto &event = Member(stored, "event");
+    severities[Text(event, "component") + "/" +
+               Text(Member(event, "payload"), "outcome")] =
+        Text(event, "severity");
+  }
+  EXPECT_EQ(severities, (std::map<std::string, std::string>{
+                            {"lite6_arm/failed", "ERROR"},
+                            {"lite6_arm/succeeded", "INFO"},
+                            {"manyforge.composer/failed", "ERROR"}}));
+}
+
 TEST(HeadlessApiCore,
      ProgramHeldDiagnosticIsInformationalAndRetainsExactValues) {
   TemporaryDirectory directory;
@@ -2499,7 +2436,7 @@ TEST(HeadlessApiCore,
       {"reason", CanonicalValue("target_not_ready")},
       {"reference_id", CanonicalValue(std::string(256U, 'r'))},
       {"retryable", CanonicalValue(false)},
-      {"latch_id", CanonicalValue(nullptr)},
+      {"rule_id", CanonicalValue(nullptr)},
       {"path", CanonicalValue(2.5)},
   });
   const CanonicalValue origin(CanonicalValue::Object{
@@ -2575,9 +2512,9 @@ TEST(HeadlessApiCore,
 
   CanonicalValue::Object registered;
   for (const auto key :
-       {"input_problem", "latch_id", "path", "reason", "reference_id",
-        "reference_type", "required_action", "retryable", "source_kind",
-        "source_reference", "target_role_id"}) {
+       {"component_id", "input_problem", "path", "reason", "reference_id",
+        "reference_type", "required_action", "retryable", "rule_id",
+        "source_kind", "source_reference", "target_role_id"}) {
     registered.emplace_back(key, CanonicalValue(true));
   }
   EXPECT_NO_THROW(static_cast<void>(core.RecordProgramDiagnostic(
@@ -2998,7 +2935,6 @@ std::vector<manyforge::core::OperationJournalEventDTO> NativeRuleStateEvents(
             UINT64_MAX}}},
       100};
   for (const auto state : {native::IoGlobalRuleState::kTripped,
-                           native::IoGlobalRuleState::kLatched,
                            native::IoGlobalRuleState::kClear}) {
     change.rule.state = state;
     if (state == native::IoGlobalRuleState::kClear)
@@ -3009,7 +2945,7 @@ std::vector<manyforge::core::OperationJournalEventDTO> NativeRuleStateEvents(
       throw std::runtime_error(recorded.error().message);
   }
   const auto page = journal.ReadOperationalEvents(owner, 0U);
-  if (!page.ok() || page.value().events.size() != 3U)
+  if (!page.ok() || page.value().events.size() != 2U)
     throw std::runtime_error("actual Core rule-state history is unavailable");
   return page.value().events;
 }
@@ -3120,7 +3056,7 @@ TEST(HeadlessApiCore,
                 "18446744073709551615");
     }
   }
-  EXPECT_EQ(states, (std::set<std::string>{"clear", "latched", "tripped"}));
+  EXPECT_EQ(states, (std::set<std::string>{"clear", "tripped"}));
 }
 
 TEST(HeadlessApiCore,
@@ -3266,7 +3202,7 @@ TEST(HeadlessApiCore,
             "manyforge.motion.runtime_collision");
   EXPECT_EQ(Text(active, "lifecycle_state"), "active_unacknowledged");
   EXPECT_EQ(Text(active, "priority"), "critical");
-  EXPECT_TRUE(
+  EXPECT_FALSE(  // V2-5: acknowledgement never gates motion.
       std::get<bool>(Member(active, "requires_motion_attention").storage()));
   EXPECT_EQ(Text(Member(active, "subject"), "subject_id"), "operation.test.1");
   ASSERT_EQ(Array(Member(active, "subject"), "resource_ids").size(), 1U);
@@ -3456,175 +3392,9 @@ TEST(HeadlessApiCore, NominalStoppedFailureIsErrorButOrdinaryStopRemainsInfo) {
   }
 }
 
-TEST(HeadlessApiCore,
-     LatchedStopFaultDrivesExactAcknowledgeableAlarmUntilDurableClear) {
-  TemporaryDirectory directory;
-  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
-  const std::string source_epoch = "execution-host.epoch.stop-fault";
-  const auto terminal = StopTerminalProjectionPayload(
-      source_epoch, "succeeded_escalated", "succeeded", true);
-  const auto terminal_digest = content_identity::sha256_digest(
-      content_identity::canonical_json(terminal));
 
-  static_cast<void>(core.IngestOperationEvent(
-      source_epoch, 1U, "stop_terminal_projected", std::nullopt, std::nullopt,
-      std::nullopt, 1100U, "2026-08-07T10:00:01.000000001Z", false, terminal,
-      terminal_digest));
-  static_cast<void>(core.CompleteOperationEventSnapshot(source_epoch, 1U));
 
-  const auto active_snapshot = core.AlarmSnapshot();
-  const auto &active = OnlyAlarm(active_snapshot);
-  EXPECT_EQ(Text(active, "definition_id"), "manyforge.motion.stop_fault");
-  EXPECT_EQ(Text(active, "lifecycle_state"), "active_unacknowledged");
-  EXPECT_EQ(Text(active, "priority"), "high");
-  EXPECT_TRUE(
-      std::get<bool>(Member(active, "requires_motion_attention").storage()));
-  EXPECT_EQ(Text(Member(active, "subject"), "subject_id"), kCellId);
-  EXPECT_EQ(Text(Member(active, "correlations"), "latch_id"),
-            "stop-fault.test.1");
-  EXPECT_EQ(Text(Member(active, "correlations"), "stop_certificate_id"),
-            "stop-certificate.test.1");
-  EXPECT_EQ(
-      Text(Member(Member(active, "details"), "fault_latch"), "reason_code"),
-      "stop_escalated");
 
-  const auto cleared = StopFaultClearProjectionPayload(source_epoch);
-  const auto cleared_digest = content_identity::sha256_digest(
-      content_identity::canonical_json(cleared));
-  static_cast<void>(core.IngestOperationEvent(
-      source_epoch, 2U, "stop_fault_cleared", "stop-fault-reset.test.1",
-      std::nullopt, std::nullopt, 1200U, "2026-08-07T10:00:01.000000002Z",
-      false, cleared, cleared_digest));
-  static_cast<void>(core.CompleteOperationEventSnapshot(source_epoch, 2U));
-
-  const auto returned_snapshot = core.AlarmSnapshot();
-  const auto &returned = OnlyAlarm(returned_snapshot);
-  EXPECT_EQ(Text(returned, "definition_id"), "manyforge.motion.stop_fault");
-  EXPECT_EQ(Text(returned, "lifecycle_state"), "returned_unacknowledged");
-  EXPECT_EQ(Text(Member(returned, "details"), "record_kind"),
-            "stop_fault_cleared");
-
-  HistorianQuery query;
-  query.components.insert("manyforge.runtime");
-  query.event_types.insert("stop_fault_cleared");
-  const auto deadline = std::chrono::steady_clock::now() + 2s;
-  while (Array(core.HistoryPage(query), "events").empty() &&
-         std::chrono::steady_clock::now() < deadline) {
-    std::this_thread::yield();
-  }
-  EXPECT_EQ(Array(core.HistoryPage(query), "events").size(), 1U);
-}
-
-TEST(HeadlessApiCore,
-     CurrentStopFaultSnapshotReannunciatesAfterOwnerRestartAndClearsExactly) {
-  TemporaryDirectory directory;
-  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
-  const std::string source_epoch = "execution-host.epoch.stop-fault-snapshot";
-
-  static_cast<void>(core.CompleteOperationEventSnapshot(
-      source_epoch, 0U, CurrentStopFaultLatch()));
-  const auto active_snapshot = core.AlarmSnapshot();
-  const auto &active = OnlyAlarm(active_snapshot);
-  EXPECT_EQ(Text(active, "definition_id"), "manyforge.motion.stop_fault");
-  EXPECT_EQ(Text(active, "lifecycle_state"), "active_unacknowledged");
-  EXPECT_EQ(Text(Member(active, "subject"), "subject_id"), kCellId);
-  EXPECT_EQ(Text(Member(active, "correlations"), "latch_id"),
-            "stop-fault.test.1");
-  EXPECT_EQ(Text(Member(active, "details"), "record_kind"),
-            "current_stop_fault_snapshot");
-  const auto activation_id = Text(active, "activation_id");
-
-  static_cast<void>(core.CompleteOperationEventSnapshot(
-      source_epoch, 0U, CurrentStopFaultLatch()));
-  const auto repeated_snapshot = core.AlarmSnapshot();
-  EXPECT_EQ(Text(OnlyAlarm(repeated_snapshot), "activation_id"), activation_id);
-
-  static_cast<void>(core.CompleteOperationEventSnapshot(
-      source_epoch, 0U, CanonicalValue(nullptr)));
-  const auto returned_snapshot = core.AlarmSnapshot();
-  const auto &returned = OnlyAlarm(returned_snapshot);
-  EXPECT_EQ(Text(returned, "lifecycle_state"), "returned_unacknowledged");
-  EXPECT_EQ(Text(Member(returned, "details"), "reason"),
-            "stop_fault_context_retired");
-}
-
-TEST(HeadlessApiCore,
-     PendingStopFaultIsVisibleBeforeItsCertificateAndNeverAutoAcknowledged) {
-  TemporaryDirectory directory;
-  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
-  const std::string epoch = "execution-host.epoch.pending-stop";
-  auto pending = JournalField(CurrentStopFaultLatch(), "stop_certificate",
-                           CanonicalValue(nullptr));
-  pending = JournalField(pending, "terminal_projection",
-                      JournalField(Member(pending, "terminal_projection"), "state",
-                                CanonicalValue("pending")));
-  static_cast<void>(core.CompleteOperationEventSnapshot(epoch, 0U, pending));
-  auto snapshot = core.AlarmSnapshot();
-  EXPECT_EQ(Text(OnlyAlarm(snapshot), "lifecycle_state"),
-            "active_unacknowledged");
-  EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(
-      Member(Member(OnlyAlarm(snapshot), "correlations"), "stop_certificate_id")
-          .storage()));
-  const auto activation = Text(OnlyAlarm(snapshot), "activation_id");
-  EXPECT_THROW(
-      core.CompleteOperationEventSnapshot(
-          epoch, 0U,
-          JournalField(pending, "recovery_status", CanonicalValue("ready"))),
-      OperatorAlarmError);
-
-  const auto terminal = StopTerminalProjectionPayload(
-      epoch, "succeeded_escalated", "succeeded", true);
-  static_cast<void>(core.IngestOperationEvent(
-      epoch, 1U, "stop_terminal_projected", std::nullopt, std::nullopt,
-      std::nullopt, 1100U, "2026-08-07T10:00:01.000000001Z", false, terminal,
-      content_identity::sha256_digest(
-          content_identity::canonical_json(terminal))));
-  static_cast<void>(
-      core.CompleteOperationEventSnapshot(epoch, 1U, CurrentStopFaultLatch()));
-  snapshot = core.AlarmSnapshot();
-  EXPECT_EQ(Text(OnlyAlarm(snapshot), "activation_id"), activation);
-  EXPECT_EQ(Text(OnlyAlarm(snapshot), "lifecycle_state"),
-            "active_unacknowledged");
-  EXPECT_EQ(
-      Text(Member(OnlyAlarm(snapshot), "correlations"), "stop_certificate_id"),
-      "stop-certificate.test.1");
-}
-
-TEST(HeadlessApiCore,
-     ClearingTheSelectedStopFaultDoesNotHideAnOlderUnresolvedFault) {
-  TemporaryDirectory directory;
-  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
-  const std::string epoch = "execution-host.epoch.two-stop-faults";
-  // The clear fixture names test.1: make it the newer selected fault.
-  const auto older = JournalField(CurrentStopFaultLatch(), "latch_id",
-                               CanonicalValue("stop-fault.older"));
-  static_cast<void>(core.CompleteOperationEventSnapshot(epoch, 0U, older));
-  const auto initial = core.AlarmSnapshot();
-  const auto activation = Text(OnlyAlarm(initial), "activation_id");
-  static_cast<void>(
-      core.CompleteOperationEventSnapshot(epoch, 0U, CurrentStopFaultLatch()));
-  // An event page omitting the cached observation is not an authoritative null.
-  static_cast<void>(core.CompleteOperationEventSnapshot(epoch, 0U));
-  auto snapshot = core.AlarmSnapshot();
-  EXPECT_EQ(Text(OnlyAlarm(snapshot), "lifecycle_state"),
-            "active_unacknowledged");
-  const auto cleared = StopFaultClearProjectionPayload(epoch);
-  static_cast<void>(core.IngestOperationEvent(
-      epoch, 1U, "stop_fault_cleared", "stop-fault-reset.test.1", std::nullopt,
-      std::nullopt, 1200U, "2026-08-07T10:00:01.000000002Z", false, cleared,
-      content_identity::sha256_digest(
-          content_identity::canonical_json(cleared))));
-  snapshot = core.AlarmSnapshot();
-  EXPECT_EQ(Text(OnlyAlarm(snapshot), "lifecycle_state"),
-            "active_unacknowledged");
-  static_cast<void>(core.CompleteOperationEventSnapshot(epoch, 1U, older));
-  snapshot = core.AlarmSnapshot();
-  EXPECT_EQ(Text(OnlyAlarm(snapshot), "activation_id"), activation);
-  EXPECT_EQ(Text(OnlyAlarm(snapshot), "lifecycle_state"),
-            "active_unacknowledged");
-  EXPECT_EQ(Text(Member(OnlyAlarm(snapshot), "correlations"), "latch_id"),
-            "stop-fault.older");
-}
 
 TEST(HeadlessApiCore,
      AcceptedResetClearsMatchingOperationFaultAndConflictsFailClosed) {
@@ -3677,160 +3447,6 @@ TEST(HeadlessApiCore,
   EXPECT_EQ(Text(returned, "lifecycle_state"), "returned_unacknowledged");
 }
 
-TEST(HeadlessApiCore,
-     AlarmResourceScopeFollowsEachActiveConfigurationWithoutSilencingTheFeed) {
-  TemporaryDirectory directory;
-  const auto configurations = LoadRegistryConfigurations();
-  const auto single = ResourceIds(*configurations.single);
-  const auto dual = ResourceIds(*configurations.dual);
-  ASSERT_FALSE(single.empty());
-  const auto kept = single.front();
-  ASSERT_TRUE(std::find(dual.begin(), dual.end(), kept) != dual.end());
-  const auto added = std::find_if(dual.begin(), dual.end(), [&](const auto &id) {
-    return std::find(single.begin(), single.end(), id) == single.end();
-  });
-  ASSERT_NE(added, dual.end());
-
-  HeadlessApiCore core(RegistryConfig(directory, "api.epoch.1"), Clocks());
-  const std::string epoch = "execution-host.epoch.registry";
-  std::uint64_t sequence = 0U;
-  const auto error = CanonicalValue(CanonicalValue::Object{
-      {"code", CanonicalValue("execution_aborted")},
-      {"details", CanonicalValue(CanonicalValue::Object{})},
-      {"message", CanonicalValue("failed")},
-  });
-  const auto ingest = [&](const std::string &operation,
-                          const std::string &resource,
-                          const std::string &state = "failed") {
-    const auto payload =
-        OperationJournalPayload(epoch, "state_observed", state, error,
-                                std::nullopt, resource, operation);
-    ++sequence;
-    const auto ingested = core.IngestOperationEvent(
-        epoch, sequence, "state_observed", std::nullopt, operation, 1U,
-        static_cast<std::int64_t>(100U + sequence),
-        "2026-10-02T10:00:00.000000001Z", false, payload,
-        content_identity::sha256_digest(
-            content_identity::canonical_json(payload)));
-    EXPECT_EQ(Text(ingested, "status"), "ingested");
-    static_cast<void>(core.CompleteOperationEventSnapshot(epoch, sequence));
-  };
-  const auto motion_reconciled = [&]() {
-    const auto snapshot = core.AlarmSnapshot();
-    for (const auto &domain : Array(snapshot, "domains")) {
-      if (Text(domain, "domain") == "motion") {
-        return std::get<bool>(Member(domain, "reconciled").storage());
-      }
-    }
-    return false;
-  };
-  const auto active_subjects = [&]() {
-    std::set<std::string> subjects;
-    const auto snapshot = core.AlarmSnapshot();
-    for (const auto &alarm : Array(snapshot, "alarms")) {
-      if (Text(alarm, "lifecycle_state") == "active_unacknowledged" &&
-          Text(alarm, "definition_id") != kAlarmScopeDefinition) {
-        subjects.insert(Text(Member(alarm, "subject"), "subject_id"));
-      }
-    }
-    return subjects;
-  };
-
-  // Empty startup: no active configuration names any resource. The fault is
-  // refused by name while the operation feed itself stays current, and the
-  // cell-scoped alarm-scope condition annunciates the retained refusal.
-  ingest("operation.startup", kept);
-  EXPECT_TRUE(active_subjects().empty());
-  EXPECT_EQ(RefusedSubjects(core.AlarmSnapshot()),
-            (std::set<std::string>{"operation.startup"}));
-  EXPECT_TRUE(motion_reconciled());
-
-  // Apply the single-arm configuration: its resources are admitted at once,
-  // before any other reader refreshed the projection, and the still-current
-  // startup fault is reconsidered and admitted.
-  PublishActiveConfiguration(directory, *configurations.single, 1U);
-  ingest("operation.kept", kept);
-  ingest("operation.added.early", *added);
-  EXPECT_EQ(active_subjects(),
-            (std::set<std::string>{"operation.kept", "operation.startup"}));
-  EXPECT_EQ(RefusedSubjects(core.AlarmSnapshot()),
-            (std::set<std::string>{"operation.added.early"}));
-
-  // Replace it with the dual configuration: the new resources are admitted,
-  // including the earlier refused, still-current fault on them.
-  PublishActiveConfiguration(directory, *configurations.dual, 2U);
-  ingest("operation.added", *added);
-  const std::set<std::string> admitted{"operation.added",
-                                       "operation.added.early",
-                                       "operation.kept", "operation.startup"};
-  EXPECT_EQ(active_subjects(), admitted);
-  {
-    // No refusal remains retained: the alarm-scope condition returns and,
-    // needing no acknowledgement, leaves the live list at once.
-    const auto snapshot = core.AlarmSnapshot();
-    EXPECT_EQ(ScopeAlarm(snapshot), nullptr);
-    EXPECT_TRUE(RefusedSubjects(snapshot).empty());
-  }
-
-  // Replace it back: the removed resource's retained alarm stays current and
-  // still returns to normal, while a new activation on it is stale. An
-  // invalid cell scope is refused without silencing the valid alarms.
-  PublishActiveConfiguration(directory, *configurations.single, 3U);
-  ingest("operation.added.stale", *added);
-  auto latch = StopTerminalProjectionPayload(epoch, "succeeded_escalated",
-                                             "succeeded", true);
-  latch = JournalField(latch, "fault_latch",
-                    JournalField(Member(latch, "fault_latch"), "cell_id",
-                              CanonicalValue("another_cell")));
-  ++sequence;
-  static_cast<void>(core.IngestOperationEvent(
-      epoch, sequence, "stop_terminal_projected", std::nullopt, std::nullopt,
-      std::nullopt, 1100U, "2026-10-02T10:00:01.000000001Z", false, latch,
-      content_identity::sha256_digest(content_identity::canonical_json(latch))));
-  static_cast<void>(core.CompleteOperationEventSnapshot(epoch, sequence));
-  EXPECT_EQ(active_subjects(), admitted);
-  EXPECT_EQ(RefusedSubjects(core.AlarmSnapshot()),
-            (std::set<std::string>{"another_cell", "operation.added.stale"}));
-  EXPECT_TRUE(motion_reconciled());
-  ingest("operation.added", *added, "completed");
-  EXPECT_EQ(active_subjects(),
-            (std::set<std::string>{"operation.added.early", "operation.kept",
-                                   "operation.startup"}));
-  const auto snapshot = core.AlarmSnapshot();
-  ASSERT_EQ(Array(snapshot, "alarms").size(), 5U);
-  ASSERT_NE(ScopeAlarm(snapshot), nullptr);
-  // One activation per refusal episode (startup, early, stale); a further
-  // refusal within an episode updates the standing alarm instead.
-  EXPECT_EQ(Unsigned(*ScopeAlarm(snapshot), "activation_count"), 3U);
-  EXPECT_EQ(Unsigned(*ScopeAlarm(snapshot), "occurrence_count"), 2U);
-  EXPECT_EQ(Text(*ScopeAlarm(snapshot), "lifecycle_state"),
-            "active_acknowledged");
-  EXPECT_TRUE(motion_reconciled());
-
-  const auto totals = Member(core.AlarmMetrics(), "totals");
-  EXPECT_EQ(Unsigned(totals, "scope_rejections"), 4U);
-  HistorianQuery query;
-  query.components.insert("manyforge.alarm");
-  query.event_types.insert("alarm_condition_rejected");
-  const auto deadline = std::chrono::steady_clock::now() + 2s;
-  while (Array(core.HistoryPage(query), "events").size() < 4U &&
-         std::chrono::steady_clock::now() < deadline) {
-    std::this_thread::yield();
-  }
-  std::vector<std::string> codes;
-  const auto page = core.HistoryPage(query);
-  for (const auto &stored : Array(page, "events")) {
-    codes.push_back(
-        Text(Member(Member(stored, "event"), "payload"), "code"));
-  }
-  std::sort(codes.begin(), codes.end());
-  EXPECT_EQ(codes, (std::vector<std::string>{
-                       "operator_alarm_scope_inactive",
-                       "operator_alarm_scope_inactive",
-                       "operator_alarm_scope_inactive",
-                       "operator_alarm_scope_invalid",
-                   }));
-}
 
 TEST(HeadlessApiCore,
      FaultRefusedBeforeAnyConfigurationIsAdmittedOnceThePublicationAppears) {
@@ -3889,8 +3505,8 @@ TEST(HeadlessApiCore,
 
   // Manager publishes the configuration; the next observation of the
   // projection reconsiders the still-current fault once and admits it, and
-  // the alarm-scope condition returns to normal, leaving the live list and
-  // the motion gate without an acknowledgement.
+  // the alarm-scope condition returns to normal. The admitted fault needs
+  // acknowledgement and so never gates motion (V2-5).
   PublishActiveConfiguration(directory, *configurations.single, 1U);
   const auto admitted = core.AlarmSnapshot();
   ASSERT_EQ(Array(admitted, "alarms").size(), 1U);
@@ -3904,11 +3520,8 @@ TEST(HeadlessApiCore,
   EXPECT_EQ(Text(*fault, "lifecycle_state"), "active_unacknowledged");
   EXPECT_EQ(Text(Member(*fault, "subject"), "subject_id"), "operation.early");
   EXPECT_EQ(ScopeAlarm(admitted), nullptr);
-  EXPECT_EQ(Unsigned(admitted, "motion_attention_count"), 1U);
-  const auto &gating = Array(admitted, "motion_attention_membership");
-  ASSERT_EQ(gating.size(), 1U);
-  EXPECT_EQ(Text(gating.front(), "condition_id"),
-            Text(*fault, "condition_id"));
+  EXPECT_EQ(Unsigned(admitted, "motion_attention_count"), 0U);
+  EXPECT_TRUE(Array(admitted, "motion_attention_membership").empty());
   static_cast<void>(core.CompleteOperationEventSnapshot(epoch, 1U));
   EXPECT_EQ(Array(core.AlarmSnapshot(), "alarms").size(), 1U);
 
@@ -3940,103 +3553,6 @@ TEST(HeadlessApiCore,
   EXPECT_EQ(Array(core.HistoryPage(query), "events").size(), 1U);
 }
 
-/// The CCLC component snapshot members the lifecycle-cause adapters read.
-CanonicalValue ComponentConditionSnapshot(
-    const std::string &component, const std::string &resource,
-    const std::string &achieved, const std::string &phase,
-    const std::string &cause, const std::string &requested = "active",
-    const double target_generation = 1.0) {
-  return CanonicalValue(CanonicalValue::Object{
-      {"component_lifecycle_state", CanonicalValue(achieved)},
-      {"controllable_component_id", CanonicalValue(component)},
-      {"domains",
-       CanonicalValue(CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
-           {"control_domain_id", CanonicalValue("domain.arm")},
-           {"kind", CanonicalValue("controller")},
-           {"resources",
-            CanonicalValue(CanonicalValue::Array{CanonicalValue(resource)})},
-       })})},
-      {"graph_revision", CanonicalValue("graph.test")},
-      {"lifecycle_progress",
-       CanonicalValue(CanonicalValue::Object{
-           {"blocking_cause_class", CanonicalValue(cause)},
-           {"blocking_reason",
-            cause == "none" ? CanonicalValue(nullptr)
-                            : CanonicalValue("reason." + cause)},
-           {"phase", CanonicalValue(phase)},
-       })},
-      {"lifecycle_target",
-       CanonicalValue(CanonicalValue::Object{
-           {"origin", CanonicalValue("startup")},
-           {"requested_state", CanonicalValue(requested)},
-           {"target_generation", CanonicalValue(target_generation)},
-       })},
-      {"retained_bundle_id", CanonicalValue("bundle.test")},
-  });
-}
-
-/// `snapshot` as CCLC captures it under `bundle` (retained bundle id and
-/// graph revision).
-CanonicalValue InConfiguration(const CanonicalValue &snapshot,
-                               const deployment::RetainedBundle &bundle) {
-  auto row = snapshot.as_object();
-  for (auto &[name, value] : row) {
-    if (name == "graph_revision") {
-      value = CanonicalValue(bundle.value().cell_graph.graph_revision.value());
-    } else if (name == "retained_bundle_id") {
-      value = CanonicalValue(bundle.retained_bundle_id().value());
-    }
-  }
-  return CanonicalValue(std::move(row));
-}
-
-/// The component-lifecycle fixture: the single-arm configuration is active
-/// and its controllable component and first resource are named.
-struct ComponentConditionFixture final {
-  TemporaryDirectory directory;
-  std::shared_ptr<const deployment::RetainedBundle> bundle;
-  std::string component;
-  std::string resource;
-  std::unique_ptr<HeadlessApiCore> core;
-
-  ComponentConditionFixture() {
-    const auto configurations = LoadRegistryConfigurations();
-    bundle = configurations.single;
-    const auto &components = bundle->value().cell_graph.controllable_components;
-    if (components.empty()) {
-      throw std::runtime_error("registry fixture has no component");
-    }
-    component = components.front().controllable_component_id.value();
-    resource = ResourceIds(*bundle).front();
-    PublishActiveConfiguration(directory, *bundle, 1U);
-    core = std::make_unique<HeadlessApiCore>(
-        RegistryConfig(directory, "api.epoch.1"), Clocks());
-    // Observing the projection establishes the alarm resource registry.
-    static_cast<void>(core->AlarmSnapshot());
-  }
-
-  /// Observe `snapshot` as captured under the active configuration.
-  CanonicalValue Observe(const CanonicalValue &snapshot,
-                         const std::string &epoch = "cclc.epoch.1") {
-    return core->ObserveComponentLifecycleConditions(
-        epoch,
-        CanonicalValue(CanonicalValue::Array{InConfiguration(snapshot, *bundle)}),
-        {});
-  }
-};
-
-/// Sources of the `runtime_health` domain (which holds the component
-/// lifecycle source) whose current quality is unknown.
-std::uint64_t UnknownRuntimeHealthSources(HeadlessApiCore &core) {
-  const auto snapshot = core.AlarmSnapshot();
-  for (const auto &domain : Array(snapshot, "domains")) {
-    if (Text(domain, "domain") == "runtime_health") {
-      return Unsigned(domain, "unknown_source_count");
-    }
-  }
-  throw std::runtime_error("runtime_health domain is missing");
-}
-
 const CanonicalValue *AlarmFor(const CanonicalValue &snapshot,
                                const std::string_view definition) {
   const CanonicalValue *found = nullptr;
@@ -4051,805 +3567,6 @@ const CanonicalValue *AlarmFor(const CanonicalValue &snapshot,
   return found;
 }
 
-constexpr std::string_view kComponentLifecycleFault =
-    "manyforge.runtime.component_lifecycle_fault";
-
-TEST(HeadlessApiCore,
-     SafetyStopHoldsComponentLifecycleFaultAcrossCommunicationLossUntilFreshClear) {
-  ComponentConditionFixture fixture;
-  const auto scope_value = fixture.core->ComponentLifecycleConditionScope();
-  const auto &scope = Array(scope_value, "component_ids");
-  ASSERT_EQ(scope.size(), 1U);
-  EXPECT_EQ(std::get<std::string>(scope.front().storage()), fixture.component);
-
-  EXPECT_EQ(Text(fixture.Observe(ComponentConditionSnapshot(
-                     fixture.component, fixture.resource, "active",
-                     "satisfied", "none")),
-                 "status"),
-            "observed");
-  EXPECT_TRUE(Array(fixture.core->AlarmSnapshot(), "alarms").empty());
-
-  // An emergency stop after the component reached its target.
-  const auto stopped = ComponentConditionSnapshot(
-      fixture.component, fixture.resource, "active", "satisfied",
-      "emergency_stop");
-  static_cast<void>(fixture.Observe(stopped));
-  auto snapshot = fixture.core->AlarmSnapshot();
-  ASSERT_EQ(Array(snapshot, "alarms").size(), 1U);
-  const auto *alarm = AlarmFor(snapshot, kComponentLifecycleFault);
-  ASSERT_NE(alarm, nullptr);
-  EXPECT_EQ(Text(*alarm, "lifecycle_state"), "active_unacknowledged");
-  EXPECT_EQ(Text(Member(*alarm, "subject"), "subject_kind"), "component");
-  EXPECT_EQ(Text(Member(*alarm, "subject"), "subject_id"), fixture.component);
-  EXPECT_EQ(Array(Member(*alarm, "subject"), "resource_ids"),
-            (CanonicalValue::Array{CanonicalValue(fixture.resource)}));
-  EXPECT_EQ(Text(Member(*alarm, "details"), "blocking_cause_class"),
-            "emergency_stop");
-  const auto activation = Text(*alarm, "activation_id");
-  const auto revision = Unsigned(*alarm, "record_revision");
-
-  // An unchanged observation submits nothing.
-  static_cast<void>(fixture.Observe(stopped));
-  snapshot = fixture.core->AlarmSnapshot();
-  EXPECT_EQ(Unsigned(*AlarmFor(snapshot, kComponentLifecycleFault),
-                     "record_revision"),
-            revision);
-
-  // CCLC unreachable, then the component unread: the condition stays.
-  EXPECT_EQ(Text(fixture.core->MarkComponentLifecycleSourceUnknown(), "status"),
-            "marked_unknown");
-  snapshot = fixture.core->AlarmSnapshot();
-  EXPECT_EQ(Text(*AlarmFor(snapshot, kComponentLifecycleFault),
-                 "lifecycle_state"),
-            "active_unacknowledged");
-  static_cast<void>(fixture.core->ObserveComponentLifecycleConditions(
-      "cclc.epoch.1", CanonicalValue(CanonicalValue::Array{}),
-      {fixture.component}));
-  snapshot = fixture.core->AlarmSnapshot();
-  EXPECT_EQ(Text(*AlarmFor(snapshot, kComponentLifecycleFault),
-                 "lifecycle_state"),
-            "active_unacknowledged");
-  // CCLC retains the class across controller communication loss as well;
-  // availability alone is never a lifecycle fault.
-  static_cast<void>(fixture.Observe(stopped));
-  EXPECT_EQ(Text(*AlarmFor(fixture.core->AlarmSnapshot(),
-                           kComponentLifecycleFault),
-                 "activation_id"),
-            activation);
-
-  // Fresh status clears the cause: the alarm returns to normal and still
-  // awaits acknowledgement (automatic recovery acknowledges nothing).
-  static_cast<void>(fixture.Observe(ComponentConditionSnapshot(
-      fixture.component, fixture.resource, "active", "satisfied", "none")));
-  snapshot = fixture.core->AlarmSnapshot();
-  ASSERT_EQ(Array(snapshot, "alarms").size(), 1U);
-  alarm = AlarmFor(snapshot, kComponentLifecycleFault);
-  ASSERT_NE(alarm, nullptr);
-  EXPECT_EQ(Text(*alarm, "lifecycle_state"), "returned_unacknowledged");
-  EXPECT_EQ(Text(*alarm, "activation_id"), activation);
-}
-
-TEST(HeadlessApiCore,
-     FaultAndUnknownCausesAreLifecycleFaultsButConfigurationIsNot) {
-  ComponentConditionFixture fixture;
-  static_cast<void>(fixture.Observe(ComponentConditionSnapshot(
-      fixture.component, fixture.resource, "declared", "blocked",
-      "configuration")));
-  EXPECT_TRUE(Array(fixture.core->AlarmSnapshot(), "alarms").empty());
-  static_cast<void>(fixture.Observe(ComponentConditionSnapshot(
-      fixture.component, fixture.resource, "disabled", "satisfied", "fault",
-      "disabled")));
-  auto snapshot = fixture.core->AlarmSnapshot();
-  ASSERT_NE(AlarmFor(snapshot, kComponentLifecycleFault), nullptr);
-  static_cast<void>(fixture.Observe(ComponentConditionSnapshot(
-      fixture.component, fixture.resource, "declared", "blocked", "unknown")));
-  snapshot = fixture.core->AlarmSnapshot();
-  EXPECT_EQ(Text(*AlarmFor(snapshot, kComponentLifecycleFault),
-                 "lifecycle_state"),
-            "active_unacknowledged");
-  EXPECT_EQ(Text(Member(*AlarmFor(snapshot, kComponentLifecycleFault),
-                        "details"),
-                 "blocking_cause_class"),
-            "unknown");
-}
-
-/// `snapshot` with an open incident in its lifecycle progress.
-CanonicalValue WithIncident(const CanonicalValue &snapshot,
-                            const std::string &incident_id,
-                            const std::string &cause) {
-  auto row = snapshot.as_object();
-  for (auto &[name, value] : row) {
-    if (name != "lifecycle_progress") {
-      continue;
-    }
-    auto progress = value.as_object();
-    progress.emplace_back(
-        "incident",
-        CanonicalValue(CanonicalValue::Object{
-            {"acknowledged", CanonicalValue(false)},
-            {"cause_class", CanonicalValue(cause)},
-            {"detected_at_ns", CanonicalValue(1000.0)},
-            {"incident_id", CanonicalValue(incident_id)},
-            {"summary", CanonicalValue("Controller lost")},
-            {"vendor_codes",
-             CanonicalValue(CanonicalValue::Array{CanonicalValue("C2")})},
-        }));
-    value = CanonicalValue(std::move(progress));
-  }
-  return CanonicalValue(std::move(row));
-}
-
-TEST(HeadlessApiCore,
-     OpenIncidentHoldsComponentLifecycleFaultUntilItsAcknowledgementClearsIt) {
-  ComponentConditionFixture fixture;
-  static_cast<void>(fixture.Observe(ComponentConditionSnapshot(
-      fixture.component, fixture.resource, "active", "satisfied", "none")));
-  const auto lost = WithIncident(
-      ComponentConditionSnapshot(fixture.component, fixture.resource, "active",
-                                 "blocked", "provider_lost"),
-      "incident.1", "provider_lost");
-  static_cast<void>(fixture.Observe(lost));
-  auto snapshot = fixture.core->AlarmSnapshot();
-  const auto *alarm = AlarmFor(snapshot, kComponentLifecycleFault);
-  ASSERT_NE(alarm, nullptr);
-  EXPECT_EQ(Text(*alarm, "lifecycle_state"), "active_unacknowledged");
-  EXPECT_EQ(Text(Member(*alarm, "details"), "incident_id"), "incident.1");
-  EXPECT_EQ(Text(Member(*alarm, "details"), "incident_cause_class"),
-            "provider_lost");
-  EXPECT_EQ(Array(Member(*alarm, "details"), "incident_vendor_codes"),
-            (CanonicalValue::Array{CanonicalValue("C2")}));
-  const auto activation = Text(*alarm, "activation_id");
-
-  // Readiness returning does not end the incident: only its acknowledgement
-  // (the incident gone from a fresh snapshot) does.
-  static_cast<void>(fixture.Observe(WithIncident(
-      ComponentConditionSnapshot(fixture.component, fixture.resource, "active",
-                                 "blocked", "none"),
-      "incident.1", "provider_lost")));
-  snapshot = fixture.core->AlarmSnapshot();
-  EXPECT_EQ(Text(*AlarmFor(snapshot, kComponentLifecycleFault),
-                 "lifecycle_state"),
-            "active_unacknowledged");
-
-  static_cast<void>(fixture.Observe(ComponentConditionSnapshot(
-      fixture.component, fixture.resource, "active", "satisfied", "none")));
-  snapshot = fixture.core->AlarmSnapshot();
-  alarm = AlarmFor(snapshot, kComponentLifecycleFault);
-  ASSERT_NE(alarm, nullptr);
-  // The alarm itself still follows the catalog's acknowledgement rule.
-  EXPECT_EQ(Text(*alarm, "lifecycle_state"), "returned_unacknowledged");
-  EXPECT_EQ(Text(*alarm, "activation_id"), activation);
-  EXPECT_EQ(Text(Member(*alarm, "details"), "incident_id"), "incident.1");
-}
-
-TEST(HeadlessApiCore, EveryIncidentCauseClassIsAComponentLifecycleFault) {
-  for (const std::string cause : {"collision", "external_control",
-                                  "provider_lost", "emergency_stop",
-                                  "protective_stop", "safeguard_stop"}) {
-    ComponentConditionFixture fixture;
-    static_cast<void>(fixture.Observe(ComponentConditionSnapshot(
-        fixture.component, fixture.resource, "active", "blocked", cause)));
-    EXPECT_NE(AlarmFor(fixture.core->AlarmSnapshot(), kComponentLifecycleFault),
-              nullptr)
-        << cause;
-  }
-  ComponentConditionFixture fixture;
-  EXPECT_THROW(static_cast<void>(fixture.Observe(WithIncident(
-                   ComponentConditionSnapshot(fixture.component,
-                                              fixture.resource, "active",
-                                              "blocked", "availability"),
-                   "incident.1", "availability"))),
-               OperatorAlarmError);
-  EXPECT_TRUE(Array(fixture.core->AlarmSnapshot(), "alarms").empty());
-}
-
-TEST(HeadlessApiCore, ComponentLifecycleObservationMustNameTheCurrentScope) {
-  ComponentConditionFixture fixture;
-  EXPECT_EQ(Text(fixture.core->MarkComponentLifecycleSourceUnknown(), "status"),
-            "not_registered");
-  EXPECT_EQ(Text(fixture.core->ObserveComponentLifecycleConditions(
-                     "cclc.epoch.1", CanonicalValue(CanonicalValue::Array{}),
-                     {}),
-                 "status"),
-            "scope_changed");
-  EXPECT_EQ(Text(fixture.Observe(ComponentConditionSnapshot(
-                     "component.elsewhere", fixture.resource, "active",
-                     "satisfied", "emergency_stop")),
-                 "status"),
-            "scope_changed");
-  const auto snapshot = fixture.core->AlarmSnapshot();
-  EXPECT_TRUE(Array(snapshot, "alarms").empty());
-  EXPECT_THROW(
-      static_cast<void>(fixture.Observe(ComponentConditionSnapshot(
-          fixture.component, fixture.resource, "active", "satisfied",
-          "intervention"))),
-      OperatorAlarmError);
-}
-
-TEST(HeadlessApiCore,
-     ComponentLifecycleSourceReconcilesAfterAnApplyRemovesAComponent) {
-  // Regression: an Apply that retires a component replaces the CCLC owner,
-  // which is briefly unreachable. The first observation of the new scope
-  // under the new owner epoch must reconcile the source (the owner admits
-  // motion again) and return the removed component's raised condition.
-  TemporaryDirectory directory;
-  const auto configurations = LoadRegistryConfigurations();
-  const auto component_ids = [](const deployment::RetainedBundle &bundle) {
-    std::set<std::string> ids;
-    for (const auto &component :
-         bundle.value().cell_graph.controllable_components) {
-      ids.insert(component.controllable_component_id.value());
-    }
-    return ids;
-  };
-  const auto single_components = component_ids(*configurations.single);
-  const auto dual_components = component_ids(*configurations.dual);
-  std::vector<std::string> removed_components;
-  std::set_difference(dual_components.begin(), dual_components.end(),
-                      single_components.begin(), single_components.end(),
-                      std::back_inserter(removed_components));
-  ASSERT_EQ(single_components.size(), 1U);
-  ASSERT_EQ(removed_components.size(), 1U);
-  const auto kept = *single_components.begin();
-  const auto removed = removed_components.front();
-  const auto single_resources = ResourceIds(*configurations.single);
-  std::vector<std::string> removed_resources;
-  for (const auto &resource : ResourceIds(*configurations.dual)) {
-    if (std::find(single_resources.begin(), single_resources.end(),
-                  resource) == single_resources.end()) {
-      removed_resources.push_back(resource);
-    }
-  }
-  ASSERT_FALSE(removed_resources.empty());
-
-  PublishActiveConfiguration(directory, *configurations.dual, 1U);
-  HeadlessApiCore core(RegistryConfig(directory, "api.epoch.1"), Clocks());
-  static_cast<void>(core.AlarmSnapshot());
-  const auto unknown_runtime_sources = [&]() {
-    return UnknownRuntimeHealthSources(core);
-  };
-  const auto baseline = unknown_runtime_sources();
-
-  EXPECT_EQ(Text(core.ObserveComponentLifecycleConditions(
-                     "cclc.epoch.1",
-                     CanonicalValue(CanonicalValue::Array{
-                         InConfiguration(
-                             ComponentConditionSnapshot(
-                                 kept, single_resources.front(), "active",
-                                 "satisfied", "none"),
-                             *configurations.dual),
-                         InConfiguration(
-                             ComponentConditionSnapshot(
-                                 removed, removed_resources.front(), "active",
-                                 "satisfied", "emergency_stop"),
-                             *configurations.dual),
-                     }),
-                     {}),
-                 "status"),
-            "observed");
-  ASSERT_NE(AlarmFor(core.AlarmSnapshot(), kComponentLifecycleFault), nullptr);
-  EXPECT_EQ(unknown_runtime_sources(), baseline);
-
-  // Apply: the CCLC owner is replaced and briefly unreachable.
-  EXPECT_EQ(Text(core.MarkComponentLifecycleSourceUnknown(), "status"),
-            "marked_unknown");
-  EXPECT_EQ(unknown_runtime_sources(), baseline + 1U);
-  PublishActiveConfiguration(directory, *configurations.single, 2U);
-  static_cast<void>(core.AlarmSnapshot());
-  EXPECT_EQ(Array(core.ComponentLifecycleConditionScope(), "component_ids"),
-            (CanonicalValue::Array{CanonicalValue(kept)}));
-
-  EXPECT_EQ(Text(core.ObserveComponentLifecycleConditions(
-                     "cclc.epoch.2",
-                     CanonicalValue(CanonicalValue::Array{
-                         InConfiguration(
-                             ComponentConditionSnapshot(
-                                 kept, single_resources.front(), "active",
-                                 "satisfied", "none"),
-                             *configurations.single),
-                     }),
-                     {}),
-                 "status"),
-            "observed");
-  EXPECT_EQ(unknown_runtime_sources(), baseline);
-  const auto snapshot = core.AlarmSnapshot();
-  const auto *alarm = AlarmFor(snapshot, kComponentLifecycleFault);
-  ASSERT_NE(alarm, nullptr);
-  EXPECT_EQ(Text(Member(*alarm, "subject"), "subject_id"), removed);
-  EXPECT_FALSE(std::get<bool>(Member(*alarm, "active").storage()));
-}
-
-TEST(HeadlessApiCore,
-     LifecycleObservationCapturedBeforeApplyRaisesKeepsAndClearsNothing) {
-  // Regression: matching component IDs alone admitted a CCLC snapshot taken
-  // under the configuration an Apply superseded. Each row is now fenced to
-  // the retained bundle and graph revision it was captured under; until a
-  // row of the active configuration arrives, the conditions held from the
-  // superseded one stay at unknown quality.
-  TemporaryDirectory directory;
-  const auto configurations = LoadRegistryConfigurations();
-  const auto &single = *configurations.single;
-  const auto &dual = *configurations.dual;
-  const auto kept =
-      single.value().cell_graph.controllable_components.front()
-          .controllable_component_id.value();
-  std::string added;
-  for (const auto &component : dual.value().cell_graph.controllable_components) {
-    if (component.controllable_component_id.value() != kept) {
-      added = component.controllable_component_id.value();
-    }
-  }
-  ASSERT_FALSE(added.empty());
-  // The kept component's condition keeps one subject across both
-  // configurations, so only the fence decides what is submitted.
-  const auto resource = ResourceIds(single).front();
-  const auto row = [&](const std::string &component, const std::string &cause,
-                       const deployment::RetainedBundle &captured_under) {
-    return InConfiguration(ComponentConditionSnapshot(component, resource,
-                                                      "active", "satisfied",
-                                                      cause),
-                           captured_under);
-  };
-  const auto observe = [&](HeadlessApiCore &core,
-                           CanonicalValue::Array rows,
-                           std::vector<std::string> unavailable = {}) {
-    return Text(core.ObserveComponentLifecycleConditions(
-                    "cclc.epoch.1", CanonicalValue(std::move(rows)),
-                    std::move(unavailable)),
-                "status");
-  };
-
-  PublishActiveConfiguration(directory, dual, 1U);
-  HeadlessApiCore core(RegistryConfig(directory, "api.epoch.1"), Clocks());
-  static_cast<void>(core.AlarmSnapshot());
-  EXPECT_FALSE(std::get<bool>(
-      Member(core.ComponentLifecycleConditionScope(), "source_registered")
-          .storage()));
-  ASSERT_EQ(observe(core, {row(kept, "none", dual), row(added, "none", dual)}),
-            "observed");
-  EXPECT_TRUE(std::get<bool>(
-      Member(core.ComponentLifecycleConditionScope(), "source_registered")
-          .storage()));
-  EXPECT_TRUE(Array(core.AlarmSnapshot(), "alarms").empty());
-  const auto baseline = UnknownRuntimeHealthSources(core);
-
-  // Apply to the single-arm configuration: the scope still names `kept`.
-  PublishActiveConfiguration(directory, single, 2U);
-  static_cast<void>(core.AlarmSnapshot());
-  ASSERT_EQ(Array(core.ComponentLifecycleConditionScope(), "component_ids"),
-            (CanonicalValue::Array{CanonicalValue(kept)}));
-  EXPECT_EQ(UnknownRuntimeHealthSources(core), baseline + 1U);
-
-  // A stale capture raises nothing.
-  EXPECT_EQ(observe(core, {row(kept, "emergency_stop", dual)}),
-            "scope_changed");
-  EXPECT_TRUE(Array(core.AlarmSnapshot(), "alarms").empty());
-  EXPECT_EQ(UnknownRuntimeHealthSources(core), baseline + 1U);
-  // An unread component does not reconcile the source either.
-  EXPECT_EQ(observe(core, {}, {kept}), "incomplete");
-  EXPECT_EQ(UnknownRuntimeHealthSources(core), baseline + 1U);
-
-  // A capture under the active configuration raises and reconciles.
-  EXPECT_EQ(observe(core, {row(kept, "emergency_stop", single)}), "observed");
-  auto snapshot = core.AlarmSnapshot();
-  const auto *alarm = AlarmFor(snapshot, kComponentLifecycleFault);
-  ASSERT_NE(alarm, nullptr);
-  EXPECT_EQ(Text(*alarm, "lifecycle_state"), "active_unacknowledged");
-  const auto activation = Text(*alarm, "activation_id");
-  const auto revision = Unsigned(*alarm, "record_revision");
-  EXPECT_EQ(UnknownRuntimeHealthSources(core), baseline);
-
-  // Apply back to the dual configuration with the same `kept` component.
-  PublishActiveConfiguration(directory, dual, 3U);
-  static_cast<void>(core.AlarmSnapshot());
-  EXPECT_EQ(UnknownRuntimeHealthSources(core), baseline + 1U);
-
-  // A stale capture neither clears nor keeps the raised condition: the
-  // record is unchanged and its source stays at unknown quality.
-  EXPECT_EQ(observe(core, {row(kept, "none", single), row(added, "none", single)}),
-            "scope_changed");
-  EXPECT_EQ(observe(core, {row(kept, "emergency_stop", single),
-                           row(added, "none", single)}),
-            "scope_changed");
-  snapshot = core.AlarmSnapshot();
-  alarm = AlarmFor(snapshot, kComponentLifecycleFault);
-  ASSERT_NE(alarm, nullptr);
-  EXPECT_EQ(Text(*alarm, "lifecycle_state"), "active_unacknowledged");
-  EXPECT_EQ(Unsigned(*alarm, "record_revision"), revision);
-  EXPECT_EQ(UnknownRuntimeHealthSources(core), baseline + 1U);
-
-  // Fresh normal status of the active configuration returns it.
-  EXPECT_EQ(observe(core, {row(kept, "none", dual), row(added, "none", dual)}),
-            "observed");
-  snapshot = core.AlarmSnapshot();
-  alarm = AlarmFor(snapshot, kComponentLifecycleFault);
-  ASSERT_NE(alarm, nullptr);
-  EXPECT_EQ(Text(*alarm, "lifecycle_state"), "returned_unacknowledged");
-  EXPECT_EQ(Text(*alarm, "activation_id"), activation);
-  EXPECT_EQ(UnknownRuntimeHealthSources(core), baseline);
-}
-
-TEST(HeadlessApiCore,
-     ConfigurationChangeReportsAPendingLifecycleObservationUntilOneIsAccepted) {
-  // Spec 530 §7.1: an Apply is respected without polling. The registry swap
-  // that marks the lifecycle source unknown is reported through the refresh
-  // the event pump offers each iteration, so the pump reads the new
-  // configuration at once; only a complete observation of the active
-  // configuration clears it.
-  TemporaryDirectory directory;
-  const auto configurations = LoadRegistryConfigurations();
-  const auto &single = *configurations.single;
-  const auto &dual = *configurations.dual;
-  const auto kept =
-      single.value().cell_graph.controllable_components.front()
-          .controllable_component_id.value();
-  std::string added;
-  for (const auto &component : dual.value().cell_graph.controllable_components) {
-    if (component.controllable_component_id.value() != kept) {
-      added = component.controllable_component_id.value();
-    }
-  }
-  ASSERT_FALSE(added.empty());
-  const auto resource = ResourceIds(single).front();
-  const auto row = [&](const std::string &component,
-                       const deployment::RetainedBundle &captured_under) {
-    return InConfiguration(ComponentConditionSnapshot(component, resource,
-                                                      "active", "satisfied",
-                                                      "none"),
-                           captured_under);
-  };
-  const auto observe = [&](HeadlessApiCore &core, CanonicalValue::Array rows,
-                           std::vector<std::string> unavailable = {}) {
-    return Text(core.ObserveComponentLifecycleConditions(
-                    "cclc.epoch.1", CanonicalValue(std::move(rows)),
-                    std::move(unavailable)),
-                "status");
-  };
-  const auto pending = [](HeadlessApiCore &core) {
-    return std::get<bool>(Member(core.RefreshAlarmSources(),
-                                 "component_lifecycle_observation_pending")
-                              .storage());
-  };
-
-  PublishActiveConfiguration(directory, dual, 1U);
-  HeadlessApiCore core(RegistryConfig(directory, "api.epoch.1"), Clocks());
-  static_cast<void>(core.AlarmSnapshot());
-  // The first configuration names components the source has not observed.
-  EXPECT_TRUE(pending(core));
-  ASSERT_EQ(observe(core, {row(kept, dual), row(added, dual)}), "observed");
-  EXPECT_FALSE(pending(core));
-  const auto baseline = UnknownRuntimeHealthSources(core);
-
-  // The registry swap marks the source unknown and the observation pending.
-  PublishActiveConfiguration(directory, single, 2U);
-  static_cast<void>(core.AlarmSnapshot());
-  EXPECT_EQ(UnknownRuntimeHealthSources(core), baseline + 1U);
-  EXPECT_TRUE(pending(core));
-  // A row CCLC captured under the superseded configuration is no observation.
-  EXPECT_EQ(observe(core, {row(kept, dual)}), "scope_changed");
-  EXPECT_TRUE(pending(core));
-  // A partial observation leaves quality unknown and is distinct.
-  EXPECT_EQ(observe(core, {}, {kept}), "incomplete");
-  EXPECT_TRUE(pending(core));
-  EXPECT_EQ(UnknownRuntimeHealthSources(core), baseline + 1U);
-  // A complete observation of the new configuration clears it.
-  EXPECT_EQ(observe(core, {row(kept, single)}), "observed");
-  EXPECT_FALSE(pending(core));
-  EXPECT_EQ(UnknownRuntimeHealthSources(core), baseline);
-
-  // An unreachable CCLC is the same pending observation.
-  EXPECT_EQ(Text(core.MarkComponentLifecycleSourceUnknown(), "status"),
-            "marked_unknown");
-  EXPECT_TRUE(pending(core));
-  EXPECT_EQ(observe(core, {row(kept, single)}), "observed");
-  EXPECT_FALSE(pending(core));
-}
-
-TEST(HeadlessApiCore,
-     LifecycleObservationIsJudgedAgainstThePublicationNotTheCachedRegistry) {
-  // Regression: the fence compared rows with the cached registry identity,
-  // which only another reader's refresh updates. After an Apply that no
-  // reader had refreshed yet, a row captured under the superseded
-  // configuration still matched that cache and could raise or clear a
-  // condition. The observation now rereads the current Manager publication
-  // first; without a fresh one it is judged against nothing.
-  TemporaryDirectory directory;
-  const auto configurations = LoadRegistryConfigurations();
-  const auto &single = *configurations.single;
-  const auto &dual = *configurations.dual;
-  const auto kept =
-      single.value().cell_graph.controllable_components.front()
-          .controllable_component_id.value();
-  std::string added;
-  for (const auto &component : dual.value().cell_graph.controllable_components) {
-    if (component.controllable_component_id.value() != kept) {
-      added = component.controllable_component_id.value();
-    }
-  }
-  ASSERT_FALSE(added.empty());
-  const auto resource = ResourceIds(single).front();
-  const auto row = [&](const std::string &component, const std::string &cause,
-                       const deployment::RetainedBundle &captured_under) {
-    return InConfiguration(ComponentConditionSnapshot(component, resource,
-                                                      "active", "satisfied",
-                                                      cause),
-                           captured_under);
-  };
-  const auto observe = [&](HeadlessApiCore &core, CanonicalValue::Array rows) {
-    return Text(core.ObserveComponentLifecycleConditions(
-                    "cclc.epoch.1", CanonicalValue(std::move(rows)), {}),
-                "status");
-  };
-
-  PublishActiveConfiguration(directory, dual, 1U);
-  HeadlessApiCore core(RegistryConfig(directory, "api.epoch.1"), Clocks());
-  static_cast<void>(core.AlarmSnapshot());
-  ASSERT_EQ(observe(core, {row(kept, "none", dual), row(added, "none", dual)}),
-            "observed");
-
-  // Apply to the single-arm configuration; nothing has refreshed the
-  // registry since. A capture of the superseded configuration raises nothing.
-  PublishActiveConfiguration(directory, single, 2U);
-  EXPECT_EQ(observe(core, {row(kept, "emergency_stop", dual),
-                           row(added, "emergency_stop", dual)}),
-            "scope_changed");
-  EXPECT_TRUE(Array(core.AlarmSnapshot(), "alarms").empty());
-  // A capture of the published configuration is accepted.
-  EXPECT_EQ(observe(core, {row(kept, "emergency_stop", single)}), "observed");
-  auto snapshot = core.AlarmSnapshot();
-  const auto *alarm = AlarmFor(snapshot, kComponentLifecycleFault);
-  ASSERT_NE(alarm, nullptr);
-  EXPECT_EQ(Text(*alarm, "lifecycle_state"), "active_unacknowledged");
-  const auto revision = Unsigned(*alarm, "record_revision");
-
-  // Apply back to the dual configuration, again unrefreshed: a capture of the
-  // superseded single-arm configuration clears nothing.
-  PublishActiveConfiguration(directory, dual, 3U);
-  EXPECT_EQ(observe(core, {row(kept, "none", single)}), "scope_changed");
-  snapshot = core.AlarmSnapshot();
-  alarm = AlarmFor(snapshot, kComponentLifecycleFault);
-  ASSERT_NE(alarm, nullptr);
-  EXPECT_EQ(Text(*alarm, "lifecycle_state"), "active_unacknowledged");
-  EXPECT_EQ(Unsigned(*alarm, "record_revision"), revision);
-
-  // Without a current publication there is no active configuration to judge
-  // against, even for rows naming the last one.
-  std::filesystem::remove(directory.publications() / "manager-source.json");
-  EXPECT_EQ(observe(core, {row(kept, "none", dual), row(added, "none", dual)}),
-            "configuration_unavailable");
-  snapshot = core.AlarmSnapshot();
-  alarm = AlarmFor(snapshot, kComponentLifecycleFault);
-  ASSERT_NE(alarm, nullptr);
-  EXPECT_EQ(Unsigned(*alarm, "record_revision"), revision);
-
-  PublishActiveConfiguration(directory, dual, 4U);
-  EXPECT_EQ(observe(core, {row(kept, "none", dual), row(added, "none", dual)}),
-            "observed");
-  snapshot = core.AlarmSnapshot();
-  alarm = AlarmFor(snapshot, kComponentLifecycleFault);
-  ASSERT_NE(alarm, nullptr);
-  EXPECT_EQ(Text(*alarm, "lifecycle_state"), "returned_unacknowledged");
-}
-
-TEST(HeadlessApiCore,
-     EmptyConfigurationReturnsRemovedLifecycleConditionsWithoutCCLC) {
-  // Regression: an Apply to a configuration without controlled components
-  // removes the CCLC service, so an empty scope observed through CCLC only
-  // marked the source unknown and the removed components' conditions stayed
-  // active. The empty configuration is observed by Headless itself, fenced
-  // to the configuration Manager publishes now.
-  TemporaryDirectory directory;
-  const auto configurations = LoadRegistryConfigurations();
-  const auto &single = *configurations.single;
-  const auto &empty = *configurations.empty;
-  const auto component =
-      single.value().cell_graph.controllable_components.front()
-          .controllable_component_id.value();
-  const auto resource = ResourceIds(single).front();
-  const auto observe_empty = [](HeadlessApiCore &core,
-                                const deployment::RetainedBundle &bundle) {
-    return Text(core.ObserveEmptyComponentLifecycleConfiguration(
-                    bundle.retained_bundle_id().value(),
-                    bundle.value().cell_graph.graph_revision.value()),
-                "status");
-  };
-
-  PublishActiveConfiguration(directory, single, 1U);
-  HeadlessApiCore core(RegistryConfig(directory, "api.epoch.1"), Clocks());
-  static_cast<void>(core.AlarmSnapshot());
-  const auto scope = core.ComponentLifecycleConditionScope();
-  EXPECT_EQ(Text(scope, "retained_bundle_id"),
-            single.retained_bundle_id().value());
-  // A configuration with components is never observed as empty.
-  EXPECT_EQ(observe_empty(core, single), "scope_changed");
-  ASSERT_EQ(Text(core.ObserveComponentLifecycleConditions(
-                     "cclc.epoch.1",
-                     CanonicalValue(CanonicalValue::Array{InConfiguration(
-                         ComponentConditionSnapshot(component, resource,
-                                                    "active", "satisfied",
-                                                    "emergency_stop"),
-                         single)}),
-                     {}),
-                 "status"),
-            "observed");
-  ASSERT_NE(AlarmFor(core.AlarmSnapshot(), kComponentLifecycleFault), nullptr);
-  const auto baseline = UnknownRuntimeHealthSources(core);
-
-  const auto pending = [](HeadlessApiCore &value) {
-    return std::get<bool>(Member(value.RefreshAlarmSources(),
-                                 "component_lifecycle_observation_pending")
-                              .storage());
-  };
-  EXPECT_FALSE(pending(core));
-
-  // Apply to the empty configuration: its CCLC owner is gone.
-  PublishActiveConfiguration(directory, empty, 2U);
-  static_cast<void>(core.AlarmSnapshot());
-  EXPECT_EQ(UnknownRuntimeHealthSources(core), baseline + 1U);
-  // The registered source must observe the empty scope too.
-  EXPECT_TRUE(pending(core));
-  const auto empty_scope = core.ComponentLifecycleConditionScope();
-  EXPECT_TRUE(Array(empty_scope, "component_ids").empty());
-  EXPECT_EQ(Text(empty_scope, "retained_bundle_id"),
-            empty.retained_bundle_id().value());
-  EXPECT_EQ(Text(empty_scope, "graph_revision"),
-            empty.value().cell_graph.graph_revision.value());
-  EXPECT_EQ(Text(core.MarkComponentLifecycleSourceUnknown(), "status"),
-            "marked_unknown");
-  // An observation fenced to the superseded configuration returns nothing.
-  EXPECT_EQ(observe_empty(core, single), "scope_changed");
-  auto snapshot = core.AlarmSnapshot();
-  const auto *alarm = AlarmFor(snapshot, kComponentLifecycleFault);
-  ASSERT_NE(alarm, nullptr);
-  EXPECT_TRUE(std::get<bool>(Member(*alarm, "active").storage()));
-  EXPECT_EQ(UnknownRuntimeHealthSources(core), baseline + 1U);
-
-  EXPECT_TRUE(pending(core));
-  EXPECT_EQ(observe_empty(core, empty), "observed");
-  EXPECT_FALSE(pending(core));
-  snapshot = core.AlarmSnapshot();
-  alarm = AlarmFor(snapshot, kComponentLifecycleFault);
-  ASSERT_NE(alarm, nullptr);
-  EXPECT_EQ(Text(Member(*alarm, "subject"), "subject_id"), component);
-  EXPECT_FALSE(std::get<bool>(Member(*alarm, "active").storage()));
-  EXPECT_EQ(UnknownRuntimeHealthSources(core), baseline);
-
-  // A source that was never registered has nothing to return.
-  TemporaryDirectory unregistered_directory;
-  PublishActiveConfiguration(unregistered_directory, empty, 1U);
-  HeadlessApiCore unregistered(
-      RegistryConfig(unregistered_directory, "api.epoch.2"), Clocks());
-  // Nothing in scope and nothing registered: no observation is pending.
-  EXPECT_FALSE(pending(unregistered));
-  EXPECT_EQ(observe_empty(unregistered, empty), "empty");
-  EXPECT_FALSE(pending(unregistered));
-}
-
-TEST(HeadlessApiCore, CCLCIncidentEventsAreRecordedOncePerIncidentAndKind) {
-  TemporaryDirectory directory;
-  const auto event = [](const std::string &kind, const double sequence) {
-    core::ComponentLifecycleIncidentDTO incident{
-        "incident.component.arm.5000", core::ControllableComponentId("arm"),
-        core::LifecycleBlockingCauseClassDTO::kUnknown, {}, 0, {}, std::nullopt, {},
-        core::ComponentIncidentContainmentStateDTO::kPending, std::nullopt, std::nullopt,
-        false, std::nullopt, std::nullopt, std::nullopt, std::nullopt, {}};
-    incident.cause_class = core::LifecycleBlockingCauseClassDTO::kEmergencyStop;
-    incident.detected_at_ns = 5000;
-    incident.summary = "Actual emergency-stop incident";
-    incident.containment_state = core::ComponentIncidentContainmentStateDTO::kRequested;
-    incident.containment = core::ComponentIncidentContainmentReceiptDTO{
-        core::StopId("stop.1"), core::StopGeneration(1U), {}, std::nullopt};
-    if (kind == "component_incident_acknowledged") {
-      incident.acknowledged = true;
-      incident.acknowledged_at_ns = 5001;
-      incident.acknowledged_by = "operator";
-      incident.acknowledgement_request_id = core::RequestId("ack.1");
-    }
-    if (!incident.locally_valid())
-      throw std::runtime_error("typed component incident fixture is invalid");
-    const auto policy = core::LifecycleIncidentRecoveryPolicyFor(
-        core::DefaultLifecycleIncidentRecoveryPolicy(), incident.cause_class);
-    const auto payload = content_identity::parse_canonical_json(
-        core::ComponentIncidentEventPayload(incident, policy, kind));
-    return CanonicalValue(CanonicalValue::Object{
-        {"event_kind", CanonicalValue(kind)},
-        {"event_sequence", CanonicalValue(sequence)},
-        {"incident_id", CanonicalValue(incident.incident_id)},
-        {"occurred_at_ns", CanonicalValue(5000.0)},
-        {"payload", payload},
-    });
-  };
-  HistorianQuery query;
-  query.components.insert("manyforge.cclc");
-  const auto durable = [&query](HeadlessApiCore &core, const std::size_t count) {
-    const auto deadline = std::chrono::steady_clock::now() + 2s;
-    CanonicalValue page;
-    do {
-      page = core.HistoryPage(query);
-      if (Array(page, "events").size() == count) break;
-      std::this_thread::yield();
-    } while (std::chrono::steady_clock::now() < deadline);
-    return page;
-  };
-  {
-    HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
-    const auto opened =
-        core.RecordCCLCIncidentEvent("cclc.epoch.1", event("component_incident", 1.0));
-    EXPECT_EQ(Text(opened, "status"), "recorded");
-    EXPECT_EQ(Text(opened, "schema_version"),
-              "manyforge.cclc_incident_history_record.v2");
-    // The same event again (a replayed cursor) is not enqueued twice.
-    EXPECT_EQ(Text(core.RecordCCLCIncidentEvent("cclc.epoch.1",
-                                                event("component_incident", 1.0)),
-                   "status"),
-              "duplicate");
-    EXPECT_EQ(Text(core.RecordCCLCIncidentEvent(
-                       "cclc.epoch.1", event("component_incident_acknowledged", 2.0)),
-                   "status"),
-              "recorded");
-    const auto page = durable(core, 2U);
-    ASSERT_EQ(Array(page, "events").size(), 2U);
-    const auto &newest = Member(Array(page, "events").front(), "event");
-    EXPECT_EQ(Text(newest, "event_type"), "component_incident_acknowledged");
-    EXPECT_EQ(Text(newest, "severity"), "INFO");
-    const auto &oldest = Member(Array(page, "events").back(), "event");
-    EXPECT_EQ(Text(oldest, "event_type"), "component_incident");
-    EXPECT_EQ(Text(oldest, "severity"), "ERROR");
-    const auto &payload = Member(oldest, "payload");
-    EXPECT_EQ(Text(payload, "schema_version"),
-              "manyforge.cclc_incident_history_event.v2");
-    EXPECT_EQ(Text(payload, "clock_owner"), "headless:api.epoch.1");
-    EXPECT_EQ(Text(payload, "cclc_owner_epoch"), "cclc.epoch.1");
-    EXPECT_EQ(Text(payload, "incident_id"), "incident.component.arm.5000");
-    EXPECT_EQ(content_identity::canonical_json(Member(payload, "cclc_occurred_at_ns")),
-              "5000");
-    EXPECT_EQ(Text(Member(payload, "details"), "cause_class"), "emergency_stop");
-
-    // Malformed or mismatched events are refused before any record.
-    auto old_schema = event("component_incident", 3.0).as_object();
-    for (auto &[key, value] : old_schema) {
-      if (key != "payload") continue;
-      auto details = value.as_object();
-      for (auto &[name, field] : details)
-        if (name == "schema_version")
-          field = CanonicalValue("manyforge.component_incident_event.v1");
-      value = CanonicalValue(std::move(details));
-    }
-    EXPECT_THROW(static_cast<void>(core.RecordCCLCIncidentEvent(
-                     "cclc.epoch.1", CanonicalValue(old_schema))),
-                 OperatorAlarmError);
-    auto mismatched = event("component_incident", 3.0).as_object();
-    for (auto &[key, value] : mismatched) {
-      if (key == "incident_id") value = CanonicalValue("incident.other");
-    }
-    EXPECT_THROW(static_cast<void>(core.RecordCCLCIncidentEvent(
-                     "cclc.epoch.1", CanonicalValue(mismatched))),
-                 OperatorAlarmError);
-    EXPECT_THROW(static_cast<void>(core.RecordCCLCIncidentEvent(
-                     "cclc.epoch.1", event("component_incident_reopened", 3.0))),
-                 OperatorAlarmError);
-    EXPECT_THROW(static_cast<void>(core.RecordCCLCIncidentEvent(
-                     "cclc.epoch.1", event("component_incident", 0.0))),
-                 OperatorAlarmError);
-    EXPECT_THROW(static_cast<void>(core.RecordCCLCIncidentEvent(
-                     "", event("component_incident", 3.0))),
-                 OperatorAlarmError);
-    core.Shutdown();
-  }
-  // A restarted reader replays from a lost cursor: the durable history
-  // answers, so nothing is recorded twice.
-  HeadlessApiCore replacement(Config(directory, "api.epoch.2"), Clocks());
-  EXPECT_EQ(Text(replacement.RecordCCLCIncidentEvent(
-                     "cclc.epoch.1", event("component_incident", 1.0)),
-                 "status"),
-            "duplicate");
-  EXPECT_EQ(Text(replacement.RecordCCLCIncidentEvent(
-                     "cclc.epoch.1", event("component_incident_acknowledged", 2.0)),
-                 "status"),
-            "duplicate");
-  EXPECT_EQ(Array(replacement.HistoryPage(query), "events").size(), 2U);
-}
-
 CanonicalValue PreviousSessionReport(const std::string &message =
     "Previous session journals retained; old events are not imported into History.") {
   return CanonicalValue(CanonicalValue::Object{
@@ -4861,8 +3578,7 @@ CanonicalValue PreviousSessionReport(const std::string &message =
       {"history_coverage", CanonicalValue("not_imported")},
       {"journal_families", CanonicalValue(CanonicalValue::Array{
           CanonicalValue("program_cycle"), CanonicalValue("scene"),
-          CanonicalValue("manager"), CanonicalValue("cclc"),
-          CanonicalValue("kernel_operation")})},
+          CanonicalValue("manager"), CanonicalValue("kernel_operation")})},
       {"message", CanonicalValue(message)},
   });
 }
@@ -6198,35 +4914,10 @@ TEST(HeadlessApiCore,
 }
 
 
-TEST(HeadlessApiCore, LifecycleObservationUsesOnlyTheCommonDomainResourcesMember) {
-  for (const std::string kind : {"controller", "io_provider"}) {
-    for (const bool empty : {false, true}) {
-      SCOPED_TRACE(kind);
-      SCOPED_TRACE(empty);
-      ComponentConditionFixture fixture;
-      auto snapshot = ComponentConditionSnapshot(
-          fixture.component, fixture.resource, "active", "satisfied", "none");
-      auto domain = Array(snapshot, "domains").front();
-      domain = JournalField(domain, "kind", CanonicalValue(kind));
-      domain = JournalField(domain, "resources", CanonicalValue(
-          empty ? CanonicalValue::Array{} : CanonicalValue::Array{CanonicalValue(fixture.resource)}));
-      snapshot = JournalField(snapshot, "domains", CanonicalValue(CanonicalValue::Array{domain}));
-      EXPECT_EQ(Text(fixture.Observe(snapshot), "status"), "observed");
-      // A superseded member is never used as a fallback source of resource truth.
-      auto obsolete = domain.as_object();
-      for (auto& [name, value] : obsolete)
-        if (name == "resources") name = kind == "io_provider" ? "output_resources" : "current_resources";
-      EXPECT_THROW(static_cast<void>(fixture.Observe(JournalField(
-                       snapshot, "domains", CanonicalValue(CanonicalValue::Array{
-                           CanonicalValue(std::move(obsolete))})))), OperatorAlarmError);
-    }
-  }
-}
-
 // Exact durable native40 state_observed row17, including its real I/O-rule
 // evidence. This is recorded producer data, not a fabricated successful trip.
 CanonicalValue Native40IoRuleRecord() {
-  return content_identity::parse_canonical_json(R"native40({"api_version":"manyforge.operation_journal_record.v7","effect_pending":false,"intent":{"transition_reason":"runtime_scale_status_observed"},"operation_state":{"active_stop_generation":null,"active_stop_id":null,"coordination_policy":"independent","journal_capture_order":"8","operation_id":"operation.kernel-owner-native-runtime-ab1ab108c01811d071cbf157d05eef41.2","operation_revision":1,"participants":[{"capability_id":"execution.trajectory.execute","capability_provider_binding_id":null,"capability_provider_binding_revision":null,"command_target_id":"arm","control_binding_id":"lite6_robot.arm.execution-trajectory-execute","control_binding_revision":"sha256:8e3f32bc78e641e62fc0b9902b615e6a3ebe7626d83eb39e81efd9ca3c2425e6","control_domain_id":"lite6_robot.arm.control","control_domain_revision":"sha256:669ef8a3882b5167bc6e94e6c253f72e88a511990821348f46b3ca2c6cb2937c","controllable_component_id":"lite6_robot","controller_goal_generation":1,"controller_goal_id":"operation.kernel-owner-native-runtime-ab1ab108c01811d071cbf157d05eef41.2.controller-goal.1","execution_scope":{"node_attempt_id":"attempt:aa48a448ad3b425681b41b013bcae166","node_instance_id":"search_trip"},"io_rule_outcomes":[{"error":null,"evidence":{"evaluation_error":null,"source_losses":[],"state":"retired","trip":null},"registration":{"catalog_generation":"2","owner_epoch":"kernel-owner-native-runtime-ab1ab108c01811d071cbf157d05eef41","policy_id":"node.9d4549f11850b1b2fc25f067c5c1a46e727105f792656507e8739f08ac7b859a","registration_id":"1","scope":{"command_target_id":"arm","controllable_component_id":"lite6_robot","controller_goal_generation":1,"controller_goal_id":"operation.kernel-owner-native-runtime-ab1ab108c01811d071cbf157d05eef41.2.controller-goal.1","kind":"operation","motion_interrupt_scope_id":"node.9d4549f11850b1b2fc25f067c5c1a46e727105f792656507e8739f08ac7b859a","operation_id":"operation.kernel-owner-native-runtime-ab1ab108c01811d071cbf157d05eef41.2","operation_revision":1,"participant_id":"operation.kernel-owner-native-runtime-ab1ab108c01811d071cbf157d05eef41.2.participant.1","preparation_id":"2","prepared_contract_digest":"sha256:3b41addb986ce1e6507c476d16d0f5598d6ce8c86f4f482b35e35fedcaa82d04"}},"stop_certificate_id":null,"stop_certificate_revision":null,"stop_generation":null,"stop_id":null,"stop_result":null,"terminal_cause":"no_signal_trip"}],"participant_id":"operation.kernel-owner-native-runtime-ab1ab108c01811d071cbf157d05eef41.2.participant.1","payload_kind":"motion","progress":1,"resources":["lite6_robot.arm.coordinate.000000","lite6_robot.arm.coordinate.000001","lite6_robot.arm.coordinate.000002","lite6_robot.arm.coordinate.000003","lite6_robot.arm.coordinate.000004","lite6_robot.arm.coordinate.000005"],"state":"completed","terminal_error":null,"terminal_fact":{"effect":"effect_settled","error":null,"kind":"computed_completion"}}],"program_binding_id":"sha256:5ef2d8159a7dc41022f543ece89a058120b49cd679656ec6181ddeaac093858e","program_run_id":"program-cycle.1","runtime_scale_generation":0,"state":"completed","updated_at_ns":595434142274283},"owner_epoch":"kernel-owner-native-runtime-ab1ab108c01811d071cbf157d05eef41","record_kind":"state_observed","result":null,"runtime_scale_status":{"effective_scale":1,"operation_id":"operation.kernel-owner-native-runtime-ab1ab108c01811d071cbf157d05eef41.2","operation_revision":1,"participants":[{"accepted_generation":0,"acknowledgement_sequence":1888,"acknowledgement_source_epoch":"native-runtime-ab1ab108c01811d071cbf157d05eef41","acknowledgement_timestamp_ns":595434139380760,"active_control_configuration_generation":1,"active_control_configuration_id":"active.i6.native.arm","applied_scale":1,"capability_id":"execution.trajectory.execute","command_target_id":"arm","commanded_scale":1,"control_binding_id":"lite6_robot.arm.execution-trajectory-execute","control_binding_revision":"sha256:8e3f32bc78e641e62fc0b9902b615e6a3ebe7626d83eb39e81efd9ca3c2425e6","control_domain_id":"lite6_robot.arm.control","control_domain_revision":"sha256:669ef8a3882b5167bc6e94e6c253f72e88a511990821348f46b3ca2c6cb2937c","control_route_id":"arm_position","controllable_component_id":"lite6_robot","controller_goal_generation":1,"controller_goal_id":"operation.kernel-owner-native-runtime-ab1ab108c01811d071cbf157d05eef41.2.controller-goal.1","controller_topology_id":"manyforge.ros2_control_arm_direct","coordinated_barrier_id":null,"error":null,"participant_id":"operation.kernel-owner-native-runtime-ab1ab108c01811d071cbf157d05eef41.2.participant.1","resources":["lite6_robot.arm.coordinate.000000","lite6_robot.arm.coordinate.000001","lite6_robot.arm.coordinate.000002","lite6_robot.arm.coordinate.000003","lite6_robot.arm.coordinate.000004","lite6_robot.arm.coordinate.000005"],"scaling_domain_id":"lite6_robot.arm.runtime_scale","state":"pending","supported":true,"topology_revision":"sha256:299f321da75dc2279ca2cebf66887ae13fb365a8a9db07d5c93d8aae6303352a","virtual_trajectory_time_s":2.533308666}],"requested_scale":1,"runtime_scale_generation":0,"state":"pending","updated_at_ns":595434145763632}})native40");
+  return content_identity::parse_canonical_json(R"native40({"api_version":"manyforge.operation_journal_record.v7","effect_pending":false,"intent":{"transition_reason":"runtime_scale_status_observed"},"operation_state":{"active_stop_generation":null,"active_stop_id":null,"coordination_policy":"independent","journal_capture_order":"8","operation_id":"operation.kernel-owner-execution-host-ab1ab108c01811d071cbf157d05eef41.2","operation_revision":1,"participants":[{"capability_id":"execution.trajectory.execute","capability_provider_binding_id":null,"capability_provider_binding_revision":null,"command_target_id":"arm","control_binding_id":"lite6_robot.arm.execution-trajectory-execute","control_binding_revision":"sha256:8e3f32bc78e641e62fc0b9902b615e6a3ebe7626d83eb39e81efd9ca3c2425e6","control_domain_id":"lite6_robot.arm.control","control_domain_revision":"sha256:669ef8a3882b5167bc6e94e6c253f72e88a511990821348f46b3ca2c6cb2937c","controllable_component_id":"lite6_robot","controller_goal_generation":1,"controller_goal_id":"operation.kernel-owner-execution-host-ab1ab108c01811d071cbf157d05eef41.2.controller-goal.1","execution_scope":{"node_attempt_id":"attempt:aa48a448ad3b425681b41b013bcae166","node_instance_id":"search_trip"},"io_rule_outcomes":[{"error":null,"evidence":{"evaluation_error":null,"source_losses":[],"state":"retired","trip":null},"registration":{"catalog_generation":"2","owner_epoch":"kernel-owner-execution-host-ab1ab108c01811d071cbf157d05eef41","policy_id":"node.9d4549f11850b1b2fc25f067c5c1a46e727105f792656507e8739f08ac7b859a","registration_id":"1","scope":{"command_target_id":"arm","controllable_component_id":"lite6_robot","controller_goal_generation":1,"controller_goal_id":"operation.kernel-owner-execution-host-ab1ab108c01811d071cbf157d05eef41.2.controller-goal.1","kind":"operation","motion_interrupt_scope_id":"node.9d4549f11850b1b2fc25f067c5c1a46e727105f792656507e8739f08ac7b859a","operation_id":"operation.kernel-owner-execution-host-ab1ab108c01811d071cbf157d05eef41.2","operation_revision":1,"participant_id":"operation.kernel-owner-execution-host-ab1ab108c01811d071cbf157d05eef41.2.participant.1","preparation_id":"2","prepared_contract_digest":"sha256:3b41addb986ce1e6507c476d16d0f5598d6ce8c86f4f482b35e35fedcaa82d04"}},"stop_certificate_id":null,"stop_certificate_revision":null,"stop_generation":null,"stop_id":null,"stop_result":null,"terminal_cause":"no_signal_trip"}],"participant_id":"operation.kernel-owner-execution-host-ab1ab108c01811d071cbf157d05eef41.2.participant.1","payload_kind":"motion","progress":1,"resources":["lite6_robot.arm.coordinate.000000","lite6_robot.arm.coordinate.000001","lite6_robot.arm.coordinate.000002","lite6_robot.arm.coordinate.000003","lite6_robot.arm.coordinate.000004","lite6_robot.arm.coordinate.000005"],"state":"completed","terminal_error":null,"terminal_fact":{"effect":"effect_settled","error":null,"kind":"computed_completion"}}],"program_binding_id":"sha256:5ef2d8159a7dc41022f543ece89a058120b49cd679656ec6181ddeaac093858e","program_run_id":"program-cycle.1","runtime_scale_generation":0,"state":"completed","updated_at_ns":595434142274283},"owner_epoch":"kernel-owner-execution-host-ab1ab108c01811d071cbf157d05eef41","record_kind":"state_observed","result":null,"runtime_scale_status":{"effective_scale":1,"operation_id":"operation.kernel-owner-execution-host-ab1ab108c01811d071cbf157d05eef41.2","operation_revision":1,"participants":[{"accepted_generation":0,"acknowledgement_sequence":1888,"acknowledgement_source_epoch":"execution-host-ab1ab108c01811d071cbf157d05eef41","acknowledgement_timestamp_ns":595434139380760,"active_control_configuration_generation":1,"active_control_configuration_id":"active.i6.native.arm","applied_scale":1,"capability_id":"execution.trajectory.execute","command_target_id":"arm","commanded_scale":1,"control_binding_id":"lite6_robot.arm.execution-trajectory-execute","control_binding_revision":"sha256:8e3f32bc78e641e62fc0b9902b615e6a3ebe7626d83eb39e81efd9ca3c2425e6","control_domain_id":"lite6_robot.arm.control","control_domain_revision":"sha256:669ef8a3882b5167bc6e94e6c253f72e88a511990821348f46b3ca2c6cb2937c","control_route_id":"arm_position","controllable_component_id":"lite6_robot","controller_goal_generation":1,"controller_goal_id":"operation.kernel-owner-execution-host-ab1ab108c01811d071cbf157d05eef41.2.controller-goal.1","controller_topology_id":"manyforge.ros2_control_arm_direct","coordinated_barrier_id":null,"error":null,"participant_id":"operation.kernel-owner-execution-host-ab1ab108c01811d071cbf157d05eef41.2.participant.1","resources":["lite6_robot.arm.coordinate.000000","lite6_robot.arm.coordinate.000001","lite6_robot.arm.coordinate.000002","lite6_robot.arm.coordinate.000003","lite6_robot.arm.coordinate.000004","lite6_robot.arm.coordinate.000005"],"scaling_domain_id":"lite6_robot.arm.runtime_scale","state":"pending","supported":true,"topology_revision":"sha256:299f321da75dc2279ca2cebf66887ae13fb365a8a9db07d5c93d8aae6303352a","virtual_trajectory_time_s":2.533308666}],"requested_scale":1,"runtime_scale_generation":0,"state":"pending","updated_at_ns":595434145763632}})native40");
 }
 
 // Re-pin the captured factual participant through the CURRENT typed journal
@@ -6392,168 +5083,7 @@ TEST(HeadlessApiCore, NativeV8IoRuleRecordKeepsTypedProducerEnvelopeAndParticipa
 } // namespace manyforge::headless
 
 
-// EOF-only companion to the shared Headless fixture. Use the actual Core
-// journal producer and scope-digest constructors, not a version-edited payload.
-#include <manyforge_core/stop_scope_resolver.hpp>
-
 namespace manyforge::headless {
-TEST(HeadlessApiCore,
-     ActualSqliteStopV8ProviderProjectionPreservesProofAndRejectsMalformedIdentity) {
-  namespace native = manyforge::core;
-  TemporaryDirectory directory;
-  const native::RequestOwnerEpoch owner("execution-host.epoch.stop.provider");
-  const native::OperationId operation("operation.output.stop");
-  const native::ProgramRunId run("run.output");
-  const native::ControllableComponentId component("station_io");
-  const native::ResourceId output("io.output.station.lamp");
-  const native::StopId stop("stop.output");
-  const native::StopGeneration generation(2U);
-  const native::FullStopIntentDTO intent{
-      {native::RequestId("request.output.stop"), owner, "journal.fixture", std::nullopt},
-      native::StopGeneration(1U)};
-  // Logical output membership is explicit; no controller binding or physical
-  // resource is invented for this provider-only affected participant.
-  const native::StopScopeResolverSnapshotDTO snapshot{
-      owner, native::GraphRevision("graph.output"), 1U, native::StopGeneration(1U),
-      {{operation, run, native::OperationRevision(1U), native::StopGeneration(1U),
-        native::OperationStateKind::kExecuting, true, false, {component}, {output}}},
-      {{component, native::ComponentLifecycleGeneration(1U), {output}, {output}}},
-      {{output, native::StopGeneration(1U), false}}, {run}};
-  const auto resolved = native::resolve_full_stop_scope(intent, snapshot);
-  ASSERT_TRUE(resolved.ok()) << resolved.error().message;
-  EXPECT_TRUE(resolved.value().full_stop);
-  EXPECT_EQ(resolved.value().resources, std::vector<native::ResourceId>{output});
-  const auto accepted = native::MakeStopAccepted(
-      intent, stop, generation, resolved.value(),
-      {{operation, native::OperationRevision(2U)}}, 100);
-  ASSERT_TRUE(accepted.ok()) << accepted.error().message;
-  const auto normalized = native::ComputeNormalizedStopIntentDigest(intent);
-  const auto selector = native::ComputeRequestedStopSelectorDigest(intent);
-  const auto captured = native::ComputeCapturedStopScopeDigest(resolved.value());
-  ASSERT_TRUE(normalized.ok());
-  ASSERT_TRUE(selector.ok());
-  ASSERT_TRUE(captured.ok());
-  EXPECT_EQ(accepted.value().requested_selector_digest, selector.value());
-  EXPECT_EQ(accepted.value().captured_scope_digest, captured.value());
-  native::OperationParticipantStateDTO participant{
-      native::OperationParticipantId("participant.output"),
-      native::ControllerGoalId("correlation.output"), native::ControllerGoalGeneration(1U),
-      component, native::CommandTargetId("lamp"), native::CapabilityId("io.signal.write"),
-      native::ParticipantBindingIdentityDTO{
-          native::ControlDomainId("domain.output"),
-          native::ControlDomainRevision("domain.output.revision"),
-          native::CapabilityProviderBindingIdentityDTO{
-              native::CapabilityProviderBindingId("provider.output"),
-              native::CapabilityProviderBindingRevision("provider.output.revision")}},
-      native::OperationParticipantPayloadKind::kCapabilityCommand,
-      native::OperationStateKind::kStopping, 0.0, {output}, std::nullopt};
-  participant.output_evidence = native::IoOutputEvidence::kSubmitted;
-  const native::OperationStateDTO state{
-      operation, native::OperationRevision(2U), native::ProgramBindingId("binding.output"), run,
-      native::OperationCoordinationPolicy::kIndependent, native::OperationStateKind::kStopping,
-      {participant}, 100, stop, generation, std::nullopt};
-  const native::EmergencyStopAcceptanceRecordDTO record{
-      owner, intent.request_context.request_id, normalized.value(), std::nullopt,
-      intent.attribution, native::RequestReplayStatusDTO::kAcceptedNew, stop, generation, 100,
-      accepted.value().resolution_disposition, captured.value(),
-      native::EmergencyStopEntryStateDTO::kActive,
-      native::EmergencyStopAcceptancePathDTO::kFreshReserved,
-      native::EmergencyStopProjectionStateDTO::kPending};
-  native::SqliteOperationJournal journal(
-      directory.path() / "native-stop-v8.sqlite3", native::CellId(std::string(kCellId)), 8U,
-      [] { return "2026-10-18T10:00:00.000000001Z"; });
-  ASSERT_TRUE(journal.BeginOwnerEpoch(owner, 0, 8U, {output}).ok());
-  // These are typed accepted-Stop persistence facts, not a claim of physical
-  // stopping, certificate completion, provider acceptance, or a Kernel trip.
-  const auto recorded = journal.RecordStopAccepted(
-      owner, record, native::EmergencyStopProjectedIntentDTO{intent}, accepted.value(),
-      native::EmergencyStopAffectedStateSnapshotDTO{{state}, {output}});
-  ASSERT_EQ(recorded.projection_state, native::EmergencyStopProjectionStateDTO::kRecorded)
-      << (recorded.error ? recorded.error->message : "missing recorded projection");
-  ASSERT_TRUE(recorded.journal_sequence);
-  const auto replayed = journal.RecordStopAccepted(
-      owner, record, native::EmergencyStopProjectedIntentDTO{intent}, accepted.value(),
-      native::EmergencyStopAffectedStateSnapshotDTO{{state}, {output}});
-  EXPECT_EQ(replayed, recorded);
-  const auto page = journal.ReadOperationalEvents(owner, 0U);
-  ASSERT_TRUE(page.ok()) << page.error().message;
-  ASSERT_EQ(page.value().events.size(), 1U);
-  const auto& event = page.value().events.front();
-  EXPECT_EQ(event.sequence, *recorded.journal_sequence);
-  EXPECT_EQ(event.record_kind, "stop_acceptance_projected");
-  EXPECT_EQ(event.owner_epoch, owner);
-  ASSERT_TRUE(event.request_id);
-  EXPECT_EQ(*event.request_id, intent.request_context.request_id);
-  EXPECT_FALSE(event.operation_id);
-  EXPECT_FALSE(event.operation_revision);
-  EXPECT_TRUE(event.effect_pending);
-  EXPECT_EQ(event.payload_digest, content_identity::sha256_digest(event.payload_json));
-  const auto payload = content_identity::parse_canonical_json(event.payload_json);
-  EXPECT_EQ(Text(payload, "api_version"), "manyforge.stop_acceptance_projection.v8");
-  EXPECT_EQ(Text(Member(payload, "acceptance"), "normalized_request_digest"),
-            normalized.value().value());
-  EXPECT_EQ(Text(Member(payload, "accepted"), "requested_selector_digest"),
-            selector.value().value());
-  EXPECT_EQ(Text(Member(payload, "accepted"), "captured_scope_digest"),
-            captured.value().value());
-  const auto& actual = Array(Array(Member(payload, "affected_state"), "operations").front(),
-                             "participants").front();
-  EXPECT_TRUE(Member(actual, "control_binding_id").is_null());
-  EXPECT_TRUE(Member(actual, "control_binding_revision").is_null());
-  EXPECT_EQ(Text(actual, "capability_provider_binding_id"), "provider.output");
-  EXPECT_EQ(Text(actual, "output_evidence"), "submitted");
-  EXPECT_EQ(Text(actual, "command_id"), participant.command_id.value());
-  EXPECT_EQ(Unsigned(actual, "command_generation"), participant.command_generation.value());
-  EXPECT_EQ(actual.find_object_member("controller_goal_id"), nullptr);
-  EXPECT_EQ(actual.find_object_member("controller_goal_generation"), nullptr);
-
-  HeadlessApiCore core(Config(directory, "api.epoch.1"), Clocks());
-  const auto ingest = [&](const CanonicalValue& value, const std::string& digest) {
-    return core.IngestOperationEvent(
-        owner.value(), event.sequence, event.record_kind, event.request_id->value(),
-        std::nullopt, std::nullopt, event.occurred_at_ns, event.occurred_at_wall,
-        event.effect_pending, value, digest);
-  };
-  // Try invalid but correctly hashed envelopes before any valid ingestion, so
-  // refusal cannot be explained by an already-consumed sequence identity.
-  for (const auto& invalid : {
-           JournalField(payload, "api_version",
-                        CanonicalValue("manyforge.stop_acceptance_projection.v9")),
-           JournalField(payload, "acceptance", JournalField(
-               Member(payload, "acceptance"), "owner_epoch", CanonicalValue("foreign.owner"))),
-           JournalField(payload, "accepted", JournalField(
-               Member(payload, "accepted"), "stop_id", CanonicalValue("foreign.stop")))}) {
-    EXPECT_THROW(static_cast<void>(ingest(invalid, content_identity::sha256_digest(
-                        content_identity::canonical_json(invalid)))), OperatorAlarmError);
-  }
-  auto invalid_participant = JournalField(
-      actual, "capability_provider_binding_revision", CanonicalValue(nullptr));
-  const auto& affected = Member(payload, "affected_state");
-  const auto& operation_row = Array(affected, "operations").front();
-  const auto invalid_provider = JournalField(payload, "affected_state", JournalField(
-      affected, "operations", CanonicalValue(CanonicalValue::Array{JournalField(
-          operation_row, "participants", CanonicalValue(CanonicalValue::Array{invalid_participant}))})));
-  EXPECT_THROW(static_cast<void>(ingest(invalid_provider, content_identity::sha256_digest(
-                      content_identity::canonical_json(invalid_provider)))), OperatorAlarmError);
-  EXPECT_THROW(static_cast<void>(ingest(payload, Digest('0'))), OperatorAlarmError);
-  EXPECT_EQ(Text(ingest(payload, event.payload_digest), "status"), "ingested");
-  EXPECT_EQ(Text(ingest(payload, event.payload_digest), "status"), "already_ingested");
-  EXPECT_EQ(Unsigned(core.CompleteOperationEventSnapshot(owner.value(), event.sequence),
-                     "native_sequence"), event.sequence);
-  HistorianQuery query;
-  query.components.insert("manyforge.runtime");
-  query.event_types.insert("stop_acceptance_projected");
-  const auto deadline = std::chrono::steady_clock::now() + 2s;
-  while (Array(core.HistoryPage(query), "events").empty() &&
-         std::chrono::steady_clock::now() < deadline)
-    std::this_thread::yield();
-  const auto history = core.HistoryPage(query);
-  ASSERT_EQ(Array(history, "events").size(), 1U);
-  const auto& saved = Member(Member(Array(history, "events").front(), "event"), "payload");
-  EXPECT_EQ(Text(saved, "payload_digest"), event.payload_digest);
-  EXPECT_EQ(Member(saved, "journal_payload"), payload);
-}
-
 TEST(HeadlessApiCore,
      SealedLogicalOutputsJoinAlarmRegistryAndInputOnlyAddsNoResources) {
   TemporaryDirectory directory;
@@ -6632,64 +5162,5 @@ TEST(HeadlessApiCore,
             (std::set<std::string>{"operation.output-after-removal"}));
 }
 
-TEST(HeadlessApiCore,
-     ClearingOneComponentConditionCannotClearAnotherOrTheCellIncidentLatch) {
-  TemporaryDirectory directory;
-  const auto configurations = LoadRegistryConfigurations();
-  const auto &bundle = *configurations.dual;
-  ASSERT_EQ(bundle.value().cell_graph.controllable_components.size(), 2U);
-  const auto first = bundle.value()
-                         .cell_graph.controllable_components[0]
-                         .controllable_component_id.value();
-  const auto second = bundle.value()
-                          .cell_graph.controllable_components[1]
-                          .controllable_component_id.value();
-  const auto resource_for = [&](const std::string &component) {
-    for (const auto &binding : bundle.value().cell_graph.control_bindings)
-      if (binding.controllable_component_id.value() == component &&
-          !binding.resource_bindings.empty())
-        return binding.resource_bindings.front().resource_id.value();
-    throw std::logic_error("actual component has no retained resource");
-  };
-  PublishActiveConfiguration(directory, bundle, 1U);
-  HeadlessApiCore core(
-      RegistryConfig(directory, "api.epoch.incident-isolation"), Clocks());
-  const auto row = [&](const std::string &component, const char *cause) {
-    return InConfiguration(
-        ComponentConditionSnapshot(component, resource_for(component), "active",
-                                   "satisfied", cause),
-        bundle);
-  };
-  const auto observe = [&](const char *first_cause) {
-    return core.ObserveComponentLifecycleConditions(
-        "cclc.epoch.incident-isolation",
-        CanonicalValue(CanonicalValue::Array{row(first, first_cause),
-                                             row(second, "fault")}),
-        {});
-  };
-  ASSERT_EQ(Text(observe("fault"), "status"), "observed");
-  const std::string epoch = "execution-host.epoch.incident-isolation";
-  static_cast<void>(
-      core.CompleteOperationEventSnapshot(epoch, 0U, CurrentStopFaultLatch()));
-  const auto before = core.AlarmSnapshot();
-  const auto *cell = AlarmFor(before, "manyforge.motion.stop_fault");
-  ASSERT_NE(cell, nullptr);
-  const auto cell_activation = Text(*cell, "activation_id");
-  EXPECT_EQ(Text(Member(*cell, "subject"), "subject_id"), kCellId);
-
-  ASSERT_EQ(Text(observe("none"), "status"), "observed");
-  const auto after = core.AlarmSnapshot();
-  std::set<std::string> active_components;
-  for (const auto &alarm : Array(after, "alarms")) {
-    if (Text(alarm, "definition_id") == kComponentLifecycleFault &&
-        std::get<bool>(Member(alarm, "active").storage()))
-      active_components.insert(Text(Member(alarm, "subject"), "subject_id"));
-  }
-  EXPECT_EQ(active_components, (std::set<std::string>{second}));
-  cell = AlarmFor(after, "manyforge.motion.stop_fault");
-  ASSERT_NE(cell, nullptr);
-  EXPECT_EQ(Text(*cell, "activation_id"), cell_activation);
-  EXPECT_TRUE(std::get<bool>(Member(*cell, "active").storage()));
-}
 
 } // namespace manyforge::headless

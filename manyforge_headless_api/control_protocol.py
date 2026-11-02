@@ -70,7 +70,6 @@ ExecutionCommandKind = Literal[
     "operation_acknowledge_completed",
     "cell_full_stop",
     "execution_recovery",
-    "stop_recovery",
     "runtime_scale",
 ]
 ExecutionCommandDisposition = Literal[

@@ -5,6 +5,7 @@ import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorksp
 import type { ComponentCatalogState } from '../hooks/useComponentCatalog';
 import {
   componentManagerRows,
+  mountParents,
   roleFeedback,
   type ComponentManagerTab,
 } from '../utils/componentManager';
@@ -31,8 +32,7 @@ import {
 import { DeploymentBindingProjection } from './DeploymentBindingProjection';
 import { DeploymentDocumentEditor } from './DeploymentDocumentEditor';
 import { DeploymentFocusedEditor } from './DeploymentFocusedEditor';
-import { ComponentOverview } from './ComponentOverview';
-import type { RuntimeStatusView } from './runtimeStatus';
+import { ComponentOverview, type ComponentOverviewProps } from './ComponentOverview';
 import type { StructuralResourceState } from '../state/structuralResource';
 import type { SourceModelProjection } from '../types/api';
 import type { TargetStopChain } from '../utils/interruptAuthoring';
@@ -42,20 +42,7 @@ import type {
 } from '../types/robotControl';
 import type { CarriedObjectLostSignalChoice } from '../utils/systemSignalAuthoring';
 
-export interface ComponentOverviewInput {
-  request: number;
-  status: RuntimeStatusView | null;
-  backendConnected: boolean;
-  connectionLabel: string;
-  connectionDetail: string;
-  contextFacts: string[];
-  unacknowledgedAlarms: number;
-  activeAcknowledgedAlarms: number;
-  clientErrorCount: number;
-  error: string | null;
-  onReconnect: () => void;
-  onOpenRuntimeHistory: () => void;
-}
+export type ComponentOverviewInput = Omit<ComponentOverviewProps, 'mounts'>;
 
 interface DeploymentCompositionPanelProps {
   controller: DeploymentWorkspaceController;
@@ -82,6 +69,8 @@ interface DeploymentCompositionPanelProps {
   executionGroupIds?: readonly string[] | null;
   systemSignalChoices?: readonly CarriedObjectLostSignalChoice[];
   systemSignalsNeedApply?: boolean;
+  /** Outputs holding a core-held `changed outside` signal (pushed I/O samples). */
+  changedOutsideOutputs?: ReadonlySet<string>;
   /** The workbench's single observation of the advertised maintenance
    * operation; this panel observes only an inventory-selected operation. */
   maintenanceStatus: ReturnType<typeof useManagerApplyStatus>;
@@ -126,6 +115,7 @@ export function DeploymentCompositionPanel({
   executionGroupIds = null,
   systemSignalChoices = [],
   systemSignalsNeedApply = false,
+  changedOutsideOutputs,
   maintenanceStatus: advertisedStatus,
   programComponentRoles = null,
   programRoleAssignment = null,
@@ -202,6 +192,7 @@ export function DeploymentCompositionPanel({
     () => componentManagerRows(draftDocument, appliedIds, catalog?.componentProfiles),
     [appliedIds, catalog, draftDocument],
   );
+  const mounts = useMemo(() => mountParents(draftDocument), [draftDocument]);
   const feedback = useMemo(() => roleFeedback(
     programComponentRoles, programRoleAssignment, rows, catalog?.componentProfiles ?? {},
   ), [catalog, programComponentRoles, programRoleAssignment, rows]);
@@ -365,7 +356,7 @@ export function DeploymentCompositionPanel({
 
       {tab === 'overview' && (
         <div id="component-manager-overview" role="tabpanel" className="dpanel">
-          <ComponentOverview {...componentOverview} />
+          <ComponentOverview {...componentOverview} mounts={mounts} />
           <ComponentManagerSummary
             controller={deploymentController}
             rows={rows}
@@ -406,6 +397,7 @@ export function DeploymentCompositionPanel({
                 programSceneIds={programSceneIds}
                 systemSignalChoices={systemSignalChoices}
                 systemSignalsNeedApply={systemSignalsNeedApply}
+                changedOutsideOutputs={changedOutsideOutputs}
               />
               <details className="dcard">
                 <summary>Advanced compiled Deployment artifact</summary>

@@ -10,7 +10,6 @@ from __future__ import annotations
 import argparse
 import json
 import time
-import uuid
 from pathlib import Path
 
 import httpx
@@ -34,69 +33,37 @@ def main() -> None:
 
         baseline_cell_id = read(f"{args.headless}/api/manager/status")["status"]["cell_id"]
         for project in args.projects:
-            workspace = read(f"{args.composer}/api/authoring/workspace")
             admission = read(f"{args.headless}/api/cell/authoring-admission")
             if admission.get("authoring_allowed") is not True:
                 raise RuntimeError("Authoring is not admitted; no Load was issued")
-            request_id = str(uuid.uuid4())
+            # CONTRACTS §11: Load is Close, then Apply of the file; the server
+            # runs it and returns ApplyResult once the Apply is terminal.
             response = client.post(
-                f"{args.composer}/api/scenario-documents/load",
+                f"{args.composer}/api/scenario/load",
                 timeout=args.timeout,
-                json={
-                    "path": str(Path(project).resolve()),
-                    "confirmDiscard": False,
-                    "draftId": workspace["program"]["draftId"],
-                    "expectedDraftRevision": workspace["program"]["draftRevision"],
-                    "deploymentDraftId": workspace["deployment"]["draftId"],
-                    "expectedDeploymentDraftRevision": workspace["deployment"]["draftRevision"],
-                    "expectedWorkspaceEpoch": workspace["workspaceEpoch"],
-                    "expectedWorkspaceRevision": workspace["workspaceRevision"],
-                    "expectedAdmissionGeneration": admission["admission_generation"],
-                    "requestOwnerEpoch": "scenario-load-regression",
-                    "requestId": request_id,
-                },
+                json={"path": str(Path(project).resolve())},
             )
             if response.status_code != 200:
-                raise RuntimeError(f"Load {request_id}: {response.status_code} {response.text}")
-            accepted = response.json()
-            if accepted.get("status") != "accepted":
-                raise RuntimeError(f"Load did not accept activation: {accepted}")
-            selected = accepted["activation"]["prepared_activation"]
-            selected = {
-                **selected,
-                "program_binding_id": selected["program_outcome"]["program_binding_id"],
-            }
+                raise RuntimeError(f"Load {project}: {response.status_code} {response.text}")
+            result = response.json()
+            if result.get("outcome") != "succeeded":
+                raise RuntimeError(f"Load {project} failed: {result.get('error')}")
             deadline = time.monotonic() + args.timeout
             current: dict = {}
             while time.monotonic() < deadline:
                 observation = client.get(f"{args.composer}/api/scenarios/current")
                 current = observation.json()
-                if observation.status_code == 200 and current.get("ready") is True:
-                    actual = current["current_scenario"]
-                    if all(actual.get(key) == selected[key] for key in (
-                        "scenario_id", "program_revision", "program_binding_id",
-                        "retained_bundle_id", "graph_revision",
-                    )):
-                        settled = read(f"{args.headless}/api/cell/authoring-admission")
-                        if settled.get("authoring_allowed") is True:
-                            break
+                if (observation.status_code == 200 and current.get("ready") is True
+                        and current["current_scenario"].get("scenario_id") == result["scenario_id"]):
+                    break
                 # Bounded polling of a real process, never a repeated effect.
                 time.sleep(0.2)
             else:
-                manager = read(f"{args.headless}/api/manager/status")
-                apply = manager["status"]["apply"]
-                summary = {
-                    "unavailable_reason_code": apply.get("unavailable_reason_code"),
-                    "records": [{key: row.get(key) for key in (
-                        "apply_id", "phase", "terminal_state", "incomplete",
-                    )} for row in apply.get("records", [])],
-                }
-                raise RuntimeError(f"Load {request_id} never became ready: "
-                                   f"{current}; Apply={summary}")
+                raise RuntimeError(f"Load {project} never became current: {current}")
             cell_id = read(f"{args.headless}/api/manager/status")["status"]["cell_id"]
             if cell_id != baseline_cell_id:
                 raise RuntimeError("Scenario Load changed the runtime identity")
-            print(json.dumps({"request_id": request_id, "project": project,
+            print(json.dumps({"project": project,
                               "runtime_cell_id": cell_id,
                               "current_scenario": current["current_scenario"],
                               "ready": True}), flush=True)

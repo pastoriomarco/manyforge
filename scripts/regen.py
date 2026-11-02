@@ -10,10 +10,14 @@ the old value is replaced by the new one in every source and test file that
 holds a copy (docs, examples and generated outputs are left to their owners).
 ``--check`` writes nothing and exits 1 if any output or pin is stale.
 
-Steps marked "native" need the built Deployment tools. Pass ``--build-dir``
-(the directory that holds ``deployment/manyforge_deployment_revision``), the
-two tool options, or ``MANYFORGE_DEPLOYMENT_REVISION_TOOL`` and
-``MANYFORGE_PROGRAM_REVISION_TOOL``. Without them those steps are skipped and
+Steps marked "native" need built tools: the Program revision tool, and the
+maintained ModelAsset catalog tool of a ``manyforge_deployment`` build
+configured with tests (its configure prepares ``generated/<family>_structural``
+beside the tool). Pass ``--build-dir`` (the directory that holds
+``deployment/manyforge_program_revision`` and
+``deployment/manyforge_maintained_model_catalog``), ``--program-revision-tool``
+/ ``--model-catalog-tool``, or ``MANYFORGE_PROGRAM_REVISION_TOOL`` /
+``MANYFORGE_MODEL_CATALOG_TOOL``. Without a tool its step is skipped and
 reported; ``--require-native`` turns a skip into a failure.
 
 Run it in the workbench or dev image (it needs the ManyForge Python
@@ -23,8 +27,6 @@ dependencies). See docs/reference/IDENTITY_AND_PINNING.md.
 from __future__ import annotations
 
 import argparse
-import hashlib
-import json
 import os
 import re
 import shutil
@@ -47,7 +49,6 @@ CATALOG_PY = f"{BEHAVIOR}/manyforge_behavior/catalog.py"
 NODE_CATALOG = f"{BEHAVIOR}/resources/node_catalog.yaml"
 SCHEMA_ROOT = "manyforge_deployment/resources/closed_schema"
 ALARM_CATALOG = "manyforge_headless/resources/operator-alarm-catalog.v1.yaml"
-MATERIALIZATION_CPP = "manyforge_deployment/src/activation_materialization_internal.cpp"
 SOURCES_CHECKER = "manyforge_deployment/tools/check_maintained_deployment_sources.py"
 PROJECT_SNAPSHOTS = (
     (f"{BEHAVIOR}/pyproject.toml",
@@ -78,18 +79,17 @@ class Skipped(Exception):
 @dataclass
 class Context:
     update: bool
-    deployment_tool: Path | None
-    program_tool: Path | None
+    tools: dict[str, Path | None]
     pairs: dict[str, str] = field(default_factory=dict)  # every move, old hex -> new hex
     pending: dict[str, str] = field(default_factory=dict)  # moves not yet propagated
     repinned: list[str] = field(default_factory=list)  # pin copies edited by this step
     cpp_repinned: bool = False
     changed: list[str] = field(default_factory=list)
 
-    def tool(self, which: str) -> Path:
-        path = self.deployment_tool if which == "deployment" else self.program_tool
+    def tool(self, name: str) -> Path:
+        path = self.tools.get(name)
         if path is None:
-            raise Skipped(f"needs the built manyforge_{which}_revision tool")
+            raise Skipped(f"needs the built {name} tool")
         return path
 
 
@@ -121,10 +121,6 @@ def python(script: str, *args: object, check: bool | None = None, ctx: Context) 
     flag = [] if check is None else (["--check"] if check else ["--update"])
     return run(sys.executable, ROOT / script, *flag, *args,
                stale_on_failure=not ctx.update)
-
-
-def sha256_file(path: str) -> str:
-    return hashlib.sha256((ROOT / path).read_bytes()).hexdigest()
 
 
 # --- pin propagation ---------------------------------------------------------
@@ -266,32 +262,13 @@ def step_alarm_catalog(ctx: Context) -> None:
 
 
 def step_maintained_sources(ctx: Context) -> None:
-    # Byte pins of the two maintained source descriptions (C++ qualification tool).
-    text = (ROOT / MATERIALIZATION_CPP).read_text(encoding="utf-8")
-    for source in (DESCRIPTION, ASSISTANT_PROFILES):
-        name = re.escape(Path(source).name)
-        match = re.search(name + r'"\);.*?"sha256:(?:"\s*")?([0-9a-f]{64})"', text, re.S)
-        if match is None:
-            raise RuntimeError(f"cannot find the byte pin of {source}")
-        repin(ctx, match.group(1), sha256_file(source))
-    # Runtime restoration profile digests, with the checker's own formula.
-    import importlib  # noqa: PLC0415
-
-    import check_maintained_deployment_sources as checker  # noqa: PLC0415
-
-    checker = importlib.reload(checker)  # its pin table may have moved in an earlier pass
-
-    description = json.loads((ROOT / DESCRIPTION).read_text(encoding="utf-8"))
-    expected = checker._EXPECTED_RUNTIME_RESTORATION_PROFILE_DIGESTS
-    for profile in description["runtime_restoration_profiles"]:
-        old = expected.get(profile["runtime_restoration_profile_id"])
-        new = hashlib.sha256(json.dumps(profile, ensure_ascii=False, separators=(",", ":"),
-                                        sort_keys=True).encode("utf-8")).hexdigest()
-        if old is not None:
-            repin(ctx, old, new)
-    flush_pins(ctx)  # the checker below reads the moved pins
     run(sys.executable, ROOT / SOURCES_CHECKER, "--check", "--input", ROOT / DESCRIPTION,
         "--workspace-root", ROOT)
+
+
+def step_robot_defaults(ctx: Context) -> None:
+    python("manyforge_core/tools/generate_robot_defaults.py",
+           *(["--check"] if not ctx.update else []), ctx=ctx)
 
 
 def step_program_binding_transport(ctx: Context) -> None:
@@ -314,7 +291,7 @@ def step_node_environment(ctx: Context) -> None:
 
 
 def step_program_revisions(ctx: Context) -> None:
-    tool = ctx.tool("program")
+    tool = ctx.tool("manyforge_program_revision")
     for path in sorted((ROOT / "examples").glob("*.program.yaml")):
         if load_data(path.read_bytes()).get("api_version") != "manyforge.program.v2":
             continue
@@ -326,19 +303,21 @@ def step_program_revisions(ctx: Context) -> None:
             run(tool, "--update", "--input", path, stale_on_failure=False)
 
 
+def step_model_assets(ctx: Context) -> None:
+    tool = ctx.tool("manyforge_maintained_model_catalog")
+    families = load_data((ROOT / DESCRIPTION).read_bytes())["model_families"]
+    prepared = [arg for family in families for arg in (
+        "--prepared", f"{family['model_family_id']}="
+                      f"{tool.parent / 'generated' / (family['model_family_id'] + '_structural')}")]
+    run(tool, "--update" if ctx.update else "--check", "--description", ROOT / DESCRIPTION,
+        "--workspace-root", ROOT, *prepared, stale_on_failure=not ctx.update)
+
+
 def step_maintained_occurrences(ctx: Context) -> None:
-    tool = ctx.tool("deployment")
     python("manyforge_deployment/tools/generate_maintained_deployment_occurrences.py",
            "--description", ROOT / DESCRIPTION, "--assistant-profiles",
-           ROOT / ASSISTANT_PROFILES, "--workspace-root", ROOT, "--revision-tool", tool,
+           ROOT / ASSISTANT_PROFILES, "--workspace-root", ROOT,
            check=not ctx.update, ctx=ctx)
-
-
-def step_ui6i_scenario(ctx: Context) -> None:
-    deployment_tool, program_tool = ctx.tool("deployment"), ctx.tool("program")
-    python("scripts/qualification/generate_ui6i_dual_robot_scenario.py",
-           "--workspace-root", ROOT, "--deployment-revision-tool", deployment_tool,
-           "--program-revision-tool", program_tool, check=not ctx.update, ctx=ctx)
 
 
 def step_scenario_pins(ctx: Context) -> None:
@@ -405,8 +384,10 @@ STEPS = (
          (f"{SCHEMA_ROOT}/value/manyforge.value_schema.runtime.io_provider_execution.v1.yaml",
           f"{SCHEMA_ROOT}/value/manyforge.value_schema.runtime.pose_source.v2.yaml")),
     Step("alarm-catalog", step_alarm_catalog, (ALARM_CATALOG,), generated=False),
-    Step("maintained-sources", step_maintained_sources, (MATERIALIZATION_CPP, SOURCES_CHECKER),
-         generated=False),
+    Step("maintained-sources", step_maintained_sources, (), generated=False),
+    Step("robot-defaults", step_robot_defaults,
+         ("manyforge_core/include/manyforge_core/types/robot_defaults.generated.hpp",
+          "manyforge_composer/backend/robot_defaults.py")),
     Step("program-binding-transport", step_program_binding_transport,
          ("manyforge_headless_api/program_binding_transport.py",
           "manyforge_composer/frontend/src/types/programBindingTransport.generated.ts",
@@ -417,13 +398,10 @@ STEPS = (
          (f"{BEHAVIOR}/resources/node_environment_manifest.yaml",)),
     Step("program-revisions", step_program_revisions, ("examples/*.program.yaml",),
          native=True),
-    Step("maintained-occurrences", step_maintained_occurrences,
-         (f"{MAINTAINED}/catalog/*/*.json", f"{MAINTAINED}/site_overlays/*.json",
-          f"{MAINTAINED}/maintained_historical_capability_closure.v1.json",
-          "examples/*.deployment.yaml", "examples/*.scenario/*"), native=True),
-    Step("ui6i-scenario", step_ui6i_scenario,
-         ("examples/ur5e_lite6_wall*.yaml", "examples/ur5e_lite6_wall*.scenario/*"),
+    Step("model-assets", step_model_assets, (f"{MAINTAINED}/model_assets/*.json",),
          native=True),
+    Step("maintained-occurrences", step_maintained_occurrences,
+         (f"{MAINTAINED}/catalog/*/*.json", f"{MAINTAINED}/site_overlays/*.json")),
     Step("scenario-pins", step_scenario_pins, ("examples/*.scenario/scenario.yaml",)),
     Step("rest-contracts", step_rest_contracts,
          ("docs/reference/REST_API.md", "docs/reference/HEADLESS_REST_API.md",
@@ -512,9 +490,10 @@ def main() -> int:
     mode.add_argument("--update", action="store_true")
     mode.add_argument("--check", action="store_true")
     parser.add_argument("--build-dir", type=Path,
-                        help="build tree holding deployment/manyforge_*_revision")
-    parser.add_argument("--deployment-revision-tool", type=Path)
+                        help="build tree holding deployment/manyforge_program_revision "
+                             "and deployment/manyforge_maintained_model_catalog")
     parser.add_argument("--program-revision-tool", type=Path)
+    parser.add_argument("--model-catalog-tool", type=Path)
     parser.add_argument("--require-native", action="store_true",
                         help="fail instead of skipping the native steps")
     parser.add_argument("--only", help="comma-separated step names")
@@ -527,11 +506,14 @@ def main() -> int:
     selected = [s for s in STEPS if not args.only or s.name in args.only.split(",")]
     ctx = Context(
         update=args.update,
-        deployment_tool=tool_path(args.deployment_revision_tool,
-                                  "MANYFORGE_DEPLOYMENT_REVISION_TOOL", args.build_dir,
-                                  "manyforge_deployment_revision"),
-        program_tool=tool_path(args.program_revision_tool, "MANYFORGE_PROGRAM_REVISION_TOOL",
-                               args.build_dir, "manyforge_program_revision"),
+        tools={
+            "manyforge_program_revision": tool_path(
+                args.program_revision_tool, "MANYFORGE_PROGRAM_REVISION_TOOL",
+                args.build_dir, "manyforge_program_revision"),
+            "manyforge_maintained_model_catalog": tool_path(
+                args.model_catalog_tool, "MANYFORGE_MODEL_CATALOG_TOOL",
+                args.build_dir, "manyforge_maintained_model_catalog"),
+        },
     )
     bad = False
     for attempt in range(1, 4 if ctx.update else 2):

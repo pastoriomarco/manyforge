@@ -24,10 +24,8 @@ export {
   parseAuthoringWorkspaceSnapshot,
   parseScenarioDocumentIndexResponse,
   parseScenarioDocumentSaveResponse,
-  parseScenarioDocumentLoadResponse,
   parseScenarioDocumentExportResponse,
   parseDeploymentWorkspaceResponse,
-  parseDeploymentCandidateOperationResponse,
   parseCurrentScenarioResponse,
   parseAppliedProgramSelection,
   parseProgramWorkspaceTransitionResponse,
@@ -69,10 +67,6 @@ export {
   parseComponentOverviewProjection,
   parseComposerHeadlessState,
   parseObjectResponse,
-  parseCellRecoverResult,
-  parseGlobalRuleRecoveryOffers,
-  parseGlobalRuleRecoveryResult,
-  parseStopFaultRecoveryOffer,
 } from './parsers/headless';
 export {
   parseHistorianCapturePage,

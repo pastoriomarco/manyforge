@@ -2,7 +2,7 @@
 api_version: manyforge.node_catalog.v2
 content_version: 2.9.0
 catalog_id: manyforge_builtin
-catalog_digest: sha256:cb77330e3362a78d9ac74177a486a3a60a8c2e20c42105b6bac8dd7f9474791c
+catalog_digest: sha256:0078bbc926b924bbc3a2d00ba46f00fee2b4deb546b7462383a6a56ae22d9e78
 schema_types:
   tcp_selector:
     type: object
@@ -251,6 +251,41 @@ schema_types:
         exactly_one:
         - - xyzw
           - rpy_deg
+  cartesian_waypoint:
+    type: object
+    additional_properties: false
+    required:
+    - position_m
+    - orientation
+    properties:
+      frame_ref:
+        schema_ref: '#/schema_types/pose_frame_ref'
+      position_m:
+        type: array
+        items:
+          type: float
+        length: 3
+      orientation:
+        type: object
+        additional_properties: false
+        properties:
+          xyzw:
+            type: array
+            items:
+              type: float
+            length: 4
+          rpy_deg:
+            type: array
+            items:
+              type: float
+            length: 3
+        exactly_one:
+        - - xyzw
+          - rpy_deg
+      blend_radius_m:
+        type: float
+        constraints:
+          min_inclusive: 0.0
   motion_reference:
     type: object
     additional_properties: false
@@ -411,7 +446,7 @@ schema_types:
     min_items: 2
     max_items: 4096
     items:
-      schema_ref: '#/schema_types/motion_pose'
+      schema_ref: '#/schema_types/cartesian_waypoint'
   pose_offset_envelope:
     type: object
     additional_properties: false
@@ -653,6 +688,36 @@ schema_types:
               min_inclusive: 0
           value:
             type: bool
+  planner_override:
+    type: object
+    additional_properties: false
+    properties:
+      search:
+        type: enum
+        values:
+        - rrt
+        - rrt_connect
+      optimize:
+        type: enum
+        values:
+        - first
+        - rrt_star
+        - best_of_n
+      n:
+        type: int
+        constraints:
+          min_inclusive: 2
+          max_inclusive: 32
+      collision_check_step_rad:
+        type: float
+        constraints:
+          min_exclusive: 0.0
+          max_inclusive: 0.2
+      max_nodes:
+        type: int
+        constraints:
+          min_inclusive: 100
+          max_inclusive: 1000000
 entries:
 - id: sequence
   name: Sequence
@@ -922,15 +987,9 @@ entries:
       values:
       - absolute
       - relative
-  - id: planning_profile
+  - id: planner
     required: false
-    default: balanced
-    schema:
-      type: enum
-      values:
-      - first_feasible
-      - balanced
-      - quality_bounded
+    schema_ref: '#/schema_types/planner_override'
   - id: velocity_scale
     required: false
     default: 1.0
@@ -1052,24 +1111,6 @@ entries:
   - capability_id: planning.motion.joint_goal
     scope: target_binding
     target_parameter: target_role
-  - capability_id: planning.profile.first_feasible
-    scope: target_binding
-    target_parameter: target_role
-    when:
-      parameter: planning_profile
-      equals: first_feasible
-  - capability_id: planning.profile.balanced
-    scope: target_binding
-    target_parameter: target_role
-    when:
-      parameter: planning_profile
-      equals: balanced
-  - capability_id: planning.profile.quality_bounded
-    scope: target_binding
-    target_parameter: target_role
-    when:
-      parameter: planning_profile
-      equals: quality_bounded
   - capability_id: planning.trajectory.time_parameterized
     scope: target_binding
     target_parameter: target_role
@@ -1150,15 +1191,9 @@ entries:
   - id: offset_reference
     required: false
     schema_ref: '#/schema_types/motion_reference'
-  - id: planning_profile
+  - id: planner
     required: false
-    default: balanced
-    schema:
-      type: enum
-      values:
-      - first_feasible
-      - balanced
-      - quality_bounded
+    schema_ref: '#/schema_types/planner_override'
   - id: velocity_scale
     required: false
     default: 1.0
@@ -1280,24 +1315,6 @@ entries:
   - capability_id: planning.motion.pose_goal
     scope: target_binding
     target_parameter: target_role
-  - capability_id: planning.profile.first_feasible
-    scope: target_binding
-    target_parameter: target_role
-    when:
-      parameter: planning_profile
-      equals: first_feasible
-  - capability_id: planning.profile.balanced
-    scope: target_binding
-    target_parameter: target_role
-    when:
-      parameter: planning_profile
-      equals: balanced
-  - capability_id: planning.profile.quality_bounded
-    scope: target_binding
-    target_parameter: target_role
-    when:
-      parameter: planning_profile
-      equals: quality_bounded
   - capability_id: planning.trajectory.time_parameterized
     scope: target_binding
     target_parameter: target_role
@@ -1378,15 +1395,6 @@ entries:
   - id: offset_reference
     required: false
     schema_ref: '#/schema_types/motion_reference'
-  - id: planning_profile
-    required: false
-    default: balanced
-    schema:
-      type: enum
-      values:
-      - first_feasible
-      - balanced
-      - quality_bounded
   - id: max_translation_step_m
     required: false
     default: 0.005
@@ -1422,9 +1430,9 @@ entries:
       type: float
       constraints:
         min_exclusive: 0.0
-  - id: max_blend_deviation_rad
+  - id: blend_radius_m
     required: false
-    default: 0.01
+    default: 0.0
     schema:
       type: float
       constraints:
@@ -1466,6 +1474,13 @@ entries:
       constraints:
         min_inclusive: 0.0
         max_inclusive: 0.05
+  - id: cartesian_timing
+    required: false
+    schema:
+      type: enum
+      values:
+      - constant_speed
+      - time_optimal
   - id: per_joint_dynamics_limits
     required: false
     default: {}
@@ -1558,24 +1573,6 @@ entries:
   - capability_id: planning.motion.cartesian_path
     scope: target_binding
     target_parameter: target_role
-  - capability_id: planning.profile.first_feasible
-    scope: target_binding
-    target_parameter: target_role
-    when:
-      parameter: planning_profile
-      equals: first_feasible
-  - capability_id: planning.profile.balanced
-    scope: target_binding
-    target_parameter: target_role
-    when:
-      parameter: planning_profile
-      equals: balanced
-  - capability_id: planning.profile.quality_bounded
-    scope: target_binding
-    target_parameter: target_role
-    when:
-      parameter: planning_profile
-      equals: quality_bounded
   - capability_id: planning.trajectory.time_parameterized
     scope: target_binding
     target_parameter: target_role
@@ -1641,15 +1638,9 @@ entries:
   - id: goal
     required: true
     schema_ref: '#/schema_types/stored_pose'
-  - id: planning_profile
+  - id: planner
     required: false
-    default: balanced
-    schema:
-      type: enum
-      values:
-      - first_feasible
-      - balanced
-      - quality_bounded
+    schema_ref: '#/schema_types/planner_override'
   - id: max_tcp_linear_speed_mps
     required: false
     schema:
@@ -1784,24 +1775,6 @@ entries:
   - capability_id: planning.motion.pose_goal
     scope: target_binding
     target_parameter: target_role
-  - capability_id: planning.profile.first_feasible
-    scope: target_binding
-    target_parameter: target_role
-    when:
-      parameter: planning_profile
-      equals: first_feasible
-  - capability_id: planning.profile.balanced
-    scope: target_binding
-    target_parameter: target_role
-    when:
-      parameter: planning_profile
-      equals: balanced
-  - capability_id: planning.profile.quality_bounded
-    scope: target_binding
-    target_parameter: target_role
-    when:
-      parameter: planning_profile
-      equals: quality_bounded
   - capability_id: planning.trajectory.time_parameterized
     scope: target_binding
     target_parameter: target_role
@@ -1870,15 +1843,9 @@ entries:
   - id: goal
     required: true
     schema_ref: '#/schema_types/stored_pose'
-  - id: planning_profile
+  - id: planner
     required: false
-    default: balanced
-    schema:
-      type: enum
-      values:
-      - first_feasible
-      - balanced
-      - quality_bounded
+    schema_ref: '#/schema_types/planner_override'
   - id: max_tcp_linear_speed_mps
     required: false
     schema:
@@ -2013,24 +1980,6 @@ entries:
   - capability_id: planning.motion.pose_goal
     scope: target_binding
     target_parameter: target_role
-  - capability_id: planning.profile.first_feasible
-    scope: target_binding
-    target_parameter: target_role
-    when:
-      parameter: planning_profile
-      equals: first_feasible
-  - capability_id: planning.profile.balanced
-    scope: target_binding
-    target_parameter: target_role
-    when:
-      parameter: planning_profile
-      equals: balanced
-  - capability_id: planning.profile.quality_bounded
-    scope: target_binding
-    target_parameter: target_role
-    when:
-      parameter: planning_profile
-      equals: quality_bounded
   - capability_id: planning.trajectory.time_parameterized
     scope: target_binding
     target_parameter: target_role
@@ -2953,6 +2902,83 @@ entries:
       implementation_id: io_wait_for_input_v1
   observability:
     event_family: manyforge.program.node
+- id: io.clear_outside_change
+  name: Clear outside change
+  category: io
+  description: Clear the changed outside flag of one output with read-back (CO0 →
+    changed outside). Writes nothing to the device and succeeds at once.
+  stability: stable
+  tags:
+  - io
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: target_role
+    required: true
+    schema:
+      type: string
+      semantic_type: target_role
+  - id: resource_role
+    required: true
+    schema:
+      type: string
+      semantic_type: resource_role
+  required_capabilities: []
+  execution:
+    blocking: false
+    cancellable: false
+    owner_api: kernel.command_target
+  outcomes:
+    success: flag_cleared
+    failure: clear_failed
+  runners:
+    py_trees:
+      implementation_id: io_clear_outside_change_v1
+  observability:
+    event_family: manyforge.program.node
+- id: rules.set_active
+  name: Set rule active
+  category: logic
+  description: Activate or deactivate one global interrupt rule of the Deployment.
+    Succeeds at once. An inactive rule doesn't watch, trip, stop or gate; activating
+    a rule whose condition already holds trips it at once. Every rule returns to its
+    active_at_start at the end of the run and at Reset.
+  stability: stable
+  tags:
+  - logic
+  - rules
+  profiles:
+    min_program_profile: composable-cell-v1
+  kind: leaf
+  children:
+    min: 0
+    max: 0
+  parameters:
+  - id: rule_id
+    required: true
+    schema:
+      type: string
+  - id: active
+    required: true
+    schema:
+      type: bool
+  required_capabilities: []
+  execution:
+    blocking: false
+    cancellable: false
+    owner_api: kernel.rules
+  outcomes:
+    success: rule_set
+    failure: set_failed
+  runners:
+    py_trees:
+      implementation_id: rules_set_active_v1
+  observability:
+    event_family: manyforge.program.node
 - id: gripper.command_position
   name: Command gripper position
   category: gripper
@@ -2985,6 +3011,11 @@ entries:
       type: float
       constraints:
         min_inclusive: 0.0
+  - id: wait_for_duration
+    required: false
+    default: false
+    schema:
+      type: bool
   - id: required_inputs
     required: false
     default: []
@@ -4103,15 +4134,9 @@ entries:
         - 0.0
         - 0.0
     schema_ref: '#/schema_types/pick_synthesis'
-  - id: planning_profile
+  - id: planner
     required: false
-    default: first_feasible
-    schema:
-      type: enum
-      values:
-      - first_feasible
-      - balanced
-      - quality_bounded
+    schema_ref: '#/schema_types/planner_override'
   - id: motion_options
     required: false
     default: {}
@@ -4160,24 +4185,6 @@ entries:
   - capability_id: planning.motion.cartesian_path
     scope: target_binding
     target_parameter: target_role
-  - capability_id: planning.profile.first_feasible
-    scope: target_binding
-    target_parameter: target_role
-    when:
-      parameter: planning_profile
-      equals: first_feasible
-  - capability_id: planning.profile.balanced
-    scope: target_binding
-    target_parameter: target_role
-    when:
-      parameter: planning_profile
-      equals: balanced
-  - capability_id: planning.profile.quality_bounded
-    scope: target_binding
-    target_parameter: target_role
-    when:
-      parameter: planning_profile
-      equals: quality_bounded
   - capability_id: planning.trajectory.time_parameterized
     scope: target_binding
     target_parameter: target_role
@@ -4279,15 +4286,9 @@ entries:
       items:
         type: float
       length: 3
-  - id: planning_profile
+  - id: planner
     required: false
-    default: first_feasible
-    schema:
-      type: enum
-      values:
-      - first_feasible
-      - balanced
-      - quality_bounded
+    schema_ref: '#/schema_types/planner_override'
   - id: motion_options
     required: false
     default: {}
@@ -4307,24 +4308,6 @@ entries:
   - capability_id: planning.motion.cartesian_path
     scope: target_binding
     target_parameter: target_role
-  - capability_id: planning.profile.first_feasible
-    scope: target_binding
-    target_parameter: target_role
-    when:
-      parameter: planning_profile
-      equals: first_feasible
-  - capability_id: planning.profile.balanced
-    scope: target_binding
-    target_parameter: target_role
-    when:
-      parameter: planning_profile
-      equals: balanced
-  - capability_id: planning.profile.quality_bounded
-    scope: target_binding
-    target_parameter: target_role
-    when:
-      parameter: planning_profile
-      equals: quality_bounded
   - capability_id: planning.trajectory.time_parameterized
     scope: target_binding
     target_parameter: target_role

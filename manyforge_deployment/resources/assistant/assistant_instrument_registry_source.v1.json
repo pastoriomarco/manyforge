@@ -3485,6 +3485,42 @@
             ],
             "type": "object"
           },
+          "s_2435b209e707b265": {
+            "additionalProperties": false,
+            "properties": {
+              "collision_check_step_rad": {
+                "exclusiveMinimum": 0.0,
+                "maximum": 0.2,
+                "type": "number"
+              },
+              "max_nodes": {
+                "maximum": 1000000,
+                "minimum": 100,
+                "type": "integer"
+              },
+              "n": {
+                "maximum": 32,
+                "minimum": 2,
+                "type": "integer"
+              },
+              "optimize": {
+                "enum": [
+                  "first",
+                  "rrt_star",
+                  "best_of_n"
+                ],
+                "type": "string"
+              },
+              "search": {
+                "enum": [
+                  "rrt",
+                  "rrt_connect"
+                ],
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
           "s_2b1e652e296bfc38": {
             "not": {
               "$ref": "#/$defs/s_b50417c15ae8053c"
@@ -3537,6 +3573,11 @@
           "s_2cacfecb9ac0e75b": {
             "not": {
               "$ref": "#/$defs/s_b4e8de2f44d7cc3e"
+            }
+          },
+          "s_3517794994aca17a": {
+            "not": {
+              "$ref": "#/$defs/s_612c0b3cbf4e5233"
             }
           },
           "s_37246640995e786a": {
@@ -4222,6 +4263,34 @@
               }
             },
             "type": "object"
+          },
+          "s_612c0b3cbf4e5233": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "planner"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "planner"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
           },
           "s_62874ee639d2bbf4": {
             "allOf": [
@@ -5337,6 +5406,36 @@
                         }
                       ]
                     }
+                  },
+                  {
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
+                                "wait_for_duration"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "wait_for_duration"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
                   }
                 ],
                 "properties": {
@@ -5638,6 +5737,9 @@
                       "target_role": {
                         "type": "string",
                         "x-manyforge-semantic-type": "target_role"
+                      },
+                      "wait_for_duration": {
+                        "type": "boolean"
                       }
                     },
                     "type": "object"
@@ -5662,6 +5764,9 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "required_inputs": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "wait_for_duration": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       }
                     },
@@ -5977,7 +6082,67 @@
                     "$ref": "#/$defs/s_2cacfecb9ac0e75b"
                   },
                   {
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
+                                "blend_radius_m"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "blend_radius_m"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  {
                     "$ref": "#/$defs/s_a47a9cc21283b82f"
+                  },
+                  {
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
+                                "cartesian_timing"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "cartesian_timing"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
                   },
                   {
                     "$ref": "#/$defs/s_c17895f8dfef1072"
@@ -6071,36 +6236,6 @@
                             "value_sources": {
                               "required": [
                                 "max_angular_speed_rad_s"
-                              ]
-                            }
-                          },
-                          "required": [
-                            "value_sources"
-                          ]
-                        }
-                      ]
-                    }
-                  },
-                  {
-                    "not": {
-                      "allOf": [
-                        {
-                          "properties": {
-                            "parameters": {
-                              "required": [
-                                "max_blend_deviation_rad"
-                              ]
-                            }
-                          },
-                          "required": [
-                            "parameters"
-                          ]
-                        },
-                        {
-                          "properties": {
-                            "value_sources": {
-                              "required": [
-                                "max_blend_deviation_rad"
                               ]
                             }
                           },
@@ -6295,10 +6430,21 @@
                         "x-manyforge-semantic-scope-parameter": "target_role",
                         "x-manyforge-semantic-type": "frame_role"
                       },
+                      "blend_radius_m": {
+                        "minimum": 0.0,
+                        "type": "number"
+                      },
                       "cache_mode": {
                         "enum": [
                           "default",
                           "disable"
+                        ],
+                        "type": "string"
+                      },
+                      "cartesian_timing": {
+                        "enum": [
+                          "constant_speed",
+                          "time_optimal"
                         ],
                         "type": "string"
                       },
@@ -6337,10 +6483,6 @@
                         "exclusiveMinimum": 0.0,
                         "type": "number"
                       },
-                      "max_blend_deviation_rad": {
-                        "minimum": 0.0,
-                        "type": "number"
-                      },
                       "max_linear_acceleration_mps2": {
                         "exclusiveMinimum": 0.0,
                         "type": "number"
@@ -6362,7 +6504,32 @@
                       },
                       "path": {
                         "items": {
-                          "$ref": "#/$defs/s_c0927a2b2371dcad"
+                          "additionalProperties": false,
+                          "properties": {
+                            "blend_radius_m": {
+                              "minimum": 0.0,
+                              "type": "number"
+                            },
+                            "frame_ref": {
+                              "$ref": "#/$defs/s_784e720f1ce83ddf"
+                            },
+                            "orientation": {
+                              "$ref": "#/$defs/s_e2cd150d27b9cb36"
+                            },
+                            "position_m": {
+                              "items": {
+                                "type": "number"
+                              },
+                              "maxItems": 3,
+                              "minItems": 3,
+                              "type": "array"
+                            }
+                          },
+                          "required": [
+                            "position_m",
+                            "orientation"
+                          ],
+                          "type": "object"
                         },
                         "maxItems": 4096,
                         "minItems": 2,
@@ -6370,14 +6537,6 @@
                       },
                       "per_joint_dynamics_limits": {
                         "$ref": "#/$defs/s_9a0d2d7b25f2ed71"
-                      },
-                      "planning_profile": {
-                        "enum": [
-                          "first_feasible",
-                          "balanced",
-                          "quality_bounded"
-                        ],
-                        "type": "string"
                       },
                       "planning_timeout_s": {
                         "exclusiveMinimum": 0.0,
@@ -6441,7 +6600,13 @@
                       "automatic_retry_delay_s": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
+                      "blend_radius_m": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
                       "cache_mode": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "cartesian_timing": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "clearance_m": {
@@ -6463,9 +6628,6 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "max_angular_speed_rad_s": {
-                        "$ref": "#/$defs/s_239060e26cdf11f6"
-                      },
-                      "max_blend_deviation_rad": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "max_linear_acceleration_mps2": {
@@ -6558,6 +6720,9 @@
                   },
                   {
                     "$ref": "#/$defs/s_f8ca5adf63dd0336"
+                  },
+                  {
+                    "$ref": "#/$defs/s_3517794994aca17a"
                   },
                   {
                     "$ref": "#/$defs/s_ab38980932f15fa2"
@@ -6667,13 +6832,8 @@
                       "per_joint_dynamics_limits": {
                         "$ref": "#/$defs/s_9a0d2d7b25f2ed71"
                       },
-                      "planning_profile": {
-                        "enum": [
-                          "first_feasible",
-                          "balanced",
-                          "quality_bounded"
-                        ],
-                        "type": "string"
+                      "planner": {
+                        "$ref": "#/$defs/s_2435b209e707b265"
                       },
                       "planning_timeout_s": {
                         "exclusiveMinimum": 0.0,
@@ -6753,6 +6913,9 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "per_joint_dynamics_limits": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "planner": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "planning_timeout_s": {
@@ -6856,6 +7019,9 @@
                     "$ref": "#/$defs/s_f8ca5adf63dd0336"
                   },
                   {
+                    "$ref": "#/$defs/s_3517794994aca17a"
+                  },
+                  {
                     "$ref": "#/$defs/s_ab38980932f15fa2"
                   },
                   {
@@ -6950,13 +7116,8 @@
                       "per_joint_dynamics_limits": {
                         "$ref": "#/$defs/s_9a0d2d7b25f2ed71"
                       },
-                      "planning_profile": {
-                        "enum": [
-                          "first_feasible",
-                          "balanced",
-                          "quality_bounded"
-                        ],
-                        "type": "string"
+                      "planner": {
+                        "$ref": "#/$defs/s_2435b209e707b265"
                       },
                       "planning_timeout_s": {
                         "exclusiveMinimum": 0.0,
@@ -7045,6 +7206,9 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "per_joint_dynamics_limits": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "planner": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "planning_timeout_s": {
@@ -8272,6 +8436,36 @@
                     }
                   },
                   {
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
+                                "wait_for_duration"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "wait_for_duration"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  {
                     "oneOf": [
                       {
                         "properties": {
@@ -8612,6 +8806,9 @@
                       "target_role": {
                         "type": "string",
                         "x-manyforge-semantic-type": "target_role"
+                      },
+                      "wait_for_duration": {
+                        "type": "boolean"
                       }
                     },
                     "required": [
@@ -8639,6 +8836,9 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "required_inputs": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "wait_for_duration": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       }
                     },
@@ -9013,7 +9213,67 @@
                     "$ref": "#/$defs/s_2cacfecb9ac0e75b"
                   },
                   {
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
+                                "blend_radius_m"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "blend_radius_m"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  {
                     "$ref": "#/$defs/s_a47a9cc21283b82f"
+                  },
+                  {
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
+                                "cartesian_timing"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "cartesian_timing"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
                   },
                   {
                     "$ref": "#/$defs/s_c17895f8dfef1072"
@@ -9107,36 +9367,6 @@
                             "value_sources": {
                               "required": [
                                 "max_angular_speed_rad_s"
-                              ]
-                            }
-                          },
-                          "required": [
-                            "value_sources"
-                          ]
-                        }
-                      ]
-                    }
-                  },
-                  {
-                    "not": {
-                      "allOf": [
-                        {
-                          "properties": {
-                            "parameters": {
-                              "required": [
-                                "max_blend_deviation_rad"
-                              ]
-                            }
-                          },
-                          "required": [
-                            "parameters"
-                          ]
-                        },
-                        {
-                          "properties": {
-                            "value_sources": {
-                              "required": [
-                                "max_blend_deviation_rad"
                               ]
                             }
                           },
@@ -9372,10 +9602,21 @@
                         "x-manyforge-semantic-scope-parameter": "target_role",
                         "x-manyforge-semantic-type": "frame_role"
                       },
+                      "blend_radius_m": {
+                        "minimum": 0.0,
+                        "type": "number"
+                      },
                       "cache_mode": {
                         "enum": [
                           "default",
                           "disable"
+                        ],
+                        "type": "string"
+                      },
+                      "cartesian_timing": {
+                        "enum": [
+                          "constant_speed",
+                          "time_optimal"
                         ],
                         "type": "string"
                       },
@@ -9414,10 +9655,6 @@
                         "exclusiveMinimum": 0.0,
                         "type": "number"
                       },
-                      "max_blend_deviation_rad": {
-                        "minimum": 0.0,
-                        "type": "number"
-                      },
                       "max_linear_acceleration_mps2": {
                         "exclusiveMinimum": 0.0,
                         "type": "number"
@@ -9439,7 +9676,32 @@
                       },
                       "path": {
                         "items": {
-                          "$ref": "#/$defs/s_c0927a2b2371dcad"
+                          "additionalProperties": false,
+                          "properties": {
+                            "blend_radius_m": {
+                              "minimum": 0.0,
+                              "type": "number"
+                            },
+                            "frame_ref": {
+                              "$ref": "#/$defs/s_784e720f1ce83ddf"
+                            },
+                            "orientation": {
+                              "$ref": "#/$defs/s_e2cd150d27b9cb36"
+                            },
+                            "position_m": {
+                              "items": {
+                                "type": "number"
+                              },
+                              "maxItems": 3,
+                              "minItems": 3,
+                              "type": "array"
+                            }
+                          },
+                          "required": [
+                            "position_m",
+                            "orientation"
+                          ],
+                          "type": "object"
                         },
                         "maxItems": 4096,
                         "minItems": 2,
@@ -9447,14 +9709,6 @@
                       },
                       "per_joint_dynamics_limits": {
                         "$ref": "#/$defs/s_9a0d2d7b25f2ed71"
-                      },
-                      "planning_profile": {
-                        "enum": [
-                          "first_feasible",
-                          "balanced",
-                          "quality_bounded"
-                        ],
-                        "type": "string"
                       },
                       "planning_timeout_s": {
                         "exclusiveMinimum": 0.0,
@@ -9522,7 +9776,13 @@
                       "automatic_retry_delay_s": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
+                      "blend_radius_m": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
                       "cache_mode": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "cartesian_timing": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "clearance_m": {
@@ -9544,9 +9804,6 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "max_angular_speed_rad_s": {
-                        "$ref": "#/$defs/s_239060e26cdf11f6"
-                      },
-                      "max_blend_deviation_rad": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "max_linear_acceleration_mps2": {
@@ -9641,6 +9898,9 @@
                   },
                   {
                     "$ref": "#/$defs/s_f8ca5adf63dd0336"
+                  },
+                  {
+                    "$ref": "#/$defs/s_3517794994aca17a"
                   },
                   {
                     "$ref": "#/$defs/s_ab38980932f15fa2"
@@ -9763,13 +10023,8 @@
                       "per_joint_dynamics_limits": {
                         "$ref": "#/$defs/s_9a0d2d7b25f2ed71"
                       },
-                      "planning_profile": {
-                        "enum": [
-                          "first_feasible",
-                          "balanced",
-                          "quality_bounded"
-                        ],
-                        "type": "string"
+                      "planner": {
+                        "$ref": "#/$defs/s_2435b209e707b265"
                       },
                       "planning_timeout_s": {
                         "exclusiveMinimum": 0.0,
@@ -9854,6 +10109,9 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "per_joint_dynamics_limits": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "planner": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "planning_timeout_s": {
@@ -9957,6 +10215,9 @@
                   },
                   {
                     "$ref": "#/$defs/s_f8ca5adf63dd0336"
+                  },
+                  {
+                    "$ref": "#/$defs/s_3517794994aca17a"
                   },
                   {
                     "$ref": "#/$defs/s_ab38980932f15fa2"
@@ -10094,13 +10355,8 @@
                       "per_joint_dynamics_limits": {
                         "$ref": "#/$defs/s_9a0d2d7b25f2ed71"
                       },
-                      "planning_profile": {
-                        "enum": [
-                          "first_feasible",
-                          "balanced",
-                          "quality_bounded"
-                        ],
-                        "type": "string"
+                      "planner": {
+                        "$ref": "#/$defs/s_2435b209e707b265"
                       },
                       "planning_timeout_s": {
                         "exclusiveMinimum": 0.0,
@@ -10193,6 +10449,9 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "per_joint_dynamics_limits": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "planner": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "planning_timeout_s": {
@@ -11750,6 +12009,42 @@
             ],
             "type": "object"
           },
+          "s_2435b209e707b265": {
+            "additionalProperties": false,
+            "properties": {
+              "collision_check_step_rad": {
+                "exclusiveMinimum": 0.0,
+                "maximum": 0.2,
+                "type": "number"
+              },
+              "max_nodes": {
+                "maximum": 1000000,
+                "minimum": 100,
+                "type": "integer"
+              },
+              "n": {
+                "maximum": 32,
+                "minimum": 2,
+                "type": "integer"
+              },
+              "optimize": {
+                "enum": [
+                  "first",
+                  "rrt_star",
+                  "best_of_n"
+                ],
+                "type": "string"
+              },
+              "search": {
+                "enum": [
+                  "rrt",
+                  "rrt_connect"
+                ],
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
           "s_2b1e652e296bfc38": {
             "not": {
               "$ref": "#/$defs/s_b50417c15ae8053c"
@@ -11802,6 +12097,11 @@
           "s_2cacfecb9ac0e75b": {
             "not": {
               "$ref": "#/$defs/s_b4e8de2f44d7cc3e"
+            }
+          },
+          "s_3517794994aca17a": {
+            "not": {
+              "$ref": "#/$defs/s_612c0b3cbf4e5233"
             }
           },
           "s_37246640995e786a": {
@@ -12487,6 +12787,34 @@
               }
             },
             "type": "object"
+          },
+          "s_612c0b3cbf4e5233": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "planner"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "planner"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
           },
           "s_62874ee639d2bbf4": {
             "allOf": [
@@ -13816,6 +14144,36 @@
                     }
                   },
                   {
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
+                                "wait_for_duration"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "wait_for_duration"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  {
                     "oneOf": [
                       {
                         "properties": {
@@ -14156,6 +14514,9 @@
                       "target_role": {
                         "type": "string",
                         "x-manyforge-semantic-type": "target_role"
+                      },
+                      "wait_for_duration": {
+                        "type": "boolean"
                       }
                     },
                     "required": [
@@ -14183,6 +14544,9 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "required_inputs": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "wait_for_duration": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       }
                     },
@@ -14557,7 +14921,67 @@
                     "$ref": "#/$defs/s_2cacfecb9ac0e75b"
                   },
                   {
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
+                                "blend_radius_m"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "blend_radius_m"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
+                  },
+                  {
                     "$ref": "#/$defs/s_a47a9cc21283b82f"
+                  },
+                  {
+                    "not": {
+                      "allOf": [
+                        {
+                          "properties": {
+                            "parameters": {
+                              "required": [
+                                "cartesian_timing"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "parameters"
+                          ]
+                        },
+                        {
+                          "properties": {
+                            "value_sources": {
+                              "required": [
+                                "cartesian_timing"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "value_sources"
+                          ]
+                        }
+                      ]
+                    }
                   },
                   {
                     "$ref": "#/$defs/s_c17895f8dfef1072"
@@ -14651,36 +15075,6 @@
                             "value_sources": {
                               "required": [
                                 "max_angular_speed_rad_s"
-                              ]
-                            }
-                          },
-                          "required": [
-                            "value_sources"
-                          ]
-                        }
-                      ]
-                    }
-                  },
-                  {
-                    "not": {
-                      "allOf": [
-                        {
-                          "properties": {
-                            "parameters": {
-                              "required": [
-                                "max_blend_deviation_rad"
-                              ]
-                            }
-                          },
-                          "required": [
-                            "parameters"
-                          ]
-                        },
-                        {
-                          "properties": {
-                            "value_sources": {
-                              "required": [
-                                "max_blend_deviation_rad"
                               ]
                             }
                           },
@@ -14916,10 +15310,21 @@
                         "x-manyforge-semantic-scope-parameter": "target_role",
                         "x-manyforge-semantic-type": "frame_role"
                       },
+                      "blend_radius_m": {
+                        "minimum": 0.0,
+                        "type": "number"
+                      },
                       "cache_mode": {
                         "enum": [
                           "default",
                           "disable"
+                        ],
+                        "type": "string"
+                      },
+                      "cartesian_timing": {
+                        "enum": [
+                          "constant_speed",
+                          "time_optimal"
                         ],
                         "type": "string"
                       },
@@ -14958,10 +15363,6 @@
                         "exclusiveMinimum": 0.0,
                         "type": "number"
                       },
-                      "max_blend_deviation_rad": {
-                        "minimum": 0.0,
-                        "type": "number"
-                      },
                       "max_linear_acceleration_mps2": {
                         "exclusiveMinimum": 0.0,
                         "type": "number"
@@ -14983,7 +15384,32 @@
                       },
                       "path": {
                         "items": {
-                          "$ref": "#/$defs/s_c0927a2b2371dcad"
+                          "additionalProperties": false,
+                          "properties": {
+                            "blend_radius_m": {
+                              "minimum": 0.0,
+                              "type": "number"
+                            },
+                            "frame_ref": {
+                              "$ref": "#/$defs/s_784e720f1ce83ddf"
+                            },
+                            "orientation": {
+                              "$ref": "#/$defs/s_e2cd150d27b9cb36"
+                            },
+                            "position_m": {
+                              "items": {
+                                "type": "number"
+                              },
+                              "maxItems": 3,
+                              "minItems": 3,
+                              "type": "array"
+                            }
+                          },
+                          "required": [
+                            "position_m",
+                            "orientation"
+                          ],
+                          "type": "object"
                         },
                         "maxItems": 4096,
                         "minItems": 2,
@@ -14991,14 +15417,6 @@
                       },
                       "per_joint_dynamics_limits": {
                         "$ref": "#/$defs/s_9a0d2d7b25f2ed71"
-                      },
-                      "planning_profile": {
-                        "enum": [
-                          "first_feasible",
-                          "balanced",
-                          "quality_bounded"
-                        ],
-                        "type": "string"
                       },
                       "planning_timeout_s": {
                         "exclusiveMinimum": 0.0,
@@ -15066,7 +15484,13 @@
                       "automatic_retry_delay_s": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
+                      "blend_radius_m": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
                       "cache_mode": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "cartesian_timing": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "clearance_m": {
@@ -15088,9 +15512,6 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "max_angular_speed_rad_s": {
-                        "$ref": "#/$defs/s_239060e26cdf11f6"
-                      },
-                      "max_blend_deviation_rad": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "max_linear_acceleration_mps2": {
@@ -15185,6 +15606,9 @@
                   },
                   {
                     "$ref": "#/$defs/s_f8ca5adf63dd0336"
+                  },
+                  {
+                    "$ref": "#/$defs/s_3517794994aca17a"
                   },
                   {
                     "$ref": "#/$defs/s_ab38980932f15fa2"
@@ -15307,13 +15731,8 @@
                       "per_joint_dynamics_limits": {
                         "$ref": "#/$defs/s_9a0d2d7b25f2ed71"
                       },
-                      "planning_profile": {
-                        "enum": [
-                          "first_feasible",
-                          "balanced",
-                          "quality_bounded"
-                        ],
-                        "type": "string"
+                      "planner": {
+                        "$ref": "#/$defs/s_2435b209e707b265"
                       },
                       "planning_timeout_s": {
                         "exclusiveMinimum": 0.0,
@@ -15398,6 +15817,9 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "per_joint_dynamics_limits": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "planner": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "planning_timeout_s": {
@@ -15501,6 +15923,9 @@
                   },
                   {
                     "$ref": "#/$defs/s_f8ca5adf63dd0336"
+                  },
+                  {
+                    "$ref": "#/$defs/s_3517794994aca17a"
                   },
                   {
                     "$ref": "#/$defs/s_ab38980932f15fa2"
@@ -15638,13 +16063,8 @@
                       "per_joint_dynamics_limits": {
                         "$ref": "#/$defs/s_9a0d2d7b25f2ed71"
                       },
-                      "planning_profile": {
-                        "enum": [
-                          "first_feasible",
-                          "balanced",
-                          "quality_bounded"
-                        ],
-                        "type": "string"
+                      "planner": {
+                        "$ref": "#/$defs/s_2435b209e707b265"
                       },
                       "planning_timeout_s": {
                         "exclusiveMinimum": 0.0,
@@ -15737,6 +16157,9 @@
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "per_joint_dynamics_limits": {
+                        "$ref": "#/$defs/s_239060e26cdf11f6"
+                      },
+                      "planner": {
                         "$ref": "#/$defs/s_239060e26cdf11f6"
                       },
                       "planning_timeout_s": {
@@ -17294,6 +17717,42 @@
             ],
             "type": "object"
           },
+          "s_2435b209e707b265": {
+            "additionalProperties": false,
+            "properties": {
+              "collision_check_step_rad": {
+                "exclusiveMinimum": 0.0,
+                "maximum": 0.2,
+                "type": "number"
+              },
+              "max_nodes": {
+                "maximum": 1000000,
+                "minimum": 100,
+                "type": "integer"
+              },
+              "n": {
+                "maximum": 32,
+                "minimum": 2,
+                "type": "integer"
+              },
+              "optimize": {
+                "enum": [
+                  "first",
+                  "rrt_star",
+                  "best_of_n"
+                ],
+                "type": "string"
+              },
+              "search": {
+                "enum": [
+                  "rrt",
+                  "rrt_connect"
+                ],
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
           "s_2b1e652e296bfc38": {
             "not": {
               "$ref": "#/$defs/s_b50417c15ae8053c"
@@ -17346,6 +17805,11 @@
           "s_2cacfecb9ac0e75b": {
             "not": {
               "$ref": "#/$defs/s_b4e8de2f44d7cc3e"
+            }
+          },
+          "s_3517794994aca17a": {
+            "not": {
+              "$ref": "#/$defs/s_612c0b3cbf4e5233"
             }
           },
           "s_37246640995e786a": {
@@ -18031,6 +18495,34 @@
               }
             },
             "type": "object"
+          },
+          "s_612c0b3cbf4e5233": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "planner"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "planner"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
           },
           "s_62874ee639d2bbf4": {
             "allOf": [
@@ -19208,6 +19700,42 @@
             ],
             "type": "object"
           },
+          "s_2435b209e707b265": {
+            "additionalProperties": false,
+            "properties": {
+              "collision_check_step_rad": {
+                "exclusiveMinimum": 0.0,
+                "maximum": 0.2,
+                "type": "number"
+              },
+              "max_nodes": {
+                "maximum": 1000000,
+                "minimum": 100,
+                "type": "integer"
+              },
+              "n": {
+                "maximum": 32,
+                "minimum": 2,
+                "type": "integer"
+              },
+              "optimize": {
+                "enum": [
+                  "first",
+                  "rrt_star",
+                  "best_of_n"
+                ],
+                "type": "string"
+              },
+              "search": {
+                "enum": [
+                  "rrt",
+                  "rrt_connect"
+                ],
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
           "s_2b1e652e296bfc38": {
             "not": {
               "$ref": "#/$defs/s_b50417c15ae8053c"
@@ -19260,6 +19788,11 @@
           "s_2cacfecb9ac0e75b": {
             "not": {
               "$ref": "#/$defs/s_b4e8de2f44d7cc3e"
+            }
+          },
+          "s_3517794994aca17a": {
+            "not": {
+              "$ref": "#/$defs/s_612c0b3cbf4e5233"
             }
           },
           "s_37246640995e786a": {
@@ -20052,6 +20585,34 @@
             "not": {
               "$ref": "#/$defs/s_2c5fb61ff814332a"
             }
+          },
+          "s_612c0b3cbf4e5233": {
+            "allOf": [
+              {
+                "properties": {
+                  "parameters": {
+                    "required": [
+                      "planner"
+                    ]
+                  }
+                },
+                "required": [
+                  "parameters"
+                ]
+              },
+              {
+                "properties": {
+                  "value_sources": {
+                    "required": [
+                      "planner"
+                    ]
+                  }
+                },
+                "required": [
+                  "value_sources"
+                ]
+              }
+            ]
           },
           "s_62874ee639d2bbf4": {
             "allOf": [
@@ -21298,6 +21859,36 @@
                 }
               },
               {
+                "not": {
+                  "allOf": [
+                    {
+                      "properties": {
+                        "parameters": {
+                          "required": [
+                            "wait_for_duration"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "parameters"
+                      ]
+                    },
+                    {
+                      "properties": {
+                        "value_sources": {
+                          "required": [
+                            "wait_for_duration"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "value_sources"
+                      ]
+                    }
+                  ]
+                }
+              },
+              {
                 "anyOf": [
                   {
                     "required": [
@@ -21626,6 +22217,9 @@
                   "target_role": {
                     "type": "string",
                     "x-manyforge-semantic-type": "target_role"
+                  },
+                  "wait_for_duration": {
+                    "type": "boolean"
                   }
                 },
                 "type": "object"
@@ -21650,6 +22244,9 @@
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },
                   "required_inputs": {
+                    "$ref": "#/$defs/s_239060e26cdf11f6"
+                  },
+                  "wait_for_duration": {
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   }
                 },
@@ -22076,7 +22673,67 @@
                 "$ref": "#/$defs/s_2cacfecb9ac0e75b"
               },
               {
+                "not": {
+                  "allOf": [
+                    {
+                      "properties": {
+                        "parameters": {
+                          "required": [
+                            "blend_radius_m"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "parameters"
+                      ]
+                    },
+                    {
+                      "properties": {
+                        "value_sources": {
+                          "required": [
+                            "blend_radius_m"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "value_sources"
+                      ]
+                    }
+                  ]
+                }
+              },
+              {
                 "$ref": "#/$defs/s_a47a9cc21283b82f"
+              },
+              {
+                "not": {
+                  "allOf": [
+                    {
+                      "properties": {
+                        "parameters": {
+                          "required": [
+                            "cartesian_timing"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "parameters"
+                      ]
+                    },
+                    {
+                      "properties": {
+                        "value_sources": {
+                          "required": [
+                            "cartesian_timing"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "value_sources"
+                      ]
+                    }
+                  ]
+                }
               },
               {
                 "$ref": "#/$defs/s_c17895f8dfef1072"
@@ -22170,36 +22827,6 @@
                         "value_sources": {
                           "required": [
                             "max_angular_speed_rad_s"
-                          ]
-                        }
-                      },
-                      "required": [
-                        "value_sources"
-                      ]
-                    }
-                  ]
-                }
-              },
-              {
-                "not": {
-                  "allOf": [
-                    {
-                      "properties": {
-                        "parameters": {
-                          "required": [
-                            "max_blend_deviation_rad"
-                          ]
-                        }
-                      },
-                      "required": [
-                        "parameters"
-                      ]
-                    },
-                    {
-                      "properties": {
-                        "value_sources": {
-                          "required": [
-                            "max_blend_deviation_rad"
                           ]
                         }
                       },
@@ -22423,10 +23050,21 @@
                     "x-manyforge-semantic-scope-parameter": "target_role",
                     "x-manyforge-semantic-type": "frame_role"
                   },
+                  "blend_radius_m": {
+                    "minimum": 0.0,
+                    "type": "number"
+                  },
                   "cache_mode": {
                     "enum": [
                       "default",
                       "disable"
+                    ],
+                    "type": "string"
+                  },
+                  "cartesian_timing": {
+                    "enum": [
+                      "constant_speed",
+                      "time_optimal"
                     ],
                     "type": "string"
                   },
@@ -22465,10 +23103,6 @@
                     "exclusiveMinimum": 0.0,
                     "type": "number"
                   },
-                  "max_blend_deviation_rad": {
-                    "minimum": 0.0,
-                    "type": "number"
-                  },
                   "max_linear_acceleration_mps2": {
                     "exclusiveMinimum": 0.0,
                     "type": "number"
@@ -22490,7 +23124,32 @@
                   },
                   "path": {
                     "items": {
-                      "$ref": "#/$defs/s_c0927a2b2371dcad"
+                      "additionalProperties": false,
+                      "properties": {
+                        "blend_radius_m": {
+                          "minimum": 0.0,
+                          "type": "number"
+                        },
+                        "frame_ref": {
+                          "$ref": "#/$defs/s_784e720f1ce83ddf"
+                        },
+                        "orientation": {
+                          "$ref": "#/$defs/s_e2cd150d27b9cb36"
+                        },
+                        "position_m": {
+                          "items": {
+                            "type": "number"
+                          },
+                          "maxItems": 3,
+                          "minItems": 3,
+                          "type": "array"
+                        }
+                      },
+                      "required": [
+                        "position_m",
+                        "orientation"
+                      ],
+                      "type": "object"
                     },
                     "maxItems": 4096,
                     "minItems": 2,
@@ -22498,14 +23157,6 @@
                   },
                   "per_joint_dynamics_limits": {
                     "$ref": "#/$defs/s_9a0d2d7b25f2ed71"
-                  },
-                  "planning_profile": {
-                    "enum": [
-                      "first_feasible",
-                      "balanced",
-                      "quality_bounded"
-                    ],
-                    "type": "string"
                   },
                   "planning_timeout_s": {
                     "exclusiveMinimum": 0.0,
@@ -22569,7 +23220,13 @@
                   "automatic_retry_delay_s": {
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },
+                  "blend_radius_m": {
+                    "$ref": "#/$defs/s_239060e26cdf11f6"
+                  },
                   "cache_mode": {
+                    "$ref": "#/$defs/s_239060e26cdf11f6"
+                  },
+                  "cartesian_timing": {
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },
                   "clearance_m": {
@@ -22591,9 +23248,6 @@
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },
                   "max_angular_speed_rad_s": {
-                    "$ref": "#/$defs/s_239060e26cdf11f6"
-                  },
-                  "max_blend_deviation_rad": {
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },
                   "max_linear_acceleration_mps2": {
@@ -22686,6 +23340,9 @@
               },
               {
                 "$ref": "#/$defs/s_f8ca5adf63dd0336"
+              },
+              {
+                "$ref": "#/$defs/s_3517794994aca17a"
               },
               {
                 "$ref": "#/$defs/s_ab38980932f15fa2"
@@ -22824,13 +23481,8 @@
                   "per_joint_dynamics_limits": {
                     "$ref": "#/$defs/s_9a0d2d7b25f2ed71"
                   },
-                  "planning_profile": {
-                    "enum": [
-                      "first_feasible",
-                      "balanced",
-                      "quality_bounded"
-                    ],
-                    "type": "string"
+                  "planner": {
+                    "$ref": "#/$defs/s_2435b209e707b265"
                   },
                   "planning_timeout_s": {
                     "exclusiveMinimum": 0.0,
@@ -22910,6 +23562,9 @@
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },
                   "per_joint_dynamics_limits": {
+                    "$ref": "#/$defs/s_239060e26cdf11f6"
+                  },
+                  "planner": {
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },
                   "planning_timeout_s": {
@@ -23011,6 +23666,9 @@
               },
               {
                 "$ref": "#/$defs/s_f8ca5adf63dd0336"
+              },
+              {
+                "$ref": "#/$defs/s_3517794994aca17a"
               },
               {
                 "$ref": "#/$defs/s_ab38980932f15fa2"
@@ -23136,13 +23794,8 @@
                   "per_joint_dynamics_limits": {
                     "$ref": "#/$defs/s_9a0d2d7b25f2ed71"
                   },
-                  "planning_profile": {
-                    "enum": [
-                      "first_feasible",
-                      "balanced",
-                      "quality_bounded"
-                    ],
-                    "type": "string"
+                  "planner": {
+                    "$ref": "#/$defs/s_2435b209e707b265"
                   },
                   "planning_timeout_s": {
                     "exclusiveMinimum": 0.0,
@@ -23231,6 +23884,9 @@
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },
                   "per_joint_dynamics_limits": {
+                    "$ref": "#/$defs/s_239060e26cdf11f6"
+                  },
+                  "planner": {
                     "$ref": "#/$defs/s_239060e26cdf11f6"
                   },
                   "planning_timeout_s": {

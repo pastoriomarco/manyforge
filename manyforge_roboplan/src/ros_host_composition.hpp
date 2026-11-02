@@ -4,6 +4,7 @@
 #include "mock_io_input_result.hpp"
 
 #include "execution_host_config.hpp"
+#include "host_component_runtime.hpp"
 #include <manyforge_roboplan/program_reset_position.hpp>
 #include <stop_token>
 #include "execution_host_scene_bridge.hpp"
@@ -14,31 +15,33 @@
 #include <manyforge_core/ports/iio_signal_service.hpp>
 #include <manyforge_core/types/io_activation_rule.hpp>
 #include <manyforge_collision/manyforge_collision_engine.hpp>
+#include <manyforge_deployment/component_spec.hpp>
 #include <manyforge_deployment/program_contract.hpp>
 #include <manyforge_deployment/prepared_activation_input.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <manyforge_roboplan/process_contained_candidate_client.hpp>
-#include <manyforge_roboplan/retained_native_runtime.hpp>
-#include <manyforge_roboplan/retained_native_cell_runtime.hpp>
-#include <manyforge_roboplan/retained_native_component_owner.hpp>
-#include <manyforge_roboplan/retained_native_gripper_runtime.hpp>
-#include <manyforge_roboplan/retained_native_cclc_runtime.hpp>
-#include <manyforge_roboplan/retained_native_cell_command_readiness_port.hpp>
+#include <manyforge_roboplan/retained_execution_host.hpp>
+#include <manyforge_roboplan/retained_cell_runtime.hpp>
+#include <manyforge_roboplan/retained_component_owner.hpp>
+#include <manyforge_roboplan/retained_gripper_runtime.hpp>
+#include <manyforge_roboplan/retained_gripper_route_publication_owner.hpp>
 #include <manyforge_roboplan/retained_planner_scene_projection.hpp>
 #include <manyforge_roboplan/retained_planning_model_stage.hpp>
 #include <manyforge_roboplan/retained_scene_frame_resolver.hpp>
 #include <manyforge_roboplan/controller_launch_process.hpp>
 #include <manyforge_roboplan/retained_ros2_control_runtime_handle.hpp>
-#include <manyforge_roboplan/retained_ros2_control_lifecycle_product.hpp>
 #include <manyforge_ros2_control_execution/ros2_transport_resources.hpp>
 #include <atomic>
 #include <functional>
 #include <memory>
 #include <optional>
 #include <shared_mutex>
+#include <thread>
 #include <vector>
 
 namespace manyforge::ros2_control_execution { class VolatileMotionTrace; }
+
+namespace manyforge::roboplan_backend { struct ComponentAdapterFamily; }
 
 namespace manyforge::roboplan_backend::host_detail {
 
@@ -80,8 +83,6 @@ struct ExecutionProduct {
   core::ProjectionRevisionDTO projection_revision;
   core::ActiveBundlePublicationGeneration publication_generation;
   std::optional<core::NamedApplyPublicationTransactionDTO> origin_named_apply{};
-  std::atomic_bool cclc_attached{false};
-  std::atomic_bool route_recovery_pending{false};
 
   ExecutionProduct(std::shared_ptr<const deployment::RetainedBundle> selected_bundle,
       std::shared_ptr<const deployment::ProgramBindingContract> selected_program,
@@ -101,11 +102,9 @@ struct Composition final : ExecutionProduct {
   // CP9: the host's one component-stream sample bridge (Python sinks), pinned
   // by every composition hosting a pose source; on `io_transport`'s node.
   std::shared_ptr<void> component_stream_sample_bridge{};
-  // The actual canonical leaves/engines, shared across retained Apply. Metadata
-  // lives in each leaf; this is only its existing composition lifetime pin.
+  // The actual output leaves, shared across retained Apply. Metadata lives in
+  // each leaf; this is only its existing composition lifetime pin.
   std::vector<std::shared_ptr<HostIoOutputChannelEntry>> io_output_channels{};
-  // Initial construction facts. Current CCLC re-seals remain owned by the cell.
-  std::vector<core::RuntimeParticipantExecutionRegistration> io_output_registrations{};
   // Completion of actual resource construction only, never lifecycle/readiness.
   // A partial failure remains pinned and cannot become an inert successful replay.
   std::optional<CompositionIoResourcePreparation> io_resource_preparation{};
@@ -123,8 +122,8 @@ struct Composition final : ExecutionProduct {
   // capability, resources). Route publication later rebinds the runtime's
   // control path (route, activation set, active configuration generation)
   // without updating these copies: read route-specific facts from the
-  // runtime's current binding (RetainedNativeRuntime::CurrentPhysicalBindings,
-  // RetainedNativeGripperRuntime::binding), never from here.
+  // runtime's current binding (RetainedExecutionHost::CurrentPhysicalBindings,
+  // RetainedGripperRuntime::binding), never from here.
   std::optional<core::RuntimeParticipantBinding> direct_control_motion_binding;
   std::optional<core::RuntimeParticipantBinding>
       direct_control_gripper_binding;
@@ -147,11 +146,17 @@ struct Composition final : ExecutionProduct {
       candidate_model_generation;
   std::shared_ptr<RetainedKinematicStateProjector>
       candidate_tool_state_projector;
-  std::shared_ptr<RetainedNativeRuntime> runtime;
+  // A retained motion controller's candidate planner settings (cell
+  // context), installed under the Apply fence with the model.
+  std::optional<deployment::PlannerSettings> candidate_planner_settings;
+  std::shared_ptr<RetainedExecutionHost> runtime;
   // Managed native cells keep this owner independently of any motion engine.
   // A component view may instead hold an independently managed gripper.
-  RetainedNativeCellRuntime *cell_runtime{};
-  std::shared_ptr<RetainedNativeGripperRuntime> gripper_runtime;
+  RetainedCellRuntime *cell_runtime{};
+  std::shared_ptr<RetainedGripperRuntime> gripper_runtime;
+  // On the root composition of a cell without an arm runtime: the route
+  // publication owner over the cell's grippers (`open_routes`, CONTRACTS §6).
+  std::shared_ptr<RetainedGripperRoutePublicationOwner> gripper_route_owner;
   // Candidate metadata for an owner retained from the predecessor. The
   // runtime's registrations are re-sealed only at fenced installation.
   std::vector<core::RuntimeParticipantBinding>
@@ -189,11 +194,11 @@ struct Composition final : ExecutionProduct {
   std::unique_ptr<core::AddressedPickPlacePlanningOwner>
       pick_place_planning_owner;
   std::unique_ptr<component_manager::SqliteActiveBundlePublicationStore>
-      cclc_active_publication_reader;
+      active_publication_reader;
   std::unique_ptr<deployment::FilesystemVerifiedRetainedProductArtifactSource>
-      cclc_artifact_source;
+      artifact_source;
   std::shared_ptr<deployment::FilesystemVerifiedRetainedProviderManifestSource>
-      cclc_provider_manifest_source;
+      provider_manifest_source;
   std::shared_ptr<RetainedRos2ControlRuntimeHandle> ros2_control_runtime_handle;
   // Prepared with the candidate; published only when this composition is selected.
   HostRobotTcpReader staged_robot_tcp_reader;
@@ -205,16 +210,22 @@ struct Composition final : ExecutionProduct {
   std::string controller_request_context;
   std::optional<ControllerLaunchSupervisor::Ensured> prepared_controller_launch;
   bool controller_launch_adopted{};
-  std::shared_ptr<RetainedHostLifecycleProduct> cclc_lifecycle_product;
-  // These external CCLC dependencies are declared before the composition so
-  // reverse member destruction retires CCLC first, then readiness/route owner,
-  // while the runtime and stable cell Kernel remain alive.
-  std::shared_ptr<deployment::IRouteConfigurationKernelPublicationOwner>
-      cclc_cell_route_publication_owner;
-  std::shared_ptr<RetainedNativeCellCommandReadinessPort>
-      cclc_cell_command_readiness_port;
-  std::unique_ptr<deployment::CCLCRuntimeComposition> cclc_runtime;
-  std::function<core::Result<void>()> cclc_cell_route_reconciler;
+  /// CONTRACTS §6: this component's adapter, coordinated by the host's one
+  /// component runtime (made from the adapter registry, or the generic I/O
+  /// driver for an I/O provider component).
+  std::shared_ptr<core::IComponentAdapter> component_adapter;
+  /// CONTRACTS §16: this component's owner (machine) and member role, when
+  /// it is a member; absent otherwise.
+  std::optional<std::string> owner_id;
+  std::optional<std::string> member_role;
+  /// CONTRACTS §16, BOUNDARY §4: on an arm member's composition (the
+  /// machine's process runs here), its owner component, built before the arm;
+  /// with a lane row, also the owner's family and the handle its members get.
+  /// With the arm deactivated the owner is a view of its own and these name
+  /// that view (it then runs the machine's process).
+  std::optional<core::CoordinatedComponent> owner_component;
+  std::shared_ptr<void> owner_handle;
+  const ComponentAdapterFamily *owner_family{};
   std::vector<std::unique_ptr<Composition>> participant_compositions;
 
   ~Composition();
@@ -252,12 +263,18 @@ struct Composition final : ExecutionProduct {
       CanonicalValue selected_direct_control_motion_descriptor,
       CanonicalValue selected_direct_control_gripper_descriptor,
       std::shared_ptr<const RetainedPlanningModelStage> selected_stage,
-      std::shared_ptr<RetainedNativeRuntime> selected_runtime,
+      std::shared_ptr<RetainedExecutionHost> selected_runtime,
       core::ProjectionRevisionDTO selected_projection,
       core::ActiveBundlePublicationGeneration selected_generation,
       std::optional<core::TargetRoleId> selected_status_motion_target_role_id,
       std::optional<core::TargetRoleId> selected_status_gripper_target_role_id);
 };
+
+/// CONTRACTS §16: the machine owners that ride on a member's view (an armed
+/// machine's owner is built on its arm's composition, with no view of its
+/// own), sorted. A retained member keeps its carried owner.
+[[nodiscard]] std::vector<core::ControllableComponentId>
+MemberCarriedOwnerIds(const Composition &cell);
 
 [[nodiscard]] core::Result<MockIoInputSetResult> SetCompositionMockInput(
     Composition &composition, const core::IoSignalId &signal,
@@ -280,6 +297,10 @@ struct ExecutionCompositionAccess final {
   std::atomic<core::ResourceAddressedExecutionKernel *> addressed_kernel{};
   // Installed with the stable Kernel and retained independently of products.
   std::atomic<core::SqliteOperationJournal *> operation_journal{};
+  // CONTRACTS §1-§6: the cell's component runtime, installed once with the
+  // stable Kernel and kept across Apply. The Stop lane and the host tick read
+  // it without the composition lock.
+  std::shared_ptr<HostComponentRuntime> component_runtime{};
 
   std::function<core::Result<ProgramResetPositionCapability>(Composition&)>
       reset_robot_position_capability;
@@ -295,9 +316,24 @@ struct ExecutionCompositionAccess final {
   // call leases before their actual owners begin destruction.
   void detach_addressed_owner();
 
-  void replace_current(Composition *replacement);
-  void replace_logical_product(std::shared_ptr<ExecutionProduct> replacement);
+  // Both run under the exclusive `mutex` and return the removed components'
+  // interrupted action threads (HostComponentRuntime::SetComponents): the
+  // caller destroys them only after releasing `mutex`, which those actions
+  // take (route opening inside `enable`, a driver restart).
+  [[nodiscard]] std::vector<std::jthread> replace_current(Composition *replacement);
+  [[nodiscard]] std::vector<std::jthread> replace_logical_product(
+      std::shared_ptr<ExecutionProduct> replacement);
 };
+/// Every component of `cell` with its adapter, in cell order: each view's
+/// owner (on an arm member's view), its component adapter, then the I/O
+/// provider components of its driver group; members carry owner and role.
+/// Owners come before their members (the arm builds the owner; I/O member
+/// views follow the robot views). The owner of a machine with its arm
+/// deactivated is a view of its own (`owner_component` names the view
+/// itself): it is listed once, as the owner.
+[[nodiscard]] std::vector<core::CoordinatedComponent> CoordinatedComponentsOf(
+    const Composition *cell);
+
 // Callback setup only. No source/readiness/command authority is created.
 void BindHostIoRuleEvidenceProcessor(
     ExecutionProduct &product,

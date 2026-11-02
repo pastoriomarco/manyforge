@@ -14,13 +14,13 @@ inline constexpr std::size_t kMaximumNativeProjectionRpcPacketBytes =
     256U * 1024U;
 
 struct NativeProjectionPrepareRequest final {
-  manyforge::core::ProjectionNativeRuntimeBindingDTO native_runtime_binding;
+  manyforge::core::ProjectionExecutionHostBindingDTO execution_host_binding;
   manyforge::core::RetainedBundleId candidate_retained_bundle_id;
   manyforge::core::GraphRevision candidate_graph_revision;
   manyforge::core::RetainedProductDTO planning_collision_model;
 
   [[nodiscard]] bool valid() const noexcept {
-    return native_runtime_binding.valid() &&
+    return execution_host_binding.valid() &&
            !candidate_retained_bundle_id.empty() &&
            !candidate_graph_revision.empty() &&
            planning_collision_model.product_kind ==
@@ -36,17 +36,17 @@ struct NativeProjectionPrepareResult final {
 };
 
 struct NativeProjectionHealthQuery final {
-  manyforge::core::ProjectionNativeRuntimeBindingDTO native_runtime_binding;
+  manyforge::core::ProjectionExecutionHostBindingDTO execution_host_binding;
   std::optional<manyforge::core::ProjectionRevisionDTO>
       selected_projection_revision{};
 };
 
 struct NativeProjectionTransactionRequest final {
-  manyforge::core::ProjectionNativeRuntimeBindingDTO native_runtime_binding;
+  manyforge::core::ProjectionExecutionHostBindingDTO execution_host_binding;
   manyforge::core::SceneTransactionDTO transaction;
 
   [[nodiscard]] bool valid() const noexcept {
-    return native_runtime_binding.valid() && !transaction.request_id.empty() &&
+    return execution_host_binding.valid() && !transaction.request_id.empty() &&
            transaction.transaction_sequence != 0U &&
            transaction.attribution.locally_valid() &&
            transaction.prior_projection_revision.valid() &&
@@ -56,41 +56,41 @@ struct NativeProjectionTransactionRequest final {
 };
 
 struct NativeProjectionRetainRequest final {
-  manyforge::core::ProjectionNativeRuntimeBindingDTO native_runtime_binding;
+  manyforge::core::ProjectionExecutionHostBindingDTO execution_host_binding;
   manyforge::core::ProjectionRevisionDTO projection_revision;
   manyforge::core::ProjectionLeaseId projection_lease_id;
 
   [[nodiscard]] bool valid() const noexcept {
-    return native_runtime_binding.valid() && projection_revision.valid() &&
+    return execution_host_binding.valid() && projection_revision.valid() &&
            !projection_lease_id.empty();
   }
 };
 
 struct NativeProjectionReleaseRequest final {
-  manyforge::core::ProjectionNativeRuntimeBindingDTO native_runtime_binding;
+  manyforge::core::ProjectionExecutionHostBindingDTO execution_host_binding;
   manyforge::core::ProjectionLeaseId projection_lease_id;
 
   [[nodiscard]] bool valid() const noexcept {
-    return native_runtime_binding.valid() && !projection_lease_id.empty();
+    return execution_host_binding.valid() && !projection_lease_id.empty();
   }
 };
 
 struct NativeProjectionSceneFrameRequest final {
-  manyforge::core::ProjectionNativeRuntimeBindingDTO native_runtime_binding;
+  manyforge::core::ProjectionExecutionHostBindingDTO execution_host_binding;
   manyforge::core::SceneFrameResolutionQueryDTO query;
 
   [[nodiscard]] bool valid() const noexcept {
-    return native_runtime_binding.valid() && query.valid();
+    return execution_host_binding.valid() && query.valid();
   }
 };
 
 struct NativeProjectionEffectivePolicyRequest final {
-  manyforge::core::ProjectionNativeRuntimeBindingDTO native_runtime_binding;
+  manyforge::core::ProjectionExecutionHostBindingDTO execution_host_binding;
   manyforge::core::LogicalSceneSnapshotDTO logical_scene;
   std::uint64_t effective_policy_revision_id{};
 
   [[nodiscard]] bool valid() const noexcept {
-    return native_runtime_binding.valid() && logical_scene.locally_valid() &&
+    return execution_host_binding.valid() && logical_scene.locally_valid() &&
            effective_policy_revision_id != 0U;
   }
 };

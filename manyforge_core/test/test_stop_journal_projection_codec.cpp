@@ -284,8 +284,6 @@ inline constexpr char kDigestC[] =
       std::move(entries),
       std::move(attempts),
       std::nullopt,
-      std::nullopt,
-      std::nullopt,
       30,
       std::nullopt};
 }
@@ -329,17 +327,11 @@ inline constexpr char kDigestC[] =
                                                       std::nullopt, std::nullopt},
                        StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kPending,
                                                       std::nullopt, std::nullopt},
-                       StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kNotApplicable,
-                                                      std::nullopt, std::nullopt},
-                       reference,
-                       std::nullopt,
-                       std::nullopt};
-  const auto terminal_error =
-      stop_terminal_projection_field_error(status, certificate.value(), std::nullopt);
+                       reference};
+  const auto terminal_error = stop_terminal_projection_field_error(status, certificate.value());
   EXPECT_FALSE(terminal_error.has_value())
       << (terminal_error.has_value() ? std::string(*terminal_error) : std::string{});
-  return StopJournalTerminalProjectionDTO{std::move(status), std::move(certificate.value()),
-                                          std::nullopt};
+  return StopJournalTerminalProjectionDTO{std::move(status), std::move(certificate.value())};
 }
 
 [[nodiscard]] StopJournalTerminalProjectionDTO TerminalProjection(
@@ -413,66 +405,12 @@ inline constexpr char kDigestC[] =
       {},
       {},
       std::nullopt,
-      std::nullopt,
-      std::nullopt,
       40,
       std::nullopt};
   auto projection = ProjectionFor(input, {joined});
   EXPECT_EQ(projection.certificate.predecessor_certificates.size(), 1U);
   EXPECT_EQ(projection.certificate.attempted_stage_results, predecessor.attempted_stage_results);
   return projection;
-}
-
-[[nodiscard]] StopFaultLatchDTO ClearedLatch(const StopCertificateDTO& certificate) {
-  return StopFaultLatchDTO{
-      CellId("cell.1"),
-      certificate.stop_id,
-      certificate.stop_generation,
-      StopCertificateRefDTO{certificate.stop_certificate_id, certificate.stop_certificate_revision,
-                            certificate.stop_id, certificate.stop_generation},
-      StopFaultLatchId("stop-fault-latch.1"),
-      StopFaultLatchGeneration(1U),
-      StopFaultTriggerDTO::kScopePromotion,
-      false,
-      {OperationId("operation.1")},
-      {ResourceId("joint.1"), ResourceId("joint.2")},
-      RetainedBundleId("retained-bundle.1"),
-      GraphRevision(kDigestA),
-      StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kRecorded, std::nullopt,
-                                     std::nullopt},
-      StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kRecorded, std::nullopt,
-                                     std::nullopt},
-      StopFaultLatchStateDTO::kCleared,
-      3U,
-      StopFaultRecoveryStatusDTO::kCleared,
-      "stop_fault_recovery_cleared",
-      {StopFaultRecoveryEvidenceRefDTO{StopFaultRecoveryEvidenceKindDTO::kSettlement,
-                                       ContentDigest(kDigestB)}},
-      {StopFaultTriggerDTO::kScopePromotion}};
-}
-
-[[nodiscard]] StopJournalFaultClearProjectionDTO FaultClearProjection() {
-  const auto terminal = TerminalProjection();
-  const auto cleared_latch = ClearedLatch(terminal.certificate);
-  const StopFaultRecoveryIntentDTO intent{
-      PublicRequestContextDTO{RequestId("recovery.1"), RequestOwnerEpoch("owner.1"), "test",
-                              std::nullopt},
-      cleared_latch.latch_id,
-      cleared_latch.latch_generation,
-      2U,
-      terminal.certificate.stop_certificate_id,
-      terminal.certificate.stop_certificate_revision,
-      cleared_latch.cell_id,
-      cleared_latch.retained_bundle_id,
-      cleared_latch.graph_revision,
-      {StopFaultRecoveryConfigurationExpectationDTO{ControlDomainId("domain.1"),
-                                                    ActiveControlConfigurationId("configuration.1"),
-                                                    ActiveControlConfigurationGeneration(1U)}},
-      std::string("operator verified cell")};
-  const StopFaultRecoveryResultDTO result{intent.request_context.request_id,
-                                          RequestReplayStatusDTO::kAcceptedNew, true, cleared_latch,
-                                          std::nullopt};
-  return StopJournalFaultClearProjectionDTO{intent, result};
 }
 
 using V = content_identity::CanonicalValue;
@@ -560,10 +498,10 @@ TEST(StopJournalProjectionCodecTest, RoundTripsEveryEmbeddedTerminalStageFieldCa
             StopDurableProjectionStateDTO::kPending);
   ExpectExactRoundTrip(projection);
   const auto root = Root(EncodeStopJournalTerminalProjection(projection).value());
-  ASSERT_EQ(root.size(), 5U);
-  EXPECT_EQ(root[1].as_array().size(), 6U);
-  EXPECT_EQ(root[2].as_array().size(), 23U);
-  EXPECT_EQ(root[4].as_array().size(), 1U);
+  ASSERT_EQ(root.size(), 4U);
+  EXPECT_EQ(root[1].as_array().size(), 4U);
+  EXPECT_EQ(root[2].as_array().size(), 21U);
+  EXPECT_EQ(root[3].as_array().size(), 1U);
 }
 
 TEST(StopJournalProjectionCodecTest, RetainsExplicitOffAndOnJerkProfilesExactly) {
@@ -646,8 +584,8 @@ TEST(StopJournalProjectionCodecTest, TwoParticipantEscalatedStopStoresEachPlanOn
 
   const auto encoded = EncodeStopJournalTerminalProjection(projection).value();
   const auto root = Root(encoded);
-  ASSERT_EQ(root.size(), 5U);
-  const auto& plans = root[4].as_array();
+  ASSERT_EQ(root.size(), 4U);
+  const auto& plans = root[3].as_array();
   ASSERT_EQ(plans.size(), 2U);
   EXPECT_LT(plans[0].as_array()[0].as_string(), plans[1].as_array()[0].as_string());
   for (const auto& plan : plans) {
@@ -655,22 +593,12 @@ TEST(StopJournalProjectionCodecTest, TwoParticipantEscalatedStopStoresEachPlanOn
   }
   // Each lean attempt names its plan by digest (resolved stage slot 26).
   const auto& certificate = root[2].as_array();
-  ASSERT_EQ(certificate.size(), 23U);
+  ASSERT_EQ(certificate.size(), 21U);
   for (const auto& attempt : certificate[11].as_array()) {
     const auto& request = attempt.as_array()[4].as_array()[0].as_array();
     ASSERT_EQ(request.size(), 29U);
     EXPECT_TRUE(request[26].is_string());
   }
-}
-
-TEST(StopJournalProjectionCodecTest, TerminalWithFaultLatchRebuildsTheStatusLatch) {
-  auto projection = TerminalProjection();
-  const auto latch = ClearedLatch(projection.certificate);
-  projection.stop_status.terminal_projection = StopDurableProjectionStatusDTO{
-      StopDurableProjectionStateDTO::kRecorded, std::nullopt, std::nullopt};
-  projection.stop_status.fault_latch = latch;
-  projection.fault_latch = latch;
-  ExpectExactRoundTrip(projection);
 }
 
 TEST(StopJournalProjectionCodecTest, PredecessorMergeCertificateRoundTripsExactly) {
@@ -698,9 +626,9 @@ TEST(StopJournalProjectionCodecTest, DecodeRefusesAMissingOrAnUnreferencedPlan) 
       EncodeStopJournalTerminalProjection(TwoParticipantEscalatedProjection()).value();
   {
     auto root = Root(encoded);
-    auto plans = root[4].as_array();
+    auto plans = root[3].as_array();
     plans.pop_back();
-    root[4] = V(std::move(plans));
+    root[3] = V(std::move(plans));
     const auto decoded = DecodeStopJournalTerminalProjection(Bytes(std::move(root)));
     ASSERT_FALSE(decoded.ok());
     EXPECT_NE(Reason(decoded.error()).find("absent participant plan"), std::string::npos)
@@ -708,11 +636,11 @@ TEST(StopJournalProjectionCodecTest, DecodeRefusesAMissingOrAnUnreferencedPlan) 
   }
   {
     auto root = Root(encoded);
-    auto plans = root[4].as_array();
+    auto plans = root[3].as_array();
     auto extra = plans.back().as_array();
     extra[0] = V("sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff");
     plans.emplace_back(std::move(extra));
-    root[4] = V(std::move(plans));
+    root[3] = V(std::move(plans));
     const auto decoded = DecodeStopJournalTerminalProjection(Bytes(std::move(root)));
     ASSERT_FALSE(decoded.ok());
     EXPECT_NE(Reason(decoded.error()).find("unreferenced participant plan"), std::string::npos)
@@ -723,54 +651,17 @@ TEST(StopJournalProjectionCodecTest, DecodeRefusesAMissingOrAnUnreferencedPlan) 
 TEST(StopJournalProjectionCodecTest, DecodeRefusesUnsortedOrDuplicatePlans) {
   const auto encoded =
       EncodeStopJournalTerminalProjection(TwoParticipantEscalatedProjection()).value();
-  const auto original = Root(encoded)[4].as_array();
+  const auto original = Root(encoded)[3].as_array();
   ASSERT_EQ(original.size(), 2U);
   for (const auto& plans : {V::Array{original[1], original[0]},
                             V::Array{original[0], original[0], original[1]}}) {
     auto root = Root(encoded);
-    root[4] = V(plans);
+    root[3] = V(plans);
     const auto decoded = DecodeStopJournalTerminalProjection(Bytes(std::move(root)));
     ASSERT_FALSE(decoded.ok());
     EXPECT_NE(Reason(decoded.error()).find("not sorted and unique"), std::string::npos)
         << Reason(decoded.error());
   }
-}
-
-TEST(StopJournalProjectionCodecTest, RoundTripsExactFaultClearAuthorityCanonically) {
-  const auto projection = FaultClearProjection();
-  const auto encoded = EncodeStopJournalFaultClearProjection(projection);
-  ASSERT_TRUE(encoded.ok()) << encoded.error().message;
-  const auto root = Root(encoded.value());
-  ASSERT_EQ(root.size(), 3U);
-  EXPECT_EQ(root[0], V(std::string(kStopJournalFaultClearProjectionApiVersion)));
-  const auto decoded = DecodeStopJournalFaultClearProjection(encoded.value());
-  ASSERT_TRUE(decoded.ok()) << decoded.error().message;
-  EXPECT_EQ(decoded.value(), projection);
-  EXPECT_EQ(EncodeStopJournalFaultClearProjection(decoded.value()).value(), encoded.value());
-  EXPECT_FALSE(DecodeStopJournalFaultClearProjection(encoded.value() + "\n").ok());
-
-  auto conflict = projection;
-  conflict.recovery_result.request_id = RequestId("recovery.conflict");
-  EXPECT_FALSE(EncodeStopJournalFaultClearProjection(conflict).ok());
-  auto latched = projection;
-  latched.recovery_result.latch.state = StopFaultLatchStateDTO::kLatched;
-  EXPECT_FALSE(EncodeStopJournalFaultClearProjection(latched).ok());
-}
-
-TEST(StopJournalProjectionCodecTest, RoundTripsThePostReserveFenceFailedTriggerAndObservedTriggers) {
-  auto projection = FaultClearProjection();
-  projection.recovery_result.latch.trigger = StopFaultTriggerDTO::kPostReserveFenceFailed;
-  projection.recovery_result.latch.observed_triggers = {
-      StopFaultTriggerDTO::kScopePromotion, StopFaultTriggerDTO::kPostReserveFenceFailed};
-  const auto encoded = EncodeStopJournalFaultClearProjection(projection);
-  ASSERT_TRUE(encoded.ok()) << encoded.error().message;
-  const auto decoded = DecodeStopJournalFaultClearProjection(encoded.value());
-  ASSERT_TRUE(decoded.ok()) << decoded.error().message;
-  EXPECT_EQ(decoded.value(), projection);
-  EXPECT_EQ(decoded.value().recovery_result.latch.trigger,
-            StopFaultTriggerDTO::kPostReserveFenceFailed);
-  EXPECT_EQ(decoded.value().recovery_result.latch.observed_triggers,
-            projection.recovery_result.latch.observed_triggers);
 }
 
 TEST(StopJournalProjectionCodecTest, BoundedFallbackListsRoundTripAndSingleModeWireIsRefused) {
@@ -829,7 +720,7 @@ TEST(StopJournalProjectionCodecTest, SingleModeSubstitutionContractWireIsRefused
   ExpectExactRoundTrip(projection);
   auto root = Root(EncodeStopJournalTerminalProjection(projection).value());
   std::size_t replaced = 0U;
-  auto plans = root[4].as_array();
+  auto plans = root[3].as_array();
   for (auto& plan_wire : plans) {
     auto plan = plan_wire.as_array();
     auto stages = plan[12].as_array();
@@ -851,7 +742,7 @@ TEST(StopJournalProjectionCodecTest, SingleModeSubstitutionContractWireIsRefused
     plan[12] = V(std::move(stages));
     plan_wire = V(std::move(plan));
   }
-  root[4] = V(std::move(plans));
+  root[3] = V(std::move(plans));
   ASSERT_GT(replaced, 0U);
   const auto decoded = DecodeStopJournalTerminalProjection(Bytes(std::move(root)));
   ASSERT_FALSE(decoded.ok());
@@ -926,7 +817,7 @@ TEST(StopJournalProjectionCodecTest, LegacyFallbackParameterKeyIsRefusedByEncode
   // The same legacy object written directly into canonical bytes.
   auto root = Root(EncodeStopJournalTerminalProjection(valid).value());
   std::size_t replaced = 0U;
-  auto plans = root[4].as_array();
+  auto plans = root[3].as_array();
   for (auto& plan_wire : plans) {
     auto plan = plan_wire.as_array();
     auto stages = plan[12].as_array();
@@ -959,129 +850,26 @@ TEST(StopJournalProjectionCodecTest, LegacyFallbackParameterKeyIsRefusedByEncode
     plan[12] = V(std::move(stages));
     plan_wire = V(std::move(plan));
   }
-  root[4] = V(std::move(plans));
+  root[3] = V(std::move(plans));
   ASSERT_GT(replaced, 0U);
   const auto decoded = DecodeStopJournalTerminalProjection(Bytes(std::move(root)));
   ASSERT_FALSE(decoded.ok());
   EXPECT_EQ(Reason(decoded.error()), "legacy Stop fallback parameters are refused");
 }
 
-TEST(StopJournalProjectionCodecTest, ClearedLatchWithAnUnclearedRecoveryStatusIsRefused) {
-  // The lean clear keeps M3's latch validation (stop_fault_latch_field_error):
-  // state Cleared with a recovery status that is not Cleared is refused at
-  // encode, and its canonical bytes are refused at decode.
-  const auto valid = FaultClearProjection();
-  auto malformed = valid;
-  malformed.recovery_result.latch.recovery_status = StopFaultRecoveryStatusDTO::kReady;
-  const auto encoded = EncodeStopJournalFaultClearProjection(malformed);
-  ASSERT_FALSE(encoded.ok());
-  EXPECT_EQ(encoded.error().code, "invalid_stop_journal_projection");
-  EXPECT_EQ(Reason(encoded.error()), "fault-clear projection is invalid");
-
-  auto root = Root(EncodeStopJournalFaultClearProjection(valid).value());
-  auto result = root[2].as_array();
-  auto latch = result[3].as_array();
-  ASSERT_EQ(latch[16], V(static_cast<double>(StopFaultRecoveryStatusDTO::kCleared)));
-  latch[16] = V(static_cast<double>(StopFaultRecoveryStatusDTO::kReady));
-  result[3] = V(std::move(latch));
-  root[2] = V(std::move(result));
-  const auto decoded = DecodeStopJournalFaultClearProjection(Bytes(std::move(root)));
-  ASSERT_FALSE(decoded.ok());
-  EXPECT_EQ(decoded.error().code, "invalid_stop_journal_projection");
-}
-
-// A monitoring checkpoint and its current (non-cleared) latch for `terminal`.
-[[nodiscard]] StopJournalSurveillanceProjectionDTO SurveillanceProjection() {
-  const auto terminal = TerminalProjection();
-  const auto& certificate = terminal.certificate;
-  auto latch = ClearedLatch(certificate);
-  latch.clear_projection = StopDurableProjectionStatusDTO{
-      StopDurableProjectionStateDTO::kNotApplicable, std::nullopt, std::nullopt};
-  latch.state = StopFaultLatchStateDTO::kLatched;
-  latch.recovery_assessment_revision = 1U;
-  latch.recovery_status = StopFaultRecoveryStatusDTO::kWaitingForObservation;
-  latch.reason_code = "stop_fault_latched";
-  latch.evidence_refs.clear();
-  const auto& attempt = certificate.attempted_stage_results.front();
-  const auto& requirement = attempt.result.request.participant_stop_plan.stage_commands.front()
-                                .resolved_stage.evidence_requirements.front();
-  const StopPostTerminalSurveillanceDTO checkpoint{
-      certificate.stop_id,
-      certificate.stop_generation,
-      *latch.stop_certificate,
-      latch.latch_id,
-      latch.latch_generation,
-      RequestOwnerEpoch("owner.1"),
-      1U,
-      {ResourceId("joint.1"), ResourceId("joint.2")},
-      {StopSurveillanceSourceStatusDTO{attempt.scope_key, requirement.requirement.evidence_item_id,
-                                       requirement.resolved_source,
-                                       StopSurveillanceSourceAvailabilityDTO::kAvailable,
-                                       RuntimeEpoch("provider.epoch"), 5U, 0, std::nullopt}},
-      StopSurveillancePolicyDTO{10'000'000, 100'000'000, 8U},
-      0U,
-      std::nullopt,
-      std::nullopt,
-      std::nullopt,
-      std::nullopt,
-      StopPostTerminalSurveillanceStateDTO::kMonitoring,
-      1U,
-      StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kRecorded, std::nullopt,
-                                     std::nullopt}};
-  return StopJournalSurveillanceProjectionDTO{checkpoint, latch};
-}
-
-TEST(StopJournalProjectionCodecTest, SurveillanceLatchWithoutCertificateIsRefused) {
-  // SX-310: a latch without its Stop certificate is refused with the typed
-  // codec error (never dereferenced), at encode and at decode.
-  const auto valid = SurveillanceProjection();
-  const auto encoded = EncodeStopJournalSurveillanceProjection(valid);
-  ASSERT_TRUE(encoded.ok()) << Reason(encoded.error());
-  const auto decoded = DecodeStopJournalSurveillanceProjection(encoded.value());
-  ASSERT_TRUE(decoded.ok()) << Reason(decoded.error());
-  EXPECT_EQ(decoded.value(), valid);
-
-  auto absent = valid;
-  absent.fault_latch.stop_certificate.reset();
-  ASSERT_FALSE(stop_fault_latch_field_error(absent.fault_latch).has_value());
-  const auto refused = EncodeStopJournalSurveillanceProjection(absent);
-  ASSERT_FALSE(refused.ok());
-  EXPECT_EQ(refused.error().code, "invalid_stop_journal_projection");
-  EXPECT_EQ(Reason(refused.error()), "surveillance projection is invalid");
-
-  auto root = Root(encoded.value());
-  auto latch = root[2].as_array();
-  ASSERT_TRUE(latch[3].is_array());
-  latch[3] = V(nullptr);
-  root[2] = V(std::move(latch));
-  const auto refused_bytes = DecodeStopJournalSurveillanceProjection(Bytes(std::move(root)));
-  ASSERT_FALSE(refused_bytes.ok());
-  EXPECT_EQ(refused_bytes.error().code, "invalid_stop_journal_projection");
-}
-
-TEST(StopJournalProjectionCodecTest, TerminalV3AndFaultClearV2BytesAreRefused) {
+TEST(StopJournalProjectionCodecTest, EarlierTerminalVersionsAreRefused) {
   const auto terminal = EncodeStopJournalTerminalProjection(TerminalProjection()).value();
   const auto terminal_root = Root(terminal);
-  const std::string terminal_v3 = "manyforge.internal.stop-journal-terminal-projection.v3";
-  for (auto root : {terminal_root,
-                    V::Array{V(terminal_v3), terminal_root[1], terminal_root[2], V(nullptr)}}) {
-    root[0] = V(terminal_v3);
-    const auto decoded = DecodeStopJournalTerminalProjection(Bytes(std::move(root)));
-    ASSERT_FALSE(decoded.ok());
-    EXPECT_EQ(Reason(decoded.error()),
-              "Stop journal terminal projection API version is unsupported");
-  }
-
-  const auto clear = EncodeStopJournalFaultClearProjection(FaultClearProjection()).value();
-  const auto clear_root = Root(clear);
-  const std::string clear_v2 = "manyforge.internal.stop-journal-fault-clear-projection.v2";
-  for (auto root : {clear_root, V::Array{V(clear_v2), clear_root[1], clear_root[2],
-                                         terminal_root[1], terminal_root[2]}}) {
-    root[0] = V(clear_v2);
-    const auto decoded = DecodeStopJournalFaultClearProjection(Bytes(std::move(root)));
-    ASSERT_FALSE(decoded.ok());
-    EXPECT_EQ(Reason(decoded.error()),
-              "Stop journal fault-clear projection API version is unsupported");
+  for (const std::string version : {"manyforge.internal.stop-journal-terminal-projection.v3",
+                                    "manyforge.internal.stop-journal-terminal-projection.v4"}) {
+    for (auto root : {terminal_root, V::Array{V(version), terminal_root[1], terminal_root[2],
+                                              V(nullptr), terminal_root[3]}}) {
+      root[0] = V(version);
+      const auto decoded = DecodeStopJournalTerminalProjection(Bytes(std::move(root)));
+      ASSERT_FALSE(decoded.ok());
+      EXPECT_EQ(Reason(decoded.error()),
+                "Stop journal terminal projection API version is unsupported");
+    }
   }
 }
 

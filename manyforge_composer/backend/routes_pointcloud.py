@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import hashlib
 import os
 import threading
-from typing import Any, Final, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 import uuid
 
 from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 
 from manyforge_headless_api.client import HeadlessClientError
 from manyforge_headless_api.pointcloud_observation import (
+    POINTCLOUD_DEFAULT_OWNER_ID,
     POINTCLOUD_MAX_PACKET_BYTES,
     POINTCLOUD_MEDIA_TYPE,
     POINTCLOUD_PROTOCOL_ID,
@@ -31,9 +32,6 @@ if TYPE_CHECKING:
     from .state import ComposerState
 
 
-_DEFAULT_OWNER_ID: Final = "manyforge.isaac.pointcloud"
-
-
 @dataclass(frozen=True, slots=True)
 class _AcceptedSourceFrame:
     owner_epoch: str
@@ -43,7 +41,7 @@ class _AcceptedSourceFrame:
 
 
 def _configured_owner_id() -> str:
-    value = os.environ.get("MANYFORGE_POINTCLOUD_OWNER_ID", _DEFAULT_OWNER_ID)
+    value = os.environ.get("MANYFORGE_POINTCLOUD_OWNER_ID", POINTCLOUD_DEFAULT_OWNER_ID)
     if (
         not value
         or len(value.encode("utf-8", errors="strict")) > 128

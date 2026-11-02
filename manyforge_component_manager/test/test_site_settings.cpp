@@ -24,8 +24,8 @@ TEST(SiteSettings, PreservesDeviceAddresses) {
   const SiteSettings::DeviceAddresses expected{{"lite6_main", "192.168.1.31"}};
   EXPECT_EQ(settings.device_addresses(), expected);
   const auto hosts = ParseSiteSettings(
-      R"({"schema":"manyforge.site.v1","device_addresses":{"A.b_c-9":"robot-1.local","v6":"fe80::1"}})");
-  EXPECT_EQ(hosts.device_addresses().at("A.b_c-9"), "robot-1.local");
+      R"({"schema":"manyforge.site.v1","device_addresses":{"a.b_c-9":"robot-1.local","v6":"fe80::1"}})");
+  EXPECT_EQ(hosts.device_addresses().at("a.b_c-9"), "robot-1.local");
   EXPECT_EQ(hosts.device_addresses().at("v6"), "fe80::1");
 }
 
@@ -79,6 +79,9 @@ TEST(SiteSettings, RejectsMalformedAndNonClosedShapes) {
       Replace(sample, "lite6_main", "lite6 main"),
       Replace(sample, R"("lite6_main")", R"("")"),
       Replace(sample, "lite6_main", std::string(129U, 'a')),
+      // The Deployment's portable id: lower-case, starting with a letter.
+      Replace(sample, "lite6_main", "Lite6_main"),
+      Replace(sample, "lite6_main", "6lite_main"),
       Replace(sample, R"("192.168.1.31")", R"("")"),
       Replace(sample, R"("192.168.1.31")", "31"),
       Replace(sample, R"("192.168.1.31")", R"({"host":"192.168.1.31"})"),

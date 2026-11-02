@@ -6,7 +6,6 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PRODUCTION_ROOTS = (
     "manyforge_behavior",
-    "manyforge_cclc_msgs",
     "manyforge_composer/backend",
     "manyforge_composer/frontend/src",
     "manyforge_core",
@@ -17,7 +16,6 @@ PRODUCTION_ROOTS = (
     "manyforge_roboplan",
     "manyforge_ros2_control_execution",
     "manyforge_ros_bringup",
-    "manyforge_xarm_adapter",
     "manyforge_xarm_control",
     "scripts",
 )
@@ -77,8 +75,6 @@ def test_legacy_lifecycle_packages_have_no_remaining_files() -> None:
         root = REPO_ROOT / relative_root
         assert not root.exists() or not any(path.is_file() for path in root.rglob("*"))
 
-    assert (REPO_ROOT / "manyforge_cclc_msgs/srv/CCLCOpenRequest.srv").is_file()
-
 
 def test_production_surfaces_do_not_retain_legacy_authority_facades() -> None:
     offenders: list[str] = []
@@ -95,7 +91,6 @@ def test_low_level_xarm_command_gate_is_removed_with_the_supervised_mode() -> No
     # R7 package 5 (2026-10-25): the supervised xArm transport seam that kept
     # the renewable command gate was removed with the supervised mode.
     xarm_roots = (
-        REPO_ROOT / "manyforge_xarm_adapter/manyforge_xarm_adapter",
         REPO_ROOT / "manyforge_xarm_control/include",
         REPO_ROOT / "manyforge_xarm_control/src",
     )

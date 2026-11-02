@@ -40,7 +40,7 @@ interface OperationalErrorRegistry {
   ) => void;
   resolve: (source: string) => void;
   dismiss: (id: string) => void;
-  /** Reset and Scenario Close clear every message. */
+  /** Reset and Scenario New clear every message. */
   clear: () => void;
 }
 
@@ -140,7 +140,7 @@ const OperationalErrorContext = createContext<OperationalErrorRegistry>(EMPTY_RE
  * One session-local registry for Composer request failures (warning row).
  * It is only a presentation source: backend alarms and runtime authority stay
  * with their owners. A failure blocks nothing, so every record is a warning
- * that stays until acknowledged, or until Reset or Scenario Close clears it.
+ * that stays until acknowledged, or until Reset or Scenario New clears it.
  */
 export function OperationalErrorProvider({ children }: { children: ReactNode }) {
   const [state, setState] = useState<OperationalErrorState>(

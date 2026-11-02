@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: lite6_lite_gripper_pick_and_place
-program_revision: sha256:d93dddfd3d7ce441cc04b324581297487d83ea191dcc50fe7b054a460a76f1f8
+program_revision: sha256:8c765fd0d0d6b18c2396f2528f6e7a4a00b5c5c4d905c663b712f4104a288f71
 program_profile: composable-cell-v1
 name: lite6_lite_gripper_pick_and_place
 description: Basic ManyForge pick-and-place Program for UFACTORY Lite6 with its lite pneumatic gripper.
@@ -41,9 +41,6 @@ target_roles:
       parameters: {}
       disposition: required
     - capability_id: planning.motion.pose_goal
-      parameters: {}
-      disposition: required
-    - capability_id: planning.profile.balanced
       parameters: {}
       disposition: required
     - capability_id: planning.trajectory.time_parameterized
@@ -150,12 +147,12 @@ parameters:
     min_exclusive: 0.0
     max_inclusive: 1.0
   description: Acceleration scale for all Lite6 pick-and-place moves.
-- parameter_id: max_blend_deviation_rad
+- parameter_id: blend_radius_m
   type: float64
-  default: 0.01
+  default: 0.0
   constraints:
     min_inclusive: 0.0
-  description: Default maximum Cartesian blend deviation.
+  description: Default Cartesian corner blend radius (m); 0 keeps exact corners.
 - parameter_id: max_tcp_linear_speed_mps
   type: float64
   default: 0.15

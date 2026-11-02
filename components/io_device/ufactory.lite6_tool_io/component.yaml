@@ -1,0 +1,25 @@
+# Component descriptor (docs/authoring/ADDING_A_COMPONENT.md): a machine's own
+# I/O bank in model form, used as a member of its machine. Real lane: the xArm
+# family reads and writes it through its owner's connection; Mock and Isaac
+# lanes: the host's Mock I/O (outputs read back). Declared I/O only: the
+# controller accepts writes to missing outputs.
+# The Lite 6 tool board has TO0/TO1 only (measured 2026-11-01).
+api_version: manyforge.component_package.v1
+kind: io_device
+id: ufactory.lite6_tool_io
+version: 1.0.0
+title: UFACTORY Lite 6 tool I/O
+license: BSD-3-Clause
+provenance:
+  source: https://github.com/pastoriomarco/xarm_ros2
+  notes: XARM_CONTROLLER_FACTS (manyforge_specs)
+signals:
+  - {signal_name: TI0, direction: input, value_type: bool}
+  - {signal_name: TI1, direction: input, value_type: bool}
+  - {signal_name: TO0, direction: output, value_type: bool}
+  - {signal_name: TO1, direction: output, value_type: bool}
+lanes:
+  # Inputs: one sample per `xarm_io_states` period (`io_states.rate`, 100 Hz).
+  # A sample older than this budget is stale: rules reading it can't watch.
+  # Ten periods at 100 Hz, as the I/O member's own stale bound.
+  real: {adapter: xarm, bank: tool, input_maximum_age_ms: 100}    # manyforge_xarm_control/vendor/README.md

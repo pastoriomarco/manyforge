@@ -858,7 +858,6 @@ automatic_retry_program(const RetainedBundle &bundle,
       node_id == "motion.move_to_joint_target" ? "planning.motion.joint_goal"
       : node_id == "motion.move_to_pose"       ? "planning.motion.pose_goal"
                                          : "planning.motion.cartesian_path",
-      "planning.profile.balanced",
       "planning.trajectory.time_parameterized",
       "state.observed.current",
       "validation.trajectory.non_collision"};
@@ -1426,7 +1425,6 @@ TEST(ProgramContractTest, CapturesOnlyExplicitParallelCoordinatedMotionSets) {
   options.capability_ids = {"execution.feedback.phase_events",
                             "execution.trajectory.execute",
                             "planning.motion.joint_goal",
-                            "planning.profile.balanced",
                             "planning.trajectory.time_parameterized",
                             "state.observed.current",
                             "validation.trajectory.non_collision"};
@@ -1605,15 +1603,12 @@ TEST(ProgramContractTest, CapturesOnlyCatalogQualifiedNodeTargetAssociations) {
       ProgramContractError);
 }
 
-TEST(ProgramContractTest,
-     CapturesEffectiveConditionalCapabilitiesWithoutDynamicScope) {
+TEST(ProgramContractTest, CapturesMotionTargetEffectsWithoutDynamicScope) {
   const auto bundle = maintained_motion_bundle();
   auto options = valid_options(*bundle);
   options.capability_ids = {"execution.feedback.phase_events",
                             "execution.trajectory.execute",
                             "planning.motion.joint_goal",
-                            "planning.profile.balanced",
-                            "planning.profile.first_feasible",
                             "planning.trajectory.time_parameterized",
                             "state.observed.current",
                             "validation.trajectory.non_collision"};
@@ -1652,42 +1647,14 @@ TEST(ProgramContractTest,
         });
     return found != effects.end() && found->effectful;
   };
-  EXPECT_TRUE(has(contract->execution_table(), "planning.profile.balanced"));
+  EXPECT_TRUE(has(contract->execution_table(), "planning.motion.joint_goal"));
   EXPECT_TRUE(
       effectful(contract->execution_table(), "execution.trajectory.execute"));
   EXPECT_FALSE(
       effectful(contract->execution_table(), "state.observed.current"));
-  EXPECT_FALSE(
-      has(contract->execution_table(), "planning.profile.first_feasible"));
-  mutate_object_member(tree, "parameters", [](auto &parameters) {
-    parameters.emplace_back("planning_profile",
-                            CanonicalValue("first_feasible"));
-  });
-  contract = verify();
-  EXPECT_FALSE(has(contract->execution_table(), "planning.profile.balanced"));
-  EXPECT_TRUE(
-      has(contract->execution_table(), "planning.profile.first_feasible"));
-  for (const auto &invalid :
-       CanonicalValue::Array{CanonicalValue("bogus"), CanonicalValue(nullptr),
-                             CanonicalValue(true), text_array({"balanced"})}) {
-    mutate_object_member(tree, "parameters", [&](auto &parameters) {
-      replace_member(parameters, "planning_profile", invalid);
-    });
-    try {
-      static_cast<void>(verify());
-      FAIL() << "invalid condition stamped an incomplete effect capture";
-    } catch (const ProgramContractError &error) {
-      EXPECT_NE(
-          std::string(error.what()).find("invalid catalog condition value"),
-          std::string::npos);
-    }
-  }
-  mutate_object_member(tree, "parameters", [](auto &parameters) {
-    replace_member(parameters, "planning_profile", CanonicalValue("balanced"));
-  });
   // Narrow native capture proof, not a runnable Program: keep only literal
   // target/default-condition fields consumed at this boundary. Full motion
-  // parameters would hit the independent YAML-node bound first. Seven target
+  // parameters would hit the independent YAML-node bound first. Six target
   // associations per node exercise the real 100,000 association limit.
   auto capture_only = tree;
   erase_member(capture_only, "execution_groups");
@@ -1697,7 +1664,7 @@ TEST(ProgramContractTest,
   CanonicalValue::Array branches;
   for (std::size_t branch = 0U; branch < 2U; ++branch) {
     CanonicalValue::Array motions;
-    for (std::size_t index = 0U; index < 7200U; ++index) {
+    for (std::size_t index = 0U; index < 8400U; ++index) {
       auto motion = capture_only;
       replace_member(motion, "instance_id",
                      CanonicalValue(std::string("n")

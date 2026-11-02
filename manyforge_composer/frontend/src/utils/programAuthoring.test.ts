@@ -398,7 +398,7 @@ describe('Program parameter binding continuity', () => {
         parameter('velocity_scale', 'number'),
         parameter('acceleration_scale', 'number'),
         parameter('translation_tol_m', 'number'),
-        parameter('max_blend_deviation_rad', 'number'),
+        parameter('blend_radius_m', 'number'),
       ],
     };
     const program = {
@@ -433,7 +433,7 @@ describe('Program parameter binding continuity', () => {
             kind: 'program_parameter',
             reference: 'path_tolerance',
           },
-          max_blend_deviation_rad: {
+          blend_radius_m: {
             kind: 'program_parameter',
             reference: 'path_blend',
           },
@@ -449,25 +449,25 @@ describe('Program parameter binding continuity', () => {
           velocity_scale: 'cycle_velocity',
           acceleration_scale: 'cycle_acceleration',
           translation_tol_m: 'path_tolerance',
-          max_blend_deviation_rad: 'path_blend',
+          blend_radius_m: 'path_blend',
         },
         values: {
           velocity_scale: 0.35,
           acceleration_scale: 0.7,
           translation_tol_m: 0.005,
-          max_blend_deviation_rad: 0.01,
+          blend_radius_m: 0.01,
         },
         usageCounts: {
           velocity_scale: 1,
           acceleration_scale: 1,
           translation_tol_m: 1,
-          max_blend_deviation_rad: 1,
+          blend_radius_m: 1,
         },
         applicableCounts: {
           velocity_scale: 1,
           acceleration_scale: 1,
           translation_tol_m: 1,
-          max_blend_deviation_rad: 1,
+          blend_radius_m: 1,
         },
       },
     });
@@ -481,7 +481,7 @@ describe('Program parameter binding continuity', () => {
         parameter('acceleration_scale', 'number'),
         parameter('max_tcp_linear_speed_mps', 'number'),
         parameter('translation_tol_m', 'number'),
-        parameter('max_blend_deviation_rad', 'number'),
+        parameter('blend_radius_m', 'number'),
       ],
     };
     const program = {
@@ -542,7 +542,7 @@ describe('Program parameter binding continuity', () => {
         ...Object.entries(fields).map(([parameter_id, defaultValue]) => ({
           ...declaration, parameter_id, default: defaultValue,
         })),
-        { ...declaration, parameter_id: 'max_blend_deviation_rad', default: 0.01 },
+        { ...declaration, parameter_id: 'blend_radius_m', default: 0.01 },
       ],
       schema_version: 'manyforge.composer_authoring_forest.v1',
       forest: [tree({
@@ -557,9 +557,9 @@ describe('Program parameter binding continuity', () => {
     const result = deriveProgramMotionConfiguration(program, [motionEntry]);
     expect(result.available).toBe(true);
     if (!result.available) return;
-    expect(result.configuration.bindings.max_blend_deviation_rad)
-      .toBe('max_blend_deviation_rad');
-    expect(result.configuration.values.max_blend_deviation_rad).toBe(0.01);
-    expect(result.configuration.applicableCounts.max_blend_deviation_rad).toBe(0);
+    expect(result.configuration.bindings.blend_radius_m)
+      .toBe('blend_radius_m');
+    expect(result.configuration.values.blend_radius_m).toBe(0.01);
+    expect(result.configuration.applicableCounts.blend_radius_m).toBe(0);
   });
 });

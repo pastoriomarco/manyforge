@@ -18,7 +18,7 @@ import logging
 from pathlib import Path
 import time
 import threading
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
 import rfc8785
 from pydantic import ValidationError
@@ -34,6 +34,7 @@ from .control_protocol import (
     ExecutionControlProjectionDTO,
 )
 from . import error_codes
+from .component_model import manual_operation_resident, run_readiness
 from .component_overview import ComponentOverviewFacts
 from .execution_control import ExecutionControlIngress
 from .held_run_authoring import held_run_draft_edit_allowed
@@ -60,10 +61,10 @@ _PROGRAM_FAILURE_CONDITION_SCHEMA = "manyforge.program_failure_condition.v1"
 # Run states holding an unresolved failure: held for it, ended failed, or
 # stopped with it. Only the Run's own resolution clears the condition.
 _ORDINARY_FAILURE_EFFECTS = frozenset({"no_effect", "effect_settled"})
-# These keep their own native alarms (runtime collision, Stop fault) or are
-# no failure at all (an operator Stop).
+# These keep their own native alarm (runtime collision) or are no failure at
+# all (an operator Stop).
 _NATIVE_ALARM_RECOVERY_CLASSES = frozenset(
-    {"runtime_collision", "stop_fault_intervention", "ordinary_operator_stop"}
+    {"runtime_collision", "ordinary_operator_stop"}
 )
 
 
@@ -279,7 +280,25 @@ def control_shell_fact_key(shell: dict[str, Any], name: str) -> Any:
         )
     if name == "program_cycle":
         return json.dumps(shell[name], sort_keys=True, separators=(",", ":"))
+    if name in _COMPONENT_MODEL_EVENTS:
+        # Ages and observation times move on every read; a change of value,
+        # freshness, state or reason is what publishes the event again.
+        return json.dumps(
+            _without_ages(shell.get(name)), sort_keys=True, separators=(",", ":")
+        )
     return shell.get(name)
+
+
+_COMPONENT_MODEL_EVENTS = ("component_state", "cell_latch", "io_signals", "run_readiness")
+_AGE_FIELDS = frozenset({"age_ns", "observed_at_ns"})
+
+
+def _without_ages(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {k: _without_ages(v) for k, v in value.items() if k not in _AGE_FIELDS}
+    if isinstance(value, list):
+        return [_without_ages(v) for v in value]
+    return value
 
 
 def _shell_key(shell: dict[str, Any]) -> tuple[Any, ...]:
@@ -291,6 +310,7 @@ def _shell_key(shell: dict[str, Any]) -> tuple[Any, ...]:
         control_shell_fact_key(shell, "execution_targets"),
         control_shell_fact_key(shell, "execution_control_state"),
         control_shell_fact_key(shell, "component_overview"),
+        *(control_shell_fact_key(shell, name) for name in _COMPONENT_MODEL_EVENTS),
     )
 
 
@@ -394,6 +414,35 @@ def build_control_projection(
             "freshness": ingress.freshness_for(owner_epoch, revision),
         }
     )
+
+
+def _component_model_events(facts: ComponentOverviewFacts) -> dict[str, Any]:
+    """`component_state`, `cell_latch`, `io_signals`, `run_readiness`.
+
+    Values are the complete current values (all components, all signals);
+    while the host's model can't be read each is null ("unavailable"), never
+    the last values.
+    """
+
+    model = facts.component_model
+    if model is None:
+        return {name: None for name in _COMPONENT_MODEL_EVENTS}
+    cycle = facts.program_cycle if isinstance(facts.program_cycle, Mapping) else None
+    return {
+        "component_state": list(model.component_states),
+        "cell_latch": dict(model.cell_latch),
+        "io_signals": list(model.signal_samples),
+        "run_readiness": dict(
+            run_readiness(
+                model,
+                cycle,
+                program_status=facts.applied_program_status,
+                manual_operation_in_progress=manual_operation_resident(
+                    facts.execution_control_response
+                ),
+            )
+        ),
+    }
 
 
 class HeadlessControlStateSource:
@@ -953,26 +1002,6 @@ class HeadlessControlStateSource:
             raise ControlStateUnavailableError("control state is not synchronized")
         return self._frame("critical")
 
-    def current_component_overview(self) -> dict[str, Any] | None:
-        """Return the already-reduced Overview while the shared source is active.
-
-        ``None`` means there is no control demand and therefore no retained fact
-        set.  A caller may then perform one standalone capture.  While control
-        demand exists, returning anything except the shared current reduction
-        would reread owners and reintroduce the crossed-projection path UI6-G
-        removes.
-        """
-
-        if not self._subscriptions:
-            return None
-        if not self._is_synchronized():
-            raise ControlStateUnavailableError("control state is not synchronized")
-        assert self._shell is not None
-        overview = self._shell.get("component_overview")
-        if not isinstance(overview, dict):
-            raise ControlStateUnavailableError("component overview is unavailable")
-        return dict(overview)
-
     def semantic_context(self) -> ControlSemanticContext:
         """Return cached semantic state without reading or reducing an owner."""
 
@@ -1423,6 +1452,9 @@ class HeadlessControlStateSource:
             "execution_targets": targets,
             "execution_control_state": control,
             "program_cycle": dict(facts.program_cycle),
+            # Component model v2 events (CONTRACTS §1, §5, §7, §10): each key
+            # is sent again in a delta whenever its value changes.
+            **_component_model_events(facts),
         }
 
     async def _assemble_shell(

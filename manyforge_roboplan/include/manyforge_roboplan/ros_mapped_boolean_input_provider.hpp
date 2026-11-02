@@ -18,22 +18,16 @@
 #include <memory>
 #include <rclcpp/node.hpp>
 #include <rclcpp/qos.hpp>
-#include <variant>
 
 namespace manyforge::roboplan_backend {
 
-struct UrDigitalInputSelector final {
-  std::uint8_t pin;
-};
 struct RosGpioBooleanInputSelector final {
   std::string group;
   std::string interface_name;
 };
-using RosBooleanInputSelector =
-    std::variant<UrDigitalInputSelector, RosGpioBooleanInputSelector>;
 struct RosMappedBooleanInputSignal final {
   core::IoSignalDescriptorDTO descriptor;
-  RosBooleanInputSelector selector;
+  RosGpioBooleanInputSelector selector;
 };
 struct RosMappedBooleanInputBinding final {
   core::InterruptSourceId source_id;
@@ -42,9 +36,8 @@ struct RosMappedBooleanInputBinding final {
   std::vector<RosMappedBooleanInputSignal> signals;
 };
 
-/// One typed ROS source, one atomic configured-signal acquisition. UR reads
-/// digital_in_states by exact pin; GPIO reads exact group/interface with finite
-/// 0/1 values. Missing/ambiguous channels are invalid without a borrowed value.
+/// One typed ROS source, one atomic configured-signal acquisition. GPIO reads
+/// exact group/interface with finite 0/1 values. Missing/ambiguous channels are invalid without a borrowed value.
 /// Receipt is actual callback ingress, never a hardware acquisition timestamp.
 /// The existing host owns node/executor/clock/ingress and lifecycle
 /// generations. Host serializes lifecycle transitions; quiesce executor before
@@ -69,6 +62,8 @@ public:
                 std::uint64_t driver_observation_generation);
   bool Pause(std::uint64_t driver_observation_generation);
   bool Resume(std::uint64_t driver_observation_generation);
+  /// IO-1: every received message records an arrival (none: no stream).
+  void SetArrivalRecorder(std::shared_ptr<core::StreamRecorder> arrivals);
   void Shutdown();
 
 private:

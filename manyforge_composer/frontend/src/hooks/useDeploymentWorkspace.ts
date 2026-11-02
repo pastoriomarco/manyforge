@@ -1,10 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import {
-  api, authoringRefusalMessage, isStaleWorkspaceError, preparationCauseCode,
+  api, apiErrorCode, authoringRefusalMessage, isStaleWorkspaceError, preparationCauseCode,
 } from '../api/client';
+import { applyResultText } from '../components/ApplyImpact';
+import type { AuthoringCommand } from '../state/busyOperation';
+import { codedErrorText } from '../state/componentPresentation';
 import { errorMessage } from '../state/structuralResource';
-import type { ManagerApplyIdentity } from '../state/managerApply';
+import type { ApplyPreview, ApplyResult } from '../types/components';
 import {
   deploymentComparisonsStale,
   deploymentLocalFence,
@@ -14,38 +17,23 @@ import {
 } from '../state/authoringWorkspace';
 import type {
   DeploymentWorkspaceResponse,
-  DeploymentCandidateOperationResponse,
   DeploymentControlledStopUpdate,
   JsonValue,
   LocalWorkspaceFenceRequest,
-  TcpSpeedCheck,
 } from '../types/api';
 import type { ComposerHeadlessState } from '../types/headless';
 import type { AuthoringWorkspaceController } from './useAuthoringWorkspace';
 import { browserStableIdentity } from './useHeadlessState';
 import { deploymentActionUnavailableReason } from '../state/documentStates';
-import {
-  ACTIVATION_SCOPE_CHANGED,
-  deploymentActivationScope,
-  sameActivationScope,
-  type DeploymentActivationScope,
-} from '../state/activationScope';
-
-/** The exact Deployment Draft content a caller acts on (a confirmed Apply). */
-export interface ExpectedDeploymentDraft {
-  draftId: string;
-  draftRevision: number;
-}
 
 /**
- * The installed Deployment Draft is not the content the caller confirmed:
- * nothing was sent.
+ * The text of a refused Preview/Apply/Load/New (CONTRACTS §11): the
+ * catalogue's text for its code, e.g. `apply_refused_run_in_progress`.
  */
-export class DeploymentDraftChangedError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'DeploymentDraftChangedError';
-  }
+export function cellApplyErrorText(reason: unknown, fallback: string): string {
+  const message = errorMessage(reason, fallback);
+  const code = apiErrorCode(reason);
+  return code === null ? message : codedErrorText({ code, message });
 }
 
 function requestId(): string {
@@ -70,22 +58,21 @@ export function useDeploymentWorkspace(
   /** The typed cause of the shown preparation refusal, if the preparer named one. */
   const [errorCauseCode, setErrorCauseCode] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<string | null>(null);
-  const [acceptedApply, setAcceptedApply] = useState<ManagerApplyIdentity | null>(null);
-  /** The shared Reset/Apply correlation the accepted Apply carries, if any. */
-  const [acceptedApplyCorrelationId, setAcceptedApplyCorrelationId] = useState<string | null>(null);
-  const [pendingApplyConfirmation, setPendingApplyConfirmation] = useState<
-    DeploymentCandidateOperationResponse | null
-  >(null);
-  /** Whether the pending confirmation is for an Apply or a Revert. */
-  const [pendingConfirmationAction, setPendingConfirmationAction] = useState<'apply' | 'revert'>('apply');
-  // What the disruptive-impact confirmation must carry to its Apply: the
-  // shared correlation and the exact activation scope the first Apply sent.
-  const pendingConfirmationContext = useRef<{
-    correlationId: string | undefined;
-    scope: DeploymentActivationScope | null;
-    /** A confirmed Revert stays a Revert of the Saved input, never an Apply. */
-    action: 'apply' | 'revert';
-  } | null>(null);
+  /** The Preview the operator confirms before the server-side Apply (§11). */
+  const [applyPreview, setApplyPreview] = useState<ApplyPreview | null>(null);
+  /** Whether the shown Preview is of the Draft's Apply or of a Revert to Saved. */
+  const [applyPreviewKind, setApplyPreviewKind] = useState<'apply' | 'revert'>('apply');
+  /**
+   * The Apply (or Revert) confirmation is open: it opens on click and shows
+   * "Previewing impact…" until its Preview arrives.
+   */
+  const [applyConfirmationOpen, setApplyConfirmationOpen] = useState(false);
+  const confirmationOpen = useRef(false);
+  const openConfirmation = useCallback((open: boolean) => {
+    confirmationOpen.current = open;
+    setApplyConfirmationOpen(open);
+    if (!open) setApplyPreview(null);
+  }, []);
   const mounted = useRef(true);
   const inFlight = useRef(false);
   const refreshSequence = useRef(0);
@@ -128,10 +115,10 @@ export function useDeploymentWorkspace(
       setError(null);
       setErrorCauseCode(null);
       setFeedback(null);
-      setPendingApplyConfirmation(null);
+      openConfirmation(false);
     }
     return () => { mounted.current = false; };
-  }, [enabled, refresh]);
+  }, [enabled, openConfirmation, refresh]);
 
   // A Draft edit (and Discard) only changes the Draft: it is also admitted
   // while a held run has all motion stopped, and it consumes no admission
@@ -161,8 +148,6 @@ export function useDeploymentWorkspace(
       ? `The Deployment could not be rechecked against Manager Applied: ${error} Refresh to retry.`
       : `${DEPLOYMENT_RECHECKING_REASON}…`;
   const published = authoring.published;
-  /** The complete activation input of the installed publication. */
-  const activationScope = useMemo(() => deploymentActivationScope(published), [published]);
 
   useEffect(() => {
     if (workspace === null || published === null) return;
@@ -189,7 +174,6 @@ export function useDeploymentWorkspace(
 
   const fence = useCallback((
     kind: 'edit' | 'document',
-    expected?: ExpectedDeploymentDraft,
   ): LocalWorkspaceFenceRequest | null => {
     if (
       (kind === 'edit' ? mutationUnavailableReason : documentUnavailableReason) !== null
@@ -197,14 +181,6 @@ export function useDeploymentWorkspace(
       || published === null
       || workspace === null
     ) return null;
-    if (expected !== undefined && (
-      published.identity.deploymentDraftId !== expected.draftId
-      || published.identity.deploymentDraftRevision !== expected.draftRevision
-    )) {
-      throw new DeploymentDraftChangedError(
-        `The Deployment Draft changed (revision ${published.identity.deploymentDraftRevision}, expected ${expected.draftRevision}).`,
-      );
-    }
     return deploymentLocalFence(
       published,
       snapshot,
@@ -217,12 +193,13 @@ export function useDeploymentWorkspace(
     operation: (requestFence: LocalWorkspaceFenceRequest) => Promise<DeploymentWorkspaceResponse>,
     message: string,
     kind: 'edit' | 'document',
+    command: AuthoringCommand,
     action?: 'discard',
   ) => {
     if (action && deploymentActionUnavailableReason(workspace, action, mutationUnavailableReason) !== null) return null;
     const requestFence = fence(kind);
     if (requestFence === null || snapshot === null || inFlight.current) return null;
-    if (!authoring.beginMutation(kind)) return null;
+    if (!authoring.beginMutation(kind, command)) return null;
     inFlight.current = true;
     setBusy(true);
     setError(null);
@@ -272,105 +249,92 @@ export function useDeploymentWorkspace(
     }
   }, [authoring, fence, refresh, snapshot, workspace, mutationUnavailableReason]);
 
-  const runApply = useCallback(async (
-    operation: (
-      requestFence: LocalWorkspaceFenceRequest,
-      scope: DeploymentActivationScope | null,
-    ) => Promise<DeploymentCandidateOperationResponse>,
-    message: string,
-    action: 'apply' | 'revert' = 'apply',
-    expected?: ExpectedDeploymentDraft,
-    /** The activation scope the operator confirmed; it must be unchanged. */
-    expectedScope?: DeploymentActivationScope | null,
-    correlationId?: string,
+  /**
+   * The one server-side Apply (CONTRACTS §11): the server disables, applies
+   * and prepares the affected components; they end prepared. Refused while a
+   * Program run is in progress; allowed during a cell latch.
+   */
+  const sendApply = useCallback(async (
+    operation: () => Promise<ApplyResult>,
+    failure: string,
+    command: 'apply' | 'revert',
   ) => {
-    if (deploymentActionUnavailableReason(workspace, action, documentUnavailableReason) !== null) return null;
-    const requestFence = fence('document', expected);
-    if (requestFence === null || snapshot === null || inFlight.current) return null;
-    if (expectedScope != null && !sameActivationScope(expectedScope, activationScope)) {
-      throw new DeploymentDraftChangedError(ACTIVATION_SCOPE_CHANGED);
-    }
-    const scope = expectedScope ?? activationScope;
-    if (!authoring.beginMutation()) return null;
+    // The server decides admission; the claim only names the operation and
+    // holds every conflicting command until the result arrives.
+    if (inFlight.current || !authoring.beginMutation('edit', command)) return null;
     inFlight.current = true;
     setBusy(true);
     setApplying(true);
     setError(null);
     setErrorCauseCode(null);
     setFeedback(null);
+    // The workspace is read again before the outcome is shown: the read
+    // clears the error it last showed.
     try {
-      const response = await operation(requestFence, scope);
-      const accepted = response.result.status === 'accepted' ? response.result.managerApply : null;
-      authoring.finishMutation(accepted === null ? null : {
-        applyId: accepted.applyId, applyGeneration: accepted.applyGeneration,
-      });
+      const result = await operation();
+      await refresh();
       if (mounted.current) {
-        // A required confirmation returns before the backend takes any claim,
-        // so it consumes no admission; waiting for a newer one would never end.
-        if (response.result.status !== 'confirmation_required') {
-          setCompletedAdmission({
-            receiverEpoch: snapshot.receiverEpoch,
-            generation: requestFence.expectedAdmissionGeneration,
-          });
-        }
-        refreshSequence.current += 1;
-        setWorkspace(response.workspace);
-        if (response.result.status === 'confirmation_required') {
-          pendingConfirmationContext.current = { correlationId, scope, action };
-          setPendingConfirmationAction(action);
-          setPendingApplyConfirmation(response);
-          setFeedback(null);
-        } else {
-          pendingConfirmationContext.current = null;
-          setPendingApplyConfirmation(null);
-          const managerApply = response.result.managerApply;
-          if (response.result.status === 'accepted' && managerApply !== null) {
-            setAcceptedApply({
-              applyId: managerApply.applyId,
-              applyGeneration: managerApply.applyGeneration,
-            });
-            setAcceptedApplyCorrelationId(correlationId ?? null);
-          }
-          setFeedback(
-            response.result.status === 'accepted'
-              ? 'Deployment activation accepted; progress is shown under Activity.'
-              : message,
-          );
-        }
+        if (result.outcome === 'failed') setError(applyResultText(result));
+        else setFeedback(applyResultText(result));
       }
-      return response;
+      return result;
     } catch (reason: unknown) {
-      authoring.finishMutation(null, reason);
-      if (mounted.current) setErrorCauseCode(preparationCauseCode(reason));
-      const message = errorMessage(
-        reason,
-        'Deployment Apply request failed.',
-      );
-      // Confirmation is a one-shot fence for one exact compiled candidate.
-      // A terminal request failure must return the UI to the ordinary Apply
-      // action instead of leaving a disabled confirmation overlay behind.
-      if (mounted.current) setPendingApplyConfirmation(null);
-      pendingConfirmationContext.current = null;
-      // A stale fence is also refused before any effect, but it needs the
-      // refresh below, so it is never handled as a plain refusal.
-      const refusal = isStaleWorkspaceError(reason) ? null : authoringRefusalMessage(reason);
-      if (refusal !== null) {
-        if (mounted.current) setError(refusal);
-        return null;
-      }
-      if (isStaleWorkspaceError(reason)) {
-        const latest = await refresh();
-        if (mounted.current && latest !== null) setError(message);
-      } else if (mounted.current) {
-        setError(message);
+      await refresh();
+      if (mounted.current) {
+        setError(cellApplyErrorText(reason, failure));
+        setErrorCauseCode(preparationCauseCode(reason));
       }
       return null;
     } finally {
+      authoring.finishMutation();
+      inFlight.current = false;
+      if (mounted.current) {
+        setBusy(false);
+        setApplying(false);
+      }
+    }
+  }, [authoring, refresh]);
+
+  /** An effect-free Preview, held as one operation like any other. */
+  const preview = useCallback(async (
+    kind: 'apply' | 'revert',
+    command: 'preview' | 'apply_preview' | 'revert_preview',
+  ): Promise<ApplyPreview | null> => {
+    if (inFlight.current || !authoring.beginMutation(kind === 'revert' ? 'document' : 'edit', command)) return null;
+    inFlight.current = true;
+    setBusy(true);
+    try {
+      return kind === 'revert' ? await api.cellApply.revertPreview() : await api.cellApply.preview();
+    } finally {
+      authoring.finishMutation();
       inFlight.current = false;
       if (mounted.current) setBusy(false);
-      if (mounted.current) setApplying(false);
     }
-  }, [activationScope, authoring, documentUnavailableReason, fence, refresh, snapshot, workspace]);
+  }, [authoring]);
+
+  const showPreview = useCallback(async (kind: 'apply' | 'revert'): Promise<ApplyPreview | null> => {
+    if (inFlight.current) return null;
+    setError(null);
+    setFeedback(null);
+    setApplyPreviewKind(kind);
+    openConfirmation(true);
+    try {
+      const shown = await preview(kind, kind === 'revert' ? 'revert_preview' : 'apply_preview');
+      // Cancelled while previewing: the late Preview is not shown.
+      if (mounted.current && confirmationOpen.current) {
+        if (shown === null) openConfirmation(false);
+        else setApplyPreview(shown);
+      }
+      return shown;
+    } catch (reason: unknown) {
+      if (mounted.current) {
+        openConfirmation(false);
+        setError(cellApplyErrorText(reason, kind === 'revert'
+          ? 'Deployment Revert preview request failed.' : 'Deployment Preview request failed.'));
+      }
+      return null;
+    }
+  }, [openConfirmation, preview]);
 
   const actions = useMemo(() => ({
     open: (path: string, confirmDiscard: boolean) => run(
@@ -379,6 +343,7 @@ export function useDeploymentWorkspace(
       ),
       'Deployment opened as Draft; Manager Applied was unchanged.',
       'document',
+      'open_draft',
     ),
     mutate: (
       path: Array<string | number>,
@@ -389,6 +354,7 @@ export function useDeploymentWorkspace(
         requestFence, path, operation, value,
       ),
       'Deployment Draft updated; Manager Applied was unchanged.',
+      'edit',
       'edit',
     ),
     /**
@@ -404,45 +370,41 @@ export function useDeploymentWorkspace(
       (requestFence) => api.deploymentWorkspace.addComponents(requestFence, rows, attachments),
       'Component added to the Deployment Draft; it runs only after Apply.',
       'edit',
+      'edit',
     ),
     /**
-     * Manager's convergence diff of the Draft against Applied. Effect-free:
-     * nothing is claimed or installed. Null when no request can be fenced;
-     * a refusal rejects with the owner's message.
+     * The per-component impact of applying the Draft (§11); effect-free.
+     * Null when another operation is in progress.
      */
-    previewDraft: () => {
-      const requestFence = fence('edit');
-      return requestFence === null
-        ? Promise.resolve(null)
-        : api.deploymentWorkspace.previewDraft(requestFence);
-    },
+    previewApply: (): Promise<ApplyPreview | null> => preview('apply', 'preview'),
     updateControlledStop: (update: DeploymentControlledStopUpdate) => run(
       (requestFence) => api.deploymentWorkspace.updateControlledStop(
         requestFence, update,
       ),
       'Controlled Stop Draft updated atomically; Manager Applied was unchanged.',
       'edit',
+      'edit',
     ),
     updateMotionTargetLimit: (
       controllableComponentId: string,
       commandTargetId: string,
       maximumTcpLinearSpeedMps: number,
-      tcpSpeedCheck?: TcpSpeedCheck,
     ) => run(
       (requestFence) => api.deploymentWorkspace.updateMotionTargetLimit(
         requestFence,
         controllableComponentId,
         commandTargetId,
         maximumTcpLinearSpeedMps,
-        tcpSpeedCheck,
       ),
       'Target maximum TCP speed updated in Draft; Manager Applied was unchanged.',
+      'edit',
       'edit',
     ),
     save: () => run(
       (requestFence) => api.deploymentWorkspace.save(requestFence),
       'Deployment Draft saved; Manager Applied was unchanged.',
       'document',
+      'save',
     ),
     saveAs: (path: string, confirmOverwrite: boolean) => run(
       (requestFence) => api.deploymentWorkspace.saveAs(
@@ -450,83 +412,51 @@ export function useDeploymentWorkspace(
       ),
       'Deployment Draft saved to the selected path; Manager Applied was unchanged.',
       'document',
+      'save_as',
     ),
     discard: () => run(
       (requestFence) => api.deploymentWorkspace.discard(requestFence),
       'Deployment Draft changes discarded; Manager Applied was unchanged.',
       'edit',
       'discard',
-    ),
-    revert: () => runApply(
-      (requestFence) => api.deploymentWorkspace.revert(requestFence),
-      'Saved Deployment was already current in Manager.',
-      'revert',
+      'discard',
     ),
     /**
-     * The ordinary Apply (Idle only; with a run, the Apply-after-Reset chain
-     * calls this once the run has ended). With `expectedDraft`, only exactly
-     * that Draft is Applied; otherwise it rejects with
-     * `DeploymentDraftChangedError` before anything is sent.
+     * Revert on the one Apply path (§11): Preview the Saved Scenario's impact,
+     * then the operator confirms it (`confirmApply`), which applies it.
      */
-    applyDraft: (
-      options: {
-        correlationId?: string;
-        expectedDraft?: ExpectedDeploymentDraft;
-        /** The complete activation input the operator confirmed. */
-        expectedScope?: DeploymentActivationScope | null;
-      } = {},
-    ) => {
-      if (documentUnavailableReason !== null || inFlight.current) return Promise.resolve(null);
-      pendingConfirmationContext.current = null;
-      setPendingApplyConfirmation(null);
-      return runApply(
-        (requestFence, scope) => api.deploymentWorkspace.applyDraft(
-          requestFence, null, undefined, options.correlationId, scope,
-        ),
-        'Deployment Draft compiled, applied by Manager, and rebound to the current Program.',
-        'apply',
-        options.expectedDraft,
-        options.expectedScope,
-        options.correlationId,
-      );
-    },
+    revert: () => (
+      deploymentActionUnavailableReason(workspace, 'revert', documentUnavailableReason) !== null
+        ? Promise.resolve(null)
+        : showPreview('revert')
+    ),
+    /**
+     * Apply: Preview the impact (effect-free, so also while a run is held),
+     * then the operator confirms it (`confirmApply`, or Reset and Apply).
+     * Resolves to the Preview, or null when it was refused.
+     */
+    applyDraft: () => (mutationUnavailableReason !== null ? Promise.resolve(null) : showPreview('apply')),
+    /**
+     * The Apply of a Preview confirmed earlier, sent by Reset and Apply once
+     * the run's Reset settled (AUD-4). Resolves to null when it was refused.
+     */
+    applyConfirmedScope: (scope: ApplyPreview['scope']) => (
+      sendApply(() => api.cellApply.apply(scope), 'Deployment Apply request failed.', 'apply')
+    ),
+    /**
+     * Send the Apply (or Revert) the operator confirmed, bound to the Preview
+     * shown: the server refuses it when the input changed since.
+     */
     confirmApply: () => {
-      if (documentUnavailableReason !== null || inFlight.current) return Promise.resolve(null);
-      const token = pendingApplyConfirmation?.result.confirmationToken ?? null;
-      const preparation = pendingApplyConfirmation?.result.preparation ?? null;
-      if (token === null || preparation === null) return Promise.resolve(null);
-      // Confirmation is only the user's authorization boundary. Once the
-      // exact token and preparation identity have been captured, close the
-      // overlay before dispatching the potentially long-running Apply. The
-      // ordinary workspace busy/error state owns progress from this point.
-      // The confirmed impact belongs to the exact input the first Apply sent
-      // and to its shared Reset/Apply correlation: carry both to the Apply.
-      const context = pendingConfirmationContext.current;
-      pendingConfirmationContext.current = null;
-      setPendingApplyConfirmation(null);
-      if (context?.action === 'revert') {
-        return runApply(
-          (requestFence) => api.deploymentWorkspace.revert(requestFence, { token, preparation }),
-          'Saved Scenario restored through the authoritative Apply.',
-          'revert',
-        );
-      }
-      return runApply(
-        (requestFence, scope) => api.deploymentWorkspace.applyDraft(
-          requestFence, { token, preparation }, undefined, context?.correlationId, scope,
-        ),
-        'Deployment Draft compiled, applied by Manager, and rebound to the current Program.',
-        'apply',
-        undefined,
-        context?.scope ?? null,
-        context?.correlationId,
-      );
+      if (applyPreview === null) return Promise.resolve(null);
+      const { scope } = applyPreview;
+      openConfirmation(false);
+      return applyPreviewKind === 'revert'
+        ? sendApply(() => api.cellApply.revert(scope), 'Deployment Revert request failed.', 'revert')
+        : sendApply(() => api.cellApply.apply(scope), 'Deployment Apply request failed.', 'apply');
     },
-    cancelApplyConfirmation: () => {
-      pendingConfirmationContext.current = null;
-      setPendingApplyConfirmation(null);
-    },
-  }), [documentUnavailableReason, fence, pendingApplyConfirmation, run, runApply, workspace]);
+    cancelApplyConfirmation: () => openConfirmation(false),
+  }), [applyPreview, applyPreviewKind, documentUnavailableReason, mutationUnavailableReason, openConfirmation, preview, run, sendApply, showPreview, workspace]);
 
   return {
     workspace,
@@ -536,11 +466,11 @@ export function useDeploymentWorkspace(
     error,
     errorCauseCode,
     feedback,
-    acceptedApply,
-    acceptedApplyCorrelationId,
-    activationScope,
-    pendingApplyConfirmation,
-    pendingConfirmationAction: pendingApplyConfirmation === null ? null : pendingConfirmationAction,
+    /** The authoring operation in progress (busy label and tooltip), or null. */
+    busyOperation: authoring.operation,
+    applyConfirmationOpen,
+    applyPreview,
+    applyPreviewKind,
     mutationAvailable,
     mutationUnavailableReason,
     documentUnavailableReason,

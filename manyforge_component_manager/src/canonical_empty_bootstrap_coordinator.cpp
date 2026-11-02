@@ -235,7 +235,7 @@ ProjectionBootstrapIntentDTO SceneIntent(
       admission.retained_bundle().value(),
       {},
   };
-  if (!intent.valid() || !intent.native_runtime_bindings.empty()) {
+  if (!intent.valid() || !intent.execution_host_bindings.empty()) {
     Fail("canonical-empty scene bootstrap intent is invalid");
   }
   return intent;
@@ -252,7 +252,7 @@ bool IntentExactlyMatchesAdmission(
              admission.retained_bundle_id() &&
          intent.canonical_empty_graph_revision ==
              admission.graph_revision() &&
-         intent.native_runtime_bindings.empty();
+         intent.execution_host_bindings.empty();
 }
 
 bool TargetExactlyMatches(
@@ -337,7 +337,7 @@ bool ZeroNativeEvidenceExactlyMatches(
     const ProjectionBootstrapEvidenceDTO& evidence,
     const ManagerBootstrapIntentDTO& intent,
     const ManagerBootstrapAcceptedTargetDTO& target) {
-  return intent.native_runtime_bindings.empty() &&
+  return intent.execution_host_bindings.empty() &&
          evidence.matches_bootstrap(
              intent.bootstrap_id,
              intent.bootstrap_generation,

@@ -164,7 +164,7 @@ TEST(PreparedPlanningCodecTest, CartesianFidelityEvidenceIsClosedValidatedAndIde
   const double end = trajectory.waypoints.back().time_from_start_s;
   trajectory.cartesian_waypoint_times_s = {0.0, end};
   trajectory.cartesian_fidelity_metrics = CartesianFidelityMetricsDTO{
-      0.005, 0.05, 0.001, 0.01, 0.0005, 0.002, 0.0015, 0.012, 0.01, 0.005, 2U};
+      0.005, 0.05, 0.001, 0.01, 0.0005, 0.002, 0.0015, 0.012};
   const auto encoded = EncodePreparedTrajectory(trajectory);
   ASSERT_TRUE(encoded.ok()) << encoded.error().message;
   const auto decoded = DecodePreparedTrajectory(encoded.value());
@@ -229,34 +229,6 @@ TEST(PreparedPlanningCodecTest, MovingPlanningBudgetIsOptionalClosedAndRoundTrip
   }
   request.moving_replacement->remaining_planning_budget_s.reset();
   EXPECT_EQ(EncodePreparedPlanRequest(request).value(), legacy.value());
-}
-
-TEST(PreparedPlanningCodecTest, SpeedCheckFrameSetsAreOptionalClosedAndRoundTrip) {
-  auto request = MovingRequest();
-  const auto tcp_only = EncodePreparedPlanRequest(request);
-  ASSERT_TRUE(tcp_only.ok()) << tcp_only.error().message;
-  EXPECT_EQ(tcp_only.value().find("speed_check_frames"), std::string::npos);
-  const ResolvedFrameDTO flange = ResolvedComponentModelFrameDTO{
-      request.controllable_component_id, request.model_group_binding.model_instance_id,
-      FrameRoleId("flange"), "mf2_flange", request.model_group_binding.model_revision};
-  request.speed_check_frames = {request.tcp_frame, flange};
-  request.moving_replacement->source_speed_check_frames = {request.tcp_frame};
-  const auto encoded = EncodePreparedPlanRequest(request);
-  ASSERT_TRUE(encoded.ok()) << encoded.error().message;
-  const auto decoded = DecodePreparedPlanRequest(encoded.value());
-  ASSERT_TRUE(decoded.ok()) << decoded.error().message;
-  EXPECT_EQ(decoded.value().speed_check_frames, request.speed_check_frames);
-  EXPECT_EQ(decoded.value().moving_replacement->source_speed_check_frames,
-            std::vector<ResolvedFrameDTO>{request.tcp_frame});
-  EXPECT_EQ(EncodePreparedPlanRequest(decoded.value()).value(), encoded.value());
-  // A present set is never empty.
-  auto empty = encoded.value();
-  const auto at = empty.find("\"speed_check_frames\":[");
-  ASSERT_NE(at, std::string::npos);
-  const auto end = empty.find(']', at);
-  ASSERT_NE(end, std::string::npos);
-  empty.replace(at, end + 1U - at, "\"speed_check_frames\":[]");
-  EXPECT_FALSE(DecodePreparedPlanRequest(empty).ok());
 }
 
 TEST(PreparedPlanningCodecTest, MovingRequestBindsSourceTimeFramesAndClosedContext) {

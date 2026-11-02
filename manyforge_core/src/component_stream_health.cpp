@@ -212,6 +212,16 @@ struct ComponentStreamHealth::Shared final {
     return verdict;
   }
 
+  void MarkStaleLocked(StreamRecorder::Slot& slot) {
+    slot.state = StreamLivenessStateDTO::kStale;
+    slot.absent_classified = false;
+    // A `fault` stream never latches here: its latch is the incident.
+    if (slot.effective.recovery == StreamRecoveryDTO::kAck &&
+        slot.effective.severity != StreamSeverityDTO::kFault)
+      slot.latched = true;
+    dirty.insert(slot.component);
+  }
+
   void PushDeadlineLocked(const std::shared_ptr<StreamRecorder::Slot>& slot, const std::int64_t at_ns) {
     deadlines.push({at_ns, slot->serial, slot});
   }
@@ -234,7 +244,12 @@ struct ComponentStreamHealth::Shared final {
         slot->notify_pending.store(false);
         if (!self->CurrentLocked(slot)) continue;
         const auto advanced = slot->last_advance_ns.load();
-        if (advanced == kNever || now - advanced >= slot->effective.budget_ns) continue;
+        if (advanced == kNever) continue;
+        if (now - advanced >= slot->effective.budget_ns) {
+          // Classified after its budget: stale like any expired sample.
+          if (slot->state == StreamLivenessStateDTO::kAbsent) self->MarkStaleLocked(*slot);
+          continue;
+        }
         if (slot->state != StreamLivenessStateDTO::kLive) {
           slot->state = StreamLivenessStateDTO::kLive;
           slot->absent_classified = false;
@@ -275,12 +290,7 @@ struct ComponentStreamHealth::Shared final {
           self->PushDeadlineLocked(slot, advanced + budget);
           continue;
         }
-        slot->state = StreamLivenessStateDTO::kStale;
-        // A `fault` stream never latches here: its latch is the incident.
-        if (slot->effective.recovery == StreamRecoveryDTO::kAck &&
-            slot->effective.severity != StreamSeverityDTO::kFault)
-          slot->latched = true;
-        self->dirty.insert(slot->component);
+        self->MarkStaleLocked(*slot);
       }
       for (const auto& component : self->dirty) {
         auto verdict = self->VerdictLocked(component);

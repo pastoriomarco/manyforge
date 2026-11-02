@@ -187,6 +187,30 @@ projected_shape(const core::CollisionGeometryDescriptor &geometry) {
 
 /// Logical collision body id to its native worker-scene names.
 using NativeBodies = std::map<core::CollisionBodyId, std::vector<std::string>>;
+using NativePairs = std::set<std::pair<std::string, std::string>>;
+
+/// Adds the canonical native pairs of one logical pair.
+void add_native_pairs(const NativeBodies &native_bodies,
+                      const core::CollisionPairId &pair, NativePairs &out) {
+  const auto left = native_bodies.find(pair.body_a);
+  const auto right = native_bodies.find(pair.body_b);
+  if (left == native_bodies.end() || right == native_bodies.end()) {
+    throw std::invalid_argument(
+        "retained collision policy names an absent body");
+  }
+  for (const auto &first : left->second) {
+    for (const auto &second : right->second) {
+      if (first == second) {
+        continue;
+      }
+      out.emplace(std::min(first, second), std::max(first, second));
+      if (out.size() > kMaximumProjectedWorkerAllowedPairs) {
+        throw std::invalid_argument(
+            "retained worker projection exceeds the allowed-pair bound");
+      }
+    }
+  }
+}
 
 [[nodiscard]] RoboPlanWorkerModelDTO
 project_worker_model(const RoboPlanWorkerModelDTO &base,
@@ -232,54 +256,48 @@ project_worker_model(const RoboPlanWorkerModelDTO &base,
     }
   }
 
-  std::set<std::pair<std::string, std::string>> allowed;
-  const auto add_allowed = [&](const core::CollisionPairId &pair) {
-    const auto left = native_bodies.find(pair.body_a);
-    const auto right = native_bodies.find(pair.body_b);
-    if (left == native_bodies.end() || right == native_bodies.end()) {
-      throw std::invalid_argument(
-          "retained collision policy names an absent body");
-    }
-    for (const auto &first : left->second) {
-      for (const auto &second : right->second) {
-        if (first == second) {
-          continue;
-        }
-        allowed.emplace(std::min(first, second), std::max(first, second));
-        if (allowed.size() > kMaximumProjectedWorkerAllowedPairs) {
-          throw std::invalid_argument(
-              "retained worker projection exceeds the allowed-pair bound");
-        }
-      }
-    }
-  };
+  // The selected contact policy's pairs are not part of the worker scene:
+  // they travel with each request (native_contact_pairs).
+  NativePairs allowed;
   for (const auto &pair : projection.policy->allowed_static_static_pairs) {
-    add_allowed(pair);
+    add_native_pairs(native_bodies, pair, allowed);
   }
   for (const auto &pair : projection.policy->allowed_touch_link_pairs) {
-    add_allowed(pair);
+    add_native_pairs(native_bodies, pair, allowed);
   }
   for (const auto &contact : projection.policy->support_contacts) {
-    add_allowed(contact.pair);
-  }
-  if (projection.contact_policy_id) {
-    const auto active = std::find_if(
-        projection.policy->contact_grasps.begin(),
-        projection.policy->contact_grasps.end(), [&](const auto &entry) {
-          return entry.policy_id == *projection.contact_policy_id;
-        });
-    if (active != projection.policy->contact_grasps.end()) {
-      // Only the bound operation's exact body/object pairs are relaxed for
-      // candidate generation; the final coordinator still checks window/depth.
-      for (const auto &pair : core::build_selected_collision_distance_pairs(
-               *projection.policy, *projection.world, *projection.contact_policy_id)) {
-        if (core::contact_grasp_pair_matches(pair, *active)) add_allowed(pair);
-      }
-    }
+    add_native_pairs(native_bodies, contact.pair, allowed);
   }
   model.allowed_collision_pairs.assign(allowed.begin(), allowed.end());
   native_bodies_out = std::move(native_bodies);
   return model;
+}
+
+/// The selected contact policy's allowed pairs as native worker-scene pairs.
+/// Only the bound operation's exact body/object pairs are relaxed for
+/// candidate generation; the final coordinator still checks window/depth.
+[[nodiscard]] std::vector<std::pair<std::string, std::string>>
+native_contact_pairs(const NativeBodies &native_bodies,
+                     const RoboPlanCandidateProjectionDTO &projection) {
+  if (!projection.contact_policy_id) {
+    return {};
+  }
+  const auto active = std::find_if(
+      projection.policy->contact_grasps.begin(),
+      projection.policy->contact_grasps.end(), [&](const auto &entry) {
+        return entry.policy_id == *projection.contact_policy_id;
+      });
+  if (active == projection.policy->contact_grasps.end()) {
+    return {};
+  }
+  NativePairs allowed;
+  for (const auto &pair : core::build_selected_collision_distance_pairs(
+           *projection.policy, *projection.world, *projection.contact_policy_id)) {
+    if (core::contact_grasp_pair_matches(pair, *active)) {
+      add_native_pairs(native_bodies, pair, allowed);
+    }
+  }
+  return {allowed.begin(), allowed.end()};
 }
 
 /// The Kernel's logical clearance margins as native worker-scene pairs. Two
@@ -698,10 +716,11 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
     core::ProjectionRevisionDTO projection_revision;
     core::CollisionWorldRevision world_revision;
     core::CollisionPolicyRevision policy_revision;
-    std::optional<std::string> contact_policy_id;
-    /// Not part of the worker identity: the margins travel with each plan.
+    /// Not part of the worker identity: the margins and the selected contact
+    /// policy's pairs travel with each request.
     NativeBodies native_bodies;
     std::vector<RoboPlanPairMarginDTO> pair_margins;
+    std::vector<std::pair<std::string, std::string>> contact_pairs;
 
     [[nodiscard]] bool
     matches(const RoboPlanCandidateProjectionDTO &candidate) const noexcept {
@@ -712,8 +731,7 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
                  candidate.world->revision.revision_id &&
              world_revision.content_hash ==
                  candidate.world->revision.content_hash &&
-             policy_revision == candidate.policy->revision &&
-             contact_policy_id == candidate.contact_policy_id;
+             policy_revision == candidate.policy->revision;
     }
   };
 
@@ -811,15 +829,19 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
     if (const auto current = selection.load(std::memory_order_acquire);
         current && current->matches(projection)) {
       std::vector<RoboPlanPairMarginDTO> margins;
+      std::vector<std::pair<std::string, std::string>> contact_pairs;
       try {
         margins = native_pair_margins(current->native_bodies,
                                       projection.clearance_margins.get());
+        contact_pairs = native_contact_pairs(current->native_bodies, projection);
       } catch (const std::exception &exception) {
         return margin_failure(exception);
       }
-      if (margins != current->pair_margins) {
+      if (margins != current->pair_margins ||
+          contact_pairs != current->contact_pairs) {
         auto updated = std::make_shared<ProjectionSelection>(*current);
         updated->pair_margins = std::move(margins);
+        updated->contact_pairs = std::move(contact_pairs);
         selection.store(std::move(updated), std::memory_order_release);
       }
       return core::Result<void>::Ok();
@@ -834,10 +856,12 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
     RoboPlanWorkerModelDTO projected;
     NativeBodies native_bodies;
     std::vector<RoboPlanPairMarginDTO> pair_margins;
+    std::vector<std::pair<std::string, std::string>> contact_pairs;
     try {
       projected = project_worker_model(source, config, projection, native_bodies);
       pair_margins =
           native_pair_margins(native_bodies, projection.clearance_margins.get());
+      contact_pairs = native_contact_pairs(native_bodies, projection);
     } catch (const SceneMeshContentChangedError &exception) {
       return core::Result<void>::Err(
           error(core::ErrorCode::kInvalidRequest,
@@ -864,19 +888,48 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
         current && current->matches(projection)) {
       auto updated = std::make_shared<ProjectionSelection>(*current);
       updated->pair_margins = std::move(pair_margins);
+      updated->contact_pairs = std::move(contact_pairs);
       selection.store(std::move(updated), std::memory_order_release);
       return core::Result<void>::Ok();
     }
-    shutdown_worker();
+    // A new revision whose worker scene is byte-identical keeps the worker:
+    // it would rebuild exactly the scene it already holds.
+    if (!loads_same_scene(projected)) {
+      shutdown_worker();
+    }
     model = std::move(projected);
     selection.store(
         std::make_shared<const ProjectionSelection>(ProjectionSelection{
             projection.projection_binding.projection_revision,
             projection.world->revision, projection.policy->revision,
-            projection.contact_policy_id, std::move(native_bodies),
-            std::move(pair_margins)}),
+            std::move(native_bodies), std::move(pair_margins),
+            std::move(contact_pairs)}),
         std::memory_order_release);
     return core::Result<void>::Ok();
+  }
+
+  /// Compares the initialization the worker loads, so equal bytes mean an
+  /// identical worker scene. A relative scene mesh is re-hashed by each new
+  /// worker generation, so such a projection always restarts the worker.
+  /// Guarded by request_mutex.
+  [[nodiscard]] bool
+  loads_same_scene(const RoboPlanWorkerModelDTO &projected) const {
+    if (std::any_of(projected.geometries.begin(), projected.geometries.end(),
+                    [](const auto &geometry) {
+                      return geometry.scene_mesh_content_digest.has_value();
+                    })) {
+      return false;
+    }
+    try {
+      return worker_protocol::encode_initialization(
+                 worker_protocol::WorkerInitializationDTO{
+                     model, binding, candidate_config}) ==
+             worker_protocol::encode_initialization(
+                 worker_protocol::WorkerInitializationDTO{
+                     projected, binding, candidate_config});
+    } catch (const std::exception &) {
+      return false;
+    }
   }
 
   [[nodiscard]] core::Result<void>
@@ -912,6 +965,27 @@ struct ProcessContainedRoboPlanCandidateClient::Impl final {
     ++base_model_generation;
     model = replacement;
     selection.store(nullptr, std::memory_order_release);
+    return core::Result<void>::Ok();
+  }
+
+  [[nodiscard]] core::Result<void>
+  replace_settings(const RoboPlanCandidateComputerConfig &replacement) {
+    std::lock_guard lock(request_mutex);
+    // Equal initialization bytes: the running worker already has them.
+    if (worker_protocol::encode_initialization(
+            worker_protocol::WorkerInitializationDTO{model, binding, candidate_config}) ==
+        worker_protocol::encode_initialization(
+            worker_protocol::WorkerInitializationDTO{model, binding, replacement})) {
+      return core::Result<void>::Ok();
+    }
+    if (active_request.load(std::memory_order_acquire)) {
+      return core::Result<void>::Err(
+          error(core::ErrorCode::kInvalidStateTransition,
+                "RoboPlan worker settings changed during an active request",
+                "native_planner_settings_replacement_busy"));
+    }
+    shutdown_worker();
+    candidate_config = replacement;
     return core::Result<void>::Ok();
   }
 
@@ -1290,10 +1364,12 @@ ProcessContainedRoboPlanCandidateClient::binding() const noexcept {
 core::Result<core::TrajectoryDTO>
 ProcessContainedRoboPlanCandidateClient::compute(
     const RoboPlanCandidateRequestDTO &selected_request) {
-  // The selected projection's clearance margins travel with this plan.
+  // The selected projection's clearance margins and contact-policy pairs
+  // travel with this plan.
   auto request = selected_request;
   if (const auto selected = impl_->selection.load(std::memory_order_acquire)) {
     request.collision_pair_margins = selected->pair_margins;
+    request.contact_allowed_pairs = selected->contact_pairs;
   }
   return impl_->transact<core::TrajectoryDTO>(
       MessageType::kPlan, MessageType::kPlanResult,
@@ -1343,13 +1419,19 @@ ProcessContainedRoboPlanCandidateClient::solve_ik(
     const core::Pose3DTO &goal, const core::ResolvedFrameDTO &base_frame,
     const core::ResolvedFrameDTO &tcp_frame,
     const core::ControlledStateDTO &seed_state, double timeout_s) {
+  // The selected contact policy's pairs travel with this solve.
+  std::vector<std::pair<std::string, std::string>> contact_pairs;
+  if (const auto selected = impl_->selection.load(std::memory_order_acquire)) {
+    contact_pairs = selected->contact_pairs;
+  }
   return impl_->transact<std::vector<double>>(
       MessageType::kIk, MessageType::kIkResult, timeout_s, true,
-      [&goal, &base_frame, &tcp_frame, &seed_state,
-       timeout_s](Clock::time_point) {
+      [&goal, &base_frame, &tcp_frame, &seed_state, timeout_s,
+       &contact_pairs](Clock::time_point) {
         return worker_protocol::encode_ik_request(
             worker_protocol::WorkerIkRequestDTO{goal, base_frame, tcp_frame,
-                                                seed_state, timeout_s});
+                                                seed_state, timeout_s,
+                                                contact_pairs});
       },
       [](std::string_view bytes) {
         return worker_protocol::decode_ik_result(bytes);
@@ -1371,6 +1453,12 @@ core::Result<void>
 ProcessContainedRoboPlanCandidateClient::replace_retained_model(
     const RoboPlanWorkerModelDTO &model) {
   return impl_->replace_model(model);
+}
+
+core::Result<void>
+ProcessContainedRoboPlanCandidateClient::replace_retained_settings(
+    const RoboPlanCandidateComputerConfig &settings) {
+  return impl_->replace_settings(settings);
 }
 
 void ProcessContainedRoboPlanCandidateClient::request_cancel() noexcept {

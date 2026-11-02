@@ -27,16 +27,14 @@ const std::string &Text(const CanonicalValue &value, const std::string &label) {
   return value.as_string();
 }
 
+/// The Deployment's portable id (`^[a-z][a-z0-9._-]{0,127}$`), the rule the
+/// compilers and the GUI apply to `device_address_ref`.
 [[nodiscard]] bool IsPortableId(const std::string_view value) noexcept {
-  const auto alphanumeric = [](const char character) {
-    return (character >= 'a' && character <= 'z') ||
-           (character >= 'A' && character <= 'Z') ||
-           (character >= '0' && character <= '9');
-  };
-  return !value.empty() && value.size() <= 128U && alphanumeric(value.front()) &&
+  const auto lower = [](const char character) { return character >= 'a' && character <= 'z'; };
+  return !value.empty() && value.size() <= 128U && lower(value.front()) &&
          std::all_of(value.begin() + 1, value.end(), [&](const char character) {
-           return alphanumeric(character) || character == '.' ||
-                  character == '_' || character == '-';
+           return lower(character) || (character >= '0' && character <= '9') ||
+                  character == '.' || character == '_' || character == '-';
          });
 }
 
@@ -139,6 +137,37 @@ ResolveSiteDeviceAddress(const std::optional<SiteSettings> &settings,
         "site settings name no address for this device reference", details});
   }
   return core::Result<std::string>::Ok(found->second);
+}
+
+deployment::SiteFacts SiteFactsOf(const std::optional<SiteSettings> &settings) {
+  deployment::SiteFacts facts;
+  facts.configured = settings.has_value();
+  if (settings.has_value())
+    facts.device_addresses.insert(settings->device_addresses().begin(),
+                                  settings->device_addresses().end());
+  return facts;
+}
+
+core::Result<std::string> ResolveSpecDeviceAddress(const deployment::ComponentSpec &spec,
+                                                   const std::string_view device_address_ref) {
+  const std::map<std::string, std::string> details{
+      {"device_address_ref", std::string(device_address_ref)}};
+  if (!spec.site_configured)
+    return core::Result<std::string>::Err(core::ErrorDTO{
+        std::string(kSiteSettingsUnavailable),
+        "no site settings file is configured for this machine", details});
+  const auto found = spec.device_addresses.find(device_address_ref);
+  if (found == spec.device_addresses.end() || !found->second)
+    return core::Result<std::string>::Err(core::ErrorDTO{
+        std::string(kSiteDeviceAddressRefUnknown),
+        "site settings name no address for this device reference", details});
+  return core::Result<std::string>::Ok(*found->second);
+}
+
+deployment::SiteFacts SiteFactsOfDocument(const std::optional<std::string> &document) {
+  return SiteFactsOf(document.has_value()
+                         ? std::optional<SiteSettings>(ParseSiteSettings(*document))
+                         : std::nullopt);
 }
 
 } // namespace manyforge::component_manager

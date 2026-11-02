@@ -1,8 +1,16 @@
 #include "execution_host_commands.hpp"
+#include "execution_host_posix.hpp"
 #include "execution_host_responses.hpp"
 
 #include <gtest/gtest.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
 #include <algorithm>
+#include <cerrno>
+#include <cstring>
+#include <filesystem>
+#include <string>
 #include <limits>
 #include <stdexcept>
 #include <manyforge_content_identity/content_identity.hpp>
@@ -16,6 +24,51 @@ TEST(ToolPayloadCommandCodec, RemovedBridgeCommandIsRejected) {
       {"api_version", Value(std::string(kCommandApiVersion))},
       {"command", Value("apply_tool_payload")}}));
   EXPECT_THROW(DecodeCommand(command), std::exception);
+}
+
+Command DecodeSetIoOutput(Value request) {
+  return DecodeCommand(content_identity::canonical_json(Value(Value::Object{
+      {"api_version", Value(std::string(kCommandApiVersion))},
+      {"command", Value("set_io_output")},
+      {"request", std::move(request)}})));
+}
+
+TEST(SetIoOutputCommandCodec, DecodesTheContractShape) {
+  // CONTRACTS §7, as manyforge_headless_api/execution.py sends it.
+  const auto command = DecodeSetIoOutput(Value(Value::Object{
+      {"origin", Value("manual")}, {"signal_id", Value("lite6_robot_controller_io/CO1")}, {"value", Value(true)}}));
+  EXPECT_EQ(command.kind, CommandKind::kSetIoOutput);
+  EXPECT_TRUE(command.io_output_manual);
+  ASSERT_TRUE(command.io_output_signal.has_value());
+  EXPECT_EQ(command.io_output_signal->controllable_component_id.value(),
+            "lite6_robot_controller_io");
+  EXPECT_EQ(command.io_output_signal->name, "CO1");
+  EXPECT_EQ(command.io_output_value, (std::variant<bool, double>(true)));
+  const auto analog = DecodeSetIoOutput(Value(Value::Object{
+      {"origin", Value("program")}, {"signal_id", Value("plc/AO0")}, {"value", Value(2.5)}}));
+  EXPECT_EQ(analog.io_output_value, (std::variant<bool, double>(2.5)));
+  EXPECT_FALSE(analog.io_output_manual);
+}
+
+TEST(SetIoOutputCommandCodec, RefusesMalformedRequests) {
+  EXPECT_THROW(DecodeSetIoOutput(Value(Value::Object{
+                   {"origin", Value("manual")}, {"signal_id", Value("no_slash")}, {"value", Value(true)}})),
+               std::exception);
+  EXPECT_THROW(DecodeSetIoOutput(Value(Value::Object{
+                   {"origin", Value("manual")}, {"signal_id", Value("plc/")}, {"value", Value(true)}})),
+               std::exception);
+  EXPECT_THROW(DecodeSetIoOutput(Value(Value::Object{
+                   {"origin", Value("manual")}, {"signal_id", Value("plc/DO0")}, {"value", Value("on")}})),
+               std::exception);
+  EXPECT_THROW(DecodeSetIoOutput(Value(Value::Object{{"signal_id", Value("plc/DO0")}})),
+               std::exception);
+  // `origin` is required and is `manual` or `program`.
+  EXPECT_THROW(DecodeSetIoOutput(Value(Value::Object{
+                   {"signal_id", Value("plc/DO0")}, {"value", Value(true)}})),
+               std::exception);
+  EXPECT_THROW(DecodeSetIoOutput(Value(Value::Object{
+                   {"origin", Value("operator")}, {"signal_id", Value("plc/DO0")}, {"value", Value(true)}})),
+               std::exception);
 }
 
 Value Row(std::string name, std::string type, Value value) {
@@ -476,6 +529,53 @@ TEST(VolatileMotionTraceCommandTest, OrdinaryReadHasBoundedAllowanceAndNoControl
   for (const double invalid : {0.0, -1.0, 0.5, 3145729.0})
     EXPECT_THROW((void)DecodeCommand(request(invalid)), std::exception);
 }
+
+// The trace export broke once a trace outgrew the default unix send buffer
+// (212992 bytes): the listener's SO_SNDBUF never reaches an accepted socket,
+// so the host's send failed and the client saw an empty response. The
+// capacity is configured and measured on the accepted client itself, and a
+// response of exactly that size crosses the real socket in one packet.
+TEST(VolatileMotionTraceCommandTest, AcceptedClientCarriesItsAtomicResponseCapacity) {
+  const auto root = std::filesystem::temp_directory_path() /
+                    ("mf-response-capacity-" + std::to_string(::getpid()));
+  std::filesystem::create_directories(root);
+  {
+    const CommandSocket listener(root, "capacity.sock");
+    FileDescriptor client(::socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0));
+    ASSERT_TRUE(client);
+    const int receive_bytes = static_cast<int>(kMaximumResponseBytes);
+    ASSERT_EQ(::setsockopt(client.get(), SOL_SOCKET, SO_RCVBUF, &receive_bytes,
+                           sizeof(receive_bytes)), 0);
+    sockaddr_un address{};
+    address.sun_family = AF_UNIX;
+    const auto path = (root / "capacity.sock").string();
+    std::memcpy(address.sun_path, path.c_str(), path.size() + 1U);
+    ASSERT_EQ(::connect(client.get(), reinterpret_cast<sockaddr *>(&address),
+                        sizeof(address)), 0);
+    FileDescriptor accepted(::accept4(listener.get(), nullptr, nullptr, SOCK_CLOEXEC));
+    ASSERT_TRUE(accepted);
+    int initial = 0;
+    socklen_t initial_size = sizeof(initial);
+    ASSERT_EQ(::getsockopt(accepted.get(), SOL_SOCKET, SO_SNDBUF, &initial,
+                           &initial_size), 0);
+
+    const auto capacity = AtomicResponseCapacity(accepted.get());
+    EXPECT_GT(capacity, static_cast<std::size_t>(initial) - 32U);
+    EXPECT_LE(capacity, kMaximumResponseBytes);
+    const std::string payload(capacity, 'x');
+    ASSERT_EQ(::send(accepted.get(), payload.data(), payload.size(), MSG_NOSIGNAL),
+              static_cast<ssize_t>(payload.size()));
+    std::string received(kMaximumResponseBytes, '\0');
+    EXPECT_EQ(::recv(client.get(), received.data(), received.size(), 0),
+              static_cast<ssize_t>(payload.size()));
+    if (capacity < kMaximumResponseBytes) {
+      const std::string oversized(capacity + 1U, 'x');
+      EXPECT_EQ(::send(accepted.get(), oversized.data(), oversized.size(), MSG_NOSIGNAL), -1);
+      EXPECT_EQ(errno, EMSGSIZE);
+    }
+  }
+  std::filesystem::remove_all(root);
+}
 }  // namespace
 
 // Active TCP (M7, T-MQ17): the motion's TCP is the three-form selector; the
@@ -498,7 +598,6 @@ TEST(MotionEndpointCommandCodecTest,
       {"timeouts", Value(Value::Object{{"planning_timeout_s", Value(2.0)},
                                        {"execution_timeout_s", Value(5.0)}})},
       {"cache_mode", Value("default")},
-      {"planning_profile", Value("first_feasible")},
       {"target_mode", Value("absolute")},
       {"target_reference", Value(nullptr)},
       {"offset_reference", Value(nullptr)},
@@ -604,6 +703,32 @@ TEST(MotionEndpointCommandCodecTest,
                               Replace(endpoint, "entry",
                                       Replace(entry, "frame_role_id", Value(""))))),
                std::exception);
+  // The planner block: absent or null keeps the Deployment's; set members
+  // override; unknown members and out-of-range values are refused.
+  EXPECT_EQ(std::get<core::MotionParticipantIntentDTO>(own.participants.front().payload)
+                .planner,
+            core::PlannerOverrideDTO{});
+  EXPECT_EQ(std::get<core::MotionParticipantIntentDTO>(
+                decode(Replace(payload, "planner", Value(nullptr))).participants.front().payload)
+                .planner,
+            core::PlannerOverrideDTO{});
+  const Value planner(Value::Object{{"search", Value("rrt")},
+                                    {"optimize", Value("best_of_n")},
+                                    {"n", Value(5.0)},
+                                    {"max_nodes", Value(nullptr)}});
+  const auto planned = decode(Replace(payload, "planner", planner));
+  EXPECT_EQ(std::get<core::MotionParticipantIntentDTO>(planned.participants.front().payload)
+                .planner,
+            (core::PlannerOverrideDTO{core::PlannerSearchDTO::kRrt,
+                                      core::PlannerOptimizeDTO::kBestOfN, 5U,
+                                      std::nullopt, std::nullopt}));
+  EXPECT_THROW(decode(Replace(payload, "planner", Replace(planner, "extra", Value(true)))),
+               std::exception);
+  EXPECT_THROW(decode(Replace(payload, "planner", Replace(planner, "n", Value(1.0)))),
+               std::exception);
+  EXPECT_THROW(decode(Replace(payload, "planner",
+                              Replace(planner, "optimize", Value("balanced")))),
+               std::exception);
   std::erase_if(fields,
                 [](const auto &row) { return row.first == "tcp_endpoint"; });
   EXPECT_THROW(decode(Value(fields)), std::exception);
@@ -656,7 +781,7 @@ TEST(MotionEndpointCommandCodecTest, DecodesTheSetTcpPayload) {
 TEST(MockIoInputCommandCodecTest,
      MalformedFinalBooleanPreservesOwningCleanupAndValidationOrder) {
   const std::string owner =
-      "kernel-owner-native-runtime-096bf5ba514b8728699ff5c290ccd23f";
+      "kernel-owner-execution-host-096bf5ba514b8728699ff5c290ccd23f";
   const Value request(Value::Object{
       {"schema_version", Value("manyforge.mock_io_input_request.v1")},
       {"owner_epoch", Value(owner)},
@@ -681,7 +806,7 @@ TEST(MockIoInputCommandCodecTest,
     FAIL() << "a string Boolean must be refused";
   } catch (const std::runtime_error &error) {
     EXPECT_STREQ(error.what(),
-                 "Native execution host: command field value must be boolean");
+                 "Execution host: command field value must be boolean");
   }
   for (const bool value : {false, true}) {
     const auto decoded = decode(Replace(request, "value", Value(value)));
@@ -708,7 +833,7 @@ TEST(MockIoInputCommandCodecTest,
     FAIL() << "an empty source epoch must be refused";
   } catch (const std::runtime_error &error) {
     EXPECT_STREQ(error.what(),
-                 "Native execution host: command field expected_source_epoch "
+                 "Execution host: command field expected_source_epoch "
                  "must be one bounded string");
   }
 }
@@ -722,7 +847,6 @@ TEST(OperationRecoveryCommandCodecTest,
       {"expected_assessment_revision", Value(7.0)},
       {"expected_control_command_epoch", Value(3.0)},
       {"expected_execution_id", Value(42.0)},
-      {"expected_latch_id", Value("latch.codec")},
       {"expected_stop_certificate_id", Value("certificate.codec")},
       {"expected_stop_owner_generation", Value(2.0)},
       {"reason", Value("codec validation only")}});
@@ -746,7 +870,6 @@ TEST(OperationRecoveryCommandCodecTest,
   EXPECT_EQ(captured.expected_assessment_revision, 7U);
   EXPECT_EQ(captured.expected_control_command_epoch, 3U);
   EXPECT_EQ(captured.expected_execution_id, 42U);
-  EXPECT_EQ(captured.expected_latch_id, "latch.codec");
   EXPECT_EQ(captured.expected_stop_certificate_id, "certificate.codec");
   EXPECT_EQ(captured.expected_stop_owner_generation, 2U);
   EXPECT_FALSE(captured.fresh_motion_attempt);

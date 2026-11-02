@@ -11,22 +11,13 @@
 
 namespace manyforge::core {
 
-/// One point held under the TCP linear-speed limit (ADR-0015): the active
-/// TCP, and the robot flange under `tcp_speed_check: active_tcp_and_flange`.
-struct SpeedCheckFrameDTO final {
-  std::string compiled_frame;
-  std::string frame_role_id;
-
-  friend bool operator==(const SpeedCheckFrameDTO&, const SpeedCheckFrameDTO&) = default;
-};
-
 /// TCP constraint for the unchanged closed prefix of a moving replacement.
 struct RetainedTrajectoryPrefixValidationOptionsDTO final {
   double end_time_s{};
   double max_tcp_linear_speed_mps{};
   std::string tcp_frame;
   std::string base_frame;
-  std::vector<SpeedCheckFrameDTO> speed_frames{};  // empty: `tcp_frame` alone
+  std::string tcp_frame_role_id{};  // portable role of tcp_frame; empty for a cell frame
 };
 
 /// Validation options for trajectory validation (spec §3.8)
@@ -39,9 +30,9 @@ struct ValidationOptionsDTO {
   // live in the normalized CollisionValidationCoordinator path.
   bool run_collision_checks = true;
   std::optional<RetainedTrajectoryPrefixValidationOptionsDTO> retained_prefix{};
-  // Every point held under max_tcp_linear_speed_mps, the TCP first. Empty
-  // checks `tcp_frame` alone.
-  std::vector<SpeedCheckFrameDTO> speed_frames{};
+  // Portable role of tcp_frame, reported as `frame_role` when the limit is
+  // exceeded; empty for a cell frame.
+  std::string tcp_frame_role_id{};
 };
 
 /// Compact measurements made while validating the exact accepted trajectory.
@@ -70,8 +61,8 @@ struct TrajectoryValidationMetricsDTO final {
   std::vector<double> peak_abs_joint_acceleration_rad_s2;
   std::optional<double> peak_tcp_linear_speed_mps;
   std::optional<CartesianFidelityMetricsDTO> cartesian_fidelity_metrics;
-  /// Compiled frame of the peak above; absent when the caller gave no
-  /// speed-check frame set.
+  /// Compiled TCP frame of the peak above; absent when no TCP speed was
+  /// measured.
   std::optional<std::string> peak_tcp_linear_speed_frame{};
 
   friend bool operator==(const TrajectoryValidationMetricsDTO&,

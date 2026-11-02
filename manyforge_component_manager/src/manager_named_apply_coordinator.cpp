@@ -2,18 +2,16 @@
 
 #include "native_projection_transition_internal.hpp"
 
-#include <manyforge_core/component_lifecycle_value_codec.hpp>
 #include <manyforge_core/types/typed_error.hpp>
 #include <manyforge_deployment/apply_affected_scope.hpp>
 #include <manyforge_deployment/content_identity.hpp>
-#include <manyforge_deployment/prepared_activation_input.hpp>
-#include <manyforge_content_identity/canonical_value.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <set>
 
 #include <algorithm>
 #include <cstddef>
+#include <iostream>
 #include <iterator>
 #include <utility>
 
@@ -24,7 +22,6 @@ namespace core = manyforge::core;
 namespace deployment = manyforge::deployment;
 
 constexpr std::size_t kMaximumApplyIdMintAttempts = 4U;
-constexpr std::size_t kMaximumSelectedBundleAdvances = 2U;
 
 [[nodiscard]] bool SameDeploymentRevision(
     const core::ProjectionRevisionDTO &left,
@@ -129,7 +126,7 @@ MaintenanceBoundary(const ManagerPlannedMaintenanceResult &result) {
 [[nodiscard]] bool IsKnownAdmissionRefusal(const std::string_view code) {
   static constexpr std::string_view kCodes[] = {
       "stale_generation", "authoring_not_ready", "request_ledger_full",
-      "kernel_owner_unavailable", "component_bring_up_inspection_pending"};
+      "kernel_owner_unavailable", "installed_process_inspection_pending"};
   return std::find(std::begin(kCodes), std::end(kCodes), code) != std::end(kCodes);
 }
 
@@ -145,14 +142,19 @@ AdmissionRefusalBoundary(const std::exception &error) {
              : ManagerApplyEffectBoundary::kUnknown;
 }
 
-/// The effects of a failed runtime-composition preparation. Only the native
-/// host's typed composition refusal proves the candidate was never installed
-/// or published (a known `failed`); any other preparation failure stays
-/// unknown.
+/// The effects of a failed host Apply. Only the host's typed refusals before
+/// any effect (an inconsistent candidate, an enabled replaced or removed
+/// component) and a host failure the host reports as `effect: none` (caught
+/// before it changed anything installed) prove the candidate was never
+/// installed or published (a known `failed`); any other failure stays unknown.
 [[nodiscard]] ManagerApplyEffectDisposition
 PreparationFailureDisposition(const std::exception &error) {
   const auto *typed = dynamic_cast<const core::TypedError *>(&error);
-  return typed != nullptr && typed->code() == kScenarioCompositionRefusedCode
+  if (typed == nullptr) return ManagerApplyEffectDisposition::kUnknown;
+  const auto effect = typed->details().find("effect");
+  return typed->code() == kScenarioCompositionRefusedCode ||
+                 typed->code() == "apply_requires_inactive_component" ||
+                 (effect != typed->details().end() && effect->second == "none")
              ? ManagerApplyEffectDisposition::kKnown
              : ManagerApplyEffectDisposition::kUnknown;
 }
@@ -285,7 +287,8 @@ public:
     core::IManagerKernelApplyFencePort &kernel_fence,
     const core::RuntimeEpoch &manager_runtime_epoch,
     IManagerSelectedRuntimeCompositionPort *runtime_composition,
-    const deployment::IVerifiedRetainedBundleSource &retained_bundle_source) {
+    const deployment::IVerifiedRetainedBundleSource &retained_bundle_source,
+    const deployment::SiteFacts &site_facts) {
   if (const auto attempt =
           journal.ReadFenceAttempt(intent.apply_id, intent.apply_generation);
       attempt.has_value()) {
@@ -295,7 +298,6 @@ public:
         fence.expected_fence_generation,
         fence.expected_active_control_configurations,
         fence.scope,
-        fence.expected_provider_lineages,
     };
   }
 
@@ -341,24 +343,13 @@ public:
                     inventory.value().error->message +
                     "; restart the workbench container");
     // This observation runs under the held parent admission and before a
-    // fence attempt, runtime convergence or Scene staging. The host's final
-    // Prepare guard still checks the same requirement at the effect boundary.
+    // fence attempt, runtime convergence or Scene staging. CONTRACTS §11: a
+    // replaced or removed component that is still Active with a live process
+    // is disabled first (the server-side orchestration does that); one whose
+    // launch processes are gone, or that is faulted, is removed or replaced
+    // without a clean Disable, in any Apply.
     const auto delta =
-        deployment::derive_apply_component_delta(predecessor, candidate);
-    // D6: only an Apply of the verified canonical-empty candidate (its
-    // Manager-verified sealed origin), from any caller, may remove a component
-    // left Active by a lost provider.
-    const bool canonical_empty_candidate = [&] {
-      try {
-        return deployment::prepared_receipt_is_canonical_empty_candidate(
-            content_identity::parse_canonical_json(
-                intent.prepared_activation.canonical_receipt_json),
-            candidate.value().cell_graph.cell_id, intent.candidate_retained_bundle_id,
-            intent.candidate_graph_revision);
-      } catch (const std::exception &) {
-        return false;
-      }
-    }();
+        deployment::derive_apply_component_delta(predecessor, candidate, site_facts);
     for (const auto &change : delta.components) {
       if (change.disposition !=
               deployment::ApplyComponentDisposition::kReplace &&
@@ -372,17 +363,9 @@ public:
           });
       RequireInstalledState(fact != inventory.value().component_lifecycles.end(),
                             "changed component lifecycle is unavailable");
-      const bool has_io_provider_domain = std::any_of(
-          predecessor.value().cell_graph.control_domains.begin(),
-          predecessor.value().cell_graph.control_domains.end(), [&](const auto &domain) {
-            return domain.provider() != nullptr &&
-                   domain.provider()->controllable_component_id ==
-                       change.controllable_component_id;
-          });
       if (fact->state == core::ComponentLifecycleStateDTO::kActive &&
-          !ActiveComponentRemovableWithoutLiveProcess(
-              change, inventory.value().process_occurrences, canonical_empty_candidate,
-              has_io_provider_domain))
+          !ComponentLaunchProcessesDrained(change.controllable_component_id,
+                                           inventory.value().process_occurrences))
         throw ActiveComponentApplyRefusal(
             "configuration Apply cannot replace or remove Active component " +
             change.controllable_component_id.value() + "; deactivate it first");
@@ -393,7 +376,7 @@ public:
           ManagerComponentProcessOwnerKindDTO::kPneumaticNoneLocal;
       if (no_launch) {
         const auto verified = ValidateManagerPneumaticNoneProcessOwner(
-            predecessor, inventory_request, row);
+            predecessor, site_facts, inventory_request, row);
         if (!verified.ok()) FailCause(verified.error(), verified.error().message);
       }
       RequireInstalledState(row.process_presence != ProcessPresenceState::kUnknown &&
@@ -401,7 +384,7 @@ public:
                             "installed process identity or presence is "
                             "unknown; restart the workbench container");
       const auto wanted = deployment::derive_component_runtime_identity(
-          candidate, row.controllable_component_id);
+          candidate, site_facts, row.controllable_component_id);
       if ((!no_launch && row.process_presence != ProcessPresenceState::kPresent) ||
           wanted != row.installed_runtime_identity)
         restart.insert(row.controllable_component_id);
@@ -409,7 +392,7 @@ public:
     for (const auto &component :
          candidate.value().cell_graph.controllable_components) {
       const auto wanted = deployment::derive_component_runtime_identity(
-          candidate, component.controllable_component_id);
+          candidate, site_facts, component.controllable_component_id);
       const auto count = std::count_if(
           inventory.value().process_occurrences.begin(),
           inventory.value().process_occurrences.end(), [&](const auto &row) {
@@ -431,15 +414,15 @@ public:
       if (!restart.contains(row.controllable_component_id))
         continue;
       const auto old_identity = deployment::derive_component_runtime_identity(
-          predecessor, row.controllable_component_id);
+          predecessor, site_facts, row.controllable_component_id);
       const auto new_identity = deployment::derive_component_runtime_identity(
-          candidate, row.controllable_component_id);
+          candidate, site_facts, row.controllable_component_id);
       if (old_identity == row.installed_runtime_identity ||
           new_identity == row.installed_runtime_identity)
         continue;
       std::shared_ptr<const deployment::RetainedBundle> source;
       for (const auto &status : old_statuses) {
-        if (!status.terminal_outcome || status.bring_up_plan ||
+        if (!status.terminal_outcome ||
             status.terminal_outcome->terminal_outcome.succeeded())
           continue;
         const auto product = retained_bundle_source.get_verified(
@@ -451,7 +434,7 @@ public:
                 status.intent.intent.candidate_graph_revision)
           continue;
         if (deployment::derive_component_runtime_identity(
-                *product, row.controllable_component_id) ==
+          *product, site_facts, row.controllable_component_id) ==
             row.installed_runtime_identity) {
           source = product;
           break;
@@ -508,7 +491,6 @@ public:
       snapshot.configuration_fence_generation,
       snapshot.active_control_configurations,
       scope,
-      snapshot.provider_lineages,
   };
 }
 
@@ -529,9 +511,7 @@ public:
 }
 
 [[nodiscard]] core::CellAdmissionClaimIntentDTO
-DirectAdmissionIntent(
-    const PersistedManagerApplyIntent &durable,
-    const std::optional<core::ContentDigest> &bring_up_plan_digest = {}) {
+DirectAdmissionIntent(const PersistedManagerApplyIntent &durable) {
   const auto &intent = durable.intent;
   Require(intent.expected_admission_generation.has_value(),
           "direct Manager Apply lacks its admission generation");
@@ -541,7 +521,7 @@ DirectAdmissionIntent(
       intent.request_context.request_owner_epoch,
       intent.apply_id.value(),
       intent.request_context.request_id,
-      bring_up_plan_digest.value_or(durable.intent_digest),
+      durable.intent_digest,
       *intent.expected_admission_generation,
       {},
       std::nullopt,
@@ -554,23 +534,7 @@ DirectAdmissionIntent(
 
 [[nodiscard]] core::CellAdmissionClaimDTO RequireHeldAdmission(
     const PersistedManagerApplyIntent &durable,
-    core::IKernelCellAdmissionPort &cell_admission,
-    const std::optional<core::ContentDigest> &bring_up_plan_digest = {},
-    const std::optional<core::CellAdmissionClaimDTO> &original_parent_claim = {}) {
-  if (original_parent_claim) {
-    Require(bring_up_plan_digest && !durable.intent.parent_authoring_claim &&
-                original_parent_claim->intent == DirectAdmissionIntent(durable, bring_up_plan_digest),
-            "original configured parent claim differs from its sealed plan");
-    const core::CellAdmissionRecoveryReceiptQueryDTO query{
-        original_parent_claim->intent, original_parent_claim, std::nullopt};
-    const auto receipt = cell_admission.GetCellAdmissionRecoveryReceipt(query);
-    Require(core::ValidateCellAdmissionRecoveryReceiptQuery(query).ok() && receipt.ok() &&
-                core::ValidateCellAdmissionRecoveryReceipt(receipt.value()).ok() &&
-                receipt.value().status == core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact &&
-                receipt.value().matched_claim == original_parent_claim,
-            "original configured parent claim is no longer held exactly");
-    return *original_parent_claim;
-  }
+    core::IKernelCellAdmissionPort &cell_admission) {
   if (durable.intent.parent_authoring_claim.has_value()) {
     const auto &parent = *durable.intent.parent_authoring_claim;
     const auto receipt = cell_admission.GetCellAdmissionRecoveryReceipt(
@@ -587,7 +551,7 @@ DirectAdmissionIntent(
     return parent;
   }
 
-  const auto intent = DirectAdmissionIntent(durable, bring_up_plan_digest);
+  const auto intent = DirectAdmissionIntent(durable);
   const core::CellAdmissionRecoveryReceiptQueryDTO query{
       intent, std::nullopt, std::nullopt};
   const auto receipt = cell_admission.GetCellAdmissionRecoveryReceipt(query);
@@ -596,20 +560,9 @@ DirectAdmissionIntent(
               "Kernel Manager-claim lookup failed: " + receipt.error().message,
               kKernelProducer);
   }
-  if (bring_up_plan_digest) {
-    Require(core::ValidateCellAdmissionRecoveryReceipt(receipt.value()).ok() &&
-                (!receipt.value().matched_claim ||
-                 receipt.value().matched_claim->intent == intent),
-            "configured bring-up received invalid or foreign parent-claim evidence");
-  }
   if (receipt.value().status ==
           core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact &&
       receipt.value().matched_claim.has_value()) {
-    if (bring_up_plan_digest) {
-      Require(core::ValidateCellAdmissionRecoveryReceiptQuery(
-                  {intent, receipt.value().matched_claim, std::nullopt}).ok(),
-              "configured bring-up retained claim differs from original admission generation");
-    }
     return *receipt.value().matched_claim;
   }
   Require(receipt.value().status ==
@@ -626,12 +579,6 @@ DirectAdmissionIntent(
                                                  : " (" + reason->second + ")"),
               kKernelProducer);
   }
-  if (bring_up_plan_digest) {
-    Require(acquired.value().intent == intent &&
-                core::ValidateCellAdmissionRecoveryReceiptQuery(
-                    {intent, acquired.value(), std::nullopt}).ok(),
-            "configured bring-up acquired a foreign or invalid original parent claim");
-  }
   return acquired.value();
 }
 
@@ -639,13 +586,12 @@ bool ReleaseAdmission(
     const PersistedManagerApplyIntent &durable,
     const PersistedManagerApplyTerminalOutcome &terminal,
     core::IKernelCellAdmissionPort &cell_admission,
-    const std::optional<core::ContentDigest> &bring_up_plan_digest = {},
     const std::optional<core::CellAdmissionClaimDTO> &original_parent_claim = {},
     const ManagerNamedApplyCoordinator::SuccessfulSettlementPreparation &prepare = {},
     const ManagerApplySettlementAttempt attempt = ManagerApplySettlementAttempt::kInitial) {
   const auto intent = durable.intent.parent_authoring_claim.has_value()
                           ? durable.intent.parent_authoring_claim->intent
-                          : DirectAdmissionIntent(durable, bring_up_plan_digest);
+                          : DirectAdmissionIntent(durable);
   const auto receipt = cell_admission.GetCellAdmissionRecoveryReceipt(
       {intent, original_parent_claim, std::nullopt});
   if (!receipt.ok()) {
@@ -653,12 +599,6 @@ bool ReleaseAdmission(
               "Kernel Manager-claim settlement lookup failed: " +
                   receipt.error().message,
               kKernelProducer);
-  }
-  if (bring_up_plan_digest) {
-    Require(core::ValidateCellAdmissionRecoveryReceipt(receipt.value()).ok() &&
-                (!receipt.value().matched_claim || receipt.value().matched_claim->intent == intent) &&
-                (!original_parent_claim || receipt.value().matched_claim == original_parent_claim),
-            "configured parent settlement lookup returned foreign claim evidence");
   }
   if (receipt.value().status ==
       core::CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact) {
@@ -702,7 +642,7 @@ bool ReleaseAdmission(
 } // namespace
 
 core::Result<void> ValidateManagerPneumaticNoneProcessOwner(
-    const deployment::RetainedBundle &predecessor,
+    const deployment::RetainedBundle &predecessor, const deployment::SiteFacts &site_facts,
     const ManagerComponentProcessInventoryRequestDTO &request,
     const ManagerComponentProcessOccurrenceDTO &row) {
   try {
@@ -712,7 +652,7 @@ core::Result<void> ValidateManagerPneumaticNoneProcessOwner(
                 row.process_owner_kind == ManagerComponentProcessOwnerKindDTO::kPneumaticNoneLocal &&
                 row.pneumatic_none_owner && row.installed_runtime_identity &&
                 row.installed_runtime_identity == deployment::derive_component_runtime_identity(
-                    predecessor, row.controllable_component_id),
+          predecessor, site_facts, row.controllable_component_id),
             "actual_installed_state_unknown: pneumatic None occurrence differs from the immutable predecessor");
     const auto &graph = predecessor.value().cell_graph;
     const auto component = std::find_if(graph.controllable_components.begin(), graph.controllable_components.end(),
@@ -832,7 +772,8 @@ ManagerNamedApplyCoordinator::ManagerNamedApplyCoordinator(
     InitialSceneSource initial_scene_source,
     RuntimePreStartGuard pre_start_guard,
     ApplyProgressObserver apply_progress_observer,
-    SuccessfulSettlementPreparation successful_settlement_preparation)
+    SuccessfulSettlementPreparation successful_settlement_preparation,
+    deployment::SiteFacts site_facts)
     : apply_journal_(apply_journal), active_plan_source_(active_plan_source),
       retained_bundle_source_(retained_bundle_source),
       artifact_source_(artifact_source), publication_reader_(publication_store),
@@ -844,7 +785,8 @@ ManagerNamedApplyCoordinator::ManagerNamedApplyCoordinator(
       initial_scene_source_(std::move(initial_scene_source)),
       apply_progress_observer_(std::move(apply_progress_observer)),
       successful_settlement_preparation_(std::move(successful_settlement_preparation)),
-      fence_coordinator_(apply_journal_, kernel_fence_, manager_runtime_epoch_),
+      site_facts_(std::move(site_facts)),
+      fence_coordinator_(apply_journal_, kernel_fence_, manager_runtime_epoch_, site_facts_),
       planned_maintenance_(planned_maintenance),
       active_runtime_coordinator_(active_plan_source, process_port,
                                   progress_port, clock_ns, pre_start_guard),
@@ -853,10 +795,7 @@ ManagerNamedApplyCoordinator::ManagerNamedApplyCoordinator(
                            std::move(operating_system),
                            std::move(launch_environment_contracts),
                            std::move(clock_ns), std::move(pre_start_guard)),
-      scene_initialization_coordinator_(apply_journal_, scene_owner),
-      runtime_composition_coordinator_(apply_journal_, scene_owner,
-                                       runtime_composition,
-                                       manager_runtime_epoch_),
+      runtime_composition_coordinator_(apply_journal_, runtime_composition),
       selected_bundle_coordinator_(apply_journal_, publication_store,
                                    scene_owner),
       fence_release_coordinator_(apply_journal_, kernel_fence_, scene_owner,
@@ -880,13 +819,8 @@ bool ManagerNamedApplyCoordinator::SettleSuccessfulAdmission(
     const PersistedManagerApplyTerminalOutcome &terminal,
     const ManagerApplySettlementAttempt attempt) {
   const auto &intent = durable.intent;
-  const bool linked = HasOriginalBringUpCapture(intent);
-  const auto plan_digest = linked
-      ? std::optional(captured_apply_inputs_->bring_up_plan->plan_digest) : std::nullopt;
-  const auto original_claim = linked
-      ? captured_apply_inputs_->original_parent_claim : std::nullopt;
   const bool settled = ReleaseAdmission(durable, terminal, cell_admission_,
-      plan_digest, original_claim, successful_settlement_preparation_, attempt);
+      std::nullopt, successful_settlement_preparation_, attempt);
   if (!settled) {
     pending_settlement_ = core::NamedApplyPublicationTransactionDTO{
         intent.apply_id, intent.apply_generation};
@@ -946,109 +880,9 @@ core::ApplyId ManagerNamedApplyCoordinator::MintApplyId() {
   Fail("Apply ID factory did not produce a fresh bounded identity");
 }
 
-bool ManagerNamedApplyCoordinator::HasOriginalBringUpCapture(
-    const ManagerApplyIntentDTO &intent) const {
-  if (!captured_apply_inputs_ || !captured_apply_inputs_->bring_up_plan ||
-      !captured_apply_inputs_->original_parent_claim ||
-      !captured_apply_inputs_->original_predecessor_publication ||
-      captured_apply_inputs_->apply_id != intent.apply_id ||
-      captured_apply_inputs_->apply_generation != intent.apply_generation ||
-      !captured_apply_inputs_->predecessor || !captured_apply_inputs_->candidate) return false;
-  const auto &captured = *captured_apply_inputs_;
-  const auto stored = apply_journal_.ReadIntent(intent.apply_id, intent.apply_generation);
-  const auto plan = apply_journal_.ReadBringUpPlan(intent.apply_id, intent.apply_generation);
-  Require(stored && stored->intent == intent && plan == captured.bring_up_plan &&
-              plan->plan.parent_intent_digest == stored->intent_digest &&
-              captured.predecessor->retained_bundle_id() == intent.expected_active_projection_revision.retained_bundle_id &&
-              captured.candidate->retained_bundle_id() == intent.candidate_retained_bundle_id &&
-              captured.original_parent_claim->intent == DirectAdmissionIntent(*stored, plan->plan_digest) &&
-              captured.original_predecessor_publication->valid() &&
-              core::SameActiveDeployment(captured.original_predecessor_publication->request.candidate_projection_revision,
-                                         intent.expected_active_projection_revision) &&
-              captured.original_predecessor_publication->publication_generation ==
-                  plan->plan.expected_publication.expected_previous_publication_generation &&
-              captured.original_predecessor_publication->durable_public_pointer_content_digest ==
-                  plan->plan.predecessor_public_pointer_digest,
-          "original configured parent capture differs from its immutable request/plan");
-  return true;
-}
-
-core::ApplyFenceAcquireAttemptQueryDTO
-ManagerNamedApplyCoordinator::CaptureOriginalSceneStagingAttempt(const ManagerApplyIntentDTO &intent) {
-  Require(HasOriginalBringUpCapture(intent), "Scene staging requires the original linked capture");
-  const auto status = apply_journal_.ReadStatus(intent.apply_id, intent.apply_generation);
-  Require(status && status->fence_attempt && status->fence_acceptance &&
-              status->fence_acceptance->fence_attempt_digest == status->fence_attempt->fence_attempt_digest,
-          "Scene staging lacks the exact persisted original fence attempt/acceptance");
-  const core::ApplyFenceAcquireAttemptQueryDTO query{
-      status->fence_attempt->fence_intent, status->fence_attempt->fence_attempt_digest,
-      manager_runtime_epoch_};
-  Require(query.valid(), "Scene staging has an invalid original acquire-attempt query");
-  return query;
-}
-
-core::QualifiedSceneProductAdoptionRequestDTO
-ManagerNamedApplyCoordinator::CaptureOriginalSceneAdoption(
-    const ManagerApplyIntentDTO &intent,
-    const std::optional<core::ApplyFenceAcquireAttemptQueryDTO> &staging_attempt) {
-  Require(HasOriginalBringUpCapture(intent), "Scene adoption requires the original linked capture");
-  const auto &captured = *captured_apply_inputs_;
-  const auto status = apply_journal_.ReadStatus(intent.apply_id, intent.apply_generation);
-  Require(status && status->fence_acceptance && status->latest_runtime_staged_ready &&
-              status->bring_up_plan == captured.bring_up_plan,
-          "Scene adoption lacks exact original parent, fence and staged host evidence");
-  const auto claim = RequireHeldAdmission(status->intent, cell_admission_,
-      captured.bring_up_plan->plan_digest, captured.original_parent_claim);
-  const auto &fence = status->fence_acceptance->accepted_fence;
-  const core::ConfigurationFenceStatusQueryDTO query{
-      {intent.apply_id, intent.apply_generation}, fence.configuration_fence_id,
-      fence.configuration_fence_generation, fence.captured_scope, manager_runtime_epoch_};
-  if (staging_attempt) {
-    Require(status->fence_attempt &&
-                staging_attempt->persisted_intent == status->fence_attempt->fence_intent &&
-                staging_attempt->persisted_attempt_digest == status->fence_attempt->fence_attempt_digest &&
-                status->fence_acceptance->fence_attempt_digest == staging_attempt->persisted_attempt_digest &&
-                staging_attempt->manager_runtime_epoch == manager_runtime_epoch_ &&
-                staging_attempt->persisted_intent.owner_request_context == intent.request_context &&
-                staging_attempt->persisted_intent.owner_transaction == query.owner_transaction &&
-                staging_attempt->persisted_intent.scope == query.expected_scope &&
-                staging_attempt->persisted_intent.expected_retained_bundle_id ==
-                    intent.expected_active_projection_revision.retained_bundle_id &&
-                staging_attempt->persisted_intent.expected_graph_revision ==
-                    intent.expected_active_projection_revision.graph_revision,
-            "Scene staging acquire-attempt query differs from the original persisted parent");
-    // Read the existing producer directly. This never enters Manager's lost
-    // Acquire wrapper, retries effects, appends acceptance or rehydrates.
-    const auto held = kernel_fence_.ReconcileAcquireAttempt(*staging_attempt);
-    Require(held.matches(*staging_attempt) &&
-                held.state == core::ApplyFenceAcquireAttemptReconcileState::kAcceptedExact &&
-                held.admission_fenced && held.accepted_fence == fence &&
-                held.execution_host_epoch.publication_generation ==
-                    captured.original_predecessor_publication->publication_generation &&
-                std::any_of(status->latest_runtime_staged_ready->staged_ready.runtime_units.begin(),
-                            status->latest_runtime_staged_ready->staged_ready.runtime_units.end(),
-                            [&](const auto &runtime) {
-                              return runtime.valid() && runtime.runtime_unit_id == held.execution_host_epoch.runtime_unit_id &&
-                                  runtime.runtime_epoch == held.execution_host_epoch.runtime_epoch;
-                            }),
-            "Scene staging original acquire attempt is not actually held by the staged host");
-  } else {
-    const auto held = kernel_fence_.QueryStatus(query);
-    Require(held.matches(query) && held.state == core::ConfigurationFenceState::kHeld && held.admission_fenced,
-            "Scene adoption parent fence is not actually held exactly");
-  }
-  const core::ApplyComponentBringUpAuthorityDTO authority{
-      {{intent.apply_id, intent.apply_generation}, captured.bring_up_plan->plan_digest}, claim, query};
-  Require(authority.valid(), "Scene adoption has invalid original parent authority");
-  return {authority, *captured.original_predecessor_publication, intent.expected_active_projection_revision,
-      {intent.expected_active_projection_revision.scene_revision, intent.cell_id}, captured.candidate->value(),
-      detail::DeriveCandidateNativeProjectionBindings(captured.candidate->value(),
-          status->latest_runtime_staged_ready->staged_ready)};
-}
-
 bool ManagerNamedApplyCoordinator::HasOriginalConfigurationCapture(
     const ManagerApplyIntentDTO &intent) const {
-  if (!captured_apply_inputs_ || captured_apply_inputs_->bring_up_plan ||
+  if (!captured_apply_inputs_ ||
       !captured_apply_inputs_->original_parent_claim ||
       !captured_apply_inputs_->original_predecessor_publication ||
       captured_apply_inputs_->apply_id != intent.apply_id ||
@@ -1058,7 +892,6 @@ bool ManagerNamedApplyCoordinator::HasOriginalConfigurationCapture(
   const auto stored = apply_journal_.ReadIntent(intent.apply_id, intent.apply_generation);
   const auto &captured = *captured_apply_inputs_;
   Require(stored && stored->intent == intent &&
-              !apply_journal_.ReadBringUpPlan(intent.apply_id, intent.apply_generation) &&
               captured.predecessor->retained_bundle_id() == intent.expected_active_projection_revision.retained_bundle_id &&
               captured.candidate->retained_bundle_id() == intent.candidate_retained_bundle_id &&
               captured.original_predecessor_publication->valid() &&
@@ -1084,7 +917,7 @@ ManagerNamedApplyCoordinator::CaptureOriginalConfigurationAdoption(
   const auto &captured = *captured_apply_inputs_;
   const auto status = apply_journal_.ReadStatus(intent.apply_id, intent.apply_generation);
   Require(status && status->fence_attempt && status->fence_acceptance &&
-              status->latest_runtime_staged_ready && !status->bring_up_plan &&
+              status->latest_runtime_staged_ready &&
               status->intent.intent == intent &&
               status->fence_acceptance->fence_attempt_digest == status->fence_attempt->fence_attempt_digest,
           "configuration Scene adoption lacks exact stored parent/fence/host evidence");
@@ -1171,7 +1004,7 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::ContinueOriginalConfigurat
         health = scene_owner_.ReadOriginalManagerConfigurationAdoptionProjectionHealth(request, attempt);
       }
       Require(CaptureOriginalConfigurationAdoption(intent, attempt) == request &&
-                  health.size() == request.native_runtime_bindings.size(),
+                  health.size() == request.execution_host_bindings.size(),
               "configuration staging changed identity or returned incomplete participants");
       const auto after = publication_reader_.ReadActiveBundlePublication(
           request.expected_predecessor_publication.publication_generation);
@@ -1180,7 +1013,7 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::ContinueOriginalConfigurat
       bool ready = true;
       for (std::size_t index = 0; index < health.size(); ++index) {
         const auto &row = health[index];
-        Require(row.valid() && row.native_runtime_binding == request.native_runtime_bindings[index] && !row.error,
+        Require(row.valid() && row.execution_host_binding == request.execution_host_bindings[index] && !row.error,
                 "configuration staging returned foreign or failed native evidence");
         if (!row.healthy_for_identity(target)) {
           Require(row.state == core::ProjectionHealthState::kRebuilding ||
@@ -1190,12 +1023,11 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::ContinueOriginalConfigurat
         }
       }
       if (!ready) return pending();
-      const auto composition = runtime_composition_coordinator_.PrepareOriginalConfiguration(
-          request, *captured.candidate);
-      if (composition.state == ManagerSelectedRuntimeCompositionResultState::kPending) return pending();
+      const auto applied = runtime_composition_coordinator_.ApplyOnHost(
+          intent.apply_id, intent.apply_generation, *captured.predecessor, *captured.candidate);
       if (captured.original_prepare_acknowledgement && !captured.prepare_acknowledgement_consumed) {
         captured.prepare_acknowledgement_consumed = true;
-        captured.original_prepare_acknowledgement(intent, *captured.candidate, composition.owner_result);
+        captured.original_prepare_acknowledgement(intent, *captured.candidate, applied);
       }
       captured.original_preparation_completed = true;
     }
@@ -1212,20 +1044,39 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::ContinueOriginalConfigurat
                                                intent.expected_active_projection_revision) &&
                   core::SameProjectionIdentity(begun.target_projection_revision, target) &&
                   SameSnapshotScene(begun.authoritative_snapshot_identity, request.expected_snapshot_identity) &&
-                  begun.native_runtime_bindings == request.native_runtime_bindings &&
+                  begun.execution_host_bindings == request.execution_host_bindings &&
                   CaptureOriginalConfigurationAdoption(intent) == request,
               "configuration Begin returned foreign or incomplete preservation evidence");
     }
-    const auto composition = runtime_composition_coordinator_.InstallOrRecover(
-        intent.apply_id, intent.apply_generation, *captured.candidate);
-    if (composition.state == ManagerSelectedRuntimeCompositionResultState::kPending) return pending();
     static_cast<void>(selected_bundle_coordinator_.PublishOriginalConfiguration(
         intent.apply_id, intent.apply_generation, *captured.predecessor, *captured.candidate));
     return FinishOriginalConfigurationPublication(durable, request_replayed);
   } catch (const std::exception &error) {
     if (apply_journal_.ReadTerminalOutcome(intent.apply_id, intent.apply_generation)) throw;
-    return RetainTerminalFailure(apply_journal_, durable, "configuration_preservation_failed",
-        error, PreparationFailureDisposition(error), request_replayed);
+    // The host's typed refusal of the candidate (nothing installed or
+    // published, nothing changed) is a known before-effect failure: like a
+    // pre-fence failure (CLAIM-1) it releases its fence and claim at once,
+    // so authoring and New work again. Any other failure keeps them.
+    const auto disposition = PreparationFailureDisposition(error);
+    const bool host_refused = disposition == ManagerApplyEffectDisposition::kKnown &&
+                              !captured.original_preparation_completed;
+    auto result = RetainTerminalFailure(apply_journal_, durable, "configuration_preservation_failed",
+        error, disposition, request_replayed,
+        host_refused ? ManagerApplyEffectBoundary::kBeforeEffect
+                     : ManagerApplyEffectBoundary::kUnknown);
+    if (host_refused) {
+      try {
+        ReleaseFailedApply(intent.apply_id, intent.apply_generation,
+            core::RequestId("host-refusal-release." + intent.apply_id.value()),
+            "manager: execution host refused the candidate before any effect", false);
+      } catch (const std::exception &release_error) {
+        // The failure stays retained; its fence and claim stay held.
+        std::cerr << "Manager Apply " << intent.apply_id.value()
+                  << ": host refusal could not release its fence and claim: "
+                  << release_error.what() << '\n';
+      }
+    }
+    return result;
   }
 }
 
@@ -1264,7 +1115,7 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::FinishOriginalConfiguratio
                   core::SameProjectionIdentity(completed.target_projection_revision, target) &&
                   SameSnapshotScene(completed.authoritative_snapshot_identity,
                                     captured.original_configuration_adoption->expected_snapshot_identity) &&
-                  completed.native_runtime_bindings == captured.original_configuration_adoption->native_runtime_bindings &&
+                  completed.execution_host_bindings == captured.original_configuration_adoption->execution_host_bindings &&
                   CaptureOriginalConfigurationAdoption(intent) == *captured.original_configuration_adoption,
               "configuration Scene Complete returned foreign or incomplete preservation evidence");
       const auto after = publication_reader_.ReadActiveBundlePublication(receipt.publication_generation);
@@ -1272,10 +1123,6 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::FinishOriginalConfiguratio
       captured.original_scene_completed = completed;
     }
     Require(captured.original_scene_completed.has_value(), "configuration Scene completion outcome is uncertain");
-    const auto composition = runtime_composition_coordinator_.InstallOrRecover(
-        intent.apply_id, intent.apply_generation, *captured.candidate);
-    if (composition.state == ManagerSelectedRuntimeCompositionResultState::kPending)
-      return {intent.apply_id, intent.apply_generation, ManagerNamedApplyResultState::kPending, request_replayed, std::nullopt};
     const auto released = fence_release_coordinator_.ReleaseOrRecover(intent.apply_id, intent.apply_generation);
     const auto terminal = apply_journal_.ReadTerminalOutcome(intent.apply_id, intent.apply_generation);
     Require(terminal.has_value(), "configuration release lacks its actual terminal evidence");
@@ -1290,224 +1137,8 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::FinishOriginalConfiguratio
   }
 }
 
-bool ManagerNamedApplyCoordinator::AdvanceOriginalBringUpChildren(
-    const ManagerApplyIntentDTO &intent, const bool after_publication) {
-  Require(HasOriginalBringUpCapture(intent), "configured children require this process's original capture");
-  auto &captured = *captured_apply_inputs_;
-  const auto &plan = *captured.bring_up_plan;
-  const auto durable = apply_journal_.ReadIntent(intent.apply_id, intent.apply_generation);
-  const auto claim = RequireHeldAdmission(*durable, cell_admission_, plan.plan_digest,
-                                         captured.original_parent_claim);
-  const auto fence = apply_journal_.ReadFenceAcceptance(intent.apply_id, intent.apply_generation);
-  Require(fence.has_value(), "configured children lack actual parent fence acceptance");
-  const core::ConfigurationFenceStatusQueryDTO query{
-      {intent.apply_id, intent.apply_generation}, fence->accepted_fence.configuration_fence_id,
-      fence->accepted_fence.configuration_fence_generation, fence->accepted_fence.captured_scope,
-      manager_runtime_epoch_};
-  const auto held = kernel_fence_.QueryStatus(query);
-  Require(held.matches(query) && held.state == core::ConfigurationFenceState::kHeld && held.admission_fenced,
-          "configured children parent fence is not actually held exactly");
-  const core::ApplyComponentBringUpAuthorityDTO authority{
-      {{intent.apply_id, intent.apply_generation}, plan.plan_digest}, claim, query};
-  Require(authority.valid(), "configured children lack exact full parent authority");
-  const auto request_for = [&](const ManagerApplyBringUpChildRequestDTO &child) {
-    ManagerApplyComponentBringUpRequestDTO request{child.intent, child.candidate_projection_revision,
-        child.candidate_retained_bundle_digest, child.candidate_retained_bundle_bytes, child.runtime_unit_id,
-        child.runtime_epoch, child.manager_runtime_epoch, authority};
-    Require(request.valid(), "original child cannot form its exact typed request");
-    return request;
-  };
-  const auto read = [&](const ManagerApplyComponentBringUpRequestDTO &request) {
-    auto value = runtime_composition_coordinator_.ReadApplyComponentBringUp({request});
-    if (!value.ok())
-      FailCause(value.error(), "configured child READ failed: " + value.error().message);
-    return value.value().result;
-  };
-  const auto record = [&](const ManagerApplyBringUpChildRequestDTO &child,
-                          const ManagerApplyBringUpChildPhase phase,
-                          const core::CCLCLifecycleRequestResultDTO &result) {
-    static_cast<void>(apply_journal_.EnsureBringUpChildProof({intent.apply_id, intent.apply_generation,
-        plan.plan_digest, child.intent.controllable_component_id, phase, result}));
-  };
-  const auto require_healthy = [&](const ManagerApplyBringUpChildRequestDTO &child,
-                                   const core::CCLCLifecycleRequestResultDTO &result) {
-    Require(result.locally_valid(), "configured child returned invalid owner data");
-    if (result.rejection || !result.status) Fail("configured child has no accepted owner status");
-    const auto &status = *result.status;
-    if (status.reconciliation_required || status.error ||
-        status.phase == core::ComponentLifecycleTransactionPhaseDTO::kOutcomeUnknown ||
-        (status.terminal_result && *status.terminal_result != core::ComponentLifecycleTerminalResultDTO::kSucceeded)) {
-      if (status.terminal_result || status.phase == core::ComponentLifecycleTransactionPhaseDTO::kOutcomeUnknown) {
-        if (!apply_journal_.ReadBringUpChildProof(intent.apply_id, intent.apply_generation,
-                child.intent.controllable_component_id, ManagerApplyBringUpChildPhase::kTerminal))
-          record(child, ManagerApplyBringUpChildPhase::kTerminal, result);
-      }
-      Fail("configured child failed or requires owner reconciliation");
-    }
-    Require(status.status_owner_epoch == child.intent.request_context.request_owner_epoch,
-            "configured child observation belongs to a replacement owner");
-    Require(std::none_of(status.domains.begin(), status.domains.end(), [](const auto &domain) {
-              return domain.error.has_value(); }), "configured child domain failed");
-  };
-  const auto holding = [](const core::ComponentLifecycleStatusDTO &status) {
-    return status.phase == core::ComponentLifecycleTransactionPhaseDTO::kVerifying &&
-        !status.terminal_result && !status.reconciliation_required && !status.error &&
-        status.requested_state.presence == core::ComponentLifecycleRequestedStatePresenceDTO::kResolved &&
-        status.requested_state.state && status.current_state == status.requested_state.state &&
-        std::all_of(status.domains.begin(), status.domains.end(), [](const auto &domain) {
-          if (domain.error) return false;
-          if (!domain.expected_domain) return domain.primitive_attempts.empty();
-          return domain.action_state == core::ComponentLifecycleDomainActionStateDTO::kSucceeded &&
-              domain.current_scope && domain.resolved_provider_occurrence &&
-              domain.requested_state.presence == core::ComponentLifecycleRequestedStatePresenceDTO::kResolved &&
-              domain.requested_state.state && domain.current_state == domain.requested_state.state;
-        });
-  };
-  // Preserve real owner acceptance for every needed row before any SUBMIT.
-  for (const auto &child : plan.plan.children) {
-    if (apply_journal_.ReadBringUpChildProof(intent.apply_id, intent.apply_generation,
-            child.intent.controllable_component_id, ManagerApplyBringUpChildPhase::kAccepted)) continue;
-    Require(!after_publication, "published configured child has no original accepted proof");
-    const auto result = read(request_for(child));
-    if (!result) return false;
-    record(child, ManagerApplyBringUpChildPhase::kAccepted, *result);
-    require_healthy(child, *result);
-  }
-  for (const auto &child : plan.plan.children) {
-    const auto request = request_for(child);
-    std::optional<core::CCLCLifecycleRequestResultDTO> result;
-    const auto submitted = std::find(captured.submitted_children.begin(), captured.submitted_children.end(),
-                                     child.intent.controllable_component_id);
-    if (!after_publication && submitted == captured.submitted_children.end()) {
-      // Consume before I/O. Unknown sends/replies cannot authorize a resend.
-      captured.submitted_children.push_back(child.intent.controllable_component_id);
-      auto value = runtime_composition_coordinator_.SubmitApplyComponentBringUp(request);
-      if (!value.ok())
-        FailCause(value.error(), "configured child SUBMIT failed: " + value.error().message);
-      result = value.value().result;
-    } else {
-      result = read(request);
-    }
-    if (!result) return false;
-    require_healthy(child, *result);
-    const auto &status = *result->status;
-    if (after_publication) {
-      if (status.phase != core::ComponentLifecycleTransactionPhaseDTO::kSucceeded ||
-          status.terminal_result != core::ComponentLifecycleTerminalResultDTO::kSucceeded) return false;
-      if (!apply_journal_.ReadBringUpChildProof(intent.apply_id, intent.apply_generation,
-              child.intent.controllable_component_id, ManagerApplyBringUpChildPhase::kTerminal))
-        record(child, ManagerApplyBringUpChildPhase::kTerminal, *result);
-    } else {
-      Require(!status.terminal_result, "configured child reported terminal success before parent publication");
-      if (!holding(status)) return false;
-      if (!apply_journal_.ReadBringUpChildProof(intent.apply_id, intent.apply_generation,
-              child.intent.controllable_component_id, ManagerApplyBringUpChildPhase::kHolding))
-        record(child, ManagerApplyBringUpChildPhase::kHolding, *result);
-    }
-  }
-  return true;
-}
-
-ManagerNamedApplyResult ManagerNamedApplyCoordinator::FinishOriginalBringUpPublication(
-    const PersistedManagerApplyIntent &durable, const bool request_replayed) {
-  const auto &intent = durable.intent;
-  Require(HasOriginalBringUpCapture(intent), "published configured parent lost original capture");
-  try {
-    auto &captured = *captured_apply_inputs_;
-    Require(captured.original_scene_begin_consumed && captured.original_scene_adoption,
-            "published parent has no original Scene operation");
-    const auto publication = apply_journal_.ReadPublicationReceipt(intent.apply_id, intent.apply_generation);
-    Require(publication && publication->publication.publication_receipt.request ==
-                captured.bring_up_plan->plan.expected_publication,
-            "original Scene completion lacks the exact sealed parent publication");
-    const auto &receipt = publication->publication.publication_receipt;
-    const auto head = publication_reader_.ReadActiveBundlePublication(receipt.publication_generation);
-    Require(head.ok() && head.value() == receipt,
-            "original Scene completion publication is not the actual current head");
-    if (!captured.original_scene_complete_consumed) {
-      Require(CaptureOriginalSceneAdoption(intent) == *captured.original_scene_adoption,
-              "original parent identity changed before Scene Complete");
-      captured.original_scene_complete_consumed = true;
-      const auto completed = scene_owner_.CompleteOriginalManagerProductAdoption(
-          *captured.original_scene_adoption, receipt);
-      Require(completed.valid() && completed.apply_id == intent.apply_id &&
-                  completed.apply_generation == intent.apply_generation && completed.state == core::ProjectionMaintenanceInitializationState::kCompleted &&
-                  core::SamePublicationIdentity(completed.publication_receipt, receipt) &&
-                  completed.initial_scene_installed &&
-                  !completed.effects_unknown && !completed.first_error &&
-                  core::SameProjectionIdentity(completed.predecessor_projection_revision,
-                                               intent.expected_active_projection_revision) &&
-                  core::SameProjectionIdentity(completed.target_projection_revision,
-                                               receipt.request.candidate_projection_revision) &&
-                  SameSnapshotScene(completed.authoritative_snapshot_identity,
-                                    captured.original_scene_adoption->expected_snapshot_identity) &&
-                  completed.native_runtime_bindings == captured.original_scene_adoption->native_runtime_bindings,
-              "original Scene Complete returned missing or foreign evidence");
-      Require(CaptureOriginalSceneAdoption(intent) == *captured.original_scene_adoption,
-              "original parent identity changed across Scene Complete");
-      const auto after = publication_reader_.ReadActiveBundlePublication(receipt.publication_generation);
-      Require(after.ok() && after.value() == receipt,
-              "original publication identity changed across Scene Complete");
-      captured.original_scene_completed = completed;
-    }
-    Require(captured.original_scene_completed.has_value(), "original Scene completion outcome is uncertain");
-    if (!AdvanceOriginalBringUpChildren(intent, true))
-      return {intent.apply_id, intent.apply_generation, ManagerNamedApplyResultState::kPending,
-              request_replayed, std::nullopt};
-    const auto composition = runtime_composition_coordinator_.InstallOrRecover(
-        intent.apply_id, intent.apply_generation, *captured_apply_inputs_->candidate);
-    if (composition.state == ManagerSelectedRuntimeCompositionResultState::kPending)
-      return {intent.apply_id, intent.apply_generation, ManagerNamedApplyResultState::kPending,
-              request_replayed, std::nullopt};
-    const auto released = fence_release_coordinator_.ReleaseOrRecover(intent.apply_id, intent.apply_generation);
-    const auto terminal = apply_journal_.ReadTerminalOutcome(intent.apply_id, intent.apply_generation);
-    Require(terminal.has_value(), "configured parent fence release lacks actual terminal proof");
-    if (!SettleSuccessfulAdmission(durable, *terminal, ManagerApplySettlementAttempt::kInitial))
-      return PendingSettlementResult(intent, request_replayed);
-    return {intent.apply_id, intent.apply_generation, ManagerNamedApplyResultState::kSucceeded,
-            request_replayed, released.durable_terminal_outcome.record.terminal_outcome};
-  } catch (const std::exception &error) {
-    // Fence release can already have recorded the actual successful parent
-    // terminal. A later claim-release refusal must not overwrite that fact.
-    if (apply_journal_.ReadTerminalOutcome(intent.apply_id, intent.apply_generation)) throw;
-    return RetainTerminalFailure(apply_journal_, durable, "apply_component_bring_up_settlement_failed",
-        error, ManagerApplyEffectDisposition::kUnknown, request_replayed);
-  }
-}
-
-std::optional<ManagerNamedApplyResult>
-ManagerNamedApplyCoordinator::ObserveBringUpParent(
-    const ManagerApplyIntentDTO &intent, const bool request_replayed) const {
-  const auto plan =
-      apply_journal_.ReadBringUpPlan(intent.apply_id, intent.apply_generation);
-  if (!plan.has_value())
-    return std::nullopt;
-  if (HasOriginalBringUpCapture(intent)) return std::nullopt;
-  // The journal's complete status read verifies every retained child proof
-  // against this exact immutable plan and the original request/fence facts.
-  // Those facts are observations, never reconstructed current authority.
-  const auto status =
-      apply_journal_.ReadStatus(intent.apply_id, intent.apply_generation);
-  Require(status.has_value() && status->intent.intent == intent &&
-              status->bring_up_plan == plan &&
-              plan->plan.parent_intent_digest == status->intent.intent_digest,
-          "linked bring-up parent does not match its exact stored request");
-  const auto &terminal = status->terminal_outcome;
-  // A child failure/unknown proof does not manufacture a parent terminal.
-  // Until the real parent result exists, preserve the unresolved observation
-  // and all exclusions for explicit owner reconciliation.
-  return ManagerNamedApplyResult{
-      intent.apply_id, intent.apply_generation,
-      terminal.has_value() ? ResultStateFromTerminal(terminal->terminal_outcome)
-                           : ManagerNamedApplyResultState::kPending,
-      request_replayed,
-      terminal.has_value() ? std::optional(terminal->terminal_outcome)
-                           : std::nullopt};
-}
-
 ManagerNamedApplyResult ManagerNamedApplyCoordinator::AcceptOrReplay(
     const ManagerNamedApplyRequestDTO &request,
-    OriginalBringUpPlanSource original_bring_up_plan_source,
     OriginalPrepareAcknowledgement original_prepare_acknowledgement) {
   std::lock_guard lock(operation_mutex_);
   Require(request.valid(), "named Apply request is invalid");
@@ -1521,9 +1152,6 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::AcceptOrReplay(
     if (pending_settlement_ == core::NamedApplyPublicationTransactionDTO{
             existing->intent.apply_id, existing->intent.apply_generation})
       return PendingSettlementResult(existing->intent, true);
-    if (const auto observation = ObserveBringUpParent(existing->intent, true);
-        observation.has_value())
-      return *observation;
     const auto terminal = apply_journal_.ReadTerminalOutcome(
         existing->intent.apply_id, existing->intent.apply_generation);
     return {existing->intent.apply_id, existing->intent.apply_generation,
@@ -1550,12 +1178,6 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::AcceptOrReplay(
           "identity and revision");
   Require(candidate_value.cell_graph.cell_id == apply_journal_.cell_id(),
           "selected candidate belongs to another cell");
-  // Configuration Apply preserves the current logical Scene. Program Load
-  // owns authored scene changes; this operation cannot install a baseline.
-  auto initial_scene = std::vector<core::AddObjectRequestDTO>{};
-  Require(core::ValidInitialSceneObjects(initial_scene),
-          "captured initial Scene has invalid geometry, pose, or ordering");
-
   const auto inventory = apply_journal_.ReadStatusInventory();
   for (const auto &status : inventory) {
     if (!IsTerminal(status)) {
@@ -1601,86 +1223,14 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::AcceptOrReplay(
       request.scene_initialization,
   };
   Require(intent.valid(), "Manager could not construct a valid Apply intent");
-  std::optional<ManagerApplyBringUpPlanDTO> original_plan;
-  if (original_bring_up_plan_source) {
-    Require(!intent.parent_authoring_claim &&
-                intent.expected_admission_generation.has_value(),
-            "configured bring-up requires the original direct Apply parent");
-    original_plan = original_bring_up_plan_source(
-        intent, *predecessor, *candidate, active_plan);
-    Require(original_plan->valid() && original_plan->apply_id == intent.apply_id &&
-                original_plan->apply_generation == intent.apply_generation &&
-                original_plan->parent_intent_digest == ComputeManagerApplyIntentDigest(intent) &&
-                original_plan->expected_publication.expected_previous_publication_generation ==
-                    active_plan.active_publication.publication_generation &&
-                original_plan->predecessor_public_pointer_digest ==
-                    active_plan.active_publication.durable_public_pointer_content_digest,
-            "original configured bring-up plan differs from its captured parent/head");
-    std::vector<core::ControllableComponentId> configured;
-    for (const auto &component : candidate_value.cell_graph.controllable_components)
-      configured.push_back(component.controllable_component_id);
-    std::sort(configured.begin(), configured.end());
-    Require(original_plan->configured_components == configured,
-            "original configured bring-up plan omits or adds candidate components");
-    const auto candidate_digest = core::ContentDigest(
-        deployment::sha256_digest(candidate->canonical_bytes()));
-    for (const auto &child : original_plan->children) {
-      const auto component = std::find_if(
-          candidate_value.cell_graph.controllable_components.begin(),
-          candidate_value.cell_graph.controllable_components.end(),
-          [&](const auto &row) {
-            return row.controllable_component_id == child.intent.controllable_component_id;
-          });
-      Require(component != candidate_value.cell_graph.controllable_components.end() &&
-                  std::find(component->runtime_unit_ids.begin(), component->runtime_unit_ids.end(),
-                            child.runtime_unit_id) != component->runtime_unit_ids.end() &&
-                  child.intent.expected_graph_revision == scene_revision.graph_revision &&
-                  child.candidate_projection_revision ==
-                      core::ProjectionRevisionDTO{candidate->retained_bundle_id(),
-                                                  candidate_value.cell_graph.graph_revision,
-                                                  scene_revision.scene_revision} &&
-                  child.candidate_retained_bundle_digest == candidate_digest &&
-                  child.candidate_retained_bundle_bytes == candidate->canonical_bytes().size() &&
-                  child.manager_runtime_epoch == manager_runtime_epoch_ &&
-                  child.intent.expected_admission_generation ==
-                      *intent.expected_admission_generation,
-              "original configured bring-up child differs from its candidate/current Manager");
-    }
-    Require(active_plan_source_.ReadCurrentPlan().active_publication ==
-                active_plan.active_publication &&
-                core::SameProjectionIdentity(scene_owner_.CurrentProjectionRevision(),
-                                             scene_revision),
-            "original configured bring-up predecessor changed before acceptance");
-  }
-  std::optional<PersistedManagerApplyBringUpPlan> durable_plan;
-  const auto durable_intent = [&] {
-    if (!original_plan) return apply_journal_.EnsureIntent(intent).record;
-    auto accepted = apply_journal_.EnsureBringUpIntent(intent, *original_plan);
-    Require(accepted.inserted,
-            "original configured bring-up acceptance lost its fresh parent identity");
-    durable_plan = std::move(accepted.plan);
-    return std::move(accepted.intent);
-  }();
-  // Capture before synchronous Acquire; only this fresh call owns these
-  // verified inputs. Neither a stored plan nor a recovered claim recreates it.
-  if (durable_plan) {
-    captured_apply_inputs_.emplace(CapturedApplyInputs{
-        intent.apply_id, intent.apply_generation, predecessor, candidate,
-        std::move(initial_scene), durable_plan,
-        std::move(original_prepare_acknowledgement)});
-    captured_apply_inputs_->original_predecessor_publication = active_plan.active_publication;
-  }
+  const auto durable_intent = apply_journal_.EnsureIntent(intent).record;
   // Claim the exact idle admission before exposing this Apply as pending.
   // Publishing pending closes readiness; doing that first invalidates the
   // admission generation carried by the accepted request itself.
   std::optional<core::CellAdmissionClaimDTO> accepted_claim;
   try {
-    accepted_claim = RequireHeldAdmission(
-        durable_intent, cell_admission_,
-        durable_plan ? std::optional(durable_plan->plan_digest) : std::nullopt);
-    if (durable_plan) captured_apply_inputs_->original_parent_claim = accepted_claim;
+    accepted_claim = RequireHeldAdmission(durable_intent, cell_admission_);
   } catch (const std::exception &error) {
-    if (durable_plan) captured_apply_inputs_.reset();
     // No runtime lifecycle action was issued on this path. Whether an
     // admission claim exists is a separate fact: only a typed known refusal
     // proves no admission effect (AdmissionRefusalBoundary). Any other failure
@@ -1694,14 +1244,13 @@ ManagerNamedApplyResult ManagerNamedApplyCoordinator::AcceptOrReplay(
             : ManagerApplyEffectDisposition::kUnknown,
         false, boundary);
   }
-  if (!durable_plan) {
-    captured_apply_inputs_.emplace(CapturedApplyInputs{
-        intent.apply_id, intent.apply_generation, predecessor, candidate,
-        std::move(initial_scene), std::nullopt,
-        std::move(original_prepare_acknowledgement)});
-    captured_apply_inputs_->original_parent_claim = accepted_claim;
-    captured_apply_inputs_->original_predecessor_publication = active_plan.active_publication;
-  }
+  // Only this fresh call owns these verified inputs; a restarted Manager
+  // cannot recreate them.
+  captured_apply_inputs_.emplace(CapturedApplyInputs{
+      intent.apply_id, intent.apply_generation, predecessor, candidate,
+      std::move(original_prepare_acknowledgement)});
+  captured_apply_inputs_->original_parent_claim = accepted_claim;
+  captured_apply_inputs_->original_predecessor_publication = active_plan.active_publication;
   if (apply_progress_observer_) {
     apply_progress_observer_(durable_intent.intent);
   }
@@ -1714,18 +1263,8 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
                                        const bool request_replayed) {
   Require(intent.valid() && intent.cell_id == apply_journal_.cell_id(),
           "durable Apply intent is invalid or belongs to another cell");
-  if (const auto observation = ObserveBringUpParent(intent, request_replayed);
-      observation.has_value())
-    return *observation;
-  const bool original_linked = HasOriginalBringUpCapture(intent);
   const bool original_configuration = HasOriginalConfigurationCapture(intent);
-  const auto durable_intent = original_linked
-      ? *apply_journal_.ReadIntent(intent.apply_id, intent.apply_generation)
-      : apply_journal_.EnsureIntent(intent).record;
-  const auto plan_digest = original_linked
-      ? std::optional(captured_apply_inputs_->bring_up_plan->plan_digest) : std::nullopt;
-  const auto original_claim = original_linked
-      ? captured_apply_inputs_->original_parent_claim : std::nullopt;
+  const auto durable_intent = apply_journal_.EnsureIntent(intent).record;
   if (apply_progress_observer_)
     apply_progress_observer_(durable_intent.intent);
 
@@ -1738,12 +1277,6 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
     return {intent.apply_id, intent.apply_generation,
             ResultStateFromTerminal(terminal->terminal_outcome),
             request_replayed, terminal->terminal_outcome};
-  }
-
-  if (original_linked && apply_journal_.ReadPublicationReceipt(intent.apply_id, intent.apply_generation)) {
-    Require(captured_apply_inputs_->original_scene_begin_consumed && captured_apply_inputs_->original_scene_adoption,
-            "publication observation cannot reconstruct an original Scene adoption");
-    return FinishOriginalBringUpPublication(durable_intent, request_replayed);
   }
 
   if (original_configuration &&
@@ -1762,10 +1295,25 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
               intent.apply_id, intent.apply_generation);
           Require(terminal.has_value(),
                   "pre-effect failure lacks terminal evidence");
-          ReleaseAdmission(durable_intent, *terminal, cell_admission_, plan_digest, original_claim);
+          ReleaseAdmission(durable_intent, *terminal, cell_admission_);
         }
         return result;
       };
+
+  // Reading the current state for the fence changes nothing: before a fence
+  // attempt is journaled its failure is known pre-effect and releases the
+  // admission claim (core rule 3); after one, its effect stays unknown.
+  const auto retain_evidence_failure = [&](const std::exception &error) {
+    if (apply_journal_.ReadFenceAttempt(intent.apply_id, intent.apply_generation))
+      return RetainTerminalFailure(
+          apply_journal_, durable_intent, "apply_fence_evidence_failed", error,
+          ManagerApplyEffectDisposition::kUnknown, request_replayed);
+    return retain_pre_effect_failure(
+        "apply_fence_evidence_failed",
+        core::CauseOf(error, "apply_fence_evidence_failed", kApplyProducer),
+        ManagerApplyEffectDisposition::kKnown,
+        ManagerApplyEffectBoundary::kBeforeEffect);
+  };
 
   Require(captured_apply_inputs_.has_value() &&
               captured_apply_inputs_->apply_id == intent.apply_id &&
@@ -1776,7 +1324,6 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
           "named Apply continuation lacks its process-local captured inputs");
   const auto &predecessor = *captured_apply_inputs_->predecessor;
   const auto &candidate = *captured_apply_inputs_->candidate;
-  const auto &initial_scene = captured_apply_inputs_->initial_scene;
 
   if (!apply_journal_
            .ReadFenceAttempt(intent.apply_id, intent.apply_generation)
@@ -1794,7 +1341,7 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
   }
 
   try {
-    static_cast<void>(RequireHeldAdmission(durable_intent, cell_admission_, plan_digest, original_claim));
+    static_cast<void>(RequireHeldAdmission(durable_intent, cell_admission_));
   } catch (const std::exception &error) {
     const auto disposition =
         apply_journal_
@@ -1817,13 +1364,10 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
                     intent.expected_active_projection_revision),
             "predecessor publication changed before initialization");
   } catch (const std::exception &error) {
-    return RetainTerminalFailure(
-        apply_journal_, durable_intent, "apply_fence_evidence_failed",
-        error, ManagerApplyEffectDisposition::kUnknown,
-        request_replayed);
+    return retain_evidence_failure(error);
   }
 
-  const auto host_continuity = VerifyNativeExecutionHostContinuity(
+  const auto host_continuity = VerifyExecutionHostContinuity(
       predecessor, candidate, artifact_source_);
   if (!host_continuity.ok()) {
     return retain_pre_effect_failure(
@@ -1838,9 +1382,10 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
     expectation.emplace(FenceExpectation(
         intent, predecessor, candidate, *active_plan, apply_journal_,
         kernel_fence_, manager_runtime_epoch_,
-        !original_linked &&
-                std::any_of(
-                    active_plan->runtime_units.begin(),
+        // Component processes and lifecycles live in the execution host.
+        // Every Apply whose predecessor runs it inspects them; a predecessor
+        // without it has none to inspect.
+        std::any_of(active_plan->runtime_units.begin(),
                     active_plan->runtime_units.end(),
                     [](const auto &unit) {
                       return unit.runtime_profile_id.value() ==
@@ -1850,7 +1395,7 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
                     })
             ? &runtime_composition_port_
             : nullptr,
-        retained_bundle_source_));
+        retained_bundle_source_, site_facts_));
   } catch (const ActiveComponentApplyRefusal &error) {
     return retain_pre_effect_failure(
         "apply_requires_inactive_component",
@@ -1858,10 +1403,7 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
         ManagerApplyEffectDisposition::kKnown,
         ManagerApplyEffectBoundary::kBeforeEffect);
   } catch (const std::exception &error) {
-    return RetainTerminalFailure(
-        apply_journal_, durable_intent, "apply_fence_evidence_failed",
-        error, ManagerApplyEffectDisposition::kUnknown,
-        request_replayed);
+    return retain_evidence_failure(error);
   }
 
   if (!apply_journal_
@@ -1928,299 +1470,9 @@ ManagerNamedApplyCoordinator::Continue(const ManagerApplyIntentDTO &intent,
         ManagerApplyEffectDisposition::kUnknown, request_replayed);
   }
 
-  if (original_linked) {
-    if (!captured_apply_inputs_->original_preparation_completed) {
-      try {
-        auto &captured = *captured_apply_inputs_;
-        const auto attempt_query = CaptureOriginalSceneStagingAttempt(intent);
-        const auto request = CaptureOriginalSceneAdoption(intent, attempt_query);
-        const auto before = publication_reader_.ReadActiveBundlePublication(
-            request.expected_predecessor_publication.publication_generation);
-        Require(before.ok() && before.value() == request.expected_predecessor_publication,
-                "original Scene staging predecessor is not the current publication");
-        std::vector<core::ProjectionHealthDTO> health;
-        if (!captured.original_scene_stage_consumed) {
-          captured.original_scene_adoption = request;
-          captured.original_scene_stage_consumed = true;
-          health = scene_owner_.StageOriginalManagerProductAdoption(request, attempt_query);
-          captured.original_scene_stage_completed = true;
-        } else {
-          Require(captured.original_scene_stage_completed && captured.original_scene_adoption == request,
-                  "original Scene staging outcome or identity is uncertain");
-          health = scene_owner_.ReadOriginalManagerProductAdoptionProjectionHealth(request, attempt_query);
-        }
-        Require(CaptureOriginalSceneStagingAttempt(intent) == attempt_query &&
-                    CaptureOriginalSceneAdoption(intent, attempt_query) == request,
-                "original parent identity changed across Scene projection staging/read");
-        const auto after = publication_reader_.ReadActiveBundlePublication(
-            request.expected_predecessor_publication.publication_generation);
-        Require(after.ok() && after.value() == request.expected_predecessor_publication,
-                "original publication identity changed across Scene projection staging/read");
-        Require(health.size() == request.native_runtime_bindings.size(),
-                "original Scene staging has an incomplete native participant set");
-        bool ready = true;
-        const auto &target = captured.bring_up_plan->plan.expected_publication.candidate_projection_revision;
-        for (std::size_t index = 0; index < health.size(); ++index) {
-          const auto &row = health[index];
-          Require(row.valid() && row.native_runtime_binding == request.native_runtime_bindings[index] && !row.error,
-                  "original Scene staging returned foreign or failed native evidence");
-          if (!row.healthy_for_identity(target)) {
-            Require(row.state == core::ProjectionHealthState::kRebuilding ||
-                        row.state == core::ProjectionHealthState::kUninitialized,
-                    "original Scene staging lacks healthy or genuinely pending native evidence");
-            ready = false;
-          }
-        }
-        if (!ready)
-          return {intent.apply_id, intent.apply_generation, ManagerNamedApplyResultState::kPending,
-                  request_replayed, std::nullopt};
-      } catch (const std::exception &error) {
-        return RetainTerminalFailure(apply_journal_, durable_intent, "scene_product_projection_staging_failed",
-            error, ManagerApplyEffectDisposition::kUnknown, request_replayed);
-      }
-    }
-    if (!captured_apply_inputs_->original_preparation_completed) {
-      try {
-        const auto claim = RequireHeldAdmission(durable_intent, cell_admission_, plan_digest, original_claim);
-        const auto composition = runtime_composition_coordinator_.PrepareOriginalApplyComponentBringUp(
-            *captured_apply_inputs_->bring_up_plan,
-            {intent.expected_active_projection_revision.scene_revision, intent.cell_id}, claim, candidate);
-        if (composition.state == ManagerSelectedRuntimeCompositionResultState::kPending)
-          return {intent.apply_id, intent.apply_generation, ManagerNamedApplyResultState::kPending,
-                  request_replayed, std::nullopt};
-        if (captured_apply_inputs_->original_prepare_acknowledgement &&
-            !captured_apply_inputs_->prepare_acknowledgement_consumed) {
-          captured_apply_inputs_->prepare_acknowledgement_consumed = true;
-          captured_apply_inputs_->original_prepare_acknowledgement(intent, candidate, composition.owner_result);
-        }
-        captured_apply_inputs_->original_preparation_completed = true;
-      } catch (const std::exception &error) {
-        return RetainTerminalFailure(apply_journal_, durable_intent,
-            "runtime_composition_preparation_failed", error,
-            PreparationFailureDisposition(error), request_replayed);
-      }
-    }
-    try {
-      if (!AdvanceOriginalBringUpChildren(intent, false))
-        return {intent.apply_id, intent.apply_generation, ManagerNamedApplyResultState::kPending,
-                request_replayed, std::nullopt};
-    } catch (const std::exception &error) {
-      return RetainTerminalFailure(apply_journal_, durable_intent, "apply_component_bring_up_failed",
-          error, ManagerApplyEffectDisposition::kUnknown, request_replayed);
-    }
-    try {
-      if (!captured_apply_inputs_->original_scene_begin_consumed) {
-        auto request = CaptureOriginalSceneAdoption(intent);
-        const auto head = publication_reader_.ReadActiveBundlePublication(
-            request.expected_predecessor_publication.publication_generation);
-        Require(head.ok() && head.value() == request.expected_predecessor_publication,
-                "original Scene Begin predecessor is not the current publication");
-        Require(captured_apply_inputs_->original_scene_stage_completed &&
-                    captured_apply_inputs_->original_scene_adoption == request,
-                "Scene Begin differs from its original native staging request");
-        captured_apply_inputs_->original_scene_begin_consumed = true;
-        const auto begun = scene_owner_.BeginOriginalManagerProductAdoption(request);
-        Require(begun.valid() && begun.apply_id == intent.apply_id &&
-                    begun.apply_generation == intent.apply_generation && begun.state == core::ProjectionMaintenanceInitializationState::kInitialized &&
-                    begun.ready_for_publication() && !begun.publication_receipt && !begun.effects_unknown && !begun.first_error &&
-                    core::SameProjectionIdentity(begun.predecessor_projection_revision,
-                                                 intent.expected_active_projection_revision) &&
-                    core::SameProjectionIdentity(begun.target_projection_revision,
-                        captured_apply_inputs_->bring_up_plan->plan.expected_publication.candidate_projection_revision) &&
-                    SameSnapshotScene(begun.authoritative_snapshot_identity, request.expected_snapshot_identity) &&
-                    begun.native_runtime_bindings == request.native_runtime_bindings,
-                "original Scene Begin returned missing or foreign adoption evidence");
-        Require(CaptureOriginalSceneAdoption(intent) == request,
-                "original parent identity changed across Scene Begin");
-        const auto after = publication_reader_.ReadActiveBundlePublication(
-            request.expected_predecessor_publication.publication_generation);
-        Require(after.ok() && after.value() == request.expected_predecessor_publication,
-                "original publication identity changed across Scene Begin");
-      }
-    } catch (const std::exception &error) {
-      return RetainTerminalFailure(apply_journal_, durable_intent, "scene_product_adoption_failed",
-          error, ManagerApplyEffectDisposition::kUnknown, request_replayed);
-    }
-    try {
-      // Holding is re-read after Begin; exact parent identity alone does not
-      // promise that a child's deadline or health stayed unchanged.
-      if (!AdvanceOriginalBringUpChildren(intent, false))
-        return {intent.apply_id, intent.apply_generation, ManagerNamedApplyResultState::kPending,
-                request_replayed, std::nullopt};
-      const auto composition = runtime_composition_coordinator_.InstallOrRecover(
-          intent.apply_id, intent.apply_generation, candidate);
-      if (composition.state == ManagerSelectedRuntimeCompositionResultState::kPending)
-        return {intent.apply_id, intent.apply_generation, ManagerNamedApplyResultState::kPending,
-                request_replayed, std::nullopt};
-    } catch (const std::exception &error) {
-      return RetainTerminalFailure(apply_journal_, durable_intent, "runtime_composition_finalization_failed",
-          error, ManagerApplyEffectDisposition::kUnknown, request_replayed);
-    }
-    try {
-      // Its first call publishes the exact head without the ordinary Scene
-      // completion call. The original completion below owns the second step.
-      static_cast<void>(selected_bundle_coordinator_.AdvanceOrRecover(
-          intent.apply_id, intent.apply_generation, predecessor, candidate));
-    } catch (const std::exception &error) {
-      return RetainTerminalFailure(apply_journal_, durable_intent, "configuration_publication_failed",
-          error, ManagerApplyEffectDisposition::kUnknown, request_replayed);
-    }
-    return FinishOriginalBringUpPublication(durable_intent, request_replayed);
-  }
-
-  if (original_configuration)
-    return ContinueOriginalConfiguration(durable_intent, request_replayed);
-
-  Require(original_linked,
+  Require(original_configuration,
           "configuration Apply lacks its original preserved-Scene capture");
-  bool scene_is_installed = false;
-  try {
-    const auto initialized = scene_initialization_coordinator_.Initialize(
-        intent.apply_id, intent.apply_generation, candidate, initial_scene);
-    scene_is_installed = initialized.ready_for_publication();
-  } catch (const ManagerSceneInitializationPending &) {
-    return {intent.apply_id, intent.apply_generation,
-            ManagerNamedApplyResultState::kPending, request_replayed,
-            std::nullopt};
-  } catch (const std::exception &error) {
-    return RetainTerminalFailure(
-        apply_journal_, durable_intent, "scene_initialization_failed",
-        error, ManagerApplyEffectDisposition::kUnknown,
-        request_replayed);
-  }
-
-  if (!scene_is_installed &&
-      (!original_linked || !captured_apply_inputs_->original_preparation_completed)) {
-    try {
-      const auto composition = runtime_composition_coordinator_.PrepareOrObserve(
-          intent.apply_id, intent.apply_generation, candidate);
-      if (composition.state ==
-          ManagerSelectedRuntimeCompositionResultState::kPending) {
-        return {intent.apply_id, intent.apply_generation,
-                ManagerNamedApplyResultState::kPending, request_replayed,
-                std::nullopt};
-      }
-      if (captured_apply_inputs_->original_prepare_acknowledgement &&
-          !captured_apply_inputs_->prepare_acknowledgement_consumed) {
-        // Consume before invoking: failure is retained as unknown by this
-        // existing preparation boundary and never replays a source transition.
-        captured_apply_inputs_->prepare_acknowledgement_consumed = true;
-        captured_apply_inputs_->original_prepare_acknowledgement(
-            intent, candidate, composition.owner_result);
-      }
-      if (original_linked) captured_apply_inputs_->original_preparation_completed = true;
-    } catch (const std::exception &error) {
-      return RetainTerminalFailure(
-          apply_journal_, durable_intent,
-          "runtime_composition_preparation_failed", error,
-          PreparationFailureDisposition(error), request_replayed);
-    }
-  }
-
-  if (original_linked) {
-    try {
-      if (!AdvanceOriginalBringUpChildren(intent, false)) {
-        return {intent.apply_id, intent.apply_generation, ManagerNamedApplyResultState::kPending,
-                request_replayed, std::nullopt};
-      }
-    } catch (const std::exception &error) {
-      return RetainTerminalFailure(apply_journal_, durable_intent, "apply_component_bring_up_failed",
-          error, ManagerApplyEffectDisposition::kUnknown, request_replayed);
-    }
-  }
-
-  try {
-    static_cast<void>(scene_initialization_coordinator_.InstallInitialScene(
-        intent.apply_id, intent.apply_generation, candidate, initial_scene));
-  } catch (const ManagerSceneInitializationPending &) {
-    return {intent.apply_id, intent.apply_generation,
-            ManagerNamedApplyResultState::kPending, request_replayed,
-            std::nullopt};
-  } catch (const std::exception &error) {
-    return RetainTerminalFailure(
-        apply_journal_, durable_intent, "initial_scene_installation_failed",
-        error, ManagerApplyEffectDisposition::kUnknown,
-        request_replayed);
-  }
-
-  try {
-    const auto composition = runtime_composition_coordinator_.InstallOrRecover(
-        intent.apply_id, intent.apply_generation, candidate);
-    if (composition.state ==
-        ManagerSelectedRuntimeCompositionResultState::kPending) {
-      return {intent.apply_id, intent.apply_generation,
-              ManagerNamedApplyResultState::kPending, request_replayed,
-              std::nullopt};
-    }
-  } catch (const std::exception &error) {
-    return RetainTerminalFailure(
-        apply_journal_, durable_intent, "runtime_composition_finalization_failed",
-        error, ManagerApplyEffectDisposition::kUnknown,
-        request_replayed);
-  }
-
-  bool completed = false;
-  try {
-    for (std::size_t advance = 0U;
-         advance < kMaximumSelectedBundleAdvances && !completed; ++advance) {
-      const auto result = selected_bundle_coordinator_.AdvanceOrRecover(
-          intent.apply_id, intent.apply_generation, predecessor, candidate);
-      completed = result.scene_completed;
-    }
-  } catch (const std::exception &error) {
-    return RetainTerminalFailure(
-        apply_journal_, durable_intent, "configuration_publication_failed",
-        error, ManagerApplyEffectDisposition::kUnknown,
-        request_replayed);
-  }
-  if (!completed) {
-    return RetainTerminalFailure(
-        apply_journal_, durable_intent,
-        "configuration_publication_incomplete",
-        "coherent publication exceeded its bounded two effects",
-        ManagerApplyEffectDisposition::kUnknown, request_replayed);
-  }
-
-  if (original_linked) return FinishOriginalBringUpPublication(durable_intent, request_replayed);
-
-  // The candidate is public only now. Its lifecycle/route owner can verify
-  // that exact publication while the parent fence is still held. Do not
-  // release admission merely because the pointer swap succeeded.
-  try {
-    const auto composition = runtime_composition_coordinator_.InstallOrRecover(
-        intent.apply_id, intent.apply_generation, candidate);
-    if (composition.state ==
-        ManagerSelectedRuntimeCompositionResultState::kPending) {
-      return {intent.apply_id, intent.apply_generation,
-              ManagerNamedApplyResultState::kPending, request_replayed,
-              std::nullopt};
-    }
-  } catch (const std::exception &error) {
-    return RetainTerminalFailure(
-        apply_journal_, durable_intent,
-        "runtime_composition_publication_verification_failed", error,
-        ManagerApplyEffectDisposition::kUnknown, request_replayed);
-  }
-
-  std::optional<ManagerApplyFenceReleaseResult> release;
-  try {
-    release.emplace(fence_release_coordinator_.ReleaseOrRecover(
-        intent.apply_id, intent.apply_generation));
-  } catch (const std::exception &error) {
-    return RetainTerminalFailure(
-        apply_journal_, durable_intent, "apply_fence_release_failed",
-        error, ManagerApplyEffectDisposition::kUnknown,
-        request_replayed);
-  }
-  const auto terminal = apply_journal_.ReadTerminalOutcome(
-      intent.apply_id, intent.apply_generation);
-  Require(terminal.has_value(),
-          "Manager Apply release completed without terminal evidence");
-  if (!SettleSuccessfulAdmission(durable_intent, *terminal, ManagerApplySettlementAttempt::kInitial))
-    return PendingSettlementResult(intent, request_replayed);
-  return {intent.apply_id, intent.apply_generation,
-          ManagerNamedApplyResultState::kSucceeded, request_replayed,
-          release->durable_terminal_outcome.record.terminal_outcome};
+  return ContinueOriginalConfiguration(durable_intent, request_replayed);
 }
 
 std::optional<ManagerNamedApplyResult>
@@ -2243,11 +1495,6 @@ ManagerNamedApplyCoordinator::RecoverIncompleteApply() {
     captured_apply_inputs_.reset();
     return std::nullopt;
   }
-
-  if (const auto observation =
-          ObserveBringUpParent(pending->intent.intent, true);
-      observation.has_value())
-    return *observation;
 
   if (captured_apply_inputs_.has_value() &&
       captured_apply_inputs_->apply_id == pending->intent.intent.apply_id &&
@@ -2299,6 +1546,34 @@ void ManagerNamedApplyCoordinator::AcknowledgeFailedApply(
     const core::ApplyId &apply_id, const core::ApplyGeneration apply_generation,
     const core::RequestId &request_id, const std::string &source_label) {
   std::lock_guard lock(operation_mutex_);
+  ReleaseFailedApply(apply_id, apply_generation, request_id, source_label, false);
+}
+
+std::optional<core::NamedApplyPublicationTransactionDTO>
+ManagerNamedApplyCoordinator::ReleaseFailedApplyForNew(const core::RequestId &request_id,
+                                                       const std::string &source_label) {
+  std::lock_guard lock(operation_mutex_);
+  for (const auto &status : apply_journal_.ReadStatusInventory()) {
+    const auto &intent = status.intent.intent;
+    if (!FailedApplyNewReleaseEligible(status) ||
+        apply_journal_.ReadFailedApplyRelease(intent.apply_id, intent.apply_generation))
+      continue;
+    // The failed Apply that holds the cell is the one whose claim the Kernel
+    // still holds; an earlier one's ended with its Kernel.
+    const auto &parent = intent.parent_authoring_claim;
+    const auto claim = cell_admission_.GetCellAdmissionRecoveryReceipt(
+        {parent ? parent->intent : DirectAdmissionIntent(status.intent), parent, std::nullopt});
+    if (!claim.ok()) FailCause(claim.error(), claim.error().message, kKernelProducer);
+    if (claim.value().status != core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact) continue;
+    ReleaseFailedApply(intent.apply_id, intent.apply_generation, request_id, source_label, true);
+    return core::NamedApplyPublicationTransactionDTO{intent.apply_id, intent.apply_generation};
+  }
+  return std::nullopt;
+}
+
+void ManagerNamedApplyCoordinator::ReleaseFailedApply(
+    const core::ApplyId &apply_id, const core::ApplyGeneration apply_generation,
+    const core::RequestId &request_id, const std::string &source_label, const bool for_new) {
   std::optional<PersistedManagerApplyStatus> status;
   std::optional<core::ConfigurationFenceReleaseDTO> release_request;
   // This block makes only read-only checks. Only a refusal from here is
@@ -2320,14 +1595,16 @@ void ManagerNamedApplyCoordinator::AcknowledgeFailedApply(
       throw core::RequestInvalid("request_context.source_label", "invalid",
                                  "Acknowledgement source label is invalid.");
     status = apply_journal_.ReadStatus(apply_id, apply_generation);
-    Require(status && FailedApplyAcknowledgementEligible(*status),
-            "failed Apply is not eligible for before-effect acknowledgement");
+    Require(status && (for_new ? FailedApplyNewReleaseEligible(*status)
+                               : FailedApplyAcknowledgementEligible(*status)),
+            for_new ? "failed Apply holds no fence New can release"
+                    : "failed Apply is not eligible for before-effect acknowledgement");
     const auto previous = apply_journal_.ReadFailedApplyRelease(apply_id, apply_generation);
     Require(!previous, "failed Apply release was already attempted; inspect its outcome");
 
     const auto &intent = status->intent.intent;
     const auto &parent = intent.parent_authoring_claim;
-    const auto claim_intent = parent ? parent->intent : DirectAdmissionIntent(status->intent, std::nullopt);
+    const auto claim_intent = parent ? parent->intent : DirectAdmissionIntent(status->intent);
     const core::CellAdmissionRecoveryReceiptQueryDTO claim_query{claim_intent, parent, std::nullopt};
     const auto claim = cell_admission_.GetCellAdmissionRecoveryReceipt(claim_query);
     if (!claim.ok()) FailCause(claim.error(), claim.error().message, kKernelProducer);
@@ -2360,8 +1637,9 @@ void ManagerNamedApplyCoordinator::AcknowledgeFailedApply(
                 evidence.active_publication_generation == active.active_publication.publication_generation &&
                 evidence.active_public_pointer_digest ==
                     active.active_publication.durable_public_pointer_content_digest &&
-                evidence.active_control_configurations ==
-                    status->fence_attempt->fence_intent.expected_active_control_configurations,
+                // New empties whatever the failed Apply changed (N7).
+                (for_new || evidence.active_control_configurations ==
+                    status->fence_attempt->fence_intent.expected_active_control_configurations),
             "failed Apply fence no longer proves the unchanged predecessor");
     release_request = core::ConfigurationFenceReleaseDTO{evidence, manager_runtime_epoch_};
     Require(release_request->valid(), "failed Apply fence still contains affected operations");
@@ -2400,7 +1678,7 @@ void ManagerNamedApplyCoordinator::AcknowledgeFailedApply(
   }
   try {
     Require(ReleaseAdmission(status->intent, *status->terminal_outcome, cell_admission_,
-                             std::nullopt, parent),
+                             parent),
             "failed Apply admission claim could not be settled");
   } catch (const std::exception &error) {
     FailAcknowledgementUncertain(error, "claim_release", kKernelProducer,

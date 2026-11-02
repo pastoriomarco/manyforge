@@ -2,17 +2,20 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>manyforge_xarm_control</name>
-  <version>0.1.0</version>
-  <description>xArm vendor adapter of the ManyForge real lane: robot_states classification into the common lifecycle causes and device facts.</description>
+  <version>0.2.0</version>
+  <description>xArm vendor adapter (CONTRACTS §6/§7/§12): robot and I/O component adapters, driver services, launch contribution.</description>
   <maintainer email="pastoriomarco@gmail.com">Marco Pastorio</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
 
+  <depend>ament_index_cpp</depend>
   <depend>rclcpp</depend>
   <depend>xarm_msgs</depend>
+  <depend>yaml-cpp</depend>
 
   <test_depend>ament_cmake_gtest</test_depend>
+  <test_depend>ament_cmake_ros</test_depend>
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_cpplint</test_depend>
   <test_depend>ament_lint_auto</test_depend>

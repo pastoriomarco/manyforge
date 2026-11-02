@@ -5,7 +5,6 @@
 #include <manyforge_core/types/manager_liveness.hpp>
 #include <manyforge_core/types/validation.hpp>
 #include <manyforge_core/types/strong_id.hpp>
-#include <manyforge_core/types/tcp_speed_check.hpp>
 #include <optional>
 #include <span>
 #include <string>
@@ -30,24 +29,14 @@ inline constexpr std::string_view kOperatingSystem = "linux";
 inline constexpr std::string_view kCandidateWorkerInstalledTargetId =
     "manyforge_roboplan_candidate_worker";
 inline constexpr std::string_view kManagerLivenessPolicyId =
-    "manyforge.retained_native_manager_liveness";
+    "manyforge.retained_manager_liveness";
 inline constexpr std::string_view kManagerLivenessLocalSafeContractId =
-    "manyforge.native_execution.manager_loss_safe";
+    "manyforge.execution_host.manager_loss_safe";
 
-struct ImportedJointJerkLimit final {
-  double maximum_rad_s3{};
-  bool enabled{};
-  bool machine_required{};
-  std::string source_id;
-  core::ContentDigest source_digest;
-  friend bool operator==(const ImportedJointJerkLimit &,
-                         const ImportedJointJerkLimit &) = default;
-};
-
+/// One joint's typed jerk value; a joint without one takes the preset.
 struct JointJerkSetting final {
   std::string source_joint_name;
   std::optional<double> override_rad_s3;
-  std::optional<ImportedJointJerkLimit> imported;
   friend bool operator==(const JointJerkSetting &,
                          const JointJerkSetting &) = default;
 };
@@ -61,8 +50,8 @@ struct OrdinaryMotionJerkSettings final {
 };
 
 /// Cold resolution against the immutable model, never a trajectory's duration.
-/// Imports/overrides retain their source identity in the saved settings; the
-/// returned private policy contains only the limits needed for admission.
+/// Switch on: each joint's typed value, else the preset from the model
+/// acceleration and the preset reference time. Switch off: no limits.
 [[nodiscard]] core::Result<core::OrdinaryMotionJerkPolicy>
 resolve_ordinary_motion_jerk_policy(
     const OrdinaryMotionJerkSettings &settings,
@@ -75,8 +64,6 @@ struct Configuration final {
     core::CommandTargetId command_target_id;
     double maximum_tcp_linear_speed_mps{};
     OrdinaryMotionJerkSettings ordinary_motion_jerk{};
-    /// Points the maximum holds at (spec 430 §1.2); schema default.
-    core::TcpSpeedCheck tcp_speed_check{core::TcpSpeedCheck::kActiveTcpAndFlange};
 
     friend bool operator==(const MotionTargetLimit &,
                            const MotionTargetLimit &) = default;

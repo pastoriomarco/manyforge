@@ -5,7 +5,7 @@
 #include "ros2_control_fake_controller.hpp"
 #include <manyforge_core/execution_port_participant.hpp>
 #include <manyforge_core/observed_robot_state_publication.hpp>
-#include <manyforge_roboplan/native_runtime_support.hpp>
+#include <manyforge_roboplan/execution_host_support.hpp>
 #include <manyforge_roboplan/retained_ros2_control_runtime_handle.hpp>
 #include <atomic>
 #include <chrono>
@@ -279,9 +279,9 @@ struct IdleRig {
       const auto activity = handle->arm_activity();
       return activity.observed && activity.controller_loaded && activity.hardware_active;
     }, "Idle controller manager discovery timed out");
-    require(handle->PrepareArmController().outcome == runtime::RetainedRos2ControlSwitchOutcome::kSucceeded,
+    require(handle->PrepareArmController({}, std::chrono::steady_clock::now() + std::chrono::seconds(30)).outcome == runtime::RetainedRos2ControlSwitchOutcome::kSucceeded,
             "Idle controller preparation failed");
-    require(handle->ActivateArmController({}).outcome == runtime::RetainedRos2ControlSwitchOutcome::kSucceeded,
+    require(handle->ActivateArmController({}, std::chrono::steady_clock::now() + std::chrono::seconds(30)).outcome == runtime::RetainedRos2ControlSwitchOutcome::kSucceeded,
             "Idle controller activation failed");
     auto publisher = jtc.node()->create_publisher<control_msgs::msg::JointTrajectoryControllerState>(
       prefix + "/arm_controller/controller_state", rclcpp::QoS(10).reliable());

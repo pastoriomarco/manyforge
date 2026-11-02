@@ -1,8 +1,9 @@
 # ManyForge Architecture
 
-The execution host uses ROS controller adapters for Mock, Isaac and Real
-components. The addressed Kernel owns execution and Stop; Manager owns
-convergence and runtime children; Headless and Program runner expose those
+One C++ execution host runs the cell's components through ros2_control with
+the stock JointTrajectoryController on every lane (Mock, Isaac, Real). The
+Kernel inside it owns execution and Stop; the Manager owns Apply and the
+execution host process; the Headless API and the Program runner expose those
 owners; Composer remains a client.
 
 A coherent, mid-depth map of how ManyForge is put together: the components, how
@@ -39,23 +40,48 @@ Six ideas explain most of the decisions below:
 
 ______________________________________________________________________
 
+## Processes
+
+`./scripts/compose-dev.sh start` runs the workbench in one ROS (Lyrical)
+container; `scripts/dev-workbench.py` starts these processes in it:
+
+| Process | Started as | Port | Role |
+| --- | --- | --- | --- |
+| Program runner | `python -m manyforge_program_runner` | 9011 | Program cycle: tree ticking, Run/Stop/Reset, cycle journal |
+| Headless API | `python -m manyforge_headless_api serve` | 9010 | REST/WebSocket over the owners: components, cell latch, readiness, I/O, cycle, history, alarms |
+| Manager | `manyforge_manager_daemon` | (local sockets) | Apply journal and convergence; starts and stops the execution host |
+| Execution host | `manyforge_ros2_control_execution_host` (started by the Manager) | — | Kernel, planner, collision, component adapters and their processes (`ros2_control.launch.py`, drivers, bridges) |
+| Assistant bridge | `python -m manyforge_assistant_bridge.bridge` | 8100 | AI tab model loop |
+| Composer backend | `python -m manyforge_composer` | 9020 | GUI/REST/MCP shell: Drafts, Scenario files, Apply/Load/New orchestration, proxies to the Headless API |
+| Composer frontend | Vite (`npm run dev`) | 3000 | Browser GUI |
+
+The execution host also runs the candidate planner as a separate worker
+process (`manyforge_roboplan_candidate_worker`). Isaac Sim runs outside the
+container, on the same machine or the LAN, and is reached over ROS 2.
+
 ## Components
 
 | Component                                 | Language         | Responsibility                                                                                                                                                                                                              |
 | ----------------------------------------- | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `manyforge_core`                          | C++20            | Execution kernel: lifecycle state machine, terminal authority, stop/reset semantics, collision-validation policy, runtime collision monitoring, execution snapshots and events. **ROS-free.**                               |
-| `manyforge_deployment`                    | C++20            | ROS-free, non-real-time composable-cell artifact decoding, qualified schema normalization, staged graph content identity, and compiler substrate. It is not a Kernel dependency.                                            |
-| `manyforge_component_manager`             | C++20            | Durable Apply, active retained-graph reconciliation, runtime-unit convergence, and explicit shutdown. The I5 daemon is its sole process owner and publishes immutable snapshots.                                            |
-| `manyforge_headless`                      | C++20 + pybind11 | I5/H0 runtime/scene source aggregation, scene-initialization lifetime, Alarm Lifecycle Owner, asynchronous historian, verified NodeEnvironment projection, and Manager/scene publication adapters.                          |
-| `manyforge_headless_api`                  | Python/FastAPI   | Bounded REST/WebSocket projection and one transport-neutral, two-class execution-control ingress over the owners. It owns transport freshness and delivery, not runtime, Program, scene, alarm, or robot semantics.          |
+| `manyforge_core`                          | C++20            | Execution kernel: lifecycle state machine, terminal authority, stop/reset semantics, collision-validation policy, runtime collision monitoring, execution snapshots and events; the component model types (`ComponentState`, cell latch) and the adapter port. **ROS-free.** |
+| `manyforge_deployment`                    | C++20            | ROS-free, non-real-time Deployment decoding, schema normalization, cell composition and compiler; the component build spec (`component_spec`, `cell_context`) and the Apply component delta. It is not a Kernel dependency. |
+| `manyforge_content_identity`              | C++20            | The one RFC 8785 canonical-JSON codec and SHA-256 digest framing used for content digests.                                                                                                                                 |
+| `manyforge_component_manager`             | C++20            | The Manager: durable Apply journal, retained-graph reconciliation, execution host convergence, site settings, and explicit shutdown.                                                                                       |
+| `manyforge_headless`                      | C++20 + pybind11 | The Manager daemon (`manyforge_manager_daemon`), runtime/scene source aggregation, alarm lifecycle owner, asynchronous historian, NodeEnvironment projection.                                                                |
+| `manyforge_scene`                         | C++20            | Logical-scene owner: canonical-empty bootstrap, Apply handoff, scene transactions.                                                                                                                                         |
+| `manyforge_persistence`                   | C++20            | Shared SQLite preflight primitives for the durable owners.                                                                                                                                                                 |
+| `manyforge_headless_api`                  | Python/FastAPI   | Bounded REST/WebSocket projection and one execution-control ingress over the owners; component states, cell latch, Run readiness and I/O. It owns transport freshness and delivery, not runtime, Program, scene, alarm, or robot semantics. |
 | `manyforge_program_runner`                | Python/FastAPI   | Independently restartable durable Program-cycle owner: exact Applied capture, tree construction/ticking, backend-owned Resetting/allowed commands, current-state idempotence, and explicit Program Stop/Reset orchestration.   |
 | `manyforge_core/python`                   | pybind11         | Bindings exposing the kernel to Python (poll-based; no C++→Python callbacks).                                                                                                                                               |
 | `manyforge_collision`                     | C++20            | Planner-neutral collision-world/query implementation behind ManyForge collision ports.                                                                                                                                      |
-| `manyforge_roboplan`                      | C++ + pybind11   | Primary planning/projection adapter (RRT + TOPP-RA), native execution, and native kernel composition.                                                                                                                       |
-| `manyforge_ros2_control_execution`        | C++20/ROS 2      | Controller execution adapter: FollowJointTrajectory, feedback/settling, bounded stop/reset, isolated ROS scene projection, and optional exact controller/lifecycle dispatch admission.                                      |
+| `manyforge_roboplan`                      | C++ + pybind11   | The execution host: RoboPlan planning adapter and candidate worker, kernel composition, the ros2_control component adapter, the adapter registry, launch artifacts (`controller_launch_artifacts`) and the Mock, simulation and point-cloud adapter families. |
+| `manyforge_ros2_control_execution`        | C++20/ROS 2      | Controller execution backend: FollowJointTrajectory and gripper commands, feedback/settling, bounded stop/reset; the Mock lane folder (`lane/`).                                                                            |
+| `manyforge_xarm_control`                  | C++20/ROS 2      | xArm vendor adapter family (xArm 5/6/7, Lite 6, UF850): machine owner, arm and I/O members, launch contribution; vendor folder `vendor/`.                                                                                  |
+| `manyforge_isaac_adapter`                 | C++20/ROS 2      | Isaac Sim lane adapter family: lane folder `lane/`, launch contribution, topic-based ros2_control settings, gripper bridges.                                                                                               |
 | `manyforge_behavior`                      | Python           | Node catalog/environment plus Program validation, tree, admission, scheduling, and focused client mechanisms hosted by the independent runner; it does not own robot effects.                                               |
-| `manyforge_composer`                      | FastAPI + React  | Structural/operator shell, revision-fenced Program authoring, transparent control/viewer proxies, and backend-state presentation. It owns no execution lifecycle and performs no Program/control polling.                    |
-| `manyforge_ros` / `manyforge_ros_bringup` | C++/Python       | ROS utility and deployment wiring: simulator inspection, standard controller/gripper surfaces, readiness supervision, and real/sim bring-up.                                                                                |
+| `manyforge_composer`                      | FastAPI + React  | Structural/operator shell, Draft authoring, server-side Apply/Load/New, transparent control/viewer proxies, and backend-state presentation. It owns no execution lifecycle.                                                 |
+| `manyforge_ros` / `manyforge_ros_bringup` | C++/Python       | ROS utilities (simulation control over `simulation_interfaces`, standard controller/gripper surfaces) and launch files (`ros2_control.launch.py`, pose source, point-cloud source, AI model, simulated PLC, Isaac gripper). |
+| `manyforge_example_models`                | data             | Component packages (`component.yaml`, URDF/SRDF, meshes, lane rows) for the included robots and tools; machine models in `components/`.                                                                                    |
 | `manyforge_assistant_bridge`              | Python           | AI tab model loop against the Deployment's `ai_model` endpoint, strict active-mode enforcement, Draft/read callback routing, cancellation/reconciliation, conversation history, and redacted audit. It owns no runtime effects or catalog truth. |
 
 ### Layers
@@ -74,7 +100,8 @@ kernel decides.
 │  Governance core (ROS-free) Execution lifecycle, terminal + stop authority,
 │                            collision policy, events/snapshots
 ├─────────────────────────────────────────────┤
-│  Backend                  RoboPlan (native) / ros2_control / custom
+│  Backend                  RoboPlan planner / component adapters
+│                            (ros2_control lanes, vendor adapters)
 └─────────────────────────────────────────────┘
               │ calls ▼        facts ▲
 ```
@@ -111,21 +138,10 @@ projections; neither is a second logical source of truth. Observed object poses
 are separate measured facts and change the authoritative scene only through a
 configured pose-source policy.
 
-A program/deployment cutover is an explicit initialization phase:
-
-```text
-close generation barrier -> reset backend -> seed authored scene
-        |                                      |
-        +-- retain newest eligible pose per object/source --+
-                                                           v
-                                      replay current batch -> open barrier
-```
-
-Only the matching generation/token may complete the phase. Stale completion is
-ignored; a failed candidate restores the retained runtime's barrier state.
-Expected waiting while the barrier is closed is status/history, not an alarm.
-A definitive initialization failure, or a pose-apply failure after readiness,
-is a typed condition with an authoritative clear path.
+Each Apply carries a Scene choice: `initialize` (reset the logical scene and
+seed it from the authored Program/Deployment) or `preserve` (keep it). Load,
+New and a Deployment Apply initialize it. A failed initialization, or a pose-apply failure after
+readiness, is a typed condition, not a silent fallback.
 
 ### Scene Viewer data plane
 
@@ -135,7 +151,7 @@ mutate the scene, certify validation, or decide stop/recovery outcomes. It
 consumes immutable facts already published by their authoritative owners.
 
 ```text
-Native current observation -> Headless credited socket -> Composer latest slot
+Execution host observation -> Headless credited socket -> Composer latest slot
                                                                |
                                                        /ws/scene/viewer
                                                                |
@@ -150,7 +166,7 @@ current joint observations; scene facts and other cold operator state arrive
 through `/ws/control`. Neither heartbeat passage nor volatile sample counters
 cause unchanged geometry to be rebuilt.
 
-Cold source-file invalidation uses the existing native canonical source reader,
+Cold source-file invalidation uses the existing C++ canonical source reader,
 including integrity checks, outside the API event loop and Python GIL. It reads
 changed files only and retains small equality hints and exact inode timestamps;
 expiry does not parse source files. Corrupt records wake an authoritative
@@ -196,7 +212,7 @@ functions; external plant safety remains independent.
 - **The kernel owns terminal authority.** Whether an execution ends
   `Completed`, `Stopped`, `Failed`, `Interrupted`, or `InterventionRequired`
   is decided inside the C++ kernel, through a single commit path, from the
-  authorities active at commit time. A stop request or a fault latch that
+  authorities active at commit time. A stop request or a component fault that
   lands mid-decision cannot be laundered into a normal completion — the fault
   outranks the normal terminal. Nothing in the behavior layer, Composer, or an
   LLM can fabricate a terminal state.
@@ -204,7 +220,8 @@ functions; external plant safety remains independent.
   Stop are first-class cell operations. The owner resolves and captures scope,
   reserves a fixed emergency transaction, atomically fences affected resource
   slots, and hands bounded participant stages to `StopControl`; it then reduces
-  immutable results into one certificate and optional fault latch. Journal,
+  immutable results into one certificate. What a Stop leaves behind is read
+  from component states (the cell latch, below), not stored. Journal,
   historian, and client latency cannot delay recognition or containment. A
   controlled stop that a backend refuses does **not** report a stopped-looking
   state—it advances only through the prepared cascade and otherwise remains
@@ -233,16 +250,16 @@ functions; external plant safety remains independent.
 - **The Robot Model Authority owns model interpretation.** URDF/SRDF plus
   package paths are interpreted once, into validated metadata and internal
   views — not re-parsed ad hoc per consumer.
-- **The execution adapter owns transport progression.** Native, ros2_control,
-  and future adapters report command acceptance, feedback, settling, stop, and
+- **The execution adapter owns transport progression.** The ros2_control
+  backend and future adapters report command acceptance, feedback, settling, stop, and
   terminal facts through the same port. A viewer pose or behavior tick is not
   controller feedback.
 - **Headless owns operator-alarm lifecycle; Composer owns presentation only.**
   Typed source adapters set/clear catalogued conditions and the independent
   Headless alarm owner tracks active/returned and acknowledged/unacknowledged
   states. Composer projects those facts and submits attributed acknowledgement.
-  Acknowledgement records awareness only: it cannot clear a condition, clear a
-  kernel latch, consume a recovery offer, reset, or move the robot.
+  Acknowledgement records awareness only: it cannot clear a condition, clear the
+  cell latch, consume a recovery offer, reset, or move the robot.
 
 This is why the kernel is ROS-free: the governance core must not depend on any
 particular robot transport.
@@ -251,14 +268,22 @@ particular robot transport.
 
 Collision protection is dual-layered and configurable:
 
-- **Plan-time validation** checks the trajectory per waypoint before it is
-  dispatched; a trajectory that fails is never sent to the robot.
+- **Plan-time checking** keeps every trajectory collision-free before it is
+  dispatched: the planner checks its own paths (edges, start, goal and
+  shortcuts, with the clearance below), and pre-dispatch validation checks
+  the waypoints of every cached trajectory, of every fresh one whose move has
+  an active contact policy (support contacts or a contact grasp, whose pairs
+  the planner switches off), and of every other fresh one unless the robot's
+  Deployment turns `collision_check_fresh_plans` off. A trajectory that fails
+  is never sent to the robot.
 - **Runtime monitoring** re-checks the lane-selected authoritative execution
   state periodically during execution and faults on a policy violation.
 
-Plan-time validation and the planner can keep a **collision clearance**
-(Deployment `collision_clearance_m`, 0 to 0.05 m; 0, the default, turns it off
-and only contact is checked). A motion's own `clearance_m` (Program motion
+Pre-dispatch validation and the planner keep a **collision clearance**
+(Deployment `collision_clearance_m`, 0 to 0.05 m; 0.001 m (1 mm) by
+default, which also covers the executed spline's small deviation from the
+planned path; 0 turns it off and only contact is checked). A motion's own
+`clearance_m` (Program motion
 nodes, Robot Control's Advanced settings) replaces it for that move. Robot and carried bodies must stay at
 least that far from every environment body, except where the collision policy
 allows contact: static, touch-link and support-contact pairs and the active
@@ -268,17 +293,28 @@ allows the contact. A move that starts inside the clearance may move away but
 not closer. Runtime monitoring and lookahead use clearance 0: they stop only on
 contact.
 
-Validation checks the stored waypoints and samples of the curve the
-controller executes between them, at the collision-check step the trajectory
-was planned with: the Deployment `collision_check_step_rad` (0.05 rad of
-joint-space distance by default) on the planner's first attempt, and the finer
-of it and 0.01 rad on a replan after a refusal. A contact thinner
-than one step can be missed between two samples; the clearance makes this less
-likely. A trajectory that would need more than 200,000 checked configurations
-is refused (`collision_validation_sample_budget_exceeded`).
+Pre-dispatch validation runs for cached trajectories, for fresh ones with an
+active contact policy and, while the robot's Deployment keeps
+`collision_check_fresh_plans` on (the default), for every other fresh plan.
+With it off, a fresh plan without a contact policy stands on the planner's
+check: its validation event reports `collision_evidence=planning`, a
+validated one `pre_dispatch_validation`. A fresh plan that fails is replanned
+within the authoritative-validation attempts, like a refused cached one. It
+runs in ManyForge's collision engine, like the runtime checks, on the
+trajectory's own waypoints only; the clearance covers the executed spline's
+deviation between them. The planner checks its
+paths at the Deployment `collision_check_step_rad` (0.05 rad of joint-space
+distance by default) on its first attempt, and the finer of it and 0.01 rad
+on a replan after a refusal.
 
-Both layers use the same authority — the motion planner does not get to certify
-its own trajectories. Each state query first determines the colliding body-pair
+Pairs that can never collide are not checked. The composed cell's SRDF takes
+each model's own disabled pairs, disables every pair between the rigid link
+groups that meet at a mount (reason `Adjacent`), and adds the arm–tool pairs a
+Deployment attachment lists under `collision_exclusions` (`{child_link,
+parent_link}`, reason `Never`; a link the model lacks is refused). These are
+part of the arm's planning model, so changing them restarts nothing.
+
+Both layers use the same collision authority. Each state query first determines the colliding body-pair
 set. When a policy mode needs signed distance/penetration, that query is run
 **only for pairs already reported colliding**, never for every possible pair.
 This selective rule applies at pre-dispatch validation and runtime monitoring;
@@ -318,6 +354,49 @@ in diagnostics rather than used silently.
 
 ______________________________________________________________________
 
+## Planning
+
+The planner is RoboPlan 0.8.0 (pinned by `ROBOPLAN_PINNED_REF` in
+`scripts/setup-docker.sh` and `.docker/roboplan.manyforge-sha`; patches and
+source closure in `third_party/roboplan/`). The execution host runs it in a
+separate worker process with a deadline; candidate search never replaces
+ManyForge's own validation and collision checks. Adapter details:
+[`ROBOPLAN_ADAPTER_NOTES.md`](ROBOPLAN_ADAPTER_NOTES.md).
+
+- **Planner block.** Free-space planning is set per robot in the Deployment
+  (`planner_search`: `rrt` or `rrt_connect`, default `rrt_connect`;
+  `planner_optimize`: `first`, `rrt_star` or `best_of_n` with `planner_n`;
+  `planner_max_nodes`; `collision_check_step_rad`; `planner_rng_seed`). A
+  motion node's optional `planner` parameter (`search`, `optimize`, `n`,
+  `collision_check_step_rad`, `max_nodes`) overrides it for that move.
+- **Cartesian timing.** `cartesian_timing` is `constant_speed` (RoboPlan's
+  Bounded timing: accelerate, hold the TCP speed, decelerate; the Deployment
+  default) or `time_optimal` (as fast as the joint limits allow), set per
+  robot and per move. Corners of a multi-waypoint path are rounded by
+  `blend_radius_m` (per move, per waypoint) before timing; radius 0 keeps the
+  exact corner, where the tool stops.
+- **Motion timing.** `motion_timing` (per robot, default `smooth`) times
+  joint and pose goals. `smooth`: TOPP-RA within the joint limits, then one
+  uniform stretch until the active TCP is at 0.98 of its speed limit at the
+  samples (and joint caps and jerk limits, if set, hold): gentle, slower.
+  `fast` (RP-3): TOPP-RA holds the TCP at 0.98 of its limit on its grid:
+  quicker, with abrupt acceleration changes. Cartesian paths follow
+  `cartesian_timing` only.
+- **TCP speed limit.** Either way the active TCP targets 0.98 of its speed
+  limit (inside TOPP-RA for `fast` and `time_optimal` Cartesian paths, by the
+  final stretch for `smooth`); a check at the trajectory samples stretches the
+  trajectory if a sample still exceeds it. The vendor TCP speed limit is never
+  exceeded.
+- **Clearance.** Every planned motion keeps the collision clearance above
+  (1 mm by default); fresh plans get the pre-dispatch waypoint check unless
+  the Deployment turns `collision_check_fresh_plans` off, as described under
+  *Collision validation*.
+
+Planner settings belong to the cell context (see *Component build spec*): an
+Apply that changes them restarts no component.
+
+______________________________________________________________________
+
 ## Cell kinematic index and TCP terms
 
 The cell kinematic index is a read-only view over facts the deployment layer
@@ -333,7 +412,7 @@ The index owns nothing. Each fact keeps the owner it already has:
 | --- | --- |
 | What is mounted on what, who owns each model, the default TCP | The deployment recipe, compiled into the cell graph of the retained bundle |
 | Which scenario is live | The Component Manager's applied publication |
-| Each component's live status | CCLC |
+| Each component's live status | The execution host's `ComponentState` |
 | Frames, targets, compiled links and frame paths | The compiled model map, verified at load |
 
 The index holds no state, authority, lifecycle, id or digest. It is derived
@@ -369,161 +448,201 @@ helper.
 
 ______________________________________________________________________
 
-## Offline ordinary jerk import
-
-The Deployment revision tool can import explicit angular `max_jerk` and
-`has_jerk_limits` fields from a selected MoveIt `joint_limits.yaml`. Run the
-installed tool in the qualified development environment, using the target's
-source-model joint names, not compiled prefixes:
-
-```bash
-manyforge_deployment_revision --update --input cell.deployment.yaml \
-  --import-moveit-jerk robot_moveit_config/config/joint_limits.yaml \
-  --source-id robot_moveit_config/config/joint_limits.yaml \
-  --runtime-unit robot.native_execution --component robot --target arm \
-  --joints joint1,joint2,joint3,joint4,joint5,joint6
-```
-
-`--print` previews only the resulting revision without writing. The same pure
-transformation is exposed as `manyforge_headless_py.import_moveit_angular_jerk_limits`.
-It preserves ordinary activation, preset time, overrides and independent Stop
-settings. A source flag does not activate ManyForge shaping or declare a
-machine-required limit. Positive disabled values retain their inactive metadata;
-absent/disabled-zero values acquire no invented imported limit. Import replaces
-the selected joints' previous import metadata, while keeping explicit overrides
-and rejecting removal/weakening of a reviewed required limit. The saved source
-identifier and SHA-256 identify the supplied bytes, not controller qualification.
-
-This authoring path supports the native angular profile; it does not reinterpret
-linear limits. The exact bound model and final capabilities are still checked
-at activation. Ordinary limits become effective through normal Save/Apply, not
-through a live file watch or an importer-owned runtime action.
-
 ## Deployment lanes
 
 The same public contracts drive the Mock, Isaac and Real lanes; they differ
-only in what sits behind the execution backend. All three use stock
-ros2_control / FollowJointTrajectory.
+only in the ros2_control hardware behind the controllers. All three run stock
+ros2_control with the stock JointTrajectoryController (FollowJointTrajectory),
+launched by `ros2_control.launch.py`. A component picks its lane with
+`components[].lane` in the Deployment; a machine member runs on its owner's
+lane.
 
-- **Mock.** ros2_control mock hardware; no simulator or robot.
-- **Isaac commanded simulation.** Stock ros2_control / FollowJointTrajectory
-  plus an Isaac topic bridge. Composer/ManyForge remain the command authority;
-  Isaac is the streamed plant. The explicit `commanded_sim` profile uses the
-  backend-authored command state for reset/planning authority while measured
-  Isaac state remains a separately-labelled observation/ghost.
-- **Physical ROS-backed robots.** The same public contracts as the Isaac
-  ros2_control lane, but controller/driver-observed state is authoritative;
-  reset resynchronizes software and never implies physical homing. Vendor
-  safety functions and explicit physical qualification remain required.
+- **Mock.** ros2_control mock hardware; no simulator or robot. Mock also
+  covers offline preparation.
+- **Isaac.** ros2_control with topic-based hardware bridged to Isaac Sim
+  (`manyforge_isaac_adapter`). ManyForge remains the command authority; Isaac
+  is the streamed plant. The simulator is reached through the generic ROS 2
+  `simulation_interfaces` services.
+- **Real.** ros2_control with the vendor's hardware plugin, through a vendor
+  adapter (xArm: `manyforge_xarm_control`). Controller/driver-observed state
+  is authoritative; reset resynchronizes software and never implies physical
+  homing. Vendor safety functions and the integrator's safety controller
+  remain required.
 
-For a physical deployment, the robot adapter resolves vendor-specific
-controller names, namespaces, joints, and interfaces into one immutable
-robot-neutral binding. The generic ros2_control backend observes
-controller-manager activity, verifies that exact binding outside the update
-loop, and requires a fresh lifecycle-admission snapshot at the final bounded
-goal-enqueue boundary. Activity or lifecycle-generation loss invalidates the
-running authority and cancels the known goal. The lifecycle provider and
-production launcher remain robot/deployment adapters; the generic execution
-package does not infer vendor names or own robot activation.
+______________________________________________________________________
 
-The initial Lite6 product shape runs a sole-owner control service separately
-from the non-owner Composer service. A committed cell and portable deployment
-template resolve into a digest-bound, retained per-run deployment/runtime
-record; Composer refuses missing or drifted provenance. Startup configures the
-hardware and controllers inactive. Composer or PLC/ROXSIE requests one stable
-robot-neutral target intent: `robot.prepare_for_motion` for **Enable robot** or
-`robot.make_noncommandable` for **Disable robot**. The lifecycle provider owns
-the durable transaction, while the selected vendor adapter owns its resumable
-stage plan and proves every stage from fresh observation. Neither client
-sequences vendor calls or controller-manager transitions.
+## Component model
 
-Enablement persists while the selected headless authority and its dependencies
-remain healthy; it is not a browser/user inactivity lease. For the
-`local_operator` profile, an app-lifespan-owned Composer task proves progress
-through bounded Kernel/cycle reads and renews the same authority epoch. The
-browser is only an HMI. Renewal never creates a session, advances lifecycle
-generation, or resets replay identity. Health loss closes admission; a
-recovered/restarted component starts observation-only and requires explicit
-Enable plus a new execution request. Client and provider reject same-generation
-renewal once the prior lease has expired, so a delayed heartbeat/RPC cannot
-reopen admission.
+Every robot, tool, I/O device, sensor, pose source, AI model and simulator in
+the cell is a **component**. The execution host owns them; the core holds and
+publishes one view of each, and everything else reads it.
 
-The retained runtime record binds the effective heartbeat/lease policy, while
-the authority component generates its unpredictable startup epoch inside the
-process. Generic admission publication uses a 250 ms lease. The xArm owner's
-internal write gate provisionally follows its 1000 ms producer-observation
-lease and cannot outlive fresh robot state. Supervision is deliberately
-layered:
+### Component state
 
-1. local command, final-dispatch, and active-goal fences close without waiting
-   for process management;
-1. a ROS-free NRT reducer checks receiver-local heartbeat/progress ages,
-   component epochs, generation identities, and the dependency DAG; and
-1. an external host supervisor observes the owner and Composer containers,
-   consumes Composer's already-reduced critical-health snapshot with its own
-   receiver-local freshness/epoch fence, and owns bounded
-   dependency-ordered teardown. Composer fences dispatch on the first
-   unhealthy reduction; external teardown requires continuous reduced-health
-   loss for its recorded persistence budget so a transient cannot destroy a
-   healthy owner. Process exit, identity/epoch mismatch, progress regression,
-   and stale supervision remain independent terminal paths. A container being
-   merely `running` is never sufficient health evidence.
+`ComponentState` (`manyforge_core/include/manyforge_core/types/component_state.hpp`)
+carries the component's `lifecycle` (`offline`, `not_prepared`, `prepared`,
+`enabled`, `fault`), a `fault` when in `fault`, a `reason` when offline or not
+prepared, its `activity` (`idle`, `busy`, `unknown`: a command's result has
+not come back), stream freshness, declared capabilities, the action in
+progress and the last finished action, and display-only vendor `details`. The
+execution host publishes every change; the Headless API serves
+`GET /api/components` and pushes `component_state` events on `/ws/control`.
 
-Provider delivery health and robot-observation freshness are deliberately
-separate. Advancing, identity-valid lifecycle samples inside the receiver-local
-delivery budget prove that the provider component is alive. The observation's
-shorter source deadline independently fences Enable, Run, final dispatch, and
-active execution. An expired observation never permits motion, but it does not
-by itself claim that the provider process died or request restart-domain
-teardown. Exact redelivery, stopped progress, delivery timeout, or identity
-failure still makes the provider component unhealthy.
+### Actions and capabilities
 
-The initial external policy is intentionally one-way: an unexpected service
-exit, stalled reduced-health channel, component-epoch replacement, or
-persistently unhealthy reduced dependency graph is terminal for that launcher
-generation. It never auto-restarts, re-enables, or resumes the lane; a later
-operator launch creates fresh epochs and starts observation-only. Its
-arm/shutdown channel is host-only, while the containers can read the retained
-heartbeat evidence. Health polling and process control remain NRT and outside
-robot command paths.
+`POST /api/components/{component_id}/actions` (and `POST
+/api/components/actions` for several) runs one of `prepare`, `enable`,
+`disable`, `recover` or a declared capability: `reset_position`, `power_off`,
+`reboot`, `sim_reset` (`io_manual_write` and `io_output_readback` describe I/O
+outputs). One action runs at a time per component; a Stop interrupts an
+action in progress; an action whose effect is unknown ends `unknown` and is
+never resent. Actions stay available during a cell latch and during a run.
 
-The execution environment is one logical, composed fence rather than one
-cross-layer lock. Composer's upper pin owns program, deployment, run,
-authority-session, and full component-graph identity. The native
-ros2_control backend's lower pin owns controller activity/binding,
-lifecycle-admission semantics, provider/owner/authority/supervisor epochs, and
-its own backend epoch. The planning/validation span, final enqueue, goal
-response, active monitor, resume, and successful terminal commit all validate
-the applicable immutable pin. Either half changing retires the execution;
-ordinary heartbeat/publication generations are correlation evidence and do
-not themselves become semantic equality fences.
+### Faults and the cell latch
 
-Reducer, heartbeat, alarm, and process-control work is NRT. None runs in the
-controller update, collision, dispatch-linearization, or Kernel stop-critical
-path.
+A `Fault` has a typed `code` (`fault_estop`, `fault_protective_stop`,
+`fault_drive`, `fault_communication`, `fault_stream_stale`,
+`fault_process_exited`, `fault_vendor`, …), the vendor's code and text where
+there is one, and the `operator_action` that clears it (`enable`, `recover`
+or `none`). The adapter maps vendor codes; unmapped ones pass through as
+`fault_vendor`.
 
-The provider projects lifecycle faults through the ordinary alarm/history
-system. UI Run/Resume and candidate approval mirror its `canExecute` state, the
-backend rejects them while admission is closed, and the execution adapter
-rechecks the immutable admission generation at FJT enqueue. The main Stop
-remains a motion/tree stop; Disable first stops the cycle and proves it
-quiescent, then one provider-owned transaction makes the robot
-non-commandable. Cause-specific recovery and controller shutdown remain
-separate operations.
+The **cell latch** is derived, never stored: after a Stop, it is set while any
+component in the cell is in `fault` or `offline` or reports
+`activity: unknown`, and also when a component faults while anything
+executes. It clears by itself once every component is healthy and idle; there
+is no recovery endpoint or acknowledgement. While latched, Program run and
+resume, every node, interrupt evaluation, manual motion and manual I/O are
+refused (`cell_latched`); component actions, Apply, Load and New are not.
+`GET /api/cell/latch` and the `cell_latch` event carry it.
+
+A simulation that isn't playing is simulator state, never a fault or latch:
+a simulated robot or tool keeps the lifecycle its controller reports with the
+reason `simulation_not_playing` and its streams stale, and the simulator
+component shows `prepared`. Enable and Execute are admitted, so the Program's
+own nodes can play the simulation. New motion and tool commands on such a
+component are refused with `simulation_not_playing`, and the node fails with
+that code.
+
+### Machines: owners and members
+
+One physical machine can be several components: an **owner** (connection,
+driver process, controller state, power) and its **members** (an arm, I/O
+banks), with ids `<owner_id>_<role>`. Members run on the owner's lane and are
+shown `offline` (`owner_unavailable`) while the owner isn't usable; a
+member action is refused (`owner_not_prepared`) while the owner isn't
+prepared. The owner has `prepare`, `recover` and its capabilities, no Enable.
+Controller faults are the owner's, with the members they concern. Members can
+be deactivated (`active: false`) but are never removed. On the real xArm,
+Prepare and Recover connect and clear errors with the motors off; the motors
+switch on only at the arm's Enable.
+
+### Adapters and the registry
+
+An adapter implements the ROS-free port
+`manyforge_core/include/manyforge_core/ports/icomponent_adapter_port.hpp`:
+it reports `ComponentState`, runs actions, and declares capabilities. It
+reports what the device or controller reports and adds no timers or retries
+of its own. Adapter families are shared libraries registered in the ament
+resource index `manyforge_component_adapters`; the execution host loads every
+family through the registry and links none of them. Families today: Mock,
+simulation and point-cloud (`manyforge_roboplan`), Isaac
+(`manyforge_isaac_adapter`), xArm (`manyforge_xarm_control`). Components
+without a lane (passive tools, I/O-driven grippers) get the host's small
+generic adapter.
+
+A family returns a **launch contribution** for its components: the
+ros2_control hardware section, controllers, driver parameters and remappings,
+built from the model's `lanes.<lane>` row in `component.yaml` and the
+family's folder (`vendor/` or `lane/`: `driver.yaml` with the pinned source,
+`manyforge_settings.yaml` with ManyForge's additions, `README.md`). The
+vendor-free generator (`controller_launch_artifacts`) adds instance values
+(namespace, device address from the site settings) and writes the robot
+description, controllers YAML and driver parameters that
+`ros2_control.launch.py` runs. A machine's process belongs to its owner.
+
+### Component build spec
+
+`manyforge_deployment` splits every compiled fact into two tiers
+(`manyforge_deployment/include/manyforge_deployment/component_spec.hpp`):
+
+- **`ComponentSpec`** (per component): what it is launched and constructed
+  with, in the sections `adapter`, `address`, `bindings`, `controllers`,
+  `description`, `launch`, `owner` and `providers` — its models and mounts,
+  its rows of the execution host configuration, the stream budget overrides
+  it is constructed with (a robot's `measured_joints`), its control bindings and
+  domains, the resolved device address, and for a member its owner's spec
+  fingerprint.
+- **`CellContext`** (per cell): policies (with the stream budget overrides
+  re-read on Apply), takeover budgets, Scene and
+  planning model (with collision exclusions), pose sources, default TCPs,
+  global rules, planner settings and assistant settings.
+
+`component_spec()` and `cell_context()` are pure functions of the compiled
+bundle (and the site's device addresses). A component's **fingerprint** is
+the digest of its spec (`component_spec_fingerprint`). On Apply, a component
+is replaced exactly when its fingerprint changes, and the replacement
+reasons are the spec sections that differ. Everything in the cell context is
+refreshed on Apply without restarting anything. The execution host builds
+each component (adapter, launch, backend configuration, owner process, I/O
+member, sensor, simulated PLC, observers) from its spec only, never from the
+whole bundle: its build functions take a component build input (the spec, an
+arm member's owner's spec and host handles), which has no bundle, model map
+or package root. Those stay on the participation path (planning model and
+scene, Program bindings and TCPs, the runtime participant binding, route
+open), which hands a build function only what it resolved there.
+
+### Apply, Load and New
+
+Apply, Load and New run server-side on one path in the Composer backend,
+used alike by the GUI, REST and MCP:
+
+- `POST /api/deployment/preview` lists each component as `add`, `remove`,
+  `replace` or `retain`, with its reasons;
+- `POST /api/deployment/apply` applies the Deployment Draft: for each removed
+  or replaced component, `disable`, Apply, then (replaced) `prepare` — owners
+  prepared before members, members disabled first. The processes of removed
+  and replaced components stop before any new one starts; a component whose
+  `disable` fails is stopped the same way, and the failure shows on its
+  row. Affected components end `prepared`, not enabled, on every lane;
+- `POST /api/scenario/new` empties the cell (Apply of the built-in Untitled
+  Scenario); it always works;
+- `POST /api/scenario/load` is New, then Apply of the Scenario file.
+
+Apply is refused while a Program run is in progress
+(`apply_refused_run_in_progress`) and allowed during a cell latch. Global
+rules return to their `active_at_start` value at Load.
+
+### Run readiness
+
+One computation in the Headless API (`GET /api/program/readiness`, event
+`run_readiness`) says whether Execute and Resume may run, with typed blocked
+reasons (`cell_latched`, `component_not_enabled`, `component_unhealthy`,
+`rule_holds`, `input_not_fresh`, `run_in_progress`, …). Every component in the
+cell must be enabled; an owner counts as ready when `prepared`, as does a
+simulator that isn't playing. The GUI's Activate prepares and enables every
+active component, then executes once. Every Program starts held and needs
+Run.
+
+______________________________________________________________________
+
+## Programs on every lane
 
 Program artifacts remain backend-neutral and can run unchanged when the target
 deployment declares the capabilities they require. Validation and
 qualification remain lane-, scene-revision-, controller-, and hardware-
-specific: a native pass never qualifies an Isaac or physical run by itself.
+specific: a Mock pass never qualifies an Isaac or physical run by itself.
 
 Arm and gripper lifecycles are deliberately separate. A deployment's gripper
 profile selects its command transport, progress/feedback source, dwell or result
-timeout, terminal policy, and any grasp-confirmation requirement. Native
-preview, Isaac bridges, ROS `GripperCommand`, and future device transports keep
-the same `command_gripper` program meaning. The native viewer renders the
-authoritative gripper state it receives; it does not progress a command.
+timeout, terminal policy, and any grasp-confirmation requirement. Mock, Isaac
+bridges, ROS `GripperCommand`, and future device transports keep the same
+gripper node meaning. The viewer renders the authoritative gripper state it
+receives; it does not progress a command. On Stop, a gripper already within
+its finish tolerance of the target (`gripper_stop_finish_tolerance` in the
+component package) finishes instead of being cancelled.
 
-Native read-only target resolution retains one verified immutable selection per
+The execution host's read-only target resolution retains one verified immutable selection per
 composition, keyed by Program Binding, target role and capability. It does not
 retain live participants or observations: current provider/route/command and
 freshness checks run on every read. Changing the composition discards the slot;
@@ -558,9 +677,10 @@ Idle → Planning → Validating → Executing → Completed
   *terminal* — reached only through the kernel's terminal-commit path.
 - **Reset** is an explicit recovery operation. From moving/stopping states it
   performs the configured bounded stop-before-reset sequence; cycle reset also
-  rebuilds the tree and authoritative scene. In a real lane it does not command
-  a home pose. Simulator-only profiles may explicitly command their declared
-  initial state.
+  rebuilds the tree and authoritative scene. It never commands a home pose;
+  where a component declares `reset_position` (Mock and Isaac robots), that
+  separate action, or Reset's **Reset robot position** option, returns it to
+  its initial joint positions.
 
 Controlled stops decelerate on-path where the profile allows, with a mandatory
 hard-stop floor as the last resort; see
@@ -595,6 +715,9 @@ acknowledgement. Run/resume and motion-producing recovery remain gated while a
 motion-attention alarm is unacknowledged or alarm state is unreconciled. Stop,
 Full Stop, and policy-admitted Reset remain available. The bulk acknowledgement
 control is shown only when more than one alarm requires acknowledgement.
+
+Component faults and the cell latch are separate from alarms: they clear when
+the component is healthy again (Recover, Enable), never by acknowledgement.
 
 ______________________________________________________________________
 
@@ -659,14 +782,17 @@ A refusal carries one carrier everywhere: `{code, message, details}` plus the
   runtime, component or Scene change; an admission claim, a Kernel fence and
   fail-closed readiness may still exist, and whoever releases them checks those
   facts directly. The operator can acknowledge a proven-before-effect failure
-  regardless of the requested component, Scene or attachment changes; planned
-  bring-up claims remain excluded until their exact settlement is supported.
-  `GET /api/manager/apply/status` reports the acknowledgement state. When the
-  native runtime finds a data or setup inconsistency while composing the
+  (`POST /api/manager/apply/acknowledge`); `GET /api/manager/apply/status`
+  reports the acknowledgement state. A failure with an unknown boundary keeps
+  its fence and claim until New: New releases them
+  (`POST /api/manager/apply/release-for-new`) and its own Apply then empties
+  the cell, whatever the failed Apply installed. When the
+  execution host finds a data or setup inconsistency while composing the
   candidate, it refuses only that Apply (`scenario_composition_refused`, with
   `details.cause`): the Apply ends `failed` with known effects, nothing is
-  published, and the runtime keeps running. The refused Apply keeps authoring
-  closed, so restart the workbench before the next Load.
+  published, and the runtime keeps running. Like any Apply that fails before
+  its first fence, the refusal releases the Apply's fence and admission claim
+  at once, so authoring, Load and New work again.
 
 The error catalog `manyforge_core/resources/error_catalog.tsv` has one line per
 code: `code`, compact text, full text. The area is the code prefix. The
@@ -681,9 +807,14 @@ ______________________________________________________________________
 
 ## Extending ManyForge
 
-- **New robot** — robots come from the included arm and gripper profiles;
-  adding a robot from your own URDF/SRDF or MoveIt configuration is not
-  supported yet.
+- **New robot, tool or I/O device** — add a component package
+  (`component.yaml` with its `lanes.<lane>` rows, URDF/SRDF, meshes; templates
+  in `components/templates/`); see
+  [`../authoring/ADDING_A_COMPONENT.md`](../authoring/ADDING_A_COMPONENT.md).
+- **New vendor or lane** — implement an adapter family (`IComponentAdapter`
+  and its launch contribution) with its `vendor/` or `lane/` folder and
+  register it in `manyforge_component_adapters`; the core and the execution
+  host need no change.
 - **New planner** — implement `IPlannerBackend` plus the focused
   revision-bound scene projection and model/reference adapters it requires;
   candidate search never replaces ManyForge validation or collision admission.

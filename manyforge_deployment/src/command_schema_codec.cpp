@@ -77,6 +77,9 @@ parse_option_kind(std::string_view token) {
   if (token == "nonnegative_duration_seconds") {
     return core::CommandCallerOptionValueKind::kNonnegativeDurationSeconds;
   }
+  if (token == "bool") {
+    return core::CommandCallerOptionValueKind::kBool;
+  }
   fail("command schema caller option kind is outside the closed enum");
 }
 
@@ -97,28 +100,6 @@ decode_normalized(const CanonicalValue &normalized) {
 
   const auto &api_version =
       require_string(require_member(normalized, "api_version"), "api_version");
-  if (api_version == core::kIoSignalWriteCommandSchemaApiVersion) {
-    if (require_string(
-            require_member(require_member(normalized, "command_value"),
-                           "value_kind"),
-            "value_kind") != "io_signal_write") {
-      fail("output command schema value kind is outside the boolean family");
-    }
-    return {core::CommandSchemaId(
-                require_string(require_member(normalized, "command_schema_id"),
-                               "command_schema_id")),
-            core::CommandSchemaRevision(require_string(
-                require_member(normalized, "command_schema_revision"),
-                "command_schema_revision")),
-            std::move(capabilities),
-            core::IoSignalWriteCommandValueContractDTO{},
-            {},
-            {},
-            {},
-            std::nullopt,
-            std::nullopt,
-            {}};
-  }
   if (api_version != core::kCommandSchemaApiVersion) {
     fail("command schema API version is outside the closed family");
   }
@@ -266,8 +247,7 @@ QualifiedCommandSchema resolve_and_qualify_command_schema(
       decoded.command_schema_revision != reference.record_revision) {
     fail("command-schema typed ID/revision selector does not match referent");
   }
-  if (decoded != core::builtin_gripper_position_command_schema() &&
-      decoded != core::builtin_io_signal_write_command_schema()) {
+  if (decoded != core::builtin_gripper_position_command_schema()) {
     fail("command schema does not match the build-owned qualified I6 family");
   }
   return QualifiedCommandSchema(reference, std::move(decoded),

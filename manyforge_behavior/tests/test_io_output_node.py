@@ -1,11 +1,13 @@
-"""io.set_output: one typed boolean write completed by source acceptance.
+"""io.set_output: one write through the one write path (CONTRACTS §7).
 
-Fakes only: the native transport and the owner-task port (contract 53).
+The node makes the same host call as a manual write (`set_io_output` by
+signal id), once: `succeeded` → success; `failed`/`unknown` → failure with
+the host's code; an admission refusal → failure with its code. Never resent.
+Fakes only: the native transport and the owner-invocation port.
 """
 
 from __future__ import annotations
 
-from copy import deepcopy
 from types import SimpleNamespace
 from typing import Any, Mapping
 
@@ -13,19 +15,13 @@ import py_trees
 import pytest
 
 from manyforge_behavior.executable_node_resolver import build_executable_node_resolver
-from manyforge_behavior.kernel_client import KernelClient
+from manyforge_behavior.kernel_client import KernelClient, KernelClientResponseError
 from manyforge_behavior.node_environment import build_node_environment
-from manyforge_behavior.nodes.stop_policy import (
-    OperatorMotionStopSnapshot,
-    OperatorMotionStopState,
-)
-from manyforge_behavior.nodes.v2_owner import IoOutputCommandAdapter
+from manyforge_behavior.nodes.v2_owner import OwnerInvocationAdapter
 from manyforge_behavior.orchestration_ports import (
     NodeAttemptIdentity,
-    OwnerInvocationHeldError,
+    OwnerInvocationResult,
     OwnerNodeInputs,
-    OwnerTaskSnapshot,
-    OwnerTaskState,
     ProgramRunPortContext,
 )
 from manyforge_behavior.production_ports import (
@@ -39,7 +35,6 @@ _B = "sha256:" + "b" * 64
 _C = "sha256:" + "c" * 64
 _D = "sha256:" + "d" * 64
 _E = "sha256:" + "e" * 64
-_SCHEMA = {"command_schema_id": "cell.valve.io_signal_write", "command_schema_revision": _E}
 
 
 def _signal(role: str, name: str, direction: str) -> dict[str, str]:
@@ -53,7 +48,7 @@ def _signal(role: str, name: str, direction: str) -> dict[str, str]:
     }
 
 
-def _context(*, schema: Any = _SCHEMA, tree: Mapping[str, Any] | None = None):
+def _context(*, tree: Mapping[str, Any] | None = None):
     target = {
         "target_role_id": "cell_io",
         "component_role_id": "io_module",
@@ -61,7 +56,7 @@ def _context(*, schema: Any = _SCHEMA, tree: Mapping[str, Any] | None = None):
         "command_target_id": "io.command",
         "capability_bindings": [
             {"capability_id": "io.gpio.get_input", "command_schema": None},
-            {"capability_id": "io.gpio.set_output", "command_schema": schema},
+            {"capability_id": "io.gpio.set_output", "command_schema": None},
         ],
         "signal_role_bindings": [
             _signal("part_present", "di_0", "input"),
@@ -94,10 +89,19 @@ def _context(*, schema: Any = _SCHEMA, tree: Mapping[str, Any] | None = None):
     )
 
 
+class _Refused(RuntimeError):
+    """The transport's typed admission refusal (`ok: false`)."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(f"refused: {code}")
+        self.code = code
+
+
 class _Transport:
-    def __init__(self) -> None:
+    def __init__(self, reply: Mapping[str, Any] | Exception | None = None) -> None:
+        self.writes: list[tuple[str, Any]] = []
         self.submissions: list[Mapping[str, Any]] = []
-        self.operations: dict[str, dict[str, Any]] = {}
+        self.reply = reply or {"outcome": "succeeded"}
 
     def identity(self) -> dict[str, Any]:
         return {"ok": True, "identity": {
@@ -105,23 +109,18 @@ class _Transport:
             "scene_revision": {"scene_id": _D, "revision_id": 4, "content_hash": _E},
         }}
 
+    def set_io_output(self, signal_id: str, value: Any, *, origin: str) -> dict[str, Any]:
+        assert origin == "program"
+        self.writes.append((signal_id, value))
+        if isinstance(self.reply, Exception):
+            raise self.reply
+        return {"ok": True, "command": "set_io_output", "result": dict(self.reply)}
+
     def submit(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        self.submissions.append(deepcopy(body))
-        operation_id = f"operation-{len(self.submissions)}"
-        self.operations[operation_id] = {
-            "operation_id": operation_id, "operation_revision": 1,
-            "program_run_id": body["program_run_id"], "state": "queued",
-            "active_stop_generation": None, "participants": [],
-        }
-        return {"ok": True, "accepted": {"operation_id": operation_id, "operation_revision": 1}}
+        self.submissions.append(body)
+        raise AssertionError("an output write is never a Kernel operation")
 
-    def read(self, operation_id: str) -> dict[str, Any]:
-        return {"ok": True, "operation": deepcopy(self.operations[operation_id]), "resident": True}
-
-    def reset(self, operation_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
-        raise AssertionError("an output write is never reset by these tests")
-
-    acknowledge_completed = stop = reset
+    read = reset = acknowledge_completed = stop = submit
 
 
 def _identity(instance: str = "set-valve") -> NodeAttemptIdentity:
@@ -132,58 +131,76 @@ def _inputs(value: Any = True, role: str = "valve") -> OwnerNodeInputs:
     return OwnerNodeInputs({"target_role": "cell_io", "resource_role": role, "value": value})
 
 
-def _port(context: ProgramRunPortContext | None = None):
-    transport = _Transport()
+def _port(transport: _Transport | None = None, context: ProgramRunPortContext | None = None):
+    transport = transport or _Transport()
     port = NativeKernelProgramPort(KernelClient(transport))
     port.bind(context or _context())
     return port, transport
 
 
-def _provider_participant(**extra: Any) -> dict[str, Any]:
-    return {
-        "participant_id": "p.1", "state": "completed", "terminal_error": None,
-        "control_binding_id": None, "control_binding_revision": None,
-        "capability_provider_binding_id": "io.1.provider", "capability_provider_binding_revision": _E,
-        **extra,
-    }
-
-
-# --- Runner emission -------------------------------------------------------
+# --- Port: one host call by signal id ---------------------------------------
 
 
 @pytest.mark.parametrize("value", [True, False])
-def test_write_uses_the_bound_sealed_schema_and_a_typed_boolean(value: bool) -> None:
+def test_success_writes_the_bound_signal_once(value: bool) -> None:
     port, transport = _port()
-    task = port.operations.start("io.set_output", _identity(), _inputs(value))
-    assert task.state is OwnerTaskState.ACTIVE
-    (submission,) = transport.submissions
-    (participant,) = submission["participants"]
-    assert participant["required_capability_id"] == "io.gpio.set_output"
-    assert participant["target_role_id"] == "cell_io"
-    assert participant["payload"] == {
-        "kind": "capability_command",
-        "command_schema_id": "cell.valve.io_signal_write",
-        "command_schema_revision": _E,
-        "command_value": {"kind": "io_signal_write", "resource_role_id": "valve", "value": value},
-        "caller_options": [],
-    }
-
-
-@pytest.mark.parametrize(
-    "context,inputs,error",
-    [
-        (_context(schema=None), _inputs(), "no sealed output command schema"),
-        (_context(), _inputs(1), "must be a boolean"),
-        (_context(), _inputs("true"), "must be a boolean"),
-        (_context(), _inputs(role="part_present"), "not an output"),
-        (_context(), _inputs(role="unknown"), "not bound to a signal"),
-    ],
-)
-def test_write_refuses_before_any_effect(context, inputs, error) -> None:
-    port, transport = _port(context)
-    with pytest.raises(ProductionPortError, match=error):
-        port.operations.start("io.set_output", _identity(), inputs)
+    result = port.queries.invoke("io.set_output", _identity(), _inputs(value))
+    assert result.succeeded
+    assert transport.writes == [("io.1/do_0", value)]
     assert transport.submissions == []
+
+
+@pytest.mark.parametrize("outcome,code", [
+    ("failed", "io_output_write_failed"),
+    ("unknown", "io_output_acceptance_unknown"),
+])
+def test_failed_or_unknown_result_fails_with_the_host_code_never_resent(outcome, code) -> None:
+    port, transport = _port(_Transport(
+        {"outcome": outcome, "error": {"code": code, "message": "the device said so"}}
+    ))
+    result = port.queries.invoke("io.set_output", _identity(), _inputs())
+    assert not result.succeeded
+    assert result.reason_code == code
+    assert "the device said so" in result.message
+    assert transport.writes == [("io.1/do_0", True)]
+
+
+@pytest.mark.parametrize("code", ["cell_latched", "rule_holds"])
+def test_admission_refusal_fails_with_its_code(code: str) -> None:
+    port, transport = _port(_Transport(_Refused(code)))
+    result = port.queries.invoke("io.set_output", _identity(), _inputs())
+    assert not result.succeeded
+    assert result.reason_code == code
+    assert len(transport.writes) == 1
+
+
+def test_unknown_result_without_a_typed_error_is_an_invalid_reply() -> None:
+    port, transport = _port(_Transport({"outcome": "unknown"}))
+    with pytest.raises(KernelClientResponseError):
+        port.queries.invoke("io.set_output", _identity(), _inputs())
+    assert len(transport.writes) == 1
+
+
+@pytest.mark.parametrize("inputs,error", [
+    (_inputs(1), "must be a boolean"),
+    (_inputs("true"), "must be a boolean"),
+])
+def test_non_boolean_value_is_refused_before_any_write(inputs, error) -> None:
+    port, transport = _port()
+    with pytest.raises(ProductionPortError, match=error):
+        port.queries.invoke("io.set_output", _identity(), inputs)
+    assert transport.writes == []
+
+
+@pytest.mark.parametrize("role,code", [
+    ("part_present", "io_signal_direction_mismatch"),
+    ("unknown", "io_signal_unbound"),
+])
+def test_unwritable_signal_fails_before_any_write(role: str, code: str) -> None:
+    port, transport = _port()
+    result = port.queries.invoke("io.set_output", _identity(), _inputs(role=role))
+    assert not result.succeeded and result.reason_code == code
+    assert transport.writes == []
 
 
 def test_run_preparation_refuses_a_literal_input_role_for_an_output() -> None:
@@ -192,203 +209,57 @@ def test_run_preparation_refuses_a_literal_input_role_for_an_output() -> None:
         "parameters": {"target_role": "cell_io", "resource_role": "part_present", "value": True},
     }
     with pytest.raises(IoSignalRefusedError, match="not an output") as refused:
-        _port(_context(tree=tree))
+        _port(context=_context(tree=tree))
     assert refused.value.code == "io_signal_direction_mismatch"
 
 
-@pytest.mark.parametrize("evidence", sorted([
-    "not_submitted", "submitted", "source_accepted", "source_rejected", "acceptance_unknown",
-]))
-def test_observation_carries_exact_output_evidence(evidence: str) -> None:
-    port, transport = _port()
-    task = port.operations.start("io.set_output", _identity(), _inputs())
-    transport.operations[task.task_id]["participants"] = [
-        _provider_participant(output_evidence=evidence)
-    ]
-    assert port.operations.observe(task.task_id).metadata["output_evidence"] == evidence
-
-
-def test_absent_evidence_is_omitted() -> None:
-    port, transport = _port()
-    task = port.operations.start("io.set_output", _identity(), _inputs())
-    transport.operations[task.task_id]["participants"] = [_provider_participant()]
-    assert "output_evidence" not in port.operations.observe(task.task_id).metadata
-
-
-@pytest.mark.parametrize(
-    "participant",
-    [
-        _provider_participant(output_evidence=None),
-        _provider_participant(output_evidence="feedback_observed"),
-        _provider_participant(capability_provider_binding_id=None),
-        _provider_participant(capability_provider_binding_revision=""),
-        _provider_participant(control_binding_id="binding"),
-        _provider_participant(control_binding_revision=_E),
-    ],
-)
-def test_participant_reader_is_strict(participant: dict[str, Any]) -> None:
-    port, transport = _port()
-    task = port.operations.start("io.set_output", _identity(), _inputs())
-    transport.operations[task.task_id]["participants"] = [participant]
-    with pytest.raises(ProductionPortError):
-        port.operations.observe(task.task_id)
-
-
-def test_controller_participant_keeps_its_paired_binding() -> None:
-    port, transport = _port()
-    task = port.operations.start("io.set_output", _identity(), _inputs())
-    transport.operations[task.task_id]["participants"] = [_provider_participant(
-        control_binding_id="arm.binding", control_binding_revision=_E,
-        capability_provider_binding_id=None, capability_provider_binding_revision=None,
-        output_evidence="source_accepted",
-    )]
-    assert port.operations.observe(task.task_id).metadata["output_evidence"] == "source_accepted"
-
-
-def test_resolver_qualifies_the_output_node_on_kernel_operations() -> None:
+def test_resolver_qualifies_the_output_node_as_an_immediate_invocation() -> None:
     resolver = build_executable_node_resolver(build_node_environment())
     (row,) = [item for item in resolver.dispositions if item.row.node_id == "io.set_output"]
     assert row.adapter_build_qualified is True
-    assert row.owner_port_name == "kernel_operations"
+    assert row.owner_port_name == "io_signals"
     assert row.unavailable_reason_code is None
 
 
-# --- Adapter completion ----------------------------------------------------
+# --- Adapter: one call per attempt ------------------------------------------
 
 
 class _Port:
-    """Owner-task port fake: one scripted terminal snapshot per attempt."""
+    def __init__(self, result: OwnerInvocationResult | Exception) -> None:
+        self.result = result
+        self.calls: list[str] = []
 
-    def __init__(self, terminal: OwnerTaskSnapshot | None = None, *, held: int = 0) -> None:
-        self.terminal = terminal
-        self.held = held
-        self.starts: list[str] = []
-        self.acknowledged: list[str] = []
-        self.closed: list[str] = []
-        self.cancelled: list[str] = []
-
-    def start(self, node_id, identity, inputs):
-        if self.held:
-            self.held -= 1
-            raise OwnerInvocationHeldError(1)
-        self.starts.append(identity.node_attempt_id)
-        return OwnerTaskSnapshot(task_id="op.1", state=OwnerTaskState.ACTIVE,
-                                 metadata={"operation_id": "op.1"})
-
-    def observe(self, task_id):
-        assert self.terminal is not None
-        return self.terminal
-
-    def acknowledge(self, task_id, identity):
-        self.acknowledged.append(task_id)
-
-    def close(self, task_id, identity, *, request_id):
-        self.closed.append(task_id)
-        return True
-
-    def cancel(self, task_id, identity):
-        self.cancelled.append(task_id)
+    def invoke(self, node_id, identity, inputs):
+        self.calls.append(node_id)
+        if isinstance(self.result, Exception):
+            raise self.result
+        return self.result
 
 
-def _terminal(state: OwnerTaskState, evidence: str | None, **metadata: Any) -> OwnerTaskSnapshot:
-    return OwnerTaskSnapshot(
-        task_id="op.1",
-        state=state,
-        metadata={
-            "operation_id": "op.1",
-            **({} if evidence is None else {"output_evidence": evidence}),
-            **metadata,
-        },
-        reason_code=None if state is OwnerTaskState.SUCCEEDED else "command_failed",
-        message="" if state is OwnerTaskState.SUCCEEDED else "output write failed",
-    )
-
-
-def _adapter(port: _Port, stop_state: OperatorMotionStopState | None = None):
-    adapter = IoOutputCommandAdapter(
+def _adapter(port: _Port) -> OwnerInvocationAdapter:
+    adapter = OwnerInvocationAdapter(
         name="set-valve", node_id="io.set_output", node_instance_id="set-valve",
-        port=port, owner_port_name="kernel_operations",
-        parameters=dict(_inputs().parameters), value_sources={},
+        port=port, parameters=dict(_inputs().parameters), value_sources={},
         attempt_source=SimpleNamespace(begin=lambda node: _identity(node)),
         input_resolver=SimpleNamespace(snapshot=lambda **kwargs: SimpleNamespace(
             parameters=kwargs["parameters"], blackboard={},
         )),
-        operator_stop_state=stop_state,
     )
     adapter.setup_with_descendants()
     return adapter
 
 
-def _tick(adapter, count: int = 1) -> py_trees.common.Status:
-    """Tick like a parent would: a settled leaf is never re-entered here."""
-    for _ in range(count):
-        adapter.tick_once()
-        if adapter.status is not py_trees.common.Status.RUNNING:
-            break
-    return adapter.status
-
-
-@pytest.mark.parametrize("evidence", ["source_accepted", "submitted"])
-def test_source_acceptance_completes_the_write(evidence: str) -> None:
-    port = _Port(_terminal(OwnerTaskState.SUCCEEDED, evidence))
+@pytest.mark.parametrize("result,status,code", [
+    (OwnerInvocationResult(True), py_trees.common.Status.SUCCESS, None),
+    (OwnerInvocationResult(False, reason_code="io_output_acceptance_unknown", message="unknown"),
+     py_trees.common.Status.FAILURE, "io_output_acceptance_unknown"),
+    (RuntimeError("socket closed"), py_trees.common.Status.FAILURE, "owner_request_failed"),
+])
+def test_adapter_settles_on_the_one_call(result, status, code) -> None:
+    port = _Port(result)
     adapter = _adapter(port)
-    assert _tick(adapter, 2) is py_trees.common.Status.SUCCESS
-    assert port.starts == ["attempt:set-valve"]
-    assert port.acknowledged == ["op.1"]
-
-
-@pytest.mark.parametrize("evidence", [None, "acceptance_unknown", "not_submitted"])
-def test_completion_without_acceptance_is_never_a_success(evidence) -> None:
-    port = _Port(_terminal(OwnerTaskState.SUCCEEDED, evidence))
-    adapter = _adapter(port)
-    assert _tick(adapter, 3) is py_trees.common.Status.FAILURE
-    assert adapter.failure_reason_code == "io_output_acceptance_unconfirmed"
-    # Retained for Reset: neither acknowledged nor resent.
-    assert port.acknowledged == [] and port.starts == ["attempt:set-valve"]
-    assert adapter.cached_control_state() == "unrecoverable"
-
-
-@pytest.mark.parametrize("evidence", ["source_rejected", "not_submitted"])
-def test_rejected_or_unsubmitted_write_fails_and_closes(evidence: str) -> None:
-    assessment = {"execution_state": "Failed", "eligible_close": True, "status": "retry_ready"}
-    port = _Port(_terminal(
-        OwnerTaskState.FAILED, evidence,
-        operation_state="failed", recovery_assessment=assessment,
-    ))
-    adapter = _adapter(port)
-    assert _tick(adapter, 2) is py_trees.common.Status.FAILURE
-    assert adapter.failure_reason_code == "command_failed"
-    assert port.closed == ["op.1"] and port.starts == ["attempt:set-valve"]
-
-
-@pytest.mark.parametrize(
-    ("operation_state", "execution_state"),
-    [("intervention_required", "InterventionRequired"), ("failed", "Failed")],
-)
-def test_unknown_acceptance_is_an_uncertain_effect_never_resent(
-    operation_state: str, execution_state: str,
-) -> None:
-    # Outer operation state is lowercase; the participant assessment carries
-    # Core's TitleCase ExecutionState spelling.
-    assessment = {"execution_state": execution_state, "eligible_close": False}
-    port = _Port(_terminal(
-        OwnerTaskState.FAILED, "acceptance_unknown",
-        operation_state=operation_state, recovery_assessment=assessment,
-    ))
-    adapter = _adapter(port)
-    assert _tick(adapter, 4) is py_trees.common.Status.FAILURE
-    # No close (uncertain effect stays retained for intervention), no resend.
-    assert port.closed == [] and port.acknowledged == []
-    assert port.starts == ["attempt:set-valve"]
-
-
-def test_held_node_sends_nothing_until_released() -> None:
-    state = OperatorMotionStopState({"set-valve": ()})
-    state.publish(OperatorMotionStopSnapshot(1, frozenset({"set-valve"})))
-    port = _Port(_terminal(OwnerTaskState.SUCCEEDED, "source_accepted"), held=1)
-    adapter = _adapter(port, state)
-    assert _tick(adapter, 4) is py_trees.common.Status.RUNNING
-    assert port.starts == [] and adapter.presented_held
-    state.publish(OperatorMotionStopSnapshot(2, frozenset()))
-    assert _tick(adapter, 2) is py_trees.common.Status.SUCCESS
-    assert len(port.starts) == 1 and port.acknowledged == ["op.1"]
+    adapter.tick_once()
+    assert adapter.status is status
+    assert port.calls == ["io.set_output"]
+    if code is not None:
+        assert adapter.failure_reason_code == code

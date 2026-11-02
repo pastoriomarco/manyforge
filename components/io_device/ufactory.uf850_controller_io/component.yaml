@@ -1,0 +1,53 @@
+# Component descriptor (docs/authoring/ADDING_A_COMPONENT.md): a machine's own
+# I/O bank in model form, used as a member of its machine. Real lane: the xArm
+# family reads and writes it through its owner's connection; Mock and Isaac
+# lanes: the host's Mock I/O (outputs read back). Declared I/O only: the
+# controller accepts writes to missing outputs.
+# Control box: CI/DI inputs, CO/DO outputs (to verify on a UF850).
+api_version: manyforge.component_package.v1
+kind: io_device
+id: ufactory.uf850_controller_io
+version: 1.0.0
+title: UFACTORY UF850 control-box I/O
+license: BSD-3-Clause
+provenance:
+  source: https://github.com/pastoriomarco/xarm_ros2
+  notes: XARM_CONTROLLER_FACTS (manyforge_specs)
+signals:
+  - {signal_name: CI0, direction: input, value_type: bool}
+  - {signal_name: CI1, direction: input, value_type: bool}
+  - {signal_name: CI2, direction: input, value_type: bool}
+  - {signal_name: CI3, direction: input, value_type: bool}
+  - {signal_name: CI4, direction: input, value_type: bool}
+  - {signal_name: CI5, direction: input, value_type: bool}
+  - {signal_name: CI6, direction: input, value_type: bool}
+  - {signal_name: CI7, direction: input, value_type: bool}
+  - {signal_name: DI0, direction: input, value_type: bool}
+  - {signal_name: DI1, direction: input, value_type: bool}
+  - {signal_name: DI2, direction: input, value_type: bool}
+  - {signal_name: DI3, direction: input, value_type: bool}
+  - {signal_name: DI4, direction: input, value_type: bool}
+  - {signal_name: DI5, direction: input, value_type: bool}
+  - {signal_name: DI6, direction: input, value_type: bool}
+  - {signal_name: DI7, direction: input, value_type: bool}
+  - {signal_name: CO0, direction: output, value_type: bool}
+  - {signal_name: CO1, direction: output, value_type: bool}
+  - {signal_name: CO2, direction: output, value_type: bool}
+  - {signal_name: CO3, direction: output, value_type: bool}
+  - {signal_name: CO4, direction: output, value_type: bool}
+  - {signal_name: CO5, direction: output, value_type: bool}
+  - {signal_name: CO6, direction: output, value_type: bool}
+  - {signal_name: CO7, direction: output, value_type: bool}
+  - {signal_name: DO0, direction: output, value_type: bool}
+  - {signal_name: DO1, direction: output, value_type: bool}
+  - {signal_name: DO2, direction: output, value_type: bool}
+  - {signal_name: DO3, direction: output, value_type: bool}
+  - {signal_name: DO4, direction: output, value_type: bool}
+  - {signal_name: DO5, direction: output, value_type: bool}
+  - {signal_name: DO6, direction: output, value_type: bool}
+  - {signal_name: DO7, direction: output, value_type: bool}
+lanes:
+  # Inputs: one sample per `xarm_io_states` period (`io_states.rate`, 100 Hz).
+  # A sample older than this budget is stale: rules reading it can't watch.
+  # Ten periods at 100 Hz, as the I/O member's own stale bound.
+  real: {adapter: xarm, bank: controller, input_maximum_age_ms: 100}    # manyforge_xarm_control/vendor/README.md

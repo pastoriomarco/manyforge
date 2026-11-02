@@ -27,10 +27,10 @@ gripper:
   attach_frame: robotiq_85_base_link
   touch_links: [robotiq_85_base_link, robotiq_85_left_finger_link, robotiq_85_left_finger_tip_link, robotiq_85_left_inner_knuckle_link, robotiq_85_left_knuckle_link, robotiq_85_right_finger_link, robotiq_85_right_finger_tip_link, robotiq_85_right_inner_knuckle_link, robotiq_85_right_knuckle_link]
 lanes:
-  mock:
-    controllers:                  # its gripper-only Mock row (no arm controller)
-      template: ur
-      hardware_component_name: MockRobotiq2F85System
-      gripper_controller: robotiq_gripper_controller
-      hard_stop_completion_timeout_s: 0.5
-      gripper_result_timeout_s: 15.0
+  mock:                           # Mock lane adapter (manyforge_ros2_control_execution/lane/)
+    adapter: mock
+    controller: robotiq_gripper_controller
+    controllers_file: mock_controllers.yaml
+    hard_stop_completion_timeout_s: 0.5
+    gripper_result_timeout_s: 15.0
+    gripper_stop_finish_tolerance: 0.04   # rad of knuckle travel (5% of the 0.8 stroke): a Stop this close lets the command finish

@@ -236,58 +236,6 @@ def test_fresh_bootstrap_with_no_program_selection_converges_to_scenario():
     assert reads.sleeps == [0.02]
 
 
-def _sealed_close_sample():
-    previous = _sample()
-    publication = previous["manager"]["status"]["active"]["publication"]
-    publication["transaction"]["apply_id"] = "close"
-    publication["projection_revision"] = {"retained_bundle_id": "empty-bundle",
-                                          "graph_revision": "empty-graph"}
-    previous["selected"] = {"scenarioId": None, "deploymentRevision": None,
-                            "activationOrder": None}
-    identity = {"deployment_artifact_id": "empty", "deployment_revision": "empty-deployment",
-                "retained_bundle_id": "empty-bundle", "graph_revision": "empty-graph"}
-    previous["program"] = {
-        **identity, "origin": {"kind": "sealed_canonical_empty", **identity},
-        "executable": False, "program": None, "program_id": None,
-        "program_revision": None, "program_binding_id": None, "non_executable": None,
-    }
-    return previous
-
-
-def test_exact_sealed_close_predecessor_converges_to_ordinary_scenario_load():
-    previous = _sealed_close_sample()
-    reads = Observations([previous, _sample()])
-    result = reads.observe(predecessor=_predecessor(previous))
-    assert result["active_publication"]["transaction"]["apply_id"] == "apply"
-    assert result["managerApplied"]["scenarioId"] == "scenario"
-    assert reads.sleeps == [0.02]
-
-
-@pytest.mark.parametrize("contradiction", ["deployment", "binding", "scenario"])
-def test_sealed_predecessor_contradictions_are_refused_without_reads(contradiction):
-    previous = _sealed_close_sample()
-    if contradiction == "deployment":
-        previous["program"]["origin"]["deployment_revision"] = "foreign"
-    elif contradiction == "binding":
-        previous["program"]["program_binding_id"] = "foreign"
-    else:
-        previous["selected"]["scenarioId"] = "foreign"
-    reads = Observations([previous])
-    with pytest.raises(AssertionError):
-        reads.observe(predecessor=_predecessor(previous))
-    assert reads.calls == [] and reads.sleeps == []
-
-
-def test_sealed_predecessor_must_match_its_named_apply_deployment_identity():
-    previous = _sealed_close_sample()
-    predecessor = _predecessor(previous)
-    predecessor["apply_status"]["prepared_activation"]["deployment_revision"] = "foreign"
-    reads = Observations([previous])
-    with pytest.raises(AssertionError):
-        reads.observe(predecessor=predecessor)
-    assert reads.calls == [] and reads.sleeps == []
-
-
 def test_historical_predecessor_request_owner_is_distinct_from_current_manager_source():
     previous = _sample()
     previous["manager"]["status"]["active"]["publication"]["transaction"]["apply_id"] = "previous"

@@ -118,6 +118,8 @@ interface ProgramPropertyEditorProps {
   sourceModelUnavailableReason?: string | null;
   deploymentWorkspace?: DeploymentWorkspaceResponse | null;
   systemSignalChoices?: readonly CarriedObjectLostSignalChoice[];
+  /** Outputs holding a core-held `changed outside` signal (`<component>/<signal>`). */
+  changedOutsideOutputs?: ReadonlySet<string>;
   systemSignalsNeedApply?: boolean;
   /** The scenario's Program role assignment: resolves target roles while the workspace has no binding. */
   programRoleAssignment?: Record<string, JsonValue> | null;
@@ -152,6 +154,8 @@ function isProgramMotionCeilingField(field: string): boolean {
     field as typeof PROGRAM_MOTION_CEILING_FIELDS[number],
   );
 }
+
+const NO_CHANGED_OUTSIDE: ReadonlySet<string> = new Set();
 
 /**
  * One change to a node's parameters and value sources, at a value path:
@@ -281,6 +285,7 @@ export function ProgramPropertyEditor({
   sourceModelUnavailableReason = null,
   deploymentWorkspace = null,
   systemSignalChoices = [],
+  changedOutsideOutputs = NO_CHANGED_OUTSIDE,
   systemSignalsNeedApply = false,
   programRoleAssignment = null,
   motionDescriptors = [],
@@ -306,7 +311,9 @@ export function ProgramPropertyEditor({
   const conditionChoices = useMemo(() => nodeConditionChoices(
     program, deploymentWorkspace?.binding, ruleIds,
     deploymentDocument as Record<string, JsonValue> | null, programRoleAssignment, systemSignalChoices,
-  ), [deploymentDocument, deploymentWorkspace?.binding, program, programRoleAssignment, ruleIds, systemSignalChoices]);
+    changedOutsideOutputs,
+  ), [changedOutsideOutputs, deploymentDocument, deploymentWorkspace?.binding, program, programRoleAssignment,
+    ruleIds, systemSignalChoices]);
   const motionConfiguration = useMemo(
     () => deriveProgramMotionConfiguration(program, catalogEntries),
     [catalogEntries, program],
@@ -764,7 +771,8 @@ export function ProgramPropertyEditor({
         )}
       </section>
       <TripPresetEditor
-        key={`${selected.instance_id}:${discardEpoch}`}
+        // Distinct from ProgramPolicyEditor's key: duplicate sibling keys leave stale cards mounted.
+        key={`trip:${selected.instance_id}:${discardEpoch}`}
         node={selected}
         keyContext={{
           entry, node: selected, parameterId: 'on_grasp_lost', program, globalRuleIds: ruleIds, onCreateReference,
@@ -819,6 +827,7 @@ export function ProgramPropertyEditor({
               { program, roleAssignment: programRoleAssignment,
                 deploymentDocument: deploymentDocument as Record<string, JsonValue> | null },
               systemSignalChoices,
+              changedOutsideOutputs,
             )
             : null;
           const unsupportedChoices = ioUnsupportedChoices(
@@ -873,6 +882,8 @@ export function ProgramPropertyEditor({
                     ? 'TCP speed ceiling (m/s)'
                     : parameter.id === 'clearance_m'
                     ? 'Collision clearance (m)'
+                    : parameter.id === 'wait_for_duration'
+                    ? 'Wait for command duration'
                     : parameter.id}
                 </label>
                 <span>{parameter.required ? 'required' : 'optional'}</span>
@@ -886,7 +897,22 @@ export function ProgramPropertyEditor({
               )}
               {parameter.id === 'clearance_m' && (
                 <p className="muted">
-                  Optional. Omitted, the move keeps the Deployment clearance (0, off, unless the Deployment sets one); 0 turns the clearance off for this move.
+                  Optional. Omitted, the move keeps the Deployment clearance (0.001 m unless the Deployment sets one); 0 turns the clearance off for this move.
+                </p>
+              )}
+              {parameter.id === 'wait_for_duration' && (
+                <p className="muted">
+                  Off: the command completes when the gripper controller reports done. On: it also waits until command_duration_s has passed since the command started. Pneumatic grippers always wait for their dwell.
+                </p>
+              )}
+              {parameter.id === 'blend_radius_m' && (
+                <p className="muted">
+                  Corner blend radius (m). 0 keeps exact corners; the tool stops at sharp corners. A waypoint may set its own radius.
+                </p>
+              )}
+              {parameter.id === 'cartesian_timing' && (
+                <p className="muted">
+                  Optional. Omitted, the path uses the Deployment&apos;s Cartesian timing.
                 </p>
               )}
               {rule.inapplicable !== undefined && (

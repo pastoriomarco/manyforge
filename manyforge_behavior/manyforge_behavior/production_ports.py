@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 import logging
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from hashlib import sha256
 from heapq import heapify, heappop, heappush
 import json
@@ -40,11 +40,15 @@ from manyforge_behavior.kernel_client import (
 )
 from manyforge_behavior.program import INTERRUPT_MOTION_NODE_IDS as _INTERRUPT_MOTION_NODE_IDS
 from manyforge_behavior.program import MOTION_NODE_IDS as _MOTION_NODE_IDS
-from manyforge_behavior.program import ProgramValidationError, motion_tcp_selection
+from manyforge_behavior.program import (
+    CHANGED_OUTSIDE_SUFFIX,
+    ProgramValidationError,
+    motion_tcp_selection,
+)
 from manyforge_behavior.orchestration_ports import (
     FAILED_EXECUTION_STATES as _FAILED_STATES,
     INTERRUPTED_EXECUTION_STATES as _INTERRUPTED_STATES,
-    PROGRAM_MOTION_STOP_RECOVERY_CLASSES,
+    PROGRAM_MOTION_STOP_RECOVERY_CLASS,
     recovery_outcome,
     request_identity as _request_identity,
     FrameTransformError,
@@ -53,7 +57,6 @@ from manyforge_behavior.orchestration_ports import (
     NodeAttemptIdentity,
     OwnerInvocationResult,
     OwnerInvocationPendingError,
-    OwnerInvocationGatedError,
     OwnerInvocationHeldError,
     OwnerInvocationRefusedByPriorityError,
     OwnerNodeInputs,
@@ -320,7 +323,8 @@ _TAKEOVER_PATHS: Final = frozenset(
 )
 _TAKEOVER_FIELDS: Final = frozenset({
     "incumbent_operation_id", "path", "cause", "decided_at_ns",
-    "elapsed_since_acceptance_ns", "preparation_budget_ns", "stop_certificate",
+    "elapsed_since_acceptance_ns", "preparation_budget_ns", "planning_budget_ns",
+    "stop_certificate",
 })
 
 
@@ -345,6 +349,8 @@ def _motion_takeover_fact(value: object) -> dict[str, Any] | None:
         or not 0 <= value["elapsed_since_acceptance_ns"] <= _INT64_MAX
         or type(value["preparation_budget_ns"]) is not int
         or not 0 < value["preparation_budget_ns"] <= _INT64_MAX
+        or type(value["planning_budget_ns"]) is not int
+        or not 0 <= value["planning_budget_ns"] <= _INT64_MAX
         or not (cause is None or (
             isinstance(cause, Mapping)
             and isinstance(cause.get("code"), str)
@@ -407,39 +413,18 @@ def _operation_failure_fact(
     }
 
 
-def _participant_output_evidence(participant: Mapping[str, Any]) -> str | None:
-    """Strictly read one operation participant's binding identity and optional
-    correlated output evidence (SX-2119).
-
-    A provider participant has control_binding_id/revision BOTH null and a
-    real capability-provider binding id/revision; a controller participant
-    keeps its paired control binding. ``output_evidence`` is omitted when
-    absent; an explicit null or unknown spelling is invalid.
-    """
+def _require_participant_binding(participant: Mapping[str, Any]) -> None:
+    """Strictly read one operation participant's binding identity: its
+    controller's paired control binding (SX-2119)."""
 
     def text(name: str) -> bool:
         value = participant.get(name)
         return isinstance(value, str) and bool(value)
 
-    if "control_binding_id" in participant or "control_binding_revision" in participant:
-        control_id = participant.get("control_binding_id")
-        control_revision = participant.get("control_binding_revision")
-        if control_id is None and control_revision is None:
-            if not (
-                text("capability_provider_binding_id")
-                and text("capability_provider_binding_revision")
-            ):
-                raise ProductionPortError(
-                    "provider participant has no capability-provider binding identity"
-                )
-        elif not (text("control_binding_id") and text("control_binding_revision")):
-            raise ProductionPortError("participant control binding identity is not paired")
-    if "output_evidence" not in participant:
-        return None
-    evidence = participant["output_evidence"]
-    if not isinstance(evidence, str) or evidence not in OUTPUT_EVIDENCE_VALUES:
-        raise ProductionPortError("participant output evidence is invalid")
-    return evidence
+    if ("control_binding_id" in participant or "control_binding_revision" in participant) and not (
+        text("control_binding_id") and text("control_binding_revision")
+    ):
+        raise ProductionPortError("participant control binding identity is not paired")
 
 
 def _sequence(value: object, *, field: str, length: int | None = None) -> Sequence[Any]:
@@ -748,12 +733,7 @@ def _reference(
 _IO_READ_NODE_IDS: Final = frozenset({"io.get_input", "io.check_input"})
 _IO_SIGNAL_NODE_IDS: Final = _IO_READ_NODE_IDS | {"io.wait_for_input"}
 _IO_OUTPUT_NODE_ID: Final = "io.set_output"
-_IO_OUTPUT_CAPABILITY: Final = "io.gpio.set_output"
-# Contract 53: the closed correlated-source facts a provider participant may
-# report. They describe the source's acceptance, never the physical effect.
-OUTPUT_EVIDENCE_VALUES: Final = frozenset(
-    {"not_submitted", "submitted", "source_accepted", "source_rejected", "acceptance_unknown"}
-)
+_IO_CLEAR_OUTSIDE_CHANGE_NODE_ID: Final = "io.clear_outside_change"
 _MAX_IO_WATCHES: Final = 4_096
 
 
@@ -842,6 +822,22 @@ def _io_signal(
         )
 
     target = targets.get(target_role_id)
+    if not output and resource_role_id.endswith(CHANGED_OUTSIDE_SUFFIX):
+        # The core-held boolean input of an output (CONTRACTS §7); the host
+        # resolves it from the output's binding.
+        bound = _io_signal(
+            targets,
+            target_role_id,
+            resource_role_id[: -len(CHANGED_OUTSIDE_SUFFIX)],
+            output=True,
+        )
+        return replace(
+            bound,
+            resource_role_id=resource_role_id,
+            signal_name=bound.signal_name + CHANGED_OUTSIDE_SUFFIX,
+            direction="input",
+            transition_capability="sampled_only",
+        )
     if target is None or resource_role_id not in target.signals:
         raise refuse(
             "io_signal_unbound",
@@ -893,7 +889,10 @@ def _validate_io_signal_nodes(
     while pending:
         node = _mapping(pending.pop(), field="Program tree node")
         pending.extend(node.get("children") or ())
-        if node.get("node_id") not in _IO_SIGNAL_NODE_IDS | {_IO_OUTPUT_NODE_ID}:
+        if node.get("node_id") not in _IO_SIGNAL_NODE_IDS | {
+            _IO_OUTPUT_NODE_ID,
+            _IO_CLEAR_OUTSIDE_CHANGE_NODE_ID,
+        }:
             continue
         parameters = node.get("parameters")
         if not isinstance(parameters, Mapping):
@@ -905,7 +904,8 @@ def _validate_io_signal_nodes(
                 targets,
                 target_role_id,
                 resource_role_id,
-                output=node["node_id"] == _IO_OUTPUT_NODE_ID,
+                output=node["node_id"]
+                in {_IO_OUTPUT_NODE_ID, _IO_CLEAR_OUTSIDE_CHANGE_NODE_ID},
             )
         if node["node_id"] == "io.wait_for_input":
             _io_watch_edge(parameters, target_role_id, resource_role_id)
@@ -1180,7 +1180,7 @@ def _motion_spec(
         }
     if node_id == "motion.follow_cartesian_path":
         path = _sequence(parameters.get("path"), field="path")
-        return {
+        motion: dict[str, Any] = {
             "kind": "cartesian_path",
             "waypoints": [
                 _pose3(waypoint, field=f"path[{index}]")
@@ -1188,7 +1188,6 @@ def _motion_spec(
             ],
             "max_translation_step_m": parameters["max_translation_step_m"],
             "max_rotation_step_rad": parameters["max_rotation_step_rad"],
-            "speed_mode": "bounded",
             # CartesianPathDTO still carries the planner's numerical
             # bound, but it is not an authored second speed knob. The
             # admitted SpeedProfile supplies the exact Deployment/request
@@ -1197,8 +1196,16 @@ def _motion_spec(
             "max_linear_acceleration_mps2": parameters["max_linear_acceleration_mps2"],
             "max_angular_acceleration_rad_s2": parameters["max_angular_acceleration_rad_s2"],
             "fallback_policy": parameters["fallback_policy"],
-            "max_blend_deviation_rad": parameters["max_blend_deviation_rad"],
+            # A waypoint's own radius overrides the move's default.
+            "blend_radii_m": [
+                waypoint.get("blend_radius_m", parameters["blend_radius_m"])
+                for waypoint in path
+            ],
         }
+        # Absent means the Deployment's cartesian_timing.
+        if parameters.get("cartesian_timing") is not None:
+            motion["speed_mode"] = parameters["cartesian_timing"]
+        return motion
     raise ProductionPortError(f"unsupported Kernel motion node {node_id!r}")
 
 
@@ -1252,6 +1259,16 @@ def _motion_tcp_payload(
         selection["tcp_endpoint"], targets=targets, active_tcp=active_tcp,
         active_tcp_key=f"active_tcp.{role}",
     )}
+
+
+def _planner_override(value: Any) -> dict[str, Any]:
+    """The node's `planner` block as plain wire members (only the set ones)."""
+
+    return {
+        name: member
+        for name, member in _mapping(value, field="planner").items()
+        if member is not None
+    }
 
 
 def program_motion_participant(
@@ -1375,7 +1392,6 @@ def program_motion_participant(
             "execution_timeout_s": parameters["execution_timeout_s"],
         },
         "cache_mode": parameters["cache_mode"],
-        "planning_profile": parameters["planning_profile"],
         "target_mode": target_mode,
         "target_reference": target_reference,
         "offset_reference": offset_reference,
@@ -1397,6 +1413,9 @@ def program_motion_participant(
     # The move's own collision clearance; absent keeps the Deployment's.
     if parameters.get("clearance_m") is not None:
         payload["clearance_m"] = parameters["clearance_m"]
+    # The move's planner override; absent keeps the Deployment planner block.
+    if parameters.get("planner") is not None:
+        payload["planner"] = _planner_override(parameters["planner"])
     return ProgramMotionParticipant(target, payload)
 
 
@@ -1471,7 +1490,8 @@ class NativeKernelProgramPort:
     ) -> _BoundContext:
         binding = context.program_binding
         rows = binding.get("target_role_bindings")
-        if not isinstance(rows, (list, tuple)) or not rows:
+        # A logical (zero-component) cell's Program binds no target role.
+        if not isinstance(rows, (list, tuple)):
             raise ProductionPortError("Program Binding has no target-role bindings")
         targets: dict[str, _TargetBinding] = {}
         for index, raw_row in enumerate(rows):
@@ -2026,7 +2046,13 @@ class NativeKernelProgramPort:
                     {
                         "option_id": "command_duration_s",
                         "value_s": parameters.get("command_duration_s", 0.0),
-                    }
+                    },
+                    # GRP-2: absent means false (complete on the controller's result).
+                    *(
+                        [{"option_id": "wait_for_duration", "value_bool": True}]
+                        if parameters.get("wait_for_duration", False) is True
+                        else []
+                    ),
                 ],
             },
             (actuation, dwell, grasp_check),
@@ -2058,45 +2084,6 @@ class NativeKernelProgramPort:
                 "expected_value": True}}
         return {"node_id": "gripper.check_status", "parameters": {
             "target_role": target.target_role_id, "expected_state": "reached"}}
-
-    def _io_output_payload(
-        self, context: _BoundContext, parameters: Mapping[str, Any]
-    ) -> tuple[_TargetBinding, dict[str, Any]]:
-        """One typed boolean write under the bound target's sealed schema.
-
-        The schema identity is the Program Binding's sealed command_schema of
-        the target's io.gpio.set_output capability; it is never invented.
-        """
-        target_role_id = _text(parameters.get("target_role"), field="target_role")
-        resource_role_id = _text(parameters.get("resource_role"), field="resource_role")
-        target = self._target(context, target_role_id, _IO_OUTPUT_CAPABILITY)
-        _io_signal(context.targets, target_role_id, resource_role_id, output=True)
-        schema = target.capabilities[_IO_OUTPUT_CAPABILITY].get("command_schema")
-        if schema is None:
-            raise ProductionPortError(
-                f"target role {target_role_id!r} has no sealed output command schema"
-            )
-        schema = _mapping(schema, field="output command_schema")
-        value = parameters.get("value")
-        if type(value) is not bool:
-            raise ProductionPortError("io.set_output value must be a boolean")
-        return target, {
-            "kind": "capability_command",
-            "command_schema_id": _text(
-                schema.get("command_schema_id"), field="command_schema_id"
-            ),
-            "command_schema_revision": _text(
-                schema.get("command_schema_revision"), field="command_schema_revision"
-            ),
-            "command_value": {
-                "kind": "io_signal_write",
-                "resource_role_id": resource_role_id,
-                "value": value,
-            },
-            # Contract 65: no caller deadline; the Kernel resolves the sealed
-            # provider/device acknowledgement policy.
-            "caller_options": [],
-        }
 
     @staticmethod
     def _pick_synthesis(
@@ -2223,7 +2210,11 @@ class NativeKernelProgramPort:
                 "execution_timeout_s": options.get("execution_timeout_s", 10.0),
             },
             "cache_mode": options.get("cache_mode", "disable"),
-            "planning_profile": parameters.get("planning_profile", "first_feasible"),
+            **(
+                {"planner": _planner_override(parameters["planner"])}
+                if parameters.get("planner") is not None
+                else {}
+            ),
             "target_mode": "absolute",
             "target_reference": None,
             "offset_reference": None,
@@ -2243,12 +2234,11 @@ class NativeKernelProgramPort:
             "waypoints": [dict(waypoint) for waypoint in waypoints],
             "max_translation_step_m": 0.005,
             "max_rotation_step_rad": 0.05,
-            "speed_mode": "bounded",
             "max_angular_speed_rad_s": 0.5,
             "max_linear_acceleration_mps2": 0.5,
             "max_angular_acceleration_rad_s2": 2.5,
             "fallback_policy": "fail_closed",
-            "max_blend_deviation_rad": 0.01,
+            "blend_radii_m": [0.0] * len(waypoints),
         }
 
     @staticmethod
@@ -2718,8 +2708,6 @@ class NativeKernelProgramPort:
         node_id: str,
         identity: NodeAttemptIdentity,
         inputs: OwnerNodeInputs,
-        *,
-        pneumatic_output_step: int | None = None,
     ) -> OwnerTaskSnapshot:
         if not isinstance(identity, NodeAttemptIdentity):
             raise TypeError("operation start requires one node-attempt identity")
@@ -2756,10 +2744,6 @@ class NativeKernelProgramPort:
                 inputs.parameters, identity, expected_owner_epoch=preset_owner_status, capture_timing=True,
             )
             capability_id = "tool.gripper.command"
-        elif node_id == _IO_OUTPUT_NODE_ID:
-            context = self._context(identity.program_run_id)
-            target, payload = self._io_output_payload(context, inputs.parameters)
-            capability_id = _IO_OUTPUT_CAPABILITY
         else:
             raise ProductionPortError(f"Kernel operation port does not implement {node_id!r}")
         span = ActionSpan(
@@ -2785,14 +2769,7 @@ class NativeKernelProgramPort:
         if node_id in _MOTION_NODE_IDS or node_id in _INTERRUPT_MOTION_NODE_IDS:
             self._latch_motion_between_nodes(identity, payload)
         owner_epoch = preset_owner_status or self._owner_status(context)
-        request_id = (
-            _request_identity(
-                "program-pneumatic-output", identity.program_run_id,
-                identity.node_attempt_id, str(pneumatic_output_step),
-            )
-            if pneumatic_output_step is not None
-            else _request_identity("program-node", identity.program_run_id, identity.node_attempt_id)
-        )
+        request_id = _request_identity("program-node", identity.program_run_id, identity.node_attempt_id)
         operation_intent = self._operation_intent(
             context,
             request_id=request_id,
@@ -2823,10 +2800,6 @@ class NativeKernelProgramPort:
             revision = _held_selection_revision(error)
             if revision is not None:
                 raise OwnerInvocationHeldError(revision) from error
-            rule_id = error.details.get("rule_id")
-            if error.details.get("reason") == "global_interrupt_gated" and isinstance(rule_id, str):
-                # Rule 2: a gate refusal is a wait at the node, not a failure.
-                raise OwnerInvocationGatedError(rule_id, error) from error
             if error.code == "refused_by_priority":
                 raise OwnerInvocationRefusedByPriorityError(
                     str(error),
@@ -3310,12 +3283,8 @@ class NativeKernelProgramPort:
             "operation_state": state,
             **self._gripper_metadata(task),
         }
-        evidence = [
-            _participant_output_evidence(_mapping(row, field="operation participant"))
-            for row in operation.get("participants") or ()
-        ]
-        if task.node_id == _IO_OUTPUT_NODE_ID and evidence and evidence[0] is not None:
-            metadata["output_evidence"] = evidence[0]
+        for row in operation.get("participants") or ():
+            _require_participant_binding(_mapping(row, field="operation participant"))
         if task.node_id in _INTERRUPT_MOTION_NODE_IDS:
             # The typed rule result the interrupt adapter maps (P5, I5).
             metadata["interrupt_operation"] = {
@@ -3376,7 +3345,7 @@ class NativeKernelProgramPort:
             )
             if assessment is not None:
                 metadata["recovery_assessment"] = assessment
-                if assessment.get("recovery_class") in (PROGRAM_MOTION_STOP_RECOVERY_CLASSES):
+                if assessment.get("recovery_class") == PROGRAM_MOTION_STOP_RECOVERY_CLASS:
                     # Only an operator's (or other non-Program) Stop holds.
                     metadata["authored_failure_policy"] = "pause_for_operator"
                     metadata["authored_failure_policy_parameter"] = "operator_stop_policy"
@@ -3478,7 +3447,6 @@ class NativeKernelProgramPort:
             "expected_assessment_revision": assessment.get("assessment_revision"),
             "expected_control_command_epoch": assessment.get("control_command_epoch"),
             "expected_execution_id": assessment.get("execution_id"),
-            "expected_latch_id": assessment.get("latch_id", ""),
             "expected_stop_certificate_id": assessment.get("stop_certificate_id", ""),
             "expected_stop_owner_generation": assessment.get("stop_owner_generation", 0),
             "reason": reason or "",
@@ -3501,7 +3469,6 @@ class NativeKernelProgramPort:
             if code not in {
                 "operation_recovery_invalid",
                 "operation_recovery_stale",
-                "operation_recovery_blocked_by_stop_fault",
                 "request_id_conflict",
                 "request_ledger_full",
             }:
@@ -4470,26 +4437,15 @@ class NativeKernelProgramPort:
             ):
                 raise ProductionPortError("Program-run Stop settlement generation is stale")
             stop_state = status.get("state")
-            if stop_state != "succeeded":
-                if not (not release_fence and stop_state == "partial"):
-                    raise ProductionPortError(
-                        "Program-run Stop cannot be released before settlement"
-                    )
-                try:
-                    fault = self._kernel.stop_fault()
-                except Exception as error:
-                    raise ProductionPortError(
-                        "Program-run Stop fault state is unavailable"
-                    ) from error
-                if (
-                    not isinstance(fault, Mapping)
-                    or fault.get("command") != "get_stop_fault"
-                    or "stop_fault" not in fault
-                    or fault["stop_fault"] is not None
-                ):
-                    raise ProductionPortError(
-                        "Program-run partial Stop has an active or unknown Stop fault"
-                    )
+            # A partial or failed Stop leaves a component's activity unknown:
+            # the cell latch (derived by the Kernel) blocks all execution until
+            # it reports idle, so only the fence release needs full settlement.
+            if stop_state != "succeeded" and not (
+                not release_fence and stop_state in ("partial", "failed")
+            ):
+                raise ProductionPortError(
+                    "Program-run Stop cannot be released before settlement"
+                )
             if release_fence:
                 self._kernel.release_program_run_stop_fence(
                     program_run_id,
@@ -5012,11 +4968,84 @@ class _NativeTargetQueryPort:
             ),
         )
 
+    def _kernel_call(self, call: Callable[[], Any]) -> OwnerInvocationResult:
+        """One immediate Kernel call: success at once, or the node fails with
+        the Kernel's typed refusal (a tree outcome, never a fault)."""
+
+        try:
+            call()
+        except Exception as error:
+            code = getattr(error, "code", None)
+            if not isinstance(code, str) or not code:
+                raise
+            return OwnerInvocationResult(
+                False,
+                reason_code=code,
+                message=_owner_failure_message(error),
+                details=exception_failure_details(error),
+            )
+        return OwnerInvocationResult(True)
+
+    def _set_rule_active(self, inputs: OwnerNodeInputs) -> OwnerInvocationResult:
+        rule_id = _text(inputs.parameters.get("rule_id"), field="rule_id")
+        active = inputs.parameters.get("active")
+        if type(active) is not bool:
+            raise ProductionPortError("rules.set_active active must be boolean")
+        return self._kernel_call(lambda: self._owner._kernel.set_rule_active(rule_id, active))
+
+    def _clear_outside_change(
+        self, identity: NodeAttemptIdentity, inputs: OwnerNodeInputs
+    ) -> OwnerInvocationResult:
+        context = self._owner._context(identity.program_run_id)
+        target_role_id = _text(inputs.parameters.get("target_role"), field="target_role")
+        resource_role_id = _text(inputs.parameters.get("resource_role"), field="resource_role")
+        try:
+            signal = _io_signal(context.targets, target_role_id, resource_role_id, output=True)
+        except IoSignalRefusedError as error:
+            return OwnerInvocationResult(
+                False, reason_code=error.code, message=str(error), details=error.details
+            )
+        component_id = context.targets[target_role_id].controllable_component_id
+        return self._kernel_call(
+            lambda: self._owner._kernel.clear_outside_change(component_id, signal.signal_name)
+        )
+
+    def _set_io_output(
+        self, identity: NodeAttemptIdentity, inputs: OwnerNodeInputs
+    ) -> OwnerInvocationResult:
+        """One output write through the one write path (CONTRACTS §7): the
+        same host call as a manual write, made once and never resent. The
+        pneumatic gripper's valve steps come here too."""
+
+        context = self._owner._context(identity.program_run_id)
+        target_role_id = _text(inputs.parameters.get("target_role"), field="target_role")
+        resource_role_id = _text(inputs.parameters.get("resource_role"), field="resource_role")
+        value = inputs.parameters.get("value")
+        if type(value) is not bool:
+            raise ProductionPortError("io.set_output value must be a boolean")
+        try:
+            signal = _io_signal(context.targets, target_role_id, resource_role_id, output=True)
+        except IoSignalRefusedError as error:
+            return OwnerInvocationResult(
+                False, reason_code=error.code, message=str(error), details=error.details
+            )
+        component_id = context.targets[target_role_id].controllable_component_id
+        self._owner._require_scope_open(identity.program_run_id)
+        return self._kernel_call(
+            lambda: self._owner._kernel.set_io_output(component_id, signal.signal_name, value)
+        )
+
     def invoke(
         self, node_id: str, identity: NodeAttemptIdentity, inputs: OwnerNodeInputs
     ) -> OwnerInvocationResult:
         if node_id in _IO_READ_NODE_IDS:
             return self._read_io_input(node_id, identity, inputs)
+        if node_id == "rules.set_active":
+            return self._set_rule_active(inputs)
+        if node_id == _IO_CLEAR_OUTSIDE_CHANGE_NODE_ID:
+            return self._clear_outside_change(identity, inputs)
+        if node_id == _IO_OUTPUT_NODE_ID:
+            return self._set_io_output(identity, inputs)
         if node_id not in {
             "model.get_frame_pose",
             "gripper.check_status",
@@ -5647,11 +5676,6 @@ class _NativeKernelOperationTaskPort:
                              "expected_value": item["value"]})
         return {"outputs": [row[3] for row in outputs], "inputs": required,
                 "logical": OwnerNodeInputs(logical, inputs.blackboard), "dwell_s": dwell}
-
-    def start_pneumatic_output(
-        self, identity: NodeAttemptIdentity, inputs: OwnerNodeInputs, step: int
-    ) -> OwnerTaskSnapshot:
-        return self._owner._start("io.set_output", identity, inputs, pneumatic_output_step=step)
 
     def observe(self, task_id: str) -> OwnerTaskSnapshot:
         return self._owner._observe_task(task_id)

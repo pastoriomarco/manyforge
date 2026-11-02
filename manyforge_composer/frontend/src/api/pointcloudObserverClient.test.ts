@@ -13,7 +13,7 @@ afterEach(() => {
 function packet(options: { clear?: boolean; colors?: boolean } = {}): ArrayBuffer {
   const encoder = new TextEncoder();
   const identities = [
-    encoder.encode('manyforge.isaac.pointcloud'),
+    encoder.encode('manyforge.pointcloud'),
     encoder.encode('pointcloud.epoch.1'),
     encoder.encode('isaac.cell.1'),
     encoder.encode('cell:isaac.cell.1'),
@@ -52,7 +52,7 @@ describe('MFOB browser decoder', () => {
     const decoded = decodePointCloudObservation(packet(), 'isaac.cell.1');
 
     expect(decoded.streamIdentity).toBe([
-      'manyforge.isaac.pointcloud',
+      'manyforge.pointcloud',
       'pointcloud.epoch.1',
       '4',
     ].join('\u0000'));

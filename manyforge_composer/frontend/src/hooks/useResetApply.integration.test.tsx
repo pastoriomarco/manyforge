@@ -38,9 +38,8 @@ const apiMock = vi.hoisted(() => ({
   deploymentWorkspace: {
     get: vi.fn(),
     mutate: vi.fn(),
-    applyDraft: vi.fn(),
-    revert: vi.fn(),
   },
+  cellApply: { preview: vi.fn(), apply: vi.fn(), revertPreview: vi.fn(), revert: vi.fn() },
   scenarioDocuments: { discard: vi.fn() },
   authoringWorkspace: { recordResetApplyContext: vi.fn() },
   execution: { runtimeScaleControl: vi.fn() },
@@ -56,6 +55,7 @@ import {
   authoringUnavailableReason,
   authoringWorkspaceIdentity,
   draftEditUnavailableReason,
+  scenarioReplacementUnavailableReason,
   projectFacts,
   publicationIsCurrent,
   type PublishedAuthoringWorkspace,
@@ -68,6 +68,7 @@ import {
   type ScenarioAction,
 } from '../state/documentStates';
 import { CommandRefusalError } from '../state/commandRefusal';
+import { codedErrorText } from '../state/componentPresentation';
 import { managerApplySettlementKey } from '../state/managerApply';
 import { resetApplyPhaseText } from '../state/resetApply';
 import { programActionUnavailableReason } from '../state/authoringWorkspace';
@@ -79,6 +80,7 @@ import { useHeldNodePreview, type HeldNodePreviewController } from './useHeldNod
 import { useProgramRuntime, type ProgramRuntimeController } from './useProgramRuntime';
 import { useProgramWorkspace, type ProgramWorkspaceController } from './useProgramWorkspace';
 import { useResetApply, type ResetApplyController } from './useResetApply';
+import { applyPreviewFixture } from '../test/applyPreview';
 
 const digest = (fill: string) => `sha256:${fill.repeat(64)}`;
 const NO_TARGETS: readonly DirectControlMotionStatus[] = [];
@@ -336,10 +338,12 @@ function authoringController(
     current: publicationIsCurrent(published, snapshot),
     unavailableReason: authoringUnavailableReason(published, snapshot),
     editUnavailableReason: draftEditUnavailableReason(published, snapshot),
+    replaceUnavailableReason: scenarioReplacementUnavailableReason(published, snapshot),
     project: projectFacts(published),
     reading: false,
     error: null,
     refresh: async () => undefined,
+    operation: null,
     beginMutation: () => true,
     finishMutation: () => undefined,
     observeApply: () => undefined,
@@ -473,82 +477,81 @@ describe('A refused stale Deployment fence', () => {
     expect(hooks!.deployment.error).toBe('Deployment Draft changed');
     expect(hooks!.deployment.mutationAvailable).toBe(true);
   });
-
-  it('refreshes the workspace after a stale Apply', async () => {
-    await mount({
-      ...HELD, hold: 'idle', cycle: idleCycle(null), deploymentRevision: 2, deploymentContent: digest('e'),
-    });
-    const reads = apiMock.deploymentWorkspace.get.mock.calls.length;
-    apiMock.deploymentWorkspace.applyDraft.mockRejectedValueOnce(stale());
-    await act(async () => { await hooks!.deployment.applyDraft(); });
-    expect(apiMock.deploymentWorkspace.applyDraft).toHaveBeenCalledOnce();
-    expect(apiMock.deploymentWorkspace.get).toHaveBeenCalledTimes(reads + 1);
-    expect(hooks!.deployment.feedback).toBeNull();
-    expect(hooks!.deployment.error).toBe('Deployment Draft changed');
-  });
 });
 
-describe('A refused Deployment Apply preparation', () => {
-  it('keeps the Draft and backend cause as a dismissible error without retrying', async () => {
-    await mount({
-      ...HELD, hold: 'idle', cycle: idleCycle(null), deploymentRevision: 2,
-      deploymentContent: digest('e'),
-    });
-    const reads = apiMock.deploymentWorkspace.get.mock.calls.length;
-    const draft = hooks!.deployment.workspace?.draft;
-    const cause = 'Program is missing compatibility with target role arm';
-    apiMock.deploymentWorkspace.applyDraft.mockRejectedValueOnce(new ApiError(
-      'candidate could not be prepared',
-      409,
-      { detail: {
-        code: 'activation_preparation_failed',
-        message: 'candidate could not be prepared',
-        effect: 'none',
-        details: { preparer_detail: `manyforge_prepare_activation: ${cause}` },
-      } },
-    ));
+describe('Deployment Apply through the server (CONTRACTS §11)', () => {
+  const preview = applyPreviewFixture([
+    { component_id: 'arm', disposition: 'replace', reasons: ['mount'], restarts: true },
+    { component_id: 'gripper', disposition: 'retain', reasons: [], restarts: false }]);
+  const edited = { ...HELD, hold: 'idle' as const, cycle: idleCycle(null), deploymentRevision: 2,
+    deploymentContent: digest('e') };
 
+  it('previews first and sends Apply once, only after the operator confirms', async () => {
+    await mount(edited);
+    apiMock.cellApply.preview.mockResolvedValue(preview);
+    apiMock.cellApply.apply.mockResolvedValue({ outcome: 'succeeded', components: [
+      { component_id: 'arm', disposition: 'replace', lifecycle_after: 'prepared' }] });
     await act(async () => { await hooks!.deployment.applyDraft(); });
+    expect(apiMock.cellApply.preview).toHaveBeenCalledOnce();
+    expect(apiMock.cellApply.apply).not.toHaveBeenCalled();
+    expect(hooks!.deployment.applyPreview).toEqual(preview);
+    await act(async () => { await hooks!.deployment.confirmApply(); });
+    // The Apply is bound to the Preview the operator saw.
+    expect(apiMock.cellApply.apply).toHaveBeenCalledExactlyOnceWith(preview.scope);
+    expect(hooks!.deployment.applyPreview).toBeNull();
+    expect(hooks!.deployment.feedback).toBe('Applied: arm prepared.');
+    // A second confirm without a new Preview sends nothing.
+    await act(async () => { await hooks!.deployment.confirmApply(); });
+    expect(apiMock.cellApply.apply).toHaveBeenCalledOnce();
+  });
 
-    expect(apiMock.deploymentWorkspace.applyDraft).toHaveBeenCalledTimes(1);
-    expect(apiMock.deploymentWorkspace.get).toHaveBeenCalledTimes(reads);
-    expect(hooks!.deployment.workspace?.draft).toBe(draft);
+  it('Cancel sends no Apply', async () => {
+    await mount(edited);
+    apiMock.cellApply.preview.mockResolvedValue(preview);
+    await act(async () => { await hooks!.deployment.applyDraft(); });
+    act(() => hooks!.deployment.cancelApplyConfirmation());
+    expect(hooks!.deployment.applyPreview).toBeNull();
+    expect(apiMock.cellApply.apply).not.toHaveBeenCalled();
+  });
+
+  it('shows the refusal during a run with its typed text, without retrying', async () => {
+    await mount(edited);
+    apiMock.cellApply.preview.mockResolvedValue(preview);
+    const message = 'A Program run is in progress; Reset first.';
+    apiMock.cellApply.apply.mockRejectedValueOnce(new ApiError(message, 409, {
+      detail: { code: 'apply_refused_run_in_progress', message },
+    }));
+    await act(async () => { await hooks!.deployment.applyDraft(); });
+    await act(async () => { await hooks!.deployment.confirmApply(); });
+    expect(apiMock.cellApply.apply).toHaveBeenCalledOnce();
+    expect(hooks!.deployment.error).toBe(codedErrorText({ code: 'apply_refused_run_in_progress', message }));
     expect(hooks!.deployment.feedback).toBeNull();
-    expect(hooks!.deployment.error).toBe(
-      `Not applied: the candidate could not be prepared (${cause}). Correct it and try again.`,
-    );
-    expect(hooks!.deployment.errorCauseCode).toBeNull();
     act(() => hooks!.deployment.dismissError());
     expect(hooks!.deployment.error).toBeNull();
   });
 
-  it('keeps the typed cause the preparer named until the error is dismissed', async () => {
-    await mount({
-      ...HELD, hold: 'idle', cycle: idleCycle(null), deploymentRevision: 2,
-      deploymentContent: digest('e'),
-    });
-    apiMock.deploymentWorkspace.applyDraft.mockRejectedValueOnce(new ApiError(
-      'candidate could not be prepared',
-      409,
-      { detail: {
-        code: 'activation_preparation_failed',
-        message: 'candidate could not be prepared',
-        effect: 'none',
-        details: {
-          preparer_detail: 'manyforge_prepare_activation: Activation Deployment compiler: '
-            + 'pneumatic_io_presets_coincident: robot Open and Close resolve to the same gripper coordinate',
-          cause_code: 'pneumatic_io_presets_coincident',
-        },
-      } },
-    ));
-
+  it('shows a Draft changed after the Preview as a refusal to review again', async () => {
+    await mount(edited);
+    apiMock.cellApply.preview.mockResolvedValue(preview);
+    const message = 'Draft changed after confirmation; review again';
+    apiMock.cellApply.apply.mockRejectedValueOnce(new ApiError(message, 409, {
+      detail: { code: 'activation_input_changed_after_confirmation', message },
+    }));
     await act(async () => { await hooks!.deployment.applyDraft(); });
+    await act(async () => { await hooks!.deployment.confirmApply(); });
+    expect(hooks!.deployment.error).toBe(
+      codedErrorText({ code: 'activation_input_changed_after_confirmation', message }));
+    expect(apiMock.cellApply.apply).toHaveBeenCalledOnce();
+  });
 
-    expect(hooks!.deployment.error).toContain('Not applied: the candidate could not be prepared');
-    expect(hooks!.deployment.errorCauseCode).toBe('pneumatic_io_presets_coincident');
-    act(() => hooks!.deployment.dismissError());
-    expect(hooks!.deployment.error).toBeNull();
-    expect(hooks!.deployment.errorCauseCode).toBeNull();
+  it('shows a failed ApplyResult as the error', async () => {
+    await mount(edited);
+    apiMock.cellApply.preview.mockResolvedValue(preview);
+    apiMock.cellApply.apply.mockResolvedValueOnce({ outcome: 'failed', components: [],
+      error: { code: 'fault_estop', message: 'e-stop' } });
+    await act(async () => { await hooks!.deployment.applyDraft(); });
+    await act(async () => { await hooks!.deployment.confirmApply(); });
+    expect(hooks!.deployment.error).toBe(`Apply failed: ${codedErrorText({ code: 'fault_estop', message: 'e-stop' })}.`);
   });
 });
 
@@ -611,9 +614,7 @@ describe('Resume, Retry and Execute with an unapplied Draft', () => {
     const render = await mount(HELD);
     const runtime = hooks!.runtime;
     expect(runtime.draftUnappliedReason).toMatch(/^Apply or Discard first: unapplied changes in Program/);
-    expect(runtime.commandAllowed('program_motion_resume')).toBe(false);
-    expect(runtime.commandDisabledReason('program_motion_resume')).toBe(runtime.draftUnappliedReason);
-    expect(runtime.commandAllowed('program_reset')).toBe(true);
+    expect(runtime.runnerAllows('program_reset')).toBe(true);
     const currentOffer = () => hooks!.runtime.state.controls!.recoveryHolds[0].offer;
     await act(async () => {
       runtime.applyRecoveryAction(currentOffer(), 'retry_motion_from_current_state');
@@ -625,7 +626,6 @@ describe('Resume, Retry and Execute with an unapplied Draft', () => {
     await render({ ...HELD, draftRevision: 4, programRevision: digest('a') });
     await flush();
     expect(hooks!.runtime.draftUnappliedReason).toBeNull();
-    expect(hooks!.runtime.commandAllowed('program_motion_resume')).toBe(true);
     await act(async () => {
       hooks!.runtime.applyRecoveryAction(currentOffer(), 'retry_motion_from_current_state');
     });
@@ -741,7 +741,6 @@ describe('Resume, Retry and Execute with an unapplied Draft', () => {
     await mount({ ...HELD, hold: 'never_run' });
     const runtime = hooks!.runtime;
     expect(runtime.draftUnappliedReason).toMatch(/^Apply or Discard first/);
-    expect(runtime.commandAllowed('program_motion_resume')).toBe(false);
     await act(async () => { await runtime.resumeMotion('all'); });
     expect(transport.sendExecutionCommand).not.toHaveBeenCalled();
   });
@@ -749,22 +748,21 @@ describe('Resume, Retry and Execute with an unapplied Draft', () => {
   it('also refuse with an unapplied Deployment edit', async () => {
     await mount({ ...HELD, programRevision: digest('a'), deploymentRevision: 2, deploymentContent: digest('e') });
     expect(hooks!.runtime.draftUnappliedReason).toContain('unapplied changes in Deployment');
-    expect(hooks!.runtime.commandAllowed('program_resume_full_stop')).toBe(false);
   });
 });
 
 describe('Apply while a run exists', () => {
-  async function confirm(document: 'program' | 'deployment') {
+  async function confirm() {
     let refusal: string | null = 'not called';
-    await act(async () => { refusal = await hooks!.resetApply.confirm(document); });
+    await act(async () => { refusal = await hooks!.resetApply.confirm(); });
     return refusal;
   }
 
   it('Resets exactly the held run, waits for its Idle, then Applies exactly the confirmed Program Draft', async () => {
     const render = await mount(HELD);
     expect(hooks!.resetApply.runExists).toBe(true);
-    expect(hooks!.resetApply.unavailableReason('program')).toBeNull();
-    expect(await confirm('program')).toBeNull();
+    expect(hooks!.resetApply.unavailableReason()).toBeNull();
+    expect(await confirm()).toBeNull();
     const [context] = apiMock.authoringWorkspace.recordResetApplyContext.mock.calls[0];
     expect(context).toMatchObject({
       document: 'program', programRunId: 'run.1', cycleGeneration: 7,
@@ -809,6 +807,51 @@ describe('Apply while a run exists', () => {
       kind: 'applied', apply: { applyId: 'apply-1', applyGeneration: 2 },
     });
     expect(transport.sendExecutionCommand).toHaveBeenCalledOnce();
+  });
+
+  it('Deployment: Resets the held run, waits for its Idle, then Applies exactly the confirmed Preview (AUD-4)', async () => {
+    const edited = { ...HELD, programRevision: digest('a'), deploymentRevision: 2, deploymentContent: digest('e') };
+    const render = await mount(edited);
+    expect(hooks!.resetApply.deploymentRunReset).toBe(true);
+    const scope = { deployment_draft_revision: 2 };
+    let refusal: string | null = 'not called';
+    await act(async () => { refusal = await hooks!.resetApply.confirm('deployment', scope); });
+    expect(refusal).toBeNull();
+    const [context] = apiMock.authoringWorkspace.recordResetApplyContext.mock.calls[0];
+    expect(context).toMatchObject({
+      document: 'deployment', programRunId: 'run.1', draftId: 'deployment-draft-1', draftRevision: 2,
+      draftContentRevision: digest('e'), appliedRevision: APPLIED_DEPLOYMENT,
+    });
+    const correlationId = transport.sendExecutionCommand.mock.calls[0][2] as string;
+    expect(apiMock.cellApply.apply).not.toHaveBeenCalled();
+    apiMock.cellApply.apply.mockResolvedValue({ outcome: 'succeeded', components: [
+      { component_id: 'arm', disposition: 'replace', lifecycle_after: 'prepared' }] });
+    await render({ ...edited, hold: 'idle' as const, admissionGeneration: 11, cycle: idleCycle(correlationId) });
+    await flush();
+    expect(apiMock.cellApply.apply).toHaveBeenCalledExactlyOnceWith(scope);
+    expect(hooks!.resetApply.sequence?.phase).toEqual({ kind: 'applied', apply: null });
+    expect(apiMock.programWorkspace.apply).not.toHaveBeenCalled();
+  });
+
+  it('Deployment: a failed server Apply after Reset ends the chain with its typed text', async () => {
+    const edited = { ...HELD, programRevision: digest('a'), deploymentRevision: 2, deploymentContent: digest('e') };
+    const render = await mount(edited);
+    await act(async () => { await hooks!.resetApply.confirm('deployment', {}); });
+    const correlationId = transport.sendExecutionCommand.mock.calls[0][2] as string;
+    apiMock.cellApply.apply.mockResolvedValue({ outcome: 'failed', components: [],
+      error: { code: 'fault_estop', message: 'e-stop' } });
+    await render({ ...edited, hold: 'idle' as const, admissionGeneration: 11, cycle: idleCycle(correlationId) });
+    await flush();
+    expect(apiMock.cellApply.apply).toHaveBeenCalledOnce();
+    expect(hooks!.resetApply.sequence?.phase).toMatchObject({ kind: 'failed', stage: 'apply' });
+  });
+
+  it('Deployment: refuses Reset and Apply without a confirmed Preview', async () => {
+    await mount({ ...HELD, programRevision: digest('a'), deploymentRevision: 2, deploymentContent: digest('e') });
+    let refusal: string | null = null;
+    await act(async () => { refusal = await hooks!.resetApply.confirm('deployment', null); });
+    expect(refusal).toBe('Preview the Deployment Draft before Reset and Apply.');
+    expect(transport.sendExecutionCommand).not.toHaveBeenCalled();
   });
 
   it('sends a Scenario Discard whose only unapplied change is the Deployment', async () => {
@@ -914,161 +957,31 @@ describe('Apply while a run exists', () => {
     expect(hooks!.deployment.comparisonUnavailableReason).toBeNull();
   });
 
-  it('keeps a confirmed Revert a Revert of the Saved input, never an Apply of the Draft', async () => {
+  it('sends Revert on the one Apply path, never as an Apply of the Draft', async () => {
     // Saved differs from Applied while the Draft is the Applied one.
     const idle = {
       ...HELD, hold: 'idle' as const, cycle: idleCycle(null), admissionGeneration: 12,
       savedDeployment: digest('5'),
     };
     await mount(idle);
-    apiMock.deploymentWorkspace.revert.mockResolvedValue({
-      schemaVersion: 'manyforge.composer_deployment_candidate_operation.v1',
-      workspace: deploymentWorkspace(idle),
-      result: {
-        status: 'confirmation_required', confirmationToken: digest('7'),
-        preparation: { requestOwnerEpoch: 'owner', requestId: 'prep' },
-        preparedActivation: {}, candidatePreview: null, managerApply: null,
-      },
-    });
+    const preview = applyPreviewFixture([
+      { component_id: 'arm', disposition: 'replace', reasons: ['mount'], restarts: true }]);
+    apiMock.cellApply.revertPreview.mockResolvedValue(preview);
+    apiMock.cellApply.revert.mockResolvedValue({ outcome: 'succeeded', components: [] });
+    // Revert goes through Preview → confirm → Apply (§11).
     await act(async () => { await hooks!.deployment.revert(); });
-    expect(hooks!.deployment.pendingApplyConfirmation).not.toBeNull();
-
+    expect(apiMock.cellApply.revertPreview).toHaveBeenCalledOnce();
+    expect(apiMock.cellApply.revert).not.toHaveBeenCalled();
+    expect(hooks!.deployment.applyPreviewKind).toBe('revert');
     await act(async () => { await hooks!.deployment.confirmApply(); });
-    expect(apiMock.deploymentWorkspace.revert).toHaveBeenLastCalledWith(
-      expect.objectContaining({ expectedAdmissionGeneration: 12 }),
-      { token: digest('7'), preparation: { requestOwnerEpoch: 'owner', requestId: 'prep' } },
-    );
-    expect(apiMock.deploymentWorkspace.applyDraft).not.toHaveBeenCalled();
-  });
-
-  it('keeps a confirmed Revert a Revert with a distinct Program Draft, fenced on the Deployment Draft', async () => {
-    // Saved Deployment differs from Applied, the Deployment Draft is the
-    // Applied one, and the Program Draft is edited (neither Saved nor Applied).
-    const idle = {
-      ...HELD, hold: 'idle' as const, cycle: idleCycle(null), admissionGeneration: 12,
-      programRevision: digest('f'), savedDeployment: digest('5'),
-    };
-    await mount(idle);
-    const response = (status: 'confirmation_required' | 'applied') => ({
-      schemaVersion: 'manyforge.composer_deployment_candidate_operation.v1',
-      workspace: deploymentWorkspace(idle),
-      result: {
-        status, confirmationToken: status === 'applied' ? null : digest('7'),
-        preparation: status === 'applied' ? null : { requestOwnerEpoch: 'owner', requestId: 'prep' },
-        preparedActivation: {}, candidatePreview: null, managerApply: null,
-      },
-    });
-    apiMock.deploymentWorkspace.revert.mockResolvedValueOnce(response('confirmation_required'));
-    await act(async () => { await hooks!.deployment.revert(); });
-    expect(hooks!.deployment.pendingApplyConfirmation).not.toBeNull();
-    expect(hooks!.deployment.pendingConfirmationAction).toBe('revert');
-
-    apiMock.deploymentWorkspace.revert.mockResolvedValueOnce(response('applied'));
-    await act(async () => { await hooks!.deployment.confirmApply(); });
-    expect(apiMock.deploymentWorkspace.revert).toHaveBeenLastCalledWith(
-      expect.objectContaining({
-        draftId: 'deployment-draft-1', expectedDraftRevision: 1, expectedAdmissionGeneration: 12,
-      }),
-      { token: digest('7'), preparation: { requestOwnerEpoch: 'owner', requestId: 'prep' } },
-    );
-    expect(apiMock.deploymentWorkspace.applyDraft).not.toHaveBeenCalled();
+    expect(apiMock.cellApply.revert).toHaveBeenCalledExactlyOnceWith(preview.scope);
+    expect(apiMock.cellApply.apply).not.toHaveBeenCalled();
     expect(apiMock.programWorkspace.apply).not.toHaveBeenCalled();
-    expect(hooks!.deployment.pendingApplyConfirmation).toBeNull();
-    expect(hooks!.deployment.pendingConfirmationAction).toBeNull();
-    expect(hooks!.deployment.feedback).toBe('Saved Scenario restored through the authoritative Apply.');
-  });
-
-  it('Applies the Deployment Draft after Reset, handing a disruptive impact to its ordinary confirmation', async () => {
-    const edited = { ...HELD, programRevision: digest('a'), deploymentRevision: 2, deploymentContent: digest('e') };
-    const render = await mount(edited);
-    expect(hooks!.resetApply.unavailableReason('deployment')).toBeNull();
-    expect(await confirm('deployment')).toBeNull();
-    const correlationId = transport.sendExecutionCommand.mock.calls[0][2] as string;
-    apiMock.deploymentWorkspace.applyDraft.mockResolvedValue({
-      schemaVersion: 'manyforge.composer_deployment_candidate_operation.v1',
-      workspace: deploymentWorkspace(edited),
-      result: {
-        status: 'confirmation_required', confirmationToken: digest('7'),
-        preparation: { requestOwnerEpoch: 'owner', requestId: 'prep' },
-        preparedActivation: {}, candidatePreview: null, managerApply: null,
-      },
-    });
-    await render({ ...edited, hold: 'idle', admissionGeneration: 11, cycle: idleCycle(correlationId) });
-    await flush();
-    // The complete activation input confirmed is sent for the backend to recheck.
-    const scope = {
-      deploymentDraftId: 'deployment-draft-1', deploymentDraftRevision: 2, deploymentRevision: null,
-      programDraftId: 'draft-1', programDraftRevision: 3, programRevision: digest('a'),
-      sourceDocumentDigest: null, programRoleAssignment: null,
-    };
-    expect(apiMock.deploymentWorkspace.applyDraft).toHaveBeenCalledExactlyOnceWith(
-      expect.objectContaining({ expectedAdmissionGeneration: 11 }),
-      null,
-      undefined,
-      correlationId,
-      scope,
-    );
-    expect(hooks!.resetApply.sequence?.phase).toEqual({ kind: 'confirmation_required' });
-    expect(hooks!.deployment.pendingApplyConfirmation).not.toBeNull();
-    // A required confirmation takes no claim, so the same admission generation
-    // stays current: Confirm must not wait for a newer one.
-    expect(hooks!.deployment.documentUnavailableReason).toBeNull();
-
-    // The operator confirms the impact: that Apply carries the same shared
-    // correlation and confirmed scope, and the chain follows it to settlement.
-    apiMock.deploymentWorkspace.applyDraft.mockResolvedValue({
-      schemaVersion: 'manyforge.composer_deployment_candidate_operation.v1',
-      workspace: deploymentWorkspace(edited),
-      result: {
-        status: 'accepted', confirmationToken: null, preparation: null,
-        preparedActivation: {}, candidatePreview: null,
-        managerApply: { applyId: 'apply-9', applyGeneration: 5 },
-      },
-    });
-    const idle = { ...edited, hold: 'idle' as const, admissionGeneration: 12, cycle: idleCycle(correlationId) };
-    await render(idle);
-    await act(async () => { await hooks!.deployment.confirmApply(); });
-    expect(apiMock.deploymentWorkspace.applyDraft).toHaveBeenLastCalledWith(
-      expect.objectContaining({ expectedAdmissionGeneration: 12 }),
-      { token: digest('7'), preparation: { requestOwnerEpoch: 'owner', requestId: 'prep' } },
-      undefined,
-      correlationId,
-      scope,
-    );
-    await flush();
-    expect(hooks!.resetApply.sequence?.phase).toEqual({
-      kind: 'awaiting_apply', apply: { applyId: 'apply-9', applyGeneration: 5 },
-    });
-    await render({
-      ...idle,
-      activation: { applyId: 'apply-9', applyGeneration: 5, state: 'succeeded', failure: null } as ManagerApplyStatus,
-    });
-    expect(hooks!.resetApply.sequence?.phase).toEqual({
-      kind: 'applied', apply: { applyId: 'apply-9', applyGeneration: 5 },
-    });
-  });
-
-  it('refuses a Deployment Apply when the Program Draft changed after confirmation', async () => {
-    const edited = { ...HELD, programRevision: digest('a'), deploymentRevision: 2, deploymentContent: digest('e') };
-    const render = await mount(edited);
-    expect(await confirm('deployment')).toBeNull();
-    const correlationId = transport.sendExecutionCommand.mock.calls[0][2] as string;
-    // The Deployment Draft is unchanged, but the Program Draft it compiles with is not.
-    await render({
-      ...edited, hold: 'idle', admissionGeneration: 11, cycle: idleCycle(correlationId),
-      draftRevision: 4, programRevision: digest('b'),
-    });
-    await flush();
-    expect(hooks!.resetApply.sequence?.phase).toMatchObject({
-      kind: 'failed', stage: 'apply', unknown: false,
-      message: expect.stringContaining('Draft changed after confirmation; review again'),
-    });
-    expect(apiMock.deploymentWorkspace.applyDraft).not.toHaveBeenCalled();
   });
 
   it('rechecks the settled Reset identity before Apply: a later cycle refuses it', async () => {
     const render = await mount(HELD);
-    expect(await confirm('program')).toBeNull();
+    expect(await confirm()).toBeNull();
     const correlationId = transport.sendExecutionCommand.mock.calls[0][2] as string;
     // Idle reached under this correlation, but authoring admission is not yet open.
     const idle = { ...HELD, hold: 'idle' as const, admissionGeneration: 11, cycle: idleCycle(correlationId), admissionOpen: false };
@@ -1090,7 +1003,7 @@ describe('Apply while a run exists', () => {
 
   it('continues Reset-Apply when the runner owner changes but the confirmed cycle is unchanged', async () => {
     const render = await mount(HELD);
-    expect(await confirm('program')).toBeNull();
+    expect(await confirm()).toBeNull();
     const correlationId = transport.sendExecutionCommand.mock.calls[0][2] as string;
     const idle = { ...HELD, hold: 'idle' as const, admissionGeneration: 11, cycle: idleCycle(correlationId), admissionOpen: false };
     await render(idle);
@@ -1112,7 +1025,7 @@ describe('Apply while a run exists', () => {
       new CommandDeliveryUnconfirmedError('Command delivery is unconfirmed; commands are disabled.'),
     );
     const render = await mount(HELD);
-    expect(await confirm('program')).toBeNull();
+    expect(await confirm()).toBeNull();
     const phase = hooks!.resetApply.sequence!.phase;
     expect(phase).toMatchObject({ kind: 'awaiting_idle', delivery: 'unconfirmed' });
     expect(resetApplyPhaseText(phase)).toContain('unknown: reconciling');
@@ -1134,13 +1047,13 @@ describe('Apply while a run exists', () => {
 
   it('never Applies on an Idle another request reached, nor a Draft changed meanwhile', async () => {
     const render = await mount(HELD);
-    expect(await confirm('program')).toBeNull();
+    expect(await confirm()).toBeNull();
     await render({ ...HELD, hold: 'idle', admissionGeneration: 11, cycle: idleCycle('someone-else') });
     expect(hooks!.resetApply.sequence?.phase).toMatchObject({ kind: 'failed', stage: 'reset' });
 
     await act(async () => { hooks!.resetApply.dismiss(); });
     await render(HELD);
-    expect(await confirm('program')).toBeNull();
+    expect(await confirm()).toBeNull();
     const correlationId = transport.sendExecutionCommand.mock.calls[1][2] as string;
     await render({
       ...HELD, hold: 'idle', admissionGeneration: 11, cycle: idleCycle(correlationId), draftRevision: 4,
@@ -1152,8 +1065,8 @@ describe('Apply while a run exists', () => {
 
   it('Resets a run Executed but never Run before Applying', async () => {
     await mount({ ...HELD, hold: 'never_run' });
-    expect(hooks!.resetApply.unavailableReason('program')).toBeNull();
-    expect(await confirm('program')).toBeNull();
+    expect(hooks!.resetApply.unavailableReason()).toBeNull();
+    expect(await confirm()).toBeNull();
     const [kind, request] = transport.sendExecutionCommand.mock.calls[0] as [
       string, Record<string, JsonValue>, string,
     ];
@@ -1164,8 +1077,8 @@ describe('Apply while a run exists', () => {
 
   it('is unavailable, with a reason, while motion is not stopped', async () => {
     await mount({ ...HELD, hold: 'stopping' });
-    expect(hooks!.resetApply.unavailableReason('program')).toContain('all Program motion stopped');
-    expect(await confirm('program')).toContain('all Program motion stopped');
+    expect(hooks!.resetApply.unavailableReason()).toContain('all Program motion stopped');
+    expect(await confirm()).toContain('all Program motion stopped');
     expect(transport.sendExecutionCommand).not.toHaveBeenCalled();
   });
 });
@@ -1179,7 +1092,6 @@ describe('Applied view after an Apply settles', () => {
     };
     const render = await mount(before);
     expect(hooks!.runtime.draftUnappliedReason).toMatch(/^Apply or Discard first/);
-    expect(hooks!.runtime.commandAllowed('program_run')).toBe(false);
     expect(programActionUnavailableReason(hooks!.program.state.workspace, 'apply', null)).toBeNull();
 
     apiMock.programWorkspace.apply.mockResolvedValue({
@@ -1207,7 +1119,6 @@ describe('Applied view after an Apply settles', () => {
     expect(apiMock.programs.applied.mock.calls.length).toBeGreaterThan(appliedReads);
     expect(hooks!.runtime.state.applied?.programRevision).toBe(digest('f'));
     expect(hooks!.runtime.draftUnappliedReason).toBeNull();
-    expect(hooks!.runtime.commandAllowed('program_run')).toBe(true);
     // Nothing is left to apply or discard.
     expect(programActionUnavailableReason(hooks!.program.state.workspace, 'apply', null))
       .toMatch(/^Nothing to apply/);

@@ -1,6 +1,6 @@
 api_version: manyforge.closed_schema.v1
 schema_id: manyforge.value_schema.runtime.ros2_control_execution.v1
-schema_revision: sha256:fb270d54f86ecc3f03cc520ea6b7c13cd2a32fef86d7da0700532fb4b2de7b59
+schema_revision: sha256:1c557174fd45649c43d2e20239ec614635ca31aa79608d87727e35edcf8c2c90
 schema_purpose: value
 root_definition_id: ros2_control_execution_runtime_configuration
 definitions:
@@ -103,70 +103,37 @@ definitions:
                     kind: scalar
                     scalar_type: string
                     constraints: []
-                - field_id: isaac_profile
-                  presence: optional
+                - field_id: lane
+                  presence: required
                   default:
                     kind: absent
                   value_schema:
                     kind: scalar
                     scalar_type: string
                     constraints:
-                      - kind: enum
-                        values:
-                          - lite6
-                          - lite_gripper
-                          - robotiq_2f_140
-                          - ur10e
                       - kind: string_format
                         value: portable_id
-                - field_id: mock_profile
-                  presence: optional
+                - field_id: lane_row
+                  presence: required
                   default:
                     kind: absent
                   value_schema:
                     kind: scalar
                     scalar_type: string
                     constraints:
-                      - kind: enum
-                        values:
-                          - lite6
-                          - lite6_lite_gripper
-                          - lite_gripper
-                          - robotiq_2f_140
-                          - robotiq_2f_85
-                          - uf850
-                          - ur10e
-                          - ur10e_robotiq_2f_140
-                          - ur5_roboplan
-                          - ur5e
-                          - ur5e_robotiq_2f_85
-                          - xarm_gripper
-                      - kind: string_format
-                        value: portable_id
-                - field_id: real_profile
-                  presence: optional
+                      - kind: min_length
+                        value: 2
+                - field_id: model_family_id
+                  presence: required
                   default:
                     kind: absent
                   value_schema:
                     kind: scalar
                     scalar_type: string
                     constraints:
-                      - kind: enum
-                        values:
-                          - lite6_real
                       - kind: string_format
                         value: portable_id
                 - field_id: device_address_ref
-                  presence: optional
-                  default:
-                    kind: absent
-                  value_schema:
-                    kind: scalar
-                    scalar_type: string
-                    constraints:
-                      - kind: string_format
-                        value: portable_id
-                - field_id: adapter_family
                   presence: optional
                   default:
                     kind: absent
@@ -196,6 +163,243 @@ definitions:
                     kind: scalar
                     scalar_type: boolean
                     constraints: []
+                - field_id: "max_deceleration_on_cancel_rad_s2"
+                  presence: "optional"
+                  default:
+                    kind: "absent"
+                  value_schema:
+                    kind: "array"
+                    min_items: 1
+                    max_items: 256
+                    collection:
+                      kind: "keyed_record_set"
+                      key_paths:
+                        - - "source_joint_name"
+                    item_schema:
+                      kind: "object"
+                      fields:
+                        - field_id: "max_deceleration_rad_s2"
+                          presence: "required"
+                          default:
+                            kind: "absent"
+                          value_schema:
+                            kind: "scalar"
+                            scalar_type: "number"
+                            constraints:
+                              - kind: "exclusive_minimum"
+                                value: 0
+                        - field_id: "source_joint_name"
+                          presence: "required"
+                          default:
+                            kind: "absent"
+                          value_schema:
+                            kind: "scalar"
+                            scalar_type: "string"
+                            constraints:
+                              - kind: "min_length"
+                                value: 1
+                - field_id: "member_role"
+                  presence: "optional"
+                  default:
+                    kind: "absent"
+                  value_schema:
+                    kind: "scalar"
+                    scalar_type: "string"
+                    constraints:
+                      - kind: "string_format"
+                        value: "portable_id"
+                - field_id: "owner_component_id"
+                  presence: "optional"
+                  default:
+                    kind: "absent"
+                  value_schema:
+                    kind: "scalar"
+                    scalar_type: "string"
+                    constraints:
+                      - kind: "string_format"
+                        value: "portable_id"
+                - field_id: "description"
+                  presence: "required"
+                  default:
+                    kind: "absent"
+                  value_schema:
+                    kind: "scalar"
+                    scalar_type: "string"
+                    constraints:
+                      - kind: "min_length"
+                        value: 1
+                - field_id: "joint_names"
+                  presence: "optional"
+                  default:
+                    kind: "absent"
+                  value_schema:
+                    kind: "array"
+                    min_items: 1
+                    max_items: 64
+                    collection:
+                      kind: "ordered"
+                    item_schema:
+                      kind: "scalar"
+                      scalar_type: "string"
+                      constraints:
+                        - kind: "min_length"
+                          value: 1
+                - field_id: "gripper_joint_name"
+                  presence: "optional"
+                  default:
+                    kind: "absent"
+                  value_schema:
+                    kind: "scalar"
+                    scalar_type: "string"
+                    constraints:
+                      - kind: "min_length"
+                        value: 1
+        - field_id: "machines"
+          presence: "optional"
+          default:
+            kind: "absent"
+          value_schema:
+            kind: "array"
+            min_items: 0
+            max_items: 256
+            collection:
+              kind: "keyed_record_set"
+              key_paths:
+                - - "controllable_component_id"
+            item_schema:
+              kind: "object"
+              fields:
+                - field_id: "arm_description"
+                  presence: "optional"
+                  default:
+                    kind: "absent"
+                  value_schema:
+                    kind: "scalar"
+                    scalar_type: "string"
+                    constraints:
+                      - kind: "min_length"
+                        value: 1
+                - field_id: "arm_joint_names"
+                  presence: "optional"
+                  default:
+                    kind: "absent"
+                  value_schema:
+                    kind: "array"
+                    min_items: 1
+                    max_items: 64
+                    collection:
+                      kind: "ordered"
+                    item_schema:
+                      kind: "scalar"
+                      scalar_type: "string"
+                      constraints:
+                        - kind: "min_length"
+                          value: 1
+                - field_id: "arm_lane_row"
+                  presence: "optional"
+                  default:
+                    kind: "absent"
+                  value_schema:
+                    kind: "scalar"
+                    scalar_type: "string"
+                    constraints:
+                      - kind: "min_length"
+                        value: 2
+                - field_id: "arm_model_family_id"
+                  presence: "optional"
+                  default:
+                    kind: "absent"
+                  value_schema:
+                    kind: "scalar"
+                    scalar_type: "string"
+                    constraints:
+                      - kind: "string_format"
+                        value: "portable_id"
+                - field_id: "controllable_component_id"
+                  presence: "required"
+                  default:
+                    kind: "absent"
+                  value_schema:
+                    kind: "scalar"
+                    scalar_type: "string"
+                    constraints:
+                      - kind: "string_format"
+                        value: "portable_id"
+                - field_id: "lane"
+                  presence: "required"
+                  default:
+                    kind: "absent"
+                  value_schema:
+                    kind: "scalar"
+                    scalar_type: "string"
+                    constraints:
+                      - kind: "string_format"
+                        value: "portable_id"
+                - field_id: "machine_lane_row"
+                  presence: "optional"
+                  default:
+                    kind: "absent"
+                  value_schema:
+                    kind: "scalar"
+                    scalar_type: "string"
+                    constraints:
+                      - kind: "min_length"
+                        value: 2
+                - field_id: "device_address_ref"
+                  presence: "optional"
+                  default:
+                    kind: "absent"
+                  value_schema:
+                    kind: "scalar"
+                    scalar_type: "string"
+                    constraints:
+                      - kind: "string_format"
+                        value: "portable_id"
+        - field_id: "sensors"
+          presence: "optional"
+          default:
+            kind: "absent"
+          value_schema:
+            kind: "array"
+            min_items: 0
+            max_items: 256
+            collection:
+              kind: "keyed_record_set"
+              key_paths:
+                - - "controllable_component_id"
+            item_schema:
+              kind: "object"
+              fields:
+                - field_id: "adapter_row"
+                  presence: "required"
+                  default:
+                    kind: "absent"
+                  value_schema:
+                    kind: "scalar"
+                    scalar_type: "string"
+                    constraints:
+                      - kind: "min_length"
+                        value: 2
+                - field_id: "controllable_component_id"
+                  presence: "required"
+                  default:
+                    kind: "absent"
+                  value_schema:
+                    kind: "scalar"
+                    scalar_type: "string"
+                    constraints:
+                      - kind: "string_format"
+                        value: "portable_id"
+                - field_id: "settings"
+                  presence: "required"
+                  default:
+                    kind: "absent"
+                  value_schema:
+                    kind: "scalar"
+                    scalar_type: "string"
+                    constraints:
+                      - kind: "min_length"
+                        value: 2
         - field_id: planner_rng_seed
           presence: required
           default:
@@ -208,6 +412,19 @@ definitions:
                 value: 0
               - kind: maximum
                 value: 4294967295
+        - field_id: cartesian_timing
+          presence: optional
+          default:
+            kind: materialized
+            value: constant_speed
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - constant_speed
+                  - time_optimal
         - field_id: initial_joint_positions_rad
           presence: required
           default:
@@ -270,19 +487,14 @@ definitions:
                         value: 0
                       - kind: maximum
                         value: 1000
-                - field_id: tcp_speed_check
+                - field_id: ordinary_motion_jerk
                   presence: optional
                   default:
                     kind: materialized
-                    value: active_tcp_and_flange
+                    value: {enabled: false, preset_reference_time_s: 1, joint_limits: []}
                   value_schema:
-                    kind: scalar
-                    scalar_type: string
-                    constraints:
-                      - kind: enum
-                        values:
-                          - active_tcp
-                          - active_tcp_and_flange
+                    kind: local_ref
+                    definition_id: ordinary_motion_jerk
         - field_id: default_fault_stop_profiles
           presence: optional
           default:
@@ -498,6 +710,16 @@ definitions:
                   value_schema:
                     kind: local_ref
                     definition_id: grasp_confirmation
+                - field_id: stop_finish_tolerance
+                  presence: optional
+                  default:
+                    kind: absent
+                  value_schema:
+                    kind: scalar
+                    scalar_type: number
+                    constraints:
+                      - kind: minimum
+                        value: 0
                 - field_id: open_state_ref
                   presence: required
                   default:
@@ -642,31 +864,6 @@ definitions:
                         value: 10000000
                       - kind: maximum
                         value: 60000000000
-                - field_id: severity
-                  presence: required
-                  default:
-                    kind: absent
-                  value_schema:
-                    kind: scalar
-                    scalar_type: string
-                    constraints:
-                      - kind: enum
-                        values:
-                          - fault
-                          - blocking
-                          - warning
-                - field_id: recovery
-                  presence: required
-                  default:
-                    kind: absent
-                  value_schema:
-                    kind: scalar
-                    scalar_type: string
-                    constraints:
-                      - kind: enum
-                        values:
-                          - ack
-                          - auto
         - field_id: execution_tick_hz
           presence: required
           default:
@@ -811,6 +1008,75 @@ definitions:
                 value: 0
               - kind: maximum
                 value: 0.2
+        - field_id: collision_check_fresh_plans
+          presence: optional
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: boolean
+            constraints: []
+        - field_id: planner_search
+          presence: optional
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - rrt
+                  - rrt_connect
+        - field_id: planner_optimize
+          presence: optional
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - first
+                  - rrt_star
+                  - best_of_n
+        - field_id: planner_n
+          presence: optional
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: integer
+            constraints:
+              - kind: minimum
+                value: 2
+              - kind: maximum
+                value: 32
+        - field_id: planner_max_nodes
+          presence: optional
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: integer
+            constraints:
+              - kind: minimum
+                value: 100
+              - kind: maximum
+                value: 1000000
+        - field_id: motion_timing
+          presence: optional
+          default:
+            kind: absent
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints:
+              - kind: enum
+                values:
+                  - smooth
+                  - fast
 
         - field_id: "lifecycle_command_timeouts"
           presence: "optional"
@@ -889,6 +1155,26 @@ definitions:
                       - kind: "maximum"
                         value: 3600
 
+                - field_id: "member_role"
+                  presence: "optional"
+                  default:
+                    kind: "absent"
+                  value_schema:
+                    kind: "scalar"
+                    scalar_type: "string"
+                    constraints:
+                      - kind: "string_format"
+                        value: "portable_id"
+                - field_id: "owner_component_id"
+                  presence: "optional"
+                  default:
+                    kind: "absent"
+                  value_schema:
+                    kind: "scalar"
+                    scalar_type: "string"
+                    constraints:
+                      - kind: "string_format"
+                        value: "portable_id"
                 - field_id: "output_source_ack_timeout_s"
                   presence: "optional"
                   default:
@@ -1648,59 +1934,6 @@ definitions:
                                           value: 0
                                         - kind: "maximum"
                                           value: 9007199254
-                      - tag_value: "xarm_digital"
-                        value_schema:
-                          kind: "object"
-                          fields:
-                            - field_id: "profile"
-                              presence: "required"
-                              default: {kind: "absent"}
-                              value_schema:
-                                kind: "scalar"
-                                scalar_type: "string"
-                                constraints:
-                                  - kind: "enum"
-                                    values: ["xarm_digital"]
-                            - field_id: "robot_component_id"
-                              presence: "required"
-                              default: {kind: "absent"}
-                              value_schema:
-                                kind: "scalar"
-                                scalar_type: "string"
-                                constraints:
-                                  - kind: "string_format"
-                                    value: "portable_id"
-                            - field_id: "bank"
-                              presence: "required"
-                              default: {kind: "absent"}
-                              value_schema:
-                                kind: "scalar"
-                                scalar_type: "string"
-                                constraints:
-                                  - kind: "enum"
-                                    values: ["tool", "controller"]
-                            - field_id: "pin"
-                              presence: "required"
-                              default: {kind: "absent"}
-                              value_schema:
-                                kind: "scalar"
-                                scalar_type: "integer"
-                                constraints:
-                                  - kind: "minimum"
-                                    value: 0
-                                  - kind: "maximum"
-                                    value: 15
-                            - field_id: "ingress_depth"
-                              presence: "optional"
-                              default: {kind: "materialized", value: 64}
-                              value_schema:
-                                kind: "scalar"
-                                scalar_type: "integer"
-                                constraints:
-                                  - kind: "minimum"
-                                    value: 1
-                                  - kind: "maximum"
-                                    value: 9007199254740991
                       - tag_value: "geometric_contact"
                         value_schema:
                           kind: "object"
@@ -1806,7 +2039,7 @@ definitions:
                                           values:
                                             - "periodic"
                                             - "change_only"
-                      - tag_value: "ur_io_states"
+                      - tag_value: "component_adapter"
                         value_schema:
                           kind: "object"
                           fields:
@@ -1820,12 +2053,22 @@ definitions:
                                 constraints:
                                   - kind: "enum"
                                     values:
-                                      - "ur_io_states"
+                                      - "component_adapter"
+                            - field_id: "bank"
+                              presence: "required"
+                              default:
+                                kind: "absent"
+                              value_schema:
+                                kind: "scalar"
+                                scalar_type: "string"
+                                constraints:
+                                  - kind: "string_format"
+                                    value: "portable_id"
                             - field_id: "ingress_depth"
                               presence: "optional"
                               default:
                                 kind: "materialized"
-                                value: 64
+                                value: 16
                               value_schema:
                                 kind: "scalar"
                                 scalar_type: "integer"
@@ -1834,30 +2077,6 @@ definitions:
                                     value: 1
                                   - kind: "maximum"
                                     value: 9007199254740991
-                            - field_id: "topic"
-                              presence: "required"
-                              default:
-                                kind: "absent"
-                              value_schema:
-                                kind: "scalar"
-                                scalar_type: "string"
-                                constraints:
-                                  - kind: "min_length"
-                                    value: 1
-                                  - kind: "max_length"
-                                    value: 4096
-                            - field_id: "pin"
-                              presence: "required"
-                              default:
-                                kind: "absent"
-                              value_schema:
-                                kind: "scalar"
-                                scalar_type: "integer"
-                                constraints:
-                                  - kind: "minimum"
-                                    value: 0
-                                  - kind: "maximum"
-                                    value: 17
                       - tag_value: "ros2_control_gpio"
                         value_schema:
                           kind: "object"
@@ -1926,6 +2145,14 @@ definitions:
           value_schema:
             kind: "object"
             fields:
+                - field_id: "controller_owned"
+                  presence: "optional"
+                  default:
+                    kind: "absent"
+                  value_schema:
+                    kind: "scalar"
+                    scalar_type: "boolean"
+                    constraints: []
                 - field_id: "controllable_component_id"
                   presence: "required"
                   default:
@@ -2058,7 +2285,7 @@ definitions:
                                 constraints:
                                   - kind: "string_format"
                                     value: "portable_id"
-                      - tag_value: "ur_set_io"
+                      - tag_value: "component_adapter"
                         value_schema:
                           kind: "object"
                           fields:
@@ -2072,73 +2299,17 @@ definitions:
                                 constraints:
                                   - kind: "enum"
                                     values:
-                                      - "ur_set_io"
-                            - field_id: "service"
+                                      - "component_adapter"
+                            - field_id: "bank"
                               presence: "required"
                               default:
                                 kind: "absent"
-                              value_schema:
-                                kind: "scalar"
-                                scalar_type: "string"
-                                constraints:
-                                  - kind: "min_length"
-                                    value: 1
-                                  - kind: "max_length"
-                                    value: 4096
-                            - field_id: "pin"
-                              presence: "required"
-                              default:
-                                kind: "absent"
-                              value_schema:
-                                kind: "scalar"
-                                scalar_type: "integer"
-                                constraints:
-                                  - kind: "minimum"
-                                    value: 0
-                                  - kind: "maximum"
-                                    value: 17
-                      - tag_value: "xarm_digital"
-                        value_schema:
-                          kind: "object"
-                          fields:
-                            - field_id: "profile"
-                              presence: "required"
-                              default: {kind: "absent"}
-                              value_schema:
-                                kind: "scalar"
-                                scalar_type: "string"
-                                constraints:
-                                  - kind: "enum"
-                                    values: ["xarm_digital"]
-                            - field_id: "robot_component_id"
-                              presence: "required"
-                              default: {kind: "absent"}
                               value_schema:
                                 kind: "scalar"
                                 scalar_type: "string"
                                 constraints:
                                   - kind: "string_format"
                                     value: "portable_id"
-                            - field_id: "bank"
-                              presence: "required"
-                              default: {kind: "absent"}
-                              value_schema:
-                                kind: "scalar"
-                                scalar_type: "string"
-                                constraints:
-                                  - kind: "enum"
-                                    values: ["tool", "controller"]
-                            - field_id: "pin"
-                              presence: "required"
-                              default: {kind: "absent"}
-                              value_schema:
-                                kind: "scalar"
-                                scalar_type: "integer"
-                                constraints:
-                                  - kind: "minimum"
-                                    value: 0
-                                  - kind: "maximum"
-                                    value: 15
                       - tag_value: "ros2_control_gpio"
                         value_schema:
                           kind: "object"
@@ -2346,3 +2517,44 @@ definitions:
             kind: scalar
             scalar_type: boolean
             constraints: []
+  - definition_id: ordinary_motion_jerk
+    value_schema:
+      kind: object
+      fields:
+        - field_id: enabled
+          presence: required
+          default: {kind: absent}
+          value_schema: {kind: scalar, scalar_type: boolean, constraints: []}
+        - field_id: preset_reference_time_s
+          presence: required
+          default: {kind: absent}
+          value_schema: {kind: local_ref, definition_id: positive_jerk_number}
+        - field_id: joint_limits
+          presence: required
+          default: {kind: absent}
+          value_schema:
+            kind: array
+            min_items: 0
+            max_items: 256
+            collection: {kind: keyed_record_set, key_paths: [[source_joint_name]]}
+            item_schema: {kind: local_ref, definition_id: joint_jerk_setting}
+  - definition_id: joint_jerk_setting
+    value_schema:
+      kind: object
+      fields:
+        - field_id: source_joint_name
+          presence: required
+          default: {kind: absent}
+          value_schema:
+            kind: scalar
+            scalar_type: string
+            constraints: [{kind: min_length, value: 1}, {kind: max_length, value: 1024}]
+        - field_id: override_rad_s3
+          presence: optional
+          default: {kind: absent}
+          value_schema: {kind: local_ref, definition_id: positive_jerk_number}
+  - definition_id: positive_jerk_number
+    value_schema:
+      kind: scalar
+      scalar_type: number
+      constraints: [{kind: exclusive_minimum, value: 0}]

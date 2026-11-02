@@ -213,8 +213,9 @@ public:
   /// publication generation and Apply (identity and record digest), the
   /// authored Program (null when
   /// the Scenario has none), and every committed Apply of this publication
-  /// history (identity, record digest and Scenario), all read from one
-  /// Manager source snapshot.
+  /// history that Manager's bounded journal still retains (identity, record
+  /// digest and Scenario; the current one always), all read from one Manager
+  /// source snapshot.
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   CommittedScenarioActivation();
   [[nodiscard]] ViewerModelAsset ViewerModelUrdf();
@@ -240,13 +241,7 @@ public:
   /// Re-evaluate the alarm sources (runtime health, scene, active resource
   /// registry) when the last completed refresh is at least
   /// `kAlarmSourceRefreshPeriodNs` old; otherwise return without the core
-  /// lock. Reports whether it refreshed, the current refresh time, and
-  /// `component_lifecycle_observation_pending`: true from the moment the
-  /// lifecycle source's quality became unknown because the active
-  /// configuration changed or CCLC was unreachable, until a complete
-  /// observation of the active configuration is accepted. The event pump
-  /// then repeats the lifecycle read at its short retry floor instead of
-  /// waiting its ordinary period (spec 530 §7.1, respected without polling).
+  /// lock. Reports whether it refreshed and the current refresh time.
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   RefreshAlarmSources();
   [[nodiscard]] manyforge::content_identity::CanonicalValue
@@ -295,10 +290,11 @@ public:
   CommitProgramModelAttempt(manyforge::content_identity::CanonicalValue record);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   RecordProgramDiagnostic(manyforge::content_identity::CanonicalValue record);
-  /// Item 37: one History row per operator Force close, naming what the
-  /// Kernel step left in an unknown state.
+  /// One finished component action or Apply terminal
+  /// (`manyforge.activity_event.v1`): `component_action_finished` under the
+  /// component's id, `apply_finished` under `manyforge.composer`.
   [[nodiscard]] manyforge::content_identity::CanonicalValue
-  RecordScenarioForceClose(manyforge::content_identity::CanonicalValue record);
+  RecordActivity(manyforge::content_identity::CanonicalValue record);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   IngestOperationEvent(
       std::string source_owner_epoch, std::uint64_t source_sequence,
@@ -311,9 +307,7 @@ public:
       std::string payload_digest);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   CompleteOperationEventSnapshot(
-      std::string source_owner_epoch, std::uint64_t through_source_sequence,
-      std::optional<manyforge::content_identity::CanonicalValue>
-          current_stop_fault = std::nullopt);
+      std::string source_owner_epoch, std::uint64_t through_source_sequence);
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   MarkOperationEventSourceUnknown(std::string source_owner_epoch);
   /// Observe two bounded current native-owner fault facts. First occurrences
@@ -325,59 +319,6 @@ public:
   /// Internal accepted Program source; absence/owner replacement never clears an occurrence.
   [[nodiscard]] manyforge::content_identity::CanonicalValue
   ObserveProgramFailureCondition(manyforge::content_identity::CanonicalValue condition);
-  /// Controllable components of the active configuration whose CCLC
-  /// snapshots the component-lifecycle alarm conditions are derived from,
-  /// that configuration's retained bundle and graph revision (null before
-  /// the first publication), and whether the lifecycle source is
-  /// registered. A registered source with an empty scope still needs an
-  /// observation (`ObserveEmptyComponentLifecycleConfiguration`), which
-  /// returns the conditions of the removed components and reconciles its
-  /// quality.
-  [[nodiscard]] manyforge::content_identity::CanonicalValue
-  ComponentLifecycleConditionScope();
-  /// Derive the safety-stop alarm condition (spec 530 §3.3, 2026-10-08)
-  /// from CCLC component snapshots: an open component incident or an
-  /// intervention-requiring blocking cause holds `component_lifecycle_fault`
-  /// (incident id in the details) until the acknowledged incident is gone
-  /// from a fresh snapshot. `snapshots`
-  /// and `unavailable_component_ids` together must name exactly the current
-  /// scope, and every snapshot must name the active retained bundle and
-  /// graph revision; otherwise nothing is submitted (`scope_changed`). The
-  /// active configuration is the one Manager publishes now, reread under the
-  /// owner lock; a stale, unavailable or unverifiable publication submits
-  /// nothing (`configuration_unavailable`). An unavailable component keeps
-  /// its conditions unchanged and leaves the source quality as it was. Only
-  /// a changed condition is submitted.
-  [[nodiscard]] manyforge::content_identity::CanonicalValue
-  ObserveComponentLifecycleConditions(
-      std::string cclc_owner_epoch,
-      manyforge::content_identity::CanonicalValue snapshots,
-      std::vector<std::string> unavailable_component_ids);
-  /// The active configuration (`retained_bundle_id`, `graph_revision`) has
-  /// no controlled components, so it has no CCLC owner and no lifecycle
-  /// conditions: the conditions of the components that left the scope
-  /// return to normal and the lifecycle source's quality becomes good
-  /// (`observed`; `empty` when the source was never registered). Judged
-  /// against the configuration Manager publishes now, like
-  /// `ObserveComponentLifecycleConditions`: a different or non-empty
-  /// configuration is `scope_changed`, a stale, unavailable or unverifiable
-  /// publication `configuration_unavailable`; neither submits anything.
-  [[nodiscard]] manyforge::content_identity::CanonicalValue
-  ObserveEmptyComponentLifecycleConfiguration(std::string retained_bundle_id,
-                                              std::string graph_revision);
-  /// CCLC is unreachable: its conditions keep their state at unknown quality.
-  [[nodiscard]] manyforge::content_identity::CanonicalValue
-  MarkComponentLifecycleSourceUnknown();
-  /// Record one CCLC incident history event (addendum 2 contract item 5,
-  /// `component_incident` / `component_incident_acknowledged`) as historian
-  /// component `manyforge.cclc`, event type = event kind, with the CCLC
-  /// fields as details. Idempotent per (incident id, event kind): an event
-  /// this process already enqueued or the durable history already holds is
-  /// `duplicate`, so a lost reader cursor never records it twice. A full
-  /// historian queue answers `rejected` (nothing recorded; retry later).
-  [[nodiscard]] manyforge::content_identity::CanonicalValue
-  RecordCCLCIncidentEvent(std::string cclc_owner_epoch,
-                          manyforge::content_identity::CanonicalValue event);
   void Shutdown();
 
 private:
@@ -444,19 +385,10 @@ private:
       std::string_view request_id, std::uint64_t native_sequence,
       std::string_view payload_digest, std::int64_t occurred_at_ns,
       std::string_view occurred_at_wall, std::string_view raw_event_id);
-  void ReconcileStopFaultLocked(
-      const manyforge::content_identity::CanonicalValue &journal_payload,
-      std::string_view record_kind, std::uint64_t native_sequence,
-      std::string_view payload_digest, std::int64_t occurred_at_ns,
-      std::string_view occurred_at_wall, std::string_view raw_event_id);
-  void ObserveCurrentStopFaultLocked(
-      const manyforge::content_identity::CanonicalValue &fault_latch,
-      std::uint64_t native_sequence);
   /// Which adapter-local record an admitted operation condition updates.
   enum class OperationConditionKind {
     kExecutionFault,
     kRuntimeCollision,
-    kStopFault,
     kProgramFailure,
   };
   /// A still-current activation the alarm owner refused for its scope. It is
@@ -469,19 +401,6 @@ private:
 
   void SynchronizeAlarmResourceRegistryLocked(
       const HeadlessRuntimeSnapshot &runtime);
-  /// Reread the current Manager publication and synchronize the alarm
-  /// resource registry from it. True only when that publication is fresh and
-  /// the registry now holds the exact configuration it names, so an
-  /// observation can be judged against the active configuration rather than
-  /// one a reader last happened to refresh.
-  [[nodiscard]] bool RefreshCurrentAlarmRegistryLocked();
-  /// Return the lifecycle conditions of components outside `in_scope` to
-  /// normal and forget them; `correlations` names the observation for one
-  /// removed component.
-  void ReturnRemovedComponentConditionsLocked(
-      const std::set<std::string> &in_scope,
-      const std::function<manyforge::content_identity::CanonicalValue(
-          const std::string &component_id)> &correlations);
   /// Submit one operation-derived condition. A scope the alarm owner refuses
   /// (stale or invalid resources) is recorded as a named, historian-visible
   /// rejection and returns no mutation; it never fails the operation feed.
@@ -502,21 +421,6 @@ private:
   /// after every change of the retained refusals; unchanged state is not
   /// resubmitted.
   void SynchronizeAlarmScopeConditionLocked();
-  /// Last submitted state of one component-lifecycle condition point.
-  struct ComponentConditionState final {
-    AlarmSubject subject;
-    bool active{};
-    std::string fingerprint;
-  };
-  /// Submit `active` for one (definition, component) point when it differs
-  /// from the last submission. A never-raised point is not cleared, and a
-  /// point whose subject changed while active is first cleared under its
-  /// old subject.
-  void SynchronizeComponentConditionLocked(
-      AdapterCursor &cursor, const std::string &definition_id,
-      const std::string &component_id, const AlarmSubject &subject,
-      bool active, const manyforge::content_identity::CanonicalValue &details,
-      const manyforge::content_identity::CanonicalValue &correlations);
   void RegisterAdapterEpochLocked(AdapterCursor &cursor,
                                   std::string source_epoch);
   [[nodiscard]] AlarmMutation SubmitAdapterUpdateLocked(
@@ -577,20 +481,8 @@ private:
   std::uint64_t program_failure_run_revision_{};
   std::string program_failure_run_id_;
   AdapterCursor alarm_scope_adapter_;
-  /// CCLC lifecycle condition (`component_lifecycle_fault`). It follows the
-  /// CCLC owner epoch and is registered only after the first complete
-  /// observation.
-  AdapterCursor component_lifecycle_adapter_;
   AdapterCursor workbench_session_adapter_;
   std::optional<std::string> workbench_previous_session_id_;
-  /// Controllable components of the active configuration, sorted.
-  std::vector<std::string> alarm_component_ids_;
-  /// (definition id, component id) -> last submitted state.
-  std::map<std::pair<std::string, std::string>, ComponentConditionState>
-      component_conditions_;
-  /// (incident id, event kind) of CCLC incident events enqueued by this
-  /// process; bounded, the durable history answers beyond it.
-  std::set<std::pair<std::string, std::string>> recorded_cclc_incident_events_;
   std::uint64_t operation_native_sequence_{};
   std::string operation_native_record_digest_;
   std::map<std::string, AlarmSubject> active_operation_faults_;
@@ -602,8 +494,6 @@ private:
   };
   std::map<std::string, RuntimeMonitorStopCondition> active_runtime_collisions_;
   std::set<std::string> observed_runtime_collisions_;
-  std::map<std::string, AlarmSubject> active_stop_faults_;
-  std::string current_stop_fault_fingerprint_;
   mutable std::mutex mutex_;
   std::uint64_t node_environment_generation_{};
   std::string previous_node_environment_digest_;
@@ -612,13 +502,6 @@ private:
   /// Monotonic observation time of the last completed `RefreshLocked`;
   /// negative before the first. Read without `mutex_` by the attention read.
   std::atomic<std::int64_t> alarm_sources_refreshed_at_ns_{-1};
-  /// Set (under `mutex_`) when the component-lifecycle source needs an
-  /// observation of the active configuration: a registry replacement or an
-  /// unreachable CCLC made its quality unknown. Cleared (under `mutex_`) when
-  /// a complete observation of the active configuration completes the
-  /// source snapshot with good quality, or when nothing is in scope. Read
-  /// without `mutex_` by `RefreshAlarmSources`.
-  std::atomic<bool> component_lifecycle_observation_pending_{};
   std::atomic<bool> shutdown_{};
 };
 

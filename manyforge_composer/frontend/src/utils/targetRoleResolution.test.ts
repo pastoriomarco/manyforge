@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 import type { JsonValue, ProgramAuthoringDocument, ProgramTreeNode } from '../types/api';
 import {
   TRIAL_E_CONDITION, trialEAssignment, trialEDeployment, trialEProgram,
-} from '../testFixtures/trialESignal';
+} from '../testFixtures/mockLite6SignalMoves';
 import { conditionProblem, nodeConditionChoices, stopStagesForTargetRole } from './interruptAuthoring';
 import { ioSignalRoleChoices } from './ioAuthoring';
 import { mockSignalProfiles } from './mockSimulation';
@@ -31,7 +31,7 @@ describe('target roles from the Draft facts (binding null)', () => {
     ]);
   });
 
-  it('offers the declared inputs of an assigned role and accepts the Trial E condition', () => {
+  it('offers the declared inputs of an assigned role and accepts the signal_moves condition', () => {
     const choices = nodeConditionChoices(program, null, [], trialEDeployment(), trialEAssignment);
     expect(choices.filter((choice) => choice.key === '').map((choice) => choice.label)).toEqual([
       'station · edge_sensor (edge_sensor, input)',
@@ -106,7 +106,7 @@ describe('binding-null consumers use the same resolver', () => {
     expect(resolvedOutputSignals(withClamp, station, trialEDeployment())).toEqual([
       { resource_role_id: 'clamp', signal_name: 'clamp', value_type: 'bool' },
     ]);
-    // clamp is declared but not a required resource role of Trial E's station.
+    // clamp is declared but not a required resource role of the signal_moves station.
     expect(resolvedOutputSignals(program, resolvedTargetRoles(program, trialEAssignment)[2], trialEDeployment()))
       .toEqual([]);
     expect(resolvedTargetRoleBindings(withClamp, trialEAssignment, null)).toEqual([]);

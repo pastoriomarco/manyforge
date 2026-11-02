@@ -26,9 +26,7 @@ from manyforge_headless_api.client import HeadlessClientError
 
 _ROOT = Path(__file__).resolve().parents[2]
 _PROGRAM_PATH = _ROOT / "examples/lite6_lite_gripper_pick_and_place.program.yaml"
-_DEPLOYMENT_PATH = (
-    _ROOT / "examples/lite6_lite_gripper_pick_and_place.deployment.yaml"
-)
+_DEPLOYMENT_PATH = _ROOT / "examples/mock_lite6_pick_and_place.scenario/deployment.yaml"
 
 
 def _fixture_deployment_compiler(source: str) -> CompiledDeploymentDocument:
@@ -52,7 +50,7 @@ def _fixture_deployment_compiler(source: str) -> CompiledDeploymentDocument:
 
 def _selection(program: dict[str, Any]) -> dict[str, Any]:
     return {
-        "scenario_id": "lite6_pick_and_place",
+        "scenario_id": "mock_lite6_pick_and_place",
         "source_document_digest": "sha256:" + "2" * 64,
         "assistant_mode": "forbidden",
         "assistant_projection": None,
@@ -415,7 +413,7 @@ def test_current_scenario_requires_both_exact_owner_projections() -> None:
     headless.manager_target = True
     current = state.current_scenario()
     assert current["ready"] is True
-    assert current["current_scenario"]["scenario_id"] == "lite6_pick_and_place"
+    assert current["current_scenario"]["scenario_id"] == "mock_lite6_pick_and_place"
 
 
 def test_published_scenario_does_not_wait_for_runtime_convergence() -> None:
@@ -563,30 +561,6 @@ def test_contradictory_applied_program_status_is_not_a_publication() -> None:
     assert published["unavailable_reasons"] == [
         "program_applied_status_invalid"
     ]
-
-
-def test_sealed_empty_publication_has_no_current_or_published_scenario() -> None:
-    program = Program(str(_PROGRAM_PATH), build_node_environment().catalog)
-    selection = _selection(program.to_dict())
-    headless = _Headless(selection)
-    status = _non_executable_status(selection)
-    status.update(program_id=None, program_revision=None, program=None,
-                  non_executable=None, message="No Program is selected")
-    status["origin"] = {
-        "kind": "sealed_canonical_empty", "cell_id": "cell_a",
-        "deployment_artifact_id": selection["deployment_artifact_id"],
-        **{name: selection[name] for name in ("deployment_revision", "retained_bundle_id", "graph_revision")},
-        "admission_digest": "sha256:" + "c" * 64,
-    }
-    headless.applied_status = status
-    headless.manager_target = True
-    state = _state(headless, _Coordinator(), program=None)
-    published = state.published_scenario()
-    assert published["published_scenario"] is None
-    assert published["ready"] is False
-    assert published["unavailable_reasons"] == ["program_not_applied"]
-    assert state.current_scenario()["current_scenario"] is None
-    assert state.applied_deployment_document is None
 
 
 @pytest.mark.parametrize("malformed_origin", [False, True])

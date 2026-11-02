@@ -4,7 +4,6 @@
 #include <exception>
 #include <manyforge_core/runtime_contract_manifest_codec.hpp>
 #include <manyforge_deployment/execution_runtime_contract.hpp>
-#include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/runtime_contract_registry.hpp>
 #include <map>
@@ -465,15 +464,12 @@ BuildVerifiedRuntimeConvergencePlan(
   return result;
 }
 
-manyforge::core::Result<void> VerifyNativeExecutionHostContinuity(
+manyforge::core::Result<void> VerifyExecutionHostContinuity(
     const RetainedBundle &predecessor, const RetainedBundle &candidate,
     const manyforge::deployment::IVerifiedRetainedProductArtifactSource
         &artifact_source) {
   using manyforge::core::ErrorDTO;
   using manyforge::core::RuntimeUnitDTO;
-  // DX-753: preserve held per-unit continuity identity and all epoch/offer guards.
-  using manyforge::deployment::native_execution_runtime_contract::
-      kRuntimeProfileId;
 
   const auto reject = [](const std::string &expected_runtime_unit_id,
                          const std::string &candidate_runtime_unit_id,
@@ -481,8 +477,8 @@ manyforge::core::Result<void> VerifyNativeExecutionHostContinuity(
                          const std::string &verification_detail = {}) {
     const auto bounded_detail = verification_detail.substr(0U, 256U);
     return manyforge::core::Result<void>::Err(ErrorDTO{
-        "native_execution_host_incompatible",
-        "candidate native execution host is incompatible with the current "
+        "execution_host_incompatible",
+        "candidate execution host is incompatible with the current "
         "host [expected_runtime_unit_id=" + expected_runtime_unit_id +
             ", candidate_runtime_unit_id=" + candidate_runtime_unit_id +
             ", reason=" + reason +
@@ -496,10 +492,9 @@ manyforge::core::Result<void> VerifyNativeExecutionHostContinuity(
          {"verification_detail", bounded_detail}}});
   };
   const auto is_execution_host = [](const RuntimeUnitDTO &unit) {
-    return unit.runtime_profile_id.value() == kRuntimeProfileId ||
-           unit.runtime_profile_id.value() ==
-               manyforge::deployment::ros2_control_execution_runtime_contract::
-                   kRuntimeProfileId;
+    return unit.runtime_profile_id.value() ==
+           manyforge::deployment::ros2_control_execution_runtime_contract::
+               kRuntimeProfileId;
   };
   const auto &predecessor_units = predecessor.value().cell_graph.runtime_units;
   const auto &candidate_units = candidate.value().cell_graph.runtime_units;
@@ -581,14 +576,14 @@ manyforge::core::Result<void> VerifyNativeExecutionHostContinuity(
         candidate, actual.runtime_unit_id, artifact_source);
   } catch (const std::exception &error) {
     return reject(expected_id, actual_id,
-                  "native_runtime_product_verification_failed", error.what());
+                  "execution_host_product_verification_failed", error.what());
   } catch (...) {
     return reject(expected_id, actual_id,
-                  "native_runtime_product_verification_failed");
+                  "execution_host_product_verification_failed");
   }
   if (!expected_product.has_value() || !candidate_product.has_value()) {
     return reject(expected_id, actual_id,
-                  "native_runtime_product_missing");
+                  "execution_host_product_missing");
   }
 
   const auto *expected_contract =
@@ -603,7 +598,7 @@ manyforge::core::Result<void> VerifyNativeExecutionHostContinuity(
           candidate_product->product_contract_revision());
   if (expected_contract == nullptr || candidate_contract == nullptr) {
     return reject(expected_id, actual_id,
-                  "native_runtime_contract_offer_missing");
+                  "execution_host_contract_offer_missing");
   }
 
   if (expected_product->product_id() != candidate_product->product_id() ||
@@ -636,7 +631,7 @@ manyforge::core::Result<void> VerifyNativeExecutionHostContinuity(
   if (expected_contract->offer().offer_digest !=
       candidate_contract->offer().offer_digest) {
     return reject(expected_id, actual_id,
-                  "native_runtime_contract_offer_changed");
+                  "execution_host_contract_offer_changed");
   }
   return manyforge::core::Result<void>::Ok();
 }
@@ -716,7 +711,7 @@ ManagerApplyRuntimeConvergenceCoordinator::ConvergeOrRecover(
   std::lock_guard operation_lock(operation_mutex_);
 
   VerifyApplyInputs(apply_intent, predecessor, candidate);
-  const auto host_continuity = VerifyNativeExecutionHostContinuity(
+  const auto host_continuity = VerifyExecutionHostContinuity(
       predecessor, candidate, artifact_source_);
   if (!host_continuity.ok()) {
     Fail(host_continuity.error().message);

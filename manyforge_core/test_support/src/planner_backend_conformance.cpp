@@ -42,30 +42,6 @@ const char* motion_capability_key(PlannerMotionCapability motion) noexcept {
   return "planning.motion.unknown";
 }
 
-const char* profile_name(PlanningProfileDTO profile) noexcept {
-  switch (profile) {
-    case PlanningProfileDTO::kFirstFeasible:
-      return "first_feasible";
-    case PlanningProfileDTO::kBalanced:
-      return "balanced";
-    case PlanningProfileDTO::kQualityBounded:
-      return "quality_bounded";
-  }
-  return "unknown";
-}
-
-const char* profile_capability_key(PlanningProfileDTO profile) noexcept {
-  switch (profile) {
-    case PlanningProfileDTO::kFirstFeasible:
-      return "planning.profile.first_feasible";
-    case PlanningProfileDTO::kBalanced:
-      return "planning.profile.balanced";
-    case PlanningProfileDTO::kQualityBounded:
-      return "planning.profile.quality_bounded";
-  }
-  return "planning.profile.unknown";
-}
-
 std::optional<PlannerMotionCapability> motion_capability(
     const ResolvedMotionSpecDTO& motion) noexcept {
   if (std::holds_alternative<ResolvedJointGoalDTO>(motion)) {
@@ -89,19 +65,6 @@ bool supports_motion(const PlannerCapabilityProfile& capabilities,
       return capabilities.pose_goal;
     case PlannerMotionCapability::kCartesian:
       return capabilities.cartesian_path;
-  }
-  return false;
-}
-
-bool supports_profile(const PlannerCapabilityProfile& capabilities,
-                      PlanningProfileDTO profile) noexcept {
-  switch (profile) {
-    case PlanningProfileDTO::kFirstFeasible:
-      return capabilities.profile_first_feasible;
-    case PlanningProfileDTO::kBalanced:
-      return capabilities.profile_balanced;
-    case PlanningProfileDTO::kQualityBounded:
-      return capabilities.profile_quality_bounded;
   }
   return false;
 }
@@ -452,8 +415,6 @@ void validate_plan_case(const PlannerConformanceCase& test_case,
   }
   const bool motion_supported =
       supports_motion(input.capabilities, *capability);
-  const bool profile_supported = supports_profile(
-      input.capabilities, test_case.request.planning_profile);
   const auto started = std::chrono::steady_clock::now();
   const PlanResultDTO result = input.planner->plan(test_case.request);
   const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -464,13 +425,9 @@ void validate_plan_case(const PlannerConformanceCase& test_case,
                       std::to_string(elapsed.count()) + " ms");
   }
 
-  if (!motion_supported || !profile_supported) {
-    const std::string expected_capability =
-        !motion_supported
-            ? motion_capability_key(*capability)
-            : profile_capability_key(test_case.request.planning_profile);
-    validate_unsupported_error(test_case.id, result, expected_capability,
-                               report);
+  if (!motion_supported) {
+    validate_unsupported_error(test_case.id, result,
+                               motion_capability_key(*capability), report);
     return;
   }
   if (!result.trajectory.has_value() || result.error.has_value()) {
@@ -501,8 +458,7 @@ void validate_matrix_completeness(const PlannerBackendConformanceInput& input,
     if (!motion.has_value()) {
       continue;
     }
-    const std::string key = std::string(motion_name(*motion)) + "." +
-                            profile_name(test_case.request.planning_profile);
+    const std::string key = motion_name(*motion);
     if (!seen.insert(key).second) {
       add_violation(report, test_case.id, "matrix.unique_case",
                     "duplicate portable matrix cell " + key);
@@ -511,15 +467,10 @@ void validate_matrix_completeness(const PlannerBackendConformanceInput& input,
   for (const auto motion : {PlannerMotionCapability::kJoint,
                             PlannerMotionCapability::kPose,
                             PlannerMotionCapability::kCartesian}) {
-    for (const auto profile : {PlanningProfileDTO::kFirstFeasible,
-                               PlanningProfileDTO::kBalanced,
-                               PlanningProfileDTO::kQualityBounded}) {
-      const std::string key = std::string(motion_name(motion)) + "." +
-                              profile_name(profile);
-      if (!seen.contains(key)) {
-        add_violation(report, "matrix", "matrix.required_case",
-                      "missing portable matrix cell " + key);
-      }
+    const std::string key = motion_name(motion);
+    if (!seen.contains(key)) {
+      add_violation(report, "matrix", "matrix.required_case",
+                    "missing portable matrix cell " + key);
     }
   }
 }
@@ -695,21 +646,14 @@ std::vector<PlannerConformanceCase> make_portable_planner_matrix(
       requests{{{PlannerMotionCapability::kJoint, &joint_request},
                 {PlannerMotionCapability::kPose, &pose_request},
                 {PlannerMotionCapability::kCartesian, &cartesian_request}}};
-  const std::array<PlanningProfileDTO, 3> profiles{
-      PlanningProfileDTO::kFirstFeasible, PlanningProfileDTO::kBalanced,
-      PlanningProfileDTO::kQualityBounded};
   std::vector<PlannerConformanceCase> cases;
-  cases.reserve(requests.size() * profiles.size());
+  cases.reserve(requests.size());
   for (const auto& [motion, request] : requests) {
-    for (const auto profile : profiles) {
-      const auto case_id = std::string(motion_name(motion)) + "." +
-                           profile_name(profile);
-      PlannerConformanceCase test_case{case_id, *request};
-      test_case.request.move_id =
-          MoveId(request->move_id.value() + "_" + case_id);
-      test_case.request.planning_profile = profile;
-      cases.push_back(std::move(test_case));
-    }
+    const std::string case_id = motion_name(motion);
+    PlannerConformanceCase test_case{case_id, *request};
+    test_case.request.move_id =
+        MoveId(request->move_id.value() + "_" + case_id);
+    cases.push_back(std::move(test_case));
   }
   return cases;
 }

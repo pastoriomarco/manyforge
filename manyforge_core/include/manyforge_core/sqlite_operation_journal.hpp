@@ -13,12 +13,14 @@
 
 namespace manyforge::core {
 
-/// v17: lean Stop record. `stop_projections` is an index of journal_records
-/// sequences; each Stop payload is stored once, in journal_records. Earlier
-/// journals are refused (operation_journal_format_unsupported), not converted.
+/// v19: the motion takeover decision carries its planning cap.
+/// v18: lean Stop record without fault latch or surveillance. `stop_projections`
+/// is an index of journal_records sequences; each Stop payload is stored once,
+/// in journal_records. Earlier journals are refused
+/// (operation_journal_format_unsupported), not converted.
 inline constexpr std::string_view kOperationJournalSchemaId =
-    "manyforge.internal.execution.operation-journal.o1.5.v17";
-inline constexpr std::int64_t kOperationJournalSchemaVersion = 17;
+    "manyforge.internal.execution.operation-journal.o1.5.v19";
+inline constexpr std::int64_t kOperationJournalSchemaVersion = 19;
 inline constexpr std::int64_t kOperationJournalSqliteApplicationId = 0x4D46454A;
 inline constexpr std::string_view kOperationJournalFilename = "operation-journal.sqlite3";
 inline constexpr std::size_t kMaximumOperationJournalHistory = 4096U;
@@ -82,17 +84,7 @@ class SqliteOperationJournal final : public IOperationJournal {
 
   [[nodiscard]] StopForensicProjectionResultDTO RecordStopTerminal(
       const RequestOwnerEpoch& owner_epoch, const StopStatusDTO& stop_status,
-      const StopCertificateDTO& certificate,
-      const std::optional<StopFaultLatchDTO>& fault_latch) noexcept override;
-
-  [[nodiscard]] StopForensicProjectionResultDTO RecordStopSurveillanceCheckpoint(
-      const RequestOwnerEpoch& owner_epoch, const StopPostTerminalSurveillanceDTO& checkpoint,
-      const StopFaultLatchDTO& fault_latch, std::int64_t projected_at_ns) noexcept override;
-
-  [[nodiscard]] Result<std::uint64_t> RecordStopFaultCleared(
-      const RequestOwnerEpoch& owner_epoch, const StopFaultRecoveryIntentDTO& recovery_intent,
-      const StopFaultRecoveryResultDTO& recovery_result, const StopFaultLatchDTO& cleared_latch,
-      const StopStatusDTO& resulting_stop_status) override;
+      const StopCertificateDTO& certificate) noexcept override;
 
   [[nodiscard]] Result<std::uint64_t> CloseOwnerEpoch(const RequestOwnerEpoch& owner_epoch,
                                                       std::int64_t closed_at_ns) override;
@@ -133,8 +125,6 @@ class SqliteOperationJournal final : public IOperationJournal {
       AdmissionGeneration resulting_generation) override;
   [[nodiscard]] Result<std::uint64_t> RecordInterruptRuleStateChanged(
       const IoRuleStateChangeDTO& change) override;
-  [[nodiscard]] Result<std::uint64_t> RecordGlobalIoRuleCleared(
-      const IoGlobalRuleRecoveryRecordDTO& record) override;
   [[nodiscard]] Result<std::uint64_t> RecordActiveTcpChanged(
       const RequestOwnerEpoch& owner_epoch, const ActiveTcpChangeDTO& change) override;
 
@@ -145,7 +135,7 @@ class SqliteOperationJournal final : public IOperationJournal {
       std::size_t limit = kMaximumOperationJournalEventPage);
 
   /// Read the bounded operational projection consumed by the headless event
-  /// pump. Forensic-only Stop terminal, surveillance, fault-clear, and owner
+  /// pump. Forensic-only Stop terminal and owner
   /// lifecycle records remain durable but cannot poison this external page.
   [[nodiscard]] Result<OperationJournalEventPageDTO> ReadOperationalEvents(
       const RequestOwnerEpoch& owner_epoch, std::uint64_t after_sequence,

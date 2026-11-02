@@ -1,23 +1,10 @@
 api_version: manyforge.closed_schema.v1
 schema_id: manyforge.command_schema.v1
-schema_revision: sha256:fdce9bb1facd259bde85f502197fd534dc05346a030605a55aa951d9e88c73dd
+schema_revision: sha256:4f23fe66c0dd587d998a52a7b166bddd22d7ab8e5b28caacc48373ff373dcd84
 schema_purpose: artifact_document
 root_definition_id: command_schema
 definitions:
   - definition_id: command_schema
-    value_schema:
-      kind: tagged_union
-      tag_field: api_version
-      alternatives:
-        - tag_value: manyforge.command_schema.v1
-          value_schema:
-            kind: local_ref
-            definition_id: gripper_command_schema
-        - tag_value: manyforge.io_signal_write_command_schema.v1
-          value_schema:
-            kind: local_ref
-            definition_id: io_signal_write_command_schema
-  - definition_id: gripper_command_schema
     value_schema:
       kind: object
       fields:
@@ -144,59 +131,6 @@ definitions:
               constraints:
                 - kind: enum
                   values: [command_terminal]
-  - definition_id: io_signal_write_command_schema
-    value_schema:
-      kind: object
-      fields:
-        - field_id: api_version
-          presence: required
-          default: {kind: absent}
-          value_schema:
-            kind: scalar
-            scalar_type: string
-            constraints:
-              - kind: enum
-                values: [manyforge.io_signal_write_command_schema.v1]
-              - kind: string_format
-                value: api_version
-        - field_id: command_schema_id
-          presence: required
-          default: {kind: absent}
-          value_schema:
-            kind: scalar
-            scalar_type: string
-            constraints:
-              - kind: string_format
-                value: portable_id
-        - field_id: command_schema_revision
-          presence: required
-          default: {kind: absent}
-          value_schema:
-            kind: scalar
-            scalar_type: string
-            constraints:
-              - kind: string_format
-                value: sha256_digest
-        - field_id: compatible_capabilities
-          presence: required
-          default: {kind: absent}
-          value_schema:
-            kind: array
-            min_items: 1
-            max_items: 64
-            collection:
-              kind: keyed_record_set
-              key_paths:
-                - [capability_id]
-            item_schema:
-              kind: local_ref
-              definition_id: compatible_capability
-        - field_id: command_value
-          presence: required
-          default: {kind: absent}
-          value_schema:
-            kind: local_ref
-            definition_id: io_signal_write_value
   - definition_id: compatible_capability
     value_schema:
       kind: object
@@ -307,7 +241,7 @@ definitions:
             scalar_type: string
             constraints:
               - kind: enum
-                values: [nonnegative_duration_seconds]
+                values: [bool, nonnegative_duration_seconds]
         - field_id: required
           presence: required
           default: {kind: absent}
@@ -315,16 +249,3 @@ definitions:
             kind: scalar
             scalar_type: boolean
             constraints: []
-  - definition_id: io_signal_write_value
-    value_schema:
-      kind: object
-      fields:
-        - field_id: value_kind
-          presence: required
-          default: {kind: absent}
-          value_schema:
-            kind: scalar
-            scalar_type: string
-            constraints:
-              - kind: enum
-                values: [io_signal_write]

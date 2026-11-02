@@ -11,17 +11,16 @@ from typing import Any, Sequence
 import uvicorn
 
 from .app import create_app
-from .cclc import MAX_CCLC_REQUEST_BYTES
 from .client import HeadlessClientError, HeadlessHttpClient
+from .component_model import COMPONENT_ACTIONS, enable_all_targets, prepare_all_targets
 from .native import (
     DEFAULT_MANAGER_COMMAND_TIMEOUT_SECONDS,
     HeadlessApiConfig,
     HeadlessApiError,
-    strict_json_object,
 )
 
 
-def _print(value: dict[str, Any]) -> None:
+def _print(value: Any) -> None:
     print(
         json.dumps(
             value,
@@ -68,7 +67,6 @@ def _parser() -> argparse.ArgumentParser:
         type=float,
         default=DEFAULT_MANAGER_COMMAND_TIMEOUT_SECONDS,
     )
-    serve.add_argument("--cclc-timeout-s", type=float, default=5.0)
     serve.add_argument("--program-runner-url")
     serve.add_argument("--program-runner-timeout-s", type=float, default=30.0)
     serve.add_argument("--activation-preparer", type=Path)
@@ -137,38 +135,53 @@ def _parser() -> argparse.ArgumentParser:
     reconcile.add_argument("expected_health_generation", type=int)
     _caller_fields(reconcile)
 
-    apply = subcommands.add_parser("apply")
-    apply.add_argument("--url", default="http://127.0.0.1:9010")
-    apply.add_argument("deployment_artifact_id")
-    apply.add_argument("deployment_revision")
-    apply.add_argument("expected_graph_revision")
-    apply.add_argument("expected_retained_bundle_id")
-    # The exact UA2A prepared activation accepted by this Apply. The Manager
-    # records these facts and never reopens a mutable Scenario/catalog
-    # selection, so the caller must name the input it accepted.
-    apply.add_argument("captured_input_digest")
-    apply.add_argument("program_binding_id")
-    apply.add_argument("prepared_activation_id")
-    _caller_fields(apply)
+    # Component model v2 (CONTRACTS §2, §7, §10), through the REST endpoints.
+    components = subcommands.add_parser("components")
+    components.add_argument("--url", default="http://127.0.0.1:9010")
+    component_commands = components.add_subparsers(dest="components_command", required=True)
+    component_commands.add_parser("list")
+    component_action = component_commands.add_parser("action")
+    component_action.add_argument("component_id")
+    component_action.add_argument("action", choices=sorted(COMPONENT_ACTIONS))
+    component_commands.add_parser("enable-all")
+    component_commands.add_parser("prepare-all")
 
-    for name in ("cclc-component", "cclc-route-templates"):
-        cclc_component = subcommands.add_parser(name)
-        cclc_component.add_argument(
-            "--url", default="http://127.0.0.1:9010"
-        )
-        cclc_component.add_argument("component_id")
+    io = subcommands.add_parser("io")
+    io.add_argument("--url", default="http://127.0.0.1:9010")
+    io_commands = io.add_subparsers(dest="io_command", required=True)
+    io_commands.add_parser("list")
+    io_set = io_commands.add_parser("set")
+    io_set.add_argument("signal_id", help="<component_id>/<signal_name>")
+    io_set.add_argument("value", type=_output_value, help="true, false or a number")
 
-    for name in ("cclc-lifecycle-submit", "cclc-route-submit"):
-        cclc_submit = subcommands.add_parser(name)
-        cclc_submit.add_argument("--url", default="http://127.0.0.1:9010")
-        cclc_submit.add_argument("request_file", type=Path)
-        cclc_submit.add_argument("--confirmed", action="store_true")
+    subcommands.add_parser("readiness").add_argument(
+        "--url", default="http://127.0.0.1:9010"
+    )
 
-    for name in ("cclc-lifecycle-status", "cclc-route-status"):
-        cclc_status = subcommands.add_parser(name)
-        cclc_status.add_argument("--url", default="http://127.0.0.1:9010")
-        cclc_status.add_argument("transaction_id")
     return parser
+
+
+def _output_value(text: str) -> bool | float:
+    if text.lower() in ("true", "false"):
+        return text.lower() == "true"
+    return float(text)
+
+
+def _components(client: HeadlessHttpClient, args: argparse.Namespace) -> Any:
+    command = args.components_command
+    if command == "list":
+        return client.components()
+    if command == "action":
+        return client.component_action(args.component_id, args.action)
+    states = client.components()
+    action, targets = (
+        ("enable", enable_all_targets(states))
+        if command == "enable-all"
+        else ("prepare", prepare_all_targets(states))
+    )
+    if not targets:
+        return {"action": action, "component_ids": []}
+    return {**client.component_actions(action, targets), "component_ids": targets}
 
 
 def _caller(args: argparse.Namespace) -> dict[str, Any]:
@@ -197,7 +210,6 @@ def _serve(args: argparse.Namespace) -> int:
         owner_id=args.owner_id,
         freshness_milliseconds=args.freshness_ms,
         manager_timeout_seconds=args.manager_timeout_s,
-        cclc_timeout_seconds=args.cclc_timeout_s,
         program_runner_url=args.program_runner_url,
         program_runner_timeout_seconds=args.program_runner_timeout_s,
         activation_preparer_path=args.activation_preparer,
@@ -225,36 +237,6 @@ def _serve(args: argparse.Namespace) -> int:
         ws_per_message_deflate=False,
     )
     return 0
-
-
-def _load_cclc_request(path: Path) -> dict[str, Any]:
-    payload = path.read_bytes()
-    if not payload or len(payload) > MAX_CCLC_REQUEST_BYTES:
-        raise ValueError("CCLC request file is empty or exceeds its byte bound")
-    try:
-        text = payload.decode("utf-8", errors="strict")
-    except UnicodeDecodeError as exc:
-        raise ValueError("CCLC request file is not UTF-8") from exc
-    value = strict_json_object(text, label="CCLC request file")
-    if "confirmed" in value:
-        raise ValueError("CCLC request file must omit CLI-owned confirmation")
-    return value
-
-
-def _bind_cclc_owner(
-    client: HeadlessHttpClient, request: dict[str, Any]
-) -> dict[str, Any]:
-    context = request.get("request_context")
-    if not isinstance(context, dict):
-        raise ValueError("CCLC request file lacks request_context")
-    owner = client.cclc_owner_identity()
-    return {
-        **request,
-        "request_context": {
-            **context,
-            "request_owner_epoch": owner["request_owner_epoch"],
-        },
-    }
 
 
 def _request(args: argparse.Namespace) -> int:
@@ -326,81 +308,16 @@ def _request(args: argparse.Namespace) -> int:
                     "expected_health_generation": args.expected_health_generation,
                 }
             )
-        elif args.command == "apply":
-            admission = client.authoring_admission()
-            preview = client.manager_deployment_candidate_preview(
-                {
-                    "deployment_artifact_id": args.deployment_artifact_id,
-                    "deployment_revision": args.deployment_revision,
-                    "expected_current": {
-                        "graph_revision": args.expected_graph_revision,
-                        "retained_bundle_id": args.expected_retained_bundle_id,
-                    },
-                    "expected_admission_generation": admission[
-                        "admission_generation"
-                    ],
-                    "request_owner_epoch": args.request_owner_epoch,
-                }
+        elif args.command == "components":
+            value = _components(client, args)
+        elif args.command == "io":
+            value = (
+                client.io_signals()
+                if args.io_command == "list"
+                else client.set_io_output(args.signal_id, args.value)
             )
-            if preview.get("ok") is not True:
-                value = preview
-                print(json.dumps(value, indent=2, sort_keys=True))
-                return 1
-            value = client.manager_apply(
-                {
-                    **_caller(args),
-                    "candidate_receipt": preview["candidate_receipt"],
-                    "deployment_artifact_id": args.deployment_artifact_id,
-                    "deployment_revision": args.deployment_revision,
-                    "expected_current": {
-                        "graph_revision": args.expected_graph_revision,
-                        "retained_bundle_id": args.expected_retained_bundle_id,
-                    },
-                    "reject_if_affected_busy": True,
-                    "prepared_activation": {
-                        "captured_input_digest": args.captured_input_digest,
-                        "deployment_artifact_id": args.deployment_artifact_id,
-                        "deployment_revision": args.deployment_revision,
-                        "program_binding_id": args.program_binding_id,
-                        "prepared_activation_id": args.prepared_activation_id,
-                    },
-                    "expected_admission_generation": admission[
-                        "admission_generation"
-                    ],
-                }
-            )
-        elif args.command == "cclc-component":
-            value = client.cclc_component(args.component_id)
-        elif args.command == "cclc-route-templates":
-            value = client.cclc_route_templates(args.component_id)
-        elif args.command == "cclc-lifecycle-submit":
-            admission = client.authoring_admission()
-            request = _bind_cclc_owner(
-                client, _load_cclc_request(args.request_file)
-            )
-            value = client.submit_component_lifecycle(
-                {
-                    **request,
-                    "confirmed": args.confirmed,
-                    "expected_admission_generation": admission[
-                        "admission_generation"
-                    ],
-                }
-            )
-        elif args.command == "cclc-lifecycle-status":
-            value = client.component_lifecycle_status(args.transaction_id)
-        elif args.command == "cclc-route-submit":
-            request = _bind_cclc_owner(
-                client, _load_cclc_request(args.request_file)
-            )
-            value = client.submit_route_selection(
-                {
-                    **request,
-                    "confirmed": args.confirmed,
-                }
-            )
-        elif args.command == "cclc-route-status":
-            value = client.route_selection_status(args.transaction_id)
+        elif args.command == "readiness":
+            value = client.program_readiness()
         else:
             raise AssertionError(f"unsupported command {args.command}")
     _print(value)

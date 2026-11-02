@@ -127,7 +127,7 @@ protected:
     V::Array capabilities;
     for (const auto *id :
          {"execution.feedback.phase_events", "execution.trajectory.execute",
-          "planning.motion.pose_goal", "planning.profile.balanced",
+          "planning.motion.pose_goal",
           "planning.trajectory.time_parameterized", "state.observed.current",
           "validation.trajectory.non_collision"})
       capabilities.emplace_back(V::Object{{"capability_id", V(id)},

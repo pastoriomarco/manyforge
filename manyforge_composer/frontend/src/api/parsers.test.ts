@@ -13,7 +13,6 @@ import {
   parseCapabilityCommandPreviewResponse,
   parseCatalogResponse,
   parseCurrentScenarioResponse,
-  parseDeploymentCandidateOperationResponse,
   parseDeploymentWorkspaceResponse,
   parseExecutionControlStatus,
   parseExecutionIdentity,
@@ -49,7 +48,6 @@ import {
   parseProgramRuntimeControlProjection,
   parseScenarioDocumentIndexResponse,
   parseScenarioDocumentExportResponse,
-  parseScenarioDocumentLoadResponse,
   parseScenarioDocumentSaveResponse,
   parseSceneRuntimeProjection,
   parseSceneMeshAssetMetadata,
@@ -160,7 +158,7 @@ describe('editable Scenario document transport', () => {
     expect(parsed.entries[0]?.location).toBe('examples');
   });
 
-  it('parses accepted and already-applied Scenario Load responses', () => {
+  it('parses a Scenario Save response', () => {
     const saved = parseScenarioDocumentSaveResponse({
       status: 'saved',
       path: '/workspace/cell',
@@ -169,79 +167,6 @@ describe('editable Scenario document transport', () => {
       workspace: workspaceFixture(),
     });
     expect(saved.lastKnownStatus).toBe('unknown');
-    const accepted = parseScenarioDocumentLoadResponse({
-      status: 'accepted',
-      path: '/workspace/cell',
-      scenario_id: 'cell',
-      activation: { status: 'accepted', apply_id: 'apply.1', apply_generation: 1 },
-      incomplete: false,
-      diagnostics: [],
-      source_diagnostics: [],
-      workspace: workspaceFixture(),
-      authoringWorkspace: authoringWorkspaceFixture(),
-    });
-    expect(accepted.activation).toEqual({
-      status: 'accepted', apply_id: 'apply.1', apply_generation: 1,
-    });
-    const alreadyApplied = parseScenarioDocumentLoadResponse({
-      status: 'applied',
-      path: '/workspace/cell',
-      scenario_id: 'cell',
-      activation: { status: 'applied', apply_id: null },
-      incomplete: false,
-      diagnostics: [],
-      source_diagnostics: [],
-      workspace: workspaceFixture(),
-      authoringWorkspace: authoringWorkspaceFixture(),
-    });
-    expect(alreadyApplied.status).toBe('applied');
-    expect(alreadyApplied.activation).toEqual({
-      status: 'applied', apply_id: null,
-    });
-    expect(() => parseScenarioDocumentLoadResponse({
-      status: 'accepted',
-      path: '/workspace/cell',
-      scenario_id: 'cell',
-      activation: { status: 'applied', apply_id: null },
-      incomplete: false,
-      diagnostics: [],
-      source_diagnostics: [],
-      workspace: workspaceFixture(),
-      authoringWorkspace: authoringWorkspaceFixture(),
-    })).toThrow('activation.status');
-    expect(() => parseScenarioDocumentLoadResponse({
-      status: 'opened',
-      path: '/workspace/cell',
-      scenario_id: 'cell',
-      activation: null,
-      incomplete: false,
-      diagnostics: [],
-      source_diagnostics: [],
-      workspace: workspaceFixture(),
-      authoringWorkspace: authoringWorkspaceFixture(),
-    })).toThrow('status');
-    expect(() => parseScenarioDocumentLoadResponse({
-      status: 'accepted',
-      path: '/workspace/cell',
-      scenario_id: 'cell',
-      activation: { status: 'accepted', apply_id: '', apply_generation: 1 },
-      incomplete: false,
-      diagnostics: [],
-      source_diagnostics: [],
-      workspace: workspaceFixture(),
-      authoringWorkspace: authoringWorkspaceFixture(),
-    })).toThrow('a non-empty string');
-    expect(() => parseScenarioDocumentLoadResponse({
-      status: 'loaded',
-      path: '/workspace/cell',
-      scenario_id: 'cell',
-      activation: null,
-      incomplete: false,
-      diagnostics: [],
-      source_diagnostics: [],
-      workspace: workspaceFixture(),
-      authoringWorkspace: authoringWorkspaceFixture(),
-    })).toThrow('status');
   });
 
   it('parses an explicit portable project export', () => {
@@ -891,7 +816,6 @@ describe('Program product projections', () => {
       deployment_generation: 1,
       scene_admission_epoch: 1,
       pose_source_apply_generation: 0,
-      latch_id: null,
       stop_id: null,
       stop_generation: null,
       stop_certificate_id: null,
@@ -1158,6 +1082,21 @@ describe('Program product projections', () => {
     expect(status.capture.programRunId).toBe('program-run.1');
   });
 
+  it('carries the run end reason (CONTRACTS §9) once the run has ended', () => {
+    expect(parseProgramRunStatus(runStatus()).runEnd).toBeNull();
+    expect(parseProgramRunStatus({ ...runStatus(), run_end: null }).runEnd).toBeNull();
+    expect(parseProgramRunStatus({ ...runStatus(), run_end: {
+      end_reason: 'stopped', details: { stopped_by: 'rule', rule_id: 'door' },
+    } }).runEnd).toEqual({ end_reason: 'stopped', details: { stopped_by: 'rule', rule_id: 'door' } });
+    expect(parseProgramRunStatus({ ...runStatus(), run_end: {
+      end_reason: 'cell_fault',
+      details: { component_id: 'lite6_robot', error: { code: 'fault_estop', message: 'e-stop' } },
+    } }).runEnd).toEqual({ end_reason: 'cell_fault',
+      details: { component_id: 'lite6_robot', error: { code: 'fault_estop', message: 'e-stop' } } });
+    expect(() => parseProgramRunStatus({ ...runStatus(), run_end: { end_reason: 'aborted', details: {} } }))
+      .toThrow(/end_reason/);
+  });
+
   it('carries a run failure as one structured error', () => {
     const status = parseProgramRunStatus(failedRunStatus({
       reason: 'frame_role_unresolved',
@@ -1214,7 +1153,7 @@ describe('Program product projections', () => {
     expect(() => parseProgramRunStatus(failedRunStatus([]))).toThrow(/an object/);
     const keys = [
       'reason', 'reference_type', 'reference_id', 'target_role_id', 'input_problem',
-      'path', 'source_kind', 'source_reference', 'latch_id', 'retryable', 'required_action',
+      'path', 'source_kind', 'source_reference', 'rule_id', 'component_id', 'retryable', 'required_action',
     ];
     const large = Object.fromEntries(keys.map((key) => [key, 'x'.repeat(200)]));
     expect(() => parseProgramRunStatus(failedRunStatus(large)))
@@ -1644,6 +1583,7 @@ describe('Program product projections', () => {
       event_revision: 1, kind: 'program_node_takeover_fallback', node_instance_id: 'move',
       incumbent_operation_id: 'op.1', path: 'spring_back_hold',
       code: 'takeover_preparation_late', message: 'late', preparation_ms: 40.5, budget_ms: 30,
+      planning_cap_ms: 24,
     };
     controls.audit = [
       fallback,
@@ -1657,7 +1597,7 @@ describe('Program product projections', () => {
         facts: {
           nodeInstanceId: 'move', incumbentOperationId: 'op.1', path: 'spring_back_hold',
           code: 'takeover_preparation_late', message: 'late', failureStage: null,
-          preparationMs: 40.5, budgetMs: 30,
+          preparationMs: 40.5, budgetMs: 30, planningCapMs: 24,
         },
       },
       {
@@ -1666,6 +1606,7 @@ describe('Program product projections', () => {
         facts: {
           nodeInstanceId: 'move', incumbentOperationId: 'op.1', path: 'ordinary_containment',
           code: null, message: null, failureStage: null, preparationMs: 40.5, budgetMs: 30,
+          planningCapMs: 24,
         },
       },
       {
@@ -1674,7 +1615,7 @@ describe('Program product projections', () => {
         facts: {
           nodeInstanceId: 'move', incumbentOperationId: 'op.1', path: 'spring_back_hold',
           code: 'takeover_preparation_late', message: 'late', failureStage: 'spring_back_planning',
-          preparationMs: 40.5, budgetMs: 30,
+          preparationMs: 40.5, budgetMs: 30, planningCapMs: 24,
         },
       },
     ]);
@@ -1684,7 +1625,7 @@ describe('Program product projections', () => {
     const valid = {
       event_revision: 1, kind: 'program_node_takeover_fallback', node_instance_id: 'move',
       incumbent_operation_id: 'op.1', path: 'spring_back_hold',
-      code: null, message: null, preparation_ms: 40.5, budget_ms: 30,
+      code: null, message: null, preparation_ms: 40.5, budget_ms: 30, planning_cap_ms: 24,
     };
     const refuses = (patch: Record<string, unknown>) => {
       const input = runtimeControlsProjection();
@@ -1705,6 +1646,8 @@ describe('Program product projections', () => {
     expect(refuses({ preparation_ms: -1 })).toThrow(/preparation_ms/);
     expect(refuses({ budget_ms: 0 })).toThrow(/budget_ms/);
     expect(refuses({ budget_ms: '30' })).toThrow(/budget_ms/);
+    expect(refuses({ planning_cap_ms: undefined })).toThrow(/planning_cap_ms/);
+    expect(refuses({ planning_cap_ms: -1 })).toThrow(/planning_cap_ms/);
     expect(refuses({ failure_stage: '' })).toThrow(/failure_stage/);
     expect(refuses({ failure_stage: 3 })).toThrow(/failure_stage/);
   });
@@ -1842,10 +1785,6 @@ describe('Program product projections', () => {
       expect(parseProgramCycleStatus({ ...input, reset_phase: phase }).resetOptions)
         .toEqual({ reloadInitialScene: true, resetRobotPosition: true });
     }
-    // D6 (SX-324): Close's accepted Reset publishes keep_stop_fault.
-    expect(parseProgramCycleStatus({ ...input, reset_phase: 'restoring_scene',
-      reset_options: { reload_initial_scene: true, reset_robot_position: true, keep_stop_fault: true } })
-      .resetOptions).toEqual({ reloadInitialScene: true, resetRobotPosition: true, keepStopFault: true });
     expect(parseProgramCycleStatus({
       ...input, state: 'recovery_required', reset_phase: 'restoring_position',
       failure: { failed_phase: 'restoring_position', code: 'position_failed' },
@@ -1856,7 +1795,7 @@ describe('Program product projections', () => {
       { reset_options: { reload_initial_scene: true } },
       { reset_options: { reload_initial_scene: true, reset_robot_position: 1 } },
       { reset_options: { reload_initial_scene: true, reset_robot_position: false, extra: true } },
-      { reset_options: { reload_initial_scene: true, reset_robot_position: false, keep_stop_fault: 1 } },
+      { reset_options: { reload_initial_scene: true, reset_robot_position: false, keep_stop_fault: true } },
       { reset_options: { reload_initial_scene: false, reset_robot_position: false } },
       { state: 'idle_after_reset' }, { current_command_kind: 'program_run' },
       { cycle_claim_generation: 2 }, { terminal_or_settlement_reference: digestA },
@@ -2137,150 +2076,6 @@ describe('Deployment workspace parser', () => {
       .prepared_activation_id;
     expect(() => parseManagerDeploymentCandidatePreviewResponse(stale))
       .toThrow(/exactly/);
-  });
-
-  it('accepts the exact Manager operation of an accepted Deployment Apply', () => {
-    const digestA = `sha256:${'a'.repeat(64)}`;
-    const digestB = `sha256:${'b'.repeat(64)}`;
-    const digestC = `sha256:${'c'.repeat(64)}`;
-    const reply = (result: Record<string, unknown>) => ({
-      schemaVersion: 'manyforge.composer_deployment_candidate_operation.v1',
-      workspace: deploymentWorkspaceFixture(),
-      result: {
-        status: 'accepted',
-        confirmation_token: null,
-        prepared_activation: {
-          schema_version: 'manyforge.prepared_activation_input.v6',
-          prepared_activation_id: digestC,
-          origin: { kind: 'scenario', scenario_id: 'fixture', source_document_digest: digestA,
-            project_path: '/projects/fixture.scenario' },
-          captured_input_digest: digestB,
-          deployment_artifact_id: 'deployment.fixture',
-          deployment_revision: digestA,
-          retained_bundle_id: digestB,
-          graph_revision: digestC,
-          program_id: 'fixture-program',
-          program_revision: digestB,
-          program_outcome: { kind: 'bound', program_binding_id: digestA },
-          node_environment_digest: digestC,
-          assistant_mode: 'forbidden',
-        },
-        candidate_preview: null,
-        manager_apply: {
-          api_version: 'manyforge.manager_command_response.v1',
-          apply_generation: 4, apply_id: 'apply-4',
-          candidate_projection_revision: null,
-          error: null, ok: true, replay_status: 'accepted_new',
-          request_id: 'request-4', request_owner_epoch: 'owner.1', state: 'pending',
-        },
-        preparation: null,
-        phases_ms: { preparation_ms: 1 },
-        apply_id: 'apply-4',
-        apply_generation: 4,
-        ...result,
-      },
-    });
-
-    // The backend's accepted reply (state.py) always names the Apply generation.
-    const parsed = parseDeploymentCandidateOperationResponse(reply({}));
-    expect(parsed.result.managerApply?.applyGeneration).toBe(4);
-    expect(() => parseDeploymentCandidateOperationResponse(reply({ apply_generation: 5 })))
-      .toThrow(/exact accepted Manager operation/);
-    expect(() => parseDeploymentCandidateOperationResponse(reply({ apply_id: 'apply-other' })))
-      .toThrow(/exact accepted Manager operation/);
-  });
-
-  it('retains bounded Apply phase timings and preparation identity', () => {
-    const digestA = `sha256:${'a'.repeat(64)}`;
-    const digestB = `sha256:${'b'.repeat(64)}`;
-    const digestC = `sha256:${'c'.repeat(64)}`;
-    const preparedActivation = {
-      schema_version: 'manyforge.prepared_activation_input.v6',
-      prepared_activation_id: digestC,
-      origin: { kind: 'scenario', scenario_id: 'fixture', source_document_digest: digestA, project_path: '/projects/fixture.scenario' },
-      captured_input_digest: digestB,
-      deployment_artifact_id: 'deployment.fixture',
-      deployment_revision: digestA,
-      retained_bundle_id: digestB,
-      graph_revision: digestC,
-      program_id: 'fixture-program',
-      program_revision: digestB,
-      program_outcome: { kind: 'bound', program_binding_id: digestA },
-      node_environment_digest: digestC,
-      assistant_mode: 'forbidden',
-    };
-    const parsed = parseDeploymentCandidateOperationResponse({
-      schemaVersion: 'manyforge.composer_deployment_candidate_operation.v1',
-      workspace: deploymentWorkspaceFixture(),
-      result: {
-        status: 'applied',
-        confirmation_token: null,
-        prepared_activation: preparedActivation,
-        candidate_preview: null,
-        manager_apply: null,
-        preparation: null,
-        phases_ms: { preparation_ms: 2.5, preview_ms: 8.25 },
-        apply_id: 'apply-1',
-      },
-    });
-
-    expect(parsed.result.phasesMs).toEqual({
-      preparation_ms: 2.5,
-      preview_ms: 8.25,
-    });
-    expect(parsed.result.applyId).toBe('apply-1');
-    expect((parsed.result.preparedActivation.origin as { scenarioId: string }).scenarioId).toBe('fixture');
-  });
-
-  it('accepts a confirmation for an authored Draft that has no compiled revision', () => {
-    const digestA = `sha256:${'a'.repeat(64)}`;
-    const digestB = `sha256:${'b'.repeat(64)}`;
-    const digestC = `sha256:${'c'.repeat(64)}`;
-    const workspace = deploymentWorkspaceFixture();
-    Object.assign(workspace.draft as Record<string, unknown>, {
-      document: {
-        api_version: 'manyforge.deployment_intent.v2',
-        deployment_artifact_id: 'deployment.fixture',
-        name: 'Fixture',
-        components: [], attachments: [], policies: {},
-      },
-      deploymentRevision: null, graphRevision: null,
-    });
-    workspace.binding = null;
-    workspace.scenarioCandidates = [];
-    workspace.savedScenarioCandidates = [];
-    const response = (deploymentArtifactId: string) => ({
-      schemaVersion: 'manyforge.composer_deployment_candidate_operation.v1',
-      workspace,
-      result: {
-        status: 'confirmation_required',
-        confirmation_token: digestA,
-        prepared_activation: {
-          schema_version: 'manyforge.prepared_activation_input.v6',
-          prepared_activation_id: digestC,
-          origin: { kind: 'scenario', scenario_id: 'fixture', source_document_digest: digestA, project_path: '/projects/fixture.scenario' },
-          captured_input_digest: digestB,
-          deployment_artifact_id: deploymentArtifactId,
-          deployment_revision: digestA,
-          retained_bundle_id: digestB,
-          graph_revision: digestC,
-          program_id: 'fixture-program',
-          program_revision: digestB,
-          program_outcome: { kind: 'bound', program_binding_id: digestA },
-          node_environment_digest: digestC,
-          assistant_mode: 'forbidden',
-        },
-        candidate_preview: null,
-        manager_apply: null,
-        preparation: { request_owner_epoch: 'owner.1', request_id: 'request.1' },
-      },
-    });
-    const parsed = parseDeploymentCandidateOperationResponse(response('deployment.fixture'));
-    expect(parsed.result.status).toBe('confirmation_required');
-    expect(parsed.result.preparation).toEqual({ requestOwnerEpoch: 'owner.1', requestId: 'request.1' });
-    // The artifact identity is still exact.
-    expect(() => parseDeploymentCandidateOperationResponse(response('deployment.other')))
-      .toThrow(/exact compiled Deployment Draft/);
   });
 
   it('accepts the authored graph without embedding its compiler-issued revision', () => {
@@ -4013,7 +3808,7 @@ describe('headless projection parsers', () => {
       shutdown: 'clean',
       effects: 'unknown',
       history_coverage: 'not_imported',
-      journal_families: ['program_cycle', 'scene', 'manager', 'cclc', 'kernel_operation'],
+      journal_families: ['program_cycle', 'scene', 'manager', 'kernel_operation'],
       message: 'Previous session journals retained; effects are unknown.',
     };
     const health = {
@@ -4055,7 +3850,7 @@ describe('headless projection parsers', () => {
     const health = {
       status: 'ok', mode: 'headless_client', components: {}, runtimeAvailability: null, timestamp: 1,
     };
-    const notice = { path: '/p/cell.scenario', code: 'scenario_close_required', message: 'Startup project /p/cell.scenario was not opened.' };
+    const notice = { path: '/p/cell.scenario', code: 'scenario_new_required', message: 'Startup project /p/cell.scenario was not opened.' };
     expect(parseHealthResponse(health).startupScenarioNotice).toBeNull();
     expect(parseHealthResponse({ ...health, startup_scenario_notice: notice }).startupScenarioNotice).toEqual(notice);
     expect(() => parseHealthResponse({ ...health, startup_scenario_notice: { ...notice, extra: 1 } }))
@@ -4351,7 +4146,10 @@ describe('addressed Robot Control parsers', () => {
         operation_id: 'operation-1',
         operation_revision: 4,
         state: 'completed',
-        participants: [{ progress: 1, terminal_error: null }],
+        participants: [{
+          progress: 1, terminal_error: null,
+          control_binding_id: 'binding-1', control_binding_revision: `sha256:${'a'.repeat(64)}`,
+        }],
         active_stop_id: null,
         active_stop_generation: null,
       },
@@ -4361,6 +4159,17 @@ describe('addressed Robot Control parsers', () => {
     const missing = structuredClone(response) as Record<string, unknown>;
     delete missing.resident;
     expect(() => parseOperationObservation(missing)).toThrow();
+
+    for (const binding of [
+      { control_binding_id: null, control_binding_revision: null },
+      { control_binding_id: 'binding-1', control_binding_revision: null },
+      { control_binding_id: undefined, control_binding_revision: undefined },
+    ]) {
+      const participant = { ...response.operation.participants[0], ...binding };
+      expect(() => parseOperationObservation({
+        ...response, operation: { ...response.operation, participants: [participant] },
+      })).toThrow();
+    }
   });
 
   it('parses the persistent runtime-scale control without making its operation evidence routable', () => {
@@ -4577,7 +4386,6 @@ describe('addressed Robot Control parsers', () => {
         cell_stop_action: {
           available: true,
           expected_stop_generation: 4,
-          fault: null,
           latest_terminal: null,
           unavailable_reason: null,
         },
@@ -5426,7 +5234,10 @@ describe('addressed Robot Control parsers', () => {
     const retired = {
       resident: false, operation: {
         program_run_id: motionTarget.program_run_id, operation_id: 'manual-1', operation_revision: 2,
-        state: 'completed', participants: [{progress: 1, terminal_error: null}],
+        state: 'completed', participants: [{
+          progress: 1, terminal_error: null,
+          control_binding_id: 'binding-arm', control_binding_revision: exactRevision,
+        }],
         active_stop_id: null, active_stop_generation: null,
       },
     };
@@ -5470,24 +5281,16 @@ describe('addressed Robot Control parsers', () => {
         hard_stop_floor_used: false,
         result: 'succeeded_escalated',
       },
-      fault: {
-        certificate: null,
-        latch_generation: 1,
-        latch_id: 'stop-fault.1',
-        observed_triggers: ['escalated', 'partial'],
-        reason_code: 'stop_escalated',
-        recovery_status: 'waiting_for_observation',
-        state: 'latched',
-        trigger: 'partial',
-      },
     });
     const stoppedStatus = parseExecutionOwnerStatus(composed(stopped));
     expect(stoppedStatus.cellStopAction.latestTerminal?.certificate.stopId)
       .toBe('stop.4');
     expect(stoppedStatus.cellStopAction.latestTerminal?.executedStages[0])
       .toMatchObject({ executedMode: 'hard_deceleration', stageIndex: 1 });
-    expect(stoppedStatus.cellStopAction.fault?.latchId).toBe('stop-fault.1');
-    expect(stoppedStatus.cellStopAction.fault?.observedTriggers).toEqual(['escalated', 'partial']);
+    // CONTRACTS §5: the stop-fault latch is gone; a `fault` field is refused.
+    const latched = structuredClone(stopped);
+    Object.assign(latched.status.cell_stop_action, { fault: null });
+    expect(() => parseExecutionOwnerStatus(composed(latched))).toThrow(/cell_stop_action/);
 
     // Strict pneumatic targets expose a model coordinate for display, without
     // claiming an authoritative finger observation. The control shell must
@@ -5623,11 +5426,9 @@ describe('addressed Robot Control parsers', () => {
     );
 
     const ordinary = structuredClone(response);
-    const jerkRow = {
-      source_joint_name: 'joint1', source: 'imported', maximum_rad_s3: 6,
+    const jerkRow: Record<string, unknown> = {
+      source_joint_name: 'joint1', source: 'override', maximum_rad_s3: 6,
       preset_rad_s3: null,
-      imported: { maximum_rad_s3: 6, enabled: true, machine_required: false,
-        source_id: 'robot_moveit_config/config/joint_limits.yaml', source_digest: exactRevision },
     };
     Object.assign(ordinary.status.direct_control.target_descriptor, {
       ordinary_jerk: { enabled: true, preset_reference_time_s: 1, joint_limits: [jerkRow] },
@@ -5636,10 +5437,16 @@ describe('addressed Robot Control parsers', () => {
       deployment_max_jerk_rad_s3: null, effective_max_jerk_rad_s3: 6,
     });
     expect(parseExecutionOwnerStatus(composed(ordinary)).directControl!.targetDescriptor.ordinaryJerk)
-      .toMatchObject({ enabled: true, jointLimits: [{ maximumRadS3: 6, source: 'imported' }] });
-    jerkRow.maximum_rad_s3 = 7;
+      .toMatchObject({ enabled: true, jointLimits: [{ maximumRadS3: 6, source: 'override' }] });
+    // V2-9: the imported jerk source is gone.
+    jerkRow.source = 'imported';
+    expect(() => parseExecutionOwnerStatus(composed(ordinary))).toThrow(/known jerk-limit source/);
+    jerkRow.source = 'preset';
     expect(() => parseExecutionOwnerStatus(composed(ordinary))).toThrow(/effective jerk limits/);
-    jerkRow.maximum_rad_s3 = 6;
+    jerkRow.source = 'override';
+    jerkRow.imported = null;
+    expect(() => parseExecutionOwnerStatus(composed(ordinary))).toThrow();
+    delete jerkRow.imported;
     jerkRow.source_joint_name = 'foreign-joint';
     expect(() => parseExecutionOwnerStatus(composed(ordinary))).toThrow(/exact ordered model joints/);
   });
@@ -5949,18 +5756,17 @@ describe('expression check parser', () => {
 describe('typed prepared activation origin v6', () => {
   const digest = `sha256:${'a'.repeat(64)}`;
   const receipt = () => ({ schema_version: 'manyforge.prepared_activation_input.v6',
-    origin: { kind: 'sealed_canonical_empty', cell_id: 'cell_a', deployment_artifact_id: 'deployment_a',
-      deployment_revision: digest, retained_bundle_id: digest, graph_revision: digest, admission_digest: digest },
+    origin: { kind: 'scenario', scenario_id: 'cell_a', source_document_digest: digest,
+      project_path: '/projects/cell_a' },
     prepared_activation_id: digest, captured_input_digest: digest, deployment_artifact_id: 'deployment_a',
     deployment_revision: digest, retained_bundle_id: digest, graph_revision: digest,
     program_id: null, program_revision: null, program_outcome: { kind: 'no_program' },
     node_environment_digest: digest, assistant_mode: 'optional' });
 
-  it('keeps sealed admission identity without a fabricated Scenario or Program', () => {
+  it('keeps the Scenario origin of an empty-cell preparation without a Program', () => {
     const parsed = parsePreparedActivationInput(receipt(), 'prepared');
-    expect(parsed.origin).toEqual({ kind: 'sealed_canonical_empty', cellId: 'cell_a', deploymentArtifactId: 'deployment_a',
-      deploymentRevision: digest, retainedBundleId: digest, graphRevision: digest, admissionDigest: digest });
-    expect(parsed).not.toHaveProperty('scenarioId');
+    expect(parsed.origin).toEqual({ kind: 'scenario', scenarioId: 'cell_a', sourceDocumentDigest: digest,
+      projectPath: '/projects/cell_a' });
     expect(parsed.programId).toBeNull();
   });
 
@@ -5969,33 +5775,28 @@ describe('typed prepared activation origin v6', () => {
   });
 
   it.each([
-    { scenario_id: 'fake' }, { source_document_digest: null }, { program_id: 'fake' },
-    { program_revision: digest }, { assistant_mode: 'required' }, { deployment_artifact_id: 'foreign' },
-    { graph_revision: `sha256:${'b'.repeat(64)}` }, { retained_bundle_id: `sha256:${'b'.repeat(64)}` },
-    { deployment_revision: `sha256:${'b'.repeat(64)}` },
+    { scenario_id: 'fake' }, { program_id: 'fake' }, { program_revision: digest }, { assistant_mode: 'required' },
   ])('refuses branch-inconsistent receipt %j', (change) => {
     expect(() => parsePreparedActivationInput({ ...receipt(), ...change }, 'prepared')).toThrow();
   });
 
-  it.each([{ kind: 'future' }, { scenario_id: null }, { source_document_digest: digest },
-    { cell_id: 'x'.repeat(129) }, { admission_digest: 'not-a-digest' }, { deployment_artifact_id: '' }])(
+  it.each([{ kind: 'future' }, { scenario_id: null }, { source_document_digest: 'not-a-digest' },
+    { project_path: 'projects/cell_a' }, { cell_id: 'cell_a' }])(
     'refuses mixed or invalid origin %j', (change) => {
       const value = receipt();
       expect(() => parsePreparedActivationInput({ ...value, origin: { ...value.origin, ...change } }, 'prepared')).toThrow();
     });
 });
 
-it('projects sealed no-Program status without inventing Scenario facts', () => {
+it('projects a no-Program status with its Scenario origin', () => {
   const digest = `sha256:${'a'.repeat(64)}`;
   const status = { schema_version: 'manyforge.applied_program_status.v2', deployment_artifact_id: 'deployment_a',
     deployment_revision: digest, retained_bundle_id: digest, graph_revision: digest, record_digest: digest,
     executable: false, program_id: null, program_revision: null, program_binding_id: null, program: null,
     non_executable: null, message: 'No Program is selected',
-    origin: { kind: 'sealed_canonical_empty', cell_id: 'cell_a', deployment_artifact_id: 'deployment_a',
-      deployment_revision: digest, retained_bundle_id: digest, graph_revision: digest, admission_digest: digest } };
-  expect(parseAppliedProgramStatus(status).origin.kind).toBe('sealed_canonical_empty');
-  expect(parseAppliedProgramStatus(status)).not.toHaveProperty('scenarioId');
-  for (const change of [{ scenario_id: 'fake' }, { program_id: 'fake' }, { deployment_artifact_id: 'foreign' }]) {
+    origin: { kind: 'scenario', scenario_id: 'cell_a', source_document_digest: digest, project_path: '/projects/cell_a' } };
+  expect(parseAppliedProgramStatus(status).origin.kind).toBe('scenario');
+  for (const change of [{ scenario_id: 'fake' }, { program_id: 'fake' }]) {
     expect(() => parseAppliedProgramStatus({ ...status, ...change })).toThrow();
   }
 });

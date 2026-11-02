@@ -171,6 +171,28 @@ public:
   }
 
 private:
+  // CONTRACTS §7 (plan V2-7): `<output name>.changed_outside` is the
+  // core-held in-process bool of an output with read-back that isn't
+  // controller-owned; the core derives its signal and source.
+  ResolvedConditionInput changed_outside(const std::string &component,
+                                         std::string_view name) {
+    const auto *output = FindChangedOutsideOutput(
+        signals_, core::ControllableComponentId(component), name);
+    if (output == nullptr)
+      fail("io_signal_unbound",
+           "Deployment condition names no retained output for changed_outside");
+    if (!core::HoldsChangedOutside(output->descriptor))
+      fail("io_output_changed_outside_unavailable",
+           output->descriptor.controller_owned
+               ? "A controller-owned output has no changed_outside signal"
+               : "An output without read-back has no changed_outside signal");
+    required_sources_.insert(
+        core::ChangedOutsideSourceId(output->descriptor.signal_id));
+    return ResolvedConditionInput{
+        core::ChangedOutsideSignalId(output->descriptor.signal_id),
+        core::IoConditionValueKind::kBoolean};
+  }
+
   std::optional<ResolvedConditionInput> resolve(const CanonicalValue &operand) {
     if (!operand.is_object() || operand.as_object().size() != 1U)
       fail("interrupt_condition_invalid", "Expected one operand selector");
@@ -219,6 +241,8 @@ private:
       fields(signal, {"controllable_component_id", "signal_name"});
       const auto &component = text(member(signal, "controllable_component_id"));
       const auto &name = text(member(signal, "signal_name"));
+      if (name.ends_with(core::kChangedOutsideSignalSuffix))
+        return changed_outside(component, name);
       const auto retained =
           std::find_if(signals_.begin(), signals_.end(), [&](const auto &row) {
             return row.descriptor.signal_id.controllable_component_id.value() == component &&

@@ -1,0 +1,23 @@
+# Mock controllers of the UFACTORY xArm gripper (lanes.mock.controllers_file): its
+# commanded finger joint on a stock GripperActionController (Q74: stock
+# defaults for every Mock gripper), in the manager rates of the robots it
+# mounts on (UFACTORY). The generator names the manager and writes
+# __controller__ and __gripper_joint__.
+/**/controller_manager:
+  ros__parameters:
+    update_rate: 150
+    enforce_command_limits: false
+    hardware_components_initial_state:
+      shutdown_on_initial_state_failure: true
+    joint_state_broadcaster:
+      type: joint_state_broadcaster/JointStateBroadcaster
+    __controller__:
+      type: position_controllers/GripperActionController
+
+/**/__controller__:
+  ros__parameters:
+    joint: __gripper_joint__
+    goal_tolerance: 0.01
+    stall_velocity_threshold: 0.001
+    stall_timeout: 1.0
+    allow_stalling: false

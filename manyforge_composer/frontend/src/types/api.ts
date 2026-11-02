@@ -1,3 +1,4 @@
+import type { ProgramRunEnd } from './components';
 import type { ProgramBindingDocument } from './programBindingTransport.generated';
 import type { Nanoseconds } from './nanoseconds';
 import type { AuthoringWorkspaceIdentity } from './headless';
@@ -454,38 +455,6 @@ export interface SaveScenarioDocumentInput {
   confirmOverwrite: boolean;
 }
 
-export type ScenarioDocumentActivation =
-  | (Record<string, JsonValue> & {
-      status: 'accepted';
-      apply_id: string;
-      apply_generation: number;
-    })
-  | (Record<string, JsonValue> & {
-      status: 'applied';
-      apply_id: null;
-    });
-
-interface ScenarioDocumentLoadResponseBase {
-  path: string;
-  scenarioId: string;
-  incomplete: boolean;
-  diagnostics: ProgramAuthoringDiagnostic[];
-  sourceDiagnostics: ScenarioSourceDiagnostic[];
-  workspace: ProgramWorkspaceResponse;
-  authoringWorkspace: AuthoringWorkspaceSnapshot;
-}
-
-export type ScenarioDocumentLoadResponse = ScenarioDocumentLoadResponseBase & (
-  | {
-      status: 'accepted';
-      activation: Extract<ScenarioDocumentActivation, { status: 'accepted' }>;
-    }
-  | {
-      status: 'applied';
-      activation: Extract<ScenarioDocumentActivation, { status: 'applied' }>;
-    }
-);
-
 /**
  * The retained Scenario project facts of the one shared authoring workspace.
  *
@@ -608,15 +577,11 @@ export interface DeploymentWorkspaceResponse {
   unavailableReasons: string[];
 }
 
-export type PreparedActivationOrigin = {
+export interface PreparedActivationOrigin {
   kind: 'scenario'; scenarioId: string; sourceDocumentDigest: string;
   /** The Scenario project folder; it scopes persistent values. */
   projectPath: string;
-} | {
-  kind: 'sealed_canonical_empty'; cellId: string; deploymentArtifactId: string;
-  deploymentRevision: string; retainedBundleId: string; graphRevision: string;
-  admissionDigest: string;
-};
+}
 
 export interface PreparedActivationInput {
   schemaVersion: 'manyforge.prepared_activation_input.v6';
@@ -634,29 +599,6 @@ export interface PreparedActivationInput {
   programBindingId: string | null;
   nodeEnvironmentDigest: string;
   assistantMode: 'required' | 'optional' | 'forbidden';
-}
-
-export interface DeploymentCandidatePreparation {
-  requestOwnerEpoch: string;
-  requestId: string;
-}
-
-export interface DeploymentCandidateOperationResponse {
-  schemaVersion: 'manyforge.composer_deployment_candidate_operation.v1';
-  workspace: DeploymentWorkspaceResponse;
-  result: {
-    status: 'previewed' | 'confirmation_required' | 'accepted' | 'applied';
-    confirmationToken: string | null;
-    /** Authoritative identity of the journalized preparation, echoed on
-     * confirmation_required so the confirmation can reference it. */
-    preparation: DeploymentCandidatePreparation | null;
-    preparedActivation: PreparedActivationInput;
-    candidatePreview: ManagerDeploymentCandidatePreviewResponse | null;
-    managerApply: ManagerApplyResponse | null;
-    /** Monotonic backend durations for the phases actually traversed. */
-    phasesMs: Record<string, number>;
-    applyId: string | null;
-  };
 }
 
 export interface DeploymentControlledStopProfile {
@@ -686,9 +628,6 @@ export interface DeploymentControlledStopProfile {
     max_jerk?: { coordinate_kind: string; value: number };
   }>;
 }
-
-/** Points where a motion target's maximum TCP speed is held. */
-export type TcpSpeedCheck = 'active_tcp' | 'active_tcp_and_flange';
 
 export interface DeploymentControlledStopUpdate {
   controllable_component_id: string;
@@ -832,14 +771,14 @@ export interface ProgramRunStatus {
    */
   reason: StructuredError | null;
   message: string;
+  /** CONTRACTS §9: why the run ended; null while it has not. */
+  runEnd: ProgramRunEnd | null;
 }
 
 /** The immutable selectors accepted with one Program Reset intent. */
 export interface ProgramResetSelection {
   reloadInitialScene: boolean;
   resetRobotPosition: boolean;
-  /** D6: the accepted Reset is Scenario Close's and keeps the cell Stop fault. */
-  keepStopFault?: boolean;
 }
 
 export interface ProgramResetRobotPositionAvailability {
@@ -864,6 +803,8 @@ export interface ProgramCycleStatus {
   causalClientSequence: string | null;
   currentCommandKind: string | null;
   failure: Record<string, JsonValue> | null;
+  /** CONTRACTS §9: why the cycle's last run ended (also on `run`). */
+  runEnd?: ProgramRunEnd | null;
   resetPhase: string | null;
   resetOptions: ProgramResetSelection | null;
   resetRobotPosition: ProgramResetRobotPositionAvailability;
@@ -1004,6 +945,8 @@ export interface TakeoverFallbackAuditFacts {
   failureStage: string | null;
   preparationMs: number;
   budgetMs: number;
+  /** The planning cap that applied: the deadline a planning timeout trips. */
+  planningCapMs: number;
 }
 
 export interface TakeoverFallbackAuditEvent {
@@ -1075,7 +1018,6 @@ export interface CycleRecoveryOffer {
   deploymentGeneration: number;
   sceneAdmissionEpoch: number;
   poseSourceApplyGeneration: number;
-  latchId: string | null;
   stopId: string | null;
   stopGeneration: number | null;
   stopCertificateId: string | null;
@@ -1812,6 +1754,8 @@ export interface ManagerDeploymentCandidateReceipt {
 export interface ManagerDeploymentImpactComponent {
   controllable_component_id: string;
   disposition: 'retain' | 'add' | 'remove' | 'replace';
+  /** The component spec sections that changed: `adapter`, `address`,
+   * `bindings`, `controllers`, `description`, `launch`, `owner`, `providers`. */
   replacement_reasons: string[];
 }
 

@@ -53,7 +53,7 @@ public:
   CreateInitialized(
       RetainedCollisionWorldProjector projector,
       core::RetainedProductDTO planning_collision_model,
-      core::ProjectionNativeRuntimeBindingDTO native_runtime_binding,
+      core::ProjectionExecutionHostBindingDTO execution_host_binding,
       core::LogicalSceneSnapshotDTO initial_scene,
       RetainedPlannerSceneProjectionConfig config, Clock clock,
       std::shared_ptr<const RetainedSceneFrameResolver> frame_resolver =
@@ -64,7 +64,7 @@ public:
   CreateUninitialized(
       RetainedCollisionWorldProjector projector,
       core::RetainedProductDTO planning_collision_model,
-      core::ProjectionNativeRuntimeBindingDTO native_runtime_binding,
+      core::ProjectionExecutionHostBindingDTO execution_host_binding,
       RetainedPlannerSceneProjectionConfig config, Clock clock,
       std::shared_ptr<const RetainedSceneFrameResolver> frame_resolver =
           nullptr);
@@ -163,7 +163,7 @@ private:
   RetainedPlannerSceneProjection(
       RetainedCollisionWorldProjector projector,
       core::RetainedProductDTO planning_collision_model,
-      core::ProjectionNativeRuntimeBindingDTO native_runtime_binding,
+      core::ProjectionExecutionHostBindingDTO execution_host_binding,
       RetainedPlannerSceneProjectionConfig config, Clock clock,
       std::shared_ptr<const RetainedSceneFrameResolver> frame_resolver);
 
@@ -202,7 +202,7 @@ private:
   RetainedCollisionWorldProjector projector_;
   core::RetainedProductDTO planning_collision_model_;
   std::shared_ptr<const RetainedSceneFrameResolver> frame_resolver_;
-  core::ProjectionNativeRuntimeBindingDTO native_runtime_binding_;
+  core::ProjectionExecutionHostBindingDTO execution_host_binding_;
   RetainedPlannerSceneProjectionConfig config_;
   Clock clock_;
   // BuildPublisher is called during construction or under mutex_. Each

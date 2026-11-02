@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: vision_guided_pose_pick
-program_revision: sha256:af7865b6fec61066c39e574a61a799d7a68fe5653ea871c9875f5187154bbf85
+program_revision: sha256:15a79d601e0ff1b8ebf94a3aa5290221e95445b72017ed9ea752795bb04c11bb
 program_profile: composable-cell-v1
 name: vision_guided_pose_pick
 description: Preview Program for the typed vision-guided pose dataflow. A model response supplies bounded
@@ -36,9 +36,6 @@ target_roles:
       parameters: {}
       disposition: required
     - capability_id: planning.motion.pose_goal
-      parameters: {}
-      disposition: required
-    - capability_id: planning.profile.balanced
       parameters: {}
       disposition: required
     - capability_id: planning.trajectory.time_parameterized

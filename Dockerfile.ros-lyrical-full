@@ -242,11 +242,14 @@ RUN set -eux; \
     rm -rf /tmp/native-tinyxml* /tmp/native-urdfdom* /tmp/cmeel_tinyxml2-11.0.0 \
       /tmp/cmeel_urdfdom-6.0.0 /tmp/cmeel_urdfdom_headers-3.0.0
 
-# Exact RoboPlan 0.7 source closure with source-built ProxSuite and TOPPRA.
+# Exact RoboPlan 0.8 source closure with source-built ProxSuite (configured by
+# exact jrl-cmakemodules, no serialization) and TOPPRA, and exact nanoflann.
 # Prepared on the host by scripts/setup-docker.sh.
 COPY .docker/roboplan/ /tmp/roboplan/
 COPY .docker/proxsuite/ /tmp/proxsuite/
+COPY .docker/jrl-cmakemodules/ /tmp/jrl-cmakemodules/
 COPY .docker/toppra/ /tmp/toppra/
+COPY .docker/nanoflann/ /tmp/nanoflann/
 COPY third_party/roboplan/ /tmp/roboplan-manifest/
 COPY scripts/ci/build-roboplan-source-stack.sh /tmp/build-roboplan-source-stack.sh
 COPY scripts/ci/build-roboplan-source-closure.sh /tmp/build-roboplan-source-closure.sh
@@ -259,7 +262,7 @@ RUN PINOCCHIO_CMAKE_DIR=$(find "${MANYFORGE_VENV}" /usr -name "pinocchioConfig.c
     && if [ "$ROBOPLAN_SOURCE_MODE" = qualified ]; then \
          python /tmp/verify-external-source-closure.py \
            --ledger /tmp/external-delta-ledger.v1.json \
-           --source-id roboplan_0_7_0_ua1_foundation --root /tmp/roboplan \
+           --source-id roboplan_0_8_0_foundation --root /tmp/roboplan \
            --content-kind source --allow-stripped-git; \
        elif [ "$ROBOPLAN_SOURCE_MODE" = development_override ]; then \
          echo "RoboPlan development override: exact-source qualification disabled" >&2; \
@@ -280,11 +283,11 @@ RUN PINOCCHIO_CMAKE_DIR=$(find "${MANYFORGE_VENV}" /usr -name "pinocchioConfig.c
     && if [ "$ROBOPLAN_SOURCE_MODE" = qualified ]; then DEVELOPMENT_SOURCE=0; else DEVELOPMENT_SOURCE=1; fi \
     && ROBOPLAN_SOURCE_LEDGER=/tmp/external-delta-ledger.v1.json \
        ROBOPLAN_SOURCE_VERIFIER=/tmp/verify-external-source-closure.py \
-       ROBOPLAN_SOURCE_ID=roboplan_0_7_0_ua1_foundation \
+       ROBOPLAN_SOURCE_ID=roboplan_0_8_0_foundation \
        ROBOPLAN_ALLOW_STRIPPED_GIT=1 \
        ROBOPLAN_ALLOW_DEVELOPMENT_SOURCE="$DEVELOPMENT_SOURCE" \
        bash /tmp/build-roboplan-source-closure.sh \
-         /tmp/proxsuite /tmp/toppra /tmp/roboplan \
+         /tmp/proxsuite /tmp/jrl-cmakemodules /tmp/toppra /tmp/nanoflann /tmp/roboplan \
          -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
          -DBUILD_PYTHON_BINDINGS=OFF \
          -Dtinyxml2_DIR=/opt/manyforge/private-tinyxml2-11/lib/cmake/tinyxml2 \
@@ -301,7 +304,7 @@ RUN PINOCCHIO_CMAKE_DIR=$(find "${MANYFORGE_VENV}" /usr -name "pinocchioConfig.c
     && ROBOPLAN_SITE_PACKAGES=$(python -c "import site; print(site.getsitepackages()[0])") \
     && export CMAKE_PREFIX_PATH="/opt/manyforge/private-tinyxml2-11:${ROBOPLAN_SITE_PACKAGES}:/usr/local:${PINOCCHIO_PREFIX}" \
     && export LD_LIBRARY_PATH="${ROBOPLAN_SITE_PACKAGES}/lib:/usr/local/lib:${PINOCCHIO_PREFIX}/lib" \
-    && export CMEEL_CMAKE_ARGS="-DFETCHCONTENT_FULLY_DISCONNECTED=ON -DFETCHCONTENT_UPDATES_DISCONNECTED=ON -Dtinyxml2_DIR=/opt/manyforge/private-tinyxml2-11/lib/cmake/tinyxml2 -DTinyXML2_DIR=/opt/manyforge/private-tinyxml2-11/lib/cmake/tinyxml2 -DCMAKE_SHARED_LINKER_FLAGS=-Wl,--exclude-libs,libtinyxml2.a" \
+    && export CMEEL_CMAKE_ARGS="-DFETCHCONTENT_FULLY_DISCONNECTED=ON -DFETCHCONTENT_UPDATES_DISCONNECTED=ON -DFETCHCONTENT_SOURCE_DIR_NANOFLANN=/tmp/nanoflann -DCMAKE_DISABLE_FIND_PACKAGE_nanoflann=ON -DCMAKE_DISABLE_FIND_PACKAGE_tl-expected=ON -Dtinyxml2_DIR=/opt/manyforge/private-tinyxml2-11/lib/cmake/tinyxml2 -DTinyXML2_DIR=/opt/manyforge/private-tinyxml2-11/lib/cmake/tinyxml2 -DCMAKE_SHARED_LINKER_FLAGS=-Wl,--exclude-libs,libtinyxml2.a" \
     && for py_pkg in roboplan_common roboplan_example_models roboplan_core roboplan_simple_ik roboplan_oink roboplan_toppra roboplan_rrt roboplan_cartesian_planning roboplan; do \
          cd "/tmp/roboplan/${py_pkg}"; \
          python -m pip install --no-build-isolation --no-deps --no-cache-dir -v .; \
@@ -322,7 +325,8 @@ RUN PINOCCHIO_CMAKE_DIR=$(find "${MANYFORGE_VENV}" /usr -name "pinocchioConfig.c
            echo "Native XML symbols escaped private linkage: $native_xml_consumer" >&2; exit 1; \
          fi; \
        done \
-    && rm -rf /tmp/roboplan /tmp/proxsuite /tmp/toppra /tmp/roboplan-manifest \
+    && rm -rf /tmp/roboplan /tmp/proxsuite /tmp/jrl-cmakemodules /tmp/toppra /tmp/nanoflann \
+         /tmp/roboplan-manifest \
          /tmp/roboplan-build-closure /tmp/roboplan-install-closure \
          /tmp/build-roboplan-source-stack.sh /tmp/build-roboplan-source-closure.sh \
          /tmp/verify-external-source-closure.py /tmp/external-delta-ledger.v1.json \
@@ -371,8 +375,8 @@ RUN set -eux; \
     rm -rf /tmp/xarm_description_ws
 
 # --- ROS dependency overlays used by every lane (Mock, Isaac, Real) ---
-# The entrypoint sources them in this order: xArm driver, ur_msgs, controller
-# overlay last. Every source is pinned by commit.
+# The entrypoint sources them in this order: xArm driver, controller overlay
+# last. Every source is pinned by commit.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ros-${ROS_DISTRO}-launch-param-builder \
         ros-${ROS_DISTRO}-robot-state-publisher \
@@ -406,26 +410,12 @@ RUN set -euo pipefail; \
         > /opt/manyforge/control_overlay/UPSTREAM_COMMITS; \
     rm -rf "${ws}"
 
-# ur_msgs 2.6.0 (I/O messages used by the ROS boolean input/output providers).
-ARG UR_MSGS_COMMIT=3c584014d9b228e0b2da819db0ca1d887c373e1d
-RUN set -euo pipefail; \
-    export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; \
-    ws=/tmp/ur_msgs_ws; mkdir -p "${ws}/src"; \
-    git init -q "${ws}/src/ur_msgs"; \
-    git -C "${ws}/src/ur_msgs" fetch -q --depth 1 https://github.com/ros-industrial/ur_msgs "${UR_MSGS_COMMIT}"; \
-    git -C "${ws}/src/ur_msgs" checkout -q FETCH_HEAD; \
-    test "$(git -C "${ws}/src/ur_msgs" rev-parse HEAD)" = "${UR_MSGS_COMMIT}"; \
-    set +u; source "/opt/ros/${ROS_DISTRO}/setup.bash"; set -u; \
-    cd "${ws}"; \
-    colcon build --install-base /opt/manyforge/ur_msgs/install --packages-select ur_msgs \
-        --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF; \
-    printf 'ur_msgs %s\n' "${UR_MSGS_COMMIT}" > /opt/manyforge/ur_msgs/install/UPSTREAM_COMMITS; \
-    rm -rf "${ws}"
-
-# UFactory xArm driver (xArm 5/6/7, Lite 6, UF850), unmodified, from the fork
-# branch `lyrical-no-gazebo`, built against the controller overlay above.
+# UFactory xArm driver (xArm 5/6/7, Lite 6, UF850) from the fork
+# branch `lyrical-no-gazebo` (upstream lyrical + the xarm_io_states topic and
+# system_control service; gazebo packages removed), built against the controller
+# overlay above.
 ARG XARM_SOURCE_REPOSITORY=https://github.com/pastoriomarco/xarm_ros2
-ARG XARM_SOURCE_COMMIT=ef7351f90e451a37ef73de69c643b7e85040401a
+ARG XARM_SOURCE_COMMIT=46aa1147d99963a8357b89744633db428746667b
 ARG XARM_SDK_COMMIT=f36794320a285c0b4bf1cd8ef181cbff6e3b794a
 RUN set -euo pipefail; \
     export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin; \

@@ -16,7 +16,7 @@ using core::CapabilityEndpointSourceKind;
 using core::CapabilityProviderBindingDTO;
 using core::CapabilityProviderBindingId;
 using core::CapabilityProviderBindingRevision;
-using core::ProjectionNativeRuntimeBindingDTO;
+using core::ProjectionExecutionHostBindingDTO;
 using core::RetainedBundleDTO;
 using core::RuntimeEpoch;
 using core::RuntimeUnitId;
@@ -94,13 +94,13 @@ Requirements(const RetainedBundleDTO &bundle) {
   return result;
 }
 
-[[nodiscard]] std::vector<ProjectionNativeRuntimeBindingDTO>
+[[nodiscard]] std::vector<ProjectionExecutionHostBindingDTO>
 CandidateBindings(const std::vector<ProviderRequirement> &requirements,
                   const ManagerApplyRuntimeStagedReadyDTO &staged_ready) {
   if (!staged_ready.valid()) {
     Fail("candidate staged-ready evidence is invalid");
   }
-  std::vector<ProjectionNativeRuntimeBindingDTO> result;
+  std::vector<ProjectionExecutionHostBindingDTO> result;
   result.reserve(requirements.size());
   for (const auto &requirement : requirements) {
     const auto evidence = std::lower_bound(
@@ -131,7 +131,7 @@ bool HasNativeProjectionRequirements(const RetainedBundleDTO &bundle) noexcept {
                      IsNativeRequirement);
 }
 
-std::vector<ProjectionNativeRuntimeBindingDTO>
+std::vector<ProjectionExecutionHostBindingDTO>
 DeriveCandidateNativeProjectionBindings(
     const RetainedBundleDTO &candidate,
     const ManagerApplyRuntimeStagedReadyDTO &candidate_staged_ready) {

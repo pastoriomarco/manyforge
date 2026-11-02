@@ -15,7 +15,6 @@
 #include <variant>
 #include <vector>
 
-#include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
 #include <manyforge_core/types/collision_world_snapshot.hpp>
 #include <manyforge_core/types/program_contract.hpp>
 #include <manyforge_deployment/content_identity.hpp>
@@ -30,13 +29,12 @@
 
 #include "content_identity_internal.hpp"
 #include "program_binding_internal.hpp"
-#include "canonical_empty_admission_internal.hpp"
 #include "ros2_control_execution_runtime_unit_internal.hpp"
+#include "gripper_only_retention_fixture.hpp"
 #include "lite6_controllable_retention_fixture.hpp"
 #include "lite6_retained_consumer_fixture.hpp"
 #include "io_retained_fixture.hpp"
 #include "program_binding_internal.hpp"
-#include "../../manyforge_roboplan/src/retained_ros2_control_lifecycle_plans_internal.hpp"
 
 namespace {
 
@@ -74,6 +72,7 @@ using manyforge::deployment::detail::ContentIdentitySpec;
 using manyforge::deployment::test::kLite6ArmTargetId;
 using manyforge::deployment::test::kLite6ControllableComponentId;
 using manyforge::deployment::test::kLite6GripperTargetId;
+using manyforge::deployment::test::kLiteGripperComponentId;
 using manyforge::deployment::test::
     materialize_lite6_ros2_control_observed_retained_consumer_fixture;
 using manyforge::deployment::test::
@@ -118,28 +117,21 @@ struct BindingCompilerContext final {
 };
 
 [[nodiscard]] BindingCompilerContext
-make_context(const std::filesystem::path &root, bool aggregate_gripper = false,
-             bool gripper_only = false, bool endpoint_contact_bodies = false,
+make_context(const std::filesystem::path &root, bool gripper_only = false,
+             bool endpoint_contact_bodies = false,
              bool shared_arm_endpoint_bodies = false) {
   const auto materialized = [&] {
     if (!gripper_only) {
       if (endpoint_contact_bodies) {
         return materialize_lite6_ros2_control_observed_endpoint_retained_consumer_fixture(
-            root, aggregate_gripper, shared_arm_endpoint_bodies);
+            root, shared_arm_endpoint_bodies);
       }
-      return materialize_lite6_ros2_control_observed_retained_consumer_fixture(
-          root, aggregate_gripper);
+      return materialize_lite6_ros2_control_observed_retained_consumer_fixture(root);
     }
-    const auto plans = manyforge::roboplan_backend::detail::
-        ros2_control_lifecycle_plans_internal::retained_ros2_control_lifecycle_plans();
-    const auto semantic = manyforge::core::ComputeBrandLifecyclePlanCatalogSemanticDigest(
-        manyforge::core::ProviderManifestId("manyforge.provider.ros2_control"), plans);
-    if (!semantic.ok()) {
-      throw std::logic_error("test ROS gripper lifecycle catalog is unavailable");
-    }
-    return manyforge::deployment::test::
-        materialize_lite6_ros2_control_gripper_only_cclc_product_retained_consumer_fixture(
-            root, semantic.value().value());
+    // The Lite gripper as its own component (a separate tool).
+    return manyforge::deployment::test::materialize_lite6_retained_consumer_fixture_from(
+        root, manyforge::deployment::test::make_lite_gripper_only_retention_fixture(
+                  manyforge::deployment::test::kWithLifecycleOffers));
   }();
   const FilesystemVerifiedRetainedBundleSource bundle_source(root);
   auto bundle =
@@ -163,7 +155,7 @@ make_context(const std::filesystem::path &root, bool aggregate_gripper = false,
 make_ros_motion_context(const std::filesystem::path &root) {
   const auto materialized =
       materialize_lite6_ros2_control_motion_retained_consumer_fixture_for_cell(
-          root, "i6_lite6_native_motion_cell");
+          root, "i6_lite6_motion_cell");
   const FilesystemVerifiedRetainedBundleSource bundle_source(root);
   auto bundle =
       bundle_source.get_verified(materialized.bundle->retained_bundle_id());
@@ -262,28 +254,29 @@ make_program_root(const RetainedBundle &bundle,
   });
 }
 
+/// A Program over the Lite gripper component alone (role `tool`): its
+/// gripper target plus a contact grasp policy on the gripper's body.
 [[nodiscard]] CanonicalValue
-make_aggregate_program_root(const RetainedBundle &bundle) {
+make_gripper_program_root(const RetainedBundle &bundle) {
   CanonicalValue::Object root = make_program_root(bundle).as_object();
   for (auto &[name, value] : root) {
     if (name == "component_roles") {
       value = CanonicalValue(CanonicalValue::Object{
-          {"robot",
+          {"tool",
            CanonicalValue(CanonicalValue::Object{
                {"required_component_type_tags",
                 CanonicalValue(CanonicalValue::Array{
-                    CanonicalValue("articulated-arm"),
                     CanonicalValue("articulated-gripper")})},
                {"required_model_roles", CanonicalValue(CanonicalValue::Array{
-                                            CanonicalValue("arm_model")})},
+                                            CanonicalValue("gripper_model")})},
            })},
       });
     } else if (name == "target_roles") {
-      CanonicalValue::Object targets = value.as_object();
+      CanonicalValue::Object targets;
       targets.emplace_back(
           "gripper",
           CanonicalValue(CanonicalValue::Object{
-              {"component_role", CanonicalValue("robot")},
+              {"component_role", CanonicalValue("tool")},
               {"required_capabilities",
                CanonicalValue(
                    CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
@@ -300,7 +293,7 @@ make_aggregate_program_root(const RetainedBundle &bundle) {
                CanonicalValue(
                    CanonicalValue::Array{CanonicalValue("gripper_collision")})},
               {"required_model_roles", CanonicalValue(CanonicalValue::Array{
-                                           CanonicalValue("arm_model")})},
+                                           CanonicalValue("gripper_model")})},
           }));
       value = CanonicalValue(std::move(targets));
     }
@@ -322,8 +315,8 @@ make_aggregate_program_root(const RetainedBundle &bundle) {
                         {"body_a",
                          CanonicalValue(CanonicalValue::Object{
                              {"kind", CanonicalValue("component_model_body")},
-                             {"component_role_id", CanonicalValue("robot")},
-                             {"model_role_id", CanonicalValue("arm_model")},
+                             {"component_role_id", CanonicalValue("tool")},
+                             {"model_role_id", CanonicalValue("gripper_model")},
                              {"collision_body_role_id",
                               CanonicalValue("gripper_collision")},
                          })},
@@ -371,15 +364,13 @@ make_aggregate_program_root(const RetainedBundle &bundle) {
 }
 
 [[nodiscard]] std::string
-make_program_bytes(const RetainedBundle &bundle, bool aggregate_gripper = false,
+make_program_bytes(const RetainedBundle &bundle,
                    bool include_node_policy = false,
                    bool own_group_intervention = false,
                    bool planning_only = false) {
-  CanonicalValue root = aggregate_gripper
-                            ? make_aggregate_program_root(bundle)
-                            : make_program_root(bundle, include_node_policy,
-                                                own_group_intervention,
-                                                planning_only);
+  CanonicalValue root = make_program_root(bundle, include_node_policy,
+                                          own_group_intervention,
+                                          planning_only);
   const std::string revision =
       compute_content_identity(root, ContentIdentitySpec{
                                          .identity_domain = "program-revision",
@@ -396,9 +387,8 @@ make_program_bytes(const RetainedBundle &bundle, bool aggregate_gripper = false,
   throw std::logic_error("test Program omitted program_revision");
 }
 
-[[nodiscard]] ProgramRoleAssignmentDTO
-valid_assignment(bool aggregate_gripper = false) {
-  ProgramRoleAssignmentDTO result{
+[[nodiscard]] ProgramRoleAssignmentDTO valid_assignment() {
+  return {
       {ProgramComponentRoleAssignmentDTO{
           ComponentRoleId("robot"),
           manyforge::core::ControllableComponentId(
@@ -407,12 +397,18 @@ valid_assignment(bool aggregate_gripper = false) {
           TargetRoleId("arm"),
           manyforge::core::CommandTargetId(std::string(kLite6ArmTargetId))}},
   };
-  if (aggregate_gripper) {
-    result.target_roles.push_back(ProgramTargetRoleAssignmentDTO{
-        TargetRoleId("gripper"),
-        manyforge::core::CommandTargetId(std::string(kLite6GripperTargetId))});
-  }
-  return result;
+}
+
+[[nodiscard]] ProgramRoleAssignmentDTO gripper_assignment() {
+  return {
+      {ProgramComponentRoleAssignmentDTO{
+          ComponentRoleId("tool"),
+          manyforge::core::ControllableComponentId(
+              std::string(kLiteGripperComponentId))}},
+      {ProgramTargetRoleAssignmentDTO{
+          TargetRoleId("gripper"),
+          manyforge::core::CommandTargetId(std::string(kLite6GripperTargetId))}},
+  };
 }
 
 [[nodiscard]] ActiveRuntimeParticipantFactsDTO active_facts_for(
@@ -519,7 +515,7 @@ TEST(ProgramBindingCompilerTest,
   const BindingCompilerContext context = make_context(root.path());
   FilesystemCatalogArtifactStore catalog_store(root.path());
   const auto contract = verify_program_binding_contract(
-      make_program_bytes(*context.bundle, false, false, false, true),
+      make_program_bytes(*context.bundle, false, false, true),
       *context.bundle);
   const auto binding = compile_program_binding(
       *contract, valid_assignment(), *context.bundle, context.model_map,
@@ -546,7 +542,7 @@ TEST(ProgramBindingCompilerTest,
   ScopedTrustedRoot root;
   const BindingCompilerContext context = make_context(root.path());
   const auto contract = verify_program_binding_contract(
-      make_program_bytes(*context.bundle, false, true, true), *context.bundle);
+      make_program_bytes(*context.bundle, true, true), *context.bundle);
   FilesystemCatalogArtifactStore catalog_store(root.path());
   const auto binding =
       compile_program_binding(*contract, valid_assignment(), *context.bundle,
@@ -809,12 +805,12 @@ TEST(ProgramBindingCompilerTest,
 
   const auto first = compile_direct_control_gripper_program_binding(
       manyforge::core::ControllableComponentId(
-          std::string(kLite6ControllableComponentId)),
+          std::string(kLiteGripperComponentId)),
       manyforge::core::CommandTargetId(std::string(kLite6GripperTargetId)),
       *context.bundle, context.model_map, catalog_store);
   const auto second = compile_direct_control_gripper_program_binding(
       manyforge::core::ControllableComponentId(
-          std::string(kLite6ControllableComponentId)),
+          std::string(kLiteGripperComponentId)),
       manyforge::core::CommandTargetId(std::string(kLite6GripperTargetId)),
       *context.bundle, context.model_map, catalog_store);
 
@@ -853,7 +849,7 @@ TEST(ProgramBindingCompilerTest,
 TEST(ProgramBindingCompilerTest,
      DirectControlGripperBindingRejectsANonGripperTarget) {
   ScopedTrustedRoot root;
-  const BindingCompilerContext context = make_context(root.path(), true);
+  const BindingCompilerContext context = make_context(root.path());
   FilesystemCatalogArtifactStore catalog_store(root.path());
 
   EXPECT_THROW(
@@ -884,7 +880,7 @@ TEST(ProgramBindingCompilerTest,
 
   ScopedTrustedRoot gripper_root;
   const BindingCompilerContext gripper_context =
-      make_context(gripper_root.path(), true, true);
+      make_context(gripper_root.path(), true);
   FilesystemCatalogArtifactStore gripper_catalog_store(gripper_root.path());
   const auto first_gripper = compile_direct_control_program_binding_inventory(
       *gripper_context.bundle, gripper_context.model_map,
@@ -898,59 +894,6 @@ TEST(ProgramBindingCompilerTest,
   ASSERT_EQ(second_gripper.gripper.size(), 1U);
   EXPECT_EQ(first_gripper.gripper.front()->canonical_bytes(),
             second_gripper.gripper.front()->canonical_bytes());
-}
-
-TEST(ProgramBindingCompilerTest, ScalarPeersRetainDistinctDirectProgramsAndResources) {
-  const auto plans = manyforge::roboplan_backend::detail::
-      ros2_control_lifecycle_plans_internal::retained_ros2_control_lifecycle_plans();
-  const auto semantic = manyforge::core::ComputeBrandLifecyclePlanCatalogSemanticDigest(
-      manyforge::core::ProviderManifestId("manyforge.provider.ros2_control"), plans);
-  ASSERT_TRUE(semantic.ok());
-  for (const bool arm_root : {false, true}) {
-    SCOPED_TRACE(arm_root ? "real arm root plus independent scalar" : "two scalars without motion");
-    ScopedTrustedRoot root;
-    const auto materialized = manyforge::deployment::test::
-        materialize_lite6_ros2_control_scalar_peer_retained_consumer_fixture(
-            root.path(), semantic.value().value(), arm_root);
-    const FilesystemVerifiedRetainedBundleSource bundles(root.path());
-    const auto bundle = bundles.get_verified(materialized.bundle->retained_bundle_id());
-    ASSERT_NE(bundle, nullptr);
-    ASSERT_EQ(bundle->value().compiled_products.symbol_role_maps.size(), 1U);
-    const FilesystemVerifiedRetainedModelMapSource maps(root.path());
-    const auto model_map = maps.get_verified(RetainedModelMapQuery{
-        bundle->retained_bundle_id(), bundle->value().compiled_products.symbol_role_maps.front().product_id});
-    ASSERT_TRUE(model_map.has_value());
-    FilesystemCatalogArtifactStore catalogs(root.path());
-    const auto inventory = compile_direct_control_program_binding_inventory(*bundle, *model_map, catalogs);
-    const auto repeated = compile_direct_control_program_binding_inventory(*bundle, *model_map, catalogs);
-    ASSERT_EQ(inventory.gripper.size(), 2U);
-    ASSERT_EQ(repeated.gripper.size(), 2U);
-    EXPECT_EQ(inventory.motion.size(), arm_root ? 1U : 0U);
-    std::set<manyforge::core::ProgramBindingId> program_ids;
-    std::set<manyforge::core::ControllableComponentId> components;
-    std::set<manyforge::core::ResourceId> resources;
-    for (std::size_t index = 0; index < inventory.gripper.size(); ++index) {
-      const auto &program = inventory.gripper[index];
-      ASSERT_NE(program, nullptr);
-      EXPECT_EQ(program->canonical_bytes(), repeated.gripper[index]->canonical_bytes());
-      EXPECT_TRUE(program_ids.insert(program->program_binding_id()).second);
-      ASSERT_EQ(program->value().target_role_bindings.size(), 1U);
-      const auto &target = program->value().target_role_bindings.front();
-      EXPECT_TRUE(components.insert(target.controllable_component_id).second);
-      EXPECT_EQ(target.command_target_id.value(), kLite6GripperTargetId);
-      ASSERT_EQ(target.resource_role_bindings.size(), 1U);
-      ASSERT_EQ(target.resource_role_bindings.front().resource_ids.size(), 1U);
-      EXPECT_TRUE(resources.insert(target.resource_role_bindings.front().resource_ids.front()).second);
-      ASSERT_EQ(target.capability_bindings.size(), 1U);
-      EXPECT_EQ(target.capability_bindings.front().capability_id.value(), "tool.gripper.command");
-      ASSERT_TRUE(target.capability_bindings.front().command_schema.has_value());
-      EXPECT_EQ(target.capability_bindings.front().command_schema->command_schema_id.value(),
-                manyforge::core::kGripperPositionCommandSchemaId);
-    }
-    EXPECT_EQ(program_ids.size(), 2U);
-    EXPECT_EQ(components.size(), 2U);
-    EXPECT_EQ(resources.size(), 2U);
-  }
 }
 
 TEST(ProgramBindingCompilerTest, RejectsIncompleteAndUnknownRoleAssignments) {
@@ -1182,6 +1125,49 @@ TEST(ProgramBindingCompilerTest,
                manyforge::deployment::PreparedActivationInputError);
 }
 
+TEST(ProgramBindingCompilerTest,
+     PreparedActivationStoreKeepsOnlyTheMostRecentlyWrittenValues) {
+  namespace d = manyforge::deployment;
+  ScopedTrustedRoot root;
+  const BindingCompilerContext context = make_context(root.path());
+  ScopedTrustedRoot store;
+  const d::FilesystemPreparedActivationRepository repository(store.path());
+  const auto stored_count = [&] {
+    std::size_t count = 0U;
+    for (const auto &entry : std::filesystem::directory_iterator(
+             store.path() / "prepared-activations"))
+      count += entry.path().extension() == ".json" ? 1U : 0U;
+    return count;
+  };
+  constexpr std::size_t kExtra = 4U;
+  std::vector<d::PreparedActivationInput> values;
+  for (std::size_t index = 0U;
+       index < d::kMaximumRetainedPreparedActivations + kExtra; ++index) {
+    values.push_back(prepare(root.path(), context, kLite6ArmTargetId,
+                             "/fixtures/scenario-" + std::to_string(index) +
+                                 ".readback.scenario"));
+    ASSERT_TRUE(repository.put_if_absent(values.back()));
+    EXPECT_LE(stored_count(), d::kMaximumRetainedPreparedActivations);
+  }
+  EXPECT_EQ(stored_count(), d::kMaximumRetainedPreparedActivations);
+  for (std::size_t index = 0U; index < values.size(); ++index)
+    EXPECT_EQ(repository.get_verified(values[index].prepared_activation_id()) !=
+                  nullptr,
+              index >= kExtra)
+        << index;
+
+  // Re-adopting the oldest retained value makes it the most recent: the next
+  // write removes the one after it instead.
+  EXPECT_FALSE(repository.put_if_absent(values[kExtra]));
+  ASSERT_TRUE(repository.put_if_absent(prepare(
+      root.path(), context, kLite6ArmTargetId, "/fixtures/scenario-new.readback.scenario")));
+  EXPECT_EQ(stored_count(), d::kMaximumRetainedPreparedActivations);
+  EXPECT_NE(repository.get_verified(values[kExtra].prepared_activation_id()),
+            nullptr);
+  EXPECT_EQ(repository.get_verified(values[kExtra + 1U].prepared_activation_id()),
+            nullptr);
+}
+
 TEST(ProgramBindingCompilerTest, NoProgramReadbackProvesAbsenceWithoutInventingABinding) {
   ScopedTrustedRoot root;
   const BindingCompilerContext context = make_context(root.path());
@@ -1306,10 +1292,10 @@ TEST(ProgramBindingCompilerTest,
   });
 }
 
-/// The aggregate arm+gripper Program with an authored initial Scene: one
-/// object on the robot's arm-model `tcp` frame and one in the cell frame.
-[[nodiscard]] std::string aggregate_program_with_scene(const RetainedBundle &bundle) {
-  CanonicalValue::Object members = make_aggregate_program_root(bundle).as_object();
+/// The arm Program with an authored initial Scene: one object on the
+/// robot's arm-model `tcp` frame and one in the cell frame.
+[[nodiscard]] std::string program_with_scene(const RetainedBundle &bundle) {
+  CanonicalValue::Object members = make_program_root(bundle).as_object();
   CanonicalValue scene(CanonicalValue::Array{
       scene_box("on_arm_tcp",
                 CanonicalValue(CanonicalValue::Object{
@@ -1345,35 +1331,17 @@ TEST(ProgramBindingCompilerTest,
 }
 
 TEST(ProgramBindingCompilerTest,
-     NonExecutableSceneKeepsObjectsOnSurvivingFramesAndRefusesUnresolvedOnes) {
+     NonExecutableSceneRefusesObjectsOnUnresolvedFrames) {
   ScopedTrustedRoot root;
-  const BindingCompilerContext context = make_context(root.path(), true);
+  const BindingCompilerContext context = make_context(root.path());
   const auto contract = verify_program_binding_contract(
-      aggregate_program_with_scene(*context.bundle), *context.bundle);
+      program_with_scene(*context.bundle), *context.bundle);
   FilesystemCatalogArtifactStore catalog_store(root.path());
   const auto cell_id = context.bundle->value().cell_graph.cell_id;
 
-  // The gripper target is gone; the arm and its tcp frame still resolve.
-  auto gripper_removed = valid_assignment(true);
-  gripper_removed.target_roles.back().command_target_id =
-      manyforge::core::CommandTargetId("removed_gripper_target");
-  const auto without_gripper = compile_program_binding_outcome(
-      *contract, gripper_removed, *context.bundle, context.model_map,
-      catalog_store);
-  ASSERT_TRUE(without_gripper.non_executable.has_value());
-  ASSERT_TRUE(without_gripper.resolved_roles.has_value());
-  const auto scene = manyforge::deployment::project_resolved_initial_scene(
-      *contract, *without_gripper.resolved_roles, cell_id);
-  ASSERT_EQ(scene.size(), 2U);
-  const auto *arm_frame =
-      std::get_if<manyforge::core::ComponentSceneFrameRefDTO>(&scene.front().frame_ref);
-  ASSERT_NE(arm_frame, nullptr);
-  EXPECT_EQ(arm_frame->controllable_component_id.value(),
-            kLite6ControllableComponentId);
-
   // The whole component is gone: its frame cannot be verified, so the object
   // is refused by name instead of being dropped from planning.
-  auto component_removed = valid_assignment(true);
+  auto component_removed = valid_assignment();
   component_removed.component_roles.front().controllable_component_id =
       manyforge::core::ControllableComponentId("removed_robot");
   const auto without_robot = compile_program_binding_outcome(
@@ -1388,9 +1356,9 @@ TEST(ProgramBindingCompilerTest,
 TEST(ProgramBindingCompilerTest,
      NonExecutableCapabilityDoesNotDiscardVerifiedSceneFrames) {
   ScopedTrustedRoot root;
-  const BindingCompilerContext context = make_context(root.path(), true);
+  const BindingCompilerContext context = make_context(root.path());
   auto program = manyforge::deployment::parse_strict_json_model_yaml(
-                     aggregate_program_with_scene(*context.bundle)).root();
+                     program_with_scene(*context.bundle)).root();
   const auto &targets = *program.find_object_member("target_roles");
   auto arm = *targets.find_object_member("arm");
   // A valid capability exists in the catalog but not on this arm target.
@@ -1411,7 +1379,7 @@ TEST(ProgramBindingCompilerTest,
       canonical_json(program), *context.bundle);
   FilesystemCatalogArtifactStore catalog_store(root.path());
   const auto outcome = compile_program_binding_outcome(
-      *contract, valid_assignment(true), *context.bundle, context.model_map,
+      *contract, valid_assignment(), *context.bundle, context.model_map,
       catalog_store);
   EXPECT_EQ(outcome.binding, nullptr);
   ASSERT_TRUE(outcome.non_executable.has_value());
@@ -1442,202 +1410,9 @@ TEST(ProgramBindingCompilerTest,
 }
 
 TEST(ProgramBindingCompilerTest,
-     EndpointAssociatedBodiesAreRetainedAndNonExecutableSceneStillResolves) {
-  ScopedTrustedRoot root;
-  const BindingCompilerContext context = make_context(root.path(), true, false,
-                                                      true);
-  CanonicalValue program = manyforge::deployment::parse_strict_json_model_yaml(
-                               aggregate_program_with_scene(*context.bundle))
-                               .root();
-  const auto &target_table = *program.find_object_member("target_roles");
-  auto arm = *target_table.find_object_member("arm");
-  arm = with_member(arm, "required_collision_body_roles",
-                    CanonicalValue(CanonicalValue::Array{}));
-  program = with_member(program, "target_roles",
-                        with_member(target_table, "arm", arm));
-  program = with_member(
-      program, "program_revision",
-      CanonicalValue(compute_content_identity(
-          program, ContentIdentitySpec{.identity_domain = "program-revision",
-                                       .api_version = "manyforge.program.v2",
-                                       .own_field = "program_revision"})));
-  const auto contract = verify_program_binding_contract(
-      canonical_json(program), *context.bundle);
-  FilesystemCatalogArtifactStore catalog_store(root.path());
-
-  const auto binding = compile_program_binding(
-      *contract, valid_assignment(true), *context.bundle, context.model_map,
-      catalog_store);
-  ASSERT_NE(binding, nullptr);
-  const auto arm_target = std::find_if(
-      binding->value().target_role_bindings.begin(),
-      binding->value().target_role_bindings.end(), [](const auto &target) {
-        return target.target_role_id == TargetRoleId("arm");
-      });
-  ASSERT_NE(arm_target, binding->value().target_role_bindings.end());
-  const auto tcp = std::find_if(
-      arm_target->frame_role_bindings.begin(),
-      arm_target->frame_role_bindings.end(), [](const auto &frame) {
-        return frame.frame_role_id == manyforge::core::FrameRoleId("tcp");
-      });
-  ASSERT_NE(tcp, arm_target->frame_role_bindings.end());
-  EXPECT_EQ(tcp->contact_body_role_ids,
-            std::vector<manyforge::core::CollisionBodyRoleId>{
-                manyforge::core::CollisionBodyRoleId("arm_collision")});
-  EXPECT_NE(std::find_if(
-                arm_target->collision_body_role_bindings.begin(),
-                arm_target->collision_body_role_bindings.end(),
-                [](const auto &body) {
-                  return body.collision_body_role_id ==
-                         manyforge::core::CollisionBodyRoleId("arm_collision");
-                }),
-            arm_target->collision_body_role_bindings.end());
-  const auto gripper_target = std::find_if(
-      binding->value().target_role_bindings.begin(),
-      binding->value().target_role_bindings.end(), [](const auto &target) {
-        return target.target_role_id == TargetRoleId("gripper");
-      });
-  ASSERT_NE(gripper_target, binding->value().target_role_bindings.end());
-  EXPECT_EQ(gripper_target->controllable_component_id,
-            arm_target->controllable_component_id);
-  const auto gripper_tcp = std::find_if(
-      gripper_target->frame_role_bindings.begin(),
-      gripper_target->frame_role_bindings.end(), [](const auto &frame) {
-        return frame.frame_role_id == manyforge::core::FrameRoleId("tcp");
-      });
-  ASSERT_NE(gripper_tcp, gripper_target->frame_role_bindings.end());
-  EXPECT_EQ(gripper_tcp->contact_body_role_ids,
-            std::vector<manyforge::core::CollisionBodyRoleId>{
-                manyforge::core::CollisionBodyRoleId("gripper_collision")});
-  EXPECT_EQ(gripper_tcp->model_instance_id, tcp->model_instance_id);
-  EXPECT_EQ(gripper_tcp->model_revision, tcp->model_revision);
-  EXPECT_NE(std::find_if(
-                gripper_target->collision_body_role_bindings.begin(),
-                gripper_target->collision_body_role_bindings.end(),
-                [](const auto &body) {
-                  return body.collision_body_role_id ==
-                         manyforge::core::CollisionBodyRoleId(
-                             "gripper_collision");
-                }),
-            gripper_target->collision_body_role_bindings.end());
-
-  auto unavailable_program = program;
-  const auto &unavailable_target_table =
-      *unavailable_program.find_object_member("target_roles");
-  auto unavailable_arm =
-      *unavailable_target_table.find_object_member("arm");
-  unavailable_arm = with_member(
-      unavailable_arm, "required_capabilities",
-      CanonicalValue(CanonicalValue::Array{CanonicalValue(
-          CanonicalValue::Object{
-              {"capability_id", CanonicalValue("tool.gripper.command")},
-              {"parameters", CanonicalValue(CanonicalValue::Object{})},
-              {"disposition", CanonicalValue("required")},
-          })}));
-  unavailable_program = with_member(
-      unavailable_program, "target_roles",
-      with_member(unavailable_target_table, "arm", unavailable_arm));
-  unavailable_program = with_member(
-      unavailable_program, "program_revision",
-      CanonicalValue(compute_content_identity(
-          unavailable_program,
-          ContentIdentitySpec{.identity_domain = "program-revision",
-                              .api_version = "manyforge.program.v2",
-                              .own_field = "program_revision"})));
-  const auto unavailable_contract = verify_program_binding_contract(
-      canonical_json(unavailable_program), *context.bundle);
-  const auto outcome = compile_program_binding_outcome(
-      *unavailable_contract, valid_assignment(true), *context.bundle,
-      context.model_map, catalog_store);
-  EXPECT_EQ(outcome.binding, nullptr);
-  ASSERT_TRUE(outcome.non_executable.has_value());
-  ASSERT_TRUE(outcome.resolved_roles.has_value());
-  const auto scene = manyforge::deployment::project_resolved_initial_scene(
-      *unavailable_contract, *outcome.resolved_roles,
-      context.bundle->value().cell_graph.cell_id);
-  ASSERT_EQ(scene.size(), 2U);
-  EXPECT_TRUE(std::holds_alternative<manyforge::core::ComponentSceneFrameRefDTO>(
-      scene.front().frame_ref));
-  const auto resolved_arm = std::find_if(
-      outcome.resolved_roles->target_roles.begin(),
-      outcome.resolved_roles->target_roles.end(), [](const auto &target) {
-        return target.target_role_id == TargetRoleId("arm");
-      });
-  ASSERT_NE(resolved_arm, outcome.resolved_roles->target_roles.end());
-  ASSERT_FALSE(resolved_arm->frame_role_bindings.empty());
-  EXPECT_TRUE(resolved_arm->frame_role_bindings.front()
-                  .contact_body_role_ids.empty());
-}
-
-TEST(ProgramBindingCompilerTest,
-     UnchangedEndpointProgramBindsTwoConcreteComponentTypes) {
-  ScopedTrustedRoot arm_root;
-  ScopedTrustedRoot aggregate_root;
-  const auto arm_only = make_context(arm_root.path(), false, false, true);
-  const auto aggregate = make_context(aggregate_root.path(), true, false, true);
-  // Program declarations are portable. A richer component type implements the
-  // same endpoint without changing one byte of the Program or its Assignment.
-  const auto program_bytes = make_program_bytes(*arm_only.bundle);
-  EXPECT_EQ(program_bytes, make_program_bytes(*aggregate.bundle));
-  const auto first_program =
-      verify_program_binding_contract(program_bytes, *arm_only.bundle);
-  const auto second_program =
-      verify_program_binding_contract(program_bytes, *aggregate.bundle);
-  FilesystemCatalogArtifactStore first_catalog(arm_root.path());
-  FilesystemCatalogArtifactStore second_catalog(aggregate_root.path());
-  const auto first = compile_program_binding(*first_program, valid_assignment(),
-                                             *arm_only.bundle,
-                                             arm_only.model_map, first_catalog);
-  const auto second = compile_program_binding(
-      *second_program, valid_assignment(), *aggregate.bundle,
-      aggregate.model_map, second_catalog);
-  ASSERT_NE(first, nullptr);
-  ASSERT_NE(second, nullptr);
-  EXPECT_EQ(first->value().program_id, second->value().program_id);
-  EXPECT_EQ(first->value().program_revision, second->value().program_revision);
-  ASSERT_EQ(first->value().component_role_bindings.size(), 1U);
-  ASSERT_EQ(second->value().component_role_bindings.size(), 1U);
-  EXPECT_NE(first->value().component_role_bindings.front().component_type_id,
-            second->value().component_role_bindings.front().component_type_id);
-  EXPECT_EQ(
-      first->value().component_role_bindings.front().component_type_id.value(),
-      "lite6_arm_component");
-  EXPECT_EQ(
-      second->value().component_role_bindings.front().component_type_id.value(),
-      "lite6_arm_gripper_component");
-  ASSERT_EQ(first->value().target_role_bindings.size(), 1U);
-  ASSERT_EQ(second->value().target_role_bindings.size(), 1U);
-  const auto &a = first->value().target_role_bindings.front();
-  const auto &b = second->value().target_role_bindings.front();
-  EXPECT_EQ(a.target_role_id, b.target_role_id);
-  EXPECT_EQ(a.command_target_id, b.command_target_id);
-  ASSERT_EQ(a.frame_role_bindings.size(), 1U);
-  ASSERT_EQ(b.frame_role_bindings.size(), 1U);
-  EXPECT_EQ(a.frame_role_bindings.front().frame_role_id,
-            manyforge::core::FrameRoleId("tcp"));
-  EXPECT_EQ(b.frame_role_bindings.front().frame_role_id,
-            a.frame_role_bindings.front().frame_role_id);
-  EXPECT_EQ(a.frame_role_bindings.front().contact_body_role_ids,
-            b.frame_role_bindings.front().contact_body_role_ids);
-  EXPECT_EQ(a.frame_role_bindings.front().contact_body_role_ids,
-            std::vector<manyforge::core::CollisionBodyRoleId>{
-                manyforge::core::CollisionBodyRoleId("arm_collision")});
-  EXPECT_NE(first->program_binding_id(), second->program_binding_id());
-  EXPECT_EQ(manyforge::deployment::reload_verified_program_binding(
-                first->canonical_bytes(), *arm_only.bundle, arm_only.model_map)
-                ->value(),
-            first->value());
-  EXPECT_EQ(
-      manyforge::deployment::reload_verified_program_binding(
-          second->canonical_bytes(), *aggregate.bundle, aggregate.model_map)
-          ->value(),
-      second->value());
-}
-
-TEST(ProgramBindingCompilerTest,
      DistinctModeledEndpointsMayShareOneRetainedBodyGroup) {
   ScopedTrustedRoot root;
-  const auto context = make_context(root.path(), false, false, true, true);
+  const auto context = make_context(root.path(), false, true, true);
   auto program = make_program_root(*context.bundle);
   const auto &target_table = *program.find_object_member("target_roles");
   auto arm = *target_table.find_object_member("arm");
@@ -1690,150 +1465,29 @@ TEST(ProgramBindingCompilerTest,
 }
 
 TEST(ProgramBindingCompilerTest,
-     BindsOneAggregateComponentToDistinctArmAndPrismaticGripperTargets) {
-  ScopedTrustedRoot root;
-  const BindingCompilerContext context = make_context(root.path(), true);
-  const auto contract = verify_program_binding_contract(
-      make_program_bytes(*context.bundle, true), *context.bundle);
-  FilesystemCatalogArtifactStore catalog_store(root.path());
-
-  const auto binding = compile_program_binding(
-      *contract, valid_assignment(true), *context.bundle, context.model_map,
-      catalog_store);
-
-  ASSERT_NE(binding, nullptr);
-  ASSERT_EQ(context.bundle->value().cell_graph.controllable_components.size(),
-            1U);
-  ASSERT_EQ(binding->value().component_role_bindings.size(), 1U);
-  ASSERT_EQ(binding->value().target_role_bindings.size(), 2U);
-  const auto gripper = std::find_if(
-      binding->value().target_role_bindings.begin(),
-      binding->value().target_role_bindings.end(), [](const auto &value) {
-        return value.target_role_id == TargetRoleId("gripper");
-      });
-  ASSERT_NE(gripper, binding->value().target_role_bindings.end());
-  EXPECT_EQ(gripper->command_target_id.value(), kLite6GripperTargetId);
-  ASSERT_EQ(gripper->resource_role_bindings.size(), 1U);
-  EXPECT_EQ(gripper->resource_role_bindings.front().resource_ids.size(), 1U);
-  ASSERT_EQ(gripper->capability_bindings.size(), 1U);
-  const auto &capability = gripper->capability_bindings.front();
-  EXPECT_EQ(capability.capability_id.value(), "tool.gripper.command");
-  ASSERT_TRUE(capability.command_schema.has_value());
-  EXPECT_EQ(capability.command_schema->command_schema_id.value(),
-            manyforge::core::kGripperPositionCommandSchemaId);
-  ASSERT_EQ(binding->value().contact_grasp_bindings.size(), 1U);
-  const auto &contact = binding->value().contact_grasp_bindings.front();
-  EXPECT_EQ(contact.contact_policy_id.value(), "selected_object_grasp");
-  EXPECT_EQ(contact.runtime_object_id.value(), "selected_object");
-  ASSERT_EQ(contact.allowed_body_bindings.size(), 1U);
-  const auto &body = contact.allowed_body_bindings.front();
-  EXPECT_EQ(body.target_role_id, TargetRoleId("gripper"));
-  EXPECT_EQ(body.command_target_id.value(), kLite6GripperTargetId);
-  EXPECT_EQ(body.collision_body_role_id.value(), "gripper_collision");
-  ASSERT_FALSE(body.collision_body_ids.empty());
-  EXPECT_EQ(body.collision_body_ids.front(),
-            manyforge::core::make_component_collision_body_id(
-                body.controllable_component_id, body.model_instance_id,
-                body.collision_body_role_id, 0U));
-  EXPECT_EQ(capability.command_schema->command_schema_revision.value(),
-            manyforge::core::kGripperPositionCommandSchemaRevision);
-
-  const auto *coordinate_map = context.model_map.find_binding(
-      manyforge::core::ControllableComponentId(
-          std::string(kLite6ControllableComponentId)),
-      manyforge::core::CommandTargetId(std::string(kLite6GripperTargetId)));
-  ASSERT_NE(coordinate_map, nullptr);
-  ASSERT_EQ(coordinate_map->resources.size(), 1U);
-  ASSERT_FALSE(coordinate_map->resources.front().coordinates.empty());
-  EXPECT_EQ(
-      coordinate_map->resources.front().coordinates.front().coordinate_kind,
-      manyforge::deployment::UrdfCoordinateKind::kLinear);
-  EXPECT_EQ(coordinate_map->resources.front().coordinates.front().unit,
-            manyforge::deployment::CompositionCoordinateUnit::kMeters);
-}
-
-TEST(ProgramBindingCompilerTest,
-     SealsExactRuntimeArmAndGripperTargetsFromOneAggregateComponent) {
-  ScopedTrustedRoot root;
-  const BindingCompilerContext context = make_context(root.path(), true);
-  const auto contract = verify_program_binding_contract(
-      make_program_bytes(*context.bundle, true), *context.bundle);
-  FilesystemCatalogArtifactStore catalog_store(root.path());
-  const auto binding = compile_program_binding(
-      *contract, valid_assignment(true), *context.bundle, context.model_map,
-      catalog_store);
-
-  const auto arm = resolve_runtime_program_target(
-      *binding, TargetRoleId("arm"), CapabilityId("state.observed.current"),
-      *context.bundle, context.model_map);
-  const auto gripper = resolve_runtime_program_target(
-      *binding, TargetRoleId("gripper"), CapabilityId("tool.gripper.command"),
-      *context.bundle, context.model_map);
-
-  EXPECT_EQ(arm.program_binding_id(), binding->program_binding_id());
-  EXPECT_EQ(gripper.program_binding_id(), binding->program_binding_id());
-  EXPECT_EQ(arm.component().controllable_component_id,
-            gripper.component().controllable_component_id);
-  EXPECT_EQ(arm.target_role().command_target_id.value(), kLite6ArmTargetId);
-  EXPECT_EQ(gripper.target_role().command_target_id.value(),
-            kLite6GripperTargetId);
-
-  ASSERT_TRUE(arm.control_binding().has_value());
-  ASSERT_TRUE(gripper.control_binding().has_value());
-  EXPECT_NE(arm.control_binding()->control_binding_id,
-            gripper.control_binding()->control_binding_id);
-  ASSERT_TRUE(arm.control_domain().has_value());
-  ASSERT_TRUE(gripper.control_domain().has_value());
-  EXPECT_NE(arm.control_domain()->control_domain_id,
-            gripper.control_domain()->control_domain_id);
-  ASSERT_TRUE(arm.desired_control_configuration().has_value());
-  ASSERT_TRUE(gripper.desired_control_configuration().has_value());
-  ASSERT_TRUE(arm.desired_route().has_value());
-  ASSERT_TRUE(gripper.desired_route().has_value());
-
-  ASSERT_TRUE(arm.coordinate_map().has_value());
-  ASSERT_TRUE(gripper.coordinate_map().has_value());
-  EXPECT_EQ(arm.coordinate_map()->resources.size(), 6U);
-  ASSERT_EQ(gripper.coordinate_map()->resources.size(), 1U);
-  ASSERT_FALSE(gripper.coordinate_map()->resources.front().coordinates.empty());
-  EXPECT_EQ(gripper.coordinate_map()
-                ->resources.front()
-                .coordinates.front()
-                .coordinate_kind,
-            manyforge::deployment::UrdfCoordinateKind::kLinear);
-  EXPECT_EQ(
-      gripper.coordinate_map()->resources.front().coordinates.front().unit,
-      manyforge::deployment::CompositionCoordinateUnit::kMeters);
-  ASSERT_TRUE(gripper.capability().command_schema.has_value());
-  EXPECT_EQ(gripper.capability().command_schema->command_schema_id.value(),
-            manyforge::core::kGripperPositionCommandSchemaId);
-}
-
-TEST(ProgramBindingCompilerTest,
      RejectsUnknownRuntimeSelectorsAndCrossBundleContext) {
-  ScopedTrustedRoot aggregate_root;
-  const BindingCompilerContext aggregate =
-      make_context(aggregate_root.path(), true);
+  ScopedTrustedRoot observed_root;
+  const BindingCompilerContext observed = make_context(observed_root.path());
   const auto contract = verify_program_binding_contract(
-      make_program_bytes(*aggregate.bundle, true), *aggregate.bundle);
-  FilesystemCatalogArtifactStore catalog_store(aggregate_root.path());
+      make_program_bytes(*observed.bundle), *observed.bundle);
+  FilesystemCatalogArtifactStore catalog_store(observed_root.path());
   const auto binding = compile_program_binding(
-      *contract, valid_assignment(true), *aggregate.bundle, aggregate.model_map,
+      *contract, valid_assignment(), *observed.bundle, observed.model_map,
       catalog_store);
 
   EXPECT_THROW(static_cast<void>(resolve_runtime_program_target(
                    *binding, TargetRoleId("missing"),
-                   CapabilityId("state.observed.current"), *aggregate.bundle,
-                   aggregate.model_map)),
+                   CapabilityId("state.observed.current"), *observed.bundle,
+                   observed.model_map)),
                RuntimeProgramBindingResolutionError);
   EXPECT_THROW(
       static_cast<void>(resolve_runtime_program_target(
           *binding, TargetRoleId("arm"), CapabilityId("missing.capability"),
-          *aggregate.bundle, aggregate.model_map)),
+          *observed.bundle, observed.model_map)),
       RuntimeProgramBindingResolutionError);
 
   ScopedTrustedRoot other_root;
-  const BindingCompilerContext other = make_context(other_root.path());
+  const BindingCompilerContext other = make_ros_motion_context(other_root.path());
   EXPECT_THROW(
       static_cast<void>(resolve_runtime_program_target(
           *binding, TargetRoleId("arm"), CapabilityId("state.observed.current"),
@@ -1842,79 +1496,14 @@ TEST(ProgramBindingCompilerTest,
 }
 
 TEST(ProgramBindingCompilerTest,
-     ProjectsCurrentOwnerFactsIntoExactArmAndGripperRuntimeParticipants) {
-  ScopedTrustedRoot root;
-  const BindingCompilerContext context = make_context(root.path(), true);
-  const auto contract = verify_program_binding_contract(
-      make_program_bytes(*context.bundle, true), *context.bundle);
-  FilesystemCatalogArtifactStore catalog_store(root.path());
-  const auto binding = compile_program_binding(
-      *contract, valid_assignment(true), *context.bundle, context.model_map,
-      catalog_store);
-
-  const auto arm_target = resolve_runtime_program_target(
-      *binding, TargetRoleId("arm"), CapabilityId("state.observed.current"),
-      *context.bundle, context.model_map);
-  const auto gripper_target = resolve_runtime_program_target(
-      *binding, TargetRoleId("gripper"), CapabilityId("tool.gripper.command"),
-      *context.bundle, context.model_map);
-  const auto arm = build_runtime_participant_binding_dto(
-      arm_target, active_facts_for(arm_target));
-  const auto gripper = build_runtime_participant_binding_dto(
-      gripper_target, active_facts_for(gripper_target));
-
-  EXPECT_EQ(arm.controllable_component_id, gripper.controllable_component_id);
-  EXPECT_NE(arm.command_target_id, gripper.command_target_id);
-  ASSERT_TRUE(arm.control_path.has_value());
-  ASSERT_TRUE(gripper.control_path.has_value());
-  EXPECT_NE(arm.control_path->control_binding_id,
-            gripper.control_path->control_binding_id);
-  EXPECT_NE(arm.control_path->control_domain_id,
-            gripper.control_path->control_domain_id);
-  EXPECT_EQ(arm.resources.size(), 6U);
-  std::vector<std::string> arm_source_joint_names;
-  arm_source_joint_names.reserve(arm.resources.size());
-  for (const auto &resource : arm.resources) {
-    ASSERT_TRUE(resource.source_joint_name.has_value());
-    arm_source_joint_names.push_back(*resource.source_joint_name);
-    EXPECT_EQ(resource.resource_role_id.value(), "joints");
-  }
-  EXPECT_EQ(arm_source_joint_names,
-            (std::vector<std::string>{"joint1", "joint2", "joint3", "joint4",
-                                      "joint5", "joint6"}));
-  EXPECT_TRUE(std::all_of(arm.resources.begin(), arm.resources.end(),
-                          [](const auto &resource) {
-                            return resource.coordinate_kind ==
-                                   manyforge::core::CoordinateKind::kAngular;
-                          }));
-  ASSERT_EQ(gripper.resources.size(), 1U);
-  ASSERT_TRUE(gripper.resources.front().source_joint_name.has_value());
-  EXPECT_EQ(*gripper.resources.front().source_joint_name, "right_finger_joint");
-  EXPECT_EQ(gripper.resources.front().coordinate_kind,
-            manyforge::core::CoordinateKind::kLinear);
-  ASSERT_TRUE(gripper.command_schema.has_value());
-  EXPECT_EQ(gripper.command_schema->command_schema_id.value(),
-            manyforge::core::kGripperPositionCommandSchemaId);
-  EXPECT_EQ(gripper.control_path->active_control_configuration_id.value(),
-            "active.native");
-  EXPECT_TRUE(
-      gripper.control_path->active_control_configuration_generation.nonzero());
-  EXPECT_FALSE(gripper.control_path->provider_runtime_epoch.empty());
-  ASSERT_EQ(arm.contact_grasp_bindings.size(), 1U);
-  EXPECT_EQ(arm.contact_grasp_bindings, gripper.contact_grasp_bindings);
-  EXPECT_EQ(arm.contact_grasp_bindings.front().runtime_object_id.value(),
-            "selected_object");
-}
-
-TEST(ProgramBindingCompilerTest,
      RejectsMissingRuntimeEpochAndNonDesiredI6Route) {
   ScopedTrustedRoot root;
-  const BindingCompilerContext context = make_context(root.path(), true);
+  const BindingCompilerContext context = make_context(root.path());
   const auto contract = verify_program_binding_contract(
-      make_program_bytes(*context.bundle, true), *context.bundle);
+      make_program_bytes(*context.bundle), *context.bundle);
   FilesystemCatalogArtifactStore catalog_store(root.path());
   const auto binding = compile_program_binding(
-      *contract, valid_assignment(true), *context.bundle, context.model_map,
+      *contract, valid_assignment(), *context.bundle, context.model_map,
       catalog_store);
   const auto target = resolve_runtime_program_target(
       *binding, TargetRoleId("arm"), CapabilityId("state.observed.current"),
@@ -2067,23 +1656,11 @@ TEST(ProgramBindingCompilerTest,
     ASSERT_NE(capability, target.capability_bindings.end());
     EXPECT_TRUE(capability->capability_provider_binding);
     EXPECT_FALSE(capability->control_binding);
-    ASSERT_TRUE(capability->command_schema);
-    EXPECT_EQ(capability->command_schema->command_schema_id.value(),
-              manyforge::core::kIoSignalWriteCommandSchemaId);
+    EXPECT_FALSE(capability->command_schema);
     EXPECT_EQ(reload_verified_program_binding(binding->canonical_bytes(),
                                               bundle, *map)
                   ->value(),
               binding->value());
-    auto forged = binding->value();
-    for (auto &row : forged.target_role_bindings.front().capability_bindings)
-      if (row.capability_id.value() == "io.gpio.set_output")
-        row.command_schema->command_schema_revision =
-            manyforge::core::CommandSchemaRevision(std::string(kZeroDigest));
-    const auto resealed = manyforge::deployment::detail::
-        ProgramBindingConstructionAuthority::seal(forged);
-    EXPECT_THROW(static_cast<void>(reload_verified_program_binding(
-                     resealed->canonical_bytes(), bundle, *map)),
-                 manyforge::deployment::ProgramBindingError);
     const auto direct =
         compile_direct_control_program_binding_inventory(bundle, *map, catalog);
     ASSERT_EQ(direct.io.size(), 1U);
@@ -2130,104 +1707,20 @@ TEST(ProgramBindingCompilerTest,
       manyforge::deployment::ProgramContractError);
 }
 
-class MissingOutputSchemaSource final
-    : public manyforge::deployment::ICatalogArtifactSource {
-public:
-  explicit MissingOutputSchemaSource(
-      const manyforge::deployment::ICatalogArtifactSource &source)
-      : source_(source) {}
-  std::optional<std::string> get_verified(
-      const manyforge::core::ContentAddressedStoreKey &key,
-      const manyforge::core::ContentDigest &digest,
-      std::optional<std::uint64_t> size = std::nullopt) const override {
-    auto bytes = source_.get_verified(key, digest, size);
-    if (bytes && bytes->find("manyforge.io_signal_write_command_schema.v1") !=
-                     std::string::npos)
-      return std::nullopt;
-    return bytes;
-  }
-
-private:
-  const manyforge::deployment::ICatalogArtifactSource &source_;
-};
-
-TEST(ProgramBindingCompilerTest,
-     OutputRequiresActualVerifiedCommandSchemaArtifact) {
-  ScopedTrustedRoot root;
-  const auto fixture =
-      manyforge::deployment::test::materialize_boolean_io_retained_fixture(
-          root.path(), false, true);
-  const auto &bundle = *fixture.bundle;
-  FilesystemVerifiedRetainedModelMapSource maps(root.path());
-  const auto map = maps.get_verified(
-      {bundle.retained_bundle_id(),
-       bundle.value().compiled_products.symbol_role_maps.front().product_id});
-  ASSERT_TRUE(map);
-  FilesystemCatalogArtifactStore catalog(root.path());
-  MissingOutputSchemaSource missing(catalog);
-  const auto program =
-      verify_program_binding_contract(output_binding_program(bundle), bundle);
-  const ProgramRoleAssignmentDTO assignment{
-      {{ComponentRoleId("device"),
-        manyforge::core::ControllableComponentId("device.io")}},
-      {{TargetRoleId("signals"), manyforge::core::CommandTargetId("gpio")}}};
-  EXPECT_THROW(static_cast<void>(compile_program_binding(
-                   *program, assignment, bundle, *map, missing)),
-               ProgramBindingCompilerError);
-  EXPECT_THROW(
-      static_cast<void>(compile_direct_control_program_binding_inventory(
-          bundle, *map, missing)),
-      ProgramBindingCompilerError);
-}
-
 } // namespace
-
-// D6 (SX-318): only the exact sealed canonical-empty origin of the candidate
-// admits an Apply while Close of a latched Scenario runs.
-TEST(ProgramBindingCompilerTest, CanonicalEmptyCandidateIsTheExactSealedOrigin) {
-  namespace d = manyforge::deployment;
-  namespace core = manyforge::core;
-  const auto digest = [](char digit) { return "sha256:" + std::string(64U, digit); };
-  const d::PreparedSealedCanonicalEmptyOrigin sealed{
-      core::CellId("cell.a"), core::DeploymentArtifactId("artifact.a"),
-      core::DeploymentRevision(digest('1')), core::RetainedBundleId(digest('2')),
-      core::GraphRevision(digest('3')), core::ContentDigest(digest('4'))};
-  const auto receipt = [](const d::PreparedActivationOrigin& origin) {
-    return d::CanonicalValue(d::CanonicalValue::Object{
-        {"origin", d::prepared_activation_origin_value(origin)}});
-  };
-  EXPECT_TRUE(d::prepared_receipt_is_canonical_empty_candidate(
-      receipt(sealed), sealed.cell_id, sealed.retained_bundle_id, sealed.graph_revision));
-  // A different candidate (for example a component-free Scenario) is refused.
-  EXPECT_FALSE(d::prepared_receipt_is_canonical_empty_candidate(
-      receipt(sealed), sealed.cell_id, core::RetainedBundleId(digest('5')),
-      sealed.graph_revision));
-  EXPECT_FALSE(d::prepared_receipt_is_canonical_empty_candidate(
-      receipt(sealed), core::CellId("cell.b"), sealed.retained_bundle_id,
-      sealed.graph_revision));
-  const d::PreparedScenarioOrigin scenario{"Untitled", core::ContentDigest(digest('6')),
-                                           "/projects/Untitled.scenario"};
-  EXPECT_FALSE(d::prepared_receipt_is_canonical_empty_candidate(
-      receipt(scenario), sealed.cell_id, sealed.retained_bundle_id, sealed.graph_revision));
-  EXPECT_FALSE(d::prepared_receipt_is_canonical_empty_candidate(
-      d::CanonicalValue(d::CanonicalValue::Object{}), sealed.cell_id,
-      sealed.retained_bundle_id, sealed.graph_revision));
-}
 
 TEST(ProgramBindingCompilerTest, PreparedOriginIsClosedAndScenarioAccessIsChecked) {
   namespace d = manyforge::deployment;
   ScopedTrustedRoot root;
   const BindingCompilerContext context = make_context(root.path());
   const auto prepared = prepare(root.path(), context, kLite6ArmTargetId);
-  ASSERT_NE(prepared.scenario_origin(), nullptr);
-  EXPECT_EQ(prepared.scenario_origin()->scenario_id, "scenario.readback");
-  EXPECT_EQ(prepared.scenario_origin()->project_path,
+  EXPECT_EQ(prepared.origin().scenario_id, "scenario.readback");
+  EXPECT_EQ(prepared.origin().project_path,
             "/fixtures/scenario.readback.scenario");
   EXPECT_EQ(
       d::prepared_activation_origin_value(d::parse_prepared_activation_origin(
           d::prepared_activation_origin_value(prepared.origin()))),
       d::prepared_activation_origin_value(prepared.origin()));
-  EXPECT_EQ(prepared.sealed_canonical_empty_origin(), nullptr);
   EXPECT_EQ(prepared.normalized_root().find_object_member("scenario_id"), nullptr);
   EXPECT_EQ(prepared.normalized_root().find_object_member("source_document_digest"), nullptr);
   auto origin = prepared.normalized_root().find_object_member("origin")->as_object();
@@ -2239,6 +1732,11 @@ TEST(ProgramBindingCompilerTest, PreparedOriginIsClosedAndScenarioAccessIsChecke
       with_member(prepared.normalized_root(), "schema_version",
                   CanonicalValue("manyforge.prepared_activation_input.v5"))))),
       d::PreparedActivationInputError);
+  // Every preparation, the empty cell included, has a Scenario origin.
+  EXPECT_THROW(static_cast<void>(d::parse_prepared_activation_origin(with_member(
+                   d::prepared_activation_origin_value(prepared.origin()), "kind",
+                   CanonicalValue("sealed_canonical_empty")))),
+               d::PreparedActivationInputError);
 }
 
 TEST(ProgramBindingCompilerTest,
@@ -2250,10 +1748,9 @@ TEST(ProgramBindingCompilerTest,
                              "/fixtures/first/same.scenario");
   const auto second = prepare(root.path(), context, kLite6ArmTargetId,
                               "/fixtures/second/same.scenario");
-  EXPECT_EQ(first.scenario_origin()->scenario_id,
-            second.scenario_origin()->scenario_id);
-  EXPECT_EQ(first.scenario_origin()->source_document_digest,
-            second.scenario_origin()->source_document_digest);
+  EXPECT_EQ(first.origin().scenario_id, second.origin().scenario_id);
+  EXPECT_EQ(first.origin().source_document_digest,
+            second.origin().source_document_digest);
   EXPECT_EQ(first.retained_bundle_id(), second.retained_bundle_id());
   EXPECT_EQ(first.program_revision(), second.program_revision());
   EXPECT_NE(first.prepared_activation_id(), second.prepared_activation_id());
@@ -2265,8 +1762,7 @@ TEST(ProgramBindingCompilerTest,
   const auto maximum = d::parse_prepared_activation_origin(
       with_member(first_origin, "project_path",
                   CanonicalValue("/" + std::string(4095U, 'x'))));
-  EXPECT_EQ(std::get<d::PreparedScenarioOrigin>(maximum).project_path.size(),
-            4096U);
+  EXPECT_EQ(maximum.project_path.size(), 4096U);
   auto missing = first_origin.as_object();
   std::erase_if(missing,
                 [](const auto &row) { return row.first == "project_path"; });
@@ -2284,57 +1780,6 @@ TEST(ProgramBindingCompilerTest,
         d::PreparedActivationInputError)
         << invalid;
   }
-}
-
-TEST(ProgramBindingCompilerTest, SealedEmptyReadbackRequiresTheActualAdmission) {
-  namespace d = manyforge::deployment;
-  ScopedTrustedRoot package;
-  const auto admission = d::detail::generate_ros_empty_package(
-      package.path(), manyforge::core::CellId("prepared_empty_cell"),
-      d::detail::ros2_control_execution_runtime_profile_document());
-  const d::FilesystemVerifiedCatalogArtifactSource catalog(package.path());
-  const d::FilesystemVerifiedRawArtifactSource raw(package.path());
-  const auto prepared = d::assemble_sealed_canonical_empty_activation(admission, catalog, raw);
-  ASSERT_NE(prepared.sealed_canonical_empty_origin(), nullptr);
-  EXPECT_EQ(prepared.scenario_origin(), nullptr);
-  EXPECT_EQ(prepared.closure().retained_bundle->canonical_bytes(),
-            admission.retained_bundle().canonical_bytes());
-  EXPECT_EQ(prepared.closure().program, nullptr);
-  EXPECT_EQ(prepared.closure().program_binding, nullptr);
-  EXPECT_FALSE(prepared.program_id().has_value());
-  EXPECT_FALSE(prepared.program_revision().has_value());
-  EXPECT_EQ(prepared.captured_input_digest(),
-      d::sealed_canonical_empty_capture_digest(*prepared.sealed_canonical_empty_origin()));
-  ScopedTrustedRoot activation;
-  const d::FilesystemPreparedActivationRepository repository(activation.path());
-  EXPECT_TRUE(repository.put_if_absent(prepared));
-  EXPECT_FALSE(repository.put_if_absent(prepared));
-  EXPECT_THROW(static_cast<void>(repository.get_verified(prepared.prepared_activation_id())),
-               d::PreparedActivationInputError);
-  const auto replay = repository.get_verified(prepared.prepared_activation_id(), &admission);
-  ASSERT_NE(replay, nullptr);
-  EXPECT_EQ(replay->prepared_activation_id(), prepared.prepared_activation_id());
-  ScopedTrustedRoot foreign;
-  const auto other = d::detail::generate_ros_empty_package(
-      foreign.path(), manyforge::core::CellId("other_prepared_empty_cell"),
-      d::detail::ros2_control_execution_runtime_profile_document());
-  EXPECT_THROW(static_cast<void>(repository.get_verified(prepared.prepared_activation_id(), &other)),
-               d::PreparedActivationInputError);
-  // Rehashed, structurally coherent JSON is still not an actual admission.
-  auto forged_origin = *prepared.sealed_canonical_empty_origin();
-  forged_origin.admission_digest = manyforge::core::ContentDigest("sha256:" + std::string(64U, 'f'));
-  auto forged = with_member(prepared.normalized_root(), "origin",
-                           d::prepared_activation_origin_value(forged_origin));
-  forged = with_member(forged, "captured_input_digest",
-                       CanonicalValue(d::sealed_canonical_empty_capture_digest(forged_origin).value()));
-  const auto parsed = d::parse_prepared_activation_input(reidentify(forged));
-  ASSERT_TRUE(repository.put_if_absent(parsed));
-  EXPECT_THROW(static_cast<void>(repository.get_verified(parsed.prepared_activation_id(), &admission)),
-               d::PreparedActivationInputError);
-  auto mixed_origin = d::prepared_activation_origin_value(*prepared.sealed_canonical_empty_origin()).as_object();
-  mixed_origin.emplace_back("scenario_id", CanonicalValue(nullptr));
-  EXPECT_THROW(static_cast<void>(d::parse_prepared_activation_origin(CanonicalValue(mixed_origin))),
-               d::PreparedActivationInputError);
 }
 
 namespace {
@@ -2498,7 +1943,7 @@ TEST(ProgramBindingCompilerTest,
 TEST(ProgramBindingCompilerTest, CompilesPortableReleaseWithoutChangingItsEnvelope) {
   ScopedTrustedRoot root;
   const auto context = make_context(root.path(), true);
-  auto program = make_aggregate_program_root(*context.bundle);
+  auto program = make_gripper_program_root(*context.bundle);
   auto policies = program.find_object_member("contact_policies")->as_array();
   auto policy = policies.front();
   auto zones = policy.find_object_member("zones")->as_array();
@@ -2532,7 +1977,7 @@ TEST(ProgramBindingCompilerTest, CompilesPortableReleaseWithoutChangingItsEnvelo
   EXPECT_FALSE(release.allow_recontact);
   FilesystemCatalogArtifactStore catalog_store(root.path());
   const auto binding = compile_program_binding(
-      *contract, valid_assignment(true), *context.bundle, context.model_map, catalog_store);
+      *contract, gripper_assignment(), *context.bundle, context.model_map, catalog_store);
   ASSERT_EQ(binding->value().contact_grasp_bindings.size(), 1U);
   const auto& bound = binding->value().contact_grasp_bindings.front();
   EXPECT_EQ(bound.envelope, contract->value().contact_grasp_templates.front().envelope);
@@ -2552,7 +1997,7 @@ TEST(ProgramBindingCompilerTest, CompilesPortableReleaseWithoutChangingItsEnvelo
 
 using GripperRead = std::pair<std::string_view, std::string_view>;
 
-// The aggregate arm+gripper Program whose gripper role also declares the
+// The gripper Program whose gripper role also declares the
 // given input capabilities (sorted, before `tool.gripper.command`) and the
 // `carried_object_lost` system resource role, read by the given
 // (node_id, resource_role) input nodes. The Lite6 gripper target offers no
@@ -2560,7 +2005,7 @@ using GripperRead = std::pair<std::string_view, std::string_view>;
 [[nodiscard]] std::string gripper_input_program(
     const RetainedBundle &bundle, const std::vector<std::string_view> &input_capabilities,
     const std::vector<GripperRead> &reads) {
-  auto root = make_aggregate_program_root(bundle);
+  auto root = make_gripper_program_root(bundle);
   auto targets = root.find_object_member("target_roles")->as_object();
   for (auto &[name, value] : targets) {
     if (name != "gripper") continue;
@@ -2619,7 +2064,7 @@ TEST(ProgramBindingCompilerTest,
         gripper_input_program(*context.bundle, {capability}, {row.second}),
         *context.bundle);
     const auto binding = compile_program_binding(
-        *contract, valid_assignment(true), *context.bundle, context.model_map, catalog_store);
+        *contract, gripper_assignment(), *context.bundle, context.model_map, catalog_store);
     ASSERT_NE(binding, nullptr);
     const auto &targets = binding->value().target_role_bindings;
     const auto gripper = std::find_if(targets.begin(), targets.end(), [](const auto &row) {
@@ -2657,7 +2102,7 @@ TEST(ProgramBindingCompilerTest,
         gripper_input_program(*context.bundle, {"io.gpio.get_input"}, reads),
         *context.bundle);
     const auto outcome = compile_program_binding_outcome(
-        *contract, valid_assignment(true), *context.bundle, context.model_map, catalog_store);
+        *contract, gripper_assignment(), *context.bundle, context.model_map, catalog_store);
     EXPECT_EQ(outcome.binding, nullptr);
     ASSERT_TRUE(outcome.non_executable.has_value());
     const auto &rows = outcome.non_executable->unresolved_roles;
@@ -2665,7 +2110,7 @@ TEST(ProgramBindingCompilerTest,
     EXPECT_EQ(rows.front().target_role_id, TargetRoleId("gripper"));
     EXPECT_EQ(rows.front().reason, ProgramBindingUnresolvedReason::kTargetIncompatible);
     EXPECT_THROW(static_cast<void>(compile_program_binding(
-                     *contract, valid_assignment(true), *context.bundle,
+                     *contract, gripper_assignment(), *context.bundle,
                      context.model_map, catalog_store)),
                  ProgramBindingCompilerError);
   }
@@ -2684,7 +2129,7 @@ TEST(ProgramBindingCompilerTest,
                             {{"io.wait_for_input", "carried_object_lost"}}),
       *context.bundle);
   const auto outcome = compile_program_binding_outcome(
-      *contract, valid_assignment(true), *context.bundle, context.model_map, catalog_store);
+      *contract, gripper_assignment(), *context.bundle, context.model_map, catalog_store);
   EXPECT_EQ(outcome.binding, nullptr);
   ASSERT_TRUE(outcome.non_executable.has_value());
   const auto &rows = outcome.non_executable->unresolved_roles;

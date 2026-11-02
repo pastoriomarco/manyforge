@@ -1,7 +1,6 @@
 #include <gtest/gtest.h>
 #include <manyforge_deployment/scene_pose_source_policy_codec.hpp>
 
-#include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
 #include <manyforge_core/runtime_contract_manifest_codec.hpp>
 #include <manyforge_core/types/capability_definition.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
@@ -40,10 +39,10 @@
 #include "content_identity_internal.hpp"
 #include "control_domain_control_internal.hpp"
 #include "deployment_catalog_codec_internal.hpp"
+#include "gripper_only_retention_fixture.hpp"
 #include "lite6_controllable_retention_fixture.hpp"
 #include "lite6_structural_retention_fixture.hpp"
-#include "native_execution_runtime_unit_internal.hpp"
-#include "../../manyforge_roboplan/src/retained_ros2_control_lifecycle_plans_internal.hpp"
+#include "execution_host_unit_internal.hpp"
 #include "ros2_control_execution_runtime_unit_internal.hpp"
 #include "planning_resource_map_internal.hpp"
 #include "retained_bundle_internal.hpp"
@@ -249,15 +248,6 @@ array_member(const CanonicalValue &value, std::string_view name) {
             {"stop_stage_parameters", CanonicalValue(CanonicalValue::Array{})},
             {"commissioned_stop_interfaces",
              CanonicalValue(CanonicalValue::Array{})},
-            {"interrupt_sources", CanonicalValue(CanonicalValue::Array{})},
-            {"interrupt_policies", CanonicalValue(CanonicalValue::Array{})},
-            {"interrupt_config",
-             CanonicalValue(CanonicalValue::Object{
-                 {"queue_depth", CanonicalValue(8.0)},
-                 {"cancel_validation_timeout_ns", CanonicalValue(1000.0)},
-                 {"motion_scope_arm_timeout_ns", CanonicalValue(1000.0)},
-                 {"supervisory_poll_rate_hz", CanonicalValue(10.0)},
-             })},
             {"motion_takeover_preparation_budget_s",
              CanonicalValue(*takeover_budget_s)},
         }));
@@ -409,15 +399,6 @@ make_contact_policy_retention_fixture() {
            {"stop_stage_parameters", CanonicalValue(CanonicalValue::Array{})},
            {"commissioned_stop_interfaces",
             CanonicalValue(CanonicalValue::Array{})},
-           {"interrupt_sources", CanonicalValue(CanonicalValue::Array{})},
-           {"interrupt_policies", CanonicalValue(CanonicalValue::Array{})},
-           {"interrupt_config",
-            CanonicalValue(CanonicalValue::Object{
-                {"queue_depth", CanonicalValue(8.0)},
-                {"cancel_validation_timeout_ns", CanonicalValue(1000.0)},
-                {"motion_scope_arm_timeout_ns", CanonicalValue(1000.0)},
-                {"supervisory_poll_rate_hz", CanonicalValue(10.0)},
-            })},
        })},
   });
   const auto deployment = compute_deployment_artifact_revision(
@@ -1430,51 +1411,8 @@ TEST(RetainedBundleMaterializer,
   EXPECT_NO_THROW(
       detail::require_ros2_control_execution_runtime_product_matches_retained_bundle(
           manifest, launch_descriptor, bundle->value(), group.runtime_unit_id));
-  const auto ros_configuration =
-      ros2_control_execution_runtime_contract::require_configuration(
-          *bundle, group.runtime_unit_id);
-  // Retain shared cold-decoder fields without native product admission. ROS
-  // has its own cadence and no direct-control joint-limit configuration row.
-  const auto cold_fixture = test::make_lite6_native_motion_retention_fixture();
-  const auto &cold_graph = cold_fixture.qualified.compiler_ir()
-                               .applicability().composition().graph();
-  const auto &cold_unit = cold_graph.runtime_units.front();
-  const auto runtime_configuration =
-      detail::decode_native_execution_runtime_configuration(
-          cold_unit.configuration, cold_graph, cold_unit.runtime_unit_id);
-  EXPECT_EQ(ros_configuration.planner_rng_seed,
-            runtime_configuration.planner_rng_seed);
-  EXPECT_EQ(ros_configuration.initial_joint_positions_rad,
-            runtime_configuration.initial_joint_positions_rad);
-  EXPECT_EQ(ros_configuration.execution_tick_hz,
-            runtime_configuration.execution_tick_hz);
-  EXPECT_EQ(ros_configuration.motion_target_limits,
-            runtime_configuration.motion_target_limits);
-  EXPECT_EQ(runtime_configuration.planner_rng_seed, 12345U);
-  EXPECT_EQ(runtime_configuration.initial_joint_positions_rad,
-            (std::vector<double>{0.0, 0.0, 1.57, 0.0, 0.0, 0.0}));
-  EXPECT_EQ(runtime_configuration.execution_tick_hz, 100U);
-  EXPECT_DOUBLE_EQ(runtime_configuration.collision_monitor_period_ms, 50.0);
-  ASSERT_EQ(runtime_configuration.direct_control_joint_limits.size(), 1U);
-  const auto &joint_limit =
-      runtime_configuration.direct_control_joint_limits.front();
-  EXPECT_EQ(joint_limit.controllable_component_id,
-            core::ControllableComponentId("lite6_arm"));
-  EXPECT_EQ(joint_limit.command_target_id, core::CommandTargetId("arm"));
-  EXPECT_EQ(joint_limit.source_joint_name, "joint1");
-  EXPECT_EQ(joint_limit.max_velocity_rad_s, 1.5);
-  EXPECT_EQ(joint_limit.max_acceleration_rad_s2, 2.5);
-  EXPECT_FALSE(joint_limit.max_jerk_rad_s3.has_value());
-  ASSERT_EQ(runtime_configuration.motion_target_limits.size(), 1U);
-  EXPECT_EQ(runtime_configuration.motion_target_limits.front().controllable_component_id,
-            core::ControllableComponentId("lite6_arm"));
-  EXPECT_EQ(runtime_configuration.motion_target_limits.front().command_target_id,
-            core::CommandTargetId("arm"));
-  EXPECT_DOUBLE_EQ(runtime_configuration.motion_target_limits.front()
-                       .maximum_tcp_linear_speed_mps,
-                   0.15);
-  EXPECT_FALSE(runtime_configuration.motion_target_limits.front().ordinary_motion_jerk.enabled);
-  EXPECT_TRUE(runtime_configuration.motion_target_limits.front().ordinary_motion_jerk.joint_limits.empty());
+  static_cast<void>(ros2_control_execution_runtime_contract::require_configuration(
+      *bundle, group.runtime_unit_id));
   const auto injected_controller_configuration = replace_object_member(
       parsed_manifest, "configuration",
       CanonicalValue(CanonicalValue::Object{
@@ -1501,33 +1439,32 @@ TEST(RetainedBundleMaterializer,
 
   // Composition may change controller inputs while retaining the same host.
   // The ROS manifest is consequently byte-identical for this runtime unit.
-  const auto aggregate_fixture =
-      test::make_lite6_ros2_control_shared_consumer_retention_fixture(
-          {}, 1U, true);
-  const test::Lite6ControllableCompilerInputArtifactSource aggregate_inputs(
-      aggregate_fixture);
-  test::InMemoryCatalogArtifactStoreFixture aggregate_catalog_store;
-  test::InMemoryRawArtifactStoreFixture aggregate_raw_store;
-  const auto aggregate_bundle = detail::RetainedBundleMaterializer::materialize(
-      aggregate_fixture.qualified,
+  const auto composed_fixture =
+      test::make_lite6_ros2_control_shared_consumer_retention_fixture({}, 2U);
+  const test::Lite6ControllableCompilerInputArtifactSource composed_inputs(
+      composed_fixture);
+  test::InMemoryCatalogArtifactStoreFixture composed_catalog_store;
+  test::InMemoryRawArtifactStoreFixture composed_raw_store;
+  const auto composed_bundle = detail::RetainedBundleMaterializer::materialize(
+      composed_fixture.qualified,
       detail::RetentionMaterializerTestAccess::make_context(),
-      aggregate_inputs,
-      aggregate_fixture.structural_preparations(), aggregate_catalog_store,
-      aggregate_raw_store);
-  ASSERT_NE(aggregate_bundle, nullptr);
-  ASSERT_EQ(aggregate_bundle->value().cell_graph.runtime_units.size(), 1U);
-  const auto &aggregate_unit =
-      aggregate_bundle->value().cell_graph.runtime_units.front();
-  EXPECT_EQ(aggregate_unit.runtime_unit_id, group.runtime_unit_id);
-  EXPECT_NE(aggregate_unit.configuration, unit.configuration);
-  const auto &aggregate_group = aggregate_bundle->value()
+      composed_inputs,
+      composed_fixture.structural_preparations(), composed_catalog_store,
+      composed_raw_store);
+  ASSERT_NE(composed_bundle, nullptr);
+  ASSERT_EQ(composed_bundle->value().cell_graph.runtime_units.size(), 1U);
+  const auto &composed_unit =
+      composed_bundle->value().cell_graph.runtime_units.front();
+  EXPECT_EQ(composed_unit.runtime_unit_id, group.runtime_unit_id);
+  EXPECT_NE(composed_unit.configuration, unit.configuration);
+  const auto &composed_group = composed_bundle->value()
                                     .compiled_products.runtime_unit_products
                                     .front();
-  const std::string aggregate_manifest = require_product_artifact_bytes(
-      aggregate_group.products.front(),
+  const std::string composed_manifest = require_product_artifact_bytes(
+      composed_group.products.front(),
       detail::kRos2ControlExecutionRuntimeManifestArtifactRole,
-      aggregate_raw_store);
-  EXPECT_EQ(aggregate_manifest, manifest);
+      composed_raw_store);
+  EXPECT_EQ(composed_manifest, manifest);
 
   test::InMemoryCatalogArtifactStoreFixture second_catalog_store;
   test::InMemoryRawArtifactStoreFixture second_raw_store;
@@ -1539,132 +1476,6 @@ TEST(RetainedBundleMaterializer,
   ASSERT_NE(regenerated, nullptr);
   EXPECT_EQ(regenerated->retained_bundle_id(), bundle->retained_bundle_id());
   EXPECT_EQ(regenerated->canonical_bytes(), bundle->canonical_bytes());
-}
-
-TEST(RetainedBundleMaterializer,
-     NativeConfigurationCarriesMotionFieldsExactlyWhenTheUnitHostsMotion) {
-  const auto fixture = test::make_lite6_native_motion_retention_fixture();
-  // DX-753: exercise the shared cold decoder from qualified source data,
-  // without native runtime product materialization or admission.
-  const auto &graph =
-      fixture.qualified.compiler_ir().applicability().composition().graph();
-  ASSERT_EQ(graph.runtime_units.size(), 1U);
-  const auto &unit = graph.runtime_units.front();
-  const auto &runtime_unit_id = unit.runtime_unit_id;
-  const auto decode = [&](const core::JsonObjectDTO &configuration,
-                          const core::CellGraphDTO &cell_graph) {
-    return detail::decode_native_execution_runtime_configuration(
-        configuration, cell_graph, runtime_unit_id);
-  };
-  const auto empty_array = core::JsonValueDTO{core::JsonValueDTO::Array{}};
-
-  // The source arm unit hosts motion and retains its authored initial state.
-  const auto arm = decode(unit.configuration, graph);
-  EXPECT_EQ(arm.initial_joint_positions_rad,
-            (std::vector<double>{0.0, 0.0, 1.57, 0.0, 0.0, 0.0}));
-  ASSERT_EQ(arm.motion_target_limits.size(), 1U);
-
-  // A motion unit never omits its motion fields.
-  auto without_motion_fields = unit.configuration;
-  without_motion_fields["initial_joint_positions_rad"] = empty_array;
-  without_motion_fields["motion_target_limits"] = empty_array;
-  without_motion_fields["direct_control_joint_limits"] = empty_array;
-  EXPECT_THROW(static_cast<void>(decode(without_motion_fields, graph)),
-               RetainedBundleError);
-
-  // A motion limit must name a motion target this unit hosts.
-  auto foreign_limit = unit.configuration;
-  auto &limits = std::get<core::JsonValueDTO::Array>(
-      foreign_limit.at("motion_target_limits").value);
-  std::get<core::JsonObjectDTO>(limits.front().value)["controllable_component_id"] =
-      core::JsonValueDTO{std::string("foreign_arm")};
-  EXPECT_THROW(static_cast<void>(decode(foreign_limit, graph)),
-               RetainedBundleError);
-
-  // Direct-control joint limits must resolve to this unit's exact motion
-  // target, just like the TCP-speed limits above.
-  auto foreign_direct_control_limit = unit.configuration;
-  auto &direct_control_limits = std::get<core::JsonValueDTO::Array>(
-      foreign_direct_control_limit.at("direct_control_joint_limits").value);
-  auto &foreign_direct_control_row =
-      std::get<core::JsonObjectDTO>(direct_control_limits.front().value);
-  foreign_direct_control_row["command_target_id"] =
-      core::JsonValueDTO{std::string("gripper")};
-  EXPECT_THROW(static_cast<void>(decode(foreign_direct_control_limit, graph)),
-               RetainedBundleError);
-
-  // The same unit hosting only a gripper: its motion binding becomes the
-  // gripper's command binding on the unit's own gripper target.
-  auto gripper_graph = graph;
-  const auto is_hosted_motion = [&](const core::ControlBindingDTO &binding) {
-    return binding.provider_runtime_unit_id == runtime_unit_id &&
-           binding.capability_id.value() == "execution.trajectory.execute";
-  };
-  ASSERT_EQ(std::count_if(gripper_graph.control_bindings.begin(),
-                          gripper_graph.control_bindings.end(),
-                          is_hosted_motion),
-            1);
-  const auto motion_binding =
-      std::find_if(gripper_graph.control_bindings.begin(),
-                   gripper_graph.control_bindings.end(), is_hosted_motion);
-  motion_binding->capability_id = core::CapabilityId("tool.gripper.command");
-  motion_binding->controllable_component_id =
-      core::ControllableComponentId("lite6_gripper");
-  motion_binding->command_target_id = core::CommandTargetId("gripper");
-
-  // Placeholder motion values on a unit without motion are refused.
-  EXPECT_THROW(static_cast<void>(decode(unit.configuration, gripper_graph)),
-               RetainedBundleError);
-  auto dummy_limits_only = without_motion_fields;
-  dummy_limits_only["direct_control_joint_limits"] =
-      unit.configuration.at("direct_control_joint_limits");
-  EXPECT_THROW(static_cast<void>(decode(dummy_limits_only, gripper_graph)),
-               RetainedBundleError);
-
-  // Gripper-only: empty motion fields and one hosted gripper configuration.
-  const auto text = [](std::string value) {
-    return core::JsonValueDTO{std::move(value)};
-  };
-  const auto list = [&](std::initializer_list<std::string> values) {
-    core::JsonValueDTO::Array items;
-    for (const auto &value : values) {
-      items.push_back(text(value));
-    }
-    return core::JsonValueDTO{std::move(items)};
-  };
-  const core::JsonObjectDTO gripper_configuration{
-      {"controllable_component_id", text("lite6_gripper")},
-      {"command_target_id", text("gripper")},
-      {"description", text("Lite6 gripper")},
-      {"actuation_kind", text("pneumatic")},
-      {"open_state_ref", text("open")},
-      {"closed_state_ref", text("closed")},
-      {"command_duration_s", core::JsonValueDTO{0.5}},
-      {"touch_links", list({"gripper_link"})},
-      {"mount_frame", text("tool0")},
-      {"attach_frame", text("tool0")},
-      {"tcp_frame", text("gripper_tcp")},
-      {"auxiliary_frames", list({})},
-  };
-  auto gripper_only = without_motion_fields;
-  gripper_only["gripper_target_configurations"] = core::JsonValueDTO{
-      core::JsonValueDTO::Array{core::JsonValueDTO{gripper_configuration}}};
-  const auto gripper = decode(gripper_only, gripper_graph);
-  EXPECT_TRUE(gripper.initial_joint_positions_rad.empty());
-  EXPECT_TRUE(gripper.motion_target_limits.empty());
-  EXPECT_TRUE(gripper.direct_control_joint_limits.empty());
-  ASSERT_EQ(gripper.gripper_target_configurations.size(), 1U);
-  EXPECT_EQ(gripper.gripper_target_configurations.front().command_target_id,
-            core::CommandTargetId("gripper"));
-
-  // A gripper configuration never borrows a target the unit does not host.
-  auto borrowed = gripper_only;
-  auto &gripper_rows = std::get<core::JsonValueDTO::Array>(
-      borrowed.at("gripper_target_configurations").value);
-  std::get<core::JsonObjectDTO>(gripper_rows.front().value)["controllable_component_id"] =
-      text("lite6_arm");
-  EXPECT_THROW(static_cast<void>(decode(borrowed, gripper_graph)),
-               RetainedBundleError);
 }
 
 TEST(RetainedBundleMaterializer,
@@ -1709,14 +1520,8 @@ TEST(RetainedBundleMaterializer,
 
 TEST(RetainedBundleMaterializer,
      GripperOnlyRosCellRetainsAUnitWithoutAnyMotionConfiguration) {
-  const auto plans = manyforge::roboplan_backend::detail::
-      ros2_control_lifecycle_plans_internal::retained_ros2_control_lifecycle_plans();
-  const auto semantic = core::ComputeBrandLifecyclePlanCatalogSemanticDigest(
-      core::ProviderManifestId("manyforge.provider.ros2_control"), plans);
-  ASSERT_TRUE(semantic.ok());
   const auto fixture =
-      test::make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture(
-          semantic.value().value());
+      test::make_lite_gripper_only_retention_fixture(test::kWithLifecycleOffers);
   const test::Lite6ControllableCompilerInputArtifactSource input_source(fixture);
   test::InMemoryCatalogArtifactStoreFixture catalog_store;
   test::InMemoryRawArtifactStoreFixture raw_store;
@@ -1763,76 +1568,9 @@ TEST(RetainedBundleMaterializer,
   ASSERT_EQ(configuration.controller_profiles.size(), 1U);
   EXPECT_EQ(configuration.controller_profiles.front().controllable_component_id,
             graph.controllable_components.front().controllable_component_id);
-  EXPECT_EQ(configuration.controller_profiles.front().mock_profile,
-            std::optional<std::string>("lite6_lite_gripper"));
-  EXPECT_FALSE(configuration.controller_profiles.front().isaac_profile.has_value());
-}
-
-TEST(RetainedBundleMaterializer, ScalarPeerShapesRetainExactIndependentOwners) {
-  const auto plans = manyforge::roboplan_backend::detail::
-      ros2_control_lifecycle_plans_internal::retained_ros2_control_lifecycle_plans();
-  const auto semantic = core::ComputeBrandLifecyclePlanCatalogSemanticDigest(
-      core::ProviderManifestId("manyforge.provider.ros2_control"), plans);
-  ASSERT_TRUE(semantic.ok());
-  for (const bool arm_root : {false, true}) {
-    SCOPED_TRACE(arm_root ? "real arm root plus independent scalar" : "two scalars without motion");
-    const auto fixture = test::make_lite6_ros2_control_scalar_peer_retention_fixture(
-        semantic.value().value(), arm_root);
-    const test::Lite6ControllableCompilerInputArtifactSource input_source(fixture);
-    test::InMemoryCatalogArtifactStoreFixture catalog_store;
-    test::InMemoryRawArtifactStoreFixture raw_store;
-    const auto bundle = detail::RetainedBundleMaterializer::materialize(
-        fixture.qualified, detail::RetentionMaterializerTestAccess::make_context(),
-        input_source, fixture.structural_preparations(), catalog_store, raw_store);
-    ASSERT_NE(bundle, nullptr);
-    EXPECT_TRUE(verify_retained_bundle_identity(*bundle));
-    const auto &graph = bundle->value().cell_graph;
-    ASSERT_EQ(graph.runtime_units.size(), 1U);
-    ASSERT_EQ(graph.controllable_components.size(), 2U);
-    EXPECT_EQ(graph.model_instances.size(), 2U);
-    EXPECT_NE(graph.controllable_components[0].controllable_component_id,
-              graph.controllable_components[1].controllable_component_id);
-    EXPECT_EQ(graph.control_domains.size(), arm_root ? 3U : 2U);
-    EXPECT_EQ(bundle->value().desired_control_configurations.size(), arm_root ? 3U : 2U);
-    EXPECT_EQ(std::count_if(graph.control_bindings.begin(), graph.control_bindings.end(),
-        [](const auto &binding) { return binding.capability_id.value() == "execution.trajectory.execute"; }),
-        arm_root ? 1 : 0);
-    std::set<core::ControllableComponentId> scalar_components;
-    std::set<core::ResourceId> scalar_resources;
-    std::set<core::ControlDomainId> scalar_domains;
-    for (const auto &binding : graph.control_bindings) {
-      if (binding.capability_id.value() != "tool.gripper.command") continue;
-      EXPECT_EQ(binding.provider_runtime_unit_id, graph.runtime_units.front().runtime_unit_id);
-      EXPECT_TRUE(scalar_components.insert(binding.controllable_component_id).second);
-      EXPECT_TRUE(scalar_domains.insert(binding.control_domain_id).second);
-      ASSERT_EQ(binding.resource_bindings.size(), 1U);
-      EXPECT_TRUE(scalar_resources.insert(binding.resource_bindings.front().resource_id).second);
-    }
-    EXPECT_EQ(scalar_components.size(), 2U);
-    EXPECT_EQ(scalar_resources.size(), 2U);
-    EXPECT_EQ(scalar_domains.size(), 2U);
-    const auto configuration = ros2_control_execution_runtime_contract::require_configuration(
-        *bundle, graph.runtime_units.front().runtime_unit_id);
-    ASSERT_EQ(configuration.controller_profiles.size(), 2U);
-    ASSERT_EQ(configuration.gripper_target_configurations.size(), 2U);
-    EXPECT_EQ(configuration.initial_joint_positions_rad.size(), arm_root ? 6U : 0U);
-    EXPECT_EQ(configuration.motion_target_limits.size(), arm_root ? 1U : 0U);
-    std::set<core::ControllableComponentId> profiled;
-    std::set<std::string> namespaces;
-    for (const auto &profile : configuration.controller_profiles) {
-      EXPECT_TRUE(profiled.insert(profile.controllable_component_id).second);
-      EXPECT_TRUE(namespaces.insert(profile.frame_prefix).second);
-      EXPECT_EQ(profile.mock_profile, std::optional<std::string>("lite6_lite_gripper"));
-      EXPECT_FALSE(profile.isaac_profile.has_value());
-    }
-    EXPECT_EQ(profiled, scalar_components);
-    for (const auto &component : graph.controllable_components) {
-      const bool has_motion = std::any_of(graph.control_bindings.begin(), graph.control_bindings.end(),
-          [&](const auto &binding) { return binding.controllable_component_id == component.controllable_component_id &&
-              binding.capability_id.value() == "execution.trajectory.execute"; });
-      EXPECT_EQ(component.component_type_id.value(), has_motion ? "lite6_arm_gripper_component" : "lite6_gripper_component");
-    }
-  }
+  EXPECT_EQ(configuration.controller_profiles.front().lane, "mock");
+  EXPECT_EQ(configuration.controller_profiles.front().model_family_id,
+            "lite_gripper");
 }
 
 TEST(RetainedBundleMaterializer,
@@ -1846,7 +1584,7 @@ TEST(RetainedBundleMaterializer,
     }};
   };
   const auto valid = detail::decode_execution_motion_target_limits(
-      core::JsonValueDTO::Array{row(0.25)}, false);
+      core::JsonValueDTO::Array{row(0.25)});
   ASSERT_EQ(valid.size(), 1U);
   EXPECT_DOUBLE_EQ(valid.front().maximum_tcp_linear_speed_mps, 0.25);
   EXPECT_FALSE(valid.front().ordinary_motion_jerk.enabled);
@@ -1855,46 +1593,48 @@ TEST(RetainedBundleMaterializer,
         std::numeric_limits<double>::quiet_NaN()}) {
     EXPECT_THROW(
         static_cast<void>(detail::decode_execution_motion_target_limits(
-            core::JsonValueDTO::Array{row(invalid)}, false)),
+            core::JsonValueDTO::Array{row(invalid)})),
         RetainedBundleError);
   }
   EXPECT_THROW(static_cast<void>(detail::decode_execution_motion_target_limits(
-                   core::JsonValueDTO::Array{row(0.25), row(0.25)}, false)),
+                   core::JsonValueDTO::Array{row(0.25), row(0.25)})),
                RetainedBundleError);
   auto missing = row(0.25);
   std::get<core::JsonObjectDTO>(missing.value).erase("command_target_id");
   EXPECT_THROW(static_cast<void>(detail::decode_execution_motion_target_limits(
-                   core::JsonValueDTO::Array{missing}, false)),
+                   core::JsonValueDTO::Array{missing})),
                RetainedBundleError);
-  // tcp_speed_check: absent is the schema default; only the two modes decode.
-  EXPECT_EQ(valid.front().tcp_speed_check, core::TcpSpeedCheck::kActiveTcpAndFlange);
-  const auto checked = [&](core::JsonValueDTO mode) {
-    auto value = row(0.25);
-    std::get<core::JsonObjectDTO>(value.value).emplace("tcp_speed_check", std::move(mode));
-    return detail::decode_execution_motion_target_limits(core::JsonValueDTO::Array{value},
-                                                         false);
-  };
-  EXPECT_EQ(checked(core::JsonValueDTO{std::string("active_tcp")}).front().tcp_speed_check,
-            core::TcpSpeedCheck::kActiveTcp);
-  EXPECT_EQ(checked(core::JsonValueDTO{std::string("active_tcp_and_flange")})
-                .front()
-                .tcp_speed_check,
-            core::TcpSpeedCheck::kActiveTcpAndFlange);
-  for (auto invalid : {core::JsonValueDTO{std::string("flange")}, core::JsonValueDTO{1.0}})
-    EXPECT_THROW(static_cast<void>(checked(std::move(invalid))), RetainedBundleError);
+  // The row is closed: an unknown member refuses.
+  auto extra = row(0.25);
+  std::get<core::JsonObjectDTO>(extra.value).emplace(
+      "unknown_member", core::JsonValueDTO{std::string("x")});
+  EXPECT_THROW(static_cast<void>(detail::decode_execution_motion_target_limits(
+                   core::JsonValueDTO::Array{extra})),
+               RetainedBundleError);
+  // V2-9: the authored ordinary-jerk switch and typed values decode.
+  auto jerk = row(0.25);
+  std::get<core::JsonObjectDTO>(jerk.value).emplace(
+      "ordinary_motion_jerk",
+      core::JsonValueDTO{core::JsonObjectDTO{
+          {"enabled", core::JsonValueDTO{true}},
+          {"preset_reference_time_s", core::JsonValueDTO{0.5}},
+          {"joint_limits",
+           core::JsonValueDTO{core::JsonValueDTO::Array{core::JsonValueDTO{
+               core::JsonObjectDTO{
+                   {"source_joint_name", core::JsonValueDTO{std::string("joint1")}},
+                   {"override_rad_s3", core::JsonValueDTO{40.0}}}}}}}}});
+  const auto decoded =
+      detail::decode_execution_motion_target_limits(core::JsonValueDTO::Array{jerk});
+  EXPECT_EQ(decoded.front().ordinary_motion_jerk,
+            (execution_runtime_contract::OrdinaryMotionJerkSettings{
+                true, 0.5, {{"joint1", 40.0}}}));
 }
 
 // A controller profile row is closed: the removed robot-row `tool_payload`
 // (a tool's payload now comes from its model) is refused, not ignored.
 TEST(RetainedBundleMaterializer, Ros2ControlControllerProfileRefusesToolPayload) {
-  const auto plans = manyforge::roboplan_backend::detail::
-      ros2_control_lifecycle_plans_internal::retained_ros2_control_lifecycle_plans();
-  const auto semantic = core::ComputeBrandLifecyclePlanCatalogSemanticDigest(
-      core::ProviderManifestId("manyforge.provider.ros2_control"), plans);
-  ASSERT_TRUE(semantic.ok());
   const auto fixture =
-      test::make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture(
-          semantic.value().value());
+      test::make_lite_gripper_only_retention_fixture(test::kWithLifecycleOffers);
   const test::Lite6ControllableCompilerInputArtifactSource input_source(fixture);
   test::InMemoryCatalogArtifactStoreFixture catalog_store;
   test::InMemoryRawArtifactStoreFixture raw_store;
@@ -2161,10 +1901,11 @@ TEST(RetainedBundleMaterializer,
   EXPECT_EQ(runtime_configuration.controller_profiles.front()
                 .controllable_component_id.value(),
             test::kLite6ControllableComponentId);
-  EXPECT_EQ(runtime_configuration.controller_profiles.front().isaac_profile,
-            std::optional<std::string>("lite6"));
-  EXPECT_FALSE(
-      runtime_configuration.controller_profiles.front().mock_profile.has_value());
+  EXPECT_EQ(runtime_configuration.controller_profiles.front().lane, "isaac");
+  EXPECT_EQ(runtime_configuration.controller_profiles.front().lane_row,
+            R"({"adapter":"isaac"})");
+  EXPECT_EQ(runtime_configuration.controller_profiles.front().model_family_id,
+            "lite6");
   // Not authored: the soft Stop lead-in keeps the default (command position).
   EXPECT_FALSE(runtime_configuration.controller_profiles.front()
                    .stop_lead_in_anchor.has_value());
@@ -2193,14 +1934,16 @@ TEST(RetainedBundleMaterializer,
   EXPECT_EQ(runtime_configuration.runtime_dynamic_body_max_age_cap_ms,
             1000.0);
   EXPECT_EQ(runtime_configuration.validation_collision_workers, 4U);
-  // Not declared: the kernel's collision clearance and check-step defaults.
+  // Not declared: the kernel's collision clearance, check-step and
+  // fresh-plan check defaults.
   EXPECT_FALSE(runtime_configuration.collision_clearance_m.has_value());
   EXPECT_FALSE(runtime_configuration.collision_check_step_rad.has_value());
+  EXPECT_FALSE(runtime_configuration.collision_check_fresh_plans.has_value());
   EXPECT_TRUE(runtime_configuration.default_fault_stop_profiles.empty());
 
   const auto changed_configuration = canonical_json(replace_object_member(
       parsed_manifest, "configuration", CanonicalValue(CanonicalValue::Object{
-          {"isaac_profile", CanonicalValue("ur10e")}})));
+          {"lane", CanonicalValue("mock")}})));
   EXPECT_THROW(static_cast<void>(
       detail::parse_and_verify_ros2_control_execution_runtime_manifest(
           changed_configuration)), RetainedBundleError);
@@ -2211,153 +1954,6 @@ TEST(RetainedBundleMaterializer,
       RetainedBundleError);
   EXPECT_NO_THROW(static_cast<void>(
       detail::RetainedBundleReloadAuthority::reload(bundle->canonical_bytes())));
-}
-
-TEST(RetainedBundleMaterializer,
-     TwoNativeMotionLite6InstancesRetainDistinctRuntimeProductsAndEndpoints) {
-  GTEST_SKIP() << "held: multi-unit discussion";
-  // DX-753: retain the two-unit assertion reference without native admission.
-  const auto assert_two_runtime_products_and_endpoints =
-      [](const test::Lite6ControllableRetentionFixture &fixture,
-         const RetainedBundle *bundle) {
-      ASSERT_NE(bundle, nullptr);
-      EXPECT_TRUE(verify_retained_bundle_identity(*bundle));
-      ASSERT_EQ(bundle->value().cell_graph.runtime_units.size(), 2U);
-      ASSERT_EQ(bundle->value().capability_provider_bindings.size(), 6U);
-      ASSERT_EQ(bundle->value().compiled_products.runtime_unit_products.size(), 2U);
-      ASSERT_EQ(bundle->value().runtime_contract_requirements.size(), 2U);
-      const auto expected_requirements =
-          detail::derive_runtime_contract_requirements(
-              fixture.qualified.compiler_ir()
-                  .applicability()
-                  .composition()
-                  .graph(),
-              fixture.qualified.deployment()
-                  .applicability_inputs()
-                  .value()
-                  .capability_provider_bindings,
-              fixture.qualified.compiler_ir().applicability().capabilities(),
-              fixture.qualified.compiler_ir()
-                  .applicability()
-                  .provider_endpoints(),
-              fixture.qualified.compiler_ir().applicability().runtime_profiles(), {});
-      EXPECT_EQ(bundle->value().runtime_contract_requirements,
-                expected_requirements);
-
-      const auto &graph =
-          fixture.qualified.compiler_ir().applicability().composition().graph();
-      ASSERT_EQ(graph.runtime_units.size(), 2U);
-      const auto &first_runtime = graph.runtime_units.front().runtime_unit_id;
-      const auto &second_runtime = graph.runtime_units.back().runtime_unit_id;
-      const auto &logical_capabilities =
-          fixture.qualified.compiler_ir().applicability().capabilities();
-      const auto &logical_endpoints =
-          fixture.qualified.compiler_ir().applicability().provider_endpoints();
-      const LogicalCapabilityTemplate *second_runtime_capability = nullptr;
-      for (const auto &capability : logical_capabilities) {
-        const auto *owner =
-            std::get_if<CapabilityProviderCapabilityOwner>(&capability.owner);
-        if (owner == nullptr) {
-          continue;
-        }
-        const auto endpoint = std::find_if(
-            logical_endpoints.begin(), logical_endpoints.end(),
-            [&](const auto &candidate) {
-              const auto *source =
-                  std::get_if<RuntimeEndpointSourceTemplate>(&candidate.source);
-              return candidate.capability_provider_binding_id ==
-                         owner->capability_provider_binding_id &&
-                     candidate.capability_provider_binding_revision ==
-                         owner->capability_provider_binding_revision &&
-                     source != nullptr && source->runtime_unit_id == second_runtime;
-            });
-        if (endpoint != logical_endpoints.end()) {
-          second_runtime_capability = &capability;
-          break;
-        }
-      }
-      ASSERT_NE(second_runtime_capability, nullptr);
-      const std::vector<LogicalCapabilityTemplate> isolated_capability{
-          *second_runtime_capability};
-      const auto isolated_requirements =
-          detail::derive_runtime_contract_requirements(
-              graph,
-              fixture.qualified.deployment()
-                  .applicability_inputs()
-                  .value()
-                  .capability_provider_bindings,
-              isolated_capability, logical_endpoints,
-              fixture.qualified.compiler_ir().applicability().runtime_profiles(),
-              {});
-      const auto isolated_ref = core::RuntimeCapabilityContractRefDTO{
-          second_runtime_capability->capability_id,
-          second_runtime_capability->capability_definition_revision};
-      for (const auto &row : isolated_requirements) {
-        const bool has_isolated_capability = std::binary_search(
-            row.requirement.required_capabilities.begin(),
-            row.requirement.required_capabilities.end(), isolated_ref,
-            [](const auto &left, const auto &right) {
-              if (left.capability_id != right.capability_id) {
-                return left.capability_id < right.capability_id;
-              }
-              return left.capability_definition_revision <
-                     right.capability_definition_revision;
-            });
-        if (row.runtime_unit_id == first_runtime) {
-          EXPECT_FALSE(has_isolated_capability);
-        } else if (row.runtime_unit_id == second_runtime) {
-          EXPECT_TRUE(has_isolated_capability);
-        }
-      }
-
-      std::map<std::string, std::set<std::string>> capabilities_by_runtime;
-      for (const auto &provider : bundle->value().capability_provider_bindings) {
-        ASSERT_EQ(provider.endpoint_bindings.size(), 1U);
-        const auto &endpoint = provider.endpoint_bindings.front();
-        EXPECT_EQ(endpoint.endpoint_role_id.value(),
-                  detail::kNativeExecutionRuntimeProjectionEndpointRoleId);
-        EXPECT_EQ(endpoint.source_kind,
-                  core::CapabilityEndpointSourceKind::kRuntimeUnit);
-        ASSERT_TRUE(
-            std::holds_alternative<core::RuntimeUnitId>(endpoint.source_id));
-        EXPECT_EQ(endpoint.source_endpoint_role_id.value(),
-                  detail::kNativeExecutionRuntimeProjectionEndpointRoleId);
-        capabilities_by_runtime[std::get<core::RuntimeUnitId>(endpoint.source_id)
-                                    .value()]
-            .insert(provider.capability_id.value());
-      }
-
-      std::set<std::string> product_runtime_ids;
-      std::set<std::string> product_ids;
-      for (const auto &group :
-           bundle->value().compiled_products.runtime_unit_products) {
-        EXPECT_TRUE(
-            product_runtime_ids.insert(group.runtime_unit_id.value()).second);
-        ASSERT_EQ(group.products.size(), 1U);
-        const auto &product = group.products.front();
-        EXPECT_TRUE(product_ids.insert(product.product_id.value()).second);
-        // Native-family product ID and admission checks retire with that product.
-        // Runtime/product uniqueness above remains a held shared assertion.
-      }
-      ASSERT_EQ(capabilities_by_runtime.size(), 2U);
-      EXPECT_EQ(product_runtime_ids, ([&] {
-                  std::set<std::string> result;
-                  for (const auto &[runtime_id, capabilities] :
-                       capabilities_by_runtime) {
-                    static_cast<void>(capabilities);
-                    result.insert(runtime_id);
-                  }
-                  return result;
-                })());
-      const std::set<std::string> expected_capabilities{
-          "planning.motion.cartesian_path", "planning.motion.joint_goal",
-          "planning.motion.pose_goal"};
-      for (const auto &[runtime_id, capabilities] : capabilities_by_runtime) {
-        SCOPED_TRACE(runtime_id);
-        EXPECT_EQ(capabilities, expected_capabilities);
-      }
-      };
-  (void)assert_two_runtime_products_and_endpoints;
 }
 
 TEST(RetainedBundleMaterializer,
@@ -2685,7 +2281,7 @@ TEST(RetainedBundleMaterializer,
 }
 
 TEST(RetainedBundleMaterializer,
-     NativeRuntimeProductRejectsMutableLaunchAndTransportSeams) {
+     ExecutionHostProductRejectsMutableLaunchAndTransportSeams) {
   const auto fixture = test::make_lite6_ros2_control_motion_retention_fixture();
   const test::Lite6ControllableCompilerInputArtifactSource input_source(
       fixture);
@@ -2796,85 +2392,10 @@ TEST(RetainedBundleMaterializer,
 }
 
 TEST(RetainedBundleMaterializer,
-     TwoSameTypeComponentsRetainDistinctTargetsResourcesAndDomains) {
-  GTEST_SKIP() << "held: multi-unit discussion";
-  // DX-753: preserve the original two-unit/model/resource assertion reference.
-  const auto assert_distinct_same_type_component_owners =
-      [](const test::Lite6ControllableRetentionFixture &fixture,
-         const RetainedBundle *bundle,
-         const test::InMemoryCatalogArtifactStoreFixture &catalog_store,
-         test::InMemoryRawArtifactStoreFixture &raw_store) {
-      ASSERT_NE(bundle, nullptr);
-      EXPECT_TRUE(verify_retained_bundle_identity(*bundle));
-      ASSERT_EQ(bundle->value().cell_graph.controllable_components.size(), 2U);
-      ASSERT_EQ(bundle->value().cell_graph.control_domains.size(), 2U);
-      ASSERT_EQ(bundle->value().cell_graph.control_bindings.size(), 2U);
-      EXPECT_EQ(bundle->value().catalogs.records.size(), 8U);
-      EXPECT_EQ(catalog_store.size(), 8U);
-      EXPECT_EQ(bundle->value().compiled_products.control_domain_products.size(),
-                2U);
-      EXPECT_EQ(bundle->value().compiled_products.runtime_unit_products.size(), 2U);
-
-      const auto &components = bundle->value().cell_graph.controllable_components;
-      EXPECT_NE(components[0].controllable_component_id,
-                components[1].controllable_component_id);
-      EXPECT_EQ(components[0].component_type_id, components[1].component_type_id);
-      EXPECT_EQ(components[0].component_type_revision,
-                components[1].component_type_revision);
-
-      std::set<std::string> domain_ids;
-      for (const auto &group :
-           bundle->value().compiled_products.control_domain_products) {
-        EXPECT_TRUE(domain_ids.insert(group.control_domain_id.value()).second);
-        ASSERT_EQ(group.products.size(), 1U);
-        const std::string control_bytes = require_product_artifact_bytes(
-            group.products.front(), detail::kControlDomainControlArtifactRole,
-            raw_store);
-        EXPECT_NO_THROW(detail::require_control_domain_control_matches(
-            control_bytes, fixture.qualified.compiler_ir(),
-            group.control_domain_id));
-        const CanonicalValue control =
-            detail::parse_and_verify_control_domain_control(control_bytes);
-        ASSERT_EQ(array_member(control, "bindings").size(), 1U);
-      }
-
-      ASSERT_EQ(bundle->value().compiled_products.symbol_role_maps.size(), 1U);
-      const std::string symbol_map = require_product_artifact_bytes(
-          bundle->value().compiled_products.symbol_role_maps.front(),
-          detail::kComposedModelSymbolRoleMapArtifactRole, raw_store);
-      const CanonicalValue parsed =
-          detail::parse_and_verify_composed_model_symbol_role_map(symbol_map);
-      const auto &binding_maps =
-          array_member(parsed, "control_binding_coordinate_maps");
-      const auto &targets = array_member(parsed, "target_role_maps");
-      ASSERT_EQ(binding_maps.size(), 2U);
-      ASSERT_EQ(targets.size(), 2U);
-
-      std::set<std::string> binding_ids;
-      std::set<std::string> component_ids;
-      std::set<std::string> resource_ids;
-      for (const auto &map : binding_maps) {
-        EXPECT_TRUE(
-            binding_ids.insert(string_member(map, "control_binding_id")).second);
-        EXPECT_TRUE(
-            component_ids.insert(string_member(map, "controllable_component_id"))
-                .second);
-        EXPECT_EQ(string_member(map, "command_target_id"), test::kLite6ArmTargetId);
-        for (const auto &resource : array_member(map, "resources")) {
-          EXPECT_TRUE(
-              resource_ids.insert(string_member(resource, "resource_id")).second);
-        }
-      }
-      EXPECT_EQ(resource_ids.size(), 12U);
-      };
-  (void)assert_distinct_same_type_component_owners;
-}
-
-TEST(RetainedBundleMaterializer,
      AssistantSettingsRetainReloadAndRequalifyExactly) {
   const auto fixture = test::make_lite6_controllable_retention_fixture(
-      false, true, 1U, false, true, {}, false, false, "resource", false,
-      {}, {}, true, false, false, std::nullopt, false,
+      false, true, 1U, {}, false, false, "resource", false,
+      {}, {}, false, false, std::nullopt,
       test::kLite6ArmTargetId, std::nullopt, std::nullopt, {}, true,
       {}, "manyforge.provider.ros2_control", false, true);
   const test::Lite6ControllableCompilerInputArtifactSource input_source(
@@ -2947,38 +2468,6 @@ TEST(RetainedBundleMaterializer,
   // kind change is not an assistant requalification failure.
 }
 
-TEST(RetainedBundleMaterializer,
-     AggregateNativeAssistantProductRetainsOneRuntimeAndDraftProjection) {
-  const auto fixture = test::make_lite6_controllable_retention_fixture(
-      false, true, 1U, true, true, "i6_lite6_arm_gripper_aggregate_cell",
-      true, true, "resource", true, {}, {}, true, false, false,
-      std::nullopt, false, test::kLite6ArmTargetId, std::nullopt,
-      std::nullopt, {}, true, {}, "manyforge.provider.ros2_control",
-      false, true);
-  const test::Lite6ControllableCompilerInputArtifactSource input_source(
-      fixture);
-  test::InMemoryCatalogArtifactStoreFixture catalog_store;
-  test::InMemoryRawArtifactStoreFixture raw_store;
-
-  const auto bundle = detail::RetainedBundleMaterializer::materialize(
-      fixture.qualified,
-      detail::RetentionMaterializerTestAccess::make_context(), input_source,
-      fixture.structural_preparations(), catalog_store, raw_store);
-
-  ASSERT_NE(bundle, nullptr);
-  EXPECT_TRUE(verify_retained_bundle_identity(*bundle));
-  EXPECT_EQ(bundle->value().cell_graph.cell_id.value(),
-            "i6_lite6_arm_gripper_aggregate_cell");
-  EXPECT_EQ(bundle->value().cell_graph.runtime_units.size(), 1U);
-  EXPECT_EQ(bundle->value().compiled_products.runtime_unit_products.size(),
-            1U);
-  ASSERT_TRUE(bundle->value().assistant.has_value());
-  EXPECT_TRUE(fixture.qualified.compiler_ir()
-                  .applicability()
-                  .assistant_settings()
-                  .enabled());
-}
-
 TEST(
     ControlDomainControlVerifier,
     PneumaticFloorRequiresExactSourceAndVerifiedModelCoordinatesAfterMaterialization) {
@@ -2986,9 +2475,8 @@ TEST(
     for (const std::string_view mode : {"commanded", "none"}) {
       if (kind == "position_commanded" && mode == "none")
         continue;
-      const auto fixture = test::
-          make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture(
-              {}, kind, 0.25, nullptr, mode);
+      const auto fixture =
+          test::make_lite_gripper_only_retention_fixture({}, kind, 0.25, mode);
       const test::Lite6ControllableCompilerInputArtifactSource input_source(
           fixture);
       test::InMemoryCatalogArtifactStoreFixture catalog_store;
@@ -3118,7 +2606,7 @@ TEST(ControlDomainControlVerifier,
   const CanonicalValue &stop = stops.front();
   EXPECT_EQ(string_member(stop, "disposition"), "stoppable");
   EXPECT_EQ(string_member(stop, "stop_evidence_policy_id"),
-            "lite6_binding_state_stop");
+            "lite6_controller_goal_terminal_stop");
   // Q51: the retained Stop policy carries no shared cell Stop budget.
   EXPECT_FALSE(std::get<CanonicalValue::Object>(stop.storage()).end() !=
                std::find_if(std::get<CanonicalValue::Object>(stop.storage()).begin(),
@@ -3138,25 +2626,20 @@ TEST(ControlDomainControlVerifier,
       member(command, "registered_command_kind_id").storage()));
   const auto &evidence = array_member(nominal, "all_of_evidence_requirements");
   ASSERT_EQ(evidence.size(), 1U);
-  EXPECT_EQ(string_member(evidence.front(), "evidence_kind"), "motion_rest");
-  EXPECT_FALSE(std::holds_alternative<std::nullptr_t>(
+  // The ROS arm without a qualified controlled Stop trusts its controller:
+  // the nominal stage ends on the goal's terminal status.
+  EXPECT_EQ(string_member(evidence.front(), "evidence_kind"),
+            "controller_goal_terminal");
+  EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(
       member(evidence.front(), "provider_contract_ref").storage()));
   EXPECT_EQ(string_member(member(evidence.front(), "source_requirement"),
                           "source_kind"),
-            "binding_state_authority");
-  EXPECT_EQ(string_member(member(evidence.front(), "source_requirement"),
-                          "endpoint_role_id"),
-            "state");
+            "controller_goal_status");
+  EXPECT_TRUE(std::holds_alternative<std::nullptr_t>(
+      member(member(evidence.front(), "source_requirement"), "endpoint_role_id")
+          .storage()));
   EXPECT_TRUE(array_member(nominal, "provider_evidence_endpoints").empty());
-  const auto &binding_sources =
-      array_member(nominal, "binding_state_authority_sources");
-  ASSERT_EQ(binding_sources.size(), 1U);
-  EXPECT_EQ(string_member(binding_sources.front(), "evidence_item_id"),
-            "nominal_rest");
-  EXPECT_EQ(string_member(binding_sources.front(), "state_authority_class"),
-            "measured");
-  EXPECT_EQ(string_member(binding_sources.front(), "state_endpoint_role_id"),
-            "state");
+  EXPECT_TRUE(array_member(nominal, "binding_state_authority_sources").empty());
   const auto &scopes = array_member(nominal, "containment_scopes");
   ASSERT_EQ(scopes.size(), 1U);
   EXPECT_EQ(string_member(scopes.front(), "scope_kind"), "resource");
@@ -3250,7 +2733,7 @@ TEST(RetainedBundleMaterializer,
      ChainedLite6RetainsOrderedJtcAdmittanceControllerProduct) {
   const auto fixture =
       test::make_lite6_chained_controllable_retention_fixture();
-  // The native runtime admission subleg retires; the chained CCT remains a
+  // The execution host admission subleg retires; the chained CCT remains a
   // normal metadata/compiler/emitter path. Durable closure uses a real ROS host.
   const auto ros_fixture =
       test::make_lite6_ros2_control_shared_consumer_retention_fixture();
@@ -3831,10 +3314,10 @@ TEST(RetainedBundleMaterializer,
                              .cell_graph.controllable_components.front()
                              .controllable_component_id;
   const std::vector<core::StreamParameterOverrideDTO> rows{
-      {component, "map_updates", std::nullopt, core::StreamSeverityDTO::kFault,
+      {component, "map_updates", std::int64_t{5000000000}, std::nullopt,
        std::nullopt},
       {component, "measured_joints", std::int64_t{300000000}, std::nullopt,
-       core::StreamRecoveryDTO::kAuto},
+       std::nullopt},
   };
   const auto with_streams = [&](CanonicalValue streams) {
     CanonicalValue::Object root = bundle->normalized_root().as_object();
@@ -3850,7 +3333,7 @@ TEST(RetainedBundleMaterializer,
 
   const std::vector<core::StreamParameterOverrideDTO> unknown{
       {core::ControllableComponentId("missing_component"), "map_updates",
-       std::nullopt, core::StreamSeverityDTO::kFault, std::nullopt}};
+       std::int64_t{5000000000}, std::nullopt, std::nullopt}};
   EXPECT_THROW(static_cast<void>(detail::RetainedBundleReloadAuthority::reload(
                    with_streams(encode_component_stream_overrides(unknown)))),
                RetainedBundleError);

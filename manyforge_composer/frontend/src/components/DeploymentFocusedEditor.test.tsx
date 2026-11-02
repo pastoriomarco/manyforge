@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
 import type { JsonValue, SourceModelProjection } from '../types/api';
 import type { ManualControlGripperDescriptor } from '../types/robotControl';
+import { api } from '../api/client';
 import { DeploymentFocusedEditor, geometricContactRobotOptions } from './DeploymentFocusedEditor';
 import { statusFixture } from '../testFixtures/robotControl';
 
@@ -34,7 +35,7 @@ function controller(
             control_bindings: [{ control_binding_id: 'arm_binding', control_binding_revision: digest,
               controllable_component_id: 'robot', command_target_id: 'arm', capability_id: 'execution.trajectory.execute' }],
             runtime_units: [{
-              runtime_unit_id: 'robot.native_execution',
+              runtime_unit_id: 'robot.ros2_control_execution',
               configuration: {
                 mode: 'simulated',
                 execution_tick_hz: 100,
@@ -108,11 +109,10 @@ function controller(
     error: null,
     errorCauseCode: null,
     feedback: null,
-    acceptedApply: null,
-    acceptedApplyCorrelationId: null,
-    activationScope: null,
-    pendingApplyConfirmation: null,
-    pendingConfirmationAction: null,
+    busyOperation: null,
+    applyConfirmationOpen: false,
+    applyPreview: null,
+    applyPreviewKind: 'apply',
     comparisonUnavailableReason: null,
     mutationAvailable: true,
     mutationUnavailableReason: null,
@@ -129,14 +129,15 @@ function controller(
     saveAs: vi.fn(),
     discard: vi.fn(),
     applyDraft: vi.fn(),
+    applyConfirmedScope: vi.fn(),
     addComponents: vi.fn(),
-    previewDraft: vi.fn(),
+    previewApply: vi.fn(),
     confirmApply: vi.fn(),
     cancelApplyConfirmation: vi.fn(),
   };
 }
 
-afterEach(() => vi.unstubAllGlobals());
+afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
 function rosGripperController(
   actuationKind: 'position_commanded' | 'pneumatic',
@@ -148,16 +149,13 @@ function rosGripperController(
   const configuration = runtime.configuration as Record<string, JsonValue>;
   runtime.runtime_unit_id = 'robot.ros2_control_execution';
   configuration.mode = 'commanded_sim';
-  configuration.controller_profiles = [{
-    controllable_component_id: 'robot', mock_profile: 'lite6_lite_gripper',
-  }];
   const row = (configuration.gripper_target_configurations as Array<Record<string, JsonValue>>)[0];
   row.output_mode = outputMode;
   configuration.component_streams = [
     { controllable_component_id: 'robot', stream_id: 'gripper_feedback',
-      budget_ns: 1_000_000_000, severity: 'fault', recovery: 'ack' },
+      budget_ns: 1_000_000_000 },
     { controllable_component_id: 'robot', stream_id: 'measured_joints',
-      budget_ns: 250_000_000, severity: 'fault', recovery: 'ack' },
+      budget_ns: 250_000_000 },
   ];
   return value;
 }
@@ -587,27 +585,6 @@ describe('DeploymentFocusedEditor', () => {
     } finally { await act(() => root.unmount()); }
   });
 
-  it('defaults the TCP speed check to TCP and flange and saves a change through the target limit', async () => {
-    const value = controller();
-    const markup = renderToStaticMarkup(<DeploymentFocusedEditor controller={value}
-      sourceModel={{ status: 'loading' }} motionDescriptors={[]} gripperDescriptors={[]} />);
-    expect(markup).toContain('Check TCP speed at');
-    expect(markup).toMatch(/<option value="active_tcp_and_flange" selected="">Active TCP and flange<\/option>/);
-    const { host, find } = mountedHost();
-    const { createRoot } = await import('react-dom/client');
-    const root = createRoot(host as unknown as Element);
-    await act(() => root.render(<DeploymentFocusedEditor controller={value}
-      sourceModel={{ status: 'loading' }} motionDescriptors={[]} gripperDescriptors={[]} />));
-    try {
-      const check = find((props) => props['aria-label'] === 'robot / arm TCP speed check');
-      expect(check.value).toBe('active_tcp_and_flange');
-      await act(() => check.onChange?.({ target: { value: 'active_tcp' } }));
-      expect(value.updateMotionTargetLimit).toHaveBeenCalledExactlyOnceWith(
-        'robot', 'arm', 0.15, 'active_tcp',
-      );
-    } finally { await act(() => root.unmount()); }
-  });
-
   it('commits a Controlled Stop number only on blur or Enter with a valid value', async () => {
     const value = controller();
     const { host, find } = mountedHost();
@@ -650,255 +627,235 @@ describe('DeploymentFocusedEditor', () => {
     } finally { await act(() => root.unmount()); }
   });
 
-  it('edits a Real robot component Stop lead-in start (commanded by default)', async () => {
-    const deploymentDocument = (anchor?: string) => ({
-      api_version: 'manyforge.deployment_intent.v2',
-      deployment_artifact_id: 'cell-a',
-      name: 'Cell A',
-      components: [{
-        component_id: 'robot',
-        component_profile_id: 'lite6_real_measured_v0',
-        frame_prefix: 'robot/',
-        model_source: { urdf: { project_path: 'sources/robot.urdf' }, package_roots: {} },
-        root_pose_in_cell: { position_m: [0, 0, 0], orientation_xyzw: [0, 0, 0, 1] },
-        target_settings: { arm: { maximum_tcp_linear_speed_mps: 0.2 } },
-        configuration: {
-          runtime_kind: 'ros2_control',
-          execution_tick_hz: 100,
-          collision_monitor_period_ms: 50,
-          planner_rng_seed: 12345,
-          initial_joint_positions_rad: [0, 1.57],
-          gripper_target_configurations: [],
-          real_profile: 'lite6_real',
-          device_address_ref: 'lite6_main',
-          ...(anchor === undefined ? {} : { stop_lead_in_anchor: anchor }),
-        },
-      }],
-      attachments: [],
-      policies: {},
-    });
-    for (const anchor of [undefined, 'measured']) {
-      const value = controller();
-      value.workspace!.draft.document = deploymentDocument(anchor);
-      value.workspace!.draft.deploymentRevision = null;
-      value.workspace!.draft.graphRevision = null;
-      const { host, find } = mountedHost();
-      const { createRoot } = await import('react-dom/client');
-      const root = createRoot(host as unknown as Element);
-      await act(() => root.render(<DeploymentFocusedEditor controller={value}
-        sourceModel={{ status: 'loading' }} motionDescriptors={[]} gripperDescriptors={[]} />));
-      const select = () => find((props) => props['aria-label'] === 'Stop lead-in start');
-      try {
-        if (anchor === undefined) {
-          expect(select().value).toBe('commanded');
-          await act(() => select().onChange?.({ target: { value: 'measured' } }));
-          expect(value.mutate).toHaveBeenCalledExactlyOnceWith(
-            ['components', 0, 'configuration', 'stop_lead_in_anchor'], 'set', 'measured');
-        } else {
-          expect(select().value).toBe('measured');
-          await act(() => select().onChange?.({ target: { value: 'commanded' } }));
-          expect(value.mutate).toHaveBeenCalledExactlyOnceWith(
-            ['components', 0, 'configuration', 'stop_lead_in_anchor'], 'remove');
-        }
-      } finally { await act(() => root.unmount()); }
-    }
-  });
-
-  it('edits a Real robot component TCP offset sync (selected by default)', async () => {
-    const deploymentDocument = (sync?: boolean) => ({
-      api_version: 'manyforge.deployment_intent.v2',
-      deployment_artifact_id: 'cell-a',
-      name: 'Cell A',
-      components: [{
-        component_id: 'robot',
-        component_profile_id: 'lite6_real_measured_v0',
-        frame_prefix: 'robot/',
-        model_source: { urdf: { project_path: 'sources/robot.urdf' }, package_roots: {} },
-        root_pose_in_cell: { position_m: [0, 0, 0], orientation_xyzw: [0, 0, 0, 1] },
-        target_settings: { arm: { maximum_tcp_linear_speed_mps: 0.2 } },
-        configuration: {
-          runtime_kind: 'ros2_control',
-          execution_tick_hz: 100,
-          collision_monitor_period_ms: 50,
-          planner_rng_seed: 12345,
-          initial_joint_positions_rad: [0, 1.57],
-          gripper_target_configurations: [],
-          real_profile: 'lite6_real',
-          device_address_ref: 'lite6_main',
-          ...(sync === undefined ? {} : { controller_tcp_offset_sync: sync }),
-        },
-      }],
-      attachments: [],
-      policies: {},
-    });
-    for (const sync of [undefined, false]) {
-      const value = controller();
-      value.workspace!.draft.document = deploymentDocument(sync);
-      value.workspace!.draft.deploymentRevision = null;
-      value.workspace!.draft.graphRevision = null;
-      const { host, find } = mountedHost();
-      const { createRoot } = await import('react-dom/client');
-      const root = createRoot(host as unknown as Element);
-      await act(() => root.render(<DeploymentFocusedEditor controller={value}
-        sourceModel={{ status: 'loading' }} motionDescriptors={[]} gripperDescriptors={[]} />));
-      const checkbox = () => find((props) => props['aria-label'] === 'Send TCP offset to controller');
-      try {
-        if (sync === undefined) {
-          expect(checkbox().checked).toBe(true);
-          await act(() => checkbox().onChange?.({ target: { checked: false } }));
-          expect(value.mutate).toHaveBeenCalledExactlyOnceWith(
-            ['components', 0, 'configuration', 'controller_tcp_offset_sync'], 'set', false);
-        } else {
-          expect(checkbox().checked).toBe(false);
-          await act(() => checkbox().onChange?.({ target: { checked: true } }));
-          expect(value.mutate).toHaveBeenCalledExactlyOnceWith(
-            ['components', 0, 'configuration', 'controller_tcp_offset_sync'], 'remove');
-        }
-      } finally { await act(() => root.unmount()); }
-    }
-  });
-
-  it('accepts any positive collision check step up to 0.2 rad, including 0.0005', async () => {
-    const value = controller();
-    value.workspace!.draft.document = {
-      api_version: 'manyforge.deployment_intent.v2',
-      deployment_artifact_id: 'cell-a',
-      name: 'Cell A',
-      components: [{
-        component_id: 'robot',
-        component_profile_id: 'robot_ros_v1',
-        frame_prefix: 'robot/',
-        model_source: { urdf: { project_path: 'sources/robot.urdf' }, package_roots: {} },
-        root_pose_in_cell: { position_m: [0, 0, 0], orientation_xyzw: [0, 0, 0, 1] },
-        target_settings: { arm: { maximum_tcp_linear_speed_mps: 0.2 } },
-        configuration: {
-          runtime_kind: 'ros2_control',
-          execution_tick_hz: 100,
-          collision_monitor_period_ms: 50,
-          planner_rng_seed: 12345,
-          initial_joint_positions_rad: [0, 1.57],
-          gripper_target_configurations: [],
-        },
-      }],
-      attachments: [],
-      policies: {},
-    };
-    value.workspace!.draft.deploymentRevision = null;
-    value.workspace!.draft.graphRevision = null;
-    const { host, find } = mountedHost();
-    const { createRoot } = await import('react-dom/client');
-    const root = createRoot(host as unknown as Element);
-    await act(() => root.render(<DeploymentFocusedEditor controller={value}
-      sourceModel={{ status: 'loading' }} motionDescriptors={[]} gripperDescriptors={[]} />));
-    const stepInput = () => find((props) => props.max === 0.2);
-    const commit = async (text: string) => {
-      await act(() => stepInput().onChange?.({ target: { value: text } }));
-      await act(() => (stepInput().onBlur as () => void)());
-    };
-    try {
-      expect(stepInput().value).toBe('0.05');
-      expect(stepInput().step).toBe('any');
-      await commit('0.0005');
-      expect(value.mutate).toHaveBeenCalledExactlyOnceWith(
-        ['components', 0, 'configuration', 'collision_check_step_rad'], 'set', 0.0005);
-      for (const refused of ['0', '-0.01', '0.2001']) await commit(refused);
-      expect(value.mutate).toHaveBeenCalledTimes(1);
-      await commit('0.2');
-      expect(value.mutate).toHaveBeenLastCalledWith(
-        ['components', 0, 'configuration', 'collision_check_step_rad'], 'set', 0.2);
-    } finally { await act(() => root.unmount()); }
-  });
-
-  it('edits the runtime settings of a Scenario robot nested under runtime_configuration', async () => {
-    const value = controller();
-    value.workspace!.draft.document = {
+  // CONTRACTS §11: fields show the backend's effective value and default;
+  // writing adds the field, Reset to default removes it. The GUI holds no default.
+  function robotDocument(configuration: Record<string, JsonValue>): Record<string, JsonValue> {
+    return {
       api_version: 'manyforge.deployment_intent.v2', deployment_artifact_id: 'cell-a', name: 'Cell A',
       components: [{
-        component_id: 'robot', component_profile_id: 'lite6_isaac_commanded_v0',
-        model_source: { urdf: { project_path: 'model.urdf' }, package_roots: {} },
+        component_id: 'robot', component_profile_id: 'ufactory.lite6', lane: 'real', frame_prefix: 'robot/',
+        model_source: { urdf: { project_path: 'sources/robot.urdf' }, package_roots: {} },
         root_pose_in_cell: { position_m: [0, 0, 0], orientation_xyzw: [0, 0, 0, 1] },
-        target_settings: { arm: { maximum_tcp_linear_speed_mps: 0.15 } },
-        configuration: {
-          runtime_kind: 'ros2_control',
-          runtime_configuration: {
-            isaac_profile: 'lite6',
-            execution_tick_hz: 250,
-            collision_monitor_period_ms: 50,
-            planner_rng_seed: 12345,
-            initial_joint_positions_rad: [0, 1.57],
-          },
-        },
+        target_settings: { arm: { maximum_tcp_linear_speed_mps: 0.2 } },
+        configuration: { runtime_kind: 'ros2_control', runtime_configuration: configuration },
       }],
       attachments: [],
       policies: {},
     };
+  }
+  const settingsPath = ['components', 0, 'configuration', 'runtime_configuration'];
+  const key = (field: string) => [...settingsPath, field].join('.');
+
+  async function mountEffective(
+    configuration: Record<string, JsonValue>,
+    fields: Record<string, { value: unknown; default: unknown; set: boolean }>,
+    document: Record<string, JsonValue> = robotDocument(configuration),
+  ) {
+    const effective = vi.spyOn(api.cellApply, 'effective').mockResolvedValue({ fields });
+    const value = controller();
+    value.workspace!.draft.document = document;
     value.workspace!.draft.deploymentRevision = null;
     value.workspace!.draft.graphRevision = null;
     vi.mocked(value.mutate).mockResolvedValue(value.workspace);
-    const markup = renderToStaticMarkup(<DeploymentFocusedEditor controller={value}
-      sourceModel={{ status: 'loading' }} motionDescriptors={[]} gripperDescriptors={[]} />);
-    expect(markup).toContain('Execution cadence');
-    expect(markup).toContain('Collision monitor period');
-    expect(markup).toContain('Planner seed');
-    expect(markup).toContain('Initial joint state');
-
     const { host, find } = mountedHost();
     const { createRoot } = await import('react-dom/client');
     const root = createRoot(host as unknown as Element);
     await act(() => root.render(<DeploymentFocusedEditor controller={value}
       sourceModel={{ status: 'loading' }} motionDescriptors={[]} gripperDescriptors={[]} />));
-    const cadence = () => find((props) => props.type === 'number' && props.value === '250');
+    await act(async () => { await Promise.resolve(); });
+    return { value, find, effective, unmount: () => act(() => root.unmount()) };
+  }
+
+  it('shows the effective value of an unset field and writes an edit into the Draft', async () => {
+    const mounted = await mountEffective({}, {
+      [key('execution_tick_hz')]: { value: 250, default: 250, set: false },
+      [key('collision_check_step_rad')]: { value: 0.05, default: 0.05, set: false },
+    });
     try {
+      expect(mounted.effective).toHaveBeenCalledOnce();
+      const cadence = () => mounted.find((props) => props.type === 'number' && props.max === 10000);
+      expect(cadence().value).toBe('250');
+      expect(() => mounted.find((props) => props['aria-label'] === 'Reset Execution cadence to default')).toThrow();
       await act(() => cadence().onChange?.({ target: { value: '125' } }));
-      await act(() => (find((props) => props.type === 'number' && props.value === '125').onBlur as () => void)());
-      expect(value.mutate).toHaveBeenCalledExactlyOnceWith(
-        ['components', 0, 'configuration', 'runtime_configuration', 'execution_tick_hz'], 'set', 125,
-      );
-    } finally { await act(() => root.unmount()); }
+      await act(() => (cadence().onBlur as () => void)());
+      expect(mounted.value.mutate).toHaveBeenCalledExactlyOnceWith([...settingsPath, 'execution_tick_hz'], 'set', 125);
+      const step = () => mounted.find((props) => props.type === 'number' && props.max === 0.2);
+      expect(step().value).toBe('0.05');
+      for (const refused of ['0', '0.2001']) {
+        await act(() => step().onChange?.({ target: { value: refused } }));
+        await act(() => (step().onBlur as () => void)());
+      }
+      expect(mounted.value.mutate).toHaveBeenCalledOnce();
+    } finally { await mounted.unmount(); }
   });
 
-  it('reads and writes a Scenario robot\'s clearance and collision step under runtime_configuration', async () => {
-    // SX-620: Scenario (intent) rows nest their runtime settings; a
-    // non-default value there is shown, and an edit writes back to it.
-    const value = controller();
-    value.workspace!.draft.document = {
+  it('resets a set field to its default by removing it from the Draft', async () => {
+    const mounted = await mountEffective({ collision_clearance_m: 0.004 }, {
+      [key('collision_clearance_m')]: { value: 0.004, default: 0.0001, set: true },
+    });
+    try {
+      expect(mounted.find((props) => props.type === 'number' && props.max === 0.05).value).toBe('0.004');
+      await act(() => mounted.find((props) => props['aria-label'] === 'Reset Collision clearance to default').onClick?.());
+      expect(mounted.value.mutate).toHaveBeenCalledExactlyOnceWith([...settingsPath, 'collision_clearance_m'], 'remove');
+    } finally { await mounted.unmount(); }
+  });
+
+  it('checks fresh plans before dispatch by default; unchecking sets it, Reset removes it', async () => {
+    const label = 'Check fresh plans before dispatch';
+    const box = (find: (match: (props: Props) => boolean) => Props) => find((props) => props['aria-label'] === label);
+    const mounted = await mountEffective({}, {
+      [key('collision_check_fresh_plans')]: { value: true, default: true, set: false },
+    });
+    try {
+      expect(box(mounted.find).checked).toBe(true);
+      expect(() => mounted.find((props) => props['aria-label'] === `Reset ${label} to default`)).toThrow();
+      await act(() => box(mounted.find).onChange?.({ target: { checked: false } }));
+      expect(mounted.value.mutate).toHaveBeenCalledExactlyOnceWith(
+        [...settingsPath, 'collision_check_fresh_plans'], 'set', false);
+    } finally { await mounted.unmount(); }
+
+    const off = await mountEffective({ collision_check_fresh_plans: false }, {
+      [key('collision_check_fresh_plans')]: { value: false, default: true, set: true },
+    });
+    try {
+      expect(box(off.find).checked).toBe(false);
+      expect(off.find((props) => props.children === 'Set · default on')).toBeDefined();
+      await act(() => off.find((props) => props['aria-label'] === `Reset ${label} to default`).onClick?.());
+      expect(off.value.mutate).toHaveBeenCalledExactlyOnceWith(
+        [...settingsPath, 'collision_check_fresh_plans'], 'remove');
+    } finally { await off.unmount(); }
+  });
+
+  it('hides a field the backend does not report', async () => {
+    const mounted = await mountEffective({ planner_rng_seed: 7 }, {});
+    try {
+      expect(() => mounted.find((props) => props.type === 'number' && props.value === '7')).toThrow();
+    } finally { await mounted.unmount(); }
+  });
+
+  it('edits a point-cloud source: required topic and source frame, limits with effective values', async () => {
+    const sensorDocument = {
       api_version: 'manyforge.deployment_intent.v2', deployment_artifact_id: 'cell-a', name: 'Cell A',
       components: [{
-        component_id: 'robot', component_profile_id: 'lite6_isaac_commanded_v0',
-        model_source: { urdf: { project_path: 'model.urdf' }, package_roots: {} },
-        root_pose_in_cell: { position_m: [0, 0, 0], orientation_xyzw: [0, 0, 0, 1] },
-        target_settings: { arm: { maximum_tcp_linear_speed_mps: 0.15 } },
-        configuration: {
-          runtime_kind: 'ros2_control',
-          runtime_configuration: {
-            isaac_profile: 'lite6',
-            collision_clearance_m: 0.004,
-            collision_check_step_rad: 0.02,
-          },
-        },
+        component_id: 'front_points', component_profile_id: 'manyforge.pointcloud_source',
+        target_settings: {},
+        configuration: { runtime_kind: 'sensor',
+          runtime_configuration: { topic: '/front/points', source_frame_id: 'camera_link', max_points: 5000 } },
       }],
       attachments: [],
       policies: {},
     };
-    value.workspace!.draft.deploymentRevision = null;
-    value.workspace!.draft.graphRevision = null;
-    vi.mocked(value.mutate).mockResolvedValue(value.workspace);
-    const { host, find } = mountedHost();
-    const { createRoot } = await import('react-dom/client');
-    const root = createRoot(host as unknown as Element);
-    await act(() => root.render(<DeploymentFocusedEditor controller={value}
-      sourceModel={{ status: 'loading' }} motionDescriptors={[]} gripperDescriptors={[]} />));
-    const clearance = () => find((props) => props.type === 'number' && props.max === 0.05);
-    const step = () => find((props) => props.type === 'number' && props.max === 0.2);
+    const mounted = await mountEffective({}, {
+      [key('max_points')]: { value: 5000, default: 200000, set: true },
+      [key('minimum_period_s')]: { value: 0.1, default: 0.1, set: false },
+    }, sensorDocument);
     try {
-      expect(clearance().value).toBe('0.004');
-      expect(step().value).toBe('0.02');
-      await act(() => step().onChange?.({ target: { value: '0.03' } }));
-      await act(() => (step().onBlur as () => void)());
-      expect(value.mutate).toHaveBeenCalledExactlyOnceWith(
-        ['components', 0, 'configuration', 'runtime_configuration', 'collision_check_step_rad'], 'set', 0.03,
-      );
-    } finally { await act(() => root.unmount()); }
+      expect(mounted.find((props) => props['aria-label'] === 'front_points topic').value).toBe('/front/points');
+      expect(mounted.find((props) => props['aria-label'] === 'front_points source frame').value).toBe('camera_link');
+      // Required, no default: nothing to reset to.
+      expect(() => mounted.find((props) => props['aria-label'] === 'Reset Source frame to default')).toThrow();
+      // No robot sections for a sensor.
+      expect(() => mounted.find((props) => props.type === 'number' && props.max === 10000)).toThrow();
+      const maxPoints = () => mounted.find((props) => props.type === 'number' && props.max === 200000);
+      expect(maxPoints().value).toBe('5000');
+      await act(() => mounted.find((props) => props['aria-label'] === 'Reset Max points to default').onClick?.());
+      expect(mounted.value.mutate).toHaveBeenLastCalledWith([...settingsPath, 'max_points'], 'remove');
+      const period = () => mounted.find((props) => props.type === 'number' && props.max === 10);
+      await act(() => period().onChange?.({ target: { value: '0.5' } }));
+      await act(() => (period().onBlur as () => void)());
+      expect(mounted.value.mutate).toHaveBeenLastCalledWith([...settingsPath, 'minimum_period_s'], 'set', 0.5);
+    } finally { await mounted.unmount(); }
+  });
+
+  it('shows Cartesian timing at its default and writes the chosen timing, with Reset to default', async () => {
+    const unset = await mountEffective({}, {
+      [key('cartesian_timing')]: { value: 'constant_speed', default: 'constant_speed', set: false },
+    });
+    try {
+      const select = () => unset.find((props) => props['aria-label'] === 'Cartesian timing');
+      expect(select().value).toBe('constant_speed');
+      expect(() => unset.find((props) => props['aria-label'] === 'Reset Cartesian timing to default')).toThrow();
+      await act(() => select().onChange?.({ target: { value: 'time_optimal' } }));
+      expect(unset.value.mutate).toHaveBeenLastCalledWith([...settingsPath, 'cartesian_timing'], 'set', 'time_optimal');
+    } finally { await unset.unmount(); }
+    const set = await mountEffective({ cartesian_timing: 'time_optimal' }, {
+      [key('cartesian_timing')]: { value: 'time_optimal', default: 'constant_speed', set: true },
+    });
+    try {
+      expect(set.find((props) => props['aria-label'] === 'Cartesian timing').value).toBe('time_optimal');
+      await act(() => set.find((props) => props['aria-label'] === 'Reset Cartesian timing to default').onClick?.());
+      expect(set.value.mutate).toHaveBeenLastCalledWith([...settingsPath, 'cartesian_timing'], 'remove');
+    } finally { await set.unmount(); }
+  });
+
+  it('shows Motion timing at its default Smooth and writes Fast, with Reset to default', async () => {
+    const unset = await mountEffective({}, {
+      [key('motion_timing')]: { value: 'smooth', default: 'smooth', set: false },
+    });
+    try {
+      const select = () => unset.find((props) => props['aria-label'] === 'Motion timing');
+      expect(select().value).toBe('smooth');
+      expect(unset.find((props) => props.children === 'Smooth (slower, M8-style)').value).toBe('smooth');
+      expect(unset.find((props) => props.children === 'Fast (near the TCP speed limit)').value).toBe('fast');
+      expect(() => unset.find((props) => props['aria-label'] === 'Reset Motion timing to default')).toThrow();
+      await act(() => select().onChange?.({ target: { value: 'fast' } }));
+      expect(unset.value.mutate).toHaveBeenLastCalledWith([...settingsPath, 'motion_timing'], 'set', 'fast');
+    } finally { await unset.unmount(); }
+    const set = await mountEffective({ motion_timing: 'fast' }, {
+      [key('motion_timing')]: { value: 'fast', default: 'smooth', set: true },
+    });
+    try {
+      expect(set.find((props) => props['aria-label'] === 'Motion timing').value).toBe('fast');
+      await act(() => set.find((props) => props['aria-label'] === 'Reset Motion timing to default').onClick?.());
+      expect(set.value.mutate).toHaveBeenLastCalledWith([...settingsPath, 'motion_timing'], 'remove');
+    } finally { await set.unmount(); }
+  });
+
+  it('shows the planner block defaults, writes a choice and shows N only for Best of N', async () => {
+    const defaults = {
+      [key('planner_search')]: { value: 'rrt_connect', default: 'rrt_connect', set: false },
+      [key('planner_optimize')]: { value: 'first', default: 'first', set: false },
+      [key('planner_n')]: { value: 4, default: 4, set: false },
+      [key('planner_max_nodes')]: { value: 5000, default: 5000, set: false },
+    };
+    const unset = await mountEffective({}, defaults);
+    try {
+      expect(unset.find((props) => props['aria-label'] === 'Planner search').value).toBe('rrt_connect');
+      const optimize = () => unset.find((props) => props['aria-label'] === 'Planner optimize');
+      expect(optimize().value).toBe('first');
+      expect(() => unset.find((props) => props.type === 'number' && props.max === 32)).toThrow();
+      expect(unset.find((props) => props.type === 'number' && props.max === 1000000).value).toBe('5000');
+      await act(() => optimize().onChange?.({ target: { value: 'best_of_n' } }));
+      expect(unset.value.mutate).toHaveBeenLastCalledWith([...settingsPath, 'planner_optimize'], 'set', 'best_of_n');
+    } finally { await unset.unmount(); }
+    const best = await mountEffective({ planner_optimize: 'best_of_n' }, {
+      ...defaults,
+      [key('planner_optimize')]: { value: 'best_of_n', default: 'first', set: true },
+    });
+    try {
+      expect(best.find((props) => props.type === 'number' && props.max === 32).value).toBe('4');
+      await act(() => best.find((props) => props['aria-label'] === 'Reset Planner optimize to default').onClick?.());
+      expect(best.value.mutate).toHaveBeenLastCalledWith([...settingsPath, 'planner_optimize'], 'remove');
+    } finally { await best.unmount(); }
+  });
+
+  it('writes the chosen Stop lead-in start and TCP offset sync, with Reset to default', async () => {
+    const mounted = await mountEffective({ stop_lead_in_anchor: 'measured' }, {
+      [key('stop_lead_in_anchor')]: { value: 'measured', default: 'commanded', set: true },
+      [key('controller_tcp_offset_sync')]: { value: true, default: true, set: false },
+    });
+    try {
+      const select = () => mounted.find((props) => props['aria-label'] === 'Stop lead-in start');
+      expect(select().value).toBe('measured');
+      await act(() => select().onChange?.({ target: { value: 'commanded' } }));
+      expect(mounted.value.mutate).toHaveBeenLastCalledWith([...settingsPath, 'stop_lead_in_anchor'], 'set', 'commanded');
+      await act(() => mounted.find((props) => props['aria-label'] === 'Reset Stop lead-in start to default').onClick?.());
+      expect(mounted.value.mutate).toHaveBeenLastCalledWith([...settingsPath, 'stop_lead_in_anchor'], 'remove');
+      const checkbox = () => mounted.find((props) => props['aria-label'] === 'Send TCP offset to controller');
+      expect(checkbox().checked).toBe(true);
+      await act(() => checkbox().onChange?.({ target: { checked: false } }));
+      expect(mounted.value.mutate).toHaveBeenLastCalledWith([...settingsPath, 'controller_tcp_offset_sync'], 'set', false);
+    } finally { await mounted.unmount(); }
   });
 
   it('edits a component\'s lifecycle time budget in the Draft, blank keeping the default', async () => {
@@ -914,14 +871,14 @@ describe('DeploymentFocusedEditor', () => {
           runtime_configuration: { base_url: 'http://127.0.0.1:8000/v1', model: 'm' },
         },
       }, {
-        component_id: 'robot', component_profile_id: 'lite6_isaac_commanded_v0',
+        component_id: 'robot', component_profile_id: 'ufactory.lite6', lane: 'isaac',
         model_source: { urdf: { project_path: 'model.urdf' }, package_roots: {} },
         root_pose_in_cell: { position_m: [0, 0, 0], orientation_xyzw: [0, 0, 0, 1] },
         target_settings: { arm: { maximum_tcp_linear_speed_mps: 0.15 } },
         configuration: {
           runtime_kind: 'ros2_control',
           lifecycle_command_timeout_s: 120,
-          runtime_configuration: { isaac_profile: 'lite6' },
+          runtime_configuration: {},
         },
       }],
       attachments: [],
@@ -961,7 +918,33 @@ describe('DeploymentFocusedEditor', () => {
       // Blank on a component without a budget writes nothing.
       await commit(model, '');
       expect(value.mutate).toHaveBeenCalledTimes(3);
+      // A set budget offers Reset to default; an unset one doesn't.
+      expect(() => find((props) => props['aria-label'] === 'Reset llm lifecycle command time limit to default')).toThrow();
+      await act(() => find((props) => props['aria-label'] === 'Reset robot lifecycle command time limit to default').onClick?.());
+      expect(value.mutate).toHaveBeenLastCalledWith(
+        ['components', 1, 'configuration', 'lifecycle_command_timeout_s'], 'remove');
     } finally { await act(() => root.unmount()); }
+  });
+
+  it('shows the lifecycle time budget\'s effective value and resets a set one to default', async () => {
+    const budgetPath = ['components', 0, 'configuration', 'lifecycle_command_timeout_s'];
+    const unset = await mountEffective({}, {
+      [budgetPath.join('.')]: { value: 10, default: 10, set: false },
+    });
+    const budget = (mounted: typeof unset) => mounted.find((props) => props['aria-label'] === 'robot lifecycle command time limit');
+    try {
+      expect(budget(unset).value).toBe('10');
+      expect(() => unset.find((props) => props['aria-label'] === 'Reset robot lifecycle command time limit to default')).toThrow();
+      // Re-entering the effective value writes nothing; another value is written.
+      await act(() => (budget(unset).onFocus as ((event: unknown) => void) | undefined)?.({}));
+      await act(() => budget(unset).onChange?.({ target: { value: '10' } }));
+      await act(() => (budget(unset).onBlur as () => void)());
+      expect(unset.value.mutate).not.toHaveBeenCalled();
+      await act(() => (budget(unset).onFocus as ((event: unknown) => void) | undefined)?.({}));
+      await act(() => budget(unset).onChange?.({ target: { value: '25' } }));
+      await act(() => (budget(unset).onBlur as () => void)());
+      expect(unset.value.mutate).toHaveBeenCalledExactlyOnceWith(budgetPath, 'set', 25);
+    } finally { await unset.unmount(); }
   });
 
   it('renders authored intent without requiring a compiled graph projection', () => {
@@ -1025,10 +1008,11 @@ describe('DeploymentFocusedEditor', () => {
     expect(markup).toContain('value="0.2"');
     expect(markup).toContain('robot · arm');
     expect(markup).toContain('joint1 maximum deceleration');
-    expect(markup).toContain('Native runtime configuration');
+    expect(markup).toContain('Execution host configuration');
     expect(markup).not.toContain('TF frame prefix');
     expect(markup).not.toContain('Applying a change restarts this robot holding.');
-    expect(markup).toContain('Execution cadence');
+    // Effective-value fields wait for the backend's values (CONTRACTS §11).
+    expect(markup).not.toContain('Execution cadence');
     expect(markup).toContain('Controlled Stop jerk limits');
     // The target is described and has a limit, but a Scenario component's
     // runtime has no direct-control caps: no editor whose values Apply ignores.
@@ -1069,11 +1053,10 @@ describe('DeploymentFocusedEditor', () => {
   });
 
   it.each([
-    { enabled: false, override: null, imported: null, maximum: '0' },
-    { enabled: true, override: 10, imported: 12, maximum: '10' },
-    { enabled: true, override: null, imported: 12, maximum: '12' },
-    { enabled: true, override: null, imported: null, maximum: null },
-  ])('bounds manual jerk from explicit Draft settings: %j', ({ enabled, override, imported, maximum }) => {
+    { enabled: false, override: null, maximum: '0' },
+    { enabled: true, override: 10, maximum: '10' },
+    { enabled: true, override: null, maximum: null },
+  ])('bounds manual jerk from explicit Draft settings: %j', ({ enabled, override, maximum }) => {
     const value = controller();
     const document = value.workspace!.draft.document as unknown as {
       graph: { runtime_units: Array<{ configuration: Record<string, unknown> }> };
@@ -1084,7 +1067,6 @@ describe('DeploymentFocusedEditor', () => {
       enabled, preset_reference_time_s: 2,
       joint_limits: [{ source_joint_name: 'joint1',
         ...(override === null ? {} : { override_rad_s3: override }),
-        ...(imported === null ? {} : { imported: { enabled: true, maximum_rad_s3: imported } }),
       }],
     };
     const descriptor = statusFixture().directControl!.targetDescriptor;
@@ -1115,7 +1097,7 @@ describe('DeploymentFocusedEditor', () => {
     const descriptor = statusFixture().directControl!.targetDescriptor;
     descriptor.controllableComponentId = 'robot';
     descriptor.ordinaryJerk = { enabled: true, presetReferenceTimeS: 1, jointLimits: [{
-      sourceJointName: 'joint1', source: 'preset', maximumRadS3: 12, presetRadS3: 12, imported: null,
+      sourceJointName: 'joint1', source: 'preset', maximumRadS3: 12, presetRadS3: 12,
     }] };
     const markup = renderToStaticMarkup(<DeploymentFocusedEditor controller={value}
       sourceModel={{ status: 'loading' }} motionDescriptors={[descriptor]} gripperDescriptors={[]} />);
@@ -1262,7 +1244,7 @@ describe('DeploymentFocusedEditor', () => {
     expect(markup).not.toContain('Update Controlled Stop Draft');
   });
 
-  it('presents canonical target, native runtime, and normalized Stop inputs', () => {
+  it('presents canonical target, execution host, and normalized Stop inputs', () => {
     const markup = renderToStaticMarkup(
       <DeploymentFocusedEditor
         controller={controller()}
@@ -1271,7 +1253,7 @@ describe('DeploymentFocusedEditor', () => {
           schemaVersion: 'manyforge.manual_control_motion_descriptor.v6',
           ordinaryJerk: { enabled: false, presetReferenceTimeS: 1, jointLimits: [{
             sourceJointName: 'joint1', source: 'off', maximumRadS3: null,
-            presetRadS3: 12, imported: null,
+            presetRadS3: 12,
           }] },
           controllableComponentId: 'robot',
           endEffectorComponentId: null,
@@ -1308,8 +1290,7 @@ describe('DeploymentFocusedEditor', () => {
     expect(markup).toContain('Robot model and target limits');
     expect(markup).toContain('Maximum TCP linear speed');
     expect(markup).toContain('value="0.15"');
-    expect(markup).toContain('Native runtime configuration');
-    expect(markup).toContain('Execution cadence');
+    expect(markup).toContain('Execution host configuration');
     expect(markup).toContain('Initial joint state');
     expect(markup).toContain('Robot Control joint caps');
     expect(markup).toMatch(/Maximum velocity<\/span>[\s\S]*?<input[^>]*max="2"/);
@@ -1392,8 +1373,8 @@ describe('DeploymentFocusedEditor', () => {
     expect(markup).toContain('binding feedback required');
     expect(markup).toContain('Update gripper Draft');
     expect(markup).toContain('finger_link');
-    expect(markup).toContain('Gripper feedback');
-    expect(markup).toContain('Default: 1000 ms · fault · ack');
+    // Streams show their freshness budget only (CONTRACTS §7: no severity or recovery).
+    expect(markup).toContain('<legend>Gripper feedback</legend><p class="muted">Default: 1000 ms</p>');
   });
 });
 

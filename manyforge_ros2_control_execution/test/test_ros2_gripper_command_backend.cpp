@@ -832,6 +832,8 @@ public:
 
 bool wait_for_gripper_fact(const std::function<bool()> &predicate);
 Ros2GripperActionConfig pneumatic_mock_config(const std::string &endpoint);
+bool has_gripper_fact(const core::GripperCommandStatusDTO &status,
+                      const std::string &fact);
 
 TEST(Ros2GripperCommandBackendTest,
      SchedulerCancelFailurePreservesTheInvalidatedGenerationFence) {
@@ -1044,6 +1046,17 @@ public:
     }
     goal->canceled(std::make_shared<Action::Result>());
   }
+  void feedback(std::size_t index, double position, bool reached_goal) {
+    std::shared_ptr<ServerGoal> goal;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      goal = goals_.at(index);
+    }
+    auto feedback = std::make_shared<Action::Feedback>();
+    feedback->position = position;
+    feedback->reached_goal = reached_goal;
+    goal->publish_feedback(feedback);
+  }
   std::atomic<bool> reject{false};
   std::atomic<bool> accept_cancel{true};
   std::atomic<bool> finite_result{false};
@@ -1101,6 +1114,221 @@ TEST(Ros2GripperCommandBackendTest,
       0.7, 0.2, 1.0, "ros_gripper_command", "driver_result")).accepted);
   EXPECT_TRUE(backend.authorize_lifecycle_gripper("tool").succeeded);
   EXPECT_FALSE(backend.get_gripper_status("tool").admission_closed);
+}
+
+// Stock GripperActionController quirk: a Stop that finds the fingers within
+// the stop finish tolerance lets the goal finish (no cancel) and settles on
+// the controller's own result; mid-motion it cancels as before.
+TEST(Ros2GripperCommandBackendTest,
+     StopWithinFinishToleranceLetsTheGoalFinishInsteadOfCancelling) {
+  for (const bool at_target : {true, false}) {
+    SCOPED_TRACE(at_target ? "at target" : "mid-motion");
+    auto sink = std::make_shared<RecordingExecutionStateSink>();
+    sink->set_joint_position("gripper", "finger_joint", 0.7);
+    core::FakeClock clock;
+    core::ManualScheduler scheduler;
+    auto resources = test_transport_resources(sink, clock, "arm");
+    Ros2GripperCommandBackend backend(*resources, sink, clock, scheduler, false);
+    const auto endpoint = "/manyforge_stop_finish_" + unique_suffix();
+    ControlledPneumaticServer server(*resources, endpoint);
+    server.finite_result = true;
+    TestTransportLifetime lifetime(*resources, backend);
+    auto config = pneumatic_mock_config(endpoint);
+    config.actuation_kind = core::GripperActuationKind::kPositionCommanded;
+    config.completion_policy = "driver_result";
+    config.stop_finish_tolerance = 0.05;
+    backend.configure_gripper_action("tool", config);
+    backend.complete_ros_configuration();
+    lifetime.start();
+    ASSERT_TRUE(wait_for_gripper_fact(
+        [&] { return backend.gripper_transport_readiness("tool").ready; }));
+    // The fingers are at 0.7: 0.68 is within the tolerance, 0.0 is not.
+    ASSERT_TRUE(backend.command_gripper(make_gripper_request(
+        at_target ? 0.68 : 0.0, 0.2, 1.0, "ros_gripper_command",
+        "driver_result")).accepted);
+    ASSERT_TRUE(server.wait_for_goal());
+    backend.invalidate_gripper_commands(core::GripperInvalidationReason::kStop);
+    const auto stopped = backend.get_gripper_status("tool");
+    EXPECT_NE(stopped.state, core::GripperCommandState::kExecuting);
+    EXPECT_TRUE(stopped.cancellation_pending);
+    EXPECT_EQ(std::find(stopped.evidence.begin(), stopped.evidence.end(),
+                        "completed_by_natural_completion") !=
+                  stopped.evidence.end(),
+              at_target);
+    if (at_target) {
+      std::this_thread::sleep_for(20ms);
+      EXPECT_EQ(server.cancels.load(), 0U);
+      server.result(0, true);
+    } else {
+      ASSERT_TRUE(wait_for_gripper_fact([&] { return server.cancels.load() == 1U; }));
+      server.canceled(0);
+    }
+    ASSERT_TRUE(wait_for_gripper_fact(
+        [&] { return !backend.get_gripper_status("tool").cancellation_pending; }));
+    EXPECT_TRUE(backend.try_authorize_gripper_commands().ok());
+  }
+}
+
+// GRP-2: wait_for_duration completes only when the controller reported done
+// and command_duration_s has elapsed since the start, in either order; false
+// completes on the controller's result. A Stop during the wait ends the
+// command like a goal finished in its last moment (no cancel).
+TEST(Ros2GripperCommandBackendTest,
+     WaitForDurationCompletesAfterControllerResultAndDuration) {
+  enum class Case { kControllerFirst, kDurationFirst, kNoWait, kStopWhileWaiting };
+  for (const auto order : {Case::kControllerFirst, Case::kDurationFirst,
+                           Case::kNoWait, Case::kStopWhileWaiting}) {
+    SCOPED_TRACE(static_cast<int>(order));
+    auto sink = std::make_shared<RecordingExecutionStateSink>();
+    sink->set_joint_position("gripper", "finger_joint", 0.7);
+    core::FakeClock clock;
+    core::ManualScheduler scheduler;
+    auto resources = test_transport_resources(sink, clock, "arm");
+    Ros2GripperCommandBackend backend(*resources, sink, clock, scheduler, false);
+    const auto endpoint = "/manyforge_wait_for_duration_" + unique_suffix();
+    ControlledPneumaticServer server(*resources, endpoint);
+    server.finite_result = true;
+    TestTransportLifetime lifetime(*resources, backend);
+    auto config = pneumatic_mock_config(endpoint);
+    config.actuation_kind = core::GripperActuationKind::kPositionCommanded;
+    config.completion_policy = "driver_result";
+    backend.configure_gripper_action("tool", config);
+    backend.complete_ros_configuration();
+    lifetime.start();
+    ASSERT_TRUE(wait_for_gripper_fact(
+        [&] { return backend.gripper_transport_readiness("tool").ready; }));
+    auto request = make_gripper_request(0.0, 0.2, 1.0, "ros_gripper_command",
+                                        "driver_result");
+    request.wait_for_duration = order != Case::kNoWait;
+    ASSERT_TRUE(backend.command_gripper(request).accepted);
+    ASSERT_TRUE(server.wait_for_goal());
+    const auto state = [&] { return backend.get_gripper_status("tool").state; };
+    if (order == Case::kDurationFirst) {
+      // Within the result deadline (duration + 0.1 s result timeout).
+      clock.advance(250'000'000);
+      scheduler.advance_to(clock.now());
+      EXPECT_EQ(state(), core::GripperCommandState::kExecuting);
+    }
+    server.result(0, true);
+    // The result's position (0.0) shows the controller's report arrived.
+    ASSERT_TRUE(wait_for_gripper_fact([&] {
+      const auto position = backend.get_gripper_status("tool").current_position;
+      return position.has_value() && *position == 0.0;
+    }));
+    if (order == Case::kDurationFirst || order == Case::kNoWait) {
+      EXPECT_TRUE(wait_for_gripper_fact(
+          [&] { return state() == core::GripperCommandState::kCompleted; }));
+      continue;
+    }
+    std::this_thread::sleep_for(50ms);
+    EXPECT_EQ(state(), core::GripperCommandState::kExecuting);
+    if (order == Case::kStopWhileWaiting) {
+      backend.invalidate_gripper_commands(core::GripperInvalidationReason::kStop);
+      const auto stopped = backend.get_gripper_status("tool");
+      EXPECT_NE(stopped.state, core::GripperCommandState::kExecuting);
+      EXPECT_FALSE(stopped.cancellation_pending);
+      EXPECT_TRUE(has_gripper_fact(stopped, "completed_by_natural_completion"));
+      std::this_thread::sleep_for(20ms);
+      EXPECT_EQ(server.cancels.load(), 0U);
+      EXPECT_TRUE(backend.try_authorize_gripper_commands().ok());
+      continue;
+    }
+    clock.advance(150'000'000);
+    scheduler.advance_to(clock.now());
+    EXPECT_EQ(state(), core::GripperCommandState::kExecuting);
+    clock.advance(50'000'000);
+    scheduler.advance_to(clock.now());
+    EXPECT_TRUE(wait_for_gripper_fact(
+        [&] { return state() == core::GripperCommandState::kCompleted; }));
+  }
+}
+
+// N10: a Stop sends no cancel when the controller reported reached_goal or
+// the node's command_duration_s has elapsed; that command ends on the goal's
+// own result. N10b: mid-motion the Stop cancels and the server's ACCEPT ends
+// the command even when no result ever follows (the stock controller's gap
+// case); the next command is admitted and a late result is ignored.
+TEST(Ros2GripperCommandBackendTest,
+     StopEndsOnFinishedResultOrCancelAcceptAndIgnoresLateResults) {
+  enum class Case { kReachedGoal, kDurationElapsed, kAcceptWithoutResult,
+                    kLateResultIgnored };
+  for (const auto which : {Case::kReachedGoal, Case::kDurationElapsed,
+                           Case::kAcceptWithoutResult,
+                           Case::kLateResultIgnored}) {
+    SCOPED_TRACE(static_cast<int>(which));
+    auto sink = std::make_shared<RecordingExecutionStateSink>();
+    sink->set_joint_position("gripper", "finger_joint", 0.7);
+    core::FakeClock clock;
+    core::ManualScheduler scheduler;
+    auto resources = test_transport_resources(sink, clock, "arm");
+    Ros2GripperCommandBackend backend(*resources, sink, clock, scheduler, false);
+    const auto endpoint = "/manyforge_stop_n10_" + unique_suffix();
+    ControlledPneumaticServer server(*resources, endpoint);
+    server.finite_result = true;
+    TestTransportLifetime lifetime(*resources, backend);
+    auto config = pneumatic_mock_config(endpoint);
+    config.actuation_kind = core::GripperActuationKind::kPositionCommanded;
+    config.completion_policy = "driver_result";
+    config.stop_finish_tolerance = 0.05;
+    backend.configure_gripper_action("tool", config);
+    backend.complete_ros_configuration();
+    lifetime.start();
+    ASSERT_TRUE(wait_for_gripper_fact(
+        [&] { return backend.gripper_transport_readiness("tool").ready; }));
+    // The fingers are at 0.7; 0.0 is far outside the finish tolerance.
+    ASSERT_TRUE(backend.command_gripper(make_gripper_request(
+        0.0, 0.2, 1.0, "ros_gripper_command", "driver_result")).accepted);
+    ASSERT_TRUE(server.wait_for_goal());
+    if (which == Case::kReachedGoal) {
+      // Feedback before the client knows its goal handle is dropped: repeat.
+      ASSERT_TRUE(wait_for_gripper_fact([&] {
+        server.feedback(0, 0.0, true);
+        return backend.get_gripper_status("tool").state ==
+               core::GripperCommandState::kCompleted;
+      }));
+    } else if (which == Case::kDurationElapsed) {
+      // The result deadline stays unscheduled: only the clock moves.
+      clock.advance(200'000'000);
+    }
+    backend.invalidate_gripper_commands(core::GripperInvalidationReason::kStop);
+    const auto stopped = backend.get_gripper_status("tool");
+    EXPECT_NE(stopped.state, core::GripperCommandState::kExecuting);
+    if (which == Case::kReachedGoal) {
+      EXPECT_FALSE(stopped.cancellation_pending);
+      std::this_thread::sleep_for(20ms);
+      EXPECT_EQ(server.cancels.load(), 0U);
+      EXPECT_TRUE(backend.try_authorize_gripper_commands().ok());
+      continue;
+    }
+    if (which == Case::kDurationElapsed) {
+      EXPECT_TRUE(stopped.cancellation_pending);
+      EXPECT_TRUE(has_gripper_fact(stopped, "completed_by_natural_completion"));
+      std::this_thread::sleep_for(20ms);
+      EXPECT_EQ(server.cancels.load(), 0U);
+      EXPECT_TRUE(backend.get_gripper_status("tool").cancellation_pending);
+      server.result(0, true);
+      ASSERT_TRUE(wait_for_gripper_fact(
+          [&] { return !backend.get_gripper_status("tool").cancellation_pending; }));
+      EXPECT_TRUE(backend.try_authorize_gripper_commands().ok());
+      continue;
+    }
+    // The server accepts the cancel and never sends a result.
+    ASSERT_TRUE(wait_for_gripper_fact([&] { return server.cancels.load() == 1U; }));
+    ASSERT_TRUE(wait_for_gripper_fact(
+        [&] { return !backend.get_gripper_status("tool").cancellation_pending; }));
+    if (which == Case::kLateResultIgnored) {
+      server.result(0, false);  // a late abort must not unsettle the Stop
+      std::this_thread::sleep_for(50ms);
+    }
+    const auto settled = backend.get_gripper_status("tool");
+    EXPECT_FALSE(settled.cancellation_pending);
+    EXPECT_EQ(settled.state, core::GripperCommandState::kIdle);
+    EXPECT_FALSE(has_gripper_fact(settled, "completed_by_natural_completion"));
+    ASSERT_TRUE(backend.try_authorize_gripper_commands().ok());
+    ASSERT_TRUE(backend.command_gripper(make_gripper_request(
+        0.7, 0.2, 1.0, "ros_gripper_command", "driver_result")).accepted);
+    ASSERT_TRUE(server.wait_for_goal(2U));
+  }
 }
 
 TEST(Ros2GripperCommandBackendTest,
@@ -1167,14 +1395,14 @@ TEST(Ros2GripperCommandBackendTest,
 
   backend.invalidate_gripper_commands(core::GripperInvalidationReason::kReset);
   ASSERT_TRUE(wait_for_gripper_fact([&] { return server.cancels.load() == 1U; }));
-  const auto pending = backend.try_authorize_gripper_commands();
-  ASSERT_FALSE(pending.ok());
-  EXPECT_EQ(pending.error().code,
-            "ros2_control_gripper_bridge_disable_unsettled");
-  server.result(0, true);
+  // N10b: the server's ACCEPT of the fenced command's cancel is its terminal;
+  // no result is needed, and a later one changes nothing.
   ASSERT_TRUE(wait_for_gripper_fact([&] {
     return backend.try_authorize_gripper_commands().ok();
   }));
+  server.result(0, false);
+  std::this_thread::sleep_for(50ms);
+  EXPECT_TRUE(backend.try_authorize_gripper_commands().ok());
   EXPECT_FALSE(backend.get_gripper_status("tool").admission_closed);
   EXPECT_EQ(server.cancels.load(), 1U);
 }
@@ -2362,7 +2590,7 @@ TEST(
       CommandSchemaRevision(std::string(kGripperPositionCommandSchemaRevision)),
       GripperPositionCommandValueDTO{LinearPositionDTO{0.0}, std::nullopt},
       2.0,
-      {CommandDurationOptionDTO{CommandOptionId("command_duration_s"), 0.03}}};
+      {CommandOptionDTO{CommandOptionId("command_duration_s"), 0.03}}};
   for (const auto &[actuation, output] :
        {std::pair{GripperActuationKind::kPneumatic,
                   GripperOutputMode::kCommanded},

@@ -82,8 +82,6 @@ struct MovingReplacementInputDTO final {
   double remaining_preparation_budget_s{};
   /// Remaining suffix-planning window; absent retains the legacy timeout.
   std::optional<double> remaining_planning_budget_s{};
-  /// The source's speed-check frames; the retained prefix keeps its own set.
-  std::vector<ResolvedFrameDTO> source_speed_check_frames{};
 };
 
 /// Kernel-produced, fully resolved planning request (spec 210 section 3.6).
@@ -135,7 +133,7 @@ struct PlanRequestDTO final {
   ResolvedMotionSpecDTO motion;
   TolerancesDTO tolerances;
   SpeedProfileDTO speed_profile;
-  PlanningProfileDTO planning_profile{PlanningProfileDTO::kFirstFeasible};
+  PlannerOverrideDTO planner{};
   std::optional<std::string> contact_policy_id;
   PerResourceDynamicsLimitsDTO per_resource_dynamics_limits;
   double planning_timeout_s{5.0};
@@ -162,11 +160,6 @@ struct PlanRequestDTO final {
   CollisionWorldSnapshotPtr retained_collision_world{};
   std::shared_ptr<const CollisionPolicySnapshot> retained_collision_policy{};
   std::optional<MovingReplacementInputDTO> moving_replacement{};
-  /// Frames whose linear speed the planner holds under
-  /// `speed_profile.max_tcp_linear_speed_mps`: `tcp_frame` first, then the
-  /// robot flange under `active_tcp_and_flange`. Empty retimes `tcp_frame`
-  /// alone.
-  std::vector<ResolvedFrameDTO> speed_check_frames{};
   /// Operation-local clearance margins retained with the same projection. A
   /// scene-aware planner keeps the same clearance as Kernel validation. Null
   /// means margin 0.

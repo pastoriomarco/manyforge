@@ -26,7 +26,7 @@ HISTORICAL_CASE_FAMILIES: Final = (
     ("demand_fanout_sequence_and_status", 5),
     ("qualification_source_and_demand_scope", 2),
 )
-OWNER_ID: Final = "manyforge.isaac.pointcloud"
+OWNER_ID: Final = "manyforge.pointcloud"
 OWNER_EPOCH: Final = "pointcloud.epoch.1"
 CELL_ID: Final = "isaac.cell.1"
 

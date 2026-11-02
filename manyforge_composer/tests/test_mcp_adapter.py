@@ -21,6 +21,7 @@ from manyforge_composer.backend.mcp_adapter import (
     TOOL_ROUTES,
     tool_contracts,
 )
+from manyforge_composer.backend.routes_headless import create_headless_router
 from manyforge_composer.backend.security import SecurityConfig
 from manyforge_composer.backend.state import ComposerState
 from manyforge_headless_api.client import HeadlessHttpClient
@@ -62,11 +63,11 @@ def test_optional_off_does_not_construct_mcp(tmp_path, monkeypatch):
         assert client.get("/api/program/draft").status_code == 200
 
 
-def test_all_18_tools_derive_action_schemas_from_real_routes(tmp_path):
+def test_all_21_tools_derive_action_schemas_from_real_routes(tmp_path):
     state = _mcp_state(object())
     app = create_app(state, security=_security(tmp_path))
     contracts = tool_contracts(app)
-    assert len(contracts) == len(TOOL_ROUTES) == 18
+    assert len(contracts) == len(TOOL_ROUTES) == 21
     api = app.openapi()
     for tool in contracts:
         jsonschema.Draft202012Validator.check_schema(tool["inputSchema"])
@@ -92,6 +93,38 @@ def test_all_18_tools_derive_action_schemas_from_real_routes(tmp_path):
     assert not next(t for t in contracts if t["name"] == "manyforge_kernel")["annotations"][
         "readOnlyHint"
     ]
+
+
+def test_mcp_has_parity_with_the_component_model_and_apply_routes(tmp_path):
+    """CONTRACTS §11: MCP reaches the same server-side operations as REST."""
+
+    expected = {
+        ("manyforge_scenario", "load"): ("POST", "/api/scenario/load"),
+        ("manyforge_scenario", "new"): ("POST", "/api/scenario/new"),
+        ("manyforge_deployment", "preview"): ("POST", "/api/deployment/preview"),
+        ("manyforge_deployment", "apply"): ("POST", "/api/deployment/apply"),
+        ("manyforge_deployment", "effective"): ("GET", "/api/deployment/effective"),
+        ("manyforge_deployment", "revert_preview"): (
+            "POST", "/api/deployment/revert/preview",
+        ),
+        ("manyforge_deployment", "revert"): ("POST", "/api/deployment/revert"),
+        ("manyforge_components", "list"): ("GET", "/api/components"),
+        ("manyforge_components", "action"): (
+            "POST", "/api/components/{component_id}/actions",
+        ),
+        ("manyforge_components", "group_action"): ("POST", "/api/components/actions"),
+        ("manyforge_components", "cell_latch"): ("GET", "/api/cell/latch"),
+        ("manyforge_components", "readiness"): ("GET", "/api/program/readiness"),
+        ("manyforge_io", "list"): ("GET", "/api/io"),
+        ("manyforge_io", "set"): ("POST", "/api/io/{signal_id}/set"),
+    }
+    for (tool, action), route in expected.items():
+        assert TOOL_ROUTES[tool][action] == route
+    api = create_app(_mcp_state(object()), security=_security(tmp_path)).openapi()
+    for method, path in expected.values():
+        assert method.lower() in api["paths"][path], path
+    routed = {route for actions in TOOL_ROUTES.values() for route in actions.values()}
+    assert not any("/api/cclc/" in path for _method, path in routed)
 
 
 def test_real_mcp_skill_expansion_uses_existing_headless_http_client(tmp_path):
@@ -220,6 +253,47 @@ def test_closed_routing_cannot_be_used_as_a_generic_http_proxy(tmp_path, argumen
     ) as client:
         result = _call(client, "manyforge_catalog", arguments).json()["result"]
         assert result["isError"]
+
+
+def test_mcp_io_set_accepts_member_signals_like_rest(tmp_path):
+    # CONTRACTS §7: a member signal is `<member_id>/<signal>`; REST's
+    # `{signal_id:path}` takes it, so MCP does too, segment by segment.
+    calls = []
+
+    class Headless:
+        def set_io_output(self, signal_id, value):
+            calls.append((signal_id, value))
+            return {"outcome": "succeeded"}
+
+    app = FastAPI()
+    app.include_router(create_headless_router(Headless(), object()))  # type: ignore[arg-type]
+    adapter = ComposerMcpAdapter(app, _security(tmp_path))
+
+    def set_output(signal_id: str):
+        return adapter.invoke(
+            "manyforge_io",
+            {"action": "set", "path": {"signal_id": signal_id}, "body": {"value": True}},
+        )
+
+    async def exercise():
+        assert (await set_output("controller_io/CO1")).json() == {"outcome": "succeeded"}
+        for refused in ("controller_io/../CO1", "controller_io/CO1?x=1", "controller_io//CO1", "/CO1"):
+            with pytest.raises(ValueError, match="invalid path component"):
+                await set_output(refused)
+        # A plain path parameter still takes one component only.
+        with pytest.raises(ValueError, match="invalid path component"):
+            await adapter.invoke(
+                "manyforge_components",
+                {
+                    "action": "action",
+                    "path": {"component_id": "controller_io/CO1"},
+                    "body": {"action": "enable"},
+                },
+            )
+
+    with TestClient(app):
+        asyncio.run(exercise())
+    assert calls == [("controller_io/CO1", True)]
 
 
 def test_mcp_keeps_host_origin_and_request_size_bounds(tmp_path):

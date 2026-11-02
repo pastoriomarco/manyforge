@@ -1029,3 +1029,24 @@ def test_actual_unknown_registration_fails_and_releases_the_attempt_scope(
         "register_io_watch", "release_io_watch"
     ]
     assert sent[3]["scope_request"]["node_attempt_id"] == "attempt.2"
+
+
+def _changed_outside_wait(resource_role: str) -> dict[str, Any]:
+    document = _wait_program(None)
+    document["tree"]["parameters"]["resource_role"] = resource_role
+    document["program_revision"] = compute_content_identity(
+        document,
+        own_field="program_revision",
+        identity_domain="program-revision",
+        api_version="manyforge.program.v2",
+    )
+    return document
+
+
+def test_a_wait_may_name_the_core_held_changed_outside_signal_of_a_declared_role() -> None:
+    """CONTRACTS §7: `<output role>.changed_outside` reads like any signal."""
+
+    catalog = NodeCatalog(_ROOT / "manyforge_behavior/resources/node_catalog.yaml")
+    Program.from_dict(_changed_outside_wait("arm_joints.changed_outside"), catalog)
+    with pytest.raises(ProgramValidationError, match="resource_role"):
+        Program.from_dict(_changed_outside_wait("undeclared.changed_outside"), catalog)

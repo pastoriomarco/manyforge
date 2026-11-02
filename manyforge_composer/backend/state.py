@@ -186,13 +186,6 @@ _PREPARED_ACTIVATION_FIELDS = (
     "node_environment_digest",
     "assistant_mode",
 )
-_DEPLOYMENT_GRAPH_COMPOSITION_RECORDS = (
-    "component_attachments",
-    "controllable_components",
-    "control_bindings",
-    "control_domains",
-    "model_instances",
-)
 _LOGGER = logging.getLogger(__name__)
 # F-6b (item 40): process-lifetime diagnostics of the rare
 # `manager_projection_unavailable` refusal; they decide nothing.
@@ -246,260 +239,6 @@ def _manager_projection_diagnostics(
             None if last_current is None else int((time.monotonic() - last_current) * 1000)
         ),
     }
-
-
-def _runtime_composition_configuration(configuration: dict[str, Any]) -> dict[str, Any]:
-    """Ignore only the validated ordinary jerk setting, not runtime wiring.
-
-    The Deployment compiler validates this parameter before a Draft is installed.
-    Controller endpoints, route configuration and target identities remain part
-    of the comparison, so an unknown configuration edit cannot be draft-only.
-    """
-
-    result = deepcopy(configuration)
-    targets = result.get("motion_target_limits")
-    if isinstance(targets, list):
-        for target in targets:
-            if isinstance(target, dict):
-                target.pop("ordinary_motion_jerk", None)
-    return result
-
-
-def _controllable_composition_change_kinds(
-    before: dict[str, Any] | None, after: dict[str, Any]
-) -> tuple[str, ...] | None:
-    """Name known live-composition contracts changed by a Draft edit.
-
-    This deliberately uses the Deployment and graph record names owned by the
-    compiler. It does not infer robot identity from names or configuration
-    strings. On a source-referenced intent, a component's `configuration` and
-    `target_settings` are ordinary parameters: they stay in the Draft until the
-    confirmed Apply, where the Manager replaces the edited component.
-    """
-
-    if not isinstance(after, dict):
-        return None
-    after_schema = after.get("api_version")
-    if before is None:
-        if after_schema == "manyforge.deployment_intent.v2":
-            # The first Deployment Open is still a before/after comparison:
-            # every authored component compiles to a controllable component.
-            before = {
-                "api_version": "manyforge.deployment_intent.v2",
-                "components": [],
-                "attachments": [],
-            }
-        elif after_schema == "manyforge.deployment.v1":
-            before = {
-                "api_version": "manyforge.deployment.v1",
-                "graph": {
-                    **{kind: [] for kind in _DEPLOYMENT_GRAPH_COMPOSITION_RECORDS},
-                    "runtime_units": [],
-                },
-                "capability_provider_bindings": [],
-            }
-        else:
-            return None
-
-    if not isinstance(before, dict):
-        return None
-
-    before_schema = before.get("api_version")
-    if before_schema != after_schema:
-        return None
-
-    if after_schema == "manyforge.deployment_intent.v2":
-        def intent_components(
-            document: dict[str, Any],
-        ) -> dict[str, dict[str, Any]] | None:
-            rows = document.get("components")
-            if not isinstance(rows, list):
-                return None
-            indexed: dict[str, dict[str, Any]] = {}
-            for row in rows:
-                if (
-                    not isinstance(row, dict)
-                    or not isinstance(row.get("component_id"), str)
-                    or not row["component_id"]
-                    or not isinstance(row.get("component_profile_id"), str)
-                    or not row["component_profile_id"]
-                    or not (
-                        isinstance(row.get("model_source"), dict)
-                        or (
-                            "model_source" not in row
-                            and isinstance(row.get("configuration"), dict)
-                            and row["configuration"].get("runtime_kind")
-                            in ("io_provider", "pose_source", "ai_model")
-                        )
-                    )
-                    or row["component_id"] in indexed
-                ):
-                    return None
-                indexed[row["component_id"]] = row
-            return indexed
-
-        def intent_attachments(
-            document: dict[str, Any],
-        ) -> list[dict[str, Any]] | None:
-            rows = document.get("attachments")
-            if not isinstance(rows, list) or any(
-                not isinstance(row, dict) for row in rows
-            ):
-                return None
-            return rows
-
-        old_by_id = intent_components(before)
-        new_by_id = intent_components(after)
-        old_attachments = intent_attachments(before)
-        new_attachments = intent_attachments(after)
-        if (
-            old_by_id is None
-            or new_by_id is None
-            or old_attachments is None
-            or new_attachments is None
-        ):
-            return None
-        changed: set[str] = set()
-        if old_by_id.keys() != new_by_id.keys():
-            changed.add("controllable_components")
-        for component_id in old_by_id.keys() & new_by_id.keys():
-            old = old_by_id[component_id]
-            new = new_by_id[component_id]
-            if old["component_profile_id"] != new["component_profile_id"]:
-                changed.add("controllable_components")
-            if old.get("model_source") != new.get("model_source"):
-                changed.add("model_instances")
-
-        if old_attachments != new_attachments:
-            changed.add("component_attachments")
-        return tuple(
-            kind
-            for kind in (
-                "component_attachments",
-                "controllable_components",
-                "model_instances",
-            )
-            if kind in changed
-        )
-
-    if after_schema == "manyforge.deployment.v1":
-        record_ids = {
-            "component_attachments": "component_attachment_id",
-            "controllable_components": "controllable_component_id",
-            "control_bindings": "control_binding_id",
-            "control_domains": "control_domain_id",
-            "model_instances": "model_instance_id",
-        }
-
-        def index(rows: Any, identity_field: str) -> dict[str, dict[str, Any]] | None:
-            if not isinstance(rows, list):
-                return None
-            result: dict[str, dict[str, Any]] = {}
-            for row in rows:
-                identity = row.get(identity_field) if isinstance(row, dict) else None
-                if not isinstance(identity, str) or not identity or identity in result:
-                    return None
-                result[identity] = row
-            return result
-
-        def composition(document: dict[str, Any]) -> dict[str, Any] | None:
-            graph = document.get("graph")
-            if not isinstance(graph, dict):
-                return None
-            result: dict[str, Any] = {}
-            for kind, identity_field in record_ids.items():
-                rows = index(graph.get(kind), identity_field)
-                if rows is None:
-                    return None
-                if kind == "model_instances":
-                    if any(
-                        not isinstance(row.get("model_asset_id"), str)
-                        or not row["model_asset_id"]
-                        or not isinstance(row.get("model_revision"), str)
-                        or not row["model_revision"]
-                        for row in rows.values()
-                    ):
-                        return None
-                    result[kind] = {
-                        identity: (row["model_asset_id"], row["model_revision"])
-                        for identity, row in rows.items()
-                    }
-                else:
-                    result[kind] = {
-                        identity: {
-                            key: value
-                            for key, value in row.items()
-                            if not (
-                                kind == "controllable_components"
-                                and key == "root_pose_in_cell"
-                            )
-                        }
-                        for identity, row in rows.items()
-                    }
-
-            runtime = index(graph.get("runtime_units"), "runtime_unit_id")
-            providers = index(
-                document.get("capability_provider_bindings"),
-                "capability_provider_binding_id",
-            )
-            if runtime is None or providers is None:
-                return None
-            for row in runtime.values():
-                dependencies = row.get("dependency_runtime_unit_ids")
-                if (
-                    not isinstance(row.get("runtime_profile_id"), str)
-                    or not isinstance(row.get("runtime_profile_revision"), str)
-                    or not isinstance(dependencies, list)
-                    or any(not isinstance(value, str) for value in dependencies)
-                    or not isinstance(row.get("configuration"), dict)
-                ):
-                    return None
-            result["runtime_units"] = {
-                identity: (
-                    row["runtime_profile_id"],
-                    row["runtime_profile_revision"],
-                    row["dependency_runtime_unit_ids"],
-                )
-                for identity, row in runtime.items()
-            }
-            result["capability_provider_bindings"] = providers
-            return result
-
-        old_shape = composition(before)
-        new_shape = composition(after)
-        if old_shape is None or new_shape is None:
-            return None
-        old_runtime_rows = before["graph"]["runtime_units"]
-        new_runtime_rows = after["graph"]["runtime_units"]
-        old_configurations = {
-            row["runtime_unit_id"]: row["configuration"]
-            for row in old_runtime_rows
-        }
-        new_configurations = {
-            row["runtime_unit_id"]: row["configuration"]
-            for row in new_runtime_rows
-        }
-        if {
-            identity: _runtime_composition_configuration(configuration)
-            for identity, configuration in old_configurations.items()
-        } != {
-            identity: _runtime_composition_configuration(configuration)
-            for identity, configuration in new_configurations.items()
-        }:
-            return None
-        changed = {kind for kind in old_shape if old_shape[kind] != new_shape[kind]}
-        return tuple(
-            kind
-            for kind in (
-                *_DEPLOYMENT_GRAPH_COMPOSITION_RECORDS,
-                "capability_provider_bindings",
-                "runtime_units",
-            )
-            if kind in changed
-        )
-
-    # Unknown or mixed document schemas cannot establish this relationship.
-    return None
 
 
 class ComposerState:
@@ -586,6 +325,9 @@ class ComposerState:
         # Keep only one pending candidate beside the last verified Applied
         # authoring input. Manager/Program publication decides promotion.
         self._applied_deployment_lock = Lock()
+        # Headless runs one activation preparation at a time; previews and
+        # Apply preparations wait here for their turn instead of being refused.
+        self._activation_preparation_lock = Lock()
         self.applied_deployment_document: dict[str, Any] | None = None
         self._applied_activation_context: dict[str, Any] | None = None
         self._applied_deployment_identity: _DeploymentPublicationIdentity | None = None
@@ -698,7 +440,7 @@ class ComposerState:
     @classmethod
     def _published_program_projection(
         cls, status: dict[str, Any]
-    ) -> dict[str, Any] | None:
+    ) -> dict[str, Any]:
         if (
             set(status) != _APPLIED_PROGRAM_STATUS_FIELDS
             or status.get("schema_version") != "manyforge.applied_program_status.v2"
@@ -760,15 +502,6 @@ class ComposerState:
             or not _is_sha256_identity(status.get("record_digest"))
         ):
             raise ValueError("Applied Program status lacks activation identity fields")
-        if origin["kind"] == "sealed_canonical_empty":
-            if not no_program or any(
-                origin[name] != projection[name]
-                for name in ("deployment_artifact_id", "deployment_revision",
-                             "retained_bundle_id", "graph_revision")
-            ):
-                raise ValueError("sealed Applied status is contradictory")
-            # A genuine empty publication has no Scenario projection.
-            return None
         projection.update(scenario_id=origin["scenario_id"],
                           source_document_digest=origin["source_document_digest"])
         projection["program_outcome"] = outcome
@@ -1221,8 +954,6 @@ class ComposerState:
         else:
             try:
                 applied = self._published_program_projection(status_reader())
-                if applied is None:
-                    reasons.append("program_not_applied")
             except HeadlessClientError as error:
                 if error.code in {
                     "program_applied_selection_not_found",
@@ -1381,25 +1112,26 @@ class ComposerState:
         phases: dict[str, float] = {}
         started = time.monotonic()
         try:
-            response = self.headless_client.prepare_activation(
-                {
-                    "source_document_digest": intent["source_document_digest"],
-                    "scenario_id": intent["scenario_id"],
-                    "project_path": intent["project_path"],
-                    "captured_input_digest": intent["captured_input_digest"],
-                    "deployment": deepcopy(intent["deployment"]),
-                    "model_source_closure": deepcopy(
-                        intent["model_source_closure"]
-                    ),
-                    "program": deepcopy(intent["program"]),
-                    "program_role_assignment": deepcopy(
-                        intent["program_role_assignment"]
-                    ),
-                    "expected_admission_generation": intent[
-                        "expected_admission_generation"
-                    ],
-                }
-            )
+            with self._activation_preparation_lock:
+                response = self.headless_client.prepare_activation(
+                    {
+                        "source_document_digest": intent["source_document_digest"],
+                        "scenario_id": intent["scenario_id"],
+                        "project_path": intent["project_path"],
+                        "captured_input_digest": intent["captured_input_digest"],
+                        "deployment": deepcopy(intent["deployment"]),
+                        "model_source_closure": deepcopy(
+                            intent["model_source_closure"]
+                        ),
+                        "program": deepcopy(intent["program"]),
+                        "program_role_assignment": deepcopy(
+                            intent["program_role_assignment"]
+                        ),
+                        "expected_admission_generation": intent[
+                            "expected_admission_generation"
+                        ],
+                    }
+                )
         except HeadlessClientError as error:
             if (
                 claim is None

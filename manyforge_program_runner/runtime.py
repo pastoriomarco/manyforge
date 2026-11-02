@@ -15,7 +15,6 @@ from typing import Any, Final, NoReturn
 import unicodedata
 from urllib.parse import urlsplit
 from uuid import uuid4
-from weakref import ref as weakref_ref
 
 import rfc8785
 
@@ -430,7 +429,7 @@ class ProgramRuntime:
             raise ProgramRunnerError(
                 "program_cycle_journal_version_unsupported", str(error)
             ) from error
-        # One change-only BB key sender per captured Run (contract 52).
+        # One synchronous BB key sender per captured Run (contract 52, BBK-1).
         # Key None is the cell-level source between Runs (SX-2088).
         self._bbkey_publishers: dict[str | None, ProgramBlackboardKeyPublisher] = {}
         # SX-2182: sources whose baseline waits for the global rule catalog of
@@ -494,7 +493,7 @@ class ProgramRuntime:
                 on_expiry=self._contain_manager_loss,
                 on_reconciliation=self._reconcile_manager_liveness,
                 cycle_status=self._current_cycle_status_projection,
-                publication_check=self._check_bbkey_publication_budgets,
+                publication_check=self._retry_pending_bbkey_sources,
             )
         self._owns_headless_client = headless_client is None
         self._headless = headless_client or HeadlessHttpClient(
@@ -633,9 +632,13 @@ class ProgramRuntime:
             owner_id=self.owner_id,
             owner_epoch=self.owner_epoch,
             ports=self._ports,
+            # The execution transport's own timeout (below), not a new one.
+            transport_timeout_s=min(config.headless_timeout_seconds, 30.0),
             maximum_retained_runs=config.maximum_retained_runs,
         )
         self._terminal_observation_lock = RLock()
+        # The latest run's `ProgramRunEnd` as observed at its end (§9).
+        self._run_ends: dict[str, dict[str, Any]] = {}
         self._pending_terminal_snapshots: dict[str, dict[str, Any]] = {}
         self._runtime_controls: dict[str, ProgramRuntimeControls] = {}
         self._runtime_controls_lock = RLock()
@@ -1394,7 +1397,7 @@ class ProgramRuntime:
             selected.add(component)
         # A provider-only I/O component (provider-kind control domain and no
         # controller binding) has no controller profile and no simulator row;
-        # CCLC activation gates it. A component that also has a controller
+        # its component state gates it. A component that also has a controller
         # binding keeps the controller-profile check.
         io_providers: set[Any] = set()
         for domain in rows(graph.get("control_domains")):
@@ -1856,11 +1859,6 @@ class ProgramRuntime:
                 "running",
                 "recovery_required",
             },
-            # The cell-wide Stop-fault latch is Kernel-owned, not Program-owned.
-            # A latch taken while idle (manual operations, malformed Stop) has
-            # no Program Reset to consume it, so the exact Kernel recovery must
-            # stay reachable; it never resumes motion or touches the cycle.
-            "stop_recovery": cycle.state in {"idle_after_reset", "recovery_required"},
             "runtime_scale": cycle.state != "recovery_required",
         }
         if cycle.reconciliation_required:
@@ -1869,7 +1867,6 @@ class ProgramRuntime:
                 in {
                     "cell_full_stop",
                     "execution_recovery",
-                    "stop_recovery",
                     # Exact native manual retirement is needed to release an
                     # unresolved child before Program recovery can complete.
                     "operation_reset",
@@ -1982,6 +1979,9 @@ class ProgramRuntime:
             None if run is None else run["node_status_revision"]
         )
         result["recovery_offer"] = recovery_offer
+        # CONTRACTS §9: why the run ended (None while it runs): the cycle-level
+        # notice reads it instead of inferring "finished" from `failure`.
+        result["run_end"] = None if run is None else run.get("run_end")
         # This is the single shared browser observation. Publishing the exact
         # projections here prevents every connected browser from re-reading
         # the same run and controls after receiving their revision hints.
@@ -2312,7 +2312,15 @@ class ProgramRuntime:
         # Program-run status v1 stays a stable owner contract. C2 state is a
         # separate joined projection so adding controls never weakens or
         # silently version-skews existing run consumers.
-        return deepcopy(dict(value))
+        projected = deepcopy(dict(value))
+        capture = projected.get("capture")
+        run_end = self._run_ends.get(
+            capture.get("program_run_id") if isinstance(capture, Mapping) else None
+        )
+        if run_end is not None and projected.get("run_end") is not None:
+            # The end observed with the cell latch (`cell_fault`).
+            projected["run_end"] = deepcopy(run_end)
+        return projected
 
     def _terminalize_failed_start(
         self,
@@ -2636,90 +2644,6 @@ class ProgramRuntime:
                 str(error) or type(error).__name__,
             ) from error
 
-    def _clear_reset_stop_fault(
-        self,
-        request: ProgramCycleResetRequest,
-    ) -> None:
-        """Consume only the current exact Kernel Stop offer during Reset."""
-
-        for attempt in range(8):
-            response = self._kernel.stop_fault()
-            offer = response.get("stop_fault")
-            if offer is None:
-                return
-            if not isinstance(offer, Mapping):
-                raise ProgramRunnerError(
-                    "program_cycle_reset_stop_recovery_invalid",
-                    "Kernel returned an invalid Stop recovery offer",
-                )
-            latch = offer.get("latch")
-            expectations = offer.get("configuration_expectations")
-            certificate = (
-                latch.get("stop_certificate") if isinstance(latch, Mapping) else None
-            )
-            identity = self._kernel.identity().get("identity")
-            if (
-                not isinstance(latch, Mapping)
-                or not isinstance(expectations, list)
-                or not isinstance(certificate, Mapping)
-                or not isinstance(identity, Mapping)
-                or not isinstance(identity.get("owner_epoch"), str)
-            ):
-                raise ProgramRunnerError(
-                    "program_cycle_reset_stop_recovery_invalid",
-                    "Kernel omitted exact Stop recovery evidence",
-                )
-            recovery_id = (
-                "program-reset-recovery-"
-                + hashlib.sha256(
-                    (
-                        request.request_owner_epoch
-                        + "\0"
-                        + request.request_id
-                        + "\0"
-                        + str(attempt)
-                    ).encode("utf-8")
-                ).hexdigest()[:32]
-            )
-            result = self._kernel.recover_stop_fault(
-                {
-                    "request_context": {
-                        "request_id": recovery_id,
-                        "request_owner_epoch": identity["owner_epoch"],
-                        "source_label": "program_runner_cycle_reset",
-                        "correlation_id": request.correlation_id or request.request_id,
-                    },
-                    "expected_latch_id": latch.get("latch_id"),
-                    "expected_latch_generation": latch.get("latch_generation"),
-                    "expected_recovery_assessment_revision": latch.get(
-                        "recovery_assessment_revision"
-                    ),
-                    "expected_stop_certificate_id": certificate.get(
-                        "stop_certificate_id"
-                    ),
-                    "expected_stop_certificate_revision": certificate.get(
-                        "stop_certificate_revision"
-                    ),
-                    "expected_cell_id": latch.get("cell_id"),
-                    "expected_retained_bundle_id": latch.get("retained_bundle_id"),
-                    "expected_graph_revision": latch.get("graph_revision"),
-                    "configuration_expectations": expectations,
-                    "reason": "Program cycle Reset settled its controlled Stop",
-                }
-            ).get("result")
-            if (
-                not isinstance(result, Mapping)
-                or type(result.get("accepted")) is not bool
-            ):
-                raise ProgramRunnerError(
-                    "program_cycle_reset_stop_recovery_invalid",
-                    "Kernel returned an invalid Stop recovery result",
-                )
-        raise ProgramRunnerError(
-            "program_cycle_reset_stop_recovery_pending",
-            "Kernel Stop recovery did not settle within its bounded attempts",
-        )
-
     def prepare_applied_scene(
         self, request: ProgramScenePreparationRequest
     ) -> dict[str, Any]:
@@ -2809,7 +2733,6 @@ class ProgramRuntime:
                     if (
                         committed.get("scene_initialization") != "initialize"
                         or applied_status.get("program_id") is not None
-                        or committed.get("origin", {}).get("kind") not in {"scenario", "sealed_canonical_empty"}
                         or committed.get("record_digest") != request.expected_applied_record_digest
                         or applied_status.get("record_digest") != request.expected_applied_record_digest
                     ):
@@ -3075,30 +2998,60 @@ class ProgramRuntime:
             "runs": values,
         }
 
+    def _reset_rule_activation(self) -> None:
+        """Every global rule returns to its `active_at_start` at the end of
+        every run (completed, failed, stopped) and at Reset (CONTRACTS §8)."""
+
+        try:
+            self._kernel.reset_rule_activation()
+        except Exception:
+            _LOGGER.exception("global rule activation could not be reset")
+
+    def _run_end_with_cell_fault(self, run_end: Mapping[str, Any]) -> dict[str, Any]:
+        """A run that failed or stopped while the cell is latched ended by a
+        cell fault: the latch is the error; the end names its component."""
+
+        if run_end["end_reason"] == "completed":
+            return dict(run_end)
+        try:
+            latch = self._headless.request("GET", "/api/cell/latch")
+        except HeadlessClientError:
+            _LOGGER.exception("cell latch could not be read for the run end")
+            return dict(run_end)
+        if latch.get("latched") is not True or not latch.get("causes"):
+            return dict(run_end)
+        return {
+            "end_reason": "cell_fault",
+            "details": {"component_id": latch["causes"][0]["component_id"]},
+        }
+
     def _record_terminal_snapshot(self, snapshot: Any) -> None:
         value = (
             snapshot.to_dict()
             if callable(getattr(snapshot, "to_dict", None))
             else snapshot
         )
-        if isinstance(value, Mapping):
-            value = self._project_run(value)
-        if (
-            self._journal is None
-            or not isinstance(value, Mapping)
-            or value.get("state")
-            not in {
-                "stopped",
-                "succeeded",
-                "failed",
-            }
-        ):
+        if not isinstance(value, Mapping) or value.get("state") not in {
+            "stopped",
+            "succeeded",
+            "failed",
+        }:
             return
         capture = value.get("capture")
         if not isinstance(capture, Mapping):
             return
         program_run_id = capture.get("program_run_id")
         if not isinstance(program_run_id, str):
+            return
+        if program_run_id not in self._run_ends and value.get("run_end") is not None:
+            # Once per run (only the latest run's end is kept): its end with
+            # the cell latch, and every rule back to `active_at_start`.
+            self._run_ends = {
+                program_run_id: self._run_end_with_cell_fault(value["run_end"])
+            }
+            self._reset_rule_activation()
+        value = self._project_run(value)
+        if self._journal is None:
             return
         with self._terminal_observation_lock:
             cycle = self._journal.read()
@@ -3163,10 +3116,10 @@ class ProgramRuntime:
                     return
                 self._bbkey_open_losses[token] = ordinal
             # F-2: the cell-level source between Runs guards no Run. Drop it
-            # locally, then fail closed in the Kernel: the sender declares
-            # its own continuity lost (an exact-sender sequence gap), so every
-            # BB-backed global-rule input becomes unavailable and gated motion
-            # is refused until the next Reset or Run installs a new source.
+            # locally; the sender has already failed closed in the Kernel: it
+            # declared its own continuity lost (an exact-sender sequence gap),
+            # so every BB-backed global-rule input is unavailable and gated
+            # motion is refused until the next Reset or Run installs a new source.
             # The fence is released only when every such loss is confirmed,
             # or superseded by a successor whose baseline the Kernel ACKed.
             with self._bbkey_publishers_lock:
@@ -3175,7 +3128,7 @@ class ProgramRuntime:
                     self._bbkey_idle_store = None
 
             def contain() -> None:
-                if created and created[0].declare_lost():
+                if created and created[0].loss_confirmed:
                     self._settle_bbkey_losses(
                         lambda key, _ordinal: key is token,
                         "declared lost in the Kernel",
@@ -3209,8 +3162,6 @@ class ProgramRuntime:
             stop_run=self._stop_for_bbkey_publication_fault,
             on_fault=on_fault,
             fault_reference=self._digest,
-            # The same bounded command budget as every execution request.
-            budget_ns=self._bbkey_budget_ns(),
             on_baseline_accepted=on_baseline_accepted,
             source_ordinal=ordinal,
         )
@@ -3270,18 +3221,24 @@ class ProgramRuntime:
     ) -> None:
         """Send the baseline of the fixed union W = Program keys ∪ the global
         rules' keys only once the catalog of this source's full context
-        (owner epoch, publication, bundle, graph) is known (SX-2182/2184);
-        until then it waits like ``bb_source_not_ready``. A retry of the same
-        pending source keeps its original ``deadline_ns`` (SX-2209)."""
+        (owner epoch, publication, bundle, graph) is known (SX-2182/2184) and
+        the Kernel has installed the source (no ``bb_source_not_ready``).
+        Until then the source is pending: its writes only commit, and the next
+        liveness observation starts it again with a baseline built from the
+        store then (BBK-1 (a)). A pending source keeps its original
+        ``deadline_ns`` (SX-2209)."""
+
+        def pend() -> None:
+            with self._bbkey_publishers_lock:
+                self._bbkey_pending[name] = (
+                    publisher, store, program_keys, context,
+                    time.monotonic_ns() + self._bbkey_budget_ns()
+                    if deadline_ns is None else deadline_ns,
+                )
 
         catalog = self._catalog_for_context(context)
         if catalog is None:
-            if deadline_ns is None:
-                deadline_ns = time.monotonic_ns() + self._bbkey_budget_ns()
-            with self._bbkey_publishers_lock:
-                self._bbkey_pending[name] = (
-                    publisher, store, program_keys, context, deadline_ns,
-                )
+            pend()
             return
         keys = tuple(sorted({*program_keys, *catalog.referenced_program_blackboard_keys}))
         if not keys:
@@ -3304,7 +3261,8 @@ class ProgramRuntime:
             scope.active_publication_generation, context[2], context[3],
             scope.program_binding_id, len(keys),
         )
-        publisher.start(store, keys)
+        if not publisher.start(store, keys):
+            pend()
 
     def _retry_pending_bbkey_sources(self) -> None:
         with self._bbkey_publishers_lock:
@@ -3315,10 +3273,10 @@ class ProgramRuntime:
                 current = self._bbkey_publishers.get(name) is publisher
             if not current:
                 continue  # Retired by a Reset, a new Run or a new publication.
-            if self._catalog_for_context(context) is None and time.monotonic_ns() >= deadline_ns:
+            if time.monotonic_ns() >= deadline_ns:
                 publisher.fail(
-                    f"global interrupt rule catalog of publication {context[1]} is not known; "
-                    "the BB key baseline was not sent"
+                    f"the BB key source of publication {context[1]} was not installed "
+                    "within the command budget (rule catalog unknown or source not ready)"
                 )
                 continue
             self._start_or_defer_bbkey_source(
@@ -3393,8 +3351,6 @@ class ProgramRuntime:
             )
         if self._applied_global_rule_ids():
             self._seed_interrupt_states(store, context)
-        else:
-            self._bind_interrupt_rule_catalog_reader(store, context)
         catalog = self._catalog_for_context(context)
         if not keys and catalog is not None and not catalog.referenced_program_blackboard_keys:
             return None  # W0: no sender, no baseline.
@@ -3597,13 +3553,6 @@ class ProgramRuntime:
                 self._start_idle_bbkey_publication(keys=self._cell_bbkey_union())
             except Exception:
                 _LOGGER.exception("cell-level BB key source could not start")
-
-    def _check_bbkey_publication_budgets(self) -> None:
-        with self._bbkey_publishers_lock:
-            publishers = tuple(self._bbkey_publishers.values())
-        for publisher in publishers:
-            publisher.check_budget()
-        self._retry_pending_bbkey_sources()
 
     # Active TCP values belong to robot handles, independent of BB publishing.
     @staticmethod
@@ -4074,37 +4023,10 @@ class ProgramRuntime:
         (owner epoch, publication, bundle, graph) from its first tick; states
         of another context are unavailable for it (SX-2207)."""
 
-        self._bind_interrupt_rule_catalog_reader(store, context)
         mirror = self._interrupt_state_mirror
         self._write_interrupt_states(
             store, None if mirror is None else mirror.current(context)
         )
-
-    def _bind_interrupt_rule_catalog_reader(
-        self, store: ProgramValueStore, context: tuple[str, int, str, str]
-    ) -> None:
-        """Let gate retries query the latest catalog for this exact Run."""
-
-        mirror = self._interrupt_state_mirror
-        if mirror is None:
-            store.set_interrupt_notify_rule_reader(None)
-            return
-        mirror_ref = weakref_ref(mirror)
-
-        def read_notify_rule_ids() -> tuple[str, ...] | None:
-            current = mirror_ref()
-            if current is None:
-                return None
-            try:
-                catalog = current.catalog()
-            except Exception:
-                _LOGGER.exception("interrupt rule catalog could not be read")
-                return None
-            if catalog is None or catalog.context != context:
-                return None
-            return catalog.notify_rule_ids
-
-        store.set_interrupt_notify_rule_reader(read_notify_rule_ids)
 
     def _stop_for_bbkey_publication_fault(self, program_run_id: str) -> None:
         """The Run's own Program Stop, tried before the health failure."""
@@ -4143,125 +4065,28 @@ class ProgramRuntime:
                         details={"controllable_component_id": robot},
                     )
 
-    def _verify_required_components_active(
-        self, applied: Mapping[str, Any]
-    ) -> None:
-        """Check the Program's bound components against current CCLC truth.
-
-        The Applied publication is validated before this check. An incomplete
-        or malformed binding fails closed.
-        """
-
-        binding = applied.get("program_binding")
-        if not isinstance(binding, Mapping):
-            raise ProgramRunnerError(
-                "program_run_binding_invalid", "Applied Program Binding is invalid"
-            )
-        roles = binding.get("component_role_bindings")
-        # An empty list is a logic-only Program: no component to check.
-        if not isinstance(roles, list) or len(roles) > 4096:
-            raise ProgramRunnerError(
-                "program_run_binding_invalid",
-                "Applied Program component requirements are not a bounded list",
-            )
-        component_ids: set[str] = set()
-        for row in roles:
-            component_id = (
-                row.get("controllable_component_id")
-                if isinstance(row, Mapping)
-                else None
-            )
-            if not isinstance(component_id, str) or not component_id:
-                raise ProgramRunnerError(
-                    "program_run_binding_invalid",
-                    "Applied Program has an invalid component requirement",
-                )
-            component_ids.add(component_id)
-        for component_id in sorted(component_ids):
-            observed = self._headless.cclc_component_lifecycle_snapshot(component_id)
-            if (
-                not isinstance(observed, Mapping)
-                or observed.get("controllable_component_id") != component_id
-                or observed.get("retained_bundle_id")
-                != applied.get("retained_bundle_id")
-                or observed.get("graph_revision") != applied.get("graph_revision")
-            ):
-                raise ProgramRunnerError(
-                    "program_required_component_stale",
-                    f"Required component {component_id} has no current CCLC identity",
-                )
-            state = observed.get("component_lifecycle_state")
-            if state != "active":
-                raise ProgramRunnerError(
-                    "program_required_component_not_active",
-                    f"Required component {component_id} is {state!r}, not active",
-                )
-
-    def _verify_selected_motion_feedback(
-        self, program_run_id: str, group_ids: Sequence[str]
-    ) -> None:
-        """Transient preflight; command-time Kernel/port checks remain authoritative."""
+    def _require_run_readiness(self, can: str) -> None:
+        """Refuse Execute (``can_execute``), a stopped run's Resume (``can_resume``)
+        or a held motion group's Run/Resume (``motion_clear``) with
+        the first reason of the one ``RunReadiness`` owner (CONTRACTS §10,
+        ``GET /api/program/readiness``); the Runner computes none itself."""
 
         try:
-            component_ids, retained_bundle_id, graph_revision = (
-                self._owner.execution_selection_motion_readiness_scope(
-                    program_run_id, group_ids
-                )
-            )
-        except ProgramRunOwnerError as error:
-            raise ProgramRunnerError(
-                "program_motion_readiness_invalid", str(error)
-            ) from error
-        if not component_ids:
+            readiness = self._headless.request("GET", "/api/program/readiness")
+        except HeadlessClientError as error:
+            raise self._headless_error(error) from error
+        if readiness.get(can) is True:
             return
-        for component_id in component_ids:
-            try:
-                observed = self._headless.cclc_component(component_id)
-            except HeadlessClientError as error:
-                raise ProgramRunnerError(
-                    "program_motion_component_readiness_unavailable",
-                    str(error),
-                    details={
-                        **error.details,
-                        "controllable_component_id": component_id,
-                    },
-                ) from error
-            if (
-                not isinstance(observed, Mapping)
-                or observed.get("controllable_component_id") != component_id
-                or observed.get("retained_bundle_id") != retained_bundle_id
-                or observed.get("graph_revision") != graph_revision
-            ):
-                raise ProgramRunnerError(
-                    "program_motion_component_readiness_stale",
-                    f"Selected component {component_id} has no current readiness identity",
-                )
-            readiness = observed.get("readiness")
-            measured = (
-                readiness.get("measured_state")
-                if isinstance(readiness, Mapping)
-                else None
-            )
-            if not isinstance(measured, Mapping):
-                raise ProgramRunnerError(
-                    "program_motion_component_readiness_unavailable",
-                    f"Selected component {component_id} has no measured-state verdict",
-                )
-            required = measured.get("required")
-            available = measured.get("available")
-            error = measured.get("error")
-            if required is False and available is None and error is None:
-                continue
-            if required is True and available is True and error is None:
-                continue
-            reason = error.get("message") if isinstance(error, Mapping) else None
-            raise ProgramRunnerError(
-                "program_motion_component_readiness_unavailable",
-                reason
-                if isinstance(reason, str) and reason
-                else f"Selected component {component_id} has no fresh measured state",
-                details={"controllable_component_id": component_id},
-            )
+        reasons = readiness["blocked_reasons"]
+        # A rule hold never clears motion_clear: the kernel refuses its scope.
+        reason = next(
+            (row for row in reasons if row["code"] != "rule_holds"), reasons[0]
+        ) if can == "motion_clear" else reasons[0]
+        raise ProgramRunnerError(
+            reason["code"],
+            reason["message"],
+            details={key: value for key, value in reason.items() if key not in {"code", "message"}},
+        )
 
     def start_run(self, request: ProgramRunStartRequest) -> dict[str, Any]:
         if not isinstance(request, ProgramRunStartRequest):
@@ -4431,7 +4256,22 @@ class ProgramRuntime:
                 )
                 if declared is not run_admission.program:
                     run_admission = replace(run_admission, program=declared)
-                self._verify_required_components_active(applied)
+                # A `rules.set_active` naming a rule the Deployment lacks
+                # blocks Execute (CONTRACTS §9).
+                unknown_rules = sorted(
+                    set(declared.rule_activation_rule_ids)
+                    - set(self._applied_global_rule_ids(
+                        retained_bundle_id=str(applied["retained_bundle_id"]),
+                        graph_revision=str(applied["graph_revision"]),
+                    ))
+                )
+                if unknown_rules:
+                    raise ProgramRunnerError(
+                        "rule_unknown",
+                        f"Rule {unknown_rules[0]} is not in the Deployment",
+                        details={"rule_id": unknown_rules[0]},
+                    )
+                self._require_run_readiness("can_execute")
                 self._require_end_effector_tcps()
                 pre_claim_dropped: tuple[Any, ...] = ()
                 if self._persistent_keys is not None:
@@ -4553,10 +4393,6 @@ class ProgramRuntime:
                         "program_run_applied_selection_stale",
                         "Applied Program changed during Run admission",
                     )
-                # CCLC excludes lifecycle mutations while this claim is held.
-                # Re-read here so a Disable that won after the first check
-                # cannot be overtaken by Program execution.
-                self._verify_required_components_active(applied_after_claim)
                 recovery_fences = self._run_recovery_fences(
                     applied_after_claim,
                     execution_identity,
@@ -5070,38 +4906,8 @@ class ProgramRuntime:
             "recovery_offers": self._recovery_offers(
                 program_run_id, cycle_generation=self._current_cycle_generation()
             ),
-            "execution_selections": self._motion_feedback_controls(
-                program_run_id, execution_selections
-            ),
+            "execution_selections": deepcopy(dict(execution_selections)),
         }
-
-    def _motion_feedback_controls(
-        self, program_run_id: str, execution_selections: Mapping[str, Any]
-    ) -> dict[str, Any]:
-        """Advisory controls projection from the same preflight as dispatch."""
-
-        projected = deepcopy(dict(execution_selections))
-        groups = projected.get("groups")
-        if not isinstance(groups, list):
-            return projected
-        for group in groups:
-            if not isinstance(group, dict) or not (
-                group.get("start_allowed") is True
-                or group.get("resume_allowed") is True
-            ):
-                continue
-            group_id = group.get("group_id")
-            if not isinstance(group_id, str):
-                continue
-            try:
-                self._verify_selected_motion_feedback(program_run_id, (group_id,))
-            except (ProgramRunnerError, ProgramRunOwnerError) as error:
-                reason = str(error) or "Selected motion feedback is unavailable"
-                group["start_allowed"] = False
-                group["resume_allowed"] = False
-                group["start_unavailable_reason"] = reason
-                group["resume_unavailable_reason"] = reason
-        return projected
 
     def _current_cycle_generation(self) -> int:
         return 1 if self._journal is None else self._journal.read().cycle_generation
@@ -5194,7 +5000,12 @@ class ProgramRuntime:
                 live = self._owner.read(request.program_run_id)
             except ProgramRunOwnerError as error:
                 reject(ProgramRunnerError("program_run_not_found", str(error)))
-            if live.run_revision != request.expected_run_revision:
+            # Run/Resume names its run by id, epoch and selection revision;
+            # tree ticks raise the run revision without changing that (N8).
+            if (
+                kind not in {"start_motion", "resume_motion"}
+                and live.run_revision != request.expected_run_revision
+            ):
                 reject(
                     ProgramRunnerError(
                         "program_runtime_control_stale",
@@ -5381,7 +5192,7 @@ class ProgramRuntime:
             if len(projection["committed_applies"]) > MAX_RECONCILED_APPLIES:
                 raise ProgramRunnerError(
                     "persistent_key_activation_unavailable",
-                    "the complete committed Apply history exceeds its bound",
+                    "the retained committed Apply history exceeds its bound",
                 )
             return projection
         except (HeadlessClientError, ProgramBindingTransportError) as error:
@@ -5397,11 +5208,6 @@ class ProgramRuntime:
 
         if projection is None:
             projection = self._committed_projection()
-        if projection["origin"]["kind"] != "scenario":
-            raise ProgramRunnerError(
-                "persistent_key_activation_unavailable",
-                "the committed activation has no Scenario",
-            )
         program: Program | None = None
         if projection["program"] is not None:
             try:
@@ -5418,11 +5224,9 @@ class ProgramRuntime:
                 record_digest=projection["record_digest"],
                 project_path=projection["origin"]["project_path"],
                 declarations={} if program is None else dict(program.blackboard_keys),
-                # Sealed rows were validated above and carry no Scenario.
                 committed_applies={
                     row["record_digest"]: row["origin"]["project_path"]
                     for row in projection["committed_applies"]
-                    if row["origin"]["kind"] == "scenario"
                 },
             )
         except PersistentKeyRegisterError as error:
@@ -5442,13 +5246,8 @@ class ProgramRuntime:
 
         if projection is None:
             projection = self._committed_projection()
-        # Preserve Scenario's Program-parse precedence; sealed origin checks
-        # the expected record before reporting that no Scenario is available.
-        scenario_activation = (
-            self._committed_activation(projection)
-            if projection["origin"]["kind"] == "scenario"
-            else None
-        )
+        # An unreadable Program takes precedence over a stale record.
+        activation, program = self._committed_activation(projection)
         if (
             expected_record_digest is not None
             and projection["record_digest"] != expected_record_digest
@@ -5457,7 +5256,6 @@ class ProgramRuntime:
                 "program_run_applied_selection_stale",
                 "the committed Scenario activation is not the admitted one",
             )
-        activation, program = scenario_activation or self._committed_activation(projection)
         try:
             reconciliation = register.reconcile(activation)
         except PersistentKeyRegisterError as error:
@@ -5483,16 +5281,6 @@ class ProgramRuntime:
 
         register = self._persistent_key_register()
         projection = self._committed_projection()
-        if projection["origin"]["kind"] == "sealed_canonical_empty":
-            return {
-                "schema_version": PERSISTENT_KEY_RECONCILIATION_VERSION,
-                "outcome": "no_scenario",
-                "record_digest": projection["record_digest"],
-                "origin": deepcopy(projection["origin"]),
-                "dropped": [],
-                "unobserved_applies": [],
-                "history_changed": False,
-            }
         activation, program, reconciliation = self._reconcile_persistent_keys(
             register, projection=projection
         )
@@ -6161,6 +5949,12 @@ class ProgramRuntime:
                     )
                 )
             if request.action_id in _MOTION_PRODUCING_RECOVERY_ACTIONS:
+                # Held motion continues: like a group's Run/Resume it needs
+                # motion_clear (CONTRACTS §10), refused before any effect.
+                try:
+                    self._require_run_readiness("motion_clear")
+                except ProgramRunnerError as error:
+                    reject(error)
                 # Spec 450 §5.2: the Kernel refuses these while operator-alarm
                 # attention gates the held node's resources. Ask it before any
                 # effect so a refusal leaves the held attempt untouched; an
@@ -6365,9 +6159,6 @@ class ProgramRuntime:
                     self._refresh_active_tcp()
                     snapshot = self._host.resume_motion(
                         program_run_id,
-                        expected_run_revision=self._owner.read(
-                            program_run_id
-                        ).run_revision,
                         expected_selection_revision=selection_scope.selection_revision,
                         request_id=request.request_id,
                         reason=request.reason,
@@ -6807,12 +6598,11 @@ class ProgramRuntime:
             )
 
         def effect() -> dict[str, Any]:
-            self._verify_selected_motion_feedback(program_run_id, request.group_ids)
+            self._require_run_readiness("motion_clear")
             try:
                 self._refresh_active_tcp()
                 snapshot = self._host.resume_motion(
                     program_run_id,
-                    expected_run_revision=request.expected_run_revision,
                     expected_selection_revision=request.expected_selection_revision,
                     request_id=request.request_id,
                     group_id=request.group_ids,
@@ -6845,11 +6635,10 @@ class ProgramRuntime:
             )
 
         def effect() -> dict[str, Any]:
-            self._verify_selected_motion_feedback(program_run_id, request.group_ids)
+            self._require_run_readiness("motion_clear")
             self._refresh_active_tcp()
             snapshot = self._host.start_motion(
                 program_run_id,
-                expected_run_revision=request.expected_run_revision,
                 expected_selection_revision=request.expected_selection_revision,
                 request_id=request.request_id,
                 group_id=request.group_ids,
@@ -7041,6 +6830,7 @@ class ProgramRuntime:
             )
 
         def effect() -> dict[str, Any]:
+            self._require_run_readiness("can_resume")
             self._refresh_active_tcp()
             snapshot = self._host.resume_full_stop(
                 program_run_id,
@@ -7273,8 +7063,6 @@ class ProgramRuntime:
             return
         try:
             projection = self._committed_projection()
-            if projection["origin"]["kind"] != "scenario":
-                return
             activation, program, _reconciliation = self._reconcile_persistent_keys(
                 register, projection=projection
             )
@@ -7342,7 +7130,7 @@ class ProgramRuntime:
         # implicit-scene journals are rejected intact, never reinterpreted.
         return {
             key: row["intent"].get(key, False)
-            for key in ("reload_initial_scene", "reset_robot_position", "keep_stop_fault")
+            for key in ("reload_initial_scene", "reset_robot_position")
         }
 
     def _reset_robot_position_availability(self) -> dict[str, Any]:
@@ -7484,15 +7272,9 @@ class ProgramRuntime:
     def _require_same_reset_options(
         request: ProgramCycleResetRequest, accepted: ProgramCycleResetRequest
     ) -> None:
-        # D6: whether the Reset keeps the Stop fault is part of the occurrence.
-        if (
-            request.reload_initial_scene,
-            request.reset_robot_position,
-            request.keep_stop_fault,
-        ) != (
+        if (request.reload_initial_scene, request.reset_robot_position) != (
             accepted.reload_initial_scene,
             accepted.reset_robot_position,
-            accepted.keep_stop_fault,
         ):
             raise ProgramRunnerError(
                 "program_run_request_conflict",
@@ -7708,6 +7490,7 @@ class ProgramRuntime:
                 request_owner_epoch=request.request_owner_epoch, request_id=request.request_id,
                 result=result,
             )
+            self._reset_rule_activation()
             self._follow_cell_bbkey_source()
             return result
         except Exception as error:
@@ -7779,7 +7562,6 @@ class ProgramRuntime:
             reset_accepted = False
             record_created = False
             recovery_reset = self._current_cycle_recovery_reset(cycle, pending)
-            confirmation_request = request
             stop_request_identity = (
                 f"program-reset:{request.request_owner_epoch}:{request.request_id}"
             )
@@ -8025,12 +7807,6 @@ class ProgramRuntime:
                         phase="settling",
                         terminal_reference=reference,
                     )
-                # Any entrypoint must reconcile the exact Kernel Stop-fault
-                # latch before publishing Idle for the next Run, except the
-                # Reset of Scenario Close (D6): Close never clears the latch,
-                # which then refuses the next Run until Recover cell.
-                if not confirmation_request.keep_stop_fault:
-                    self._clear_reset_stop_fault(confirmation_request)
                 cycle = journal.read()
                 request = request.model_copy(
                     update={
@@ -8384,6 +8160,7 @@ class ProgramRuntime:
                         "released Program-cycle claim was not durably settled",
                     )
                 )
+            self._reset_rule_activation()
             # Idle and the bounded history row are now durable.  The
             # executable tree is no longer current and must not accumulate
             # for the lifetime of this process. This is idempotent when Reset

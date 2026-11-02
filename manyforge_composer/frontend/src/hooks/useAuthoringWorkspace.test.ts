@@ -25,7 +25,7 @@ vi.mock('../api/client', async (importOriginal) => ({
 
 import { useAuthoringWorkspace } from './useAuthoringWorkspace';
 import { managerApplyRecord } from '../test/managerApplyRecord';
-import { ApiError, authoringRefusalMessage } from '../api/client';
+import { ApiError, authoringRefusalMessage, KnownOutcomeError } from '../api/client';
 import type { ControlTransportStatus } from './useHeadlessState';
 
 type FakeNode = {
@@ -142,7 +142,7 @@ function headlessSnapshot(
       overviewRevision: `sha256:${'a'.repeat(64)}`,
       readiness: 'ready',
       summaryLabel: 'Ready',
-      profileLabel: 'native',
+      profileLabel: 'standard',
       authorityLabel: 'owner-issued scoped facts',
       userMessage: 'Current.',
       capabilities: [],
@@ -306,13 +306,13 @@ describe('useAuthoringWorkspace', () => {
     const rerender = await mountHarness(headlessSnapshot(1));
     await flush();
     await act(async () => {
-      expect(latest!.beginMutation()).toBe(true);
-      expect(latest!.beginMutation()).toBe(false);
+      expect(latest!.beginMutation('document', 'save')).toBe(true);
+      expect(latest!.beginMutation('document', 'save')).toBe(false);
       latest!.finishMutation({ applyId: 'apply-3', applyGeneration: 3 });
     });
-    expect(latest!.unavailableReason).toContain('submitted operation');
+    expect(latest!.unavailableReason).toBe('Save is in progress.');
     await rerender(headlessSnapshot(1));
-    expect(latest!.unavailableReason).toContain('submitted operation');
+    expect(latest!.unavailableReason).toBe('Save is in progress.');
     const pending = headlessSnapshot(1);
     pending.runtime.sections.manager.payload = { apply: {
       records: [managerApplyRecord()], mutation_available: false, unavailable_reason_code: 'pending',
@@ -339,7 +339,7 @@ describe('useAuthoringWorkspace', () => {
     } };
     await mountHarness(pending);
     await flush();
-    expect(latest!.beginMutation()).toBe(false);
+    expect(latest!.beginMutation('document', 'save')).toBe(false);
     expect(latest!.unavailableReason).toContain('Manager operation');
   });
 
@@ -355,14 +355,14 @@ describe('useAuthoringWorkspace', () => {
     // Apply/Save keep their gate; the Draft edit takes no claim.
     expect(latest!.unavailableReason).toBe('Authoring is currently locked by the backend.');
     expect(latest!.editUnavailableReason).toBe(null);
-    await act(async () => { expect(latest!.beginMutation('edit')).toBe(true); });
+    await act(async () => { expect(latest!.beginMutation('edit', 'edit')).toBe(true); });
   });
 
   it('handles completion before the response, and exact terminal lookup after inventory eviction', async () => {
     apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
     const rerender = await mountHarness(headlessSnapshot(1));
     await flush();
-    await act(async () => { expect(latest!.beginMutation()).toBe(true); });
+    await act(async () => { expect(latest!.beginMutation('document', 'save')).toBe(true); });
     const terminal = headlessSnapshot(1);
     terminal.runtime.sections.manager.payload = { apply: {
       records: [managerApplyRecord('terminal', 'succeeded')], mutation_available: true, unavailable_reason_code: null,
@@ -372,7 +372,7 @@ describe('useAuthoringWorkspace', () => {
     expect(latest!.unavailableReason).toBe(null);
     await rerender(headlessSnapshot(1));
     await act(async () => {
-      expect(latest!.beginMutation()).toBe(true);
+      expect(latest!.beginMutation('document', 'save')).toBe(true);
       latest!.finishMutation({ applyId: 'apply-4', applyGeneration: 4 });
     });
     const result = { applyId: 'apply-4', applyGeneration: 4, state: 'succeeded' } as import('../types/api').ManagerApplyStatus;
@@ -382,31 +382,75 @@ describe('useAuthoringWorkspace', () => {
     expect(latest!.unavailableReason).toBe(null);
   });
 
-  it('keeps a lost response unknown, but releases a marked pre-effect refusal', async () => {
+  it('names the operation at once on begin and releases it on a refusal', async () => {
+    apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
+    await mountHarness(headlessSnapshot(1));
+    await flush();
+    await act(async () => { expect(latest!.beginMutation('edit', 'apply_preview')).toBe(true); });
+    expect(latest!.operation).toEqual({ command: 'apply_preview', label: 'Previewing…', name: 'Apply preview' });
+    // Every other authoring command is gated, with the operation named.
+    expect(latest!.unavailableReason).toBe('Apply preview is in progress.');
+    expect(latest!.editUnavailableReason).toBe('Apply preview is in progress.');
+    expect(latest!.beginMutation('document', 'save')).toBe(false);
+    await act(async () => latest!.finishMutation(null, new ApiError('refused', 409, {
+      detail: { code: 'authoring_not_ready', effect: 'none' },
+    })));
+    expect(latest!.operation).toBe(null);
+    expect(latest!.unavailableReason).toBe(null);
+  });
+
+  it('shows a lost response as unknown without gating, and releases a marked pre-effect refusal', async () => {
     apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
     const rerender = await mountHarness(headlessSnapshot(1));
     await flush();
     await act(async () => {
-      expect(latest!.beginMutation()).toBe(true);
+      expect(latest!.beginMutation('document', 'save')).toBe(true);
       latest!.finishMutation(null, new ApiError('not ready', 409, {
         detail: { code: 'authoring_not_ready', effect: 'none' },
       }));
     });
     expect(latest!.unavailableReason).toBe(null);
     await act(async () => {
-      expect(latest!.beginMutation()).toBe(true);
+      expect(latest!.beginMutation('document', 'save')).toBe(true);
       latest!.finishMutation(null, new ApiError('Applied configuration changed', 409, {
         detail: { code: 'observed_move_configuration_changed', effect: 'none' },
       }));
     });
     expect(latest!.unavailableReason).toBe(null);
     await act(async () => {
-      expect(latest!.beginMutation()).toBe(true);
+      expect(latest!.beginMutation('document', 'save')).toBe(true);
       latest!.finishMutation(null, new Error('reply lost'));
     });
     await rerender(headlessSnapshot(1));
-    expect(latest!.unavailableReason).toContain('unconfirmed');
-    expect(latest!.beginMutation()).toBe(false);
+    // A lost reply is only shown; it never gates (backend admission decides).
+    expect(latest!.submissionUnconfirmed).toBe(true);
+    expect(latest!.unavailableReason).toBe(null);
+  });
+
+  it('releases a reply that states the outcome: a failed Load and a re-worded refusal', async () => {
+    // Live 2026-11-01: a Load whose ApplyResult failed showed "Submission unconfirmed".
+    apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
+    const rerender = await mountHarness(headlessSnapshot(1));
+    await flush();
+    await act(async () => {
+      expect(latest!.beginMutation('replace', 'load')).toBe(true);
+      latest!.finishMutation(null, new KnownOutcomeError('Scenario Load: Apply failed'));
+    });
+    expect(latest!.unavailableReason).toBe(null);
+    await act(async () => {
+      expect(latest!.beginMutation('replace', 'load')).toBe(true);
+      latest!.finishMutation(null, new Error('Scenario Load refused: bad file', {
+        cause: new ApiError('bad file', 422, { detail: { code: 'scenario_source_invalid' } }),
+      }));
+    });
+    expect(latest!.unavailableReason).toBe(null);
+    await act(async () => {
+      expect(latest!.beginMutation('replace', 'load')).toBe(true);
+      latest!.finishMutation(null, new Error('Scenario Load refused: lost', { cause: new Error('reply lost') }));
+    });
+    await rerender(headlessSnapshot(1));
+    expect(latest!.submissionUnconfirmed).toBe(true);
+    expect(latest!.unavailableReason).toBe(null);
   });
 
   it('releases the guard for a marked observed-move refusal reported as 503', async () => {
@@ -421,12 +465,12 @@ describe('useAuthoringWorkspace', () => {
       `Edit not applied: ${message}. Wait for the robot to report its current state, then try again.`,
     );
     await act(async () => {
-      expect(latest!.beginMutation()).toBe(true);
+      expect(latest!.beginMutation('document', 'save')).toBe(true);
       latest!.finishMutation(null, refusal);
     });
     expect(latest!.submissionUnconfirmed).toBe(false);
     expect(latest!.unavailableReason).toBe(null);
-    await act(async () => { expect(latest!.beginMutation()).toBe(true); });
+    await act(async () => { expect(latest!.beginMutation('document', 'save')).toBe(true); });
   });
 
   it('leaves the editor usable after the live Copy current position refusal', async () => {
@@ -442,7 +486,7 @@ describe('useAuthoringWorkspace', () => {
     apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
     await mountHarness(headlessSnapshot(1));
     await flush();
-    await act(async () => { expect(latest!.beginMutation('edit')).toBe(true); });
+    await act(async () => { expect(latest!.beginMutation('edit', 'edit')).toBe(true); });
     const fence = {
       draftId: 'draft.1', expectedDraftRevision: 3,
       expectedAdmissionGeneration: 4, requestOwnerEpoch: 'browser.1', requestId: 'copy.1',
@@ -458,24 +502,24 @@ describe('useAuthoringWorkspace', () => {
     await act(async () => latest!.finishMutation(null, failure));
     expect(latest!.submissionUnconfirmed).toBe(false);
     expect(latest!.editUnavailableReason).toBe(null);
-    await act(async () => { expect(latest!.beginMutation('edit')).toBe(true); });
+    await act(async () => { expect(latest!.beginMutation('edit', 'edit')).toBe(true); });
   });
 
-  it('keeps the guard locked for the same conflict without the before-effect marker', async () => {
+  it('shows the same conflict without the before-effect marker as unconfirmed, without gating', async () => {
     apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
     await mountHarness(headlessSnapshot(1));
     await flush();
     await act(async () => {
-      expect(latest!.beginMutation('edit')).toBe(true);
+      expect(latest!.beginMutation('edit', 'edit')).toBe(true);
       latest!.finishMutation(null, new ApiError('refused', 409, {
         detail: { code: 'observed_scene_object_ineligible' },
       }));
     });
     expect(latest!.submissionUnconfirmed).toBe(true);
-    expect(latest!.beginMutation('edit')).toBe(false);
+    expect(latest!.editUnavailableReason).toBe(null);
   });
 
-  it('releases the guard when Load or Save refuses a project with a leftover overrides.yaml', async () => {
+  it('releases the guard when Save refuses a project with a leftover overrides.yaml', async () => {
     // The exact backend refusal body (routes_scenario_documents._raise), read
     // through the real client so the classification sees what production sees.
     const message = '/workspace/cell: Scenario parameter overrides (overrides.yaml) were removed; '
@@ -494,14 +538,13 @@ describe('useAuthoringWorkspace', () => {
       deploymentDraftId: 'deployment-draft.1', expectedDeploymentDraftRevision: 4,
       expectedAdmissionGeneration: 4, requestOwnerEpoch: 'browser.1', requestId: 'load.1',
       expectedWorkspaceEpoch: 'workspace.epoch.1', expectedWorkspaceRevision: 1,
-    } as Parameters<typeof realApi.scenarioDocuments.load>[0];
+    } as Parameters<typeof realApi.scenarioDocuments.save>[0];
     for (const request of [
-      () => realApi.scenarioDocuments.load(fence, '/workspace/cell', false),
       () => realApi.scenarioDocuments.save(fence, {
         directory: '/workspace', name: 'Cell', description: '', confirmOverwrite: true,
       }),
     ]) {
-      await act(async () => { expect(latest!.beginMutation()).toBe(true); });
+      await act(async () => { expect(latest!.beginMutation('document', 'save')).toBe(true); });
       const failure = await request().then(() => null, (error: unknown) => error);
       expect(failure).toBeInstanceOf(ApiError);
       expect(authoringRefusalMessage(failure)).toBe(
@@ -511,9 +554,9 @@ describe('useAuthoringWorkspace', () => {
       expect(latest!.submissionUnconfirmed).toBe(false);
       expect(latest!.unavailableReason).toBe(null);
     }
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
     // Authoring stays usable: the next change is admitted.
-    await act(async () => { expect(latest!.beginMutation()).toBe(true); });
+    await act(async () => { expect(latest!.beginMutation('document', 'save')).toBe(true); });
   });
 
   it('releases the guard for a Manager Apply rejection and keeps its precise text', async () => {
@@ -529,19 +572,14 @@ describe('useAuthoringWorkspace', () => {
     apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
     await mountHarness(headlessSnapshot(1));
     await flush();
-    const fence = {
-      draftId: 'deployment-draft.1', expectedDraftRevision: 4,
-      expectedAdmissionGeneration: 4, requestOwnerEpoch: 'browser.1', requestId: 'apply.1',
-      expectedWorkspaceEpoch: 'workspace.epoch.1', expectedWorkspaceRevision: 1,
-    } as Parameters<typeof realApi.deploymentWorkspace.applyDraft>[0];
-    await act(async () => { expect(latest!.beginMutation()).toBe(true); });
-    const failure = await realApi.deploymentWorkspace.applyDraft(fence)
+    await act(async () => { expect(latest!.beginMutation('document', 'save')).toBe(true); });
+    const failure = await realApi.cellApply.apply({})
       .then(() => null, (error: unknown) => error);
     expect(failure).toBeInstanceOf(ApiError);
     expect((failure as ApiError).message).toBe(message);
     await act(async () => latest!.finishMutation(null, failure));
     expect(latest!.submissionUnconfirmed).toBe(false);
-    await act(async () => { expect(latest!.beginMutation()).toBe(true); });
+    await act(async () => { expect(latest!.beginMutation('document', 'save')).toBe(true); });
   });
 
   it('releases the Deployment Draft owner stale refusal without locking', async () => {
@@ -549,14 +587,14 @@ describe('useAuthoringWorkspace', () => {
     await mountHarness(headlessSnapshot(1));
     await flush();
     await act(async () => {
-      expect(latest!.beginMutation()).toBe(true);
+      expect(latest!.beginMutation('document', 'save')).toBe(true);
       // The owner refuses before any edit and its detail carries no effect marker.
       latest!.finishMutation(null, new ApiError('Deployment Draft changed; refresh before editing', 409, {
         detail: { code: 'deployment_draft_stale', message: 'Deployment Draft changed; refresh before editing' },
       }));
     });
     expect(latest!.submissionUnconfirmed).toBe(false);
-    await act(async () => { expect(latest!.beginMutation()).toBe(true); });
+    await act(async () => { expect(latest!.beginMutation('document', 'save')).toBe(true); });
   });
 
   it('releases a refused-before-effect stale fence without locking', async () => {
@@ -564,13 +602,13 @@ describe('useAuthoringWorkspace', () => {
     await mountHarness(headlessSnapshot(1));
     await flush();
     await act(async () => {
-      expect(latest!.beginMutation()).toBe(true);
+      expect(latest!.beginMutation('document', 'save')).toBe(true);
       latest!.finishMutation(null, new ApiError('stale', 409, {
         detail: { code: 'composer_draft_revision_stale', message: 'stale', effect: 'none' },
       }));
     });
     expect(latest!.submissionUnconfirmed).toBe(false);
-    await act(async () => { expect(latest!.beginMutation()).toBe(true); });
+    await act(async () => { expect(latest!.beginMutation('document', 'save')).toBe(true); });
   });
 
   it.each([
@@ -585,14 +623,14 @@ describe('useAuthoringWorkspace', () => {
     // definite outcome naming the written path, so the editor never locks.
     const message = 'The document was written to /workspace/cell, but it was not adopted as the Saved baseline';
     await act(async () => {
-      expect(latest!.beginMutation()).toBe(true);
+      expect(latest!.beginMutation('document', 'save')).toBe(true);
       latest!.finishMutation(null, new ApiError(message, 409, {
         detail: { code, message, path: '/workspace/cell', causeCode: 'scenario_source_invalid' },
       }));
     });
     expect(latest!.submissionUnconfirmed).toBe(false);
     expect(latest!.unavailableReason).toBe(null);
-    await act(async () => { expect(latest!.beginMutation()).toBe(true); });
+    await act(async () => { expect(latest!.beginMutation('document', 'save')).toBe(true); });
   });
 
   it.each([
@@ -604,20 +642,20 @@ describe('useAuthoringWorkspace', () => {
     await flush();
     // Before Save creates or writes anything the backend keeps the named 400.
     await act(async () => {
-      expect(latest!.beginMutation()).toBe(true);
+      expect(latest!.beginMutation('document', 'save')).toBe(true);
       latest!.finishMutation(null, new ApiError('refused', 400, { detail: { code, message: 'refused' } }));
     });
     expect(latest!.submissionUnconfirmed).toBe(false);
     // The same cause after the first write is the one distinct partial outcome.
     await act(async () => {
-      expect(latest!.beginMutation()).toBe(true);
+      expect(latest!.beginMutation('document', 'save')).toBe(true);
       latest!.finishMutation(null, new ApiError(partial, 500, {
         detail: { code: 'scenario_artifact_save_incomplete', message: partial },
       }));
     });
     expect(latest!.submissionUnconfirmed).toBe(true);
-    expect(latest!.unavailableReason).toContain('unconfirmed');
-    expect(latest!.beginMutation()).toBe(false);
+    // A lost reply is only shown; it never gates (backend admission decides).
+    expect(latest!.unavailableReason).toBe(null);
   });
 
   it.each([
@@ -625,31 +663,97 @@ describe('useAuthoringWorkspace', () => {
     ['503 without a body', new ApiError('Service Unavailable', 503, null)],
     ['503 with an unknown code', new ApiError('unavailable', 503, { detail: { code: 'headless_unavailable' } })],
     ['502 with an unstructured detail', new ApiError('bad gateway', 502, { detail: 'upstream failed' })],
-  ])('keeps the guard locked for a bare %s', async (_label, failure) => {
+  ])('shows a bare %s as unconfirmed without gating', async (_label, failure) => {
     apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
     await mountHarness(headlessSnapshot(1));
     await flush();
     await act(async () => {
-      expect(latest!.beginMutation()).toBe(true);
+      expect(latest!.beginMutation('document', 'save')).toBe(true);
       latest!.finishMutation(null, failure);
     });
     expect(latest!.submissionUnconfirmed).toBe(true);
-    expect(latest!.unavailableReason).toContain('unconfirmed');
-    expect(latest!.beginMutation()).toBe(false);
+    // A lost reply is only shown; it never gates (backend admission decides).
+    expect(latest!.unavailableReason).toBe(null);
   });
 
-  it('does not release the submission guard for an unclassified conflict', async () => {
+  it('shows an unclassified conflict as unconfirmed without gating', async () => {
     apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
     await mountHarness(headlessSnapshot(1));
     await flush();
     await act(async () => {
-      expect(latest!.beginMutation()).toBe(true);
+      expect(latest!.beginMutation('document', 'save')).toBe(true);
       latest!.finishMutation(null, new ApiError('conflict', 409, {
         detail: { code: 'component_fault' },
       }));
     });
-    expect(latest!.unavailableReason).toContain('unconfirmed');
-    expect(latest!.beginMutation()).toBe(false);
+    expect(latest!.submissionUnconfirmed).toBe(true);
+    expect(latest!.unavailableReason).toBe(null);
+  });
+
+  it('keeps Load and New admitted after a dropped Load and settles it from the current Scenario', async () => {
+    // Live 2026-11-02: a Load's connection dropped (Firefox NetworkError); the
+    // GUI then disabled Load and New until a page reload.
+    const digest = `sha256:${'b'.repeat(64)}`;
+    const fetchMock = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({
+      schema_version: 'manyforge.current_scenario.v1', ready: true, unavailable_reasons: [],
+      current_scenario: {
+        scenario_id: 'mock_lite6_motion_preemption', source_document_digest: digest,
+        deployment_artifact_id: 'mock_lite6_motion_preemption', deployment_revision: digest,
+        retained_bundle_id: digest, graph_revision: digest, program_id: 'program',
+        program_revision: digest, program_binding_id: digest,
+      },
+    }) }));
+    vi.stubGlobal('fetch', fetchMock);
+    apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
+    const rerender = await mountHarness(headlessSnapshot(1));
+    await flush();
+    await act(async () => {
+      expect(latest!.beginMutation('replace', 'load')).toBe(true);
+      latest!.finishMutation(null, new Error('Scenario Load: the connection dropped', {
+        cause: new TypeError('NetworkError when attempting to fetch resource.'),
+      }));
+    });
+    expect(latest!.submissionUnconfirmed).toBe(true);
+    expect(latest!.replaceUnavailableReason).toBe(null);
+    expect(latest!.unavailableReason).toBe(null);
+    // An Apply still in flight: the banner stays and says so; nothing is read or retried.
+    const applying = headlessSnapshot(1);
+    applying.runtime.sections.manager.payload = { apply: {
+      records: [managerApplyRecord()], mutation_available: false, unavailable_reason_code: 'pending',
+    } };
+    await rerender(applying);
+    await act(async () => { await latest!.recheckSubmission(); });
+    expect(latest!.submissionUnconfirmed).toBe(true);
+    expect(latest!.recheckMessage).toContain('still in progress');
+    expect(fetchMock).not.toHaveBeenCalled();
+    // Idle: the current Scenario settles it.
+    await rerender(headlessSnapshot(1));
+    await act(async () => { await latest!.recheckSubmission(); });
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(latest!.submissionUnconfirmed).toBe(false);
+    expect(latest!.recheckMessage).toBe('Current Scenario: mock_lite6_motion_preemption, applied. Nothing was retried.');
+  });
+
+  it('a later successful action settles a lost reply; a refusal does not', async () => {
+    apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
+    await mountHarness(headlessSnapshot(1));
+    await flush();
+    await act(async () => {
+      expect(latest!.beginMutation('replace', 'load')).toBe(true);
+      latest!.finishMutation(null, new Error('dropped', { cause: new TypeError('Failed to fetch') }));
+    });
+    expect(latest!.submissionUnconfirmed).toBe(true);
+    await act(async () => {
+      expect(latest!.beginMutation('replace', 'new')).toBe(true);
+      latest!.finishMutation(null, new KnownOutcomeError('New Scenario: Apply failed'));
+    });
+    expect(latest!.submissionUnconfirmed).toBe(true);
+    await act(async () => {
+      expect(latest!.beginMutation('replace', 'load')).toBe(true);
+      latest!.finishMutation();
+    });
+    expect(latest!.submissionUnconfirmed).toBe(false);
+    expect(latest!.replaceUnavailableReason).toBe(null);
   });
 
   it('rechecks exact local settlement, not an unrelated revision or idle status', async () => {
@@ -659,7 +763,7 @@ describe('useAuthoringWorkspace', () => {
     const rerender = await mountHarness(headlessSnapshot(1));
     await flush();
     await act(async () => {
-      latest!.beginMutation(); latest!.finishMutation(null, new Error('reply lost'));
+      latest!.beginMutation('document', 'save'); latest!.finishMutation(null, new Error('reply lost'));
     });
     apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(2, 4, 4, '/workspace/cell'));
     await rerender(headlessSnapshot(2, 4, 4));
@@ -680,7 +784,7 @@ describe('useAuthoringWorkspace', () => {
     apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
     const rerender = await mountHarness(headlessSnapshot(1));
     await flush();
-    await act(async () => { latest!.beginMutation(); latest!.finishMutation(null, new Error('lost')); });
+    await act(async () => { latest!.beginMutation('document', 'save'); latest!.finishMutation(null, new Error('lost')); });
     const terminal = headlessSnapshot(1);
     terminal.runtime.sections.manager.payload = { apply: {
       records: [managerApplyRecord('terminal', 'unknown_effect')], mutation_available: false, unavailable_reason_code: 'unknown_effect',
@@ -694,7 +798,7 @@ describe('useAuthoringWorkspace', () => {
     await act(async () => { await latest!.recheckSubmission(); });
     expect(apiMock.manager.applyStatus).toHaveBeenCalledWith('apply-3', 3);
     expect(latest!.submissionUnconfirmed).toBe(false);
-    expect(latest!.beginMutation()).toBe(false);
+    expect(latest!.beginMutation('document', 'save')).toBe(false);
     expect(latest!.unavailableReason).toContain('Manager operation');
   });
 
@@ -703,7 +807,7 @@ describe('useAuthoringWorkspace', () => {
     apiMock.authoringWorkspace.get.mockResolvedValue(snapshotFixture(1, 3, 4, '/workspace/cell'));
     const rerender = await mountHarness(headlessSnapshot(1));
     await flush();
-    await act(async () => { latest!.beginMutation(); latest!.finishMutation(null, new Error('lost')); });
+    await act(async () => { latest!.beginMutation('document', 'save'); latest!.finishMutation(null, new Error('lost')); });
     const unrelated = managerApplyRecord('terminal', 'unknown_effect');
     unrelated.request = { ...unrelated.request, correlation_id: 'composer-document.other' as never };
     const other = headlessSnapshot(1);
@@ -723,7 +827,7 @@ describe('useAuthoringWorkspace', () => {
     await rerender(matched);
     expect(latest!.correlatedApply).toEqual({ applyId: 'apply-7', applyGeneration: 3 });
     expect(latest!.submissionUnconfirmed).toBe(false);
-    expect(latest!.beginMutation()).toBe(false);
+    expect(latest!.beginMutation('document', 'save')).toBe(false);
     expect(latest!.unavailableReason).toContain('Manager operation');
   });
 

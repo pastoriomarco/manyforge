@@ -48,14 +48,9 @@ REQUIRED_CAPABILITIES = {
     "scene.projection.revision_bound",
     "planning.failure.structured",
 }
-REQUIRED_PROFILES = {
-    "planning.profile.first_feasible",
-    "planning.profile.balanced",
-    "planning.profile.quality_bounded",
-}
 SELECTED_ROBOPLAN_SOURCE = (
-    "RoboPlan 0.7.0 099dfa5ccd80b191eb3d6da9f4795f808a63913f "
-    "plus the exact UA1 patch manifest"
+    "RoboPlan 0.8.0 2a6b447e648b1a3337f10cbab995cda0c0a71d55 "
+    "plus the exact patch manifest"
 )
 REQUIRED_EVIDENCE = {
     "neutral_harness_reference_backend",
@@ -71,7 +66,7 @@ REQUIRED_EVIDENCE = {
     "cache_hit_revalidates_against_latest_scene",
     "failed_revalidation_forces_planning",
     "intent_change_forces_planning",
-    "profile_participates_in_cache_identity",
+    "planner_participates_in_cache_identity",
     "start_incompatibility_forces_planning",
     "goal_incompatibility_forces_planning",
     "model_binding_participates_in_cache_identity",
@@ -87,7 +82,6 @@ FORBIDDEN_BACKEND_OPTION_KEYS = {
     "fast_return",
     "goal_bias",
     "goal_biasing_probability",
-    "max_nodes",
     "oin_k",
     "rrt_star",
 }
@@ -97,14 +91,12 @@ _TOP_LEVEL_FIELDS = {
     "contract_revision",
     "runtime_availability",
     "portable_capabilities",
-    "portable_profiles",
     "authority",
     "adapters",
     "test_references",
 }
 _PROGRAM_ARTIFACT_ROOTS = (
     "examples",
-    "verification/programs",
     "manyforge_behavior/resources",
     "manyforge_behavior/tests/fixtures",
     "tests/fixtures",
@@ -837,15 +829,6 @@ def _run_check(root: Path, mapping: Path) -> tuple[list[str], int]:
         != REQUIRED_CAPABILITIES
     ):
         fail(failures, "portable_capabilities does not match the required contract")
-    if (
-        _string_set(
-            failures,
-            document.get("portable_profiles"),
-            location="portable_profiles",
-        )
-        != REQUIRED_PROFILES
-    ):
-        fail(failures, "portable_profiles does not match the required contract")
 
     availability = _object(
         failures,
@@ -886,7 +869,7 @@ def _run_check(root: Path, mapping: Path) -> tuple[list[str], int]:
     adapters = require_mapping_fields(
         failures,
         document.get("adapters"),
-        {"deterministic_fake", "roboplan_0_7_0", "moveit2", "curobo"},
+        {"deterministic_fake", "roboplan_0_8_0", "moveit2", "curobo"},
         "adapters",
     )
     fake = _object(
@@ -899,8 +882,8 @@ def _run_check(root: Path, mapping: Path) -> tuple[list[str], int]:
 
     roboplan = _object(
         failures,
-        adapters.get("roboplan_0_7_0"),
-        location="adapters.roboplan_0_7_0",
+        adapters.get("roboplan_0_8_0"),
+        location="adapters.roboplan_0_8_0",
     )
     if roboplan.get("status") != "temporarily_unavailable_composable_cell_rebuild":
         fail(failures, "RoboPlan runtime is not explicitly marked unavailable")
@@ -917,21 +900,12 @@ def _run_check(root: Path, mapping: Path) -> tuple[list[str], int]:
     capability_disposition = _string_value_mapping(
         failures,
         roboplan.get("capability_disposition"),
-        location="adapters.roboplan_0_7_0.capability_disposition",
+        location="adapters.roboplan_0_8_0.capability_disposition",
     )
     if set(capability_disposition) != REQUIRED_CAPABILITIES:
         fail(failures, "RoboPlan mapping does not cover every portable capability")
     elif set(capability_disposition.values()) != {"temporarily_unavailable"}:
         fail(failures, "RoboPlan capability mapping contains a runtime support claim")
-    profile_disposition = _string_value_mapping(
-        failures,
-        roboplan.get("profile_disposition"),
-        location="adapters.roboplan_0_7_0.profile_disposition",
-    )
-    if set(profile_disposition) != REQUIRED_PROFILES:
-        fail(failures, "RoboPlan mapping does not cover every portable profile")
-    elif set(profile_disposition.values()) != {"temporarily_unavailable"}:
-        fail(failures, "RoboPlan profile mapping contains a runtime support claim")
 
     moveit = _object(
         failures,
@@ -949,7 +923,6 @@ def _run_check(root: Path, mapping: Path) -> tuple[list[str], int]:
             "retained_product_input",
             "ports",
             "capability_disposition",
-            "profile_disposition",
             "adapter_local_gaps",
             "forbidden_shortcuts",
         },
@@ -964,13 +937,6 @@ def _run_check(root: Path, mapping: Path) -> tuple[list[str], int]:
     )
     if set(moveit_capabilities) != REQUIRED_CAPABILITIES:
         fail(failures, "MoveIt2 mapping does not cover every portable capability")
-    moveit_profiles = _object(
-        failures,
-        moveit.get("profile_disposition"),
-        location="adapters.moveit2.profile_disposition",
-    )
-    if set(moveit_profiles) != REQUIRED_PROFILES:
-        fail(failures, "MoveIt2 mapping does not cover every portable profile")
     required_ports = {
         "IPlannerBackend",
         "IRobotKinematics",

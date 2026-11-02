@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.14)
-project(manyforge_component_manager VERSION 0.1.0 LANGUAGES CXX)
+project(manyforge_component_manager VERSION 0.2.0 LANGUAGES CXX)
 
 cmake_policy(SET CMP0077 NEW)
 
@@ -204,15 +204,14 @@ add_library(manyforge_component_manager
   src/manager_active_runtime_coordinator.cpp
   src/manager_planned_maintenance_coordinator.cpp
   src/manager_runtime_convergence_coordinator.cpp
-  src/manager_scene_initialization_coordinator.cpp
   src/manager_selected_bundle_transition_coordinator.cpp
   src/manager_selected_runtime_composition_coordinator.cpp
   src/native_projection_rpc_internal.cpp
   src/native_projection_transition_internal.cpp
   src/manager_bootstrap_journal.cpp
-  src/native_execution_runtime_unit_admission.cpp
+  src/execution_host_unit_admission.cpp
   src/reference_runtime_unit_admission.cpp
-  src/retained_native_runtime_unit_adapter.cpp
+  src/retained_execution_host_unit_adapter.cpp
   src/retained_posix_runtime_unit_adapter.cpp
   src/runtime_convergence.cpp
   src/runtime_observation.cpp
@@ -375,8 +374,10 @@ if(BUILD_TESTING)
     test/test_active_bundle_publication_store.cpp)
   target_link_libraries(test_active_bundle_publication_store PRIVATE
     manyforge_component_manager GTest::gtest_main)
+  # The receipt-bound test publishes past the 4096-receipt limit; every
+  # Publish fully re-verifies the retained receipts, so it needs minutes.
   gtest_discover_tests(test_active_bundle_publication_store
-    PROPERTIES TIMEOUT ${MANYFORGE_GTEST_TIMEOUT_SECONDS})
+    PROPERTIES TIMEOUT 300)
 
   add_executable(test_manager_apply_journal
     test/test_manager_apply_journal.cpp)
@@ -443,11 +444,37 @@ if(BUILD_TESTING)
       "Manager native-host fixture preparation failed:\n"
       "${_MANYFORGE_MANAGER_MODEL_PREPARATION_OUTPUT}${_MANYFORGE_MANAGER_MODEL_PREPARATION_ERROR}")
   endif()
+  # The Lite gripper as its own tool component, prepared beside the Lite6
+  # root (gripper_only_retention_fixture.hpp names it by that sibling rule).
+  set(_MANYFORGE_MANAGER_LITE_GRIPPER_SOURCE
+    "${_MANYFORGE_MANAGER_WORKSPACE_ROOT}/manyforge_example_models/models/lite_gripper")
+  set(_MANYFORGE_MANAGER_LITE_GRIPPER_FIXTURE
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/lite_gripper_structural")
+  file(MAKE_DIRECTORY "${_MANYFORGE_MANAGER_LITE_GRIPPER_FIXTURE}")
+  execute_process(
+    COMMAND "${Python3_EXECUTABLE}" "${_MANYFORGE_MANAGER_MODEL_PREPARER}"
+      --urdf "${_MANYFORGE_MANAGER_LITE_GRIPPER_SOURCE}/lite_gripper.urdf"
+      --srdf "${_MANYFORGE_MANAGER_LITE_GRIPPER_SOURCE}/lite_gripper.srdf"
+      --model-asset-id lite_gripper
+      --accepted-package-uri-prefix "package://manyforge_example_models/models/lite6_lite_gripper/"
+      --resource-root "${_MANYFORGE_MANAGER_LITE6_SOURCE}"
+      --output-directory "${_MANYFORGE_MANAGER_LITE_GRIPPER_FIXTURE}"
+    RESULT_VARIABLE _MANYFORGE_MANAGER_MODEL_PREPARATION_RESULT
+    OUTPUT_VARIABLE _MANYFORGE_MANAGER_MODEL_PREPARATION_OUTPUT
+    ERROR_VARIABLE _MANYFORGE_MANAGER_MODEL_PREPARATION_ERROR)
+  if(NOT _MANYFORGE_MANAGER_MODEL_PREPARATION_RESULT EQUAL 0)
+    message(FATAL_ERROR
+      "Manager Lite gripper fixture preparation failed:\n"
+      "${_MANYFORGE_MANAGER_MODEL_PREPARATION_OUTPUT}${_MANYFORGE_MANAGER_MODEL_PREPARATION_ERROR}")
+  endif()
   set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${_MANYFORGE_MANAGER_MODEL_PREPARER}"
     "${_MANYFORGE_MANAGER_WORKSPACE_ROOT}/manyforge_behavior/manyforge_behavior/model_source_preparation.py"
     "${_MANYFORGE_MANAGER_LITE6_SOURCE}/lite6_lite_gripper.urdf"
     "${_MANYFORGE_MANAGER_LITE6_SOURCE}/lite6_lite_gripper.srdf"
+    "${_MANYFORGE_MANAGER_LITE_GRIPPER_SOURCE}/lite_gripper.urdf"
+    "${_MANYFORGE_MANAGER_LITE_GRIPPER_SOURCE}/lite_gripper.srdf"
+    "${_MANYFORGE_MANAGER_DEPLOYMENT_ROOT}/resources/maintained/model_assets/lite_gripper.model_asset.json"
     ${_MANYFORGE_MANAGER_LITE6_RESOURCES})
   target_compile_definitions(test_manager_runtime_convergence_coordinator PRIVATE
     MANYFORGE_LITE6_STRUCTURAL_FIXTURE_ROOT="${_MANYFORGE_MANAGER_LITE6_FIXTURE}"
@@ -465,7 +492,7 @@ if(BUILD_TESTING)
     GTest::gtest_main)
   # The real failure/restart test owns the concrete journals. Standalone
   # Manager embeds pure Core; composed graphs can reuse its existing adapters.
-  foreach(_manager_test_journal IN ITEMS sqlite_operation_journal sqlite_cclc_journal)
+  foreach(_manager_test_journal IN ITEMS sqlite_operation_journal)
     if(TARGET manyforge_core_${_manager_test_journal})
       target_link_libraries(test_manager_runtime_convergence_coordinator PRIVATE
         manyforge_core_${_manager_test_journal})

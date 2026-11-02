@@ -27,8 +27,8 @@ void apply_observed_state_to_stop_certificate(const ObservedRobotStatePublicatio
 ///    strictly monotonic (stop_owner_generation, certificate_revision):
 ///    a late completion from an older generation can never displace or
 ///    become authoritative for a newer one;
-///  - admission lookups are by exact (owner kind, execution, latch,
-///    generation) match against the authoritative selection only.
+///  - admission lookups are by exact (owner kind, execution, generation)
+///    match against the authoritative selection only.
 class RecoveryCertificateStore {
  public:
   /// Returns the assigned strictly increasing certificate revision.
@@ -46,7 +46,7 @@ class RecoveryCertificateStore {
   /// Exact-match authoritative lookup used by admission. Returns nullopt
   /// unless the authoritative certificate for `kind` matches every key.
   [[nodiscard]] std::optional<KernelStopCertificateDTO> find_authoritative(
-      StopOwnerKind kind, std::uint64_t execution_id, const std::string& latch_id,
+      StopOwnerKind kind, std::uint64_t execution_id,
       std::uint64_t stop_owner_generation) const;
 
   [[nodiscard]] std::uint64_t last_revision() const { return next_revision_; }
@@ -95,19 +95,14 @@ struct RecoveryAuthorityCapture {
   std::uint64_t control_command_epoch = 0;
   std::uint64_t execution_id = 0;
   ExecutionState execution_state = ExecutionState::kIdle;
-  std::optional<InterruptLatch> active_latch;
   bool fault_preempt_stop_active = false;
   bool fault_preempt_worker_active = false;
   bool operator_stop_active = false;
   bool motion_trip_stop_active = false;
   bool stronger_authority_active = false;
-  bool queued_latch_present = false;
-  std::uint64_t fault_preempt_owner_generation = 0;
   std::uint64_t operator_stop_owner_generation = 0;
-  std::optional<KernelStopCertificateDTO> fault_preempt_certificate;
   std::optional<KernelStopCertificateDTO> operator_stop_certificate;
   std::optional<AddressedMotionStopRecoveryEvidenceDTO> addressed_motion_stop_evidence;
-  bool stop_fault_intervention_classified = false;
   /// Classified retryable pre-dispatch validation failure, or a Failed
   /// prepared execution proven never dispatched (no physical effect).
   bool failed_validation_retryable = false;
@@ -176,7 +171,6 @@ MotionRetryEligibilityDTO planning_retry_eligibility(const RecoveryAuthorityCapt
 /// Pure construction of the assessment from one coherent capture. Performs
 /// no locking, no I/O, no backend/planner/engine calls.
 KernelRecoveryAssessmentDTO build_recovery_assessment(const RecoveryAuthorityCapture& capture,
-                                                      const RecoveryReadinessPolicy& policy,
                                                       std::uint64_t previous_revision);
 
 /// A certified ordinary Stop whose execute worker's terminal cleanup is still
@@ -202,7 +196,7 @@ struct RecoveryAssessmentPublication {
 
 RecoveryAssessmentPublication prepare_recovery_assessment_publication(
     const KernelRecoveryAssessmentDTO& previous, const RecoveryAuthorityCapture& capture,
-    const RecoveryReadinessPolicy& policy, std::string_view trigger);
+    std::string_view trigger);
 
 /// Structured admission decision for ApplyRecoveryAction. `admitted=false`
 /// carries the stable rejection reason; the caller guarantees no side

@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { parseApiErrorDto } from '../api/parsers/programRuntime';
 import { ERROR_CATALOG } from '../api/errorCatalog.generated';
 import {
-  commandRefusalText, errorCatalogRow, errorPresentation, receiptRefusal,
+  commandRefusalText, errorCatalogRow, errorPresentation, isRuleHoldsRefusal, receiptRefusal, ruleHoldsMessage,
 } from './commandRefusal';
 
 describe('command refusal text', () => {
@@ -53,15 +53,20 @@ describe('command refusal text', () => {
       .toBeUndefined();
   });
 
-  it('keeps the existing alarm and motion-wait guidance first', () => {
-    expect(commandRefusalText(receiptRefusal('global_interrupt_source_not_ready', {
+  it('keeps the existing alarm and holding-rule guidance first', () => {
+    expect(commandRefusalText(receiptRefusal('rule_holds', {
       error: { details: { rule_id: 'door' } },
     }), { withCode: true })).toBe(
-      'Motion waits: global interrupt rule door is waiting for its source. Try again once the source reports.',
+      "Global interrupt rule door holds this scope: its condition still holds after its Stop, or it can't watch its signals. It clears by itself.",
     );
+    expect(isRuleHoldsRefusal({ code: 'rule_holds', message: '', details: null, origin: null })).toBe(true);
+    expect(isRuleHoldsRefusal({ code: 'global_interrupt_gated', message: '', details: null, origin: null })).toBe(false);
+    expect(ruleHoldsMessage(null)).toContain('A global interrupt rule holds this scope');
     expect(commandRefusalText({
-      code: 'unacknowledged_operator_alarms', message: 'refused', details: null, origin: null,
-    })).toBe('Motion is blocked by unacknowledged alarms. Acknowledge them, then try again.');
+      code: 'operator_alarm_interlock_active', message: 'refused', details: null, origin: null,
+    })).toBe(
+      'Motion is blocked by an active alarm condition. Resolve its cause; acknowledging the alarm does not release it.',
+    );
   });
 
   it('presents the catalog text and falls back to the producer message', () => {

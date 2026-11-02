@@ -421,9 +421,7 @@ template <typename Identity>
 [[nodiscard]] bool correlation_valid(const StopInterruptCorrelationDTO& correlation) noexcept {
   return bounded_identity(correlation.interrupt_source_id) &&
          bounded_identity(correlation.interrupt_policy_id) &&
-         bounded_identity(correlation.motion_interrupt_scope_id) &&
-         (!correlation.interrupt_latch_id.has_value() ||
-          bounded_identity(*correlation.interrupt_latch_id));
+         bounded_identity(correlation.motion_interrupt_scope_id);
 }
 
 struct DerivedTerminal final {
@@ -580,19 +578,6 @@ struct DerivedTerminal final {
   return Result<DerivedTerminal>::Ok(std::move(derived));
 }
 
-[[nodiscard]] bool latch_presence_valid(const StopCertificateDTO& certificate) noexcept {
-  if (certificate.fault_latch_id.has_value() != certificate.fault_latch_generation.has_value()) {
-    return false;
-  }
-  // Items 25 and Q29: no Stop outcome requires a cell-wide latch; only a
-  // promotion to a full Stop does.
-  const bool required =
-      certificate.resolution_disposition == StopResolutionDispositionDTO::kPromotedToFull;
-  return !required ||
-         (certificate.fault_latch_id.has_value() && bounded_identity(*certificate.fault_latch_id) &&
-          certificate.fault_latch_generation->nonzero());
-}
-
 [[nodiscard]] std::optional<std::string_view> certificate_shape_error(
     const StopCertificateDTO& certificate, bool compare_derived) noexcept {
   if (!bounded_identity(certificate.stop_certificate_id) ||
@@ -612,8 +597,7 @@ struct DerivedTerminal final {
                              certificate.resolution_reason, certificate.stop_id) ||
       (certificate.interrupt_correlation.has_value() &&
        !correlation_valid(*certificate.interrupt_correlation)) ||
-      (certificate.terminal_error.has_value() && !error_valid(*certificate.terminal_error)) ||
-      !latch_presence_valid(certificate)) {
+      (certificate.terminal_error.has_value() && !error_valid(*certificate.terminal_error))) {
     return "stop_certificate_identity_or_presence_invalid";
   }
   if (certificate.predecessor_certificates.size() > kMaximumStopTerminalPredecessors ||
@@ -705,9 +689,6 @@ std::optional<std::string_view> stop_terminal_reduction_input_field_error(
       input.newly_completed_stage_results.size() > kMaximumStopTerminalAttemptResults ||
       (input.interrupt_correlation.has_value() &&
        !correlation_valid(*input.interrupt_correlation)) ||
-      (input.fault_latch_id.has_value() != input.fault_latch_generation.has_value()) ||
-      (input.fault_latch_id.has_value() &&
-       (!bounded_identity(*input.fault_latch_id) || !input.fault_latch_generation->nonzero())) ||
       (input.terminal_error.has_value() && !error_valid(*input.terminal_error))) {
     return "stop_terminal_reduction_input_invalid";
   }
@@ -884,14 +865,6 @@ Result<StopCertificateDTO> reduce_stop_terminal_impl(
   if (!derived.ok()) {
     return Result<StopCertificateDTO>::Err(derived.error());
   }
-  const bool latch_required =
-      input.resolution_disposition == StopResolutionDispositionDTO::kPromotedToFull;
-  if (latch_required && !input.fault_latch_id.has_value()) {
-    return Result<StopCertificateDTO>::Err(
-        terminal_input_error("stop_terminal_fault_latch_required",
-                             "Stop terminal outcome requires an exact containment-fault latch"));
-  }
-
   StopCertificateDTO certificate{input.stop_certificate_id,
                                  input.stop_certificate_revision,
                                  input.stop_id,
@@ -911,8 +884,6 @@ Result<StopCertificateDTO> reduce_stop_terminal_impl(
                                  std::move(derived.value().unsettled),
                                  std::move(derived.value().failed),
                                  input.interrupt_correlation,
-                                 input.fault_latch_id,
-                                 input.fault_latch_generation,
                                  input.completed_at_ns,
                                  input.terminal_error,
                                  std::move(lane_hard_stop_requested)};

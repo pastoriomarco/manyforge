@@ -3,7 +3,7 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py mcp
-  Last regenerated: 2026-10-30 06:51:44 UTC
+  Last regenerated: 2026-11-02 10:29:59 CET
   Generator source: scripts/regen-public-contracts.py:gen_mcp_api
 -->
 
@@ -16,6 +16,8 @@ Each action delegates to the listed existing REST route. Supply its exact body a
 Requests are limited to 1 MiB; owner response/query bounds also apply. Configure `MANYFORGE_MCP_ALLOWED_HOSTS` for remote Host names/IPs and `MANYFORGE_CORS_ORIGINS` for browser origins. Default MCP hosts are loopback. These are transport bounds, not caller authorization. Use the deployment's trusted network/perimeter; request attribution is not authentication.
 
 JSON route bodies are returned as text with `isError` for HTTP failures; viewer snapshots return MCP image content and require an existing matching viewer. Tools list only configured routes; capability availability is still determined by their owners. This is the current wire contract, not full historical-functional or provider qualification. Historical v0 signatures are preserved in git at `08222188293df8e12f90dc72e204c21f22f92ea1`.
+
+**Real robot.** `manyforge_components` reads component states (the machine's controller mode, state, error and motors in `details`), faults, the cell latch and readiness, and runs component actions. A failed Apply or Load names its cause (e.g. `site_settings_unavailable`). Ask the operator for the site settings file, a workbench restart, robot power and network, the e-stop and an attended session. See [Real robot setup](../operations/REAL_ROBOT_SETUP.md).
 
 ## manyforge_scene_state
 
@@ -2175,7 +2177,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
               "operation_acknowledge_completed",
               "cell_full_stop",
               "execution_recovery",
-              "stop_recovery",
               "runtime_scale"
             ],
             "title": "Command Kind",
@@ -4938,96 +4939,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
   "description": "Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unchanged REST DTOs. No implicit Apply, retry, confirmation or identity selection. See each action's schema.",
   "inputSchema": {
     "$defs": {
-      "ActivationScope": {
-        "additionalProperties": false,
-        "description": "The complete activation input an operator confirmed.\n\nDeployment activation compiles the Deployment Draft together with the\ncurrent Program Draft, the Scenario's Program role assignment and its\nsource document. A confirmation names all of them; any change before the\nApply is sent refuses it so the operator reviews the new input.",
-        "properties": {
-          "deploymentDraftId": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Deploymentdraftid",
-            "type": "string"
-          },
-          "deploymentDraftRevision": {
-            "maximum": 9007199254740991.0,
-            "minimum": 0.0,
-            "title": "Deploymentdraftrevision",
-            "type": "integer"
-          },
-          "deploymentRevision": {
-            "anyOf": [
-              {
-                "maxLength": 256,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Deploymentrevision"
-          },
-          "programDraftId": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Programdraftid",
-            "type": "string"
-          },
-          "programDraftRevision": {
-            "maximum": 9007199254740991.0,
-            "minimum": 0.0,
-            "title": "Programdraftrevision",
-            "type": "integer"
-          },
-          "programRevision": {
-            "anyOf": [
-              {
-                "maxLength": 256,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Programrevision"
-          },
-          "programRoleAssignment": {
-            "anyOf": [
-              {
-                "additionalProperties": true,
-                "type": "object"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Programroleassignment"
-          },
-          "sourceDocumentDigest": {
-            "anyOf": [
-              {
-                "maxLength": 256,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Sourcedocumentdigest"
-          }
-        },
-        "required": [
-          "deploymentDraftId",
-          "deploymentDraftRevision",
-          "deploymentRevision",
-          "programDraftId",
-          "programDraftRevision",
-          "programRevision",
-          "sourceDocumentDigest",
-          "programRoleAssignment"
-        ],
-        "title": "ActivationScope",
-        "type": "object"
-      },
       "AddComponentsRequest": {
         "additionalProperties": false,
         "properties": {
@@ -5106,617 +5017,24 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
         "title": "AddComponentsRequest",
         "type": "object"
       },
-      "ApplyDeploymentCandidateRequest": {
+      "ConfirmedApplyRequest": {
         "additionalProperties": false,
+        "description": "Apply and Revert: the ``scope`` of the Preview the user confirmed.\n\nWhen present, the Apply is refused before any effect if the activation\ninput changed since that Preview (``activation_input_changed_after_confirmation``).",
         "properties": {
-          "confirmationToken": {
+          "scope": {
             "anyOf": [
               {
-                "maxLength": 71,
-                "minLength": 71,
-                "pattern": "^sha256:[0-9a-f]{64}$",
-                "type": "string"
+                "additionalProperties": true,
+                "type": "object"
               },
               {
                 "type": "null"
               }
             ],
-            "title": "Confirmationtoken"
-          },
-          "correlationId": {
-            "anyOf": [
-              {
-                "maxLength": 256,
-                "minLength": 1,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Correlationid"
-          },
-          "draftId": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Draftid",
-            "type": "string"
-          },
-          "expectedActivationScope": {
-            "anyOf": [
-              {
-                "$ref": "#/$defs/ActivationScope"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "expectedAdmissionGeneration": {
-            "maximum": 9007199254740991.0,
-            "minimum": 1.0,
-            "title": "Expectedadmissiongeneration",
-            "type": "integer"
-          },
-          "expectedDraftRevision": {
-            "maximum": 9007199254740991.0,
-            "minimum": 0.0,
-            "title": "Expecteddraftrevision",
-            "type": "integer"
-          },
-          "expectedWorkspaceEpoch": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Expectedworkspaceepoch",
-            "type": "string"
-          },
-          "expectedWorkspaceRevision": {
-            "maximum": 9007199254740991.0,
-            "minimum": 1.0,
-            "title": "Expectedworkspacerevision",
-            "type": "integer"
-          },
-          "preparationRequestId": {
-            "anyOf": [
-              {
-                "maxLength": 256,
-                "minLength": 1,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Preparationrequestid"
-          },
-          "preparationRequestOwnerEpoch": {
-            "anyOf": [
-              {
-                "maxLength": 256,
-                "minLength": 1,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Preparationrequestownerepoch"
-          },
-          "requestId": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestid",
-            "type": "string"
-          },
-          "requestOwnerEpoch": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestownerepoch",
-            "type": "string"
+            "title": "Scope"
           }
         },
-        "required": [
-          "draftId",
-          "expectedDraftRevision",
-          "expectedAdmissionGeneration",
-          "requestOwnerEpoch",
-          "requestId",
-          "expectedWorkspaceEpoch",
-          "expectedWorkspaceRevision"
-        ],
-        "title": "ApplyDeploymentCandidateRequest",
-        "type": "object"
-      },
-      "CCLCControlBindingRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "control_binding_id": {
-            "title": "Control Binding Id",
-            "type": "string"
-          },
-          "control_binding_revision": {
-            "title": "Control Binding Revision",
-            "type": "string"
-          },
-          "control_route_id": {
-            "title": "Control Route Id",
-            "type": "string"
-          }
-        },
-        "required": [
-          "control_binding_id",
-          "control_binding_revision",
-          "control_route_id"
-        ],
-        "title": "CCLCControlBindingRequest",
-        "type": "object"
-      },
-      "CCLCDesiredControlBindingRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "control_binding_id": {
-            "title": "Control Binding Id",
-            "type": "string"
-          },
-          "control_binding_revision": {
-            "title": "Control Binding Revision",
-            "type": "string"
-          },
-          "control_route_id": {
-            "title": "Control Route Id",
-            "type": "string"
-          }
-        },
-        "required": [
-          "control_binding_id",
-          "control_binding_revision",
-          "control_route_id"
-        ],
-        "title": "CCLCDesiredControlBindingRequest",
-        "type": "object"
-      },
-      "CCLCDesiredControlConfigurationRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "activation_set_id": {
-            "title": "Activation Set Id",
-            "type": "string"
-          },
-          "binding_routes": {
-            "items": {
-              "$ref": "#/$defs/CCLCDesiredControlBindingRequest"
-            },
-            "maxItems": 4096,
-            "minItems": 1,
-            "title": "Binding Routes",
-            "type": "array"
-          },
-          "control_domain_id": {
-            "title": "Control Domain Id",
-            "type": "string"
-          },
-          "control_domain_revision": {
-            "title": "Control Domain Revision",
-            "type": "string"
-          },
-          "controller_topology_id": {
-            "title": "Controller Topology Id",
-            "type": "string"
-          },
-          "topology_revision": {
-            "title": "Topology Revision",
-            "type": "string"
-          }
-        },
-        "required": [
-          "control_domain_id",
-          "control_domain_revision",
-          "controller_topology_id",
-          "topology_revision",
-          "activation_set_id",
-          "binding_routes"
-        ],
-        "title": "CCLCDesiredControlConfigurationRequest",
-        "type": "object"
-      },
-      "CCLCExpectedActiveConfigurationRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "active_control_configuration_generation": {
-            "anyOf": [
-              {
-                "maximum": 9007199254740991.0,
-                "minimum": 1.0,
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Active Control Configuration Generation"
-          },
-          "active_control_configuration_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Active Control Configuration Id"
-          },
-          "presence": {
-            "enum": [
-              "absent",
-              "present"
-            ],
-            "title": "Presence",
-            "type": "string"
-          }
-        },
-        "required": [
-          "presence"
-        ],
-        "title": "CCLCExpectedActiveConfigurationRequest",
-        "type": "object"
-      },
-      "CCLCExpectedControlDomainRequest": {
-        "additionalProperties": false,
-        "description": "Expected controller domain; `kind` is required (no kindless legacy shape).",
-        "properties": {
-          "control_domain_id": {
-            "title": "Control Domain Id",
-            "type": "string"
-          },
-          "control_domain_revision": {
-            "title": "Control Domain Revision",
-            "type": "string"
-          },
-          "controller_topology_id": {
-            "title": "Controller Topology Id",
-            "type": "string"
-          },
-          "expected_active_control_configuration": {
-            "$ref": "#/$defs/CCLCExpectedActiveConfigurationRequest"
-          },
-          "expected_control_bindings": {
-            "items": {
-              "$ref": "#/$defs/CCLCControlBindingRequest"
-            },
-            "maxItems": 4096,
-            "minItems": 1,
-            "title": "Expected Control Bindings",
-            "type": "array"
-          },
-          "kind": {
-            "const": "controller",
-            "title": "Kind",
-            "type": "string"
-          },
-          "topology_revision": {
-            "title": "Topology Revision",
-            "type": "string"
-          }
-        },
-        "required": [
-          "kind",
-          "control_domain_id",
-          "control_domain_revision",
-          "controller_topology_id",
-          "topology_revision",
-          "expected_active_control_configuration",
-          "expected_control_bindings"
-        ],
-        "title": "CCLCExpectedControlDomainRequest",
-        "type": "object"
-      },
-      "CCLCExpectedProviderDomainRequest": {
-        "additionalProperties": false,
-        "description": "Existing Core expected provider domain: no topology, bindings or routes.",
-        "properties": {
-          "control_domain_id": {
-            "title": "Control Domain Id",
-            "type": "string"
-          },
-          "control_domain_revision": {
-            "title": "Control Domain Revision",
-            "type": "string"
-          },
-          "expected_active_control_configuration": {
-            "$ref": "#/$defs/CCLCExpectedActiveConfigurationRequest"
-          },
-          "kind": {
-            "const": "io_provider",
-            "title": "Kind",
-            "type": "string"
-          },
-          "provider": {
-            "$ref": "#/$defs/CCLCProviderControlDomainRequest"
-          }
-        },
-        "required": [
-          "kind",
-          "control_domain_id",
-          "control_domain_revision",
-          "provider",
-          "expected_active_control_configuration"
-        ],
-        "title": "CCLCExpectedProviderDomainRequest",
-        "type": "object"
-      },
-      "CCLCProviderControlDomainRequest": {
-        "additionalProperties": false,
-        "description": "Existing Core provider-domain proof, echoed verbatim from the component snapshot.",
-        "properties": {
-          "controllable_component_id": {
-            "title": "Controllable Component Id",
-            "type": "string"
-          },
-          "lifecycle_command_timeout_ns": {
-            "maximum": 3600000000000.0,
-            "minimum": 1.0,
-            "title": "Lifecycle Command Timeout Ns",
-            "type": "integer"
-          },
-          "lifecycle_plan_catalog_digest": {
-            "pattern": "^sha256:[0-9a-f]{64}$",
-            "title": "Lifecycle Plan Catalog Digest",
-            "type": "string"
-          },
-          "provider_instance_id": {
-            "title": "Provider Instance Id",
-            "type": "string"
-          },
-          "provider_manifest_id": {
-            "title": "Provider Manifest Id",
-            "type": "string"
-          },
-          "provider_manifest_revision": {
-            "pattern": "^sha256:[0-9a-f]{64}$",
-            "title": "Provider Manifest Revision",
-            "type": "string"
-          },
-          "provider_runtime_unit_id": {
-            "title": "Provider Runtime Unit Id",
-            "type": "string"
-          },
-          "signal_configuration_digest": {
-            "pattern": "^sha256:[0-9a-f]{64}$",
-            "title": "Signal Configuration Digest",
-            "type": "string"
-          },
-          "signal_names": {
-            "items": {
-              "type": "string"
-            },
-            "maxItems": 4096,
-            "minItems": 1,
-            "title": "Signal Names",
-            "type": "array"
-          }
-        },
-        "required": [
-          "controllable_component_id",
-          "provider_runtime_unit_id",
-          "provider_instance_id",
-          "provider_manifest_id",
-          "provider_manifest_revision",
-          "lifecycle_plan_catalog_digest",
-          "signal_configuration_digest",
-          "signal_names",
-          "lifecycle_command_timeout_ns"
-        ],
-        "title": "CCLCProviderControlDomainRequest",
-        "type": "object"
-      },
-      "CCLCRouteComponentExpectationRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "controllable_component_id": {
-            "title": "Controllable Component Id",
-            "type": "string"
-          },
-          "expected_component_lifecycle_generation": {
-            "maximum": 9007199254740991.0,
-            "minimum": 1.0,
-            "title": "Expected Component Lifecycle Generation",
-            "type": "integer"
-          },
-          "expected_component_lifecycle_state": {
-            "enum": [
-              "prepared",
-              "active"
-            ],
-            "title": "Expected Component Lifecycle State",
-            "type": "string"
-          }
-        },
-        "required": [
-          "controllable_component_id",
-          "expected_component_lifecycle_generation",
-          "expected_component_lifecycle_state"
-        ],
-        "title": "CCLCRouteComponentExpectationRequest",
-        "type": "object"
-      },
-      "CallerAttributionRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "correlation_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Correlation Id"
-          },
-          "request_id": {
-            "title": "Request Id",
-            "type": "string"
-          },
-          "request_owner_epoch": {
-            "title": "Request Owner Epoch",
-            "type": "string"
-          },
-          "source_label": {
-            "title": "Source Label",
-            "type": "string"
-          }
-        },
-        "required": [
-          "request_id",
-          "request_owner_epoch",
-          "source_label"
-        ],
-        "title": "CallerAttributionRequest",
-        "type": "object"
-      },
-      "CloseIncidentRecoveryRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "expected_incident_id": {
-            "title": "Expected Incident Id",
-            "type": "string"
-          }
-        },
-        "required": [
-          "expected_incident_id"
-        ],
-        "title": "CloseIncidentRecoveryRequest",
-        "type": "object"
-      },
-      "ComponentLifecycleRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "acknowledge_incident": {
-            "anyOf": [
-              {
-                "type": "boolean"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Acknowledge Incident"
-          },
-          "close_incident_recovery": {
-            "anyOf": [
-              {
-                "$ref": "#/$defs/CloseIncidentRecoveryRequest"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "confirmed": {
-            "title": "Confirmed",
-            "type": "boolean"
-          },
-          "controllable_component_id": {
-            "title": "Controllable Component Id",
-            "type": "string"
-          },
-          "expected_admission_generation": {
-            "maximum": 9007199254740991.0,
-            "minimum": 1.0,
-            "title": "Expected Admission Generation",
-            "type": "integer"
-          },
-          "expected_component_lifecycle_generation": {
-            "maximum": 9007199254740991.0,
-            "minimum": 1.0,
-            "title": "Expected Component Lifecycle Generation",
-            "type": "integer"
-          },
-          "expected_control_domains": {
-            "items": {
-              "discriminator": {
-                "mapping": {
-                  "controller": "#/components/schemas/CCLCExpectedControlDomainRequest",
-                  "io_provider": "#/components/schemas/CCLCExpectedProviderDomainRequest"
-                },
-                "propertyName": "kind"
-              },
-              "oneOf": [
-                {
-                  "$ref": "#/$defs/CCLCExpectedControlDomainRequest"
-                },
-                {
-                  "$ref": "#/$defs/CCLCExpectedProviderDomainRequest"
-                }
-              ]
-            },
-            "maxItems": 256,
-            "minItems": 1,
-            "title": "Expected Control Domains",
-            "type": "array"
-          },
-          "expected_graph_revision": {
-            "title": "Expected Graph Revision",
-            "type": "string"
-          },
-          "expected_incident_id": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Expected Incident Id"
-          },
-          "intent": {
-            "enum": [
-              "prepare",
-              "enable",
-              "disable",
-              "recover"
-            ],
-            "title": "Intent",
-            "type": "string"
-          },
-          "program_node_evidence": {
-            "anyOf": [
-              {
-                "$ref": "#/$defs/ProgramNodeAdmissionEvidenceRequest"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "reason": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Reason"
-          },
-          "request_context": {
-            "$ref": "#/$defs/CallerAttributionRequest"
-          }
-        },
-        "required": [
-          "request_context",
-          "controllable_component_id",
-          "intent",
-          "expected_graph_revision",
-          "expected_component_lifecycle_generation",
-          "expected_control_domains",
-          "confirmed",
-          "expected_admission_generation"
-        ],
-        "title": "ComponentLifecycleRequest",
+        "title": "ConfirmedApplyRequest",
         "type": "object"
       },
       "DiscardDeploymentRequest": {
@@ -5847,271 +5165,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
         "title": "OpenDeploymentRequest",
         "type": "object"
       },
-      "PreviewDeploymentCandidateRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "draftId": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Draftid",
-            "type": "string"
-          },
-          "expectedAdmissionGeneration": {
-            "maximum": 9007199254740991.0,
-            "minimum": 1.0,
-            "title": "Expectedadmissiongeneration",
-            "type": "integer"
-          },
-          "expectedDraftRevision": {
-            "maximum": 9007199254740991.0,
-            "minimum": 0.0,
-            "title": "Expecteddraftrevision",
-            "type": "integer"
-          },
-          "expectedWorkspaceEpoch": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Expectedworkspaceepoch",
-            "type": "string"
-          },
-          "expectedWorkspaceRevision": {
-            "maximum": 9007199254740991.0,
-            "minimum": 1.0,
-            "title": "Expectedworkspacerevision",
-            "type": "integer"
-          },
-          "requestId": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestid",
-            "type": "string"
-          },
-          "requestOwnerEpoch": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestownerepoch",
-            "type": "string"
-          }
-        },
-        "required": [
-          "draftId",
-          "expectedDraftRevision",
-          "expectedAdmissionGeneration",
-          "requestOwnerEpoch",
-          "requestId",
-          "expectedWorkspaceEpoch",
-          "expectedWorkspaceRevision"
-        ],
-        "title": "PreviewDeploymentCandidateRequest",
-        "type": "object"
-      },
-      "ProgramNodeAdmissionEvidenceRequest": {
-        "additionalProperties": false,
-        "description": "Exact runtime-node attribution; the Kernel checks the sealed owner API.",
-        "properties": {
-          "node_attempt_id": {
-            "title": "Node Attempt Id",
-            "type": "string"
-          },
-          "node_instance_id": {
-            "title": "Node Instance Id",
-            "type": "string"
-          },
-          "owner_api": {
-            "enum": [
-              "scene.transaction",
-              "scene.carried_attachment"
-            ],
-            "title": "Owner Api",
-            "type": "string"
-          },
-          "parent_program_cycle_claim_generation": {
-            "maximum": 9007199254740991.0,
-            "minimum": 1.0,
-            "title": "Parent Program Cycle Claim Generation",
-            "type": "integer"
-          },
-          "program_run_id": {
-            "title": "Program Run Id",
-            "type": "string"
-          },
-          "program_runner_owner_epoch": {
-            "title": "Program Runner Owner Epoch",
-            "type": "string"
-          }
-        },
-        "required": [
-          "program_runner_owner_epoch",
-          "program_run_id",
-          "parent_program_cycle_claim_generation",
-          "node_instance_id",
-          "node_attempt_id",
-          "owner_api"
-        ],
-        "title": "ProgramNodeAdmissionEvidenceRequest",
-        "type": "object"
-      },
-      "RevertDeploymentRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "confirmationToken": {
-            "anyOf": [
-              {
-                "maxLength": 71,
-                "minLength": 71,
-                "pattern": "^sha256:[0-9a-f]{64}$",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Confirmationtoken"
-          },
-          "draftId": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Draftid",
-            "type": "string"
-          },
-          "expectedAdmissionGeneration": {
-            "maximum": 9007199254740991.0,
-            "minimum": 1.0,
-            "title": "Expectedadmissiongeneration",
-            "type": "integer"
-          },
-          "expectedDraftRevision": {
-            "maximum": 9007199254740991.0,
-            "minimum": 0.0,
-            "title": "Expecteddraftrevision",
-            "type": "integer"
-          },
-          "expectedWorkspaceEpoch": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Expectedworkspaceepoch",
-            "type": "string"
-          },
-          "expectedWorkspaceRevision": {
-            "maximum": 9007199254740991.0,
-            "minimum": 1.0,
-            "title": "Expectedworkspacerevision",
-            "type": "integer"
-          },
-          "preparationRequestId": {
-            "anyOf": [
-              {
-                "maxLength": 256,
-                "minLength": 1,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Preparationrequestid"
-          },
-          "preparationRequestOwnerEpoch": {
-            "anyOf": [
-              {
-                "maxLength": 256,
-                "minLength": 1,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Preparationrequestownerepoch"
-          },
-          "requestId": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestid",
-            "type": "string"
-          },
-          "requestOwnerEpoch": {
-            "maxLength": 256,
-            "minLength": 1,
-            "title": "Requestownerepoch",
-            "type": "string"
-          }
-        },
-        "required": [
-          "draftId",
-          "expectedDraftRevision",
-          "expectedAdmissionGeneration",
-          "requestOwnerEpoch",
-          "requestId",
-          "expectedWorkspaceEpoch",
-          "expectedWorkspaceRevision"
-        ],
-        "title": "RevertDeploymentRequest",
-        "type": "object"
-      },
-      "RouteSelectionRequest": {
-        "additionalProperties": false,
-        "properties": {
-          "component_expectations": {
-            "items": {
-              "$ref": "#/$defs/CCLCRouteComponentExpectationRequest"
-            },
-            "maxItems": 4096,
-            "minItems": 1,
-            "title": "Component Expectations",
-            "type": "array"
-          },
-          "confirmed": {
-            "title": "Confirmed",
-            "type": "boolean"
-          },
-          "desired_configuration": {
-            "$ref": "#/$defs/CCLCDesiredControlConfigurationRequest"
-          },
-          "expected_active_control_configuration": {
-            "$ref": "#/$defs/CCLCExpectedActiveConfigurationRequest"
-          },
-          "expected_admission_generation": {
-            "maximum": 9007199254740991.0,
-            "minimum": 1.0,
-            "title": "Expected Admission Generation",
-            "type": "integer"
-          },
-          "expected_graph_revision": {
-            "title": "Expected Graph Revision",
-            "type": "string"
-          },
-          "expected_retained_bundle_id": {
-            "title": "Expected Retained Bundle Id",
-            "type": "string"
-          },
-          "program_node_evidence": {
-            "anyOf": [
-              {
-                "$ref": "#/$defs/ProgramNodeAdmissionEvidenceRequest"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "request_context": {
-            "$ref": "#/$defs/CallerAttributionRequest"
-          }
-        },
-        "required": [
-          "request_context",
-          "expected_admission_generation",
-          "expected_retained_bundle_id",
-          "expected_graph_revision",
-          "desired_configuration",
-          "expected_active_control_configuration",
-          "component_expectations",
-          "confirmed"
-        ],
-        "title": "RouteSelectionRequest",
-        "type": "object"
-      },
       "SaveDeploymentAsRequest": {
         "additionalProperties": false,
         "properties": {
@@ -6238,6 +5291,13 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "expectedWorkspaceRevision"
         ],
         "title": "SaveDeploymentRequest",
+        "type": "object"
+      },
+      "ServerApplyRequest": {
+        "additionalProperties": false,
+        "description": "CONTRACTS \u00a711: Preview takes an empty body.",
+        "properties": {},
+        "title": "ServerApplyRequest",
         "type": "object"
       },
       "UpdateControlledStopRequest": {
@@ -6475,21 +5535,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "minLength": 1,
             "title": "Requestownerepoch",
             "type": "string"
-          },
-          "tcp_speed_check": {
-            "anyOf": [
-              {
-                "enum": [
-                  "active_tcp",
-                  "active_tcp_and_flange"
-                ],
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Tcp Speed Check"
           }
         },
         "required": [
@@ -6629,14 +5674,14 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       },
       {
         "additionalProperties": false,
-        "description": "POST /api/deployment/draft/preview",
+        "description": "POST /api/deployment/preview",
         "properties": {
           "action": {
             "const": "preview",
             "type": "string"
           },
           "body": {
-            "$ref": "#/$defs/PreviewDeploymentCandidateRequest"
+            "$ref": "#/$defs/ServerApplyRequest"
           }
         },
         "required": [
@@ -6647,19 +5692,33 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       },
       {
         "additionalProperties": false,
-        "description": "POST /api/deployment/draft/apply",
+        "description": "POST /api/deployment/apply",
         "properties": {
           "action": {
             "const": "apply",
             "type": "string"
           },
           "body": {
-            "$ref": "#/$defs/ApplyDeploymentCandidateRequest"
+            "$ref": "#/$defs/ConfirmedApplyRequest"
           }
         },
         "required": [
           "action",
           "body"
+        ],
+        "type": "object"
+      },
+      {
+        "additionalProperties": false,
+        "description": "GET /api/deployment/effective",
+        "properties": {
+          "action": {
+            "const": "effective",
+            "type": "string"
+          }
+        },
+        "required": [
+          "action"
         ],
         "type": "object"
       },
@@ -6719,6 +5778,24 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       },
       {
         "additionalProperties": false,
+        "description": "POST /api/deployment/revert/preview",
+        "properties": {
+          "action": {
+            "const": "revert_preview",
+            "type": "string"
+          },
+          "body": {
+            "$ref": "#/$defs/ServerApplyRequest"
+          }
+        },
+        "required": [
+          "action",
+          "body"
+        ],
+        "type": "object"
+      },
+      {
+        "additionalProperties": false,
         "description": "POST /api/deployment/revert",
         "properties": {
           "action": {
@@ -6726,7 +5803,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "type": "string"
           },
           "body": {
-            "$ref": "#/$defs/RevertDeploymentRequest"
+            "$ref": "#/$defs/ConfirmedApplyRequest"
           }
         },
         "required": [
@@ -6762,17 +5839,76 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "action"
         ],
         "type": "object"
+      }
+    ],
+    "type": "object"
+  },
+  "name": "manyforge_deployment"
+}
+```
+
+## manyforge_scenario
+
+Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unchanged REST DTOs. No implicit Apply, retry, confirmation or identity selection. See each action's schema.
+
+```json
+{
+  "annotations": {
+    "destructiveHint": true,
+    "idempotentHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false
+  },
+  "description": "Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unchanged REST DTOs. No implicit Apply, retry, confirmation or identity selection. See each action's schema.",
+  "inputSchema": {
+    "$defs": {
+      "ScenarioEmptyRequest": {
+        "additionalProperties": false,
+        "description": "CONTRACTS \u00a711 `POST /api/scenario/new` body: refused with\nan unsaved Draft unless the caller confirms `discard_unsaved`.",
+        "properties": {
+          "discard_unsaved": {
+            "default": false,
+            "title": "Discard Unsaved",
+            "type": "boolean"
+          }
+        },
+        "title": "ScenarioEmptyRequest",
+        "type": "object"
       },
+      "ScenarioLoadRequest": {
+        "additionalProperties": false,
+        "description": "CONTRACTS \u00a711 `POST /api/scenario/load` body. With an unsaved Draft the\nLoad is refused unless the caller confirms `discard_unsaved`.",
+        "properties": {
+          "discard_unsaved": {
+            "default": false,
+            "title": "Discard Unsaved",
+            "type": "boolean"
+          },
+          "path": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "ScenarioLoadRequest",
+        "type": "object"
+      }
+    },
+    "oneOf": [
       {
         "additionalProperties": false,
-        "description": "POST /api/cclc/lifecycle/requests",
+        "description": "POST /api/scenario/load",
         "properties": {
           "action": {
-            "const": "lifecycle",
+            "const": "load",
             "type": "string"
           },
           "body": {
-            "$ref": "#/$defs/ComponentLifecycleRequest"
+            "$ref": "#/$defs/ScenarioLoadRequest"
           }
         },
         "required": [
@@ -6783,14 +5919,14 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       },
       {
         "additionalProperties": false,
-        "description": "POST /api/cclc/routes/requests",
+        "description": "POST /api/scenario/new",
         "properties": {
           "action": {
-            "const": "route",
+            "const": "new",
             "type": "string"
           },
           "body": {
-            "$ref": "#/$defs/RouteSelectionRequest"
+            "$ref": "#/$defs/ScenarioEmptyRequest"
           }
         },
         "required": [
@@ -6802,7 +5938,282 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
     ],
     "type": "object"
   },
-  "name": "manyforge_deployment"
+  "name": "manyforge_scenario"
+}
+```
+
+## manyforge_components
+
+Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unchanged REST DTOs. No implicit Apply, retry, confirmation or identity selection. See each action's schema.
+
+```json
+{
+  "annotations": {
+    "destructiveHint": true,
+    "idempotentHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false
+  },
+  "description": "Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unchanged REST DTOs. No implicit Apply, retry, confirmation or identity selection. See each action's schema.",
+  "inputSchema": {
+    "$defs": {
+      "ComponentActionRequest": {
+        "additionalProperties": false,
+        "description": "CONTRACTS \u00a72 `POST /api/components/{component_id}/actions`.",
+        "properties": {
+          "action": {
+            "enum": [
+              "prepare",
+              "enable",
+              "disable",
+              "recover",
+              "reset_position",
+              "power_off",
+              "reboot",
+              "sim_reset"
+            ],
+            "title": "Action",
+            "type": "string"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "title": "ComponentActionRequest",
+        "type": "object"
+      },
+      "ComponentGroupActionRequest": {
+        "additionalProperties": false,
+        "description": "CONTRACTS \u00a72 `POST /api/components/actions` (Enable all and groups):\nthe caller names the components (Enable all = every `prepared` member and\nowner-less component; owners have no Enable, \u00a716).",
+        "properties": {
+          "action": {
+            "enum": [
+              "prepare",
+              "enable",
+              "disable",
+              "recover",
+              "reset_position",
+              "power_off",
+              "reboot",
+              "sim_reset"
+            ],
+            "title": "Action",
+            "type": "string"
+          },
+          "component_ids": {
+            "items": {
+              "maxLength": 256,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 256,
+            "minItems": 1,
+            "title": "Component Ids",
+            "type": "array"
+          }
+        },
+        "required": [
+          "action",
+          "component_ids"
+        ],
+        "title": "ComponentGroupActionRequest",
+        "type": "object"
+      }
+    },
+    "oneOf": [
+      {
+        "additionalProperties": false,
+        "description": "GET /api/components",
+        "properties": {
+          "action": {
+            "const": "list",
+            "type": "string"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object"
+      },
+      {
+        "additionalProperties": false,
+        "description": "POST /api/components/{component_id}/actions",
+        "properties": {
+          "action": {
+            "const": "action",
+            "type": "string"
+          },
+          "body": {
+            "$ref": "#/$defs/ComponentActionRequest"
+          },
+          "path": {
+            "additionalProperties": false,
+            "properties": {
+              "component_id": {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "component_id"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "action",
+          "path",
+          "body"
+        ],
+        "type": "object"
+      },
+      {
+        "additionalProperties": false,
+        "description": "POST /api/components/actions",
+        "properties": {
+          "action": {
+            "const": "group_action",
+            "type": "string"
+          },
+          "body": {
+            "$ref": "#/$defs/ComponentGroupActionRequest"
+          }
+        },
+        "required": [
+          "action",
+          "body"
+        ],
+        "type": "object"
+      },
+      {
+        "additionalProperties": false,
+        "description": "GET /api/cell/latch",
+        "properties": {
+          "action": {
+            "const": "cell_latch",
+            "type": "string"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object"
+      },
+      {
+        "additionalProperties": false,
+        "description": "GET /api/program/readiness",
+        "properties": {
+          "action": {
+            "const": "readiness",
+            "type": "string"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object"
+      }
+    ],
+    "type": "object"
+  },
+  "name": "manyforge_components"
+}
+```
+
+## manyforge_io
+
+Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unchanged REST DTOs. No implicit Apply, retry, confirmation or identity selection. See each action's schema.
+
+```json
+{
+  "annotations": {
+    "destructiveHint": true,
+    "idempotentHint": false,
+    "openWorldHint": false,
+    "readOnlyHint": false
+  },
+  "description": "Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unchanged REST DTOs. No implicit Apply, retry, confirmation or identity selection. See each action's schema.",
+  "inputSchema": {
+    "$defs": {
+      "SetOutputRequest": {
+        "additionalProperties": false,
+        "description": "CONTRACTS \u00a77 `POST /api/io/{signal_id}/set` body.",
+        "properties": {
+          "value": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "integer"
+              },
+              {
+                "type": "number"
+              }
+            ],
+            "title": "Value"
+          }
+        },
+        "required": [
+          "value"
+        ],
+        "title": "SetOutputRequest",
+        "type": "object"
+      }
+    },
+    "oneOf": [
+      {
+        "additionalProperties": false,
+        "description": "GET /api/io",
+        "properties": {
+          "action": {
+            "const": "list",
+            "type": "string"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "type": "object"
+      },
+      {
+        "additionalProperties": false,
+        "description": "POST /api/io/{signal_id}/set",
+        "properties": {
+          "action": {
+            "const": "set",
+            "type": "string"
+          },
+          "body": {
+            "$ref": "#/$defs/SetOutputRequest"
+          },
+          "path": {
+            "additionalProperties": false,
+            "properties": {
+              "signal_id": {
+                "maxLength": 512,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "signal_id"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "action",
+          "path",
+          "body"
+        ],
+        "type": "object"
+      }
+    ],
+    "type": "object"
+  },
+  "name": "manyforge_io"
 }
 ```
 
@@ -6972,7 +6383,14 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
         "properties": {
           "caller_options": {
             "items": {
-              "$ref": "#/$defs/CommandDurationOptionRequest"
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/CommandDurationOptionRequest"
+                },
+                {
+                  "$ref": "#/$defs/CommandFlagOptionRequest"
+                }
+              ]
             },
             "maxItems": 64,
             "title": "Caller Options",
@@ -6987,34 +6405,12 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "type": "string"
           },
           "command_value": {
-            "discriminator": {
-              "mapping": {
-                "gripper_position": "#/components/schemas/GripperPositionCommandValueRequest",
-                "io_signal_write": "#/components/schemas/IoSignalWriteCommandValueRequest"
-              },
-              "propertyName": "kind"
-            },
-            "oneOf": [
-              {
-                "$ref": "#/$defs/GripperPositionCommandValueRequest"
-              },
-              {
-                "$ref": "#/$defs/IoSignalWriteCommandValueRequest"
-              }
-            ],
-            "title": "Command Value"
+            "$ref": "#/$defs/GripperPositionCommandValueRequest"
           },
           "completion_timeout_s": {
-            "anyOf": [
-              {
-                "exclusiveMinimum": 0.0,
-                "type": "number"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Completion Timeout S"
+            "exclusiveMinimum": 0.0,
+            "title": "Completion Timeout S",
+            "type": "number"
           },
           "kind": {
             "const": "capability_command",
@@ -7027,6 +6423,7 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "command_schema_id",
           "command_schema_revision",
           "command_value",
+          "completion_timeout_s",
           "caller_options"
         ],
         "title": "CapabilityCommandParticipantRequest",
@@ -7035,6 +6432,16 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       "CartesianPathRequest": {
         "additionalProperties": false,
         "properties": {
+          "blend_radii_m": {
+            "items": {
+              "minimum": 0.0,
+              "type": "number"
+            },
+            "maxItems": 4096,
+            "minItems": 1,
+            "title": "Blend Radii M",
+            "type": "array"
+          },
           "fallback_policy": {
             "enum": [
               "fail_closed",
@@ -7058,12 +6465,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Max Angular Speed Rad S",
             "type": "number"
           },
-          "max_blend_deviation_rad": {
-            "default": 0.01,
-            "minimum": 0.0,
-            "title": "Max Blend Deviation Rad",
-            "type": "number"
-          },
           "max_linear_acceleration_mps2": {
             "exclusiveMinimum": 0.0,
             "title": "Max Linear Acceleration Mps2",
@@ -7080,9 +6481,19 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "type": "number"
           },
           "speed_mode": {
-            "const": "bounded",
-            "title": "Speed Mode",
-            "type": "string"
+            "anyOf": [
+              {
+                "enum": [
+                  "constant_speed",
+                  "time_optimal"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Speed Mode"
           },
           "waypoints": {
             "items": {
@@ -7099,11 +6510,11 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "waypoints",
           "max_translation_step_m",
           "max_rotation_step_rad",
-          "speed_mode",
           "max_angular_speed_rad_s",
           "max_linear_acceleration_mps2",
           "max_angular_acceleration_rad_s2",
-          "fallback_policy"
+          "fallback_policy",
+          "blend_radii_m"
         ],
         "title": "CartesianPathRequest",
         "type": "object"
@@ -7141,6 +6552,25 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "value_s"
         ],
         "title": "CommandDurationOptionRequest",
+        "type": "object"
+      },
+      "CommandFlagOptionRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "option_id": {
+            "title": "Option Id",
+            "type": "string"
+          },
+          "value_bool": {
+            "title": "Value Bool",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "option_id",
+          "value_bool"
+        ],
+        "title": "CommandFlagOptionRequest",
         "type": "object"
       },
       "ComponentBodyRoleReferenceRequest": {
@@ -7326,32 +6756,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "pose"
         ],
         "title": "InlinePoseReferenceRequest",
-        "type": "object"
-      },
-      "IoSignalWriteCommandValueRequest": {
-        "additionalProperties": false,
-        "description": "One typed boolean output write (contract 53); no provider/readback data.",
-        "properties": {
-          "kind": {
-            "const": "io_signal_write",
-            "title": "Kind",
-            "type": "string"
-          },
-          "resource_role_id": {
-            "title": "Resource Role Id",
-            "type": "string"
-          },
-          "value": {
-            "title": "Value",
-            "type": "boolean"
-          }
-        },
-        "required": [
-          "kind",
-          "resource_role_id",
-          "value"
-        ],
-        "title": "IoSignalWriteCommandValueRequest",
         "type": "object"
       },
       "JointDynamicsLimitRequest": {
@@ -7662,14 +7066,15 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
             "title": "Per Joint Dynamics Limits",
             "type": "object"
           },
-          "planning_profile": {
-            "enum": [
-              "first_feasible",
-              "balanced",
-              "quality_bounded"
-            ],
-            "title": "Planning Profile",
-            "type": "string"
+          "planner": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/MotionPlannerRequest"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "runtime_object_bindings": {
             "items": {
@@ -7769,13 +7174,90 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "speed_profile",
           "timeouts",
           "cache_mode",
-          "planning_profile",
           "target_mode",
           "motion",
           "per_joint_dynamics_limits",
           "motion_interrupt_scopes"
         ],
         "title": "MotionParticipantRequest",
+        "type": "object"
+      },
+      "MotionPlannerRequest": {
+        "additionalProperties": false,
+        "description": "A motion's planner override; unset members take the Deployment's.",
+        "properties": {
+          "collision_check_step_rad": {
+            "anyOf": [
+              {
+                "exclusiveMinimum": 0.0,
+                "maximum": 0.2,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Collision Check Step Rad"
+          },
+          "max_nodes": {
+            "anyOf": [
+              {
+                "maximum": 1000000.0,
+                "minimum": 100.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Max Nodes"
+          },
+          "n": {
+            "anyOf": [
+              {
+                "maximum": 32.0,
+                "minimum": 2.0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "N"
+          },
+          "optimize": {
+            "anyOf": [
+              {
+                "enum": [
+                  "first",
+                  "rrt_star",
+                  "best_of_n"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Optimize"
+          },
+          "search": {
+            "anyOf": [
+              {
+                "enum": [
+                  "rrt",
+                  "rrt_connect"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Search"
+          }
+        },
+        "title": "MotionPlannerRequest",
         "type": "object"
       },
       "MotionSpeedProfileRequest": {
@@ -8004,24 +7486,8 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
       },
       "OperationResetRequest": {
         "additionalProperties": false,
-        "description": "Targeted operation Reset (contract 66).\n\n``acknowledged_uncertain_outputs`` lists only this operation's own retained\nacceptance_unknown output(s) the operator explicitly acknowledged (\"a write\nalready queued in the remote device may still act\"); sorted and unique.\nOmitted when absent, so an ordinary Reset keeps its exact wire bytes. The\nowner refuses a Reset that would release an unlisted unknown output.",
+        "description": "Targeted operation Reset (contract 66).",
         "properties": {
-          "acknowledged_uncertain_outputs": {
-            "anyOf": [
-              {
-                "items": {
-                  "$ref": "#/$defs/UncertainOutputAcknowledgementRequest"
-                },
-                "maxItems": 64,
-                "minItems": 1,
-                "type": "array"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Acknowledged Uncertain Outputs"
-          },
           "expected_operation_revision": {
             "maximum": 9007199254740991.0,
             "minimum": 1.0,
@@ -8573,28 +8039,6 @@ Thin ManyForge API adapter. Submit once; observe owner state. Bodies use the unc
           "entry"
         ],
         "title": "TcpEntrySelectorRequest",
-        "type": "object"
-      },
-      "UncertainOutputAcknowledgementRequest": {
-        "additionalProperties": false,
-        "description": "One retained acceptance_unknown output the operator acknowledged.",
-        "properties": {
-          "operation_id": {
-            "title": "Operation Id",
-            "type": "string"
-          },
-          "operation_revision": {
-            "maximum": 9007199254740991.0,
-            "minimum": 1.0,
-            "title": "Operation Revision",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "operation_id",
-          "operation_revision"
-        ],
-        "title": "UncertainOutputAcknowledgementRequest",
         "type": "object"
       },
       "Vector3Request": {

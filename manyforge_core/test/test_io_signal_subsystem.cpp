@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 
+#include <manyforge_core/execution_event_change_signal.hpp>
 #include <manyforge_core/io_signal_subsystem.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
 #include <utility>
@@ -707,6 +708,159 @@ TEST(IoSignalSubsystemTest, SameValuedPeriodicReceiptRefreshesItsActualReceiptBu
   EXPECT_EQ(service.ReadSignal(signal_id()).value().availability, IoSignalAvailability::kFresh);
   clock.advance(2);
   EXPECT_EQ(service.ReadSignal(signal_id()).value().availability, IoSignalAvailability::kStale);
+}
+
+
+TEST(IoSignalSubsystemTest, SampleValueSourceOrFreshnessChangeRaisesTheEventSignalAgeAloneDoesNot) {
+  // CONTRACTS §7: the event stream pushes `state` when a sample's value,
+  // source or freshness changes, never for its age alone.
+  FakeClock clock;
+  auto created = IoSignalSubsystem::Create(catalog(), limits(), clock);
+  ASSERT_TRUE(created.ok());
+  auto& io = *created.value();
+  auto& signal = execution_event_change_signal();
+  const auto raised = [&](const auto& step) {
+    const auto before = signal.Generation();
+    step();
+    return signal.Generation() != before;
+  };
+  EXPECT_TRUE(raised([&] { ASSERT_TRUE(io.InstallSource(kSourceA, kIncarnation, std::nullopt).ok()); }));
+  EXPECT_FALSE(io.NextSampleExpiry());  // nothing fresh yet
+  EXPECT_TRUE(raised([&] { ASSERT_TRUE(io.Publish(acquisition(publication(1, true), 0)).ok()); }));
+  EXPECT_EQ(io.NextSampleExpiry(), std::optional<TimePoint>(11));
+  // The same value again, only older or renewed: no change.
+  clock.advance(5);
+  EXPECT_FALSE(raised([&] { io.RefreshSamples(); }));
+  EXPECT_FALSE(raised([&] {
+    ASSERT_TRUE(io.Publish(acquisition(publication(2, true), clock.now())).ok());
+  }));
+  EXPECT_EQ(io.NextSampleExpiry(), std::optional<TimePoint>(16));
+  // A new value.
+  clock.advance(1);
+  EXPECT_TRUE(raised([&] {
+    ASSERT_TRUE(io.Publish(acquisition(publication(3, false), clock.now())).ok());
+  }));
+  // Fresh turning stale with no acquisition: seen at the expiry refresh.
+  clock.advance(10);
+  EXPECT_FALSE(raised([&] { io.RefreshSamples(); }));
+  clock.advance(1);
+  EXPECT_TRUE(raised([&] { io.RefreshSamples(); }));
+  EXPECT_FALSE(io.NextSampleExpiry());
+  EXPECT_FALSE(raised([&] { io.RefreshSamples(); }));
+  // A lost source.
+  EXPECT_TRUE(raised([&] {
+    ASSERT_TRUE(io.Publish(acquisition(publication(4, false), clock.now())).ok());
+  }));
+  EXPECT_TRUE(raised([&] {
+    ASSERT_TRUE(io.MarkSourceUnavailable(kSourceA, kIncarnation, 4,
+                                         {"source_disconnected", "provider unavailable", {}})
+                    .ok());
+  }));
+}
+
+IoSignalDescriptorDTO output_descriptor(const std::string& name, bool readback = true,
+                                        bool controller_owned = false) {
+  return {signal_id(name),
+          kSourceB,
+          IoSignalValueType::kBoolean,
+          IoSignalDirection::kOutput,
+          IoSignalUpdateMode::kChangeOnly,
+          IoTransitionCapability::kSampledOnly,
+          {IoFreshnessMode::kProviderValidity, std::nullopt},
+          ResourceId("resource." + name),
+          std::nullopt,
+          controller_owned,
+          readback};
+}
+
+IoSourceAcquisitionDTO output_sample(std::uint64_t sequence, bool value,
+                                     IoSignalSampleSource source, TimePoint received,
+                                     const std::string& name = "valve") {
+  return {kSourceB, kIncarnation, sequence, received,
+          {{signal_id(name), IoSampleValidity::kValid, value, std::nullopt, source}}};
+}
+
+TEST(IoSignalSubsystemTest, ChangedOutsideExistsOnlyForReadBackOutputsNotControllerOwned) {
+  FakeClock clock;
+  auto created = IoSignalSubsystem::Create(
+      catalog({descriptor(), output_descriptor("valve"), output_descriptor("owned", true, true),
+               output_descriptor("blind", false)}),
+      {3, 8, 8, 8, 512, 1024}, clock);
+  ASSERT_TRUE(created.ok()) << created.error().message;
+  auto& io = *created.value();
+  const auto flag = io.ReadSignal(ChangedOutsideSignalId(signal_id("valve")));
+  ASSERT_TRUE(flag.ok());
+  EXPECT_EQ(flag.value().descriptor.direction, IoSignalDirection::kInput);
+  EXPECT_EQ(flag.value().descriptor.liveness, std::optional(IoSignalLivenessMode::kInProcess));
+  EXPECT_EQ(flag.value().availability, IoSignalAvailability::kFresh);
+  ASSERT_TRUE(flag.value().latest_sample);
+  EXPECT_EQ(flag.value().latest_sample->publication.value, std::optional(false));
+  EXPECT_FALSE(io.ReadSignal(ChangedOutsideSignalId(signal_id("owned"))).ok());
+  EXPECT_FALSE(io.ReadSignal(ChangedOutsideSignalId(signal_id("blind"))).ok());
+  EXPECT_FALSE(io.ClearOutsideChange(signal_id("owned")).ok());
+  EXPECT_FALSE(io.ClearOutsideChange(signal_id("blind")).ok());
+  EXPECT_TRUE(io.ClearOutsideChange(signal_id("valve")).ok());
+  // The core-held source takes no outside installation or samples.
+  const auto core_source = ChangedOutsideSourceId(signal_id("valve"));
+  EXPECT_FALSE(io.InstallSource(core_source, kIncarnation, std::nullopt).ok());
+  // Read-back and controller ownership are output facts only.
+  auto input = catalog();
+  input.signals.front().readback = true;
+  EXPECT_FALSE(IoSignalSubsystem::Create(std::move(input), limits(), clock).ok());
+  // Each core-held signal and source counts against the explicit bounds.
+  EXPECT_FALSE(IoSignalSubsystem::Create(catalog({output_descriptor("valve")}),
+                                         {1, 4, 8, 8, 512, 1024}, clock).ok());
+}
+
+TEST(IoSignalSubsystemTest, ChangedOutsideSetsOnOutsideAndClearsOnWriteClearAndPrepare) {
+  FakeClock clock;
+  auto created =
+      IoSignalSubsystem::Create(catalog({output_descriptor("valve")}), limits(), clock);
+  ASSERT_TRUE(created.ok()) << created.error().message;
+  auto& io = *created.value();
+  ASSERT_TRUE(io.InstallSource(kSourceB, kIncarnation, std::nullopt).ok());
+  const auto flag_id = ChangedOutsideSignalId(signal_id("valve"));
+  const auto flag = [&] {
+    return io.ReadSignal(flag_id).value().latest_sample->publication.value;
+  };
+  const auto publish = [&](std::uint64_t sequence, bool value, IoSignalSampleSource source) {
+    clock.advance(1);
+    return io.Publish(output_sample(sequence, value, source, clock.now()));
+  };
+  ASSERT_TRUE(publish(1U, true, IoSignalSampleSource::kManyforgeWrite).ok());
+  EXPECT_EQ(flag(), std::optional(false));
+  // A Program level watch reads it like any signal.
+  const auto watch = io.RegisterLevelWatch({scope(), flag_id, true});
+  ASSERT_TRUE(watch.ok());
+  ASSERT_TRUE(publish(2U, false, IoSignalSampleSource::kOutside).ok());
+  EXPECT_EQ(flag(), std::optional(true));
+  EXPECT_EQ(io.ReadWatch(watch.value()).value().state, IoWatchState::kMatched);
+  const auto sample = ToSignalSample(io.ReadSignal(signal_id("valve")).value());
+  EXPECT_EQ(sample.source, IoSignalSampleSource::kOutside);
+  EXPECT_EQ(sample.value, (std::optional<std::variant<bool, double>>(false)));
+  EXPECT_TRUE(sample.fresh);
+  // The node `io.clear_outside_change` clears it; the same outside reading
+  // repeated is no new change.
+  ASSERT_TRUE(io.ClearOutsideChange(signal_id("valve")).ok());
+  EXPECT_EQ(flag(), std::optional(false));
+  ASSERT_TRUE(publish(3U, false, IoSignalSampleSource::kOutside).ok());
+  EXPECT_EQ(flag(), std::optional(false));
+  ASSERT_TRUE(publish(4U, true, IoSignalSampleSource::kOutside).ok());
+  EXPECT_EQ(flag(), std::optional(true));
+  // An accepted ManyForge write clears it.
+  ASSERT_TRUE(publish(5U, true, IoSignalSampleSource::kManyforgeWrite).ok());
+  EXPECT_EQ(flag(), std::optional(false));
+  ASSERT_TRUE(publish(6U, false, IoSignalSampleSource::kOutside).ok());
+  EXPECT_EQ(flag(), std::optional(true));
+  // The owning component becoming prepared clears it; other components don't.
+  ASSERT_TRUE(io.ClearComponentOutsideChanges(ControllableComponentId("component.other")).ok());
+  EXPECT_EQ(flag(), std::optional(true));
+  ASSERT_TRUE(io.ClearComponentOutsideChanges(ControllableComponentId("component.io")).ok());
+  EXPECT_EQ(flag(), std::optional(false));
+  // A device reading or a last-write echo never sets it.
+  ASSERT_TRUE(publish(7U, true, IoSignalSampleSource::kDevice).ok());
+  ASSERT_TRUE(publish(8U, true, IoSignalSampleSource::kLastWrite).ok());
+  EXPECT_EQ(flag(), std::optional(false));
 }
 
 }  // namespace

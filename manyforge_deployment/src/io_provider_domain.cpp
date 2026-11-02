@@ -4,9 +4,6 @@
 #include "content_identity_internal.hpp"
 #include <algorithm>
 #include <manyforge_content_identity/content_identity.hpp>
-#include <manyforge_core/component_lifecycle_budget.hpp>
-#include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
-#include <manyforge_core/io_provider_lifecycle_catalog.hpp>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -87,7 +84,13 @@ Array member_rows(const core::CellGraphDTO &graph,
 
 /// CP9 pose sources and AI models have no device-configured lifecycle limit
 /// field: the default component lifecycle budget.
-constexpr core::Duration kModelFreeLifecycleCommandTimeoutNs = core::kDefaultLifecycleBudgetNs;
+constexpr core::Duration kModelFreeLifecycleCommandTimeoutNs = kDefaultLifecycleBudgetNs;
+
+/// The core provider domain still carries a lifecycle plan catalog digest;
+/// with no plan catalog, the provider's manifest revision fills it.
+core::ContentDigest lifecycle_digest(const core::ProviderManifestRevision &revision) {
+  return core::ContentDigest(revision.value());
+}
 
 struct Owner final {
   core::ProviderInstanceId instance;
@@ -143,7 +146,7 @@ Owner signal_owner(const core::CellGraphDTO &graph,
                       })))
       fail("io_provider_manifest_offer_mismatch");
     if (structural_only && binding.provider_manifest_id.value() !=
-                               core::kIoProviderLifecycleManifestId)
+                               kIoProviderManifestId)
       fail("io_provider_manifest_offer_mismatch");
     for (const auto &endpoint : binding.endpoint_bindings) {
       if (endpoint.endpoint_role_id.value() != "io_signal_service")
@@ -235,10 +238,10 @@ struct ModelFreeDomainKind final {
   std::string_view configuration_api;
 };
 constexpr ModelFreeDomainKind kPoseSourceDomainKind{
-    "scene.pose.observe", core::kPoseSourceLifecycleManifestId, "pose_source",
+    "scene.pose.observe", kPoseSourceProviderManifestId, "pose_source",
     "pose-source-configuration", "manyforge.pose_source_configuration.v1"};
 constexpr ModelFreeDomainKind kAiModelDomainKind{
-    kAiModelCapabilityId, core::kAiModelLifecycleManifestId, "ai_model",
+    kAiModelCapabilityId, kAiModelProviderManifestId, "ai_model",
     "ai-model-configuration", "manyforge.ai_model_configuration.v1"};
 
 [[noreturn]] void refuse(const ModelFreeDomainKind &kind,
@@ -304,26 +307,6 @@ static void derive_model_free_domains(
     }
     if (!owner)
       refuse(kind, "_ownership_missing");
-    const auto catalog =
-        [&]() -> core::Result<core::BrandLifecyclePlanCatalogDTO> {
-      if (!structural_only) {
-        const auto manifest = std::find_if(
-            manifests.begin(), manifests.end(), [&](const auto &value) {
-              return value.value().provider_manifest_id == owner->manifest &&
-                     value.value().provider_manifest_revision ==
-                         owner->revision;
-            });
-        return core::MakeIoProviderLifecycleCatalog(manifest->value());
-      }
-      const auto plans = core::MakeIoProviderLifecyclePlans();
-      if (!plans.ok())
-        return core::Result<core::BrandLifecyclePlanCatalogDTO>::Err(
-            plans.error());
-      return core::MakeBrandLifecyclePlanCatalog(owner->manifest,
-                                                 owner->revision, plans.value());
-    }();
-    if (!catalog.ok())
-      refuse(kind, "_lifecycle_catalog_unqualified");
     const auto identity = content_identity::sha256_digest(canonical_json(
         Value(Object{{"runtime_unit_id", Value(source.runtime_unit_id.value())},
                      {"provider_instance_id",
@@ -336,7 +319,7 @@ static void derive_model_free_domains(
         owner->instance,
         owner->manifest,
         owner->revision,
-        catalog.value().catalog_digest,
+        lifecycle_digest(owner->revision),
         core::ContentDigest(content_identity::framed_sha256(
             kind.configuration_domain, kind.configuration_api,
             json_value(source.row))),
@@ -433,11 +416,10 @@ derive_domains(const core::CellGraphDTO &graph,
     IoProviderDomainDerivation result;
     for (const auto &signal : signals.value()) {
       const auto& profile = signal.provider.profile;
-      const bool ros_connection =
-          profile == "ros_bool" || profile == "ros_set_bool" ||
-          profile == "ur_io_states" || profile == "ur_set_io" ||
-          profile == "xarm_digital" ||
-          profile == "ros2_control_gpio";
+      // Every provider but the in-process ones is a device connection.
+      const bool ros_connection = profile != "mock" &&
+                                  profile != "mock_output" &&
+                                  profile != "geometric_contact";
       // A ROS I/O connection owns its actual component and lifecycle. A
       // separate provider domain inside a physical controller component would
       // still couple both through the component's CCLC Enable/Disable plans.
@@ -450,41 +432,6 @@ derive_domains(const core::CellGraphDTO &graph,
                                signal.descriptor.signal_id.controllable_component_id;
                       }))
         fail("io_ros_connection_component_has_controller_binding");
-      if (signal.provider.profile == "xarm_controller_input") {
-        const core::ControlDomainDTO *domain = nullptr;
-        std::size_t arm_binding_count = 0U;
-        for (const auto &binding : graph.control_bindings) {
-          if (binding.controllable_component_id !=
-                  signal.descriptor.signal_id.controllable_component_id ||
-              binding.provider_runtime_unit_id != signal.runtime_unit_id ||
-              binding.capability_id.value() != "execution.trajectory.execute")
-            continue;
-          const auto found = std::find_if(
-              graph.control_domains.begin(), graph.control_domains.end(),
-              [&](const auto &value) {
-                return value.control_domain_id == binding.control_domain_id;
-              });
-          if (found == graph.control_domains.end() || found->provider() ||
-              found->controller().controller_topology_id !=
-                  binding.controller_topology_id ||
-              found->controller().topology_revision !=
-                  binding.topology_revision ||
-              !std::binary_search(found->runtime_unit_ids.begin(),
-                                  found->runtime_unit_ids.end(),
-                                  signal.runtime_unit_id) ||
-              (domain && domain->control_domain_id != found->control_domain_id))
-            fail("io_arm_domain_ambiguous");
-          ++arm_binding_count;
-          domain = &*found;
-        }
-        if (!domain)
-          fail("io_arm_domain_missing");
-        if (arm_binding_count != 1U)
-          fail("io_arm_domain_ambiguous");
-        result.signal_domains.push_back(
-            {signal.descriptor.signal_id, domain->control_domain_id});
-        continue;
-      }
       auto owner = signal_owner(graph, signal, bindings, profiles, manifests,
                                 structural_only);
       const auto key = std::pair{signal.runtime_unit_id, owner.instance};
@@ -507,28 +454,6 @@ derive_domains(const core::CellGraphDTO &graph,
           });
       if (device == devices.value().end())
         fail("io_provider_device_policy_missing");
-      const auto manifest = std::find_if(
-          manifests.begin(), manifests.end(), [&](const auto &value) {
-            return value.value().provider_manifest_id == group.owner.manifest &&
-                   value.value().provider_manifest_revision ==
-                       group.owner.revision;
-          });
-      const auto catalog =
-          [&]() -> core::Result<core::BrandLifecyclePlanCatalogDTO> {
-        if (!structural_only) {
-          if (manifest == manifests.end())
-            fail("io_provider_lifecycle_manifest_missing");
-          return core::MakeIoProviderLifecycleCatalog(manifest->value());
-        }
-        const auto plans = core::MakeIoProviderLifecyclePlans();
-        if (!plans.ok())
-          return core::Result<core::BrandLifecyclePlanCatalogDTO>::Err(
-              plans.error());
-        return core::MakeBrandLifecyclePlanCatalog(
-            group.owner.manifest, group.owner.revision, plans.value());
-      }();
-      if (!catalog.ok())
-        fail("io_provider_lifecycle_catalog_unqualified");
       const auto identity = content_identity::sha256_digest(canonical_json(
           Value(Object{{"runtime_unit_id", Value(key.first.value())},
                        {"provider_instance_id", Value(key.second.value())}})));
@@ -548,7 +473,7 @@ derive_domains(const core::CellGraphDTO &graph,
           group.owner.instance,
           group.owner.manifest,
           group.owner.revision,
-          catalog.value().catalog_digest,
+          lifecycle_digest(group.owner.revision),
           core::ContentDigest(content_identity::sha256_digest(
               canonical_json(Value(std::move(signal_configuration))))),
           std::vector<std::string>(group.names.begin(), group.names.end()),

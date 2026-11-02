@@ -1,12 +1,10 @@
 import { act } from 'react';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
-import { CommandRefusalError, errorCatalogRow } from '../state/commandRefusal';
-import type { ManagerActiveProjection } from '../types/api';
+import { authoringOperation, type BusyOperation } from '../state/busyOperation';
 import { ScenarioDocumentCommands } from './ScenarioDocumentCommands';
 
 const apiMock = vi.hoisted(() => ({
-  manager: { status: vi.fn() }, deploymentWorkspace: { get: vi.fn() },
   scenarioDocuments: { list: vi.fn() }, files: { browse: vi.fn() },
 }));
 vi.mock('../api/client', () => ({ api: apiMock }));
@@ -57,16 +55,6 @@ function mountedHost() {
   };
   return { host, find };
 }
-const active: ManagerActiveProjection = {
-  canonicalEmpty: false, retainedBundleId: 'bundle.current', graphRevision: 'graph.current',
-  cellGraph: { controllable_components: [{ controllable_component_id: 'arm' }] },
-  publication: { publication_generation: 1, durable_public_pointer_content_digest: 'pointer.1',
-    projection_revision: { retained_bundle_id: 'bundle.current', graph_revision: 'graph.current',
-      scene_revision: { scene_id: 'scene', revision_id: 1, content_hash: 'digest' } },
-    transaction: { kind: 'bootstrap', bootstrap_id: 'boot', bootstrap_generation: 1 } },
-};
-const empty: ManagerActiveProjection = { ...active, canonicalEmpty: true,
-  retainedBundleId: 'bundle.empty', graphRevision: 'graph.empty', cellGraph: {} };
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>((done) => { resolve = done; });
@@ -76,11 +64,6 @@ let unmount: (() => Promise<void>) | null = null;
 afterEach(async () => { await unmount?.(); unmount = null; vi.unstubAllGlobals(); });
 beforeEach(() => {
   vi.clearAllMocks();
-  apiMock.manager.status.mockResolvedValue({ source: { available: true, freshness: 'fresh' },
-    status: { managerReady: true, active } });
-  apiMock.deploymentWorkspace.get.mockResolvedValue({ managerApplied: {
-    scenarioId: 'current', activationOrder: { retainedBundleId: active.retainedBundleId,
-      graphRevision: active.graphRevision } } });
   apiMock.files.browse.mockResolvedValue({ entries: [] });
   apiMock.scenarioDocuments.list.mockResolvedValue({ directory: '/projects', entries: [
     { sourceKind: 'saved', path: '/projects/other', scenarioId: 'other', name: 'Other', folderName: 'other',
@@ -89,242 +72,103 @@ beforeEach(() => {
       location: 'projects', description: '', displayStatus: 'ready', statusDetail: '', savedManyforgeVersion: null },
   ] });
 });
-async function mount(closeScenario = vi.fn(async () => empty as ManagerActiveProjection | null),
-  documentUnavailableReason: string | null = null, motionActive = false, documentPath = '/projects/current.scenario',
-  readOnly = false, hasChanges = true,
-  forceCloseScenario?: (expected: ManagerActiveProjection, confirmed?: unknown, signal?: AbortSignal) => Promise<ManagerActiveProjection | null>,
-  closeUnavailableReason: string | null = null) {
+async function mount(documentUnavailableReason: string | null = null, motionActive = false,
+  documentPath = '/projects/current.scenario', readOnly = false, hasChanges = true,
+  cellComponents: readonly string[] | null = [], scenarioReplacementUnavailableReason: string | null = null,
+  busyOperation: BusyOperation | null = null) {
   const dom = mountedHost();
   const controller = {
-    documentUnavailableReason, state: { status: 'ready', pendingAction: null, workspace: {
+    busyOperation,
+    documentUnavailableReason, scenarioReplacementUnavailableReason, state: { status: 'ready',
+      pendingAction: busyOperation === null ? null : 'save_scenario_document', error: null, workspace: {
       authoringWorkspace: { revision: 1 }, draft: { authoring: null }, hasUnsavedChanges: hasChanges,
       hasUnappliedChanges: hasChanges } }, scenarioDocumentPath: documentPath,
     scenarioDocument: { id: readOnly ? 'Untitled' : 'current', name: 'Current', description: '', readOnly },
     saveScenarioDocument: vi.fn(), exportScenarioDocument: vi.fn(),
-    scenarioReplacementIdentity: { authoring: { workspaceEpoch: 'workspace', workspaceRevision: 1,
-      programDraftId: 'draft', programDraftRevision: 1, deploymentDraftId: 'deployment', deploymentDraftRevision: 1 },
-      managerActive: { canonical_empty: active.canonicalEmpty, retained_bundle_id: active.retainedBundleId,
-        graph_revision: active.graphRevision, publication: active.publication } },
-    reportCloseCancellation: vi.fn(),
-    scenarioCloseHandoff: vi.fn(() => ({ status: 'ready', message: null })),
     newScenarioDocument: vi.fn(async () => ({})), loadScenarioDocument: vi.fn(async () => ({})),
   } as unknown as ProgramWorkspaceController;
   const { createRoot } = await import('react-dom/client');
   const root = createRoot(dom.host as unknown as Element);
-  await act(() => root.render(<ScenarioDocumentCommands controller={controller} closeScenario={closeScenario}
-    forceCloseScenario={forceCloseScenario} motionActive={motionActive}
-    closeUnavailableReason={closeUnavailableReason} />));
+  await act(() => root.render(<ScenarioDocumentCommands controller={controller} motionActive={motionActive}
+    cellComponents={cellComponents} />));
   unmount = async () => { await act(() => root.unmount()); };
   const click = async (props: Props) => { await act(async () => props.onClick?.({ currentTarget: { focus: () => undefined } })); };
   const open = async (label: string) => click(dom.find((p) => p['aria-label'] === label));
   const confirm = async () => { await act(() => dom.find((p) => p.type === 'checkbox').onChange?.({ target: { checked: true } })); };
-  const ack = async () => click(dom.find((p) => p.children === 'Close and continue'));
+  const ack = async () => click(dom.find((p) => p.className === 'danger-button'));
   const choose = async (id: string) => { await act(() => dom.find((p) => p.children instanceof Array
     && (p.children as Array<unknown>).some((c) => (c as { props?: Props })?.props?.children === 'Select a Scenario'))
     .onChange?.({ target: { value: `saved:/projects/${id}` } })); };
-  // Confirmations use the danger look for Close, the primary look elsewhere.
+  // Confirmations use the danger look, the primary look elsewhere.
   const primary = (label: string) => dom.find((p) => (p.className === 'primary-action' || p.className === 'danger-button') && p.children === label);
-  return { ...dom, controller, closeScenario, click, open, confirm, choose, primary, ack };
+  return { ...dom, controller, click, open, confirm, choose, primary, ack };
 }
 
-it('disables New, Save, Save As and Load while robots are moving; there is no Close command', async () => {
-  const test = await mount(undefined, null, true);
-  expect(() => test.find((p) => p['aria-label'] === 'Close Scenario')).toThrow();
+it('disables New, Save, Save As and Load while robots are moving', async () => {
+  const test = await mount(null, true);
   for (const label of ['New', 'Save Scenario as', 'Load Scenario']) {
     expect(test.find((p) => p['aria-label'] === label).disabled).toBe(true);
   }
-  const save = test.find((p) => typeof p['aria-label'] === 'string'
-    && p['aria-label'].startsWith('Save Scenario') && p['aria-label'] !== 'Save Scenario as');
-  expect(save.disabled).toBe(true);
 });
 
-it('Cancel before confirmation sends no Close, creation or Load effect', async () => {
+it('Cancel on the discard confirmation sends no New or Load', async () => {
   const test = await mount(); await test.open('New');
+  expect(test.find((p) => p.children === 'New Scenario?')).toBeDefined();
   await test.click(test.find((p) => p.children === 'Cancel'));
-  expect(test.closeScenario).not.toHaveBeenCalled();
   expect(test.controller.newScenarioDocument).not.toHaveBeenCalled();
   expect(test.controller.loadScenarioDocument).not.toHaveBeenCalled();
   expect(() => test.find((p) => p.role === 'dialog')).toThrow();
 });
 
-it('different Load requires one confirmation and waits for successful Close', async () => {
-  const close = deferred<ManagerActiveProjection | null>();
-  const test = await mount(vi.fn(() => close.promise));
-  await test.open('Load Scenario'); await test.choose('other');
-  expect(test.primary('Load Scenario').disabled).toBe(false);
-  await test.click(test.primary('Load Scenario'));
-  expect(test.closeScenario).not.toHaveBeenCalled();
-  await test.ack();
-  expect(test.closeScenario).toHaveBeenCalledExactlyOnceWith(active, test.controller.scenarioReplacementIdentity, expect.any(AbortSignal));
-  expect(test.controller.loadScenarioDocument).not.toHaveBeenCalled();
-  await test.click(test.find((p) => p.children === 'Cancel'));
-  expect(test.find((p) => p.role === 'dialog')).toBeDefined();
-  await act(() => close.resolve(empty));
-  expect(test.controller.loadScenarioDocument).toHaveBeenCalledExactlyOnceWith('/projects/other', true, test.controller.scenarioReplacementIdentity!.authoring, expect.any(Function));
-  expect(() => test.find((p) => p.role === 'dialog')).toThrow();
-});
-
-it.each(['unknown', 'failure', 'not_empty'])('does not load a replacement after Close %s', async (kind) => {
-  const close = vi.fn(async () => {
-    if (kind === 'failure') throw new Error('process drain is unknown');
-    return kind === 'unknown' ? null : active;
-  });
-  const test = await mount(close); await test.open('Load Scenario'); await test.choose('other');
-  await test.click(test.primary('Load Scenario')); await test.ack();
-  expect(close).toHaveBeenCalledOnce();
-  expect(test.controller.loadScenarioDocument).not.toHaveBeenCalled();
-  expect(test.find((p) => p.role === 'dialog')).toBeDefined();
-});
-
-it('Load of the applied Scenario requires the same confirmation and waits for Close', async () => {
-  const close = deferred<ManagerActiveProjection | null>();
-  const test = await mount(vi.fn(() => close.promise));
-  await test.open('Load Scenario'); await test.choose('current');
-  expect(() => test.find((p) => p.type === 'checkbox')).toThrow();
-  await test.click(test.primary('Load Scenario'));
-  expect(test.closeScenario).not.toHaveBeenCalled();
-  expect(test.controller.loadScenarioDocument).not.toHaveBeenCalled();
-  await test.ack();
-  expect(test.closeScenario).toHaveBeenCalledExactlyOnceWith(active, test.controller.scenarioReplacementIdentity, expect.any(AbortSignal));
-  expect(test.controller.loadScenarioDocument).not.toHaveBeenCalled();
-  await act(() => close.resolve(empty));
-  expect(test.controller.loadScenarioDocument).toHaveBeenCalledExactlyOnceWith('/projects/current', true, test.controller.scenarioReplacementIdentity!.authoring, expect.any(Function));
-});
-
-it('New asks no name: it confirms, closes first and then opens the Untitled Scenario', async () => {
-  const close = deferred<ManagerActiveProjection | null>();
-  const test = await mount(vi.fn(() => close.promise)); await test.open('New');
-  expect(() => test.find((p) => p.placeholder === 'e.g. lite6_pick_and_place')).toThrow();
-  expect(test.closeScenario).not.toHaveBeenCalled();
-  await test.ack();
-  expect(test.closeScenario).toHaveBeenCalledExactlyOnceWith(active, test.controller.scenarioReplacementIdentity, expect.any(AbortSignal));
-  expect(test.controller.newScenarioDocument).not.toHaveBeenCalled();
-  await act(() => close.resolve(empty));
-  expect(test.controller.newScenarioDocument).toHaveBeenCalledExactlyOnceWith(true, test.controller.scenarioReplacementIdentity!.authoring);
-  expect(() => test.find((p) => p.role === 'dialog')).toThrow();
-});
-
-it('SX-679: while Recover cell runs, New shows the reason and sends no Close', async () => {
-  const reason = 'Recover cell is in progress; wait for it to finish or abort it.';
-  const test = await mount(undefined, null, false, undefined, false, true, undefined, reason);
-  await test.open('New');
-  expect(test.find((p) => p.role === 'status' && p.children === reason)).toBeTruthy();
-  expect(test.closeScenario).not.toHaveBeenCalled();
-  expect(test.controller.newScenarioDocument).not.toHaveBeenCalled();
-});
-
-it('New on an empty cell without Draft changes closes at once, without a popup', async () => {
-  apiMock.manager.status.mockResolvedValue({ source: { available: true, freshness: 'fresh' },
-    status: { managerReady: true, active: empty } });
-  const test = await mount(undefined, null, false, '/projects/current.scenario', false, false);
-  await test.open('New');
-  expect(() => test.find((p) => p.children === 'Close Scenario?')).toThrow();
-  expect(test.closeScenario).toHaveBeenCalledExactlyOnceWith(empty, test.controller.scenarioReplacementIdentity, expect.any(AbortSignal));
-  expect(test.controller.newScenarioDocument).toHaveBeenCalledExactlyOnceWith(true, test.controller.scenarioReplacementIdentity!.authoring);
-});
-
-it('keeps empty Load Close-first', async () => {
-  apiMock.manager.status.mockResolvedValue({ source: { available: true, freshness: 'fresh' },
-    status: { managerReady: true, active: empty } });
+it('Load with Draft changes confirms the discard, then calls the server Load once', async () => {
+  const load = deferred<unknown>();
   const test = await mount();
-  if (test.controller.state.workspace !== null) {
-    test.controller.state.workspace.hasUnsavedChanges = false;
-    test.controller.state.workspace.hasUnappliedChanges = false;
-  }
+  vi.mocked(test.controller.loadScenarioDocument).mockImplementation(() => load.promise as never);
   await test.open('Load Scenario'); await test.choose('other');
   await test.click(test.primary('Load Scenario'));
-  expect(test.closeScenario).toHaveBeenCalledExactlyOnceWith(empty, test.controller.scenarioReplacementIdentity, expect.any(AbortSignal));
-  expect(test.controller.loadScenarioDocument).toHaveBeenCalledExactlyOnceWith('/projects/other', true, test.controller.scenarioReplacementIdentity!.authoring, expect.any(Function));
+  expect(test.controller.loadScenarioDocument).not.toHaveBeenCalled();
+  await test.ack();
+  expect(test.controller.loadScenarioDocument).toHaveBeenCalledExactlyOnceWith('/projects/other', expect.any(Function));
+  await act(async () => load.resolve({}));
+  expect(test.controller.loadScenarioDocument).toHaveBeenCalledOnce();
+  expect(() => test.find((p) => p.role === 'dialog')).toThrow();
 });
 
-it.each(['current', 'other'])('Load of %s is admitted by the Close path, not by ordinary document admission', async (id) => {
-  const test = await mount(undefined, 'Reset stopped operations first');
-  await test.open('Load Scenario'); await test.choose(id);
-  expect(test.primary('Load Scenario').disabled).toBe(false);
-  await test.click(test.primary('Load Scenario')); await test.ack();
-  expect(test.closeScenario).toHaveBeenCalledOnce();
-  expect(test.controller.loadScenarioDocument).toHaveBeenCalledExactlyOnceWith(`/projects/${id}`, true, test.controller.scenarioReplacementIdentity!.authoring, expect.any(Function));
+it('Load without Draft changes calls the server Load at once', async () => {
+  const test = await mount(null, false, '/projects/current.scenario', false, false);
+  await test.open('Load Scenario'); await test.choose('current');
+  await test.click(test.primary('Load Scenario'));
+  expect(() => test.find((p) => p.children === 'Load Scenario?')).toThrow();
+  expect(test.controller.loadScenarioDocument).toHaveBeenCalledExactlyOnceWith('/projects/current', expect.any(Function));
 });
 
-it('keeps the dialog after an unresolved replacement without sending it again', async () => {
+it('New without Draft changes calls the server New once, without a popup', async () => {
+  const test = await mount(null, false, '/projects/current.scenario', false, false);
+  await test.open('New');
+  expect(() => test.find((p) => p.children === 'New Scenario?')).toThrow();
+  expect(test.controller.newScenarioDocument).toHaveBeenCalledOnce();
+  expect(test.controller.loadScenarioDocument).not.toHaveBeenCalled();
+});
+
+it('New with Draft changes asks once, then calls the server New once', async () => {
+  const test = await mount(); await test.open('New');
+  expect(test.controller.newScenarioDocument).not.toHaveBeenCalled();
+  await test.ack();
+  expect(test.controller.newScenarioDocument).toHaveBeenCalledOnce();
+});
+
+it('keeps the dialog with the refusal after a refused Load and does not resend it', async () => {
   const test = await mount();
   vi.mocked(test.controller.loadScenarioDocument).mockResolvedValue(null);
   await test.open('Load Scenario'); await test.choose('other');
   await test.click(test.primary('Load Scenario')); await test.ack();
   expect(test.controller.loadScenarioDocument).toHaveBeenCalledOnce();
   expect(test.find((p) => p.role === 'dialog')).toBeDefined();
-});
-
-
-it.each(['new', 'load'])('popup Cancel before %s sends no effects', async (kind) => {
-  const test = await mount(); await test.open(kind === 'new' ? 'New' : 'Load Scenario');
-  if (kind === 'load') {
-    await test.choose('other');
-    await test.click(test.primary('Load Scenario'));
-  }
-  expect(test.find((p) => p.children === 'Close Scenario?')).toBeDefined();
-  expect(test.closeScenario).not.toHaveBeenCalled();
-  await test.click(test.find((p) => p.children === 'Cancel'));
-  expect(test.closeScenario).not.toHaveBeenCalled();
-  expect(test.controller.newScenarioDocument).not.toHaveBeenCalled();
-  expect(test.controller.loadScenarioDocument).not.toHaveBeenCalled();
-  if (kind === 'new') expect(() => test.find((p) => p.role === 'dialog')).toThrow();
-  else expect(test.primary('Load Scenario')).toBeDefined();
-});
-
-it.each(['new', 'load'])('keeps internal Close reachable for %s while stopped operations need Reset', async (kind) => {
-  const close = deferred<ManagerActiveProjection | null>();
-  const test = await mount(vi.fn(() => close.promise), 'Reset stopped operations first');
-  await test.open(kind === 'new' ? 'New' : 'Load Scenario');
-  if (kind === 'load') {
-    await test.choose('other');
-    expect(test.primary('Load Scenario').disabled).toBe(false);
-    await test.click(test.primary('Load Scenario'));
-  }
-  await test.ack();
-  expect(test.closeScenario).toHaveBeenCalledExactlyOnceWith(active, test.controller.scenarioReplacementIdentity, expect.any(AbortSignal));
-  expect(test.controller.newScenarioDocument).not.toHaveBeenCalled();
-  expect(test.controller.loadScenarioDocument).not.toHaveBeenCalled();
-});
-
-
-it('keeps the popup bound to its captured Load path despite an intervening selection callback', async () => {
-  const test = await mount(); await test.open('Load Scenario'); await test.choose('other');
-  const selection = test.find((p) => p.value === 'saved:/projects/other');
-  await test.click(test.primary('Load Scenario'));
-  await act(() => selection.onChange?.({ target: { value: 'saved:/projects/current' } }));
-  await test.ack();
-  expect(test.closeScenario).toHaveBeenCalledExactlyOnceWith(active, test.controller.scenarioReplacementIdentity, expect.any(AbortSignal));
-  expect(test.controller.loadScenarioDocument).toHaveBeenCalledExactlyOnceWith('/projects/other', true, test.controller.scenarioReplacementIdentity!.authoring, expect.any(Function));
-});
-
-it('sends the authoring identity confirmed before Close to the Load request', async () => {
-  const close = deferred<ManagerActiveProjection | null>();
-  const test = await mount(vi.fn(() => close.promise));
-  await test.open('Load Scenario'); await test.choose('other');
-  await test.click(test.primary('Load Scenario')); await test.ack();
-  const confirmed = structuredClone(test.controller.scenarioReplacementIdentity!.authoring);
-  test.controller.scenarioReplacementIdentity = { ...test.controller.scenarioReplacementIdentity!,
-    authoring: { ...confirmed, workspaceRevision: confirmed.workspaceRevision + 1 } };
-  await act(() => close.resolve(empty));
-  expect(test.controller.loadScenarioDocument).toHaveBeenCalledExactlyOnceWith('/projects/other', true, confirmed, expect.any(Function));
-});
-
-
-it.each(['unknown', 'failure', 'not_empty'])('New keeps Close %s visible without opening Untitled', async (kind) => {
-  const close = vi.fn(async () => {
-    if (kind === 'failure') throw new Error('Process settlement failed');
-    return kind === 'unknown' ? null : active;
-  });
-  const test = await mount(close); await test.open('New'); await test.ack();
-  expect(close).toHaveBeenCalledExactlyOnceWith(active, test.controller.scenarioReplacementIdentity, expect.any(AbortSignal));
-  expect(test.controller.newScenarioDocument).not.toHaveBeenCalled();
-  expect(test.controller.loadScenarioDocument).not.toHaveBeenCalled();
   expect(test.find((p) => p.className === 'inline-message severity-error')).toBeDefined();
 });
 
 it('the read-only Untitled Scenario disables Save; Save As places it in the Scenario folder', async () => {
-  const test = await mount(undefined, null, false, '/opt/manyforge/resources/Untitled.scenario', true);
+  const test = await mount(null, false, '/opt/manyforge/resources/Untitled.scenario', true);
   const save = test.find((p) => p['aria-label'] === 'Save Scenario');
   expect(save.disabled).toBe(true);
   expect(save['data-tooltip']).toBe('Save Scenario: The Untitled Scenario is read-only. Use Save Scenario as.');
@@ -339,7 +183,7 @@ it('the read-only Untitled Scenario disables Save; Save As places it in the Scen
 });
 
 it('the read-only Untitled Scenario has no portable copy until it is saved', async () => {
-  const test = await mount(undefined, null, false, '/opt/manyforge/resources/Untitled.scenario', true);
+  const test = await mount(null, false, '/opt/manyforge/resources/Untitled.scenario', true);
   await test.open('Save Scenario as');
   await test.click(test.find((p) => p.children === 'Portable copy'));
   expect(test.find((p) => p.children === 'Save the Scenario as a project first.')).toBeDefined();
@@ -349,7 +193,7 @@ it('the read-only Untitled Scenario has no portable copy until it is saved', asy
 it('Save As saves <directory>/<name>.scenario with one name and asks before replacing', async () => {
   apiMock.files.browse.mockResolvedValue({ entries: [{ name: 'Renamed.scenario', entryType: 'directory',
     path: '/projects/Renamed.scenario', selectable: false, scenarioProject: true }] });
-  const test = await mount(undefined, null, false, '/projects/Lab_Cell.scenario');
+  const test = await mount(null, false, '/projects/Lab_Cell.scenario');
   await test.open('Save Scenario as');
   const name = () => test.find((p) => p['aria-describedby'] === 'save-scenario-name-help');
   expect(name().value).toBe('Lab_Cell');
@@ -367,7 +211,7 @@ it('Save As saves <directory>/<name>.scenario with one name and asks before repl
 });
 
 it('plain Save writes the open project under its folder name', async () => {
-  const test = await mount(undefined, null, false, '/projects/Lab_Cell.scenario');
+  const test = await mount(null, false, '/projects/Lab_Cell.scenario');
   await test.open('Save Scenario');
   expect(test.controller.saveScenarioDocument).toHaveBeenCalledExactlyOnceWith({
     directory: '/projects', name: 'Lab_Cell', description: '', confirmOverwrite: false,
@@ -400,7 +244,7 @@ function browseTree(tree: Record<string, Array<[string, boolean]>>, roots = ['/p
   });
 }
 
-it('Load Browse… selects a Scenario project and loads it through Close', async () => {
+it('Load Browse… selects a Scenario project and loads it', async () => {
   browseTree({ '/projects': [['cells', false]], '/projects/cells': [['lab', false], ['pick.scenario', true]] });
   apiMock.scenarioDocuments.list.mockImplementation(async (directory?: string) => directory === '/projects/cells'
     ? { directory: '/projects/cells', entries: [
@@ -417,8 +261,7 @@ it('Load Browse… selects a Scenario project and loads it through Close', async
   expect(apiMock.scenarioDocuments.list).toHaveBeenLastCalledWith('/projects/cells');
   expect(test.find((p) => p.value === 'saved:/projects/cells/pick.scenario')).toBeDefined();
   await test.click(test.primary('Load Scenario')); await test.ack();
-  expect(test.closeScenario).toHaveBeenCalledOnce();
-  expect(test.controller.loadScenarioDocument).toHaveBeenCalledExactlyOnceWith('/projects/cells/pick.scenario', true, test.controller.scenarioReplacementIdentity!.authoring, expect.any(Function));
+  expect(test.controller.loadScenarioDocument).toHaveBeenCalledExactlyOnceWith('/projects/cells/pick.scenario', expect.any(Function));
 });
 
 it('Load Browse… selects a project from another allowed root', async () => {
@@ -435,12 +278,12 @@ it('Load Browse… selects a project from another allowed root', async () => {
   await test.click(test.find((p) => p.role === 'listitem' && label(p).startsWith('pick.scenario')));
   expect(apiMock.scenarioDocuments.list).toHaveBeenLastCalledWith(external);
   await test.click(test.primary('Load Scenario')); await test.ack();
-  expect(test.controller.loadScenarioDocument).toHaveBeenCalledExactlyOnceWith(`${external}/pick.scenario`, true, test.controller.scenarioReplacementIdentity!.authoring, expect.any(Function));
+  expect(test.controller.loadScenarioDocument).toHaveBeenCalledExactlyOnceWith(`${external}/pick.scenario`, expect.any(Function));
 });
 
 it('Export Browse… picks a parent folder and exports the project there under its name', async () => {
   browseTree({ '/projects': [['out', false], ['Lab_Cell.scenario', true]] });
-  const test = await mount(undefined, null, false, '/projects/Lab_Cell.scenario');
+  const test = await mount(null, false, '/projects/Lab_Cell.scenario');
   await test.open('Save Scenario as');
   await test.click(test.find((p) => p.children === 'Portable copy'));
   expect(test.primary('Export copy').disabled).toBe(true);
@@ -462,7 +305,7 @@ it('Export Browse… picks a parent folder and exports the project there under i
 it('Export Browse… can write to another allowed root', async () => {
   const external = '/projects/user projects';
   browseTree({ '/projects': [], [external]: [] }, ['/projects', external]);
-  const test = await mount(undefined, null, false, '/projects/Lab_Cell.scenario');
+  const test = await mount(null, false, '/projects/Lab_Cell.scenario');
   await test.open('Save Scenario as');
   await test.click(test.find((p) => p.children === 'Portable copy'));
   await test.click(test.find((p) => p.children === 'Browse…'));
@@ -472,105 +315,100 @@ it('Export Browse… can write to another allowed root', async () => {
   expect(test.controller.exportScenarioDocument).toHaveBeenCalledExactlyOnceWith(`${external}/Lab_Cell.scenario`);
 });
 
-// Item 37: a refused Close offers Force close; one confirmation states the
-// risks, then the same replacement continues after the forced Close.
-it('a refused Load Close offers Force close, which confirms the risks and then loads', async () => {
-  const refused = vi.fn(async () => { throw Object.assign(new Error('Close cannot infer rest from an uncertain terminal'),
-    { code: 'cell_close_containment_uncertain' }); });
-  const forced = vi.fn(async () => empty as ManagerActiveProjection | null);
-  const test = await mount(refused, null, false, '/projects/current.scenario', false, true, forced);
-  expect(() => test.find((p) => p.children === 'Force close…')).toThrow();
-  await test.open('Load Scenario'); await test.choose('other');
-  await test.click(test.primary('Load Scenario')); await test.ack();
-  expect(refused).toHaveBeenCalledOnce();
-  expect(test.controller.loadScenarioDocument).not.toHaveBeenCalled();
-  await test.click(test.find((p) => p.children === 'Force close…'));
-  expect(test.find((p) => p.children === 'Force close Scenario?')).toBeDefined();
-  expect(forced).not.toHaveBeenCalled();
-  await test.click(test.primary('Force close and continue'));
-  expect(forced).toHaveBeenCalledExactlyOnceWith(active, test.controller.scenarioReplacementIdentity, expect.any(AbortSignal));
-  expect(test.controller.loadScenarioDocument).toHaveBeenCalledExactlyOnceWith('/projects/other', true, test.controller.scenarioReplacementIdentity!.authoring, expect.any(Function));
-});
 
-it.each([
-  ['stop_not_contained', 'Use Recover cell, then Force close again.'],
-  ['stop_pending', 'A previous Stop is still waiting for a component; try again shortly.'],
-] as const)('shows exact Force close guidance for typed Stop reason %s', async (reason, message) => {
-  const refusedClose = vi.fn(async () => {
-    throw Object.assign(new Error('Close refused.'), { code: 'cell_close_containment_uncertain' });
-  });
-  const catalogCode = reason === 'stop_not_contained'
-    ? 'scenario_force_close_stop_not_contained'
-    : 'scenario_force_close_stop_pending';
-  expect(errorCatalogRow(catalogCode)?.[0]).toBe(message);
-  const refusedForceClose = vi.fn(async () => {
-    throw new CommandRefusalError({
-      code: 'scenario_force_close_stop_unconfirmed',
-      message: 'Full Stop was not confirmed.',
-      details: { reason },
-      origin: null,
-    });
-  });
-  const test = await mount(refusedClose, null, false, '/projects/current.scenario', false, true, refusedForceClose);
-  await test.open('Load Scenario');
-  await test.choose('other');
-  await test.click(test.primary('Load Scenario'));
-  await test.ack();
-  await test.click(test.find((p) => p.children === 'Force close…'));
-  await test.click(test.primary('Force close and continue'));
-  expect(refusedForceClose).toHaveBeenCalledOnce();
-  expect(test.find((p) => p.className === 'inline-message severity-error'
-    && p.children === message).children).toBe(message);
-});
-
-it.each(['stop_superseded', 'not_armed'] as const)(
-  'keeps generic Force close guidance accurate for %s', async (reason) => {
-    const refusedClose = vi.fn(async () => {
-      throw Object.assign(new Error('Close refused.'), { code: 'cell_close_containment_uncertain' });
-    });
-    const refusedForceClose = vi.fn(async () => {
-      throw new CommandRefusalError({
-        code: 'scenario_force_close_stop_unconfirmed',
-        message: 'Full Stop was not confirmed.',
-        details: { reason },
-        origin: null,
-      });
-    });
-    const test = await mount(refusedClose, null, false, '/projects/current.scenario', false, true, refusedForceClose);
-    await test.open('Load Scenario');
-    await test.choose('other');
-    await test.click(test.primary('Load Scenario'));
-    await test.ack();
-    await test.click(test.find((p) => p.children === 'Force close…'));
-    await test.click(test.primary('Force close and continue'));
-    const message = test.find((p) => p.className === 'inline-message severity-error').children as string;
-    expect(message).toContain('The requested Full Stop was not confirmed, so Force close was refused.');
-    expect(message).not.toContain('Press Full Stop, then Force close.');
-  },
-);
-
-it('Force close uses the Scene identity captured when its confirmation opened', async () => {
-  const refused = vi.fn(async () => { throw new Error('Close refused'); });
-  const forced = vi.fn(async (_expected: ManagerActiveProjection, _confirmed?: unknown, _signal?: AbortSignal) => empty as ManagerActiveProjection | null);
-  const test = await mount(refused, null, false, '/projects/current.scenario', false, true, forced);
-  await test.open('New'); await test.ack();
-  await test.click(test.find((p) => p.children === 'Force close…'));
-  const confirmed = test.controller.scenarioReplacementIdentity!;
-  test.controller.scenarioReplacementIdentity = { ...confirmed };
-  await test.click(test.primary('Force close and continue'));
-  expect(forced.mock.calls[0][1]).toBe(confirmed);
-});
-
-it('Cancel on the Force close confirmation sends nothing', async () => {
-  const refused = vi.fn(async () => { throw new Error('Close refused'); });
-  const forced = vi.fn(async () => empty as ManagerActiveProjection | null);
-  const test = await mount(refused, null, false, '/projects/current.scenario', false, true, forced);
-  await test.open('New'); await test.ack();
-  await test.click(test.find((p) => p.children === 'Force close…'));
-  const dialogs = (test.find((p) => p.children === 'Force close Scenario?'));
-  expect(dialogs).toBeDefined();
-  const cancel = test.find((p) => p.children === 'Cancel' && p.className === undefined && p.onClick !== undefined);
-  await test.click(cancel);
-  expect(forced).not.toHaveBeenCalled();
+it('New of a non-empty cell confirms once, then calls the server New once (R3)', async () => {
+  const test = await mount(null, false, '/projects/current.scenario', false, false, ['lite6']);
+  await test.open('New');
   expect(test.controller.newScenarioDocument).not.toHaveBeenCalled();
+  expect(test.find((p) => p.children === 'New Scenario?')).toBeDefined();
+  await test.ack();
+  expect(test.controller.newScenarioDocument).toHaveBeenCalledOnce();
+  expect(test.controller.loadScenarioDocument).not.toHaveBeenCalled();
+});
+
+it('shows a refused New and does not resend it', async () => {
+  const test = await mount(null, false, '/projects/current.scenario', false, false, ['lite6']);
+  vi.mocked(test.controller.newScenarioDocument).mockResolvedValue(null);
+  await test.open('New'); await test.ack();
+  expect(test.controller.newScenarioDocument).toHaveBeenCalledOnce();
+  expect(test.find((p) => p.children === 'New was refused; nothing was retried.')).toBeDefined();
+});
+
+// AUD-1: New and Load ask once when the cell isn't empty (one dialog).
+const listsComponents = (text: string) => (p: Props) => Array.isArray(p.children)
+  && (p.children as unknown[]).includes(text);
+const discardLine = (p: Props) => p.children === 'Current unsaved and unapplied Draft changes will be discarded.';
+
+it('New of a non-empty cell lists what gets stopped, without the discard line when nothing is unsaved',
+  async () => {
+    const test = await mount(null, false, '/projects/current.scenario', false, false, ['lite6', 'camera']);
+    await test.open('New');
+    expect(test.find((p) => p.children === 'New Scenario?')).toBeDefined();
+    expect(test.find(listsComponents(': lite6, camera.'))).toBeDefined();
+    expect(() => test.find(discardLine)).toThrow();
+    expect(test.controller.newScenarioDocument).not.toHaveBeenCalled();
+  });
+
+it('Load of a non-empty cell asks once with the components and the discard line, then loads once', async () => {
+  const test = await mount(null, false, '/projects/current.scenario', false, true, ['lite6']);
+  await test.open('Load Scenario'); await test.choose('other');
+  await test.click(test.primary('Load Scenario'));
+  expect(test.find((p) => p.children === 'Load Scenario?')).toBeDefined();
+  expect(test.find(listsComponents(': lite6.'))).toBeDefined();
+  expect(test.find(discardLine)).toBeDefined();
+  expect(test.controller.loadScenarioDocument).not.toHaveBeenCalled();
+  await test.ack();
+  expect(test.controller.loadScenarioDocument).toHaveBeenCalledExactlyOnceWith('/projects/other', expect.any(Function));
+});
+
+it('asks when the cell\'s components cannot be read', async () => {
+  const test = await mount(null, false, '/projects/current.scenario', false, false, null);
+  await test.open('New');
+  expect(test.find((p) => p.children === 'New Scenario?')).toBeDefined();
+  expect(test.controller.newScenarioDocument).not.toHaveBeenCalled();
+});
+
+it('New and Load follow their own gate, not the Idle-only document gate', async () => {
+  // A finished run blocks Save, not New or Load (R3; the server Resets it).
+  const finished = await mount('Program execution is terminal awaiting reset; authoring requires Idle.');
+  for (const label of ['New', 'Load Scenario']) {
+    expect(finished.find((p) => p['aria-label'] === label).disabled).toBe(false);
+  }
+  expect(finished.find((p) => p['aria-label'] === 'Save Scenario as').disabled).toBe(true);
+  await unmount?.(); unmount = null;
+  const locked = await mount(null, false, '/projects/current.scenario', false, true, [],
+    'Authoring is currently locked by the backend.');
+  for (const label of ['New', 'Load Scenario']) {
+    const button = locked.find((p) => p['aria-label'] === label);
+    expect(button.disabled).toBe(true);
+    expect(button['data-tooltip']).toBe(`${label}: Authoring is currently locked by the backend.`);
+  }
+});
+
+it('a refused Load shows its reason, not the generic line', async () => {
+  const test = await mount(null, false, '/projects/current.scenario', false, false);
+  vi.mocked(test.controller.loadScenarioDocument).mockImplementation(async (_path, onRefusal) => {
+    onRefusal?.('Scenario Load refused: A Program run is in progress; Reset it before Apply');
+    return null;
+  });
+  await test.open('Load Scenario'); await test.choose('other');
+  await test.click(test.primary('Load Scenario'));
+  expect(test.find((p) => p.children === 'Scenario Load refused: A Program run is in progress; Reset it before Apply'))
+    .toBeDefined();
+  expect(() => test.find((p) => typeof p.children === 'string' && p.children.includes('was refused; nothing was retried')))
+    .toThrow();
+});
+
+it('a running Save shows its busy label and names itself on every other Scenario command', async () => {
+  const test = await mount(null, false, '/projects/current.scenario', false, true, [], null,
+    authoringOperation('save'));
+  const save = test.find((p) => p['aria-label'] === 'Save Scenario');
+  expect(save['data-tooltip']).toBe('Saving…');
+  expect(save['aria-busy']).toBe(true);
+  expect(save.disabled).toBe(true);
+  for (const label of ['New', 'Save Scenario as', 'Load Scenario']) {
+    const other = test.find((p) => p['aria-label'] === label);
+    expect(other.disabled).toBe(true);
+    expect(other['data-tooltip']).toBe(`${label}: Save is in progress.`);
+  }
 });

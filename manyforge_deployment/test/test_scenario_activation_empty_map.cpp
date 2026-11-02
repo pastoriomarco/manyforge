@@ -15,10 +15,11 @@ namespace {
 using manyforge::deployment::CanonicalValue;
 namespace detail = manyforge::deployment::detail;
 
-// A Scenario whose Deployment has no component goes through the same
-// activation materializer as prepare_activation. Its candidate must carry the
-// empty model map (so a zero-role Program can bind), while the sealed
-// canonical-empty predecessor published beside it must keep none (Q125).
+// Close and New are an ordinary Apply of the empty cell: a Scenario whose
+// Deployment has no component goes through the same activation materializer
+// as prepare_activation. Its candidate must carry the empty model map (so a
+// zero-role Program can bind), while the Manager's startup empty-cell
+// predecessor published beside it keeps none (Q125).
 TEST(ScenarioActivationEmptyCell,
      CandidateCarriesTheEmptyMapAndSealedPredecessorDoesNot) {
   const CanonicalValue intent_value(CanonicalValue::Object{

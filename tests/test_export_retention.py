@@ -4,7 +4,6 @@ import io
 import json
 import os
 from pathlib import Path
-import sqlite3
 import sys
 import pytest
 
@@ -15,18 +14,15 @@ sys.modules[spec.name] = retention
 spec.loader.exec_module(retention)
 
 
-def journal(root, acknowledged=1):
-    path = root / 'execution-state/cclc-journal.sqlite3'
+def journal(root):
+    """An owner journal: retention never touches it."""
+    path = root / 'execution-state/operation-journal.sqlite3'
     path.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(path) as db:
-        db.execute('CREATE TABLE cclc_component_incidents(acknowledged INTEGER)')
-        db.execute('INSERT INTO cclc_component_incidents VALUES (?)', (acknowledged,))
+    path.write_bytes(b'owner journal')
     return path
 
 
 def capture(root, index):
-    if not (root/'execution-state/cclc-journal.sqlite3').exists():
-        journal(root)
     folder = root / 'evidence' / f'20261013T0000{index:02}Z'
     folder.mkdir(parents=True)
     (folder / 'docker-inspect.json').write_text(json.dumps({'container_id':'a'*64,'image':'sha256:'+'b'*64,'mounts':[{'Type':'bind','Source':str(root),'Destination':'/tmp/manyforge-state'},{'Type':'bind','Source':'/workspace-owner','Destination':'/workspace'}],'manyforge_export_kind': 'console_tail', 'state': {'running': False}}))
@@ -81,20 +77,6 @@ def test_pressure_deletes_only_superseded_closed_units_oldest_first(tmp_path):
     assert result.deleted == (str(old.relative_to(root)),str(old_epoch.relative_to(root)))
     assert latest.exists() and latest_epoch.exists() and durable.read_bytes() == before
     assert 'only protected material remains' in result.warning and 'latest controller-launch' in result.warning
-
-
-@pytest.mark.parametrize('state',['open','missing','corrupt','wal'])
-def test_open_or_unknown_incident_protects_all_epochs(tmp_path,state):
-    root = tmp_path/'runtime'
-    first,latest = epoch(root,1),epoch(root,2)
-    if state != 'missing':
-        path = journal(root,0 if state=='open' else 1)
-        if state=='corrupt': path.write_text('not a journal')
-        elif state=='wal': path.with_name(path.name+'-wal').write_bytes(b'unknown committed WAL')
-    before={str(p):p.read_bytes() for p in root.rglob('*') if p.is_file()}
-    result=pressure(root)
-    assert not result.deleted and first.exists() and latest.exists() and 'incident' in result.warning
-    assert before=={str(p):p.read_bytes() for p in root.rglob('*') if p.is_file()}
 
 
 def test_partial_foreign_and_unproved_symlink_material_stays(tmp_path):
@@ -162,19 +144,6 @@ def test_previous_session_journals_are_accounted_but_never_pruned_without_histor
     assert 'previous-session journals kept' in result.warning and 'not_imported or unknown' in result.warning
     measured = int(result.warning.split('measured owned=')[1].split(' bytes')[0])
     assert measured >= protected.stat().st_blocks * 512
-
-
-def test_current_session_incident_guard_does_not_read_legacy_or_archived_owner(tmp_path):
-    root = tmp_path / 'runtime'
-    legacy = journal(root, 0)
-    current = journal(root / 'current', 1)
-    archived = journal(root / 'previous-sessions' / ('b' * 32), 0)
-    originals = {p: p.read_bytes() for p in (legacy, current, archived)}
-    old, latest = capture(root, 1), capture(root, 2)
-    result = pressure(root)
-    assert result.deleted == (str(old.relative_to(root)),)
-    assert latest.exists() and archived.exists()
-    assert all(p.read_bytes() == content for p, content in originals.items())
 
 
 def test_previous_sessions_are_bounded_with_one_slot_reserved_for_current(tmp_path):
@@ -248,20 +217,6 @@ def test_session_order_uses_start_time_and_legacy_directory_mtime(tmp_path):
     _quiet_count_pass(root)
     assert not old.exists()
     assert legacy.exists() and all(folder.exists() for folder in recent)
-
-
-@pytest.mark.parametrize('state', ['open', 'missing'])
-def test_session_count_pruning_preserves_all_while_incident_is_open_or_unknown(tmp_path, state):
-    root = tmp_path / 'runtime'
-    if state == 'open':
-        journal(root / 'current', 0)
-    else:
-        (root / 'current').mkdir(parents=True)
-    archives = [_archive(root, index) for index in range(6)]
-    result = _quiet_count_pass(root)
-    assert not result.deleted
-    assert all(folder.exists() for folder in archives)
-    assert 'previous-session retention deferred' in result.warning
 
 
 def test_session_pruning_preserves_incomplete_selection_and_pending_report(tmp_path):
@@ -456,19 +411,6 @@ def test_artifact_metadata_ownership_is_required_even_with_extra_files(tmp_path)
     assert 'unknown controller-launch artifact ownership' in result.warning
 
 
-@pytest.mark.parametrize('state',['open','unknown'])
-def test_incident_protection_also_keeps_older_console_traces(tmp_path,state):
-    root=tmp_path/'runtime'
-    first,latest=capture(root,1),capture(root,2)
-    path=root/'execution-state/cclc-journal.sqlite3'
-    if state=='unknown': path.unlink()
-    else:
-        with sqlite3.connect(path) as db: db.execute('UPDATE cclc_component_incidents SET acknowledged=0')
-    result=pressure(root)
-    assert not result.deleted and first.exists() and latest.exists()
-    assert 'incident' in result.warning
-
-
 def test_root_replacement_during_inventory_never_deletes_replacement_files(tmp_path,monkeypatch):
     root=tmp_path/'runtime'
     original,latest=capture(root,1),capture(root,2)
@@ -508,50 +450,6 @@ def test_parent_symlink_swap_after_inventory_cannot_redirect_fd_deletion(tmp_pat
     assert (root/'saved-evidence'/old.name).exists() and (root/'saved-evidence'/latest.name).exists()
 
 
-@pytest.mark.parametrize('swap',['journal','state-directory','wal'])
-@pytest.mark.parametrize('initial_ack',[0,1])
-def test_pinned_incident_inputs_detect_swap_before_inventory(tmp_path,monkeypatch,swap,initial_ack):
-    root=tmp_path/'runtime'
-    old,latest=capture(root,1),capture(root,2)
-    path=root/'execution-state/cclc-journal.sqlite3'
-    with sqlite3.connect(path) as db: db.execute('UPDATE cclc_component_incidents SET acknowledged=?',(initial_ack,))
-    inventory=retention._units
-    replaced=False
-    def replace(owner,**options):
-        nonlocal replaced
-        if not replaced:
-            replaced=True
-            if swap=='journal':
-                path.rename(root/'original-open.sqlite3')
-                journal(root,1-initial_ack)
-            elif swap=='state-directory':
-                (root/'execution-state').rename(root/'original-execution-state')
-                journal(root,1-initial_ack)
-            else:
-                path.with_name(path.name+'-wal').write_bytes(b'unknown committed changes')
-        return inventory(owner,**options)
-    monkeypatch.setattr(retention,'_units',replace)
-    result=pressure(root)
-    assert not result.deleted and old.exists() and latest.exists()
-    assert result.warning is not None
-
-
-def test_journal_opened_via_held_fd_and_all_resources_close(tmp_path,monkeypatch):
-    root=tmp_path/'runtime'
-    capture(root,1)
-    initial=len(os.listdir('/proc/self/fd'))
-    original=sqlite3.connect
-    inputs=[]
-    def connect(path,**options):
-        inputs.append(path)
-        return original(path,**options)
-    monkeypatch.setattr(sqlite3,'connect',connect)
-    for _ in range(4):
-        pressure(root)
-    assert all(path.startswith('file:/proc/self/fd/') and path.endswith('?mode=ro&immutable=1') for path in inputs)
-    assert len(os.listdir('/proc/self/fd'))==initial
-
-
 def test_failed_oldest_deletion_is_protected_and_later_eligible_unit_rotates(tmp_path,monkeypatch):
     root=tmp_path/'runtime'
     first,second,latest=capture(root,1),capture(root,2),capture(root,3)
@@ -567,14 +465,6 @@ def test_failed_oldest_deletion_is_protected_and_later_eligible_unit_rotates(tmp
     assert result.deleted==(str(second.relative_to(root)),)
     assert first.exists() and latest.exists() and calls.count(first.name)==1
     assert 'deletion failed; protected for this pass' in result.warning
-
-
-def test_missing_journal_below_trigger_is_silent_and_preserves_material(tmp_path):
-    root=tmp_path/'runtime'
-    old,latest=capture(root,1),capture(root,2)
-    (root/'execution-state/cclc-journal.sqlite3').unlink()
-    result=retention.rotate_retained_logs(root,retention.SiteRetentionPolicy(),disk_facts=lambda _:retention.DiskFacts(10**12,10**12))
-    assert not result.deleted and result.warning is None and old.exists() and latest.exists()
 
 
 def test_symlinked_root_ancestor_is_resolved_and_descendant_link_is_protected(tmp_path):
@@ -854,25 +744,6 @@ def test_owned_unit_symlink_is_unlinked_without_touching_external_target(tmp_pat
     assert list(outside.iterdir()) == [outside/'file']
 
 
-@pytest.mark.parametrize('acknowledged', [0, None])
-def test_open_or_unknown_incident_owned_units_with_extra_files_remain_protected(tmp_path, acknowledged):
-    root = tmp_path/'runtime'
-    path = journal(root, acknowledged or 0)
-    old, latest = capture(root,1), capture(root,2)
-    old_epoch, latest_epoch = epoch(root,3), epoch(root,4)
-    for folder in (old, old_epoch):
-        (folder/'user-file').write_bytes(b'user data')
-        (folder/'user-directory').mkdir()
-        (folder/'user-directory/note').write_bytes(b'user data')
-    if acknowledged is None:
-        path.unlink()
-    before = {str(p):p.read_bytes() for p in root.rglob('*') if p.is_file()}
-    result = pressure(root)
-    assert not result.deleted and 'incident' in result.warning
-    assert before == {str(p):p.read_bytes() for p in root.rglob('*') if p.is_file()}
-    assert all(p.exists() for p in (old, latest, old_epoch, latest_epoch))
-
-
 def test_owned_capture_cleanup_refuses_same_filesystem_mount_before_any_mutation(tmp_path, monkeypatch):
     root = tmp_path/'runtime'
     root.mkdir()
@@ -957,7 +828,7 @@ def ros_session(root, started, *, written=None):
     sequence = 1 + sum(1 for entry in logs.iterdir()) if logs.exists() else 1
     folder = logs / f'{sequence}-{started}'
     folder.mkdir(parents=True)
-    trace = folder / 'native-execution-host.log'
+    trace = folder / 'execution-host.log'
     trace.write_bytes(b'host trace' * 1000)
     os.utime(trace, ns=(written or started, written or started))
     return folder
@@ -984,21 +855,6 @@ def test_host_ros_old_directory_with_current_file_is_never_deleted(tmp_path):
     result = pressure(root)
     assert not result.deleted and old.exists() and current.exists()
     assert 'current-session' in result.warning
-
-
-@pytest.mark.parametrize('state', ['open', 'missing', 'corrupt', 'wal'])
-def test_host_ros_open_or_unknown_incident_protects_every_session(tmp_path, state):
-    root = tmp_path / 'runtime'
-    old, current = ros_session(root, 100), ros_session(root, 200)
-    if state != 'missing':
-        path = journal(root, 0 if state == 'open' else 1)
-        if state == 'corrupt':
-            path.write_text('not a journal')
-        elif state == 'wal':
-            path.with_name(path.name + '-wal').write_bytes(b'unknown WAL')
-    result = pressure(root)
-    assert not result.deleted and old.exists() and current.exists()
-    assert 'incident' in result.warning
 
 
 def test_host_ros_unproved_names_and_latest_future_session_are_protected(tmp_path):

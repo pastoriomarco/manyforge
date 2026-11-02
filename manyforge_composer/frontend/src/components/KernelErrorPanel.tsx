@@ -30,7 +30,6 @@ function stableValue(value: unknown): unknown {
 
 const ERROR_PRESENTATION_IDENTITY_KEYS = [
   'runtime_fault_id',
-  'latch_id',
   'execution_id',
   'action_span_id',
   'node_attempt_id',

@@ -11,7 +11,7 @@
 namespace manyforge::roboplan_backend::worker_protocol {
 
 inline constexpr std::uint32_t kFrameMagic = 0x4d465750U;  // MFWP
-inline constexpr std::uint16_t kProtocolVersion = 11U;
+inline constexpr std::uint16_t kProtocolVersion = 12U;
 inline constexpr int kProtocolDescriptor = 3;
 /// Worker-reserved duplicate of the approved scene-asset root directory.
 inline constexpr int kSceneAssetRootDescriptor = 9;
@@ -48,6 +48,9 @@ struct WorkerIkRequestDTO final {
   core::ResolvedFrameDTO tcp_frame;
   core::ControlledStateDTO seed_state;
   double timeout_s{};
+  /// Native body-name pairs (`first < second`) the selected contact policy
+  /// allows; the worker deactivates them for this solve.
+  std::vector<std::pair<std::string, std::string>> contact_allowed_pairs{};
 };
 
 [[nodiscard]] std::string encode_initialization(

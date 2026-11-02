@@ -1,10 +1,9 @@
 #include "apply_affected_scope_internal.hpp"
-#include "native_execution_runtime_unit_internal.hpp"
 
 #include <gtest/gtest.h>
 
 #include <manyforge_deployment/apply_affected_scope.hpp>
-#include <manyforge_deployment/native_execution_runtime_contract.hpp>
+#include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 
 #include <optional>
 #include <string>
@@ -173,9 +172,8 @@ Products(std::string planning_id = "planning",
   };
 }
 
-// DX-753: unverified DTO scope fixtures remain compiled; they do not admit native execution.
 [[nodiscard]] core::RuntimeUnitId NativeHostId() {
-  return core::RuntimeUnitId("robot_cell.native_execution");
+  return core::RuntimeUnitId("execution_host");
 }
 
 [[nodiscard]] core::JsonValueDTO MotionLimit(const std::string &component,
@@ -196,11 +194,6 @@ Products(std::string planning_id = "planning",
 
 [[nodiscard]] core::CellGraphDTO NativeGraph(const bool include_b = true) {
   auto runtime = RuntimeUnit(NativeHostId().value());
-  runtime.runtime_profile_id =
-      core::RuntimeProfileId(std::string(native_execution_runtime_contract::kRuntimeProfileId));
-  runtime.runtime_profile_revision =
-      core::RuntimeProfileRevision(
-          "sha256:b4d1e602c5d312a4248be8d9d6a5f8e27b36d3545fa12507d0c5c28336c9ec15");
   auto positions = core::JsonValueDTO::Array{core::JsonValueDTO{0.1},
                                              core::JsonValueDTO{0.2}};
   auto limits =
@@ -267,7 +260,7 @@ Products(std::string planning_id = "planning",
   auto runtime_product =
       Product("runtime_unit_configuration_bbf6d9b7ba5419cccbb4eb8e282aa7213f9fc042222b5e053f9fbeb1c546caeb",
               core::RetainedProductKind::kRuntimeUnitConfiguration);
-  runtime_product.product_contract_id = core::ProductContractId("manyforge.native_execution_runtime_unit");
+  runtime_product.product_contract_id = core::ProductContractId("manyforge.execution_host_unit");
   products.runtime_unit_products = {
       {NativeHostId(), {std::move(runtime_product)}}};
   return products;
@@ -279,7 +272,7 @@ RuntimeRequirement(const core::RuntimeUnitId &runtime_unit_id) {
       runtime_unit_id,
       {core::RuntimeContractRequirementDigest("sha256:" +
                                               std::string(64U, 'a')),
-       core::RuntimeImplementationFamilyId("manyforge.native_execution_host"),
+       core::RuntimeImplementationFamilyId("manyforge.execution_host"),
        {core::ApiContractId("manyforge.api.native.execution")},
        {{core::CapabilityId("execution.trajectory.execute"),
          core::CapabilityDefinitionRevision("capability-r1")}}},
@@ -363,60 +356,6 @@ TEST(ApplyAffectedScope,
                ApplyAffectedScopeError);
 }
 
-TEST(ApplyAffectedScope, NativeInitialPositionChangeFencesOnlyItsComponent) {
-  GTEST_SKIP() << "held: multi-unit discussion";
-  const auto predecessor = NativeGraph();
-  auto candidate = predecessor;
-  std::get<core::JsonValueDTO::Array>(
-      candidate.runtime_units.front()
-          .configuration.at("initial_joint_positions_rad")
-          .value)
-      .back() = core::JsonValueDTO{0.4};
-
-  const auto scope = derive_apply_configuration_fence_scope_verified_values(
-      Bundle(predecessor, NativeProducts()),
-      Bundle(candidate, NativeProducts()));
-
-  ExpectOnlyComponentB(scope);
-}
-
-TEST(ApplyAffectedScope, NativeMotionLimitChangeFencesOnlyItsComponent) {
-  GTEST_SKIP() << "held: multi-unit discussion";
-  const auto predecessor = NativeGraph();
-  auto candidate = predecessor;
-  std::get<core::JsonValueDTO::Array>(
-      candidate.runtime_units.front()
-          .configuration.at("motion_target_limits")
-          .value)
-      .back() = MotionLimit("component-b", "target-b", 0.75);
-
-  const auto scope = derive_apply_configuration_fence_scope_verified_values(
-      Bundle(predecessor, NativeProducts()),
-      Bundle(candidate, NativeProducts()));
-
-  ExpectOnlyComponentB(scope);
-}
-
-TEST(ApplyAffectedScope,
-     NativeRemovalKeepsOnlyRemovedComponentPredecessorScope) {
-  GTEST_SKIP() << "held: multi-unit discussion";
-  // The collision product/model tables deliberately stay equal: this isolates
-  // removal's aggregate controller settings from genuine shared dependencies.
-  const auto scope = derive_apply_configuration_fence_scope_verified_values(
-      Bundle(NativeGraph(), NativeProducts()),
-      Bundle(NativeGraph(false), NativeProducts()));
-
-  ExpectOnlyComponentB(scope);
-  ASSERT_EQ(scope.bindings.size(), 1U);
-  EXPECT_EQ(scope.bindings.front().predecessor_control_binding_revision,
-            core::ControlBindingRevision("binding-b-r1"));
-  EXPECT_FALSE(scope.bindings.front().candidate_control_binding_revision);
-  ASSERT_EQ(scope.domains.size(), 1U);
-  EXPECT_EQ(scope.domains.front().predecessor_control_domain_revision,
-            core::ControlDomainRevision("domain-r1"));
-  EXPECT_FALSE(scope.domains.front().candidate_control_domain_revision);
-}
-
 TEST(ApplyAffectedScope, SharedNativeScalarsFenceEveryHostedComponent) {
   const auto predecessor = NativeGraph();
   for (const auto *field : {"planner_rng_seed", "execution_tick_hz",
@@ -451,37 +390,83 @@ TEST(ApplyAffectedScope, SharedNativeScalarsFenceDependentGenericRuntime) {
   }
 }
 
-TEST(ApplyAffectedScope,
-     NativeLocalConfigurationDoesNotFenceDependentGenericRuntime) {
-  GTEST_SKIP() << "held: multi-unit discussion";
-  const auto predecessor = NativeGraphWithDependentGenericRuntime();
-  for (const auto *field : {"initial_joint_positions_rad",
-                            "motion_target_limits"}) {
+// The fixture graph hosted by the ros2_control execution host profile.
+[[nodiscard]] core::CellGraphDTO HostGraph() {
+  auto graph = NativeGraph();
+  graph.runtime_units.front().runtime_profile_id = core::RuntimeProfileId(
+      std::string(ros2_control_execution_runtime_contract::kRuntimeProfileId));
+  return graph;
+}
+
+[[nodiscard]] core::JsonValueDTO::Array &HostTable(core::CellGraphDTO &graph,
+                                                   const std::string &table) {
+  auto &configuration = graph.runtime_units.front().configuration;
+  configuration.try_emplace(table, core::JsonValueDTO{core::JsonValueDTO::Array{}});
+  return std::get<core::JsonValueDTO::Array>(configuration.at(table).value);
+}
+
+TEST(ApplyAffectedScope, ExecutionHostComponentRowChangeFencesOnlyItsComponent) {
+  const auto predecessor = HostGraph();
+  auto candidate = predecessor;
+  HostTable(candidate, "motion_target_limits").back() =
+      MotionLimit("component-b", "target-b", 0.75);
+
+  ExpectOnlyComponentB(derive_apply_configuration_fence_scope_verified_values(
+      Bundle(predecessor, NativeProducts()), Bundle(candidate, NativeProducts())));
+}
+
+TEST(ApplyAffectedScope, ExecutionHostSharedSettingChangeFencesEveryHostedComponent) {
+  const auto predecessor = HostGraph();
+  for (const auto *field : {"execution_tick_hz", "initial_joint_positions_rad"}) {
     SCOPED_TRACE(field);
     auto candidate = predecessor;
-    auto &values = std::get<core::JsonValueDTO::Array>(
-        candidate.runtime_units.front().configuration.at(field).value);
-    values.front() = std::string(field) == "initial_joint_positions_rad"
-                         ? core::JsonValueDTO{0.4}
-                         : MotionLimit("component-a", "target-a", 0.75);
+    auto &value = candidate.runtime_units.front().configuration.at(field).value;
+    if (auto *number = std::get_if<double>(&value))
+      *number += 1.0;
+    else
+      std::get<core::JsonValueDTO::Array>(value).back() = core::JsonValueDTO{0.4};
 
-    const auto scope = derive_apply_configuration_fence_scope_verified_values(
-        Bundle(predecessor, NativeProducts()),
-        Bundle(candidate, NativeProducts()));
-
-    ASSERT_TRUE(scope.valid());
-    EXPECT_EQ(scope.controllable_component_ids,
-              (std::vector{core::ControllableComponentId("component-a")}));
-    EXPECT_EQ(scope.resources,
-              (std::vector{core::ResourceId("resource-a-1"),
-                           core::ResourceId("resource-a-2")}));
-    ASSERT_EQ(scope.bindings.size(), 1U);
-    EXPECT_EQ(scope.bindings.front().control_binding_id,
-              core::ControlBindingId("binding-a"));
-    ASSERT_EQ(scope.domains.size(), 1U);
-    EXPECT_EQ(scope.domains.front().control_domain_id,
-              core::ControlDomainId("domain-a"));
+    ExpectBothComponents(derive_apply_configuration_fence_scope_verified_values(
+        Bundle(predecessor, NativeProducts()), Bundle(candidate, NativeProducts())));
   }
+}
+
+// CONTRACTS §16: a member's runtime identity includes its owner's, so a
+// change of the owner's own rows fences its members too.
+TEST(ApplyAffectedScope, ExecutionHostOwnerRowChangeFencesItsMembers) {
+  auto predecessor = HostGraph();
+  HostTable(predecessor, "controller_profiles")
+      .push_back(core::JsonValueDTO{core::JsonObjectDTO{
+          {"controllable_component_id", core::JsonValueDTO{std::string("component-b")}},
+          {"owner_component_id", core::JsonValueDTO{std::string("owner")}},
+          {"member_role", core::JsonValueDTO{std::string("arm")}}}});
+  HostTable(predecessor, "machines")
+      .push_back(core::JsonValueDTO{core::JsonObjectDTO{
+          {"controllable_component_id", core::JsonValueDTO{std::string("owner")}},
+          {"model", core::JsonValueDTO{std::string("model-1")}}}});
+  auto candidate = predecessor;
+  std::get<core::JsonObjectDTO>(HostTable(candidate, "machines").front().value)
+      .at("model") = core::JsonValueDTO{std::string("model-2")};
+
+  ExpectOnlyComponentB(derive_apply_configuration_fence_scope_verified_values(
+      Bundle(predecessor, NativeProducts()), Bundle(candidate, NativeProducts())));
+}
+
+TEST(ApplyAffectedScope, ExecutionHostRequirementChangeDoesNotFenceUnchangedComponent) {
+  auto predecessor = Bundle(HostGraph(), NativeProducts());
+  predecessor.runtime_contract_requirements = {RuntimeRequirement(NativeHostId())};
+  auto candidate = predecessor;
+  candidate.cell_graph.control_bindings.back().control_binding_revision =
+      core::ControlBindingRevision("binding-b-r2");
+  candidate.runtime_contract_requirements.front().requirement.requirement_digest =
+      core::RuntimeContractRequirementDigest("sha256:" + std::string(64U, 'b'));
+
+  const auto scope =
+      derive_apply_configuration_fence_scope_verified_values(predecessor, candidate);
+
+  ExpectOnlyComponentB(scope);
+  EXPECT_EQ(scope.bindings.front().candidate_control_binding_revision,
+            core::ControlBindingRevision("binding-b-r2"));
 }
 
 TEST(ApplyAffectedScope, NativeCollisionProductChangeFencesEveryComponent) {
@@ -519,33 +504,6 @@ TEST(ApplyAffectedScope, NativeHostProductChangeFencesEveryHostedComponent) {
       Bundle(graph, NativeProducts()), Bundle(graph, candidate_products));
 
   ExpectBothComponents(scope);
-}
-
-TEST(ApplyAffectedScope,
-     NativeAggregateRequirementChangeDoesNotFenceUnchangedComponent) {
-  GTEST_SKIP() << "held: multi-unit discussion";
-  auto predecessor = Bundle(NativeGraph(), NativeProducts());
-  predecessor.runtime_contract_requirements = {
-      RuntimeRequirement(NativeHostId())};
-  auto candidate = predecessor;
-  candidate.cell_graph.control_bindings.back().control_binding_revision =
-      core::ControlBindingRevision("binding-b-r2");
-  std::get<core::JsonValueDTO::Array>(
-      candidate.cell_graph.runtime_units.front()
-          .configuration.at("initial_joint_positions_rad")
-          .value)
-      .back() = core::JsonValueDTO{0.4};
-  candidate.runtime_contract_requirements.front()
-      .requirement.requirement_digest =
-      core::RuntimeContractRequirementDigest("sha256:" + std::string(64U, 'b'));
-
-  const auto scope = derive_apply_configuration_fence_scope_verified_values(
-      predecessor, candidate);
-
-  ExpectOnlyComponentB(scope);
-  ASSERT_EQ(scope.bindings.size(), 1U);
-  EXPECT_EQ(scope.bindings.front().candidate_control_binding_revision,
-            core::ControlBindingRevision("binding-b-r2"));
 }
 
 TEST(ApplyAffectedScope, GenericRequirementChangeStillFencesWholeRuntime) {
@@ -592,45 +550,6 @@ TEST(ApplyAffectedScope, GenericConfigurationChangeStillFencesWholeRuntime) {
       predecessor, candidate);
 
   ExpectBothComponents(scope);
-}
-
-TEST(ApplyAffectedScope,
-     MultipleNativeMotionTargetsRejectBeforeScopeProduction) {
-  const auto predecessor = NativeGraph();
-  auto candidate = predecessor;
-  auto second_motion = candidate.control_bindings.back();
-  second_motion.control_binding_id =
-      core::ControlBindingId("binding-b-secondary");
-  second_motion.command_target_id = core::CommandTargetId("target-b-secondary");
-  second_motion.resource_bindings.front().resource_id =
-      core::ResourceId("resource-b-secondary");
-  candidate.control_bindings.push_back(std::move(second_motion));
-  auto &configuration = candidate.runtime_units.front().configuration;
-  std::get<core::JsonValueDTO::Array>(
-      configuration.at("initial_joint_positions_rad").value)
-      .push_back(core::JsonValueDTO{0.5});
-  std::get<core::JsonValueDTO::Array>(
-      configuration.at("motion_target_limits").value)
-      .push_back(MotionLimit("component-b", "target-b-secondary"));
-  const auto decoded = decode_native_execution_runtime_configuration(
-      configuration, candidate, NativeHostId());
-  try {
-    static_cast<void>(select_native_component_configuration(
-        decoded, candidate, NativeHostId(),
-        core::ControllableComponentId("component-b")));
-    FAIL() << "ambiguous native motion ownership returned a configuration";
-  } catch (const RetainedBundleError &error) {
-    EXPECT_EQ(
-        std::string(error.what()),
-        "native runtime supports at most one motion target per component: "
-        "component-b");
-  }
-
-  EXPECT_THROW(
-      static_cast<void>(derive_apply_configuration_fence_scope_verified_values(
-          Bundle(predecessor, NativeProducts()),
-          Bundle(candidate, NativeProducts()))),
-      RetainedBundleError);
 }
 
 TEST(ApplyAffectedScope, RuntimeOnlyAndViewerOnlyChangesStayEmpty) {

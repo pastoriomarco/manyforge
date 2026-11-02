@@ -6,7 +6,6 @@
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/observed_state.hpp>
 #include <manyforge_core/types/io_signal.hpp>
-#include <manyforge_core/types/io_output_policy.hpp>
 #include <manyforge_core/types/lifecycle_provider_occurrence.hpp>
 #include <manyforge_core/types/participant_binding_identity.hpp>
 #include <manyforge_core/types/program_binding.hpp>
@@ -97,21 +96,6 @@ struct RuntimeCapabilityProviderPathDTO final {
                          const RuntimeCapabilityProviderPathDTO&) = default;
 };
 
-/// A real logical output channel. It has no coordinate unit, URDF joint,
-/// controller route or fabricated physical Stop evidence.
-struct RuntimeIoOutputBindingDTO final {
-  ResourceRoleId resource_role_id;
-  IoSignalDescriptorDTO signal;
-  ContentDigest signal_descriptor_digest;
-  ComponentLifecycleGeneration component_lifecycle_generation;
-  ResolvedLifecycleProviderOccurrenceDTO provider;
-  ContentDigest signal_configuration_digest;
-  IoOutputCompletionPolicyDTO completion_policy;
-
-  friend bool operator==(const RuntimeIoOutputBindingDTO&,
-                         const RuntimeIoOutputBindingDTO&) = default;
-};
-
 /// Exact selected endpoint. Body IDs follow the existing semantic-to-physical
 /// alias projection; this record does not grant motion ownership to the tool.
 struct RuntimeMotionEndpointBindingDTO final {
@@ -180,9 +164,6 @@ struct RuntimeParticipantBindingDTO final {
   /// Exact Program-owned templates copied from the sealed Program Binding.
   /// Runtime object selection remains unresolved until operation admission.
   std::vector<ProgramContactGraspBindingDTO> contact_grasp_bindings{};
-  /// Mutually exclusive with coordinate resources/control_path. The ordinary
-  /// capability provider path still identifies the exact installed command port.
-  std::optional<RuntimeIoOutputBindingDTO> io_output_binding{};
   std::optional<RuntimeMotionEndpointBindingDTO> motion_endpoint{};
 
   friend bool operator==(const RuntimeParticipantBindingDTO&,

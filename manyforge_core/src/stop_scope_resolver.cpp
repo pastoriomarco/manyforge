@@ -283,7 +283,6 @@ template <typename Rows, typename Identity, typename Key>
 struct ResourceOwnerIndexRow final {
   const ResourceId* resource_id{};
   const StopScopeComponentSnapshotDTO* owner{};
-  bool logical_output{};
 };
 
 using ResourceOwnerIndex = std::vector<ResourceOwnerIndexRow>;
@@ -295,10 +294,7 @@ using ResourceOwnerIndex = std::vector<ResourceOwnerIndexRow>;
                          snapshot.resources.size() + snapshot.components.size()));
   for (const auto& component : snapshot.components) {
     for (const auto& resource_id : component.resources) {
-      index.push_back(ResourceOwnerIndexRow{
-          &resource_id, &component,
-          std::binary_search(component.logical_output_resources.begin(),
-                             component.logical_output_resources.end(), resource_id)});
+      index.push_back(ResourceOwnerIndexRow{&resource_id, &component});
     }
   }
   std::sort(index.begin(), index.end(), [](const auto& left, const auto& right) {
@@ -644,11 +640,7 @@ std::optional<std::string_view> stop_scope_snapshot_field_error(
         !safe_counter(component.component_lifecycle_generation)) {
       return "stop_scope_component_invalid";
     }
-    if (!canonical_id_set(component.resources) ||
-        !canonical_id_set(component.logical_output_resources) ||
-        !std::includes(component.resources.begin(), component.resources.end(),
-                       component.logical_output_resources.begin(),
-                       component.logical_output_resources.end())) {
+    if (!canonical_id_set(component.resources)) {
       return "stop_scope_component_resources_not_canonical";
     }
     if (component.resources.size() > kMaximumStopScopeMembershipRows - membership_rows) {
@@ -667,8 +659,7 @@ std::optional<std::string_view> stop_scope_snapshot_field_error(
     const auto next = std::upper_bound(
         current, owner_index.end(), *current->resource_id,
         [](const auto& value, const auto& row) { return value < *row.resource_id; });
-    if (static_cast<std::size_t>(std::distance(current, next)) > 1U &&
-        std::any_of(current, next, [](const auto& member) { return !member.logical_output; })) {
+    if (static_cast<std::size_t>(std::distance(current, next)) > 1U) {
       return "stop_scope_resource_owner_ambiguous";
     }
     current = next;

@@ -642,6 +642,25 @@ describe('Program authoring panels', () => {
       .toContain('Catalog-invalid value:');
   });
 
+  it('labels the gripper wait-for-duration flag with its help text', () => {
+    const entry: CatalogEntry = { ...timer, id: 'gripper.command_position', parameters: [{
+      id: 'wait_for_duration', required: false, hasDefault: true, default: false,
+      schema: { type: 'boolean' }, schemaHash: timer.parameters[0].schemaHash,
+    }] };
+    const node: ProgramTreeNode = {
+      node_id: entry.id, instance_id: 'gripper', parameters: {
+        command_duration_s: 0.25, position: { kind: 'named_preset', name: 'closed' },
+      }, children: [],
+    };
+    const markup = renderToStaticMarkup(<ProgramPropertyEditor
+      roots={[node]} selectedId="gripper" catalogEntries={[entry]}
+      program={authoringProgram([node], [])}
+      busy={false} onMutate={vi.fn()} onUpdateNodePolicies={vi.fn()}
+    />);
+    expect(markup).toContain('Wait for command duration</label>');
+    expect(markup).toContain('it also waits until command_duration_s has passed since the command started');
+  });
+
   it('disables automatic retry fields by contract item 7, with the reason', () => {
     // Fixture entries declare the retry parameters ahead of the catalog 2.6.0 bump.
     const retryParameters: CatalogEntry['parameters'] = [
@@ -1403,13 +1422,9 @@ describe('Program authoring panels', () => {
     const controller = {
       mutationAvailable: true,
       acceptedApply: null,
-      newSceneClearApply: null,
-      clearNewSceneClearApply: vi.fn(),
       mutationUnavailableReason: null,
       documentUnavailableReason: null,
-      scenarioReplacementIdentity: null,
-      reportCloseCancellation: vi.fn(),
-      scenarioCloseHandoff: vi.fn(() => ({ status: 'waiting' as const, message: null })),
+      scenarioReplacementUnavailableReason: null,
       admissionObserved: true,
       fenceDraft: null,
       refreshApplied: vi.fn(),
@@ -1477,6 +1492,7 @@ describe('Program authoring panels', () => {
       updateNodePolicies: vi.fn(),
       updateNodePresentation: vi.fn(),
       clearFeedback: vi.fn(),
+      busyOperation: null,
     } satisfies ProgramWorkspaceController;
     const runtime = {
       state: {
@@ -1498,19 +1514,13 @@ describe('Program authoring panels', () => {
       cycleFailure: null,
       resetRobotPositionAvailability: { available: true, reason: null },
       active: false,
-      commandAllowed: vi.fn(() => false),
-      commandDisabledReason: vi.fn(() => null),
+      runnerAllows: vi.fn(() => false),
+      runnerRefusal: vi.fn(() => null),
       draftUnappliedReason: null,
       refresh: vi.fn(),
       dismissError: vi.fn(),
-      activationOffer: null,
-      activationComponentHealth: {},
-      activationProgress: null,
-      activationPending: false,
-      activationWaiting: false,
-      confirmActivationExecute: vi.fn(async () => {}),
-      cancelActivationExecute: vi.fn(),
       run: vi.fn(),
+      activation: { available: false, flow: null, states: [], open: vi.fn(), confirm: vi.fn(), cancel: vi.fn() },
       stopMotion: vi.fn(),
       startMotion: vi.fn(),
       resumeMotion: vi.fn(),
@@ -1524,7 +1534,8 @@ describe('Program authoring panels', () => {
       writeRuntimeBlackboard: vi.fn(),
       persistentValues: { read: vi.fn(), edit: vi.fn(), clear: vi.fn() },
       stageManualResult: vi.fn(),
-      motionAttentionBlock: vi.fn(() => null),
+      readiness: null,
+      cellLatch: null,
     } satisfies ProgramRuntimeController;
     const markup = renderToStaticMarkup(
       <ProgramWorkspace
@@ -1637,13 +1648,9 @@ describe('Program authoring panels', () => {
     const controller = {
       mutationAvailable: true,
       acceptedApply: null,
-      newSceneClearApply: null,
-      clearNewSceneClearApply: vi.fn(),
       mutationUnavailableReason: null,
       documentUnavailableReason: null,
-      scenarioReplacementIdentity: null,
-      reportCloseCancellation: vi.fn(),
-      scenarioCloseHandoff: vi.fn(() => ({ status: 'waiting' as const, message: null })),
+      scenarioReplacementUnavailableReason: null,
       admissionObserved: true,
       fenceDraft: null,
       refreshApplied: vi.fn(),
@@ -1675,6 +1682,7 @@ describe('Program authoring panels', () => {
       updateNodePolicies: vi.fn(),
       updateNodePresentation: vi.fn(),
       clearFeedback: vi.fn(),
+      busyOperation: null,
     } satisfies ProgramWorkspaceController;
     const runtime = {
       state: {
@@ -1696,19 +1704,13 @@ describe('Program authoring panels', () => {
       cycleFailure: null,
       resetRobotPositionAvailability: { available: true, reason: null },
       active: false,
-      commandAllowed: vi.fn(() => false),
-      commandDisabledReason: vi.fn(() => null),
+      runnerAllows: vi.fn(() => false),
+      runnerRefusal: vi.fn(() => null),
       draftUnappliedReason: null,
       refresh: vi.fn(),
       dismissError: vi.fn(),
-      activationOffer: null,
-      activationComponentHealth: {},
-      activationProgress: null,
-      activationPending: false,
-      activationWaiting: false,
-      confirmActivationExecute: vi.fn(async () => {}),
-      cancelActivationExecute: vi.fn(),
       run: vi.fn(),
+      activation: { available: false, flow: null, states: [], open: vi.fn(), confirm: vi.fn(), cancel: vi.fn() },
       stopMotion: vi.fn(),
       startMotion: vi.fn(),
       resumeMotion: vi.fn(),
@@ -1722,7 +1724,8 @@ describe('Program authoring panels', () => {
       writeRuntimeBlackboard: vi.fn(),
       persistentValues: { read: vi.fn(), edit: vi.fn(), clear: vi.fn() },
       stageManualResult: vi.fn(),
-      motionAttentionBlock: vi.fn(() => null),
+      readiness: null,
+      cellLatch: null,
     } satisfies ProgramRuntimeController;
     const markup = renderToStaticMarkup(
       <div>
@@ -1732,7 +1735,7 @@ describe('Program authoring panels', () => {
           actions={(
             <ScenarioActionControls
               program={controller}
-              deployment={{ workspace: null, busy: false, applying: false, pendingApplyConfirmation: null,
+              deployment={{ workspace: null, busy: false, applying: false, applyPreview: null,
                 documentUnavailableReason: null, mutationUnavailableReason: null } as unknown as DeploymentWorkspaceController}
               runtime={runtime}
             />

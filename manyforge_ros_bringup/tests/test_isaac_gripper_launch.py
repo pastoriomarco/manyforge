@@ -17,6 +17,10 @@ if str(_PACKAGE_ROOT) not in sys.path:  # the launch files import manyforge_ros_
     sys.path.insert(0, str(_PACKAGE_ROOT))
 _LAUNCH_FILE = _PACKAGE_ROOT / "launch" / "isaac_gripper.launch.py"
 _NAMESPACE = "/manyforge/ur10e_gripper"
+_BRIDGE_FILE = (
+    _PACKAGE_ROOT.parent
+    / "manyforge_isaac_adapter" / "lane" / "gripper_bridges" / "robotiq_2f_140.yaml"
+)
 
 
 def _load_launch_module():
@@ -48,9 +52,9 @@ def _context(module, tmp_path: Path, **values: str) -> LaunchContext:
 
 
 def _bridge_values() -> dict[str, str]:
-    # The host's arguments for the UR10e Robotiq transport (profile facts).
+    # The host's arguments for the Robotiq transport (the tool's lanes.isaac row).
     return {
-        "gripper_bridge_parameters": "isaac_robotiq_2f_140_gripper_bridge.yaml",
+        "gripper_bridge_parameters": str(_BRIDGE_FILE),
         "gripper_action_name": "robotiq_gripper_controller/gripper_cmd",
         "gripper_command_topic": "/isaac_gripper_state",
         "gripper_state_topic": "/isaac_joint_states",
@@ -70,13 +74,8 @@ def test_direct_transport_publishes_only_the_tool_description(tmp_path: Path) ->
     }
 
 
-def test_action_transport_runs_the_bridge_in_the_tool_namespace(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_action_transport_runs_the_bridge_in_the_tool_namespace(tmp_path: Path) -> None:
     module = _load_launch_module()
-    monkeypatch.setattr(
-        module.FindPackageShare, "find", lambda _self, _name: str(_PACKAGE_ROOT)
-    )
     context = _context(module, tmp_path, **_bridge_values())
     actions = module._launch_setup(context)
 
@@ -86,9 +85,7 @@ def test_action_transport_runs_the_bridge_in_the_tool_namespace(
     ]
     bridge = actions[1]
     parameters = evaluate_parameters(context, bridge._Node__parameters)
-    assert Path(str(parameters[0])) == (
-        _PACKAGE_ROOT / "config" / "isaac_robotiq_2f_140_gripper_bridge.yaml"
-    )
+    assert Path(str(parameters[0])) == _BRIDGE_FILE
     assert parameters[-1] == {
         "action_name": _NAMESPACE + "/robotiq_gripper_controller/gripper_cmd",
         "command_topic": "/isaac_gripper_state",
@@ -99,13 +96,8 @@ def test_action_transport_runs_the_bridge_in_the_tool_namespace(
     assert getattr(bridge, "_ExecuteLocal__on_exit") is not None
 
 
-def test_missing_description_or_bridge_budget_refuses(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_missing_description_or_bridge_budget_refuses(tmp_path: Path) -> None:
     module = _load_launch_module()
-    monkeypatch.setattr(
-        module.FindPackageShare, "find", lambda _self, _name: str(_PACKAGE_ROOT)
-    )
     missing = _context(module, tmp_path)
     missing.launch_configurations["robot_description_file"] = str(tmp_path / "absent")
     with pytest.raises(ValueError, match="robot_description_file"):
@@ -115,6 +107,11 @@ def test_missing_description_or_bridge_budget_refuses(
     values["gripper_state_freshness_timeout_s"] = ""
     with pytest.raises(ValueError):
         module._launch_setup(_context(module, tmp_path, **values))
+
+    relative = _bridge_values()
+    relative["gripper_bridge_parameters"] = "robotiq_2f_140.yaml"
+    with pytest.raises(ValueError, match="absolute"):
+        module._launch_setup(_context(module, tmp_path, **relative))
 
 
 def test_owned_nodes_disable_external_library_log_files() -> None:

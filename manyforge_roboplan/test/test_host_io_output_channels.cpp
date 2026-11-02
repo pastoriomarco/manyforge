@@ -11,7 +11,6 @@ namespace manyforge::roboplan_backend::host_detail {
 namespace {
 using Object = core::JsonValueDTO::Object;
 using Array = core::JsonValueDTO::Array;
-const core::ContentDigest kDigest("sha256:" + std::string(64U, 'a'));
 
 class HostIoOutputChannelsTest : public ::testing::Test {
 protected:
@@ -81,8 +80,6 @@ protected:
       } else {
         provider.emplace("service",
                          core::JsonValueDTO{std::string("/io_device/lamp")});
-        if (profile == "ur_set_io")
-          provider.emplace("pin", core::JsonValueDTO{1.0});
       }
       first["provider"].value.emplace<Object>(std::move(provider));
     }
@@ -92,9 +89,7 @@ protected:
     second["source_id"] = core::JsonValueDTO{std::string("source.alias")};
     if (distinct_channel) {
       auto &provider = std::get<Object>(second.at("provider").value);
-      if (profile == "ur_set_io")
-        provider["pin"] = core::JsonValueDTO{2.0};
-      else if (profile == "ros2_control_gpio") {
+      if (profile == "ros2_control_gpio") {
         provider["interface_name"] = core::JsonValueDTO{std::string("other")};
         if (distinct_group)
           provider["group"] = core::JsonValueDTO{std::string("other.group")};
@@ -114,25 +109,9 @@ protected:
           row.descriptor.signal_id.controllable_component_id.value() == "device.alias";
       result.push_back({std::move(row), Occurrence(alias), 1U,
                         alias ? alias_driver_owner : driver_owner,
-                        core::ActiveBundlePublicationGeneration(1U)});
+                        core::ActiveBundlePublicationGeneration(1U), 500'000'000});
     }
     return result;
-  }
-
-  core::IoOutputWriteRequestDTO
-  Request(const HostIoOutputAliasInstallation &alias, std::uint64_t number,
-          bool value) const {
-    return {{{core::OperationId("operation." + std::to_string(number)),
-              core::OperationRevision(1U),
-              core::OperationParticipantId("participant"),
-              core::ControllerGoalId("goal." + std::to_string(number)),
-              core::ControllerGoalGeneration(1U)},
-             kDigest,
-             core::ComponentLifecycleGeneration(7U),
-             alias.provider},
-            alias.row.descriptor.signal_id,
-            value,
-            std::nullopt};
   }
 
   static inline std::atomic<std::uint64_t> next{};
@@ -144,27 +123,25 @@ protected:
 };
 
 TEST_F(HostIoOutputChannelsTest,
-       GenuineRetainedOutputCreatesOnePausedModelAndEngine) {
+       GenuineRetainedOutputCreatesOnePausedModel) {
   const auto aliases = Single();
   auto channels = CreateHostIoOutputChannels(aliases, {}, clock);
   ASSERT_TRUE(channels.ok());
   ASSERT_EQ(channels.value().size(), 1U);
   auto &entry = channels.value().front();
   EXPECT_EQ(entry.resource_id, aliases.front().row.descriptor.output_resource);
-  ASSERT_NE(entry.engine, nullptr);
   const auto provider =
       std::get<std::shared_ptr<MockBooleanOutputProvider>>(entry.provider);
   ASSERT_NE(provider, nullptr);
   EXPECT_FALSE(provider->model_value());
-  const auto request = Request(aliases.front(), 1U, true);
-  const auto refused = provider->SubmitOutput(request);
-  ASSERT_TRUE(refused.ok());
-  EXPECT_EQ(refused.value().evidence, core::IoOutputEvidence::kNotSubmitted);
+  const auto refused =
+      provider->WriteOutput(aliases.front().row.descriptor.signal_id, true);
+  EXPECT_EQ(refused.outcome, core::ActionOutcome::kFailed);
   EXPECT_FALSE(provider->model_value());
 }
 
 TEST_F(HostIoOutputChannelsTest,
-       CatalogAliasesShareOneModelCorrelationAndDistinctLifecycleGates) {
+       CatalogAliasesShareOneModelAndDistinctLifecycleGates) {
   const auto aliases = Aliases();
   ASSERT_EQ(aliases[0].row.descriptor.output_resource,
             aliases[1].row.descriptor.output_resource);
@@ -175,35 +152,30 @@ TEST_F(HostIoOutputChannelsTest,
       channels.value().front().provider);
   ASSERT_TRUE(provider->Resume(aliases[0].provider, 2U,
                                aliases[0].actual_driver_owner).ok());
-  const auto first = Request(aliases[0], 1U, true);
-  ASSERT_EQ(provider->SubmitOutput(first).value().evidence,
-            core::IoOutputEvidence::kSourceAccepted);
-  const auto second = Request(aliases[1], 2U, false);
-  EXPECT_FALSE(provider->SubmitOutput(second).ok());
+  const auto &first = aliases[0].row.descriptor.signal_id;
+  const auto &second = aliases[1].row.descriptor.signal_id;
+  ASSERT_EQ(provider->WriteOutput(first, true).outcome,
+            core::ActionOutcome::kSucceeded);
+  EXPECT_EQ(provider->WriteOutput(second, false).outcome,
+            core::ActionOutcome::kFailed);
   EXPECT_EQ(provider->model_value(), std::optional<bool>(true));
-  ASSERT_TRUE(provider->RetireOutput(first.identity).ok());
-  EXPECT_EQ(provider->SubmitOutput(second).value().evidence,
-            core::IoOutputEvidence::kNotSubmitted);
-  ASSERT_TRUE(provider->RetireOutput(second.identity).ok());
   ASSERT_TRUE(provider->Resume(aliases[1].provider, 2U,
                                aliases[1].actual_driver_owner).ok());
   ASSERT_TRUE(provider->Pause(aliases[0].provider, 3U,
                               aliases[0].actual_driver_owner).ok());
   EXPECT_FALSE(provider->Resume(aliases[0].provider, 2U,
                                 aliases[0].actual_driver_owner).ok());
-  const auto third = Request(aliases[1], 3U, false);
-  EXPECT_EQ(provider->SubmitOutput(third).value().evidence,
-            core::IoOutputEvidence::kSourceAccepted);
+  EXPECT_EQ(provider->WriteOutput(second, false).outcome,
+            core::ActionOutcome::kSucceeded);
   EXPECT_EQ(provider->model_value(), std::optional<bool>(false));
 }
 
 TEST_F(HostIoOutputChannelsTest,
-       DistinctCatalogChannelsHaveDistinctModelsAndEngines) {
+       DistinctCatalogChannelsHaveDistinctModels) {
   auto channels = CreateHostIoOutputChannels(Aliases(true), {}, clock);
   ASSERT_TRUE(channels.ok());
   ASSERT_EQ(channels.value().size(), 2U);
   EXPECT_NE(channels.value()[0].resource_id, channels.value()[1].resource_id);
-  EXPECT_NE(channels.value()[0].engine.get(), channels.value()[1].engine.get());
   EXPECT_NE(std::get<std::shared_ptr<MockBooleanOutputProvider>>(
                 channels.value()[0].provider)
                 .get(),
@@ -314,14 +286,13 @@ TEST_F(HostIoOutputChannelsTest,
     EXPECT_TRUE(
         std::holds_alternative<std::shared_ptr<RosBooleanOutputProvider>>(
             channels.value().front().provider));
-    EXPECT_NE(channels.value().front().engine, nullptr);
   }
   node.reset();
   context->shutdown("host output channel test complete");
 }
 
 TEST_F(HostIoOutputChannelsTest,
-       TypedCatalogAliasesKeepTheCompleteAddressAndEvidence) {
+       TypedCatalogAliasesKeepTheCompleteAddress) {
   auto context = std::make_shared<rclcpp::Context>();
   context->init(0, nullptr);
   rclcpp::NodeOptions options;
@@ -329,7 +300,7 @@ TEST_F(HostIoOutputChannelsTest,
   options.use_global_arguments(false);
   auto node =
       std::make_shared<rclcpp::Node>("typed_host_output_channel_test", options);
-  for (const auto profile : {"ur_set_io", "ros2_control_gpio"}) {
+  for (const auto profile : {"ros_set_bool", "ros2_control_gpio"}) {
     const auto aliases = Aliases(false, false, profile);
     ASSERT_EQ(aliases[0].row.descriptor.output_resource,
               aliases[1].row.descriptor.output_resource);
@@ -340,27 +311,20 @@ TEST_F(HostIoOutputChannelsTest,
       ASSERT_EQ(channels.value().size(), 1U);
       const auto provider = std::get<std::shared_ptr<RosBooleanOutputProvider>>(
           channels.value().front().provider);
-      EXPECT_EQ(provider->StrongestOutputEvidence(),
-                std::string_view(profile) == "ur_set_io"
-                    ? core::IoOutputEvidence::kSourceAccepted
-                    : core::IoOutputEvidence::kSubmitted);
-      const auto refused =
-          provider->SubmitOutput(Request(aliases[0], 1U, true));
-      ASSERT_TRUE(refused.ok());
-      EXPECT_EQ(refused.value().evidence,
-                core::IoOutputEvidence::kNotSubmitted);
-      EXPECT_NE(channels.value().front().engine, nullptr);
+      EXPECT_EQ(static_cast<bool>(provider->gpio_topic()),
+                std::string_view(profile) == "ros2_control_gpio");
+      EXPECT_EQ(provider->WriteOutput(aliases[0].row.descriptor.signal_id, true, {})
+                    .outcome,
+                core::ActionOutcome::kFailed);
     }
     {
-      // A second UR pin or GPIO interface on the same endpoint is distinct.
+      // A second service or GPIO interface is a distinct channel.
       const auto distinct = Aliases(true, false, profile);
       ASSERT_NE(distinct[0].row.descriptor.output_resource,
                 distinct[1].row.descriptor.output_resource);
       auto channels = CreateHostIoOutputChannels(distinct, node, clock);
       ASSERT_TRUE(channels.ok()) << channels.error().message;
       ASSERT_EQ(channels.value().size(), 2U);
-      EXPECT_NE(channels.value()[0].engine.get(),
-                channels.value()[1].engine.get());
     }
   }
   node.reset();
@@ -376,7 +340,7 @@ TEST_F(HostIoOutputChannelsTest,
   options.use_global_arguments(false);
   auto node = std::make_shared<rclcpp::Node>("typed_host_output_conflict_test",
                                              options);
-  for (const auto profile : {"ur_set_io", "ros2_control_gpio"}) {
+  for (const auto profile : {"ros_set_bool", "ros2_control_gpio"}) {
     auto aliases = Aliases(true, false, profile);
     aliases[1].row.descriptor.output_resource =
         aliases[0].row.descriptor.output_resource;
@@ -392,10 +356,8 @@ TEST_F(HostIoOutputChannelsTest,
     EXPECT_EQ(result.error().details.at("reason"),
               "host_io_output_resource_conflict");
     aliases = Aliases(false, false, profile);
-    if (std::string_view(profile) == "ur_set_io")
-      aliases[0].row.provider.pin = 256U; // Refuse before narrowing to uint8_t.
-    else
-      aliases[0].row.provider.pin = 1U; // GPIO has no pin field.
+    aliases[0].row.provider.adapter_fields["pin"] =
+        core::JsonValueDTO{1.0}; // No generic profile has adapter fields.
     result = CreateHostIoOutputChannels(aliases, node, clock);
     ASSERT_FALSE(result.ok());
     EXPECT_EQ(result.error().details.at("reason"),
@@ -434,8 +396,6 @@ TEST_F(HostIoOutputChannelsTest,
     ASSERT_TRUE(first->gpio_topic());
     EXPECT_EQ(first->gpio_topic(), second->gpio_topic());
     EXPECT_NE(first.get(), second.get());
-    EXPECT_NE(channels.value()[0].engine.get(),
-              channels.value()[1].engine.get());
   }
   node.reset();
   context->shutdown("GPIO whole topic helper complete");
@@ -510,6 +470,31 @@ TEST_F(HostIoOutputChannelsTest,
   foreign.reset();
   foreign_context->shutdown("GPIO foreign topic helper complete");
   context->shutdown("GPIO predecessor topic helper complete");
+}
+
+// UR I/O profiles are gone (specs UR_IO_FACTS.md); a row naming one is refused.
+TEST_F(HostIoOutputChannelsTest, UrSetIoProfileIsRefused) {
+  auto context = std::make_shared<rclcpp::Context>();
+  context->init(0, nullptr);
+  rclcpp::NodeOptions options;
+  options.context(context);
+  options.use_global_arguments(false);
+  auto node = std::make_shared<rclcpp::Node>("ur_profile_refused_test", options);
+  {
+    auto aliases = Single();
+    auto &provider = aliases.front().row.provider;
+    provider.profile = "ur_set_io";
+    provider.channel.reset();
+    provider.adapter_fields["service"] =
+        core::JsonValueDTO{std::string("/io_and_status_controller/set_io")};
+    provider.adapter_fields["pin"] = core::JsonValueDTO{1.0};
+    const auto result = CreateHostIoOutputChannels(aliases, node, clock);
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(result.error().details.at("reason"),
+              "host_io_output_profile_unqualified");
+  }
+  node.reset();
+  context->shutdown("UR profile refusal checked");
 }
 
 TEST_F(HostIoOutputChannelsTest, EmptyOutputCatalogNeedsNoSyntheticProvider) {

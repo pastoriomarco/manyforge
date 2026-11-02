@@ -216,6 +216,11 @@ bool RosBooleanInputProvider::Resume(std::uint64_t generation) {
   }
 }
 
+void RosBooleanInputProvider::SetArrivalRecorder(
+    std::shared_ptr<core::StreamRecorder> arrivals) {
+  state_->sender.SetArrivalRecorder(std::move(arrivals));
+}
+
 void RosBooleanInputProvider::Shutdown() { state_->sender.Shutdown(); }
 
 } // namespace manyforge::roboplan_backend

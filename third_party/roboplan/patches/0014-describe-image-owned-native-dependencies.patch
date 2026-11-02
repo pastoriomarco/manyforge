@@ -1,24 +1,26 @@
 diff --git a/roboplan_core/pyproject.toml b/roboplan_core/pyproject.toml
-index f46bafa..2a2a3ed 100644
+index d0ff419..51ec05a 100644
 --- a/roboplan_core/pyproject.toml
 +++ b/roboplan_core/pyproject.toml
-@@ -19,8 +19,6 @@ authors = [{ name = "Sebastian Castro", email = "sebas.a.castro@gmail.com" }]
+@@ -19,9 +19,7 @@ requires-python = ">=3.10,<3.15"
+ authors = [{ name = "Sebastian Castro", email = "sebas.a.castro@gmail.com" }]
  classifiers = ["License :: OSI Approved :: MIT License"]
  dependencies = [
 -    "cmeel-eigen >=3.4",
      "cmeel-urdfdom[build] >=6",
 -    "cmeel-yaml-cpp >=0.8, <0.9; platform_system != 'Windows'",
      "pin >=4.1.0, <4.2",
-     "roboplan-common ==0.7.0",
+     "roboplan-common ==0.8.0",
  ]
 diff --git a/roboplan_toppra/pyproject.toml b/roboplan_toppra/pyproject.toml
-index e3fd1bc..ec2a8a7 100644
+index 01e365f..c61e69b 100644
 --- a/roboplan_toppra/pyproject.toml
 +++ b/roboplan_toppra/pyproject.toml
-@@ -17,6 +17,5 @@ authors = [{ name = "Sebastian Castro", email = "sebas.a.castro@gmail.com" }]
+@@ -17,7 +17,6 @@ requires-python = ">=3.10,<3.15"
+ authors = [{ name = "Sebastian Castro", email = "sebas.a.castro@gmail.com" }]
  classifiers = ["License :: OSI Approved :: MIT License"]
  dependencies = [
 -    "cmeel-toppra ==0.6.8",
-     "roboplan-common ==0.7.0",
-     "roboplan-core ==0.7.0",
+     "roboplan-common ==0.8.0",
+     "roboplan-core ==0.8.0",
  ]

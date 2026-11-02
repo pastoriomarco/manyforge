@@ -1,7 +1,6 @@
 #pragma once
 
-#include "lite6_controllable_retention_fixture.hpp"
-#include "content_identity_internal.hpp"
+#include "gripper_only_retention_fixture.hpp"
 
 #include <filesystem>
 #include <map>
@@ -9,8 +8,6 @@
 #include <string>
 #include <string_view>
 #include <utility>
-#include <variant>
-#include <vector>
 
 #ifndef MANYFORGE_ROBOTIQ_GRIPPER_ONLY_STRUCTURAL_FIXTURE_ROOT
 #error "MANYFORGE_ROBOTIQ_GRIPPER_ONLY_STRUCTURAL_FIXTURE_ROOT is required"
@@ -29,119 +26,15 @@ namespace manyforge::deployment::test {
 
 [[nodiscard]] inline Lite6StructuralRetentionFixture
 make_robotiq_gripper_only_structural_retention_fixture() {
-  const std::filesystem::path prepared_root{
-      MANYFORGE_ROBOTIQ_GRIPPER_ONLY_STRUCTURAL_FIXTURE_ROOT};
+  // The independently authored standalone asset selects only the qualified
+  // Robotiq subtree.
   const std::filesystem::path source_root{
       MANYFORGE_ROBOTIQ_GRIPPER_ONLY_STRUCTURAL_SOURCE_ROOT};
-  const std::filesystem::path resource_root{
-      MANYFORGE_ROBOTIQ_GRIPPER_ONLY_STRUCTURAL_RESOURCE_ROOT};
-  const auto* schema = build_qualified_closed_schema_registry()
-                           .find_catalog_schema_family(
-                               core::CatalogRecordKind::kModelAsset);
-  if (schema == nullptr ||
-      schema->qualification() != CatalogSchemaQualification::kQualified ||
-      schema->compiled_schema() == nullptr) {
-    throw std::logic_error(
-        "Robotiq standalone fixture requires the build-qualified model-asset schema");
-  }
-  const auto maintained = validate_and_normalize_unqualified_artifact_candidate(
-      *schema->compiled_schema(),
-      parse_strict_json_model_yaml(read_lite6_fixture_file(
-          MANYFORGE_ROBOTIQ_GRIPPER_ONLY_STRUCTURAL_CATALOG_PATH)));
-  const auto& maintained_root = maintained.normalized_root();
-  if (std::get<std::string>(
-          maintained_root.find_object_member("model_asset_id")->storage()) !=
-      "robotiq_2f_85") {
-    throw std::logic_error("Robotiq standalone fixture requires the genuine robotiq_2f_85 asset");
-  }
-  const auto* expanded = maintained_root.find_object_member("expanded_source");
-  const auto* declared = expanded->find_object_member("artifacts");
-  std::vector<Lite6InputArtifact> artifacts;
-  CanonicalValue::Array artifact_rows;
-  constexpr std::string_view prefix = "asset://robotiq_2f_85/";
-  for (const auto& row : declared->as_array()) {
-    const auto& uri =
-        std::get<std::string>(row.find_object_member("logical_uri")->storage());
-    const auto& media_type =
-        std::get<std::string>(row.find_object_member("media_type")->storage());
-    if (!uri.starts_with(prefix)) {
-      throw std::logic_error("Robotiq standalone fixture artifact has a foreign model identity");
-    }
-    const std::string relative = uri.substr(prefix.size());
-    const auto path = (relative == "model.urdf" || relative == "model.srdf")
-                          ? prepared_root / relative
-                          : resource_root / relative;
-    std::string bytes = read_lite6_fixture_file(path);
-    const std::string digest = sha256_digest(bytes);
-    artifact_rows.emplace_back(CanonicalValue::Object{
-        {"logical_uri", CanonicalValue(uri)},
-        {"media_type", CanonicalValue(media_type)},
-        {"byte_size", CanonicalValue(static_cast<double>(bytes.size()))},
-        {"content_digest", CanonicalValue(digest)},
-    });
-    artifacts.push_back({
-        uri, media_type,
-        core::ContentAddressedStoreKey(
-            "sha256/" + digest.substr(std::string_view("sha256:").size())),
-        core::ContentDigest(digest), std::move(bytes),
-    });
-  }
-
-  // The independently authored standalone asset selects only the qualified
-  // Robotiq subtree. Build preparation changes bytes, never its role identities.
-  auto expanded_members = expanded->as_object();
-  for (auto& [name, value] : expanded_members) {
-    if (name == "artifacts") {
-      value = CanonicalValue(std::move(artifact_rows));
-    }
-  }
-  auto root_members = maintained_root.as_object();
-  for (auto& [name, value] : root_members) {
-    if (name == "expanded_source") {
-      value = CanonicalValue(std::move(expanded_members));
-    }
-  }
-  const auto normalized = validate_and_normalize_unqualified_artifact_candidate(
-      *schema->compiled_schema(),
-      parse_strict_json_model_yaml(
-          canonical_json(CanonicalValue(std::move(root_members)))));
-  const std::string revision = detail::compute_content_identity(
-      normalized.normalized_root(),
-      {detail::catalog_record_identity_domain("model_asset"),
-       std::string(core::kModelAssetApiVersion), "model_revision"});
-  auto catalog_members = normalized.normalized_root().as_object();
-  for (auto& [name, value] : catalog_members) {
-    if (name == "model_revision") {
-      value = CanonicalValue(revision);
-    }
-  }
-  const std::string catalog_bytes =
-      canonical_json(CanonicalValue(std::move(catalog_members)));
-  const core::ContentAddressedStoreKey catalog_key(
-      "catalog/model-assets/robotiq_2f_85/" +
-      revision.substr(std::string_view("sha256:").size()));
-  const core::ModelAssetCatalogRecordRefDTO reference{
-      core::ModelAssetId("robotiq_2f_85"), core::ModelRevision(revision),
-      core::SchemaId(std::string(core::kModelAssetApiVersion)),
-      schema->compiled_schema()->schema_revision(),
-      core::ContentDigest(sha256_digest(catalog_bytes)), catalog_key,
-  };
-  const auto qualified = resolve_and_qualify_model_asset(
-      reference, catalog_key, catalog_bytes);
-  std::vector<ResolvedModelSourceArtifactCandidate> candidates;
-  candidates.reserve(artifacts.size());
-  for (const auto& artifact : artifacts) {
-    candidates.push_back(
-        {artifact.logical_uri, artifact.store_key, artifact.bytes});
-  }
-  auto verified = verify_model_source_closure(qualified, std::move(candidates));
-  auto preparation = verify_build_qualified_structural_model_preparation(
-      read_lite6_fixture_file(prepared_root / "preparation-manifest.json"),
-      read_lite6_fixture_file(source_root / "robotiq_2f_85.urdf"),
-      read_lite6_fixture_file(source_root / "robotiq_2f_85.srdf"),
-      verified);
-  return {reference, catalog_bytes, std::move(verified), std::move(artifacts),
-          std::move(preparation)};
+  return make_prepared_gripper_structural_retention_fixture(
+      "robotiq_2f_85", MANYFORGE_ROBOTIQ_GRIPPER_ONLY_STRUCTURAL_CATALOG_PATH,
+      MANYFORGE_ROBOTIQ_GRIPPER_ONLY_STRUCTURAL_FIXTURE_ROOT,
+      source_root / "robotiq_2f_85.urdf", source_root / "robotiq_2f_85.srdf",
+      MANYFORGE_ROBOTIQ_GRIPPER_ONLY_STRUCTURAL_RESOURCE_ROOT);
 }
 
 inline constexpr std::string_view kRobotiqGripperOnlyComponentId = "robotiq_gripper";
@@ -193,7 +86,6 @@ inline void map_robotiq_gripper_only_graph(CanonicalValue::Object &members) {
       {"lite6_gripper_provider_instance", "robotiq_gripper_provider_instance"},
       {"lite6_gripper_commanded_state", "robotiq_gripper_commanded_state"},
       {"lite6_gripper_joint", std::string(kRobotiqGripperOnlyResourceId)},
-      {"lite6_lite_gripper", "ur5e_robotiq_2f_85"},
   };
   const auto map = [&](auto &self, CanonicalValue &value) -> void {
     if (value.is_string()) {
@@ -220,6 +112,28 @@ inline void map_robotiq_gripper_only_graph(CanonicalValue::Object &members) {
       if (field != "configuration") continue;
       auto configuration = selected.as_object();
       for (auto &[key, setting] : configuration) {
+        if (key == "controller_profiles") {
+          // The tool's own model and its `lanes.mock` row, as the compiler
+          // emits them for the Robotiq 2F-85 (models/robotiq_2f_85).
+          auto profiles = setting.as_array();
+          for (auto &row : profiles) {
+            auto fields = row.as_object();
+            for (auto &[field, entry] : fields) {
+              if (field == "model_family_id") entry = CanonicalValue("robotiq_2f_85");
+              if (field == "gripper_joint_name")
+                entry = CanonicalValue("robotiq_85_left_knuckle_joint");
+              if (field == "lane_row")
+                entry = CanonicalValue(
+                    R"({"adapter":"mock","controller":"robotiq_gripper_controller",)"
+                    R"("controllers_file":"mock_controllers.yaml","gripper_result_timeout_s":15,)"
+                    R"("gripper_stop_finish_tolerance":0.04,)"
+                    R"("hard_stop_completion_timeout_s":0.5})");
+            }
+            row = CanonicalValue(std::move(fields));
+          }
+          setting = CanonicalValue(std::move(profiles));
+          continue;
+        }
         if (key != "gripper_target_configurations") continue;
         // gripper_tcp is the real base frame used as an authored fixture
         // reference. It is not a calibrated jaw TCP or tool mounting claim.
@@ -261,12 +175,11 @@ inline void map_robotiq_gripper_only_graph(CanonicalValue::Object &members) {
 make_robotiq_gripper_only_retention_fixture(std::string_view lifecycle_semantic_digest) {
   const auto structural = make_robotiq_gripper_only_structural_retention_fixture();
   return make_lite6_controllable_retention_fixture(
-      false, false, 1U, true, true, "i6_robotiq_gripper_only_cell", false, true,
-      "resource", true, lifecycle_semantic_digest, lifecycle_semantic_digest,
-      true, true, true, std::nullopt, false, kLite6ArmTargetId,
+      false, false, 1U, "i6_robotiq_gripper_only_cell", false, true,
+      "resource", true, lifecycle_semantic_digest, lifecycle_semantic_digest, true, true, std::nullopt, kLite6ArmTargetId,
       std::nullopt, std::nullopt, {}, true, {},
       "manyforge.provider.ros2_control", true, true, &structural,
-      map_robotiq_gripper_only_graph, false, false, "position_commanded", 1.0,
+      map_robotiq_gripper_only_graph, false, "position_commanded", 1.0,
       "commanded", map_robotiq_gripper_only_component);
 }
 

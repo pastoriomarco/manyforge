@@ -183,15 +183,6 @@ def _effect_observations(folder: Path) -> tuple[str, list[str], list[str]]:
             "SELECT 1 FROM cell_admission_claims WHERE release_owner_role IS NULL AND reconciled_sequence IS NULL LIMIT 1",
             "SELECT 1 FROM stop_projections WHERE terminal_sequence IS NULL OR (surveillance_sequence IS NOT NULL AND clear_sequence IS NULL) LIMIT 1",
         ], []),
-        ("cclc", "execution-state/cclc-journal.sqlite3", 0x4D464C4A, [
-            "SELECT 1 FROM lifecycle_transactions WHERE terminal != 1 LIMIT 1",
-            "SELECT 1 FROM route_selection_transactions WHERE terminal != 1 LIMIT 1",
-            "SELECT 1 FROM cclc_effect_attempts WHERE completed_attempt_blob IS NULL LIMIT 1",
-            "SELECT 1 FROM cclc_route_effect_attempts WHERE completed_attempt_blob IS NULL LIMIT 1",
-            "SELECT 1 FROM cclc_lifecycle_cell_claims WHERE release_receipt_recorded != 1 LIMIT 1",
-            "SELECT 1 FROM cclc_native_apply_reservations LIMIT 1",
-            "SELECT 1 FROM cclc_component_incidents WHERE acknowledged IS NULL OR acknowledged != 1 LIMIT 1",
-        ], ["lifecycle_transactions", "route_selection_transactions", "cclc_effect_attempts", "cclc_route_effect_attempts"]),
         ("manager", "manager/manager-bootstrap-journal.sqlite3", 1296450122, [
             "SELECT 1 FROM manager_bootstrap_intents i LEFT JOIN manager_bootstrap_accepted_targets t USING(bootstrap_id,bootstrap_generation) WHERE t.bootstrap_id IS NULL LIMIT 1",
         ], ["manager_bootstrap_intents"]),
@@ -272,7 +263,7 @@ def _report(root: Path, identity: str, marker: dict | None) -> dict:
     source = _safe_path(root / "previous-sessions" / identity, root)
     if not source.exists():
         source = root / "current"
-    effects, unknown, unresolved = _effect_observations(source) if marker is not None else ("unknown", ["program_cycle", "scene", "manager", "cclc", "kernel_operation"], [])
+    effects, unknown, unresolved = _effect_observations(source) if marker is not None else ("unknown", ["program_cycle", "scene", "manager", "kernel_operation"], [])
     message = (f"Previous workbench session {identity}: effects are {effects}"
                + ("; shutdown was unclean or could not be verified." if shutdown != "clean" else "; owned processes stopped normally.")
                + " The new cell is empty; no previous state was adopted or replayed."
@@ -287,7 +278,7 @@ def _report(root: Path, identity: str, marker: dict | None) -> dict:
         "shutdown": shutdown,
         "effects": effects,
         "history_coverage": "not_imported",
-        "journal_families": ["program_cycle", "scene", "manager", "cclc", "kernel_operation"],
+        "journal_families": ["program_cycle", "scene", "manager", "kernel_operation"],
         "message": (message + " Up to five previous sessions are normally kept; "
                     "copy any journals you want to retain."),
     }

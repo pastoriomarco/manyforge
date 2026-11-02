@@ -153,12 +153,12 @@ public:
   [[nodiscard]] std::shared_ptr<RetainedPlannerSceneProjection>
   FindActiveProjection(
       const core::ProjectionRevisionDTO &expected,
-      const core::ProjectionNativeRuntimeBindingDTO &binding) const;
+      const core::ProjectionExecutionHostBindingDTO &binding) const;
 
   [[nodiscard]] std::optional<core::ProjectionRevisionDTO>
   FindCurrentProjectionRevision(
       const core::ProjectionRevisionDTO &expected,
-      const core::ProjectionNativeRuntimeBindingDTO &binding) const;
+      const core::ProjectionExecutionHostBindingDTO &binding) const;
 
   [[nodiscard]] bool
   AllRequiredProjectionsHealthy(const deployment::RetainedBundle &bundle,

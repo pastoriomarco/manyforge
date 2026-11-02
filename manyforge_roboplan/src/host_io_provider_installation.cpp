@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <manyforge_deployment/runtime_program_binding.hpp>
+#include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <set>
 #include <stdexcept>
 #include <type_traits>
@@ -176,8 +177,7 @@ existing_channels(std::span<const CompositionIoResourcePredecessor> roots) {
         root.bundle->value().cell_graph);
     require(catalog.ok(), "owned output catalog is invalid");
     for (const auto &entry : root.channels) {
-      require(entry && entry->engine,
-              "owned output channel has no actual engine");
+      require(entry != nullptr, "owned output channel is absent");
       const auto actual = std::visit(
           [](const auto &p) { return p->ReadAliasState(); }, entry->provider);
       if (actual.active_publication_generation != root.publication_generation)
@@ -226,7 +226,7 @@ existing_channels(std::span<const CompositionIoResourcePredecessor> roots) {
       const auto [found, inserted] =
           result.emplace(entry->resource_id, ExistingChannel{entry, actual, gpio_topic});
       require(inserted || found->second.entry == entry,
-              "one output resource has multiple actual channel engines");
+              "one output resource has multiple actual channels");
     }
   }
   for (const auto &root : roots)
@@ -271,7 +271,7 @@ CaptureCompositionIoResourcePredecessors(
 }
 
 core::Result<void> PrepareCompositionIoProviderResources(
-    Composition &candidate, RetainedNativeCellRuntime &cell,
+    Composition &candidate, RetainedCellRuntime &cell,
     rclcpp::Node::SharedPtr generic_node,
     std::span<const CompositionIoResourcePredecessor> actual_existing) {
   using Reply = core::Result<void>;
@@ -290,6 +290,18 @@ core::Result<void> PrepareCompositionIoProviderResources(
         candidate.bundle->value().cell_graph);
     if (!catalog.ok())
       return Reply::Err(catalog.error());
+    const auto devices = deployment::ResolveRetainedIoProviderDevices(
+        candidate.bundle->value().cell_graph);
+    if (!devices.ok())
+      return Reply::Err(devices.error());
+    // The authored answer bound of each device's acknowledged outputs.
+    const auto ack_timeout_ns = [&](const deployment::RetainedIoSignalConfiguration &row) {
+      for (const auto &device : devices.value())
+        if (device.runtime_unit_id == row.runtime_unit_id &&
+            device.controllable_component_id == row.descriptor.signal_id.controllable_component_id)
+          return device.output_source_ack_timeout_ns.value_or(0);
+      return core::Duration{0};
+    };
     const auto key_capacity = CompiledProgramBlackboardKeyCapacity(candidate);
     if (!key_capacity.ok())
       return Reply::Err(key_capacity.error());
@@ -302,9 +314,16 @@ core::Result<void> PrepareCompositionIoProviderResources(
     // Compiled system signals have no I/O driver or lifecycle: the runtime
     // owns their one in-process source.
     std::vector<deployment::RetainedIoSignalConfiguration> system_rows;
+    // A machine's I/O member signals on the real lane (CONTRACTS §16): no
+    // I/O driver either; their family's I/O update sink feeds them.
+    std::vector<deployment::RetainedIoSignalConfiguration> adapter_rows;
     for (const auto &row : catalog.value()) {
       if (row.provider.profile == deployment::kSystemCarriedObjectProfile) {
         system_rows.push_back(row);
+        continue;
+      }
+      if (row.provider.profile == deployment::kComponentAdapterIoProfile) {
+        adapter_rows.push_back(row);
         continue;
       }
       const auto driver = driver_for(candidate, row);
@@ -344,7 +363,10 @@ core::Result<void> PrepareCompositionIoProviderResources(
         aliases[*row.descriptor.output_resource].push_back(
             {row, driver->occurrence(),
              driver->driver_observation_generation_locked(), driver,
-             candidate.publication_generation});
+             candidate.publication_generation, ack_timeout_ns(row)});
+        // A Mock output reports its written value back (CONTRACTS §7, D2).
+        if (row.provider.profile == "mock_output")
+          adapter_rows.push_back(row);
       }
     }
     // These labels come from the same sealed catalog/actual alias proof above.
@@ -377,18 +399,28 @@ core::Result<void> PrepareCompositionIoProviderResources(
           id, std::make_shared<HostIoOutputChannelEntry>(std::move(entry)));
     }
     auto runtime =
-        sources.empty() && system_rows.empty() && key_capacity.value() == 0U
+        sources.empty() && system_rows.empty() && adapter_rows.empty() &&
+                key_capacity.value() == 0U
             ? std::shared_ptr<HostIoSignalRuntime>{}
             : HostIoSignalRuntime::Create(
                   cell.addressed_kernel().request_owner_epoch(),
                   candidate.publication_generation.value(), std::move(sources),
                   cell.clock(), cell.scheduler(), key_capacity.value(),
-                  std::move(system_rows));
+                  std::move(system_rows), std::move(adapter_rows));
     for (const auto &[resource, rows] : aliases) {
       static_cast<void>(rows);
       const auto old = existing.find(resource);
       if (old != existing.end())
         channels.emplace(resource, old->second.entry);
+    }
+    for (const auto &row : catalog.value()) {
+      if (row.provider.profile != "mock_output" ||
+          row.descriptor.direction != core::IoSignalDirection::kOutput)
+        continue;
+      const auto *provider = std::get_if<std::shared_ptr<MockBooleanOutputProvider>>(
+          &channels.at(*row.descriptor.output_resource)->provider);
+      require(runtime && provider && *provider, "Mock output channel is not synthetic");
+      runtime->AddMockOutput(*provider, row.descriptor.signal_id);
     }
     for (const auto &row : catalog.value()) {
       if (!row.provider.echo_output_signal_name)
@@ -440,11 +472,9 @@ core::Result<void> PrepareCompositionIoProviderResources(
               const auto &profile = row.row.provider.profile;
               // The sealed canonical resource includes the complete profile
               // and typed address. Matching that same actual channel above
-              // preserves its immutable SetBool/UR/GPIO selector tuple.
+              // preserves its immutable SetBool/GPIO selector tuple.
               require(mock ? profile == "mock_output"
                            : (profile == "ros_set_bool" ||
-                              profile == "ur_set_io" ||
-                              profile == "xarm_digital" ||
                               profile == "ros2_control_gpio"),
                       "retained output channel changed its immutable profile");
               installed.push_back({row.row.descriptor.signal_id, row.provider,
@@ -477,6 +507,9 @@ core::Result<void> PrepareCompositionIoProviderResources(
       if (root.runtime && root.runtime != runtime &&
           retired.insert(root.runtime.get()).second)
         root.runtime->Shutdown();
+    // IO-1: the Deployment rows of the devices' optional `inputs` streams.
+    const auto stream_rows =
+        deployment::ComponentStreamParameterOverrides(*candidate.bundle);
     for (const auto &[id, driver] : drivers) {
       std::vector<IoProviderInputSourceInstallation> inputs;
       if (runtime) {
@@ -535,6 +568,15 @@ core::Result<void> PrepareCompositionIoProviderResources(
                     std::move(lifecycle), std::move(acquisition));
       if (!prepared.ok())
         return Reply::Err(prepared.error());
+      std::optional<std::int64_t> inputs_budget_ns;
+      for (const auto &row : stream_rows)
+        if (row.controllable_component_id ==
+                driver->domain().provider()->provider.controllable_component_id &&
+            row.stream_id == kIoDeviceInputsStreamId)
+          inputs_budget_ns = row.budget_ns;
+      const auto stream = driver->SetInputsStreamLocked(inputs_budget_ns);
+      if (!stream.ok())
+        return Reply::Err(stream.error());
     }
     for (const auto &root : actual_existing)
       if (root.runtime && !root.runtime->driver_input_installations().empty()) {
@@ -549,141 +591,4 @@ core::Result<void> PrepareCompositionIoProviderResources(
   }
 }
 
-core::Result<void> BindCompositionIoOutputParticipants(
-    Composition &candidate,
-    const IoProviderConstructionGenerations &actual_generations) {
-  using Reply = core::Result<void>;
-  try {
-    const auto catalog = deployment::ResolveRetainedIoSignalCatalog(
-        candidate.bundle->value().cell_graph);
-    if (!catalog.ok())
-      return Reply::Err(catalog.error());
-    const auto owners = views(candidate);
-    for (auto *owner : owners)
-      owner->io_output_registrations.clear();
-    std::vector<std::shared_ptr<const deployment::ProgramBinding>> bindings =
-        candidate.direct_control_io_program_bindings;
-    if (candidate.program_binding)
-      bindings.push_back(candidate.program_binding);
-    std::set<core::ProgramBindingId> seen;
-    std::vector<core::ProgramBindingId> intrinsic;
-    for (const auto &binding : candidate.direct_control_io_program_bindings)
-      intrinsic.push_back(binding->program_binding_id());
-    for (const auto &binding : bindings) {
-      if (!seen.insert(binding->program_binding_id()).second)
-        continue;
-      for (const auto &target : binding->value().target_role_bindings) {
-        if (std::none_of(target.capability_bindings.begin(),
-                         target.capability_bindings.end(), [](const auto &cap) {
-                           return cap.capability_id.value() ==
-                                  "io.gpio.set_output";
-                         }))
-          continue;
-        require(candidate.target_resolver != nullptr,
-                "output has no sealed target resolver");
-        auto sealed_target = candidate.target_resolver->ResolveBoundTarget(
-            *binding, target.target_role_id,
-            core::CapabilityId("io.gpio.set_output"));
-        if (!sealed_target.ok())
-          return Reply::Err(sealed_target.error());
-        for (const auto &role : target.signal_role_bindings) {
-          if (role.direction != core::IoSignalDirection::kOutput)
-            continue;
-          const auto row = std::find_if(
-              catalog.value().begin(), catalog.value().end(),
-              [&](const auto &value) {
-                return value.descriptor.signal_id.controllable_component_id ==
-                           target.controllable_component_id &&
-                       value.command_target_id == target.command_target_id &&
-                       value.resource_role_id == role.resource_role_id &&
-                       value.descriptor.signal_id.name == role.signal_name;
-              });
-          require(row != catalog.value().end() &&
-                      row->descriptor.output_resource,
-                  "output role has no exact sealed signal/resource");
-          const auto driver = driver_for(candidate, *row);
-          const auto generation =
-              actual_generations.find(target.controllable_component_id);
-          require(generation != actual_generations.end() &&
-                      generation->second.nonzero(),
-                  "output binding has no actual CCLC construction generation");
-          core::RuntimeProviderDomainConfigurationReadbackDTO closed{
-              candidate.bundle->retained_bundle_id(),
-              candidate.bundle->value().cell_graph.graph_revision,
-              generation->second,
-              driver->domain(),
-              driver->occurrence(),
-              false,
-              0U,
-              0U};
-          auto verified = core::verify_runtime_participant_binding(
-              deployment::build_runtime_io_output_binding_dto(
-                  sealed_target.value(), role.resource_role_id,
-                  *candidate.bundle, closed));
-          if (!verified.ok())
-            return Reply::Err(verified.error());
-          const auto channel = std::find_if(
-              candidate.io_output_channels.begin(),
-              candidate.io_output_channels.end(), [&](const auto &entry) {
-                return entry->resource_id == *row->descriptor.output_resource;
-              });
-          require(channel != candidate.io_output_channels.end() &&
-                      (*channel)->engine,
-                  "output has no actual canonical channel engine");
-          const auto owner =
-              std::find_if(owners.begin(), owners.end(), [&](const auto *view) {
-                return view->controllable_component_id ==
-                       target.controllable_component_id;
-              });
-          require(owner != owners.end(), "output has no actual component view");
-          (*owner)->io_output_registrations.push_back(
-              {.binding = std::move(verified.value()),
-               .stop_readiness = {},
-               .retained_default_stop_limits = {},
-               .stop_node_category =
-                   core::MotionInterruptNodeCategory::kGeneric,
-               .engine = (*channel)->engine.get(),
-               .stop_execution_port = nullptr,
-               .participant_policy = {},
-               .prepared_motion_engine = (*channel)->engine.get(),
-               .default_operator_stop_profile = {},
-               .default_fault_stop_profile = {},
-               .deployment_maximum_tcp_linear_speed_mps = {},
-               .intrinsic_direct_control =
-                   std::find(intrinsic.begin(), intrinsic.end(),
-                             binding->program_binding_id()) != intrinsic.end(),
-               .direct_control_joint_limits = {}});
-        }
-      }
-    }
-    std::vector<core::RuntimeParticipantBinding> composed;
-    for (const auto *owner : owners)
-      for (const auto &registration : owner->component_registrations())
-        composed.push_back(registration.binding);
-    if (candidate.target_resolver) {
-      // Input-only direct bindings have no execution rows and are not grants.
-      std::erase_if(intrinsic, [&](const auto &id) {
-        return std::none_of(composed.begin(), composed.end(),
-                            [&](const auto &value) {
-                              return value.value().program_binding_id == id;
-                            });
-      });
-      candidate.target_resolver =
-          candidate.target_resolver->WithComposedParticipants(composed,
-                                                              intrinsic);
-      candidate.candidate_participant_resolver_factory =
-          [resolver = candidate.target_resolver](auto current) {
-            auto product =
-                resolver->WithComposedParticipants(std::move(current));
-            return RetainedRuntimeParticipantResolver{
-                [product](const auto &operation, auto index) {
-                  return product->ResolveExecutionParticipant(operation, index);
-                }};
-          };
-    }
-    return Reply::Ok();
-  } catch (const std::exception &error) {
-    return Reply::Err(failure(error));
-  }
-}
 } // namespace manyforge::roboplan_backend::host_detail

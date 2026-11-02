@@ -70,7 +70,7 @@ BuildVerifiedRuntimeConvergencePlan(
 /// Effect-free continuity admission for retained native and ROS execution hosts.
 /// Generic runtime units are intentionally outside this stable-host rule.
 [[nodiscard]] manyforge::core::Result<void>
-VerifyNativeExecutionHostContinuity(
+VerifyExecutionHostContinuity(
     const manyforge::deployment::RetainedBundle &predecessor,
     const manyforge::deployment::RetainedBundle &candidate,
     const manyforge::deployment::IVerifiedRetainedProductArtifactSource

@@ -44,8 +44,8 @@ Result<void> ResourceAddressedExecutionKernel::begin_motion_takeover_fallback(
   // Genuine faults retain their ordinary containment route; no successor may
   // activate while admission is closed. The same Stop owner still stops the
   // logically preempted incumbent.
-  const bool spring = !motion_admission_closed_ &&
-                      !is_active_stop_fault_latch(active_stop_fault_latch_) &&
+  const bool spring = !motion_admission_closed_locked() &&
+                      !cell_latched_locked() &&
                       sealed_spring_return_allowed(participant);
   const MotionTakeoverStopSelection selection{incumbent_id, candidate_id, spring};
   const auto material = config_.request_owner_epoch.value() + "\nmotion-takeover-fallback\n" +
@@ -70,7 +70,8 @@ Result<void> ResourceAddressedExecutionKernel::begin_motion_takeover_fallback(
       decided_at_ns,
       std::max<std::int64_t>(0, decided_at_ns - candidate.accepted.accepted_at_ns),
       candidate.participants.front().takeover_preparation_budget_ns.value_or(0),
-      std::nullopt};
+      std::nullopt,
+      candidate.participants.front().takeover_planning_budget_ns.value_or(0)};
   stamp_operation_capture_locked(candidate, candidate.state);
   bool fallback_accepted = false;
   const ScopeExit restore_unaccepted_decision([&] {
@@ -81,7 +82,7 @@ Result<void> ResourceAddressedExecutionKernel::begin_motion_takeover_fallback(
   });
   const auto stopped =
       accept_stop_locked(EmergencyStopProjectedIntentDTO{std::move(intent)}, handoff, decided_at_ns,
-                         nullptr, nullptr, std::nullopt, &selection);
+                         nullptr, nullptr, &selection);
   if (!stopped.ok()) return Result<void>::Err(stopped.error());
   fallback_accepted = true;
   candidate.motion_takeover_spring_fallback.emplace(
@@ -130,8 +131,8 @@ Result<void> ResourceAddressedExecutionKernel::advance_motion_takeover_fallback(
                                       source->settled_stop->certificate->stop_certificate_id)
         certificate = *fallback.certificate;
     }
-    if (certificate && (!fallback.stage || !fallback.return_point || motion_admission_closed_ ||
-                        is_active_stop_fault_latch(active_stop_fault_latch_)))
+    if (certificate && (!fallback.stage || !fallback.return_point ||
+                        motion_admission_closed_locked() || cell_latched_locked()))
       refusal = fallback.smooth_failure;
     if (engine == nullptr || !participant.takeover_preparation ||
         !participant.takeover_preparation_budget_ns)
@@ -201,7 +202,6 @@ Result<void> ResourceAddressedExecutionKernel::advance_motion_takeover_fallback(
         auto* source = find_active_operation_locked(incumbent_id);
         if (!source || source->pending_motion_takeover.empty() ||
             source->pending_motion_takeover.key() != candidate_id) {
-          motion_admission_closed_ = true;
           return reject<void>("Borrowed spring retirement lost its owner",
                               "motion_takeover_preparation_owner_lost",
                               ErrorCode::kInvariantViolation);
@@ -297,7 +297,6 @@ Result<void> ResourceAddressedExecutionKernel::advance_motion_takeover_fallback(
       if (!source || source->pending_motion_takeover.empty() ||
           source->pending_motion_takeover.key() != candidate_id) {
         // The parent advancement borrow must retain this owner until return.
-        motion_admission_closed_ = true;
         return reject<void>("Borrowed takeover preparation lost its owner",
                             "motion_takeover_preparation_owner_lost",
                             ErrorCode::kInvariantViolation);

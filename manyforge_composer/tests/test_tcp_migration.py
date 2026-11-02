@@ -103,9 +103,7 @@ def test_scenario_load_refuses_ambiguous_tcp_without_changing_draft_or_source(tm
     state.authoring_admission = _PassThroughAdmission()
     client = _scenario_client(state)
     before = state.authoring_workspace.snapshot().as_dict()
-    response = client.post("/api/scenario-documents/load", json={
-        **_fence(state), "path": str(source), "confirmDiscard": False,
-    })
+    response = client.post("/api/scenario/load", json={"path": str(source)})
     _assert_ambiguity(response)
     assert state.authoring_workspace.snapshot().as_dict() == before
     assert {path.relative_to(source): path.read_bytes()

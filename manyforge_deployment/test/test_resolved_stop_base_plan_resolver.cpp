@@ -5,22 +5,19 @@
 #include <array>
 #include <atomic>
 #include <filesystem>
-#include <manyforge_core/controller_lifecycle_evaluator.hpp>
 #include <manyforge_core/resolved_stop_base_plan_codec.hpp>
 #include <manyforge_deployment/resolved_stop_base_plan_resolver.hpp>
 #include <manyforge_deployment/cell_applicability.hpp>
-#include <manyforge_deployment/route_configuration_publication.hpp>
 #include <set>
-#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <tuple>
 #include <unistd.h>
 #include <vector>
 
 #include "build_manifest_internal.hpp"
 #include "content_identity_internal.hpp"
+#include "gripper_only_retention_fixture.hpp"
 #include "lite6_retained_consumer_fixture.hpp"
 #include "verified_retained_bundle_internal.hpp"
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
@@ -287,152 +284,6 @@ make_runtime_context(const RetainedBundle &retained_bundle,
           source_runtime_unit_id, source_runtime_epoch};
 }
 
-[[nodiscard]] core::RouteSelectionAcceptedDTO make_route_acceptance(
-    const RuntimeContext &runtime,
-    const VerifiedControllerLifecycleExpectedDomain &expected) {
-  const auto &binding = runtime.binding.value();
-  std::vector<core::RouteSelectionComponentExpectationDTO> components{
-      {binding.controllable_component_id,
-       core::ComponentLifecycleGeneration(11U),
-       core::ComponentLifecycleStateDTO::kActive}};
-  std::vector<core::ConfigurationFenceBindingScopeDTO> scoped_bindings;
-  scoped_bindings.reserve(runtime.desired_configuration.binding_routes.size());
-  for (const auto &route : runtime.desired_configuration.binding_routes) {
-    scoped_bindings.push_back({route.control_binding_id,
-                               route.control_binding_revision,
-                               route.control_binding_revision});
-  }
-  std::vector<core::ResourceId> resources;
-  resources.reserve(binding.resources.size());
-  for (const auto &resource : binding.resources) {
-    resources.push_back(resource.resource_id);
-  }
-  std::sort(resources.begin(), resources.end());
-  core::ConfigurationFenceScopeDTO scope{
-      {binding.controllable_component_id},
-      {{runtime.desired_configuration.control_domain_id,
-        runtime.desired_configuration.control_domain_revision,
-        runtime.desired_configuration.control_domain_revision}},
-      std::move(scoped_bindings),
-      std::move(resources)};
-  core::RouteSelectionAcceptedDTO result{
-      core::RequestId("request.route.publication"),
-      core::RequestReplayStatusDTO::kAcceptedNew,
-      core::RouteSelectionTransactionId("route.transaction.publication"),
-      core::RouteSelectionTransactionGeneration(1U),
-      binding.retained_bundle_id,
-      binding.graph_revision,
-      runtime.desired_configuration,
-      std::move(components),
-      runtime.active_configuration,
-      std::move(scope),
-      core::MakeControllerLifecycleObservationQuery(expected.value()),
-      core::ActiveControlConfigurationId("active.route.publication"),
-      core::ActiveControlConfigurationGeneration(5U),
-      50,
-      1'000'000'000};
-  if (!result.locally_valid()) {
-    throw std::logic_error("test route acceptance is invalid");
-  }
-  return result;
-}
-
-[[nodiscard]] core::ActiveControlConfigurationDTO
-make_route_configuration(const RuntimeContext &runtime) {
-  auto result = runtime.active_configuration;
-  result.active_control_configuration_id =
-      core::ActiveControlConfigurationId("active.route.publication");
-  result.active_control_configuration_generation =
-      core::ActiveControlConfigurationGeneration(5U);
-  if (!result.locally_valid()) {
-    throw std::logic_error("test route configuration is invalid");
-  }
-  return result;
-}
-
-[[nodiscard]] core::ControllerLifecycleObservationDTO
-make_desired_controller_observation(
-    const VerifiedControllerLifecycleExpectedDomain &expected) {
-  std::vector<core::ActiveControlConfigurationBindingRouteDTO> routes;
-  routes.reserve(expected.value().desired_configuration.binding_routes.size());
-  for (const auto &route :
-       expected.value().desired_configuration.binding_routes) {
-    routes.push_back({route.control_binding_id, route.control_binding_revision,
-                      route.control_route_id});
-  }
-  std::vector<core::ControllerLifecycleObservedControllerDTO> controllers;
-  controllers.reserve(expected.value().expected_controllers.size());
-  for (const auto &controller : expected.value().expected_controllers) {
-    controllers.push_back(
-        {controller, core::ControllerLifecycleActivityDTO::kActive});
-  }
-  std::vector<core::ControllerLifecycleObservedEndpointDTO> endpoints;
-  endpoints.reserve(expected.value().expected_endpoints.size());
-  for (const auto &endpoint : expected.value().expected_endpoints) {
-    endpoints.push_back({endpoint, true});
-  }
-  return {core::MakeControllerLifecycleObservationQuery(expected.value()),
-          1U,
-          100,
-          101,
-          1'000,
-          core::ControllerLifecycleObservedConfigurationDTO{
-              expected.value().desired_configuration.activation_set_id,
-              std::move(routes)},
-          std::move(controllers),
-          {},
-          std::move(endpoints)};
-}
-
-class MemoryRouteConfigurationKernelPublicationOwner final
-    : public IRouteConfigurationKernelPublicationOwner {
-public:
-  explicit MemoryRouteConfigurationKernelPublicationOwner(
-      std::vector<core::RuntimeParticipantBinding> current)
-      : current_(std::move(current)) {}
-
-  [[nodiscard]] core::Result<std::vector<core::RuntimeParticipantBinding>>
-  ReadCurrentPhysicalParticipants(
-      const core::ActiveControlConfigurationDTO &) const override {
-    ++read_count_;
-    return core::Result<std::vector<core::RuntimeParticipantBinding>>::Ok(
-        current_);
-  }
-
-  [[nodiscard]] core::Result<core::RuntimeRouteConfigurationReadbackDTO>
-  PublishAndReadBackRouteConfiguration(
-      const core::ActiveControlConfigurationDTO &configuration,
-      std::vector<VerifiedRouteReadinessParticipant> participants) override {
-    ++publish_count_;
-    published_participants_ = participants;
-    std::vector<core::RouteReadinessPublicationRowDTO> rows;
-    rows.reserve(participants.size());
-    for (const auto &participant : participants) {
-      rows.push_back(participant.readiness_row);
-    }
-    auto readback_configuration = configuration;
-    if (mismatch_configuration_) {
-      readback_configuration.active_control_configuration_id =
-          core::ActiveControlConfigurationId("active.route.drifted");
-    }
-    const bool expected_open =
-        configuration.state ==
-        core::ActiveControlConfigurationStateDTO::kReconciled;
-    return core::Result<core::RuntimeRouteConfigurationReadbackDTO>::Ok(
-        {std::move(readback_configuration), std::move(rows),
-         mismatch_admission_ ? !expected_open : expected_open});
-  }
-
-  mutable std::size_t read_count_{};
-  std::size_t publish_count_{};
-  bool mismatch_configuration_{};
-  bool mismatch_admission_{};
-  std::vector<VerifiedRouteReadinessParticipant> published_participants_;
-
-private:
-  std::vector<core::RuntimeParticipantBinding> current_;
-};
-
 TEST(ResolvedStopBasePlanResolverTest,
      ExplicitMaxStopTimeSurvivesCompilationDurableReloadAndReadiness) {
   // Q51/item 24 (as `main`): the robot's own `max_stop_time_s` lives in its
@@ -567,270 +418,6 @@ TEST(ResolvedStopBasePlanResolverTest,
                RetainedBundleError);
 }
 
-TEST(ResolvedStopBasePlanResolverTest,
-     RebindsAndPublishesOneCompleteSelectedBindingBatch) {
-  ScopedTrustedRoot root;
-  const auto retained = test::
-      materialize_lite6_stop_capable_ros_motion_retained_consumer_fixture(
-          root.path());
-  const FilesystemVerifiedRetainedProductArtifactSource source(root.path());
-  const auto runtime = make_runtime_context(*retained.bundle);
-  const auto expected = load_verified_controller_lifecycle_expected_domain(
-      *retained.bundle, source, runtime.desired_configuration,
-      runtime.source_runtime_unit_id, runtime.source_runtime_epoch);
-
-  auto active = runtime.active_configuration;
-  active.active_control_configuration_id =
-      core::ActiveControlConfigurationId("active.route.publication");
-  active.active_control_configuration_generation =
-      core::ActiveControlConfigurationGeneration(5U);
-  const std::vector<core::RouteSelectionComponentExpectationDTO> components{
-      {runtime.binding.value().controllable_component_id,
-       core::ComponentLifecycleGeneration(11U),
-       core::ComponentLifecycleStateDTO::kActive}};
-  const std::vector<core::RuntimeParticipantBinding> participants{
-      runtime.binding};
-
-  auto batch = resolve_and_verify_route_readiness_batch(
-      *retained.bundle, source, expected, active, components, participants);
-  ASSERT_TRUE(batch.ok()) << batch.error().message;
-  ASSERT_EQ(batch.value().size(), 1U);
-  const auto &published = batch.value().front();
-  ASSERT_TRUE(published.participant_binding.value().control_path.has_value());
-  EXPECT_EQ(published.participant_binding.value()
-                .control_path->active_control_configuration_id,
-            active.active_control_configuration_id);
-  EXPECT_EQ(published.participant_binding.value()
-                .control_path->active_control_configuration_generation,
-            active.active_control_configuration_generation);
-  EXPECT_EQ(published.stop_readiness.value().component_lifecycle_generation,
-            core::ComponentLifecycleGeneration(11U));
-  EXPECT_EQ(published.stop_readiness.value()
-                .resolved_stop_base_plan.active_control_configuration_id,
-            active.active_control_configuration_id);
-  EXPECT_EQ(published.readiness_row.controllable_component_id,
-            runtime.binding.value().controllable_component_id);
-  EXPECT_EQ(published.readiness_row.resolved_stop_base_plan_id,
-            published.stop_readiness.value()
-                .resolved_stop_base_plan.resolved_stop_base_plan_id);
-
-  {
-    // A parent Apply installs the route of a Declared (command-closed)
-    // component; a state without a lifecycle fact is still refused.
-    auto declared = components;
-    declared.front().expected_component_lifecycle_state =
-        core::ComponentLifecycleStateDTO::kDeclared;
-    const auto installed = resolve_and_verify_route_readiness_batch(
-        *retained.bundle, source, expected, active, declared, participants);
-    ASSERT_TRUE(installed.ok()) << installed.error().message;
-    auto undeclared = components;
-    undeclared.front().expected_component_lifecycle_state =
-        core::ComponentLifecycleStateDTO::kUndeclared;
-    const auto refused = resolve_and_verify_route_readiness_batch(
-        *retained.bundle, source, expected, active, undeclared, participants);
-    ASSERT_FALSE(refused.ok());
-    EXPECT_EQ(refused.error().details.at("reason"),
-              "route_readiness_batch_shape_invalid");
-  }
-
-  const std::vector<core::RuntimeParticipantBinding> missing;
-  batch = resolve_and_verify_route_readiness_batch(
-      *retained.bundle, source, expected, active, components, missing);
-  ASSERT_FALSE(batch.ok());
-  EXPECT_EQ(batch.error().details.at("reason"),
-            "route_readiness_batch_shape_invalid");
-
-  active.state =
-      core::ActiveControlConfigurationStateDTO::kExternalOrUnknownUnreconciled;
-  batch = resolve_and_verify_route_readiness_batch(
-      *retained.bundle, source, expected, active, components, participants);
-  ASSERT_FALSE(batch.ok());
-  EXPECT_EQ(batch.error().details.at("reason"),
-            "route_readiness_batch_shape_invalid");
-}
-
-TEST(ResolvedStopBasePlanResolverTest,
-     PublishesExactRouteReadinessAndRejectsKernelReadbackDrift) {
-  ScopedTrustedRoot root;
-  const auto retained = test::
-      materialize_lite6_stop_capable_ros_motion_retained_consumer_fixture(
-          root.path());
-  const FilesystemVerifiedRetainedProductArtifactSource source(root.path());
-  const auto runtime = make_runtime_context(*retained.bundle);
-  const auto expected = load_verified_controller_lifecycle_expected_domain(
-      *retained.bundle, source, runtime.desired_configuration,
-      runtime.source_runtime_unit_id, runtime.source_runtime_epoch);
-  const auto acceptance = make_route_acceptance(runtime, expected);
-  const auto configuration = make_route_configuration(runtime);
-  MemoryRouteConfigurationKernelPublicationOwner owner({runtime.binding});
-  VerifiedRouteConfigurationPublicationPort publisher(
-      *retained.bundle, source, owner,
-      runtime.active_configuration.kinematic_resource_source_projections,
-      [] { return 75; });
-
-  const auto first = publisher.PublishAndReadBack(acceptance, expected.sealed(),
-                                                  configuration);
-  ASSERT_TRUE(first.ok()) << first.error().message;
-  ASSERT_TRUE(first.value().locally_valid());
-  EXPECT_TRUE(first.value().operation_admission_open);
-  ASSERT_EQ(first.value().readiness_rows.size(), 1U);
-  EXPECT_EQ(first.value().readiness_rows.front().controllable_component_id,
-            runtime.binding.value().controllable_component_id);
-  ASSERT_EQ(owner.published_participants_.size(), 1U);
-  EXPECT_EQ(owner.published_participants_.front()
-                .participant_binding.value()
-                .control_path->active_control_configuration_id,
-            configuration.active_control_configuration_id);
-  EXPECT_EQ(owner.published_participants_.front()
-                .stop_readiness.value()
-                .resolved_stop_base_plan.active_control_configuration_id,
-            configuration.active_control_configuration_id);
-
-  const auto replay = publisher.PublishAndReadBack(
-      acceptance, expected.sealed(), configuration);
-  ASSERT_TRUE(replay.ok()) << replay.error().message;
-  EXPECT_EQ(replay.value(), first.value());
-  EXPECT_EQ(owner.read_count_, 2U);
-  EXPECT_EQ(owner.publish_count_, 2U);
-
-  // Route selection for a Prepared component installs coherent route and
-  // Stop readiness. It neither enables nor closes the component: command
-  // eligibility is the Kernel's separate lifecycle projection.
-  auto prepared_acceptance = acceptance;
-  prepared_acceptance.component_expectations.front()
-      .expected_component_lifecycle_state =
-      core::ComponentLifecycleStateDTO::kPrepared;
-  const auto prepared = publisher.PublishAndReadBack(
-      prepared_acceptance, expected.sealed(), configuration);
-  ASSERT_TRUE(prepared.ok()) << prepared.error().message;
-  EXPECT_TRUE(prepared.value().operation_admission_open);
-  EXPECT_EQ(prepared.value().readiness_rows.size(), 1U);
-
-  owner.mismatch_configuration_ = true;
-  const auto drifted = publisher.PublishAndReadBack(
-      acceptance, expected.sealed(), configuration);
-  ASSERT_FALSE(drifted.ok());
-  EXPECT_EQ(drifted.error().details.at("reason"),
-            "route_publication_kernel_readback_mismatch");
-  owner.mismatch_configuration_ = false;
-  owner.mismatch_admission_ = true;
-  const auto reopened = publisher.PublishAndReadBack(
-      acceptance, expected.sealed(), configuration);
-  ASSERT_FALSE(reopened.ok());
-  EXPECT_EQ(reopened.error().details.at("reason"),
-            "route_publication_kernel_readback_mismatch");
-}
-
-TEST(ResolvedStopBasePlanResolverTest,
-     RouteResolutionSelectsOnlyItsDomainSourceProjections) {
-  ScopedTrustedRoot root;
-  const auto retained = test::
-      materialize_lite6_stop_capable_ros_motion_retained_consumer_fixture(
-          root.path());
-  const FilesystemVerifiedRetainedProductArtifactSource source(root.path());
-  const auto runtime = make_runtime_context(*retained.bundle);
-  const auto expected = load_verified_controller_lifecycle_expected_domain(
-      *retained.bundle, source, runtime.desired_configuration,
-      runtime.source_runtime_unit_id, runtime.source_runtime_epoch);
-  const auto acceptance = make_route_acceptance(runtime, expected);
-  const auto observation = make_desired_controller_observation(expected);
-  const auto reconciliation = core::ReconcileControllerLifecycle(
-      expected.value(), observation, observation.received_at_ns);
-  ASSERT_TRUE(reconciliation.ok()) << reconciliation.error().message;
-  ASSERT_FALSE(runtime.active_configuration
-                   .kinematic_resource_source_projections.empty());
-
-  auto foreign = runtime.active_configuration
-                     .kinematic_resource_source_projections.front();
-  foreign.resource_id = core::ResourceId("resource.foreign.domain");
-  foreign.contributing_control_bindings.front().control_binding_id =
-      core::ControlBindingId("binding.foreign.domain");
-  foreign.contributing_control_bindings.front().control_binding_revision =
-      core::ControlBindingRevision("revision.foreign.domain");
-  auto cell_projections =
-      runtime.active_configuration.kinematic_resource_source_projections;
-  cell_projections.push_back(std::move(foreign));
-
-  MemoryRouteConfigurationKernelPublicationOwner owner({runtime.binding});
-  VerifiedRouteConfigurationPublicationPort publisher(
-      *retained.bundle, source, owner, std::move(cell_projections),
-      [] { return 90; });
-  const auto resolved = publisher.ResolveResultingActiveControlConfiguration(
-      acceptance, expected.sealed(), observation, reconciliation.value(),
-      core::RouteSelectionEffectDTO::kKnownNoEffect);
-  ASSERT_TRUE(resolved.ok()) << resolved.error().message;
-  EXPECT_EQ(resolved.value().kinematic_resource_source_projections,
-            runtime.active_configuration.kinematic_resource_source_projections);
-
-  auto mixed =
-      runtime.active_configuration.kinematic_resource_source_projections;
-  auto foreign_source = mixed.front().contributing_control_bindings.front();
-  foreign_source.control_binding_id =
-      core::ControlBindingId("binding.foreign.domain");
-  foreign_source.control_binding_revision =
-      core::ControlBindingRevision("revision.foreign.domain");
-  mixed.front().contributing_control_bindings.push_back(
-      std::move(foreign_source));
-  std::sort(
-      mixed.front().contributing_control_bindings.begin(),
-      mixed.front().contributing_control_bindings.end(),
-      [](const auto &lhs, const auto &rhs) {
-        return std::tie(lhs.control_binding_id, lhs.control_binding_revision) <
-               std::tie(rhs.control_binding_id, rhs.control_binding_revision);
-      });
-  VerifiedRouteConfigurationPublicationPort mixed_publisher(
-      *retained.bundle, source, owner, std::move(mixed),
-      [] { return 91; });
-  const auto rejected =
-      mixed_publisher.ResolveResultingActiveControlConfiguration(
-          acceptance, expected.sealed(), observation, reconciliation.value(),
-          core::RouteSelectionEffectDTO::kKnownNoEffect);
-  ASSERT_FALSE(rejected.ok());
-  EXPECT_EQ(rejected.error().details.at("reason"),
-            "route_publication_cross_domain_source_projection");
-}
-
-TEST(ResolvedStopBasePlanResolverTest,
-     PublishesUnreconciledTruthClosedAndRejectsUnsafeReceiptTime) {
-  ScopedTrustedRoot root;
-  const auto retained = test::
-      materialize_lite6_stop_capable_ros_motion_retained_consumer_fixture(
-          root.path());
-  const FilesystemVerifiedRetainedProductArtifactSource source(root.path());
-  const auto runtime = make_runtime_context(*retained.bundle);
-  const auto expected = load_verified_controller_lifecycle_expected_domain(
-      *retained.bundle, source, runtime.desired_configuration,
-      runtime.source_runtime_unit_id, runtime.source_runtime_epoch);
-  const auto acceptance = make_route_acceptance(runtime, expected);
-  auto configuration = make_route_configuration(runtime);
-  configuration.state =
-      core::ActiveControlConfigurationStateDTO::kExternalOrUnknownUnreconciled;
-  MemoryRouteConfigurationKernelPublicationOwner owner({runtime.binding});
-  VerifiedRouteConfigurationPublicationPort publisher(
-      *retained.bundle, source, owner,
-      runtime.active_configuration.kinematic_resource_source_projections,
-      [] { return 80; });
-
-  const auto result = publisher.PublishAndReadBack(
-      acceptance, expected.sealed(), configuration);
-  ASSERT_TRUE(result.ok()) << result.error().message;
-  EXPECT_TRUE(result.value().readiness_rows.empty());
-  EXPECT_FALSE(result.value().operation_admission_open);
-  EXPECT_EQ(owner.read_count_, 0U);
-  ASSERT_EQ(owner.publish_count_, 1U);
-  EXPECT_TRUE(owner.published_participants_.empty());
-
-  VerifiedRouteConfigurationPublicationPort unsafe_clock(
-      *retained.bundle, source, owner,
-      runtime.active_configuration.kinematic_resource_source_projections,
-      [] { return 9'007'199'254'740'992LL; });
-  const auto unsafe = unsafe_clock.PublishAndReadBack(
-      acceptance, expected.sealed(), configuration);
-  ASSERT_FALSE(unsafe.ok());
-  EXPECT_EQ(unsafe.error().details.at("reason"),
-            "route_publication_time_invalid");
-}
-
 } // namespace
 } // namespace manyforge::deployment
 
@@ -841,8 +428,7 @@ TEST(ResolvedStopBasePlanResolverTest, RosGripperLogicalEvidenceSurvivesDurableR
   for (const std::string_view kind : {"pneumatic", "position_commanded"}) {
     ScopedTrustedRoot root;
     const auto retained = test::materialize_lite6_retained_consumer_fixture_from(
-        root.path(), test::make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture(
-                         {}, kind));
+        root.path(), test::make_lite_gripper_only_retention_fixture({}, kind));
     ASSERT_EQ(retained.bundle->value().compiled_products.symbol_role_maps.size(), 1U);
     FilesystemVerifiedRetainedModelMapSource maps(root.path());
     const auto map = maps.get_verified(RetainedModelMapQuery{
@@ -890,6 +476,7 @@ TEST(ResolvedStopBasePlanResolverTest, ModelBackedCommandedGripperWithoutRowReta
   // Remove the row only from authored compiler input. No verified retained
   // product is rewritten or constructed after this genuine compiler refusal.
   const auto without_row = +[](CanonicalValue::Object &graph) {
+    test::map_lite_gripper_only_graph(graph);
     const auto units_field = std::find_if(graph.begin(), graph.end(),
         [](const auto &field) { return field.first == "runtime_units"; });
     if (units_field == graph.end()) throw std::logic_error("authored fixture has no runtime units");
@@ -927,14 +514,10 @@ TEST(ResolvedStopBasePlanResolverTest, ModelBackedCommandedGripperWithoutRowReta
     units_field->second = CanonicalValue(std::move(units));
   };
   try {
-    // The real aggregate has an arm and model-backed position gripper with
-    // its genuine commanded provider/hard floor, not an invented None owner.
-    const auto fixture = test::make_lite6_controllable_retention_fixture(
-        false, false, 1U, true, true, {}, false, true, "resource", true,
-        {}, {}, true, false, false, std::nullopt, false,
-        test::kLite6ArmTargetId, std::nullopt, std::nullopt, {}, true, {},
-        "manyforge.provider.ros2_control", true, true, nullptr, without_row,
-        false, false, "position_commanded", 0.2, "commanded");
+    // The real Lite gripper as a model-backed position gripper with its
+    // genuine commanded provider/hard floor, not an invented None owner.
+    const auto fixture = test::make_lite_gripper_only_retention_fixture(
+        {}, "position_commanded", 0.2, "commanded", false, without_row);
     (void)test::materialize_lite6_retained_consumer_fixture_from(root.path(), fixture);
     FAIL() << "model-backed ROS gripper without a matching authored row was accepted";
   } catch (const CellApplicabilityError &error) {
@@ -947,7 +530,7 @@ TEST(ResolvedStopBasePlanResolverTest, NoOutputGripperSealsOnlyItsExactLocalOwne
   for (const double dwell : {0.0, 0.25}) {
     ScopedTrustedRoot root;
     const auto retained = test::materialize_lite6_retained_consumer_fixture_from(
-        root.path(), test::make_lite6_ros2_control_no_output_gripper_retention_fixture({}, dwell));
+        root.path(), test::make_lite_gripper_only_retention_fixture({}, "pneumatic", dwell, "none"));
     ASSERT_EQ(retained.bundle->value().compiled_products.symbol_role_maps.size(), 1U);
     FilesystemVerifiedRetainedModelMapSource maps(root.path());
     const auto map = maps.get_verified(RetainedModelMapQuery{

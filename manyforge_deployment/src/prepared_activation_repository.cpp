@@ -1,11 +1,12 @@
 #include "manyforge_deployment/prepared_activation_repository.hpp"
 
 #include <algorithm>
+#include <filesystem>
 #include <optional>
-#include <set>
 #include <string>
 #include <string_view>
 #include <utility>
+#include <vector>
 
 #include "manyforge_deployment/artifact_codec.hpp"
 #include "manyforge_deployment/content_identity.hpp"
@@ -367,144 +368,6 @@ PreparedActivationInput assemble_prepared_activation(
   return prepared;
 }
 
-
-void verify_prepared_canonical_empty_origin(
-    const PreparedActivationInput &prepared,
-    const CanonicalEmptyRetainedBundleAdmission &admission) {
-  const PreparedSealedCanonicalEmptyOrigin expected{
-      admission.cell_id(), admission.deployment_artifact_id(),
-      admission.deployment_revision(), admission.retained_bundle_id(),
-      admission.graph_revision(), admission.admission_digest()};
-  const auto *origin = prepared.sealed_canonical_empty_origin();
-  if (origin == nullptr || *origin != expected ||
-      prepared.closure().retained_bundle->canonical_bytes() !=
-          admission.retained_bundle().canonical_bytes() ||
-      prepared.node_environment_digest() != admission.environment_digest()) {
-    fail("sealed canonical empty prepared activation differs from actual admission");
-  }
-  std::set<std::string> raw_keys, catalog_keys;
-  const auto require_artifact = [&](const auto &values, auto &keys,
-                                    const auto &ref, std::optional<std::uint64_t> size) {
-    keys.insert(ref.content_addressed_store_key.value());
-    const auto found = std::find_if(values.begin(), values.end(), [&](const auto &value) {
-      return value.content_addressed_store_key == ref.content_addressed_store_key;
-    });
-    if (found == values.end() || found->content_digest != ref.content_digest ||
-        (size.has_value() && found->bytes.size() != *size)) {
-      fail("sealed canonical empty prepared activation omits an exact retained artifact");
-    }
-  };
-  const auto &bundle = admission.retained_bundle().value();
-  const auto &closure = prepared.closure();
-  for (const auto &ref : bundle.catalogs.schema_artifacts)
-    require_artifact(closure.raw_artifacts, raw_keys, ref, std::nullopt);
-  const auto product = [&](const auto &value) {
-    for (const auto &ref : value.artifact_refs)
-      require_artifact(closure.raw_artifacts, raw_keys, ref, ref.byte_size);
-  };
-  product(bundle.compiled_products.planning_collision_model);
-  if (bundle.compiled_products.viewer_model.has_value()) product(*bundle.compiled_products.viewer_model);
-  for (const auto &group : bundle.compiled_products.control_domain_products)
-    for (const auto &value : group.products) product(value);
-  for (const auto &value : bundle.compiled_products.symbol_role_maps) product(value);
-  for (const auto &group : bundle.compiled_products.runtime_unit_products)
-    for (const auto &value : group.products) product(value);
-  const auto record = [&](const auto &value) {
-    std::visit([&](const auto &ref) {
-      require_artifact(closure.catalog_artifacts, catalog_keys, ref, std::nullopt);
-    }, value);
-  };
-  for (const auto &ref : bundle.catalogs.records) record(ref);
-  for (const auto &ref : bundle.retained_policy_records) record(ref);
-  if (raw_keys.size() != closure.raw_artifacts.size() ||
-      catalog_keys.size() != closure.catalog_artifacts.size()) {
-    fail("sealed canonical empty prepared activation carries foreign retained artifacts");
-  }
-}
-
-PreparedActivationInput assemble_sealed_canonical_empty_activation(
-    const CanonicalEmptyRetainedBundleAdmission &admission,
-    const ICatalogArtifactSource &catalog,
-    const FilesystemVerifiedRawArtifactSource &raw_artifacts) {
-  const auto &bundle = admission.retained_bundle();
-  const PreparedSealedCanonicalEmptyOrigin origin{
-      admission.cell_id(), admission.deployment_artifact_id(),
-      admission.deployment_revision(), admission.retained_bundle_id(),
-      admission.graph_revision(), admission.admission_digest()};
-  std::vector<PreparedActivationArtifact> raw, records;
-  const auto remember = [&](auto &values, const auto &key, const auto &digest,
-                            std::optional<std::string> bytes) {
-    if (!bytes.has_value() || sha256_digest(*bytes) != digest.value()) {
-      fail("sealed canonical empty retained artifact is unavailable");
-    }
-    const auto found = std::find_if(values.begin(), values.end(),
-        [&](const auto &value) { return value.content_addressed_store_key == key; });
-    if (found != values.end()) {
-      if (found->content_digest != digest || found->bytes != *bytes) {
-        fail("sealed canonical empty retained artifact has contradictory identity");
-      }
-      return;
-    }
-    values.push_back({key, digest, std::move(*bytes)});
-  };
-  for (const auto &schema : bundle.value().catalogs.schema_artifacts) {
-    remember(raw, schema.content_addressed_store_key, schema.content_digest,
-             raw_artifacts.get_verified(schema.content_addressed_store_key,
-                                        schema.content_digest));
-  }
-  const auto product = [&](const auto &value) {
-    for (const auto &ref : value.artifact_refs) {
-      remember(raw, ref.content_addressed_store_key, ref.content_digest,
-               raw_artifacts.get_verified(ref.content_addressed_store_key,
-                                          ref.content_digest, ref.byte_size));
-    }
-  };
-  const auto &products = bundle.value().compiled_products;
-  product(products.planning_collision_model);
-  if (products.viewer_model.has_value()) product(*products.viewer_model);
-  for (const auto &group : products.control_domain_products)
-    for (const auto &value : group.products) product(value);
-  for (const auto &value : products.symbol_role_maps) product(value);
-  for (const auto &group : products.runtime_unit_products)
-    for (const auto &value : group.products) product(value);
-  const auto record = [&](const auto &value) {
-    std::visit([&](const auto &ref) {
-      remember(records, ref.content_addressed_store_key, ref.content_digest,
-               catalog.get_verified(ref.content_addressed_store_key,
-                                    ref.content_digest, std::nullopt));
-    }, value);
-  };
-  for (const auto &value : bundle.value().catalogs.records) record(value);
-  for (const auto &value : bundle.value().retained_policy_records) record(value);
-  CanonicalValue::Object identity{
-      {"schema_version", CanonicalValue(std::string(kPreparedActivationInputSchemaVersion))},
-      {"origin", prepared_activation_origin_value(origin)},
-      {"captured_input_digest", CanonicalValue(sealed_canonical_empty_capture_digest(origin).value())},
-      {"deployment_artifact_id", CanonicalValue(admission.deployment_artifact_id().value())},
-      {"deployment_revision", CanonicalValue(admission.deployment_revision().value())},
-      {"retained_bundle_id", CanonicalValue(admission.retained_bundle_id().value())},
-      {"graph_revision", CanonicalValue(admission.graph_revision().value())},
-      {"node_environment_digest", CanonicalValue(admission.environment_digest().value())},
-      {"assistant_mode", CanonicalValue("optional")},
-      {"program_id", CanonicalValue(nullptr)},
-      {"program_revision", CanonicalValue(nullptr)},
-      {"program_outcome", CanonicalValue(CanonicalValue::Object{{"kind", CanonicalValue("no_program")}})},
-      {"activation_payload", CanonicalValue(CanonicalValue::Object{
-          {"retained_bundle", bundle.normalized_root()},
-          {"program", CanonicalValue(nullptr)},
-          {"program_binding", CanonicalValue(nullptr)},
-          {"program_role_assignment", CanonicalValue(CanonicalValue::Object{
-              {"component_roles", CanonicalValue(CanonicalValue::Array{})},
-              {"target_roles", CanonicalValue(CanonicalValue::Array{})}})},
-          {"raw_artifacts", prepared_activation_artifact_rows(std::move(raw))},
-          {"catalog_artifacts", prepared_activation_artifact_rows(std::move(records))}})}};
-  identity.emplace_back("prepared_activation_id",
-      CanonicalValue(sha256_digest(canonical_json(CanonicalValue(identity)))));
-  auto prepared = parse_prepared_activation_input(CanonicalValue(std::move(identity)));
-  verify_prepared_canonical_empty_origin(prepared, admission);
-  return prepared;
-}
-
 void verify_prepared_program_outcome(const PreparedActivationInput &prepared) {
   static_cast<void>(recompile_prepared_program_outcome(prepared));
 }
@@ -594,7 +457,52 @@ FilesystemPreparedActivationRepository::FilesystemPreparedActivationRepository(
                                                  kTrustedRootMessages) /
             "prepared-activations") {}
 
+namespace {
+
+// Keep the most recently written prepared activations; `latest` (just
+// written or re-adopted) is never removed. A file another writer removed
+// first is simply gone; storage errors are not escalated.
+void trim_prepared_activations(const std::filesystem::path &root,
+                               const std::filesystem::path &latest) {
+  std::vector<std::pair<std::filesystem::file_time_type, std::filesystem::path>>
+      stored;
+  std::error_code error;
+  for (std::filesystem::directory_iterator entry(root, error), end;
+       !error && entry != end; entry.increment(error)) {
+    const auto name = entry->path().filename().string();
+    if (name.size() != 64U + 5U || !name.ends_with(".json") ||
+        entry->symlink_status(error).type() !=
+            std::filesystem::file_type::regular)
+      continue;
+    const auto written = entry->last_write_time(error);
+    if (!error)
+      stored.emplace_back(written, entry->path());
+  }
+  if (stored.size() <= kMaximumRetainedPreparedActivations)
+    return;
+  std::sort(stored.begin(), stored.end());
+  for (std::size_t index = 0U;
+       index + kMaximumRetainedPreparedActivations < stored.size(); ++index)
+    if (stored[index].second != latest)
+      std::filesystem::remove(stored[index].second, error);
+}
+
+} // namespace
+
 bool FilesystemPreparedActivationRepository::put_if_absent(
+    const PreparedActivationInput &prepared) const {
+  const auto path = prepared_path(root_, prepared.prepared_activation_id());
+  const bool inserted = publish(prepared);
+  // Stamp it explicitly: file-system timestamps are too coarse to order
+  // writes in quick succession, and re-adoption must count as recent.
+  std::error_code error;
+  std::filesystem::last_write_time(
+      path, std::filesystem::file_time_type::clock::now(), error);
+  trim_prepared_activations(root_, path);
+  return inserted;
+}
+
+bool FilesystemPreparedActivationRepository::publish(
     const PreparedActivationInput &prepared) const {
   posix::ensure_owned_plain_directory(root_, kPosixErrors, kDirectoryMessages,
                                       kDirectorySyncMessages);
@@ -629,8 +537,7 @@ bool FilesystemPreparedActivationRepository::put_if_absent(
 
 std::shared_ptr<const PreparedActivationInput>
 FilesystemPreparedActivationRepository::get_verified(
-    const core::ContentDigest &prepared_activation_id,
-    const CanonicalEmptyRetainedBundleAdmission *sealed_admission) const {
+    const core::ContentDigest &prepared_activation_id) const {
   const auto bytes = posix::read_exact_regular_file(
       prepared_path(root_, prepared_activation_id), kMaxPreparedActivationBytes,
       true, kPosixErrors, kReadMessages);
@@ -654,12 +561,6 @@ FilesystemPreparedActivationRepository::get_verified(
     fail("stored prepared activation has another identity");
   }
   verify_prepared_program_outcome(*prepared);
-  if (prepared->sealed_canonical_empty_origin() != nullptr) {
-    if (sealed_admission == nullptr) {
-      fail("sealed canonical empty prepared activation admission is unavailable");
-    }
-    verify_prepared_canonical_empty_origin(*prepared, *sealed_admission);
-  }
   return prepared;
 }
 

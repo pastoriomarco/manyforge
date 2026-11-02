@@ -24,11 +24,10 @@ if [ -f "/opt/manyforge/topic_based_ros2_control/install/setup.bash" ]; then
     set -u
 fi
 
-# Pinned ROS dependency overlays of the full Lyrical image: xArm driver,
-# ur_msgs, then the controller overlay (stock JTC 6.10.0) last so that its
-# packages take precedence. Local setups keep the order above unchanged.
-for overlay in /opt/manyforge/xarm_ws/install /opt/manyforge/ur_msgs/install \
-        /opt/manyforge/control_overlay; do
+# Pinned ROS dependency overlays of the full Lyrical image: xArm driver, then
+# the controller overlay (stock JTC 6.10.0) last so that its packages take
+# precedence. Local setups keep the order above unchanged.
+for overlay in /opt/manyforge/xarm_ws/install /opt/manyforge/control_overlay; do
     if [ -f "${overlay}/local_setup.bash" ]; then
         # shellcheck disable=SC1090,SC1091
         set +u

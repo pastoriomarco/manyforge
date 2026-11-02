@@ -185,7 +185,7 @@ def test_catalog_exposes_structured_v2_semantics() -> None:
         "max_tcp_linear_speed_mps",
         "offset_reference",
         "per_joint_dynamics_limits",
-        "planning_profile",
+        "planner",
         "planning_timeout_s",
         "preempted_result",
         "preemption_priority",
@@ -261,24 +261,21 @@ def test_catalog_schema_retains_semantic_role_and_validates_defaults() -> None:
     move = catalog.get("motion.move_to_pose")
     joint_target = catalog.schema_registry.types["joint_target"]
     target_role = next(parameter for parameter in move.parameters if parameter.id == "target_role")
-    planning_profile = next(
-        parameter for parameter in move.parameters if parameter.id == "planning_profile"
-    )
+    planner = next(parameter for parameter in move.parameters if parameter.id == "planner")
     joint_name = catalog.schema_registry.resolve(joint_target.properties["joint_name"])
 
     assert catalog.schema_registry.resolve(target_role.schema).semantic_type == "target_role"
     assert joint_target.required == ("joint_name", "position_rad")
     assert joint_name.semantic_type == "source_joint"
-    assert planning_profile.has_default is True
-    assert planning_profile.default == "balanced"
-    assert (
-        validate_value(
-            planning_profile.schema,
-            "balanced",
-            registry=catalog.schema_registry,
-        )
-        == []
-    )
+    # Planner block: optional, no default (the Deployment's applies); any
+    # subset of its members, each range-checked.
+    assert planner.has_default is False
+    for value in ({}, {"search": "rrt"}, {"optimize": "best_of_n", "n": 8},
+                  {"collision_check_step_rad": 0.02, "max_nodes": 20000}):
+        assert validate_value(planner.schema, value, registry=catalog.schema_registry) == []
+    for value in ({"search": "prm"}, {"optimize": "balanced"}, {"n": 1},
+                  {"max_nodes": 10}, {"collision_check_step_rad": 0.0}, {"extra": 1}):
+        assert validate_value(planner.schema, value, registry=catalog.schema_registry) != []
 
     dynamics = catalog.schema_registry.types["per_joint_dynamics_limits"]
     assert (

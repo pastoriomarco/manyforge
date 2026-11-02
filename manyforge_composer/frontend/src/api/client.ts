@@ -1,12 +1,31 @@
-import { normalizePublicRequestContext, parseComponentProcessStopResult, parseComponentProcessStopOffer } from './processStopParsers';
 import { errorCatalogRow } from '../state/commandRefusal';
-import type { ManualValveIntent } from '../state/pneumaticManual';
-import { parseCanonicalEmptySelection, parseSceneClearStatus, parseForceCloseResult, parseLifecycleOwnerSettlement, parseLifecycleTargetRetirementOffer,
-  parseLifecycleTargetRetirementResult, parseLifecycleTargetRetirementLookup } from './scenarioCloseParsers';
-import type { SceneClearStatus, CanonicalEmptySelection, ForceCloseRequest, ForceCloseResult, LifecycleOwnerSettlementResult,
-  LifecycleTargetRetirementIntent, LifecycleTargetRetirementOffer, LifecycleTargetRetirementResult,
-  LifecycleTargetRetirementScope } from '../types/scenarioClose';
-import type { ComponentProcessStopRequest, ComponentProcessStopResult } from '../types/cclc';
+import { errorMessage } from '../state/structuralResource';
+import {
+  parseApplyPreview,
+  parseApplyResult,
+  parseCellLatch,
+  parseComponentStates,
+  parseEffectiveValues,
+  parseRunReadiness,
+  parseSetOutputResult,
+  parseSignalSamples,
+} from './parsers/components';
+import { objectAt, stringAt } from './parsers/shared';
+import type {
+  ApplyPreview,
+  ApplyResult,
+  CellLatch,
+  ComponentAction,
+  ComponentState,
+  EffectiveValues,
+  RunReadiness,
+  SetOutputResult,
+  SignalSample,
+} from '../types/components';
+
+function parseAcceptedAction(value: unknown): { action: ComponentAction } {
+  return { action: stringAt(objectAt(value, 'accepted').action, 'accepted.action') };
+}
 import {
   parseAuthoringSubmissionOutcome,
   parseAuthoringWorkspaceSnapshot,
@@ -20,7 +39,6 @@ import {
   parsePersistentKeyValuesCleared,
   parseCapabilityCommandPreviewResponse,
   parseDraftMutationResponse,
-  parseDeploymentCandidateOperationResponse,
   parseDeploymentWorkspaceResponse,
   parseFileBrowserResponse,
   parseHealthResponse,
@@ -35,23 +53,14 @@ import {
   parseManagerStatusProjection,
   parseMotionPreviewResponse,
   parseManualControlAvailability,
-  parseGlobalRuleRecoveryOffers,
-  parseGlobalRuleRecoveryResult,
-  parseStopFaultRecoveryOffer,
-  parseCellRecoverResult,
   parseNodeEnvironmentResponse,
-  parsePreparedActivationInput,
-  parseManagerDeploymentCandidatePreviewResponse,
-  parseManagerApplyResponse,
   parseObjectResponse,
-  parseOperationObservation,
   parseProgramWorkspaceResponse,
   parseProgramWorkspaceTransitionResponse,
   parseCurrentScenarioResponse,
   parseRuntimeScaleControlStatus,
   parseScenarioDocumentIndexResponse,
   parseScenarioDocumentExportResponse,
-  parseScenarioDocumentLoadResponse,
   parseScenarioDocumentSaveResponse,
   parseSceneTransactionResponse,
   parseSceneMeshAssetMetadata,
@@ -79,13 +88,6 @@ import {
   parseAssistantModeIndex,
   parseAssistantProviderStatus,
 } from './assistantParsers';
-import {
-  parseCCLCAdmission,
-  parseCCLCComponentSnapshot,
-  parseCCLCOwnerIdentity,
-  parseCCLCRouteTemplateSet,
-  parseCCLCStatusEnvelope,
-} from './cclcParsers';
 import type {
   FileBrowseKind,
   SaveScenarioDocumentInput,
@@ -101,9 +103,6 @@ import type {
   LocalWorkspaceFenceRequest,
   DraftMutationResponse,
   DeploymentControlledStopUpdate,
-  TcpSpeedCheck,
-  DeploymentCandidateOperationResponse,
-  DeploymentCandidatePreparation,
   DeploymentWorkspaceResponse,
   FileBrowserResponse,
   HealthResponse,
@@ -120,7 +119,6 @@ import type {
   ScenarioDocumentFenceRequest,
   ScenarioDocumentExportResponse,
   ScenarioDocumentIndexResponse,
-  ScenarioDocumentLoadResponse,
   ScenarioDocumentSaveResponse,
   SceneTransactionRequest,
   SceneTransactionResponse,
@@ -142,20 +140,14 @@ import type {
 } from '../types/headless';
 import type {
   CapabilityCommandPreviewReceipt,
-  CellRecoverResult,
   DirectControlOperationIntent,
   ExecutionIdentity,
   MotionPreviewReceipt,
-  OperationObservation,
   ManualControlAvailability,
-  GlobalRuleRecoveryOffer,
-  GlobalRuleRecoveryResult,
-  StopFaultRecoveryOffer,
   RuntimeScaleControlSelector,
   RuntimeScaleControlStatus,
   ProgramRunAdmittedSpeeds,
 } from '../types/robotControl';
-import type { DeploymentActivationScope } from '../state/activationScope';
 import type { ComponentCatalog } from '../types/componentCatalog';
 import { parseComponentCatalog } from './componentCatalogParser';
 import type {
@@ -163,15 +155,6 @@ import type {
   AssistantProviderStatus,
   AssistantRequestInput,
 } from '../types/assistant';
-import type {
-  CCLCAdmission,
-  CCLCComponentSnapshot,
-  CCLCOwnerIdentity,
-  CCLCLifecycleRequestBody,
-  CCLCRouteRequestBody,
-  CCLCRouteTemplateSet,
-  CCLCTransactionStatus,
-} from '../types/cclc';
 
 export interface HistorianListQuery {
   startNs?: string;
@@ -363,6 +346,17 @@ export class ApiError extends Error {
 }
 
 /**
+ * The reply arrived and states the outcome (e.g. a failed ApplyResult): the
+ * request settled, so the browser's submission guard is released.
+ */
+export class KnownOutcomeError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'KnownOutcomeError';
+  }
+}
+
+/**
  * Whether the backend refused this request before any of its effects.
  *
  * The backend marks every such refusal in its structured error body
@@ -377,6 +371,27 @@ export class ApiError extends Error {
 export function refusedBeforeEffect(error: unknown): boolean {
   if (!(error instanceof ApiError) || error.structuredError === null) return false;
   return (error.payload as { detail: Record<string, unknown> }).detail.effect === 'none';
+}
+
+/**
+ * Whether the connection dropped before any reply: `fetch` rejects with a
+ * TypeError (Firefox: "NetworkError when attempting to fetch resource").
+ * The request may still have taken effect, so it is never a refusal.
+ */
+export function connectionLost(error: unknown): boolean {
+  return error instanceof TypeError;
+}
+
+/** The current Scenario as one line, read from `/api/scenarios/current`. */
+export async function currentScenarioText(): Promise<string> {
+  try {
+    const current = await api.programs.currentScenario();
+    return current.currentScenario === null
+      ? `No Scenario is applied (${current.unavailableReasons.join(', ')}).`
+      : `Current Scenario: ${current.currentScenario.scenarioId}, applied.`;
+  } catch (error) {
+    return `The current Scenario could not be read: ${errorMessage(error, 'request failed').replace(/[.\s]*$/, '')}.`;
+  }
 }
 
 /** Remedies the owner's message does not already name (it lies outside the Draft). */
@@ -629,29 +644,6 @@ export function composerSettingsConflict(error: unknown): ComposerSettingsSnapsh
   }
 }
 
-/** A Close recovery reply cannot fall back to an ordinary lifecycle transaction. */
-function requireExactCloseIncidentRecovery(
-  request: CCLCLifecycleRequestBody,
-  result: CCLCAdmission,
-): void {
-  const expected = request.close_incident_recovery;
-  if (expected == null) {
-    if (result.incidentRecovery?.closureReason !== undefined) {
-      throw new Error('Ordinary Recover cannot acknowledge a Close closure reason.');
-    }
-    return;
-  }
-  if (['stale_request_owner_epoch', 'request_id_conflict', 'request_ledger_full', 'request_result_expired'].includes(result.replayStatus)
-    && result.incidentRecovery === null && result.transactionId === null && result.requestId === null && result.status === null) return;
-  if (request.intent !== 'recover' || request.reason !== 'cell closed by operator'
-    || result.incidentRecovery?.incidentId !== expected.expected_incident_id
-    || result.incidentRecovery.controllableComponentId !== request.controllable_component_id
-    || result.incidentRecovery.closureReason !== 'cell_closed_by_operator'
-    || result.transactionId !== null || result.status !== null) {
-    throw new Error('Close incident recovery was not acknowledged for the exact incident.');
-  }
-}
-
 export const api = {
   health: {
     get: (signal?: AbortSignal): Promise<HealthResponse> =>
@@ -700,178 +692,61 @@ export const api = {
     get: (signal?: AbortSignal): Promise<SourceModelProjection> =>
       requestJson('/api/source-model', parseSourceModelProjection, signal),
   },
-  cclc: {
-    targetRetirementOffer: (signal?: AbortSignal): Promise<LifecycleTargetRetirementOffer> => requestJson(
-      '/api/cclc/targets/retirement-offer', parseLifecycleTargetRetirementOffer, signal,
-    ),
-    retireTargets: (request: LifecycleTargetRetirementIntent, signal?: AbortSignal): Promise<LifecycleTargetRetirementResult> => {
-      const sent = structuredClone(request);
-      sent.request_context = normalizePublicRequestContext(sent.request_context) as typeof sent.request_context;
-      return requestJson('/api/cclc/targets/retire', (value) => parseLifecycleTargetRetirementResult(value, sent),
-        signal, { method: 'POST', body: JSON.stringify(sent) });
-    },
-    targetRetirementResult: (request: LifecycleTargetRetirementIntent, signal?: AbortSignal): Promise<LifecycleTargetRetirementResult | null> => {
-      const sent = structuredClone(request);
-      sent.request_context = normalizePublicRequestContext(sent.request_context) as typeof sent.request_context;
-      return requestJson('/api/cclc/targets/retire/result', (value) => parseLifecycleTargetRetirementLookup(value, sent),
-        signal, { method: 'POST', body: JSON.stringify(sent) });
-    },
-    ownerSettlement: (scope: LifecycleTargetRetirementScope, signal?: AbortSignal): Promise<LifecycleOwnerSettlementResult> => {
-      const sent = structuredClone(scope);
-      return requestJson('/api/cclc/targets/settlement', (value) => parseLifecycleOwnerSettlement(value, sent),
-        signal, { method: 'POST', body: JSON.stringify({ scope: sent }) });
-    },
-    componentProcessStopOffer: (controllableComponentId: string): Promise<import('../types/cclc').ComponentProcessStopOffer> => requestJson(
-      `/api/cclc/components/${encodeURIComponent(controllableComponentId)}/process/stop-offer`,
-      (value) => parseComponentProcessStopOffer(value, controllableComponentId),
-    ),
-    stopComponentProcess: (request: ComponentProcessStopRequest): Promise<ComponentProcessStopResult> => {
-      const captured = structuredClone(request);
-      captured.request_context = normalizePublicRequestContext(captured.request_context) as typeof captured.request_context;
-      return requestJson(
-        `/api/cclc/components/${encodeURIComponent(captured.controllable_component_id)}/process/stop`,
-        (value) => parseComponentProcessStopResult(value, captured), undefined,
-        { method: 'POST', body: JSON.stringify({ request: captured }) },
-      );
-    },
-    componentProcessStopResult: (request: ComponentProcessStopRequest): Promise<ComponentProcessStopResult> => {
-      const captured = structuredClone(request);
-      captured.request_context = normalizePublicRequestContext(captured.request_context) as typeof captured.request_context;
-      return requestJson(
-        `/api/cclc/components/${encodeURIComponent(captured.controllable_component_id)}/process/stop/result`,
-        (value) => parseComponentProcessStopResult(value, captured), undefined,
-        { method: 'POST', body: JSON.stringify({ request: captured }) },
-      );
-    },
-    owner: (signal?: AbortSignal): Promise<CCLCOwnerIdentity> => requestJson(
-      '/api/cclc/owner',
-      parseCCLCOwnerIdentity,
-      signal,
-    ),
-    component: (
-      controllableComponentId: string,
-      signal?: AbortSignal,
-    ): Promise<CCLCComponentSnapshot> => requestJson(
-      `/api/cclc/components/${encodeURIComponent(controllableComponentId)}`,
-      (value) => {
-        const snapshot = parseCCLCComponentSnapshot(value);
-        if (snapshot.controllableComponentId !== controllableComponentId) {
-          throw new Error('component snapshot does not match its request');
-        }
-        return snapshot;
-      },
-      signal,
-    ),
-    routeTemplates: (
-      controllableComponentId: string,
-      signal?: AbortSignal,
-    ): Promise<CCLCRouteTemplateSet> => requestJson(
-      `/api/cclc/components/${encodeURIComponent(controllableComponentId)}/route-templates`,
-      (value) => {
-        const templates = parseCCLCRouteTemplateSet(value);
-        if (templates.controllableComponentId !== controllableComponentId) {
-          throw new Error('route templates do not match their request');
-        }
-        return templates;
-      },
-      signal,
-    ),
-    submitLifecycle: (
-      request: CCLCLifecycleRequestBody,
-      signal?: AbortSignal,
-    ): Promise<CCLCAdmission> => requestJson(
-      '/api/cclc/lifecycle/requests',
-      (value) => {
-        const result = parseCCLCAdmission(value, 'lifecycle');
-        if (
-          result.requestId !== null
-          && result.requestId !== request.request_context.request_id
-        ) {
-          throw new Error('lifecycle acceptance does not match its request');
-        }
-        if (
-          result.incidentRecovery !== null
-          && result.incidentRecovery.controllableComponentId !== request.controllable_component_id
-        ) {
-          throw new Error('incident recovery does not match its request');
-        }
-        requireExactCloseIncidentRecovery(request, result);
-        return result;
-      },
-      signal,
-      { method: 'POST', body: JSON.stringify(request) },
-    ),
-    lifecycleRequestResult: (
-      request: CCLCLifecycleRequestBody,
-      signal?: AbortSignal,
-    ): Promise<CCLCAdmission | null> => requestJson(
-      '/api/cclc/lifecycle/requests/result',
-      (value) => {
-        const envelope = parseObjectResponse(value);
-        if (Object.keys(envelope).length !== 1 || !Object.hasOwn(envelope, 'result')) {
-          throw new Error('lifecycle request result must contain only result');
-        }
-        if (envelope.result === null) return null;
-        const result = parseCCLCAdmission(envelope.result, 'lifecycle');
-        if (result.requestId !== null && result.requestId !== request.request_context.request_id) {
-          throw new Error('lifecycle request result does not match its request');
-        }
-        if (result.incidentRecovery !== null
-          && result.incidentRecovery.controllableComponentId !== request.controllable_component_id) {
-          throw new Error('incident recovery does not match its request');
-        }
-        requireExactCloseIncidentRecovery(request, result);
-        return result;
-      },
-      signal,
-      { method: 'POST', body: JSON.stringify(request) },
-    ),
-    lifecycleStatus: (
-      transactionId: string,
-      signal?: AbortSignal,
-    ): Promise<CCLCTransactionStatus | null> => requestJson(
-      `/api/cclc/lifecycle/transactions/${encodeURIComponent(transactionId)}`,
-      (value) => {
-        const status = parseCCLCStatusEnvelope(value, 'lifecycle');
-        if (status !== null && status.transactionId !== transactionId) {
-          throw new Error('lifecycle status does not match its request');
-        }
-        return status;
-      },
-      signal,
-    ),
-    submitRoute: (
-      request: CCLCRouteRequestBody,
-      signal?: AbortSignal,
-    ): Promise<CCLCAdmission> => requestJson(
-      '/api/cclc/routes/requests',
-      (value) => {
-        const result = parseCCLCAdmission(value, 'route');
-        if (
-          result.requestId !== null
-          && result.requestId !== request.request_context.request_id
-        ) {
-          throw new Error('route acceptance does not match its request');
-        }
-        return result;
-      },
-      signal,
-      { method: 'POST', body: JSON.stringify(request) },
-    ),
-    routeStatus: (
-      transactionId: string,
-      signal?: AbortSignal,
-    ): Promise<CCLCTransactionStatus | null> => requestJson(
-      `/api/cclc/routes/transactions/${encodeURIComponent(transactionId)}`,
-      (value) => {
-        const status = parseCCLCStatusEnvelope(value, 'route');
-        if (status !== null && status.transactionId !== transactionId) {
-          throw new Error('route status does not match its request');
-        }
-        return status;
-      },
-      signal,
-    ),
+  /** CONTRACTS §1–§2: component states and actions. */
+  components: {
+    list: (signal?: AbortSignal): Promise<ComponentState[]> =>
+      requestJson('/api/components', parseComponentStates, signal),
+    /** 202: accepted; the result arrives in the component's `last_action`. */
+    action: (componentId: string, action: ComponentAction): Promise<{ action: ComponentAction }> =>
+      requestJson(`/api/components/${encodeURIComponent(componentId)}/actions`, parseAcceptedAction,
+        undefined, { method: 'POST', body: JSON.stringify({ action }) }),
+    /** The same action on the named components, one at a time in cell order (Prepare all, Enable all). */
+    groupAction: (action: ComponentAction, componentIds: readonly string[]): Promise<{ action: ComponentAction }> =>
+      requestJson('/api/components/actions', parseAcceptedAction, undefined,
+        { method: 'POST', body: JSON.stringify({ action, component_ids: componentIds }) }),
+  },
+  /** CONTRACTS §5. */
+  cell: {
+    latch: (signal?: AbortSignal): Promise<CellLatch> =>
+      requestJson('/api/cell/latch', parseCellLatch, signal),
+  },
+  /** CONTRACTS §7. */
+  io: {
+    list: (signal?: AbortSignal): Promise<SignalSample[]> =>
+      requestJson('/api/io', parseSignalSamples, signal),
+    setOutput: (signalId: string, value: boolean | number): Promise<SetOutputResult> =>
+      requestJson(`/api/io/${encodeURIComponent(signalId)}/set`, parseSetOutputResult, undefined,
+        { method: 'POST', body: JSON.stringify({ value }) }),
+  },
+  /** CONTRACTS §10. */
+  readiness: {
+    get: (signal?: AbortSignal): Promise<RunReadiness> =>
+      requestJson('/api/program/readiness', parseRunReadiness, signal),
+  },
+  /** CONTRACTS §11: the one server-side Apply path for Apply, Load and New. */
+  cellApply: {
+    preview: (): Promise<ApplyPreview> =>
+      requestJson('/api/deployment/preview', parseApplyPreview, undefined, { method: 'POST', body: '{}' }),
+    /** Applies exactly what `scope` previewed; a changed Draft is refused. */
+    apply: (scope: ApplyPreview['scope']): Promise<ApplyResult> =>
+      requestJson('/api/deployment/apply', parseApplyResult, undefined,
+        { method: 'POST', body: JSON.stringify({ scope }) }),
+    /** The impact of reverting to the Saved Scenario; effect-free. */
+    revertPreview: (): Promise<ApplyPreview> =>
+      requestJson('/api/deployment/revert/preview', parseApplyPreview, undefined, { method: 'POST', body: '{}' }),
+    /** Apply of the Saved Scenario the Revert preview showed; both Drafts return to Saved. */
+    revert: (scope: ApplyPreview['scope']): Promise<ApplyResult> =>
+      requestJson('/api/deployment/revert', parseApplyResult, undefined,
+        { method: 'POST', body: JSON.stringify({ scope }) }),
+    effective: (signal?: AbortSignal): Promise<EffectiveValues> =>
+      requestJson('/api/deployment/effective', parseEffectiveValues, signal),
+    /** The GUI asks before discarding unsaved Drafts, then confirms here. */
+    load: (path: string): Promise<ApplyResult> =>
+      requestJson('/api/scenario/load', parseApplyResult, undefined,
+        { method: 'POST', body: JSON.stringify({ path, discard_unsaved: true }) }),
+    newScenario: (): Promise<ApplyResult> =>
+      requestJson('/api/scenario/new', parseApplyResult, undefined,
+        { method: 'POST', body: JSON.stringify({ discard_unsaved: true }) }),
   },
   authoringWorkspace: {
     /** Log one confirmed Apply-after-Reset before its Reset; grants no authority. */
@@ -1032,15 +907,6 @@ export const api = {
     ),
   },
   scenarioDocuments: {
-    /** Load the built-in, read-only empty Untitled Scenario. */
-    new: (
-      fence: ScenarioDocumentFenceRequest,
-      confirmDiscard: boolean,
-      signal?: AbortSignal,
-    ): Promise<ScenarioDocumentLoadResponse> => requestJson(
-      '/api/scenario-documents/new', parseScenarioDocumentLoadResponse, signal,
-      { method: 'POST', body: JSON.stringify({ ...fence, confirmDiscard }) },
-    ),
     list: (
       directory?: string,
       signal?: AbortSignal,
@@ -1060,24 +926,6 @@ export const api = {
       {
         method: 'POST',
         body: JSON.stringify({ ...fence, ...input }),
-      },
-    ),
-    load: (
-      fence: ScenarioDocumentFenceRequest,
-      path: string,
-      confirmDiscard: boolean,
-      signal?: AbortSignal,
-    ): Promise<ScenarioDocumentLoadResponse> => requestJson(
-      '/api/scenario-documents/load',
-      parseScenarioDocumentLoadResponse,
-      signal,
-      {
-        method: 'POST',
-        body: JSON.stringify({
-          ...fence,
-          path,
-          confirmDiscard,
-        }),
       },
     ),
     /** Return every Draft with unapplied changes to Applied (Draft-only). */
@@ -1116,19 +964,6 @@ export const api = {
     /** Components Add component can compose into the Draft (read-only). */
     componentCatalog: (signal?: AbortSignal): Promise<ComponentCatalog> =>
       requestJson('/api/deployment/component-catalog', parseComponentCatalog, signal),
-    /**
-     * Compile the Draft and read Manager's convergence diff against Applied.
-     * Effect-free: nothing is claimed, applied or installed.
-     */
-    previewDraft: (
-      fence: LocalWorkspaceFenceRequest,
-      signal?: AbortSignal,
-    ): Promise<DeploymentCandidateOperationResponse> => requestJson(
-      '/api/deployment/draft/preview',
-      parseDeploymentCandidateOperationResponse,
-      signal,
-      { method: 'POST', body: JSON.stringify(fence) },
-    ),
     openDraft: (
       fence: LocalWorkspaceFenceRequest,
       path: string,
@@ -1191,7 +1026,6 @@ export const api = {
       controllableComponentId: string,
       commandTargetId: string,
       maximumTcpLinearSpeedMps: number,
-      tcpSpeedCheck?: TcpSpeedCheck,
       signal?: AbortSignal,
     ): Promise<DeploymentWorkspaceResponse> => requestJson(
       '/api/deployment/draft/motion-target-limit',
@@ -1204,7 +1038,6 @@ export const api = {
           controllable_component_id: controllableComponentId,
           command_target_id: commandTargetId,
           maximum_tcp_linear_speed_mps: maximumTcpLinearSpeedMps,
-          tcp_speed_check: tcpSpeedCheck,
         }),
       },
     ),
@@ -1240,81 +1073,14 @@ export const api = {
       signal,
       { method: 'POST', body: JSON.stringify(fence) },
     ),
-    revert: (
-      fence: DraftFenceRequest,
-      /** Manager's disruptive-impact confirmation of this exact Revert. */
-      confirmation: {
-        token: string;
-        preparation: DeploymentCandidatePreparation;
-      } | null = null,
-      signal?: AbortSignal,
-    ): Promise<DeploymentCandidateOperationResponse> => requestJson(
-      '/api/deployment/revert',
-      parseDeploymentCandidateOperationResponse,
-      signal,
-      {
-        method: 'POST',
-        body: JSON.stringify({
-          ...fence,
-          confirmationToken: confirmation?.token ?? null,
-          preparationRequestOwnerEpoch: confirmation?.preparation.requestOwnerEpoch ?? null,
-          preparationRequestId: confirmation?.preparation.requestId ?? null,
-        }),
-      },
-    ),
-    applyDraft: (
-      fence: DraftFenceRequest,
-      confirmation: {
-        token: string;
-        preparation: DeploymentCandidatePreparation;
-      } | null = null,
-      signal?: AbortSignal,
-      /** An Apply after Reset keeps its shared reference in the Manager record. */
-      correlationId?: string,
-      /** The complete activation input the operator confirmed; rechecked
-       * by the backend before any effect. */
-      expectedActivationScope?: DeploymentActivationScope | null,
-    ): Promise<DeploymentCandidateOperationResponse> => requestJson(
-      '/api/deployment/draft/apply',
-      parseDeploymentCandidateOperationResponse,
-      signal,
-      {
-        method: 'POST',
-        body: JSON.stringify({
-          ...fence,
-          ...(correlationId === undefined ? {} : { correlationId }),
-          ...(expectedActivationScope == null ? {} : { expectedActivationScope }),
-          confirmationToken: confirmation?.token ?? null,
-          preparationRequestOwnerEpoch:
-            confirmation?.preparation.requestOwnerEpoch ?? null,
-          preparationRequestId:
-            confirmation?.preparation.requestId ?? null,
-        }),
-      },
-    ),
   },
   programs: {
-    sceneClearStatus: async (signal?: AbortSignal): Promise<SceneClearStatus | null> => {
-      try { return await requestJson('/api/cycle/status', parseSceneClearStatus, signal); }
-      catch (error) {
-        const detail = error instanceof ApiError && error.structuredError !== null
-          ? (error.payload as { detail?: { details?: { scene_clear?: unknown } } } | null)?.detail : undefined;
-        const clear = detail?.details?.scene_clear;
-        if (clear !== undefined && clear !== null) return parseSceneClearStatus({ scene_clear: clear });
-        throw error;
-      }
-    },
     currentScenario: (signal?: AbortSignal): Promise<CurrentScenarioResponse> =>
       requestJson('/api/scenarios/current', parseCurrentScenarioResponse, signal),
     applied: (signal?: AbortSignal): Promise<AppliedProgramSelection> =>
       requestJson('/api/program/applied', parseAppliedProgramSelection, signal),
     appliedStatus: (signal?: AbortSignal): Promise<AppliedProgramStatus> =>
       requestJson('/api/program/applied/status', parseAppliedProgramStatus, signal),
-    clearEmptyScene: (request: { request_id: string; request_owner_epoch: string; source_label: string;
-      correlation_id: null; expected_admission_generation: number; clear_empty_scene: true;
-      expected_applied_record_digest: null; expected_publication_generation: number }, signal?: AbortSignal): Promise<SceneClearStatus | null> =>
-      requestJson('/api/program/scene-preparations', parseSceneClearStatus, signal,
-        { method: 'POST', body: JSON.stringify(request) }),
     /** Advisory, effect-free preview of one held motion node (D4). */
     nodeCorrectionPreview: (
       request: ProgramNodeCorrectionPreviewRequest,
@@ -1351,28 +1117,6 @@ export const api = {
     ),
   },
   manager: {
-    prepareCanonicalEmpty: (body: Record<string, unknown>): Promise<Record<string, unknown>> => requestJson(
-      '/api/activation-preparations', (value) => {
-        const envelope = parseObjectResponse(value);
-        if (Object.keys(envelope).length !== 1 || !Object.hasOwn(envelope, 'prepared_activation')) {
-          throw new Error('activation preparation must contain only prepared_activation');
-        }
-        parsePreparedActivationInput(envelope.prepared_activation, 'preparedActivation');
-        return parseObjectResponse(envelope.prepared_activation);
-      }, undefined,
-      { method: 'POST', body: JSON.stringify(body) },
-    ),
-    previewCandidate: (body: Record<string, unknown>): Promise<import('../types/api').ManagerDeploymentCandidatePreviewResponse> => requestJson(
-      '/api/manager/deployment-candidates/preview', parseManagerDeploymentCandidatePreviewResponse, undefined,
-      { method: 'POST', body: JSON.stringify(body) },
-    ),
-    applyCandidate: (body: Record<string, unknown>): Promise<import('../types/api').ManagerApplyResponse> => requestJson(
-      '/api/manager/apply', parseManagerApplyResponse, undefined,
-      { method: 'POST', body: JSON.stringify(body) },
-    ),
-    canonicalEmptySelection: (signal?: AbortSignal): Promise<CanonicalEmptySelection> => requestJson(
-      '/api/manager/canonical-empty-selection', parseCanonicalEmptySelection, signal,
-    ),
     status: (signal?: AbortSignal): Promise<ManagerStatusProjection> => requestJson(
       '/api/manager/status',
       parseManagerStatusProjection,
@@ -1553,33 +1297,6 @@ export const api = {
     ),
   },
   execution: {
-    /** Read one accepted manual valve operation; a read never retries its effect. */
-    readManualValveOperation: (
-      operationId: string,
-      intent: ManualValveIntent,
-      componentId: string,
-      commandTargetId: string,
-      signal?: AbortSignal,
-    ): Promise<OperationObservation> => requestJson(
-      `/api/execution/operations/${encodeURIComponent(operationId)}`,
-      (value) => {
-        const observation = parseOperationObservation(value);
-        const envelope = value as Record<string, unknown>;
-        const operation = envelope.operation as Record<string, unknown>;
-        const participant = (operation.participants as Array<Record<string, unknown>>)[0];
-        if (envelope.owner_epoch !== intent.request_context.request_owner_epoch
-          || operation.program_binding_id !== intent.program_binding_id
-          || operation.program_run_id !== intent.program_run_id
-          || observation.operationId !== operationId
-          || participant.capability_id !== intent.participants[0].required_capability_id
-          || participant.payload_kind !== 'capability_command'
-          || observation.controllableComponentId !== componentId
-          || observation.commandTargetId !== commandTargetId) {
-          throw new Error('The valve operation observation does not match the accepted command.');
-        }
-        return observation;
-      }, signal,
-    ),
     /** Read one bound boolean signal (`query_target` kind `io_signal`); no effect. */
     readIoSignal: (selector: IoSignalSelector, signal?: AbortSignal): Promise<IoSignalReading> =>
       requestJson(
@@ -1613,112 +1330,6 @@ export const api = {
         parseExecutionIdentity,
         signal,
       ),
-    stopFault: (signal?: AbortSignal): Promise<StopFaultRecoveryOffer | null> =>
-      requestJson(
-        '/api/execution/stop-fault',
-        parseStopFaultRecoveryOffer,
-        signal,
-      ),
-    /**
-     * Recover cell: one Headless composite. It acknowledges open component
-     * incidents, waits briefly for the cell latch, and clears it with the
-     * owners' current identities. The browser sends its request ID and,
-     * when it showed them, the open incident IDs (M6, item 36): an incident
-     * not shown refuses the press `cclc_incident_changed`. `replayOnly`
-     * (an automatic resend after an HTTP timeout) never starts a press: an
-     * ID Headless no longer holds answers an unknown outcome.
-     */
-    cellRecover: (
-      requestId: string,
-      expectedIncidentIds?: readonly string[] | null,
-      signal?: AbortSignal,
-      replayOnly = false,
-    ): Promise<CellRecoverResult> =>
-      requestJson(
-        '/api/execution/cell-recover',
-        (value) => parseCellRecoverResult(value, requestId),
-        signal,
-        {
-          method: 'POST',
-          body: JSON.stringify({
-            request_context: {
-              request_id: requestId,
-              source_label: 'composer_ui',
-              correlation_id: null,
-            },
-            ...(expectedIncidentIds == null
-              ? {} : { expected_incident_ids: [...expectedIncidentIds] }),
-            ...(replayOnly ? { replay_only: true } : {}),
-          }),
-        },
-      ),
-    /**
-     * SX-679: abort the running Recover cell press. Headless starts no later
-     * step; the step in flight settles and the press answers
-     * `cell_recover_aborted`. With none running it throws
-     * `cell_recover_not_running`.
-     */
-    cellRecoverAbort: (requestId: string, signal?: AbortSignal): Promise<void> =>
-      requestJson(
-        '/api/execution/cell-recover/abort',
-        () => undefined,
-        signal,
-        {
-          method: 'POST',
-          body: JSON.stringify({
-            request_context: { request_id: requestId, source_label: 'composer_ui', correlation_id: null },
-          }),
-        },
-      ),
-    /**
-     * Item 37: one step of an operator Force close. `stop` sends the cell Full
-     * Stop and returns only once the Kernel confirms it; `close_operations`
-     * moves the resident operations into history and records the History row.
-     * A refusal throws with its typed code. One send per step, never replayed.
-     */
-    forceClose: (request: ForceCloseRequest, signal?: AbortSignal): Promise<ForceCloseResult> =>
-      requestJson(
-        '/api/execution/force-close',
-        (value) => parseForceCloseResult(value, request.step),
-        signal,
-        { method: 'POST', body: JSON.stringify(request) },
-      ),
-    /** Latched global rules' recovery offers from the same stop-fault read (SX-2206). */
-    globalRuleRecoveryOffers: (signal?: AbortSignal): Promise<GlobalRuleRecoveryOffer[]> =>
-      requestJson('/api/execution/stop-fault', parseGlobalRuleRecoveryOffers, signal),
-    /**
-     * Clear one latched global rule with the offer's exact selector. One send
-     * per operator action: an unknown outcome is reported, never replayed.
-     */
-    clearGlobalRuleLatch: (
-      ownerEpoch: string,
-      requestId: string,
-      offer: GlobalRuleRecoveryOffer,
-      signal?: AbortSignal,
-    ): Promise<GlobalRuleRecoveryResult> => {
-      // The sent selector, snapshotted: its reply must echo exactly its rule
-      // and context (SX-2216).
-      const selector = { ...offer.selector, context: { ...offer.selector.context } };
-      return requestJson(
-        '/api/execution/stop-fault/recover',
-        (value) => parseGlobalRuleRecoveryResult(value, requestId, selector),
-        signal,
-        {
-          method: 'POST',
-          body: JSON.stringify({
-            kind: 'global_io_rule',
-            request_context: {
-              request_id: requestId,
-              request_owner_epoch: ownerEpoch,
-              source_label: 'composer_ui',
-              correlation_id: null,
-            },
-            selector,
-            reason: 'operator cleared global rule latch',
-          }),
-        },
-      );
-    },
     runtimeScaleControl: (
       selector: RuntimeScaleControlSelector,
       signal?: AbortSignal,

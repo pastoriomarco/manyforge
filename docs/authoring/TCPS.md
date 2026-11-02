@@ -44,14 +44,14 @@ Each robot keeps its Active TCP while it is known:
 
 | Event | Active TCP |
 | --- | --- |
-| Enable (also after Disable, and in **Recover cell**) | Kept. With **Send TCP offset to controller** selected, the controller is re-synced to the Active TCP, or offset 0 if there is none; with it off, Enable sends offset 0 (the flange) if needed. |
-| Execute; Reset without **Reload initial scene**; Stop, Resume, Retry and recovery after a Stop fault | Kept |
+| Enable (also after Disable) | Kept. With **Send TCP offset to controller** selected, the controller is re-synced to the Active TCP, or offset 0 if there is none; with it off, Enable sends offset 0 (the flange) if needed. |
+| Execute; Reset without **Reload initial scene**; Stop, Resume, Retry; Recover | Kept |
 | A controller power cycle or vendor fault | Kept; the next Enable re-syncs the controller |
 | A move whose TCP selector is a default TCP or a specific TCP; Set TCP; a selection in Robot Control | Set to that TCP |
 | A move that replaces a running move | Never changed |
 | Reset with **Reload initial scene**; **Reset simulation** (`simulation.reset`) | Reset to the End-effector TCP, or none if there is no End-effector TCP |
 | An external Isaac world reload | Not observed by ManyForge; it does not reset the Active TCP. Use `simulation.reset` for a reset ManyForge observes. |
-| A workbench restart, a robot process restart, Close and Load, an Apply that restarts the robot, a Deployment change that removes the Active TCP | Starts again at the End-effector TCP, or none if there is no End-effector TCP |
+| A workbench restart, a robot process restart, New and Load, an Apply that restarts the robot, a Deployment change that removes the Active TCP | Starts again at the End-effector TCP, or none if there is no End-effector TCP |
 
 A robot without an End-effector TCP has no initial Active TCP. Robot Control
 shows "No End-effector TCP; choose one"; joint jog remains available, and
@@ -124,8 +124,9 @@ consistent is the Program's job: ManyForge plans and checks every move
 planning node. The pick-and-place template gives the planner and its moves the
 same selector (normally **Current**); you can change both.
 
-**Legacy Program conversion.** In the M7 conversion, an old `{robot, tcp}`
-becomes **Current** only when that moving robot's Program uses no other TCP.
+**Legacy Program conversion.** When an older Program is opened, an old
+`{robot, tcp}` becomes **Current** only when that moving robot's Program uses
+no other TCP.
 This is checked per moving robot; another robot's TCPs do not make it
 ambiguous. If the same robot uses another TCP too, Load is refused with a
 typed reason naming each affected move and asking you to choose its TCP. The
@@ -145,6 +146,39 @@ composed `tcp`, binding refuses it; open it in Composer and choose the attach
 frame. A concurrent external Apply during Program Open can change holder
 frames after the conversion reads them; the Active TCP holder check still
 applies when Attach runs.
+
+## TCP speed limit
+
+Every move is limited at its TCP, the robot's Active TCP during the move
+(TCP-1): ManyForge sets that TCP on the robot, so it checks no other frame,
+the flange included. The limit is the robot row's TCP ceiling
+(`target_settings.arm.maximum_tcp_linear_speed_mps`); a move's own
+`max_tcp_linear_speed_mps` can only lower it. Keep the ceiling at or below the
+vendor TCP speed limit (`limits.max_tcp_linear_speed_mps` in the robot's
+`component.yaml`); `scripts/manyforge component check --scenario` refuses a
+ceiling above it ([Adding a component](ADDING_A_COMPONENT.md#descriptor-fields)).
+
+- **Joint moves and time-optimal Cartesian moves** are timed by TOPP-RA with
+  the TCP held at 0.98 of the limit at each point of its grid. A check of the
+  trajectory's samples follows; when one is above the limit, the whole
+  trajectory is slowed back to the 0.98 target. Speed between samples is not
+  measured; the robot's own safety controller covers it.
+- **Constant-speed Cartesian moves** run at 0.98 of the limit and are
+  certified over the whole trajectory before they are sent.
+
+The controller applies its own TCP speed limit at the TCP it was sent; with
+**Send TCP offset to controller** off, that is the flange
+([below](#the-controllers-tcp-offset)).
+
+## TCPs and Apply
+
+Choosing a component's default TCP (the Deployment row's `default_tcp`, on
+the component page's **Default TCP and primary tool** card) is cell context: an Apply that changes only the default refreshes it without
+restarting the robot. A custom TCP is part of
+the component's model, so adding, changing or removing one replaces the
+component at Apply (preview reason `description`), and a robot carrying that
+tool too when the tool runs no process of its own. A replaced robot's Active
+TCP starts again at its End-effector TCP.
 
 ## Robot Control
 
@@ -174,12 +208,13 @@ An **Attach object** node names the holder (for example the gripper) and the
 frame the part is attached to: one of the holder's frames, or **Active TCP**.
 The Active TCP is resolved when Attach runs and is accepted only when it is
 one of the holder's own TCPs; otherwise the attach is refused with "Active
-TCP is not on this tool" (`attach_active_tcp_not_holder`). A later Active TCP
+TCP is not on the holder" (`attach_active_tcp_not_holder`). A later Active TCP
 change does not retarget an existing attachment. Detach and grasp-lost
 handling do not change.
 
 On a Real xArm, the host follows its current Scene projection for total
-payload. A successful projection transaction or rebuild prompts an update on
+payload and sends it through the xArm adapter's tool-context hook
+(`ApplyToolContext`), the same call that sends TCP offsets. A successful projection transaction or rebuild prompts an update on
 enabled robots, including while they move. When the total changes, it uses
 `set_tcp_load` without sending a TCP offset or re-arming the controller. An
 object without a declared payload, or with payload 0, does not change the total.

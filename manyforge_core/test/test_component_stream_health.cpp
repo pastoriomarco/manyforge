@@ -154,6 +154,25 @@ TEST_F(ComponentStreamHealthTest, AbsentIsClassifiedAfterOneBudget) {
   EXPECT_FALSE(Row("arm").acknowledgement_required);
 }
 
+TEST_F(ComponentStreamHealthTest, AFirstSampleClassifiedAfterItsBudgetIsStale) {
+  // The Monitoring lane runs late: the only sample is past its budget when classified.
+  auto fault = Declare("a", Stream("s", StreamSeverityDTO::kFault, StreamRecoveryDTO::kAuto));
+  auto warning = Declare("c", Stream("s", StreamSeverityDTO::kWarning, StreamRecoveryDTO::kAuto));
+  fault->Record(1);
+  warning->Record(1);
+  Advance(100 * kMs);
+  EXPECT_EQ(Row("a").state, StreamLivenessStateDTO::kStale);
+  ASSERT_TRUE(verdicts_["a"].fault_loss);
+  EXPECT_EQ(verdicts_["a"].fault_loss->code, kComponentStreamStaleCode);
+  EXPECT_EQ(Row("c").state, StreamLivenessStateDTO::kStale);
+  EXPECT_FALSE(verdicts_.contains("c"));
+  // The next sample in time is live again.
+  fault->Record(2);
+  Run();
+  EXPECT_EQ(Row("a").state, StreamLivenessStateDTO::kLive);
+  EXPECT_TRUE(verdicts_["a"].empty());
+}
+
 TEST_F(ComponentStreamHealthTest, SeverityDecidesTheVerdict) {
   auto fault = Declare("a", Stream("s", StreamSeverityDTO::kFault, StreamRecoveryDTO::kAck));
   auto blocking = Declare("b", Stream("s", StreamSeverityDTO::kBlocking, StreamRecoveryDTO::kAuto));

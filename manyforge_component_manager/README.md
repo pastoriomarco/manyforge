@@ -18,7 +18,7 @@ Composable Cell Component Manager. It currently owns these bounded mechanisms:
   convergence coordinator, Scene maintenance initialization and selected-bundle
   completion coordinators;
 - closed concrete Linux/POSIX adapters for the exact I3-qualified reference
-  and native runtime products, including direct-child epoch observation and a
+  and execution host products, including direct-child epoch observation and a
   private transport-neutral scene-projection resolver; and
 - active-plan reconstruction plus dependency-ordered steady-state
   reconciliation and explicit reverse-order shutdown.
@@ -146,7 +146,7 @@ reused or silently replaced. An exact duplicate write replays the original
 record, while a different payload or stale first-time acceptance fails closed.
 It stores no arbitrary event bytes, mutable generic phase, Apply transaction,
 active alias, or effect command. Its initial resource envelope is at most 64
-attempts, 64 canonical native-runtime bindings per attempt, 256
+attempts, 64 canonical execution-host bindings per attempt, 256
 printable-ASCII bytes per identity, and a 64 MiB main database page image.
 
 The Apply journal stores the exact immutable named transaction and predecessor
@@ -190,12 +190,12 @@ coordinator admits only the build-qualified retained POSIX reference product;
 unsupported external or replacement products fail before fence or process
 effects.
 
-`ManagerSceneInitializationCoordinator` binds the complete durable
-staged-ready set to one Scene-owned maintenance initialization. Scene captures
-the authoritative logical snapshot, closes writes and leases, and performs
-fresh native initialization without exposing per-projection recovery progress.
-`ManagerSelectedBundleTransitionCoordinator` then verifies and privately binds
-the selected bundle, compare-and-swap publishes the public pointer, and asks
+Scene stages the candidate's planning projections. The Manager then sends the
+execution host its one Apply call (`HostApplyRequest`, CONTRACTS §15): the
+host refuses an enabled replaced or removed component, stops removed and
+replaced components and installs the candidate. The Manager records the private
+materialization, Scene begins the adoption, and
+`ManagerSelectedBundleTransitionCoordinator` verifies the selected bundle, compare-and-swap publishes the public pointer, and asks
 Scene to complete the exact initialized operation. The admitted idle
 maintenance path has already stopped and proven absence of the previous
 Manager-owned runtime, so no live-to-live retirement phase remains.

@@ -298,97 +298,43 @@ parse_prepared_activation_program_outcome(const CanonicalValue &prepared) {
   }
 }
 
-PreparedActivationOrigin
+PreparedScenarioOrigin
 parse_prepared_activation_origin(const CanonicalValue &value) {
-  const auto &kind = text(member(value, "kind"), "origin.kind");
-  if (kind == "scenario") {
-    require_exact_fields(
-        value,
-        {"kind", "scenario_id", "source_document_digest", "project_path"},
-        "origin");
-    const auto &scenario = text(member(value, "scenario_id"), "origin.scenario_id");
-    if (scenario.size() > 256U) fail("prepared activation origin scenario_id exceeds its bound");
-    const auto &source = text(member(value, "source_document_digest"), "origin.source_document_digest");
-    require_digest(source, "origin.source_document_digest");
-    const auto &project =
-        text(member(value, "project_path"), "origin.project_path");
-    const std::filesystem::path path(project);
-    if (project.size() > 4096U || project.find('\0') != std::string::npos ||
-        !path.is_absolute() ||
-        path.lexically_normal().generic_string() != project ||
-        (project.size() > 1U && project.back() == '/'))
-      fail("prepared activation origin project_path must be a bounded "
-           "normalized absolute folder");
-    return PreparedScenarioOrigin{scenario, core::ContentDigest(source),
-                                  project};
-  }
-  if (kind != "sealed_canonical_empty") fail("prepared activation origin kind is unsupported");
-  require_exact_fields(value, {"kind", "cell_id", "deployment_artifact_id", "deployment_revision",
-                             "retained_bundle_id", "graph_revision", "admission_digest"}, "origin");
-  const auto identity = [&](std::string_view name) -> const std::string & {
-    const auto &result = text(member(value, name), std::string("origin.") + std::string(name));
-    try {
-      detail::require_retained_portable_identity(result, std::string("origin.") + std::string(name));
-    } catch (const std::exception &error) {
-      fail(error.what());
-    }
-    return result;
-  };
-  const auto digest = [&](std::string_view name) -> const std::string & {
-    const auto &result = text(member(value, name), std::string("origin.") + std::string(name));
-    require_digest(result, std::string("origin.") + std::string(name));
-    return result;
-  };
-  return PreparedSealedCanonicalEmptyOrigin{
-      core::CellId(identity("cell_id")), core::DeploymentArtifactId(identity("deployment_artifact_id")),
-      core::DeploymentRevision(digest("deployment_revision")), core::RetainedBundleId(digest("retained_bundle_id")),
-      core::GraphRevision(digest("graph_revision")), core::ContentDigest(digest("admission_digest"))};
+  if (text(member(value, "kind"), "origin.kind") != "scenario")
+    fail("prepared activation origin kind is unsupported");
+  require_exact_fields(
+      value,
+      {"kind", "scenario_id", "source_document_digest", "project_path"},
+      "origin");
+  const auto &scenario = text(member(value, "scenario_id"), "origin.scenario_id");
+  if (scenario.size() > 256U) fail("prepared activation origin scenario_id exceeds its bound");
+  const auto &source = text(member(value, "source_document_digest"), "origin.source_document_digest");
+  require_digest(source, "origin.source_document_digest");
+  const auto &project =
+      text(member(value, "project_path"), "origin.project_path");
+  const std::filesystem::path path(project);
+  if (project.size() > 4096U || project.find('\0') != std::string::npos ||
+      !path.is_absolute() ||
+      path.lexically_normal().generic_string() != project ||
+      (project.size() > 1U && project.back() == '/'))
+    fail("prepared activation origin project_path must be a bounded "
+         "normalized absolute folder");
+  return PreparedScenarioOrigin{scenario, core::ContentDigest(source),
+                                project};
 }
 
-bool prepared_receipt_is_canonical_empty_candidate(
-    const CanonicalValue &prepared_receipt, const core::CellId &cell_id,
-    const core::RetainedBundleId &candidate_retained_bundle_id,
-    const core::GraphRevision &candidate_graph_revision) noexcept {
-  try {
-    const auto *origin_value = prepared_receipt.find_object_member("origin");
-    if (origin_value == nullptr) return false;
-    const auto origin = parse_prepared_activation_origin(*origin_value);
-    const auto *sealed = std::get_if<PreparedSealedCanonicalEmptyOrigin>(&origin);
-    return sealed != nullptr && sealed->cell_id == cell_id &&
-           sealed->retained_bundle_id == candidate_retained_bundle_id &&
-           sealed->graph_revision == candidate_graph_revision;
-  } catch (...) {
-    return false;
-  }
-}
-
-CanonicalValue prepared_activation_origin_value(const PreparedActivationOrigin &origin) {
-  if (const auto *scenario = std::get_if<PreparedScenarioOrigin>(&origin))
-    return CanonicalValue(CanonicalValue::Object{
-        {"kind", CanonicalValue("scenario")},
-        {"scenario_id", CanonicalValue(scenario->scenario_id)},
-        {"source_document_digest",
-         CanonicalValue(scenario->source_document_digest.value())},
-        {"project_path", CanonicalValue(scenario->project_path)}});
-  const auto &sealed = std::get<PreparedSealedCanonicalEmptyOrigin>(origin);
+CanonicalValue prepared_activation_origin_value(const PreparedScenarioOrigin &origin) {
   return CanonicalValue(CanonicalValue::Object{
-      {"kind", CanonicalValue("sealed_canonical_empty")}, {"cell_id", CanonicalValue(sealed.cell_id.value())},
-      {"deployment_artifact_id", CanonicalValue(sealed.deployment_artifact_id.value())},
-      {"deployment_revision", CanonicalValue(sealed.deployment_revision.value())},
-      {"retained_bundle_id", CanonicalValue(sealed.retained_bundle_id.value())},
-      {"graph_revision", CanonicalValue(sealed.graph_revision.value())},
-      {"admission_digest", CanonicalValue(sealed.admission_digest.value())}});
-}
-
-core::ContentDigest sealed_canonical_empty_capture_digest(const PreparedSealedCanonicalEmptyOrigin &origin) {
-  return core::ContentDigest(sha256_digest(canonical_json(CanonicalValue(CanonicalValue::Object{
-      {"schema_version", CanonicalValue("manyforge.sealed_canonical_empty_capture.v1")},
-      {"origin", prepared_activation_origin_value(origin)}}))));
+      {"kind", CanonicalValue("scenario")},
+      {"scenario_id", CanonicalValue(origin.scenario_id)},
+      {"source_document_digest",
+       CanonicalValue(origin.source_document_digest.value())},
+      {"project_path", CanonicalValue(origin.project_path)}});
 }
 
 PreparedActivationInput::PreparedActivationInput(
     core::ContentDigest prepared_activation_id,
-    PreparedActivationOrigin origin,
+    PreparedScenarioOrigin origin,
     core::ContentDigest captured_input_digest,
     core::DeploymentArtifactId deployment_artifact_id,
     core::DeploymentRevision deployment_revision,
@@ -627,19 +573,6 @@ parse_prepared_activation_input(const CanonicalValue &value) {
   if ((assistant_mode == "required" && !assistant_available) ||
       (assistant_mode == "forbidden" && assistant_available)) {
     fail("prepared activation assistant mode differs from retained contents");
-  }
-
-  if (const auto *sealed = std::get_if<PreparedSealedCanonicalEmptyOrigin>(&origin)) {
-    if (!no_program || assistant_mode != "optional" ||
-        sealed->cell_id != bundle->value().cell_graph.cell_id ||
-        sealed->deployment_artifact_id != bundle->value().deployment_artifact_id ||
-        sealed->deployment_revision != bundle->value().deployment_revision ||
-        sealed->retained_bundle_id != bundle->retained_bundle_id() ||
-        sealed->graph_revision != bundle->value().cell_graph.graph_revision ||
-        sealed_canonical_empty_capture_digest(*sealed).value() != captured_digest ||
-        !bundle->value().cell_graph.controllable_components.empty() ||
-        !bundle->value().cell_graph.model_instances.empty() || model_map.has_value())
-      fail("sealed canonical-empty origin differs from its exact no_program candidate capture");
   }
 
   VerifiedPreparedActivationClosure closure{

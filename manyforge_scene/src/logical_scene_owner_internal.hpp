@@ -344,7 +344,7 @@ struct MaintenanceInitializationState final {
   ProjectionRevisionDTO predecessor;
   ProjectionRevisionDTO target;
   LogicalSceneSnapshotDTO authoritative_snapshot;
-  std::vector<core::ProjectionNativeRuntimeBindingDTO> bindings;
+  std::vector<core::ProjectionExecutionHostBindingDTO> bindings;
   std::optional<ProjectionMaintenanceInitializationState> result_state;
   std::optional<ErrorDTO> first_error;
   bool effects_unknown{};
@@ -363,8 +363,8 @@ struct DurableState final {
   std::vector<MigratedStructuralCompletionState> migrated_structural_completions;
   std::optional<ProjectionRevisionDTO> active_projection;
   std::optional<LogicalSceneSnapshotDTO> active_scene_snapshot;
-  std::vector<core::ProjectionNativeRuntimeBindingDTO>
-      active_native_runtime_bindings;
+  std::vector<core::ProjectionExecutionHostBindingDTO>
+      active_execution_host_bindings;
   bool legacy_native_effects_uncertain{};
   std::vector<MaintenanceInitializationState> maintenance_initializations;
   bool projection_desynchronized{};
@@ -398,8 +398,8 @@ AccessStatus(const DurableState &state);
 /// Returns the exact Scene-owned current native binding set. A maintenance
 /// completion supplies the complete set; only a pre-UA4 store falls back to
 /// its immutable migration snapshot.
-[[nodiscard]] std::vector<core::ProjectionNativeRuntimeBindingDTO>
-ActiveNativeRuntimeBindings(const DurableState &state);
+[[nodiscard]] std::vector<core::ProjectionExecutionHostBindingDTO>
+ActiveExecutionHostBindings(const DurableState &state);
 
 struct StoredSceneOutcome final {
   std::string request_owner_epoch;
@@ -500,6 +500,12 @@ SceneTransactionStoreState
 ReadSceneTransactionStoreState(sqlite3 *database,
                                const DurableState &durable_state);
 
+/// Prunes the resident Scene ledger behind a checkpoint of the settled head.
+/// `maintenance_fold` admits a non-full ledger and a closed maintenance window.
+void CompactSceneTransactionHistory(
+    sqlite3 *database, const DurableState &durable_state,
+    const SceneTransactionStoreState &transactions, bool maintenance_fold);
+
 ErrorDTO SceneError(const std::string_view code, const std::string_view message,
                     std::map<std::string, std::string> details = {});
 
@@ -557,7 +563,7 @@ struct RequiredSceneProjection final {
 };
 
 [[nodiscard]] RequiredSceneProjection ResolveRequiredProjection(
-    const core::ProjectionNativeRuntimeBindingDTO &binding,
+    const core::ProjectionExecutionHostBindingDTO &binding,
     const core::IPlannerSceneProjectionResolver *resolver,
     const ProjectionRevisionDTO &selected_revision);
 

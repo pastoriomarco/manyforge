@@ -33,27 +33,119 @@ takes a while; later starts are incremental.
 `build` prepares the pinned RoboPlan sources under `.docker/`
 (`scripts/setup-docker.sh --prepare-only`), then builds
 `Dockerfile.ros-lyrical-full` through the `ros-jazzy-full` Compose service into
-the image `manyforge-ros-lyrical-full`. It works on x86_64 and arm64; on a
-Jetson it selects NVIDIA's `noble-jetpack` package suite automatically. Plan
-for well over half an hour on a first build: on a 14-core arm64 Jetson with
-the ROS and Python layers already cached it took about 19 minutes; the
+the image `manyforge-ros-lyrical-full`. It works on x86_64 and arm64. The build
+argument `NVIDIA_ISAAC_ROS_RELEASE_SUITE` selects NVIDIA's ROS package suite:
+`noble` on x86_64, `noble-jetpack` on a Jetson (Thor, Orin). `build` picks
+`noble-jetpack` by itself when `/etc/nv_tegra_release` exists; export the
+variable to override it. Building the image by hand needs the same argument:
+
+```bash
+./scripts/setup-docker.sh --prepare-only
+docker build --build-arg NVIDIA_ISAAC_ROS_RELEASE_SUITE=noble-jetpack \
+  -f Dockerfile.ros-lyrical-full -t manyforge-ros-lyrical-full .
+```
+
+Plan for well over half an hour on a first build: on a 14-core arm64 Jetson
+with the ROS and Python layers already cached it took about 19 minutes; the
 resulting image is about 5.4 GB.
 
-The one image serves every lane (Mock, Isaac, Real). It contains ROS 2
-Lyrical, the pinned controller overlay (stock joint_trajectory_controller
-6.10.0 with realtime_tools 5.4.0 and ros2_control_cmake 1.0.0), `ur_msgs`
-2.6.0 and the UFactory xArm driver. The driver package covers xArm 5/6/7,
-Lite 6 and UF850. Lite 6 is the supported Real model; physical execution
-is not yet qualified and requires attended robot sessions. The Real lane needs
-no extra install step.
+The one image serves every lane. It contains ROS 2 Lyrical, the pinned
+controller overlay (stock joint_trajectory_controller 6.10.0 with
+realtime_tools 5.4.0 and ros2_control_cmake 1.0.0), `topic_based_ros2_control`
+for Isaac, and the UFACTORY xArm driver. The driver comes from the fork
+`https://github.com/pastoriomarco/xarm_ros2`, branch `lyrical-no-gazebo`
+(upstream `lyrical` plus the `xarm_io_states` topic and the `system_control`
+service, Gazebo removed), pinned by `XARM_SOURCE_COMMIT` in the Dockerfile and
+`manyforge_xarm_control/vendor/driver.yaml`. It covers xArm 5/6/7, Lite 6 and
+UF850. The Real lane needs no extra install step.
 
-Isaac Sim is not part of this image. Start Isaac Sim yourself and open the
-scene; the workbench then attaches to it (attach-only) from this same
-container. No separate Isaac control container is used.
+### Lanes
 
-To use another tag, set `MANYFORGE_ROS_FULL_IMAGE` for both `build` and
-`start`; `MANYFORGE_DEV_IMAGE` selects an already built image for `start`
-only.
+Each component of a Deployment runs on one lane. All three lanes run
+ros2_control with the stock joint trajectory controller, in the same
+container:
+
+- **Mock**: ROS 2 mock hardware; no simulator or robot.
+- **Isaac**: a scene open in Isaac Sim on this or another machine. Isaac Sim is
+  not part of the image and the workbench does not start it, open a stage or
+  load a world. Start Isaac Sim, open the scene with its ROS 2 bridge and the
+  ROS 2 Simulation Interfaces services (`simulation_interfaces`), then Load
+  the Scenario. ManyForge reaches it over DDS (see
+  [ROS and DDS](#ros-and-dds)).
+- **Real**: a UFACTORY xArm-family robot on the LAN, addressed through the
+  site settings ([Real robot setup](REAL_ROBOT_SETUP.md)). Lite 6 is the model
+  measured on hardware; physical execution is not qualified and needs
+  attended sessions.
+
+A UFACTORY robot is a machine: the owner component carries the lane, and every
+member (arm, controller I/O, tool I/O) runs on its owner's lane.
+
+### Environment variables
+
+Export them in the shell that runs `./scripts/compose-dev.sh`; `start` reads
+them once, when it creates the container.
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `MANYFORGE_DEV_IMAGE` | `manyforge-ros-lyrical-full` (or `MANYFORGE_ROS_FULL_IMAGE`) | Image that `start` runs. |
+| `MANYFORGE_ROS_FULL_IMAGE` | `manyforge-ros-lyrical-full` | Image tag that `build` writes and `start` runs; set it for both. |
+| `NVIDIA_ISAAC_ROS_RELEASE_SUITE` | `noble`, or `noble-jetpack` on a Jetson | NVIDIA package suite for `build`. |
+| `MANYFORGE_DEV_CACHE_BASE` | `<checkout>/.manyforge-dev` | Build, npm, state and runtime caches. |
+| `MANYFORGE_DEV_RUNTIME_STATE_ROOT` | `<cache base>/runtime/<container name>` | Absolute host path of the runtime state root. |
+| `MANYFORGE_DEV_SITE_SETTINGS` | unset | Absolute host path of the [site settings](#site-settings) file. |
+| `MANYFORGE_DEV_CONTAINER_NAME` | `manyforge-development-workbench` | Container name; use it for diagnosis too. |
+| `MANYFORGE_DEV_BUILD_JOBS` | CPU count, at most 8 | Parallel C++ build jobs at start; lower it if compilation runs out of memory. |
+| `MANYFORGE_DEV_START_TIMEOUT_SECONDS` | `900` | How long `start` waits for readiness. |
+| `ROS_DOMAIN_ID`, `ROS_AUTOMATIC_DISCOVERY_RANGE`, `ROS_STATIC_PEERS`, `RMW_IMPLEMENTATION` | ROS defaults (domain 0, `SUBNET`) | DDS topology; see [ROS and DDS](#ros-and-dds). |
+| `MANYFORGE_AI_*` | unset | Tokens for `ai_model` components, forwarded by name ([assistant cookbook](ASSISTANT_E2E_COOKBOOK.md)). |
+| `MANYFORGE_MOTION_TRACE_DIR` | `/tmp/manyforge-state/motion-traces` | Motion-trace snapshots for the debug export, in a capped store; empty keeps traces inline ([Reference](#reference)). |
+
+### Site settings
+
+Machine facts live in one JSON file, `manyforge.site.v1`, never in a
+Scenario: robot addresses (`device_addresses`) and the host project folders
+shown in Composer (`project_folders`). For example:
+
+```json
+{"schema":"manyforge.site.v1","device_addresses":{"lite6_main":"192.168.1.31"},"project_folders":["/home/USER/Projects"]}
+```
+
+`schema` is required; `device_addresses` and `project_folders` are optional;
+no other field is accepted. A Scenario names a `device_addresses` key (for
+example `lite6_main`), never the address. Set `MANYFORGE_DEV_SITE_SETTINGS`
+to the file's absolute host path before `start`. The file is read when the
+workbench starts: after editing it, `stop` and `start` again. `start` refuses
+a relative path, a missing file and an invalid file (see
+[Site file errors](TROUBLESHOOTING.md#site-file-errors)). Example:
+[`../examples/site/manyforge.site.example.json`](../examples/site/manyforge.site.example.json).
+
+### ROS and DDS
+
+The container uses the host network, so DDS sees the host's interfaces. The
+launcher passes `ROS_DOMAIN_ID`, `RMW_IMPLEMENTATION`,
+`ROS_AUTOMATIC_DISCOVERY_RANGE`, `ROS_STATIC_PEERS`, the Fast DDS and Cyclone
+DDS profile variables (`FASTRTPS_DEFAULT_PROFILES_FILE`,
+`FASTDDS_DEFAULT_PROFILES_FILE`, `ROS_DISCOVERY_SERVER`, `ROS_SUPER_CLIENT`,
+`CYCLONEDDS_URI`) into the container unchanged, and only when they are set.
+
+- `ROS_DOMAIN_ID`: ROS uses 0 when it is unset. Isaac Sim, any other ROS
+  machine and the workbench must use the same domain.
+- `ROS_AUTOMATIC_DISCOVERY_RANGE`: leave it unset, or `SUBNET` (the ROS
+  default), when Isaac Sim or another ROS machine on the LAN must be reached.
+  `LOCALHOST` keeps discovery on this machine: use it to isolate a test
+  machine, or together with `ROS_STATIC_PEERS` listing every host to reach.
+- `FASTDDS_BUILTIN_TRANSPORTS`: the launcher sets `UDPv4` unless it is set,
+  so Fast DDS uses UDP loopback instead of shared memory. A shared-memory port
+  of a killed process (a hung `ros2_control_node` stopped by SIGKILL) stays
+  behind: long-lived processes keep writing into the old port, and a
+  replacement that takes its port never receives their requests. With
+  `ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST`, rmw_fastrtps always adds shared
+  memory and ignores this variable.
+- A DDS profile file must exist at the same path inside the container; a
+  host-only path does not become visible by exporting it.
+
+Configure the topology before `start`; a running container keeps the values it
+was started with.
 
 The launcher builds current C++ owners, the activation preparer and a small
 canonical-empty bootstrap from this checkout. It does not import a maintained
@@ -66,20 +158,11 @@ validated before activation.
 ### Project folders
 
 To use project folders outside the repository in Composer, list existing
-absolute host directories in the JSON `manyforge.site.v1` settings file. The
-same file can also contain robot `device_addresses`; keep those settings when
-adding folders. See the [site-file example](../examples/site/manyforge.site.example.json).
-For example, replace the path below with your own directory:
-
-```json
-{
-  "schema": "manyforge.site.v1",
-  "project_folders": ["/home/USER/Projects"]
-}
-```
-
-Set `MANYFORGE_DEV_SITE_SETTINGS` to the site's absolute file path before
-starting the workbench. Put projects in one of those host folders. Composer's
+absolute host directories under `project_folders` in the
+[site settings](#site-settings) file (keep its `device_addresses` when adding
+folders). Each folder must exist when the workbench starts; a path cannot
+contain `:`, a folder name cannot contain `,`, and a folder may be listed only
+once. Put projects in one of those host folders. Composer's
 Load, Save As and Export browsers show the bundled examples and each configured
 folder under `/projects/<folder name>`. For example, a project at
 `/home/USER/Projects/cell.scenario` appears as
@@ -118,11 +201,11 @@ For example, with the built image:
 
 ```bash
 ./scripts/compose-dev.sh start \
-  --bootstrap-project examples/isaac-ur10e-light-scene.scenario
+  --bootstrap-project examples/sim_ur10e_pick_and_place.scenario
 ```
 
 The image entrypoint supplies the ROS and Python environment, including the
-image's xArm driver, `ur_msgs` and controller overlays. Startup builds the
+image's xArm driver and controller overlays. Startup builds the
 mechanical ROS overlay and imports its setup into the service environment;
 Manager children inherit that environment. Optional: to add separately
 installed ROS dependencies on top of the image, set
@@ -132,36 +215,19 @@ the backend build and imports the application overlay last for services.
 Missing configured scripts fail startup with their exact path. Leave it unset
 with the image built above.
 
-Explicitly exported standard DDS
-inputs, including `ROS_DOMAIN_ID`, `RMW_IMPLEMENTATION`,
-`ROS_AUTOMATIC_DISCOVERY_RANGE` and `ROS_STATIC_PEERS`, pass into this container
-unchanged. Configure the selected topology before starting it. Exported DDS
-profile-file paths are preserved too; each referenced XML or other
-configuration file must exist at that path inside the container. A host-only
-absolute path does not become container-visible by exporting it.
-
 The ROS option runs with the launching host user's UID/GID and uses the
 image-keyed `/runner/home` and `/runner/build` bind mounts for writable home
 and build caches. The repository, caches and persistent state directories must
 be writable by that user before startup. This supports hosts whose UID differs
 from the full ROS image's development user.
 
-This option starts neither Isaac Sim nor its mechanical controller/bridge launch, and
-does not choose peers or load a simulator world. Those prerequisites remain
-separate, explicitly operated processes. Stop an existing Workbench before
-changing its selected runtime capabilities.
+The launcher does not start Isaac Sim, choose DDS peers or load a simulator
+world. Isaac object observers are pose-source components of the selected
+Deployment; the launcher needs no observer input.
 
-Isaac object observers are pose-source components of the selected Deployment;
-the launcher needs no observer input. The operator opens the Isaac scene;
-ManyForge attaches its inactive controller infrastructure.
-
-`examples/isaac-ur10e-light-scene.scenario` is an Isaac UR10e and gripper
-Scenario. Its explicit 0.25 m/s TCP ceiling is an example setting, not a default
-for a missing limit. Pose-source configuration is in the Deployment.
-
-Existing v1 authored Deployment files must be migrated explicitly: change their
-intent version to v2 and remove the authored `cell_id`. Do not remove cell IDs
-from compiled Deployment artifacts or rename existing runtime journals.
+`examples/sim_ur10e_pick_and_place.scenario` is an Isaac UR10e and Robotiq
+gripper Scenario. Its 0.5 m/s TCP ceiling is an example setting, not a default
+for a missing limit.
 
 ## Start, inspect, and stop
 
@@ -173,18 +239,16 @@ Run every command from the repository root.
    with no project for an empty authoring workspace:
 
    ```bash
-   ./scripts/compose-dev.sh start --project examples/ur5e_lite6_wall_workbench.scenario
+   ./scripts/compose-dev.sh start --project examples/mock_dual_arm_workbench.scenario
    ./scripts/compose-dev.sh start
    ```
 
-   `examples/ur5e_lite6_wall_workbench.scenario` is the editable everyday
-   UR5e + Lite6 Scenario; edit and Save it in Composer. It has its own
-   Scenario ID, so its stored persistent values and Applies are separate from
-   other Scenarios. Do not edit or Save
-   `examples/ur5e_lite6_wall_grouped.scenario` in Composer: it is a generated
-   qualification fixture that tests check byte for byte. Change it only through
-   its generator, `scripts/qualification/generate_ui6i_dual_robot_scenario.py
-   --update` (with the built Deployment and Program revision tools).
+   Example folder names start with their lane: `mock_`, `sim_` (Isaac) or
+   `real_`. `examples/mock_dual_arm_workbench.scenario` is the editable
+   everyday UR5e + Lite 6 Scenario; edit and Save it in Composer. It has its
+   own Scenario ID, so its stored persistent values and Applies are separate
+   from other Scenarios. Tests check the other examples, so Save As a copy
+   instead of saving over them.
 
    The project must be a folder containing `scenario.yaml` inside the
    repository's `examples/` folder, the only root startup accepts. Keep the
@@ -222,7 +286,7 @@ Scenario; no Activate, Execute or Reset is submitted automatically.
 
 Runtime owners use `current/` below the mounted state root. Before they start,
 the launcher atomically moves the previous `current/` into
-`previous-sessions/<session-id>/`, preserving all five journal families and
+`previous-sessions/<session-id>/`, preserving every journal and
 their WAL/SHM companions together. Archived files lose write permissions and
 are never passed to runtime owners. `history.sqlite3` and its companions stay
 at the stable state root; installation settings and persistent Program keys
@@ -257,9 +321,11 @@ execution host is up. They are expected and stop once the start reports ready:
 
 ### Reference
 
-To save motion-trace snapshots when exporting debug data, set
-`MANYFORGE_MOTION_TRACE_DIR=/tmp/manyforge-state/motion-traces` before starting.
-Leave it unset for no disk snapshots. The directory survives Workbench restarts;
+By default, `start` keeps motion-trace snapshots for debug exports in
+`/tmp/manyforge-state/motion-traces` (`MANYFORGE_MOTION_TRACE_DIR`). Set
+`MANYFORGE_MOTION_TRACE_DIR=` (empty) before starting for no disk snapshots;
+the export then carries the trace inline, newest goals first, bounded by the execution socket's send buffer (twice
+`net.core.wmem_max`, about 416 KiB at the Linux default). The directory survives Workbench restarts;
 files are limited to 3 MiB each and 64 MiB in total, with oldest-first eviction.
 These are snapshots of the bounded volatile window (16 goals, 1,024 controller
 samples), with explicit coverage and omission counts, not complete Run journals.
@@ -316,7 +382,7 @@ replace the same `.legacy-<container-id>.partial` folder with a matching
 receipt instead of accumulating full-state partial copies. Unknown historical
 partials remain protected. The legacy export path can be removed once an inventory confirms that no unmounted containers remain.
 
-Q99 runs one bounded retention pass before a new container starts and after a
+The launcher runs one bounded retention pass before a new container starts and after a
 confirmed stop, after checking that no running, paused or restarting container
 has an overlapping bind. A root flock serializes session selection and service
 ownership; the mount inspection is a point-in-time check. Selected roots may have symlinked
@@ -358,12 +424,9 @@ creation timestamp. At most eight eligible
 deletion attempts run per pass; a failed deletion protects that folder for the
 pass and cleanup continues with another eligible folder. The latest capture,
 latest artifact epoch per bundle (including equal marker times), partial captures, unknown ownership, and
-sibling roots are protected. Any open or unknown CCLC incident protects every artifact epoch, console capture and host ROS session; an
-uncheckpointed or changed journal/WAL is unknown. Retention pins its read-only
-protection inputs before inventory and checks that they still identify the
-same journal before deletion. Sibling roots are rotated only on their own next
-start/stop. Live journals, incident records, current publication/state, inputs
-and build caches are never candidates. Directory inventories observe at most
+sibling roots are protected. Sibling roots are rotated only on their own next
+start/stop. Live journals, current publication/state, inputs and build caches
+are never candidates. Directory inventories observe at most
 1000 entries each. Overflow warns that usage is a measured lower bound and
 unseen material is protected. Cleanup can consider independently eligible
 observed units only when measured usage or the actual filesystem free-space
@@ -372,7 +435,7 @@ pressure reports a warning and stops cleanup; it never gates motion or
 startup.
 
 Previous-session journals are not imported into History. The workbench
-normally keeps up to five previous sessions, subject to incident protection.
+normally keeps up to five previous sessions.
 Unimported records, including safety records, are not guaranteed to survive
 retention. See the [session note](FRESH_CHECKOUT_CHECKLIST.md) for their
 location and what to preserve.
@@ -434,13 +497,11 @@ fails with a direct diagnostic rather than taking over the process.
 
 ## Operation and troubleshooting
 
-Apply through the private Manager socket does not prepare the program scene; use Headless.
-
-Use Composer at `http://localhost:3000` for Program, Scene and Deployment work.
-Read Runtime/history and component readiness before issuing commands. Apply
-activates configuration; Save persists an artifact. Motion requires a separate
-authorized command. Browser closure does not Stop the runtime, and an unconfirmed
-viewer pose must not be treated as current measured state.
+Use Composer at `http://localhost:3000` for Program, Scene, Components and
+Deployment work. Read component states and Runtime/history before issuing
+commands. Apply makes a configuration run; Save persists an artifact. Browser
+closure does not Stop the runtime, and an unconfirmed viewer pose must not be
+treated as current measured state.
 
 The ordinary authoring artifact is a Scenario project directory with fixed
 members: `scenario.yaml`, `deployment.yaml`, `program.yaml` and
@@ -448,61 +509,107 @@ members: `scenario.yaml`, `deployment.yaml`, `program.yaml` and
 directory to load those parts together. Program parameters always take their
 Program defaults: a former project with `overrides.yaml` (or a
 `manyforge.scenario.project.v1` manifest) is refused, not read; move any
-needed value into the Program default and recreate the project. Save updates authored intent and source
-references; Save As creates another project without copying referenced external
-sources. Missing/invalid sources block preparation, while changed compatible
-sources are reported for review rather than silently pinned to an old vendor
-copy. New closes the current Scenario and opens the built-in, read-only
-Untitled Scenario (empty Program, Scene and Deployment) through the same Load
-path, so composing and Apply work at once. Save is disabled for it; Save As
-writes it to a project folder and continues there. Unsaved Untitled changes
-are not recovered after a Composer restart. Use Export when a portable project
+needed value into the Program default and recreate the project. Save updates
+authored intent and source references; Save As creates another project without
+copying referenced external sources. Missing/invalid sources block
+preparation, while changed compatible sources are reported for review rather
+than silently pinned to an old vendor copy. Use Export when a portable project
 is required: it copies the admitted source/asset closure and rewrites only the
 exported references. Do not use Save As as an asset-collection operation.
+
+### Load, New, Activate, Execute, Run
+
+- **New** empties the cell: it applies the built-in, read-only Untitled
+  Scenario (empty Program, Scene and Deployment). A finished or stopped Program
+  run is Reset first, every component of the current cell is disabled and its
+  processes are stopped, and the Scene is initialized. New is the one way to
+  empty the cell; it is refused only while motion runs. Save is disabled for
+  Untitled; Save Scenario as writes it to a project folder and continues
+  there. Unsaved Untitled changes are not recovered after a Composer restart.
+- **Load Scenario** is New, then Apply of the chosen project. Its components
+  come up **prepared**, never enabled. When the cell is not empty, New and
+  Load ask once, listing what they stop; they also warn about unsaved Draft
+  changes.
+- **Apply** (Deployment) makes the Draft the running configuration. Replaced
+  and removed components are disabled and stopped first; affected components
+  come back prepared. Apply is refused while a Program run is in progress.
+- **Prepare** and **Enable** run on one component (its page) or on all of them
+  (**Prepare all**, **Enable all** in the Components list). On a machine,
+  Prepare the owner first; Enable acts on members. On a real xArm the motors
+  switch on only at Enable ([Real robot setup](REAL_ROBOT_SETUP.md)).
+- **Execute** (Program panel) starts the Applied Program tree. Every active
+  component of the Deployment must be enabled. When some are not, Execute
+  offers **Activate and execute**: it prepares and enables every active
+  component, then executes the Program once.
+- **Run** starts motion. A Program starts held: each motion group shows **Run**
+  in the Motion panel, and nothing moves until it is pressed. **Stop** holds a
+  group, **Resume** continues it, **Halt** stops all Program motion and halts
+  the tree, and **Reset** ends the run.
+- **Reset robot position** (a Reset option, and **Reset position** on a robot's
+  component page) sets the robots to the Deployment's initial joint positions.
+  It is offered where every robot's adapter supports it: Mock and Isaac,
+  never a real robot. The trajectory controller is switched off, the initial
+  joints are written once (on Isaac to its joint commands topic), and the
+  controller is switched back on to hold them. On Isaac it is refused with
+  **Simulation not playing** while the simulation isn't playing; play it, then
+  reset.
+- **Recover** (component page) clears a component fault; for a machine, Recover
+  the owner, then Enable its arm. A component in fault blocks Execute. When a
+  component faults while something executes, or is unhealthy after a Stop,
+  the cell is latched ("N errors require attention"): runs, nodes, manual
+  motion and manual I/O are blocked until every component is healthy and idle
+  again. Component actions, Apply, New and Load still work.
+
+A component that is deactivated in the Deployment (its **Active** box off) is
+not part of the running cell: it is never prepared or enabled and blocks
+nothing.
+
+On the Isaac lane, a simulation that is not playing never blocks Enable,
+Activate or Execute. Its robots and tools keep their lifecycle and show the
+reason **Simulation not playing**, and their streams show stale; this is
+never a fault and never latches the cell. A new motion or gripper command on
+them is refused with `simulation_not_playing`: a Program node fails with that
+code and the tree handles it like any failed node. A Program can play the
+simulation itself with a **Set simulation state** node
+(`simulation.set_state`, `play`) before its motion. The same reason appears when the workbench
+cannot reach Isaac at all ([Troubleshooting](TROUBLESHOOTING.md#simulation-not-playing)).
 
 ### Components and Deployment
 
 The center-top sections are Program, Scene, Components and Deployment.
 
-**Components** shows each component of the cell. On the left, the list: every
-component of the Deployment Draft and of Manager Applied, with its kind, a
-tool's mount (`lite_gripper → lite6_robot.flange`), its lifecycle state and
-health, or Added in Draft (runs after Apply) / Removed in Draft; above it,
-**Activate all**; below it, **Add component**. On the right, the selected
-component's page:
+**Components** shows the cell. On the left, the list: every component of the
+Deployment Draft and of Manager Applied, with its kind and model, a tool's
+mount (`lite_gripper → lite6_robot.flange`) and its state, or Added in Draft /
+Removed in Draft; a machine's members sit under it. Above the list,
+**Prepare all** and **Enable all**; below it, **Add component**. On the right,
+the selected component's page:
 
-- what it is: profile, mount or mounted tool, Deployment status and the Program
-  roles assigned to it, with links to **Open in Robot Control** (jogging and
-  gripper commands stay in the viewer's Robot panel), **Roles in Deployment**
-  and, for an unapplied change, **Review in Deployment Changes**;
-- its lifecycle (state, readiness, open incident, stream health, Activate,
-  Prepare, Enable, Disable, Recover when offered, control routes) and its
-  vendor status as the driver reports it (error, warning, mode and state codes,
-  condition, moved externally, the blocking reason);
-- its TCPs and frames: the Applied frames of each target with what its `tcp`
-  resolves to and which frames are TCPs, a gripper's authored TCP, attach and
-  mount frames, and its custom TCPs (see [TCPs](#tcps));
-- for a tool, its payload (mass and centre of mass in its mount), read-only:
-  it is defined by the component's model (0 kg when the model defines none);
-- its I/O signals: those it declares, those of other components it uses (a
-  pneumatic gripper's valves and sensors) and those that use it (its signals in
-  another gripper's pneumatic I/O, an xArm pin on this robot, a geometric
-  contact on one of its frames); live values stay in the viewer's Tool & I/O
-  panel;
-- its settings, edited in the Deployment Draft: model and target limits, native
-  runtime inputs, Stop settings, gripper configuration, I/O device and I/O
-  signals, pose source, AI model and stream overrides, each only when the
-  component has them.
+- what it is: model, mount or mounted tool, Deployment status and the Program
+  roles assigned to it, with **Open in Robot Control** (jogging and gripper
+  commands stay in the viewer's Robot panel), **Roles in Deployment** and, for
+  an unapplied change, **Review in Deployment Changes**;
+- its status: lifecycle (Offline, Not prepared, Prepared, Enabled, Fault),
+  fault, reason, stream freshness, the last action's result, and the actions
+  it offers (Prepare, Enable, Disable, Recover, plus Reset position, Power
+  off, Reboot or Reset simulation where the adapter supports them). A
+  machine's card also has its **Lane**, **Address (site settings key)**,
+  **Controller status** (as the controller reports it) and its **Members**,
+  each with an **Active** box;
+- placement: base pose, lane (a member runs on its owner's lane), a tool's
+  mount and **Primary tool** box, **Remove from Draft**, Preview and Apply;
+- its TCPs and frames (see [TCPs](#tcps)), a tool's payload (read-only, from
+  its model), its I/O signals (live values stay in the viewer's Tool & I/O
+  panel), and its settings in the Deployment Draft: model and target limits,
+  execution host configuration, Stop settings, gripper, I/O, pose source, AI
+  model and stream overrides, each only when the component has them.
 
-Each lifecycle transition (Prepare, Enable, Disable, Recover) is one adapter
-action with one budget. Its result is **succeeded**, **failed** with a typed
-reason, or **connection lost**; the result and feedback list the substeps the
-adapter ran and their outcomes. After a dispatched failure, ManyForge decides
-what comes next from the component's current status, not from a guess about
-the failed step's partial effects. A fresh status at rest supplies the shown
-state; without it, the component is shown as Declared with a warning. A robot
-that remains fully active stays commandable. See
-[Observability](OBSERVABILITY.md#workbench-console).
+Each action (Prepare, Enable, Disable, Recover, ...) is one adapter action.
+Its result is **succeeded**, **failed** with a typed reason, or **unknown**;
+nothing resends an action whose effect is unknown. One action runs at a time
+per component; a member action is refused while its owner is not prepared
+(`owner_not_prepared`). What comes next is decided from the component's
+current state. See [Observability](OBSERVABILITY.md#workbench-console).
 
 **Deployment** keeps the cell as a whole, in four tabs:
 
@@ -514,48 +621,37 @@ that remains fully active stays commandable. See
 - **Cell settings**: motion takeover timing, global interrupt rules, the AI
   model aliases, pose links and stream overrides that no current component
   owns, and the read-only compiled artifact.
-- **Changes**: Preview compiles the Draft and shows Manager's convergence diff
-  against Applied (components added, replaced or removed; compiled record
-  changes; Program impact) without changing anything. Apply sends that exact
-  Draft once; when components are brought up, replaced or removed, Manager asks
-  for one confirmation in the Apply dialog.
+- **Changes**: Preview compiles the Draft and shows the diff against Applied
+  (components added, replaced or removed, with the reasons; Program impact)
+  without changing anything. Apply sends that exact Draft once; when components
+  are brought up, replaced or removed, Manager asks for one confirmation.
+  When a finished or stopped run blocks Apply, **Reset and Apply** resets it
+  first.
 
-**Add component** (Components) composes components that already exist:
-the complete component rows of the example Scenarios under `examples/` (robots,
-tools, I/O devices, pose sources, AI models). A component whose gripper uses an
-I/O device is added together with it. Pick the kind and the entry, check the
-component id (the id a Program role is assigned to binds that role), and for a
-robot the frame prefix and base position, then **Add to Draft**; its page opens.
-A tool is mounted on a robot interface in the Draft: pick the robot under
-**Mount on**; the tool and its attachment row are added together. More than
-one tool may share an interface. When multiple tool-tagged components share
-it, mark exactly one attachment row `primary: true` in the Scenario's
-Deployment, then Load the Scenario. The primary tool's default TCP becomes the
-robot's End-effector TCP; without a tool on the flange, the robot's own
-default TCP applies, or its flange if it has no other default ([TCPs](#tcps)).
-The component is
-only in the Draft until Apply. Undo an unapplied addition with
-Discard. Component profiles without a ready row are listed by name; write the
-row in a Scenario first ([Adding a component](../authoring/ADDING_A_COMPONENT.md)).
-An I/O device or AI model that no example has is written by hand under
-**Custom I/O device or AI model**.
+**Add component** (Components) adds components that already exist: the
+complete rows of the example Scenarios under `examples/` (machines, robots,
+tools, I/O devices, pose sources, AI models). Adding a machine adds its owner
+and every member (ids `<owner_id>_<role>`). Pick the kind and the entry, check
+the component id (the id a Program role is assigned to binds that role), and
+for a robot the frame prefix and base position; for a tool, pick the robot
+under **Mount on**; then **Add to Draft**. The component is only in the Draft
+until Apply; Discard undoes it. Component models without a ready row are
+listed by name; write the row in a Scenario first
+([Adding a component](../authoring/ADDING_A_COMPONENT.md)). An I/O device or
+AI model that no example has is written by hand under **Custom I/O device or
+AI model**.
 
 Scripts and assistants use the same routes: `GET
 /api/deployment/component-catalog` lists the entries (MCP
-`manyforge_deployment` action `component_catalog`); append the entry's
-`components` rows and, for a tool, its attachment row
-(`{"parent": {"component_id": <robot>, "interface": "flange"}, "child":
-{"component_id": <tool>, "interface": "mount"}}`; the tool row has no
-`root_pose_in_cell`, its mount places it) in one edit with `POST
-/api/deployment/draft/components` (`components`, `attachments`; MCP action
-`add_components`); `POST /api/deployment/draft/preview` returns the diff; `POST
-/api/deployment/draft/apply` applies it. The Draft accepts a pure addition
-only: new rows, and new attachment rows whose child is a new component.
-Changing or removing an existing component or attachment still needs Load or
-Revert.
-
-Follow Runtime/history rather than assuming that successful preparation means a
-completed live transition. Discard changes only the Draft.
+`manyforge_deployment` action `component_catalog`); `POST
+/api/deployment/draft/components` adds `components` and `attachments` rows in
+one edit (action `add_components`); `POST /api/deployment/draft/mutations`
+changes or removes existing rows (action `mutate`); `POST
+/api/deployment/preview` returns the diff and `POST /api/deployment/apply`
+applies it. `POST /api/scenario/load` and `POST /api/scenario/new` are Load and
+New (MCP `manyforge_scenario`); `GET /api/components` and `POST
+/api/components/{component_id}/actions` read states and run actions (MCP
+`manyforge_components`).
 
 Inspect before restarting:
 
@@ -573,122 +669,64 @@ the same capture policy; retain the startup terminal output too.
 
 ### TCPs
 
-See the [TCP guide](../authoring/TCPS.md) for selector forms, Robot Control,
-and the Active TCP. A TCP entry belongs to one component and names one target
-and one frame role, for example `lite6_robot · arm · flange` or
-`lite_gripper · gripper · tcp`.
+The rules (which TCPs a robot lists, the End-effector and Active TCP, Set TCP,
+the controller's TCP offset) are in the [TCP guide](../authoring/TCPS.md).
+In the workbench:
 
-- **Model and descriptor TCPs** come from component type declarations and
-  tags; a frame's name alone does not make it a TCP. They are shown on the
-  component page under **TCPs and frames** and cannot be edited.
-- **Custom TCPs** are added, edited and deleted on the component page of a
-  robot or a tool: an id, a parent frame of that component (never another
-  custom TCP), a position in metres and a roll/pitch/yaw in degrees. Each
-  change is one Deployment Draft edit (the component row's `custom_tcps`) and
-  runs after Apply.
-- **Default TCP**: each component has at most one. For a component descriptor,
-  the first `tcps` entry declares the default. A component type with TCPs on
-  multiple targets and no single type-declared default needs `default_tcp` in
-  its Deployment row: its page then shows a **Default TCP and primary tool**
-  card with a select of its TCP entries, each shown as `frame (target)`, for
-  example `tcp (arm)`. Choosing one is a Deployment Draft edit and runs after
-  Apply.
-- **Primary tool**: when two or more tools share one mount, the robot's page
-  shows **Primary tool on <interface>** in the same card, read-only like every
-  mount: mark one tool's attachment row `primary: true` in the Scenario's
-  Deployment, then Load it. If only one tool shares the mount, it is the
-  primary tool. The primary tool's default TCP is the robot's End-effector
-  TCP.
-- **End-effector TCP**: a default mark on one of the robot's TCPs, where its
-  Active TCP starts: the primary tool's default TCP when a tool is mounted on
-  the flange; otherwise the robot's own default TCP, or its flange. If the
-  primary tool has no TCP, there is no End-effector TCP and no fallback to the
-  robot's own TCP or flange. The cell still loads and applies with a
-  non-blocking Deployment warning. Execute is refused with
-  `program_end_effector_tcp_unavailable` while any robot in the cell has no
-  End-effector TCP. Declare a TCP on each affected robot's primary tool to
-  provide one.
-  Robot Control still permits joint jog; Cartesian control needs a selected
-  TCP.
-- A TCP may have any valid name, and every frame has exactly one name: a
-  frame merely named `tcp` is not a TCP unless its component lists it. A
-  custom TCP may not reuse an existing frame name.
+- A component page lists its **TCPs and frames**: model and descriptor TCPs
+  (read-only) and **custom TCPs** of a robot or tool, which you add, edit and
+  delete there (an id, a parent frame of that component, a position in metres
+  and roll/pitch/yaw in degrees). Each change is a Deployment Draft edit (the
+  row's `custom_tcps`) and runs after Apply.
+- A component with TCPs on several targets and no single declared default
+  shows a **Default TCP and primary tool** card to choose its default TCP.
+  When several tools share one mount, the tool whose mount has **Primary
+  tool** checked gives the robot its End-effector TCP.
+- **Robot Control** has a **TCP** select beside the robot that shows and sets
+  its Active TCP. Jog, Move to, the Cartesian moves and the viewer gizmo use
+  it. A robot without an End-effector TCP starts with no TCP selected and
+  offers joint jog only.
+- **Programs** choose each move's TCP as **Current** (the Active TCP),
+  **Default TCP of <role>**, or a specific TCP of the bound robot or a tool.
+  Custom TCPs still in the Draft are marked "after Apply".
 
-- **Active TCP**: the TCP the robot uses now, shared by Programs and Robot
-  Control; see [TCPs](../authoring/TCPS.md).
+### When an Apply or Load fails
 
-**Robot Control** has a **TCP** select beside the robot that shows and sets
-the robot's Active TCP. The picker follows the visibility rule in the [TCP
-guide](../authoring/TCPS.md#the-robots-tcp-list). Jog, Move to, the
-Cartesian moves and the viewer gizmo
-use the Active TCP. A robot without an End-effector TCP starts with no TCP
-selected and offers joint jog only ("No TCP: joint jog only"); choosing a TCP
-in the select enables the Cartesian modes.
+An Apply that fails reports each affected component's outcome. Nothing is
+rolled back or retried: the new Deployment stays installed, every affected
+component is still prepared (a member of a failed owner reports
+`owner_not_prepared`), and you fix what failed with the component actions
+(Prepare, Recover, Prepare all). An Apply that fails before it changes
+anything leaves authoring open; correct the named cause and Apply again. An
+Apply that fails after it started changing the cell (effect unknown) keeps
+Apply refused (`authoring_not_ready`) until **New** or **Load** (which starts
+with a New): New stops and removes everything in the cell, whatever the failed
+Apply installed. Stop and the installed Program keep working meanwhile. Do
+not restart the workbench merely because an Apply failed.
 
-**Programs** choose each move's TCP as **Current** (the Active TCP, the
-default for a new move), **Default TCP of <role>**, or a specific TCP of the
-bound robot or of a tool (for example `gripper · cup_edge`). Custom TCPs
-still in the Draft are marked "after Apply". Add a tool to the Program's
-roles before selecting its TCP; selecting an entry adds its frame requirement
-to an existing role in the same edit. **Use current robot
-pose** captures the pose of the move's TCP, so replaying the move brings that
-same point back. The rules (which TCPs are listed, when the Active TCP changes,
-Set TCP) are in [TCPs](../authoring/TCPS.md).
-
-### Terminal Apply recovery (simulated workbench only)
-
-Use this procedure only when Composer reports that a terminal Apply left the
-runtime locked: an `unknown_effect` outcome, or a `failed` outcome other than
-the exact pair `effect_disposition=known` and `failure_phase=accepted`. That
-exact pair is a clean pre-effect refusal; correct its named cause and do not
-restart the workbench merely because the Apply failed. The terminal record is
-not admission readback: retry only when the current owner reports admission
-open. If it remains closed or unavailable, inspect Runtime/history for the
-current holder rather than assuming either successful settlement or a
-catastrophic lock.
-
-For a locked outcome, do not retry it or resume execution. From the repository
-root, either close the failed runtime:
+One Load refusal needs a restart: Composer shows **Scenario refused**
+(`scenario_composition_refused`) when the execution host finds an
+inconsistency while composing the Scenario. Nothing was applied. Fix the cause
+named in the details, then restart the workbench before the next Load:
 
 ```bash
 ./scripts/compose-dev.sh stop --keep-evidence
+./scripts/compose-dev.sh start --project 'examples/<saved>.scenario'
 ```
 
-Or preserve it and cold-reload the current Saved Scenario in a fresh container:
+`--project` accepts only Scenario project folders under `examples/`; for a
+project elsewhere, start without it and Load it in Composer. The page
+disconnects while the container is replaced and may need a refresh; unsaved
+Draft changes are lost. A restart does not start a Program or authorize
+motion.
 
-```bash
-./scripts/compose-dev.sh stop --keep-evidence && \
-  ./scripts/compose-dev.sh start --project 'path/to/saved.scenario'
-```
-
-The project argument must be a safely shell-quoted Scenario project directory
-relative to the repository root; it must contain `scenario.yaml`. A Saved
-Scenario outside the repository, or a Saved single-file `.scenario.yaml`/
-`.scenario.yml` artifact, cannot be reloaded by this workbench command. Use
-Close to preserve the evidence, then reopen such a Scenario through a
-supported workflow. The page disconnects while the container is replaced and
-may need a refresh; unsaved Draft changes are lost. Startup validates the
-Saved Scenario, so invalid content leaves the runtime closed. A successful
-reload does not start a Program or authorize motion automatically.
-
-Scenario Load is a Manager Apply and does not ordinarily restart the
-workbench. These commands are a development-workbench fallback for a runtime
-that deliberately retained its restrictions.
-
-One Load refusal has its own restart requirement: Composer shows **Scenario
-refused** (`scenario_composition_refused`) when the native runtime finds an
-inconsistency while composing the candidate. The candidate was not published
-and the runtime keeps running, but authoring remains closed. Fix the cause in
-the notice details, preserve the evidence, and restart the workbench before the
-next Load. This differs from a clean pre-effect Apply refusal, which does not
-require a restart merely because the Apply failed.
-
-This procedure is only for the simulated development workbench. It is not a
-containment or recovery procedure for physical equipment.
+These steps are for the workbench. They are not a containment or recovery
+procedure for physical equipment.
 
 | Symptom | Action |
 | --- | --- |
 | Image missing | Run `./scripts/compose-dev.sh build` (see [Install](#install-one-build-one-start)). |
+| Site settings refused at start | See [Site file errors](TROUBLESHOOTING.md#site-file-errors). |
 | Project source missing, invalid or changed | Preserve the diagnostic, inspect the named project/source path, and review changes before retrying. Do not bypass identity checks or delete caches blindly. |
 | Port occupied | Identify the listener on 3000/9010/9011/9020; do not kill an unrelated process. |
 | Different or unhealthy workbench already running | Read status/logs first. Stop only with authorization before switching scenarios; do not spawn another stack to hide the failure. |
@@ -697,8 +735,10 @@ containment or recovery procedure for physical equipment.
 | `Scenario project is outside allowed roots` (exit 69) | Pass a project folder inside `examples/`, the only root startup accepts; a scratch folder such as `.manyforge-dev/` is refused. |
 | Start refuses with `… assistant instrument source is invalid or stale` or `… node environment manifest is stale` | A generated source is out of date after a catalog or covered source change. Run `python3 scripts/regen.py --update` in the workbench image, review the diff, then `python3 scripts/regen.py --check` ([Identities and pins](../reference/IDENTITY_AND_PINNING.md)). |
 | Error-looking `Execution event pump unavailable` lines during start | Expected before the ROS host is up; see the everyday workflow. Investigate only if they continue after the start reports ready. |
+| Isaac robot shows **Simulation not playing** | Play the simulation, or check that the workbench reaches Isaac ([Troubleshooting](TROUBLESHOOTING.md#simulation-not-playing)). |
+| Real robot does not connect | See [Real robot setup](REAL_ROBOT_SETUP.md#troubleshooting). |
 | Page stale or disconnected after a restart | Refresh the tab. |
-| Stale viewer or failed command | Inspect Runtime/history and owner status. Do not infer rejection from a lost response or resend motion/Apply automatically. |
+| Stale viewer or failed command | Inspect Runtime/history and component states. Do not infer rejection from a lost response or resend motion/Apply automatically. |
 
 For API clients, use the public generated
 [Composer contract](../reference/REST_API.md),

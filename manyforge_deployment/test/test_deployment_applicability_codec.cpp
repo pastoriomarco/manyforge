@@ -66,67 +66,9 @@ minimal_document(std::string desired = "[]", std::string providers = "[]",
 }
 
 [[nodiscard]] std::string
-interrupt_config(std::string_view queue_depth = "64",
-                 std::string_view cancel_validation_timeout_ns = "1000000",
-                 std::string_view motion_scope_arm_timeout_ns = "2000000",
-                 std::string_view supervisory_poll_rate_hz = "10") {
-  return "{\"queue_depth\":" + std::string(queue_depth) +
-         ",\"cancel_validation_timeout_ns\":" +
-         std::string(cancel_validation_timeout_ns) +
-         ",\"motion_scope_arm_timeout_ns\":" +
-         std::string(motion_scope_arm_timeout_ns) +
-         ",\"supervisory_poll_rate_hz\":" +
-         std::string(supervisory_poll_rate_hz) + "}";
-}
-
-[[nodiscard]] std::string interrupt_source(
-    std::string_view source_id, std::string_view provider_binding_id,
-    std::string_view source_class = "fast_execution_relevant",
-    std::string_view kind = "level", std::string_view priority = "100",
-    std::string_view optional_fields = "") {
-  return "{\"source_id\":\"" + std::string(source_id) +
-         "\",\"capability_provider_binding_id\":\"" +
-         std::string(provider_binding_id) +
-         "\",\"adapter_capability_id\":\"interrupt.signal\","
-         "\"signal\":\"halt\",\"source_class\":\"" +
-         std::string(source_class) + "\",\"kind\":\"" + std::string(kind) +
-         "\",\"priority\":" + std::string(priority) +
-         std::string(optional_fields) + "}";
-}
-
-[[nodiscard]] std::string
-interrupt_policy(std::string_view policy_id, std::string_view source_id,
-                 std::string_view affected_phases = "[\"executing\"]",
-                 std::string_view action = "preempt_trajectory",
-                 std::string_view disposition = "await_recovery_action",
-                 std::string_view scope_kind = "static",
-                 std::string_view control_domain_ids = "[\"arm_domain\"]",
-                 std::string_view resource_ids = "[]",
-                 std::string_view optional_fields = "") {
-  return "{\"policy_id\":\"" + std::string(policy_id) + "\",\"source_id\":\"" +
-         std::string(source_id) +
-         "\",\"controllable_component_ids\":[],\"command_target_ids\":[],"
-         "\"control_domain_ids\":" +
-         std::string(control_domain_ids) +
-         ",\"control_binding_ids\":[],\"resource_ids\":" +
-         std::string(resource_ids) +
-         ",\"affected_phases\":" + std::string(affected_phases) +
-         ",\"preemption_action\":\"" + std::string(action) +
-         "\",\"post_latch_disposition\":\"" + std::string(disposition) +
-         "\",\"scope_kind\":\"" + std::string(scope_kind) + "\"" +
-         std::string(optional_fields) + "}";
-}
-
-[[nodiscard]] std::string
-interrupt_policy_envelope(std::string sources, std::string policies,
-                          std::string config = interrupt_config(),
-                          std::string retained_policy_records = "[]") {
+policy_envelope(std::string retained_policy_records = "[]") {
   return "{\"retained_policy_records\":" + std::move(retained_policy_records) +
-         ",\"stop_stage_parameters\":[],"
-         "\"commissioned_stop_interfaces\":[],\"interrupt_sources\":[" +
-         std::move(sources) + "],\"interrupt_policies\":[" +
-         std::move(policies) + "],\"interrupt_config\":" + std::move(config) +
-         "}";
+         ",\"stop_stage_parameters\":[],\"commissioned_stop_interfaces\":[]}";
 }
 
 [[nodiscard]] std::string
@@ -720,53 +662,6 @@ TEST(DeploymentApplicabilityCodec,
 }
 
 TEST(DeploymentApplicabilityCodec,
-     RetainsAndCanonicallyOrdersClosedInterruptDeclarations) {
-  const std::string providers = "[" + provider_binding("signal_z") + "," +
-                                provider_binding("signal_a") + "]";
-  const std::string sources = interrupt_source("source_z", "signal_z") + "," +
-                              interrupt_source("source_a", "signal_a");
-  const std::string policies =
-      interrupt_policy("policy_z", "source_z",
-                       "[\"intervention_required\",\"executing\"]",
-                       "latch_faulted", "fault_terminal", "static",
-                       "[\"domain_z\",\"domain_a\"]",
-                       "[\"resource_z\",\"resource_a\"]") +
-      "," +
-      interrupt_policy(
-          "policy_a", "source_a", "[\"stopping\",\"executing\"]",
-          "complete_move_on_signal", "auto_clear_after_motion_outcome",
-          "operation", "[\"domain_a\"]", "[\"resource_a\"]",
-          ",\"allowed_activation_modes\":[\"trip_if_already_active\","
-          "\"fresh_edge_after_arm\"],\"allowed_stop_modes\":["
-          "\"hard_deceleration\",\"soft_on_path\"],"
-          "\"scope_expiry\":\"operation_terminal\"");
-
-  const auto candidate =
-      decode(with_policies(minimal_document("[]", providers),
-                           interrupt_policy_envelope(sources, policies)));
-  ASSERT_TRUE(candidate.normalized_policies().has_value());
-  const std::string normalized =
-      canonical_json(*candidate.normalized_policies());
-  EXPECT_LT(normalized.find("\"source_a\""), normalized.find("\"source_z\""));
-  EXPECT_LT(normalized.find("\"policy_a\""), normalized.find("\"policy_z\""));
-  EXPECT_NE(normalized.find("\"affected_phases\":[\"executing\",\"stopping\"]"),
-            std::string::npos);
-  EXPECT_NE(normalized.find("\"affected_phases\":[\"executing\","
-                            "\"intervention_required\"]"),
-            std::string::npos);
-  EXPECT_NE(normalized.find("\"allowed_stop_modes\":[\"soft_on_path\","
-                            "\"hard_deceleration\"]"),
-            std::string::npos);
-  EXPECT_NE(normalized.find("\"resource_ids\":[\"resource_a\",\"resource_z\"]"),
-            std::string::npos);
-
-  const auto revisioned =
-      compute_capability_provider_binding_revisions(candidate);
-  ASSERT_TRUE(revisioned.normalized_policies().has_value());
-  EXPECT_EQ(canonical_json(*revisioned.normalized_policies()), normalized);
-}
-
-TEST(DeploymentApplicabilityCodec,
      RetainsOnlyCanonicalClosedPolicyCatalogReferences) {
   const std::string retained =
       "[" +
@@ -779,7 +674,7 @@ TEST(DeploymentApplicabilityCodec,
 
   const auto candidate = decode(with_policies(
       minimal_document(),
-      interrupt_policy_envelope("", "", interrupt_config(), retained)));
+      policy_envelope(retained)));
   const auto &references = candidate.value().retained_policy_records;
   ASSERT_EQ(references.size(), 2U);
   EXPECT_TRUE(std::holds_alternative<core::ContactPolicyCatalogRecordRefDTO>(
@@ -806,8 +701,7 @@ TEST(DeploymentApplicabilityCodec,
   const auto document_for = [](std::string records) {
     return with_policies(
         minimal_document(),
-        interrupt_policy_envelope("", "", interrupt_config(),
-                                  "[" + std::move(records) + "]"));
+        policy_envelope("[" + std::move(records) + "]"));
   };
   expect_decode_error_containing(
       document_for(catalog_record("component_type", "arm",
@@ -822,194 +716,6 @@ TEST(DeploymentApplicabilityCodec,
       "contact_policy", "contact.alpha", "manyforge.contact_policy.v1");
   expect_decode_error_containing(document_for(duplicate + "," + duplicate),
                                  "duplicate complete catalog-record identity");
-}
-
-TEST(DeploymentApplicabilityCodec,
-     InterruptDeclarationsRejectBrokenIdentityAndPolicyJoins) {
-  const std::string provider = "[" + provider_binding("signal") + "]";
-  const auto document_for = [&](std::string sources, std::string policies) {
-    return with_policies(
-        minimal_document("[]", provider),
-        interrupt_policy_envelope(std::move(sources), std::move(policies)));
-  };
-  expect_decode_error_containing(
-      document_for(interrupt_source("source", "missing"),
-                   interrupt_policy("policy", "source")),
-      "references an unknown capability-provider binding");
-  expect_decode_error_containing(
-      document_for(interrupt_source("source", "signal") + "," +
-                       interrupt_source("source", "signal"),
-                   interrupt_policy("policy", "source")),
-      "duplicate source_id");
-  expect_decode_error_containing(
-      document_for(interrupt_source("source", "signal"),
-                   interrupt_policy("policy", "missing")),
-      "references an unknown interrupt source");
-  expect_decode_error_containing(
-      document_for(interrupt_source("source", "signal"),
-                   interrupt_policy("policy", "source", "[\"executing\"]",
-                                    "preempt_trajectory",
-                                    "await_recovery_action", "static", "[]",
-                                    "[]")),
-      "requires at least one control domain or resource");
-  expect_decode_error_containing(
-      document_for(interrupt_source("source", "signal"),
-                   interrupt_policy("policy", "source", "[\"planning\"]",
-                                    "preempt_trajectory",
-                                    "await_recovery_action", "operation")),
-      "operation policy must include executing");
-  // Operation-level Pause was removed; its former phase is refused, not
-  // aliased.
-  expect_decode_error_containing(
-      document_for(interrupt_source("source", "signal"),
-                   interrupt_policy("policy", "source",
-                                    "[\"executing\",\"paused\"]")),
-      "value is outside the closed enum");
-  expect_decode_error_containing(
-      document_for(interrupt_source("source", "signal"),
-                   interrupt_policy("policy_a", "source", "[\"executing\"]",
-                                    "preempt_trajectory",
-                                    "await_recovery_action") +
-                       "," +
-                       interrupt_policy("policy_b", "source", "[\"executing\"]",
-                                        "latch_faulted", "fault_terminal")),
-      "same-source equal-priority overlapping phases");
-  expect_decode_error_containing(
-      document_for(interrupt_source("source", "signal"),
-                   interrupt_policy("policy", "source", "[\"executing\"]",
-                                    "preempt_trajectory",
-                                    "await_recovery_action", "static",
-                                    "[\"arm_domain\"]", "[]",
-                                    ",\"maskable_by\":[\"missing\"]")),
-      "references an unknown interrupt policy");
-}
-
-TEST(DeploymentApplicabilityCodec,
-     InterruptConfigurationUsesExactQualifiedNumericBounds) {
-  const std::string provider = "[" + provider_binding("signal") + "]";
-  const std::string source = interrupt_source("source", "signal");
-  const std::string policy = interrupt_policy("policy", "source");
-  const auto document_for = [&](std::string config) {
-    return with_policies(
-        minimal_document("[]", provider),
-        interrupt_policy_envelope(source, policy, std::move(config)));
-  };
-  expect_decode_error_containing(
-      document_for(interrupt_config("1.5")),
-      "queue_depth: expected a non-negative I-JSON-safe integer");
-  expect_decode_error_containing(
-      document_for(interrupt_config("64", "0")),
-      "cancel_validation_timeout_ns: integer is outside");
-  expect_decode_error_containing(
-      document_for(interrupt_config("64", "100", "200", "10.1")),
-      "supervisory_poll_rate_hz: must be within");
-  expect_decode_error_containing(
-      document_for(replace_first(interrupt_config(), "\"queue_depth\"",
-                                 "\"unknown_depth\"")),
-      "unknown field 'unknown_depth'");
-}
-
-TEST(DeploymentApplicabilityCodec,
-     RetainsClosedStructuredHysteresisAndTypedStopProfile) {
-  const std::string provider = "[" + provider_binding("signal") + "]";
-  const std::string profile =
-      "{\"profile_id\":\"guard.soft\",\"stop_mode\":\"soft_on_path\","
-      "\"jerk_limits_enabled\":true,"
-      "\"deceleration_time_s\":1.25,\"per_joint_max_deceleration\":{"
-      "\"z_slide\":{\"coordinate_kind\":\"linear_m_s2\",\"value_m_s2\":2.5},"
-      "\"a_joint\":{\"coordinate_kind\":\"angular_rad_s2\","
-      "\"value_rad_s2\":3.5}},\"recoverable_substitution_mode\":"
-      "\"spring_back_hold\",\"per_joint_settle_velocity_threshold\":{"
-      "\"z_slide\":{\"coordinate_kind\":\"linear_m_s\",\"value_m_s\":0.01}},"
-      "\"diagnostics\":{\"qualified\":true,\"revision\":\"v2\","
-      "\"tolerance\":0.5}}";
-  const auto candidate = decode(with_policies(
-      minimal_document("[]", provider),
-      interrupt_policy_envelope(
-          interrupt_source(
-              "source", "signal", "fast_execution_relevant", "level", "100",
-              ",\"hysteresis_value\":{\"high\":2,\"latched\":false}"),
-          interrupt_policy("policy", "source", "[\"executing\"]",
-                           "preempt_trajectory", "await_recovery_action",
-                           "static", "[\"arm_domain\"]", "[]",
-                           ",\"stop_profile\":" + profile))));
-  ASSERT_TRUE(candidate.normalized_policies().has_value());
-  const std::string normalized =
-      canonical_json(*candidate.normalized_policies());
-  EXPECT_NE(normalized.find("\"allow_natural_completion_on_short_path\":true"),
-            std::string::npos);
-  EXPECT_NE(normalized.find("\"require_backend_confirmation\":true"),
-            std::string::npos);
-  EXPECT_LT(normalized.find("\"a_joint\""), normalized.find("\"z_slide\""));
-  EXPECT_NE(normalized.find("\"hysteresis_value\":{\"high\":2,"
-                            "\"latched\":false}"),
-            std::string::npos);
-}
-
-TEST(DeploymentApplicabilityCodec,
-     TypedInterruptValuesRejectOpenShapesAndRetiredProfileFields) {
-  const std::string provider = "[" + provider_binding("signal") + "]";
-  const auto document_for_source = [&](std::string optional_fields) {
-    return with_policies(
-        minimal_document("[]", provider),
-        interrupt_policy_envelope(
-            interrupt_source("source", "signal", "fast_execution_relevant",
-                             "level", "100", optional_fields),
-            interrupt_policy("policy", "source")));
-  };
-  const auto document_for_profile = [&](std::string profile) {
-    return with_policies(
-        minimal_document("[]", provider),
-        interrupt_policy_envelope(
-            interrupt_source("source", "signal"),
-            interrupt_policy("policy", "source", "[\"executing\"]",
-                             "preempt_trajectory", "await_recovery_action",
-                             "static", "[\"arm_domain\"]", "[]",
-                             ",\"stop_profile\":" + profile)));
-  };
-
-  expect_decode_error_containing(
-      document_for_source(",\"hysteresis_value\":{}"),
-      "must contain 1..64 entries");
-  expect_decode_error_containing(
-      document_for_source(",\"hysteresis_value\":{\"nested\":{\"x\":1}}"),
-      "must be exactly boolean, finite number, or NFC string");
-  expect_decode_error_containing(
-      document_for_profile(
-          "{\"profile_id\":\"soft\",\"stop_mode\":\"soft_on_path\","
-          "\"deceleration_time_s\":1.0}"),
-      "requires its exact duration/limit presence matrix");
-  expect_decode_error_containing(
-      document_for_profile(
-          "{\"profile_id\":\"hard\",\"stop_mode\":\"hard_deceleration\","
-          "\"per_joint_max_deceleration\":{\"joint\":{"
-          "\"coordinate_kind\":\"angular_rad_s2\",\"value_rad_s2\":1}}}"),
-      "hard_deceleration forbids");
-  expect_decode_error_containing(
-      document_for_profile(
-          "{\"profile_id\":\"spring\",\"stop_mode\":\"spring_back_hold\","
-          "\"jerk_limits_enabled\":false,"
-          "\"per_joint_max_deceleration\":{\"joint\":{"
-          "\"coordinate_kind\":\"angular_rad_s2\",\"value_m_s2\":1}}}"),
-      "unknown field 'value_m_s2'");
-  EXPECT_NO_THROW((void)decode(document_for_profile(
-      "{\"profile_id\":\"spring\",\"stop_mode\":\"spring_back_hold\","
-      "\"jerk_limits_enabled\":false,"
-      "\"per_joint_max_deceleration\":{\"joint\":{"
-      "\"coordinate_kind\":\"angular_rad_s2\",\"value_rad_s2\":1}},"
-      "\"allow_natural_completion_on_short_path\":true}")));
-  expect_decode_error_containing(
-      document_for_profile(
-          "{\"profile_id\":\"hard\",\"stop_mode\":\"hard_deceleration\","
-          "\"allow_natural_completion_on_short_path\":false}"),
-      "explicit presence is legal only for soft_on_path or spring_back_hold");
-  expect_decode_error_containing(
-      document_for_profile(
-          "{\"profile_id\":\"soft\",\"stop_mode\":\"soft_on_path\","
-          "\"deceleration_time_s\":1,\"per_joint_max_deceleration\":{"
-          "\"joint\":{\"coordinate_kind\":\"angular_rad_s2\","
-          "\"value_rad_s2\":1}},\"allowed_fallback_modes\":[]}"),
-      "unknown field 'allowed_fallback_modes'");
 }
 
 TEST(DeploymentApplicabilityCodec,
@@ -1267,7 +973,7 @@ TEST(DeploymentApplicabilityCodec, PerBindingStopTimingIsNoLongerAPolicyField) {
   // Q51/Q53: each robot's Stop timing lives in its own controlled-Stop profile
   // (`max_stop_time_s`); the cell-wide per-binding timing table is gone and
   // an older document carrying it is refused, not converted.
-  auto policies = interrupt_policy_envelope("", "");
+  auto policies = policy_envelope();
   const auto absent = decode(with_policies(minimal_document(), policies));
   EXPECT_EQ(absent.normalized_policies()->find_object_member(
                 "stop_timing_parameters"),
@@ -1290,7 +996,7 @@ TEST(DeploymentApplicabilityCodec,
      MotionTakeoverPlanningBudgetRequiresAStrictlyLargerPreparationBudget) {
   const auto document_for = [](std::string_view planning,
                                bool preparation = true) {
-    auto policies = interrupt_policy_envelope("", "");
+    auto policies = policy_envelope();
     policies.pop_back();
     if (preparation)
       policies += ",\"motion_takeover_preparation_budget_s\":3.5";
@@ -1299,7 +1005,7 @@ TEST(DeploymentApplicabilityCodec,
     return with_policies(minimal_document(), policies);
   };
   const auto ordinary = decode(
-      with_policies(minimal_document(), interrupt_policy_envelope("", "")));
+      with_policies(minimal_document(), policy_envelope()));
   EXPECT_FALSE(ordinary.value().motion_takeover_planning_budget_s);
   EXPECT_EQ(ordinary.normalized_policies()->find_object_member(
                 "motion_takeover_planning_budget_s"),
@@ -1323,7 +1029,7 @@ TEST(DeploymentApplicabilityCodec,
 
 TEST(DeploymentApplicabilityCodec, ScenePosePoliciesAreClosedAndRetained) {
   const auto document_for = [](const std::string &rows) {
-    auto policies = interrupt_policy_envelope("", "");
+    auto policies = policy_envelope();
     policies.pop_back();
     return with_policies(minimal_document(),
                          policies + ",\"scene_pose_sources\":" + rows + "}");
@@ -1363,7 +1069,7 @@ TEST(DeploymentApplicabilityCodec, ScenePosePoliciesAreClosedAndRetained) {
 
 TEST(DeploymentApplicabilityCodec, ScenePoseSourceKeysRoundTripOneRowPerObject) {
   const auto document_for = [](const std::string &rows) {
-    auto policies = interrupt_policy_envelope("", "");
+    auto policies = policy_envelope();
     policies.pop_back();
     return with_policies(minimal_document(),
                          policies + ",\"scene_pose_sources\":" + rows + "}");
@@ -1453,20 +1159,20 @@ TEST(DeploymentApplicabilityCodec, ScenePoseSourceKeysRoundTripOneRowPerObject) 
 TEST(DeploymentApplicabilityCodec,
      ComponentStreamOverridesAreClosedNormalizedAndRetained) {
   const auto document_for = [](const std::string &rows) {
-    auto policies = interrupt_policy_envelope("", "");
+    auto policies = policy_envelope();
     policies.pop_back();
     return with_policies(minimal_document(),
                          policies + ",\"component_streams\":" + rows + "}");
   };
   // Authored out of canonical order; the codec normalizes the table.
   const auto candidate = decode(document_for(
-      R"([{"controllable_component_id":"robot_1","stream_id":"measured_joints","budget_ns":300000000,"recovery":"auto"},)"
-      R"({"controllable_component_id":"octomap_1","stream_id":"map_updates","severity":"fault"}])"));
+      R"([{"controllable_component_id":"robot_1","stream_id":"measured_joints","budget_ns":300000000},)"
+      R"({"controllable_component_id":"octomap_1","stream_id":"map_updates","budget_ns":5000000000}])"));
   const std::vector<core::StreamParameterOverrideDTO> expected{
-      {core::ControllableComponentId("octomap_1"), "map_updates", std::nullopt,
-       core::StreamSeverityDTO::kFault, std::nullopt},
+      {core::ControllableComponentId("octomap_1"), "map_updates",
+       std::int64_t{5000000000}, std::nullopt, std::nullopt},
       {core::ControllableComponentId("robot_1"), "measured_joints",
-       std::int64_t{300000000}, std::nullopt, core::StreamRecoveryDTO::kAuto},
+       std::int64_t{300000000}, std::nullopt, std::nullopt},
   };
   ASSERT_TRUE(candidate.normalized_policies().has_value());
   const auto *streams =
@@ -1480,41 +1186,38 @@ TEST(DeploymentApplicabilityCodec,
 
   // Absent or empty tables keep the existing policy projection unchanged.
   const auto ordinary = decode(
-      with_policies(minimal_document(), interrupt_policy_envelope("", "")));
+      with_policies(minimal_document(), policy_envelope()));
   EXPECT_EQ(ordinary.normalized_policies()->find_object_member(
                 "component_streams"),
             nullptr);
   EXPECT_EQ(decode(document_for("[]")).normalized_policies(),
             ordinary.normalized_policies());
 
-  // `fault` + `auto` is accepted (the user's choice of safety level).
-  EXPECT_NO_THROW(decode(document_for(
-      R"([{"controllable_component_id":"octomap_1","stream_id":"map_updates","severity":"fault","recovery":"auto"}])")));
-
   const std::string row_prefix =
       R"({"controllable_component_id":"octomap_1","stream_id":"map_updates")";
   expect_decode_error_containing(
-      document_for("[" + row_prefix + R"(,"severity":"fault"},)" + row_prefix +
+      document_for("[" + row_prefix + R"(,"budget_ns":7},)" + row_prefix +
                    R"(,"budget_ns":5}])"),
       "$.policies.component_streams: duplicate");
   expect_decode_error_containing(document_for("[" + row_prefix + "}]"),
-                                 "$.policies.component_streams[0]: expected "
-                                 "at least one");
+                                 "$.policies.component_streams[0]: missing "
+                                 "required field 'budget_ns'");
+  // CONTRACTS §7: severity and recovery are gone; budget_ns stays.
   expect_decode_error_containing(
-      document_for("[" + row_prefix + R"(,"severity":"fatal"}])"),
-      "$.policies.component_streams[0].severity");
+      document_for("[" + row_prefix + R"(,"budget_ns":5,"severity":"fault"}])"),
+      "unknown field 'severity'");
   expect_decode_error_containing(
-      document_for("[" + row_prefix + R"(,"recovery":"never"}])"),
-      "$.policies.component_streams[0].recovery");
+      document_for("[" + row_prefix + R"(,"budget_ns":5,"recovery":"auto"}])"),
+      "unknown field 'recovery'");
   expect_decode_error_containing(
       document_for("[" + row_prefix + R"(,"budget_ns":0}])"),
       "$.policies.component_streams[0].budget_ns");
   expect_decode_error_containing(
-      document_for("[" + row_prefix + R"(,"timestamp_source":"arrival"}])"),
+      document_for("[" + row_prefix + R"(,"budget_ns":5,"timestamp_source":"arrival"}])"),
       "unknown field 'timestamp_source'");
   expect_decode_error_containing(
       document_for(
-          R"([{"controllable_component_id":"octomap_1","stream_id":"Map","severity":"fault"}])"),
+          R"([{"controllable_component_id":"octomap_1","stream_id":"Map","budget_ns":5}])"),
       "$.policies.component_streams[0].stream_id");
   expect_decode_error_containing(document_for("{}"),
                                  "$.policies.component_streams: expected "
@@ -1523,7 +1226,7 @@ TEST(DeploymentApplicabilityCodec,
 
 TEST(DeploymentApplicabilityCodec, ScenePoseDeadbandIsOptionalNonnegative) {
   const auto document_for = [](const std::string &extra) {
-    auto policies = interrupt_policy_envelope("", "");
+    auto policies = policy_envelope();
     policies.pop_back();
     return with_policies(
         minimal_document(),
@@ -1565,7 +1268,7 @@ TEST(DeploymentApplicabilityCodec, ScenePoseDeadbandIsOptionalNonnegative) {
 TEST(DeploymentApplicabilityCodec,
      MotionTakeoverBudgetIsOptionalPositiveAndPreserved) {
   const auto document_for = [](std::string_view value) {
-    auto policies = interrupt_policy_envelope("", "");
+    auto policies = policy_envelope();
     policies.pop_back();
     return with_policies(minimal_document(),
                          policies +
@@ -1576,7 +1279,7 @@ TEST(DeploymentApplicabilityCodec,
   EXPECT_FALSE(
       no_policies.value().motion_takeover_preparation_budget_s.has_value());
   const auto omitted = decode(
-      with_policies(minimal_document(), interrupt_policy_envelope("", "")));
+      with_policies(minimal_document(), policy_envelope()));
   EXPECT_FALSE(
       omitted.value().motion_takeover_preparation_budget_s.has_value());
   EXPECT_EQ(omitted.normalized_policies()->find_object_member(
@@ -1645,8 +1348,9 @@ TEST(DeploymentApplicabilityCodecTest, GlobalConditionUsesOnlyExistingNodeAndDep
   const auto document = [&](const CanonicalValue& condition) {
     const CanonicalValue rule(CanonicalValue::Object{
         {"rule_id", CanonicalValue("many_sources")}, {"condition", condition},
-        {"scope", CanonicalValue("all_motion")}});
-    auto policies = interrupt_policy_envelope("", "");
+        {"scope", CanonicalValue("all_motion")}, {"on_trip", CanonicalValue("notify")},
+        {"active_at_start", CanonicalValue(false)}});
+    auto policies = policy_envelope();
     policies.pop_back();
     policies += ",\"interrupt_rules\":[" + canonical_json(rule) + "]}";
     return with_policies(minimal_document(), std::move(policies));
@@ -1678,7 +1382,7 @@ TEST(DeploymentApplicabilityCodecTest, GlobalConditionUsesOnlyExistingNodeAndDep
   EXPECT_THROW(static_cast<void>(decode(document(deepest))), DeploymentApplicabilityCodecError);
 }
 
-TEST(DeploymentApplicabilityCodecTest, GlobalRuleOnTripIsGateByDefaultAndOwnsIdleBehaviour) {
+TEST(DeploymentApplicabilityCodecTest, GlobalRuleOnTripAfterStopAndActiveAtStartFollowContract) {
   const auto document = [&](CanonicalValue::Object extra) {
     CanonicalValue::Object fields{
         {"rule_id", CanonicalValue("light_curtain")},
@@ -1690,7 +1394,7 @@ TEST(DeploymentApplicabilityCodecTest, GlobalRuleOnTripIsGateByDefaultAndOwnsIdl
                 {"op", CanonicalValue("==")}, {"value", CanonicalValue(true)}})}})},
         {"scope", CanonicalValue("all_motion")}};
     for (auto& field : extra) fields.push_back(std::move(field));
-    auto policies = interrupt_policy_envelope("", "");
+    auto policies = policy_envelope();
     policies.pop_back();
     policies += ",\"interrupt_rules\":[" + canonical_json(CanonicalValue(std::move(fields))) + "]}";
     return with_policies(minimal_document(), std::move(policies));
@@ -1700,38 +1404,70 @@ TEST(DeploymentApplicabilityCodecTest, GlobalRuleOnTripIsGateByDefaultAndOwnsIdl
     return decoded.normalized_policies()->find_object_member("interrupt_rules")
         ->as_array().front();
   };
-  const auto gate = sealed({});
-  ASSERT_NE(gate.find_object_member("on_trip"), nullptr);
-  EXPECT_EQ(gate.find_object_member("on_trip")->as_string(), "gate");
-  EXPECT_EQ(gate.find_object_member("idle_behaviour"), nullptr);
-  EXPECT_EQ(sealed({{"on_trip", CanonicalValue("gate")}}), gate);
-  const auto full = sealed({{"on_trip", CanonicalValue("full_stop")},
-                            {"idle_behaviour", CanonicalValue("latch")}});
-  EXPECT_EQ(full.find_object_member("on_trip")->as_string(), "full_stop");
-  EXPECT_EQ(full.find_object_member("idle_behaviour")->as_string(), "latch");
-  const auto notify = sealed({{"on_trip", CanonicalValue("notify")}});
-  ASSERT_NE(notify.find_object_member("on_trip"), nullptr);
-  EXPECT_EQ(notify.find_object_member("on_trip")->as_string(), "notify");
-  EXPECT_EQ(notify.find_object_member("idle_behaviour"), nullptr);
+  const auto text = [](const CanonicalValue& rule, std::string_view name) {
+    const auto* value = rule.find_object_member(name);
+    return value == nullptr ? std::string("<absent>") : value->as_string();
+  };
+  // on_trip is required; after_stop defaults to hold (stop only) and
+  // active_at_start to false (CONTRACTS §8).
+  const CanonicalValue::Object stop_fields{{"on_trip", CanonicalValue("stop")},
+                                           {"after_stop", CanonicalValue("hold")},
+                                           {"active_at_start", CanonicalValue(false)}};
+  const auto stop = sealed(stop_fields);
+  EXPECT_EQ(text(stop, "on_trip"), "stop");
+  EXPECT_EQ(text(stop, "after_stop"), "hold");
+  ASSERT_NE(stop.find_object_member("active_at_start"), nullptr);
+  EXPECT_FALSE(stop.find_object_member("active_at_start")->as_bool());
+  const auto failing = sealed({{"on_trip", CanonicalValue("stop")},
+                               {"after_stop", CanonicalValue("fail_node")},
+                               {"active_at_start", CanonicalValue(true)},
+                               {"stop_entry_stage_id", CanonicalValue("stage")}});
+  EXPECT_EQ(text(failing, "after_stop"), "fail_node");
+  EXPECT_TRUE(failing.find_object_member("active_at_start")->as_bool());
+  EXPECT_EQ(text(failing, "stop_entry_stage_id"), "stage");
+  // notify: no after_stop is emitted.
+  const auto notify = sealed({{"on_trip", CanonicalValue("notify")},
+                              {"active_at_start", CanonicalValue(false)}});
+  EXPECT_EQ(text(notify, "on_trip"), "notify");
+  EXPECT_EQ(notify.find_object_member("after_stop"), nullptr);
   EXPECT_EQ(notify.find_object_member("stop_entry_stage_id"), nullptr);
-  for (const auto *mode : {"gate", "full_stop"}) {
-    const auto with_entry = sealed({{"on_trip", CanonicalValue(mode)},
-                                    {"stop_entry_stage_id", CanonicalValue("stage")}});
-    ASSERT_NE(with_entry.find_object_member("stop_entry_stage_id"), nullptr);
-    EXPECT_EQ(with_entry.find_object_member("stop_entry_stage_id")->as_string(), "stage");
-  }
+  EXPECT_FALSE(notify.find_object_member("active_at_start")->as_bool());
+  const auto defaulted = sealed({{"on_trip", CanonicalValue("stop")}});
+  EXPECT_EQ(text(defaulted, "after_stop"), "hold");
+  EXPECT_FALSE(defaulted.find_object_member("active_at_start")->as_bool());
+  const auto with = [](CanonicalValue::Object fields, CanonicalValue::Object extra) {
+    for (auto& field : extra) fields.push_back(std::move(field));
+    return fields;
+  };
+  const CanonicalValue::Object active{{"active_at_start", CanonicalValue(false)}};
   for (auto invalid : std::vector<CanonicalValue::Object>{
-           {{"on_trip", CanonicalValue("stop")}},
-           {{"on_trip", CanonicalValue(true)}},
-           {{"on_trip", CanonicalValue(nullptr)}},
-           {{"idle_behaviour", CanonicalValue("latch")}},
-           {{"on_trip", CanonicalValue("gate")}, {"idle_behaviour", CanonicalValue("ignore")}},
-           {{"on_trip", CanonicalValue("notify")}, {"idle_behaviour", CanonicalValue("latch")}},
-           {{"on_trip", CanonicalValue("notify")}, {"idle_behaviour", CanonicalValue("ignore")}},
-           {{"on_trip", CanonicalValue("notify")}, {"stop_entry_stage_id", CanonicalValue("stage")}},
-           {{"latch_release", CanonicalValue("operator")}}})
+           {},
+           active,
+           with(active, {{"on_trip", CanonicalValue("gate")}}),
+           with(active, {{"on_trip", CanonicalValue("full_stop")}}),
+           with(active, {{"on_trip", CanonicalValue(true)}}),
+           with(active, {{"on_trip", CanonicalValue(nullptr)}}),
+           with(stop_fields, {{"idle_behaviour", CanonicalValue("latch")}}),
+           with(active, {{"on_trip", CanonicalValue("notify")}, {"after_stop", CanonicalValue("hold")}}),
+           with(active, {{"on_trip", CanonicalValue("notify")}, {"after_stop", CanonicalValue("fail_node")}}),
+           with(active, {{"on_trip", CanonicalValue("notify")}, {"stop_entry_stage_id", CanonicalValue("stage")}}),
+           with(active, {{"on_trip", CanonicalValue("stop")}, {"after_stop", CanonicalValue("resume")}}),
+           {{"on_trip", CanonicalValue("stop")}, {"after_stop", CanonicalValue("hold")},
+            {"active_at_start", CanonicalValue("yes")}},
+           with(stop_fields, {{"latch_release", CanonicalValue("operator")}})})
     EXPECT_THROW(static_cast<void>(decode(document(std::move(invalid)))),
                  DeploymentApplicabilityCodecError);
+}
+
+TEST(DeploymentApplicabilityCodecTest, LegacyInterruptPolicyTablesAreUnknownFields) {
+  for (const auto* field : {"interrupt_sources", "interrupt_policies", "interrupt_config"}) {
+    auto policies = policy_envelope();
+    policies.pop_back();
+    policies += ",\"" + std::string(field) + "\":" +
+                (std::string_view(field) == "interrupt_config" ? "{}" : "[]") + "}";
+    expect_decode_error_containing(with_policies(minimal_document(), std::move(policies)),
+                                   "unknown field '" + std::string(field) + "'");
+  }
 }
 
 } // namespace manyforge::deployment

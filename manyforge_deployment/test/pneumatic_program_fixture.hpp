@@ -21,7 +21,7 @@ inline PneumaticProgramFixture compile_pneumatic_program_fixture(
   using namespace maintained_activation_fixture_detail;
   const auto source = parse_strict_json_model_yaml(Read(
       std::filesystem::path(MANYFORGE_WORKSPACE_ROOT) /
-      "examples/lite6_pneumatic_mock.scenario/program.yaml")).root();
+      "examples/mock_lite6_pneumatic_pick_and_place.scenario/program.yaml")).root();
   ProgramOptions options;
   options.catalog_content_version = product.bundle->value().catalogs.node_environment.content_version;
   options.logic_only = true;

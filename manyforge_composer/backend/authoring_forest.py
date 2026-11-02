@@ -111,11 +111,11 @@ def empty_authoring(catalog: NodeCatalog) -> dict[str, Any]:
                 "description": "Default acceleration scale for motion nodes.",
             },
             {
-                "parameter_id": "max_blend_deviation_rad",
+                "parameter_id": "blend_radius_m",
                 "type": "float64",
-                "default": 0.01,
+                "default": 0.0,
                 "constraints": {"min_inclusive": 0.0},
-                "description": "Default maximum Cartesian blend deviation.",
+                "description": "Default Cartesian corner blend radius (m); 0 keeps exact corners.",
             },
             {
                 "parameter_id": "translation_tol_m",

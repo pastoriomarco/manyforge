@@ -67,15 +67,15 @@ TOPIC_TYPE_BY_NAME: Final = {
 
 COMMON_ROW_CHECKS: Final = frozenset(
     {
-        "cclc_route_ready",
+        "component_route_ready",
         "controller_ready",
         "cross_host_clock_payload",
         "execution_owner_exact",
         "joint_command_payload",
         "joint_state_payload",
         "program_terminal",
-        "reset_observed",
         "required_topics_exact",
+        "reset_observed",
         "runtime_namespace_exact",
         "simulation_playing_during",
         "simulation_stopped_after",
@@ -148,7 +148,7 @@ _UR10_WORLD = (
 
 SCENARIOS: Final = (
     ScenarioSpec(
-        scenario_id="isaac-lite6-pick-place",
+        scenario_id="sim_lite6_pick_and_place",
         deployment_artifact_id="isaac_lite6_lite_gripper_pick_and_place",
         cell_id="isaac_lite6_pick_place_cell",
         component_id="isaac_lite6_robot",
@@ -173,7 +173,7 @@ SCENARIOS: Final = (
         | frozenset({"gripper_converged", "scene_observation_fresh"}),
     ),
     ScenarioSpec(
-        scenario_id="isaac-lite6-trocar-foundationpose",
+        scenario_id="sim_lite6_foundationpose_trocar_pick",
         deployment_artifact_id="trocar_lite6_foundationpose_pick",
         cell_id="isaac_lite6_trocar_cell",
         component_id="isaac_lite6_trocar_robot",
@@ -214,7 +214,7 @@ SCENARIOS: Final = (
         ),
     ),
     ScenarioSpec(
-        scenario_id="isaac-ur10e-light-scene",
+        scenario_id="sim_ur10e_pick_and_place",
         deployment_artifact_id="isaac_manipulator_scene_light_ros2_control",
         cell_id="isaac_ur10e_light_cell",
         component_id="isaac_ur10e_light_robot",
@@ -245,7 +245,7 @@ SCENARIOS: Final = (
         ),
     ),
     ScenarioSpec(
-        scenario_id="isaac-ur10e-light-scene-assistant",
+        scenario_id="sim_ur10e_assistant_scene_authoring",
         deployment_artifact_id="isaac_manipulator_scene_light_assistant",
         cell_id="isaac_ur10e_assistant_cell",
         component_id="isaac_ur10e_assistant_robot",
@@ -278,7 +278,7 @@ SCENARIOS: Final = (
         ),
     ),
     ScenarioSpec(
-        scenario_id="isaac-ur10e-light-scene-collision",
+        scenario_id="sim_ur10e_runtime_collision_stop",
         deployment_artifact_id=(
             "isaac_manipulator_scene_light_ros2_control_collision"
         ),
@@ -814,7 +814,7 @@ def validate_recovery_evidence(
     if recovery["schema_version"] != RECOVERY_EVIDENCE_SCHEMA:
         raise QualificationError("FoundationPose recovery schema is not I9 v1")
     expected_component = SCENARIO_BY_ID[
-        "isaac-lite6-trocar-foundationpose"
+        "sim_lite6_foundationpose_trocar_pick"
     ].component_id
     if recovery["component_id"] != expected_component:
         raise QualificationError("FoundationPose recovery crossed components")
@@ -968,9 +968,9 @@ def reduce_matrix(
     evidence, clock_passed, probe_checks = validate_matrix_evidence(
         matrix_evidence
     )
-    foundation_row = by_id["isaac-lite6-trocar-foundationpose"]
+    foundation_row = by_id["sim_lite6_foundationpose_trocar_pick"]
     recovery, recovery_checks = validate_recovery_evidence(foundation_row)
-    collision_checks = by_id["isaac-ur10e-light-scene-collision"]["checks"]
+    collision_checks = by_id["sim_ur10e_runtime_collision_stop"]["checks"]
     namespace_checks = all(
         row["checks"]["runtime_namespace_exact"]
         and row["checks"]["execution_owner_exact"]

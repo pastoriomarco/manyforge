@@ -16,12 +16,11 @@
 #include <climits>
 #include <cstdint>
 #include <cstring>
+#include <iostream>
 #include <limits>
 #include <manyforge_component_manager/active_bundle_publication_store.hpp>
 #include <manyforge_component_manager/durable_store_set.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
-#include <manyforge_core/route_fence_record_codec_internal.hpp>
-#include <manyforge_deployment/verified_retained_bundle.hpp>
 #include <manyforge_persistence/sqlite_read_only_preflight.hpp>
 #include <optional>
 #include <set>
@@ -41,12 +40,11 @@ namespace {
 namespace component_manager = manyforge::component_manager;
 namespace content_identity = manyforge::content_identity;
 namespace core = manyforge::core;
-namespace deployment = manyforge::deployment;
 namespace persistence = manyforge::persistence;
 
 constexpr std::string_view kSchemaId =
-    "manyforge.internal.kernel-configuration-fence-ledger.v6";
-constexpr int kSchemaVersion = 6;
+    "manyforge.internal.kernel-configuration-fence-ledger.v7";
+constexpr int kSchemaVersion = 7;
 constexpr int kSqliteApplicationId = 1296451142;
 constexpr std::uint64_t kMaximumFenceRecords = 256U;
 constexpr std::uint64_t kMaximumDatabasePageImageBytes = 64U * 1024U * 1024U;
@@ -68,22 +66,6 @@ constexpr std::uint64_t kMaximumDatabasePageImageBytes = 64U * 1024U * 1024U;
 void Require(const bool condition, std::string detail) {
   if (!condition) {
     Fail(std::move(detail));
-  }
-}
-
-template <typename Value, typename Operation>
-[[nodiscard]] core::Result<Value>
-InvokeRouteFencePort(Operation &&operation) noexcept {
-  try {
-    return core::Result<Value>::Ok(operation());
-  } catch (const std::exception &error) {
-    return core::Result<Value>::Err(
-        core::ErrorDTO{"route_configuration_fence_rejected", error.what(), {}});
-  } catch (...) {
-    return core::Result<Value>::Err(
-        core::ErrorDTO{"route_configuration_fence_rejected",
-                       "route-configuration fence operation failed",
-                       {}});
   }
 }
 
@@ -130,16 +112,6 @@ ExistingPlainDirectory(std::filesystem::path path,
   return absolute.lexically_normal();
 }
 
-void RequireDisjointDirectories(const std::filesystem::path &left,
-                                const std::filesystem::path &right,
-                                const std::string_view label) {
-  std::error_code error;
-  const bool equivalent = std::filesystem::equivalent(left, right, error);
-  Require(!error, std::string(label) + " cannot be compared");
-  Require(!equivalent,
-          std::string(label) + " must refer to distinct directories");
-}
-
 [[nodiscard]] std::filesystem::path
 ValidateLedgerPath(std::filesystem::path path) {
   Require(!path.empty() && path.has_filename(), "ledger path is empty");
@@ -174,12 +146,24 @@ public:
       descriptor_ = -1;
       Fail("durable-owner lock is not a regular file: " + detail);
     }
-    if (::flock(descriptor_, LOCK_EX | LOCK_NB) != 0) {
-      const auto detail = std::string(std::strerror(errno));
-      ::close(descriptor_);
-      descriptor_ = -1;
-      Fail("another process owns the Kernel Apply-fence ledger: " + detail);
+    if (::flock(descriptor_, LOCK_EX | LOCK_NB) == 0) {
+      return;
     }
+    // A predecessor execution host (e.g. of a Manager that was killed) still
+    // owns the ledger until its teardown completes; the kernel releases the
+    // lock when it exits. Wait for exactly that release. The Manager's
+    // readiness timeout bounds the wait; a stop signal interrupts it.
+    if (errno == EWOULDBLOCK) {
+      std::cerr << "Kernel Apply-fence ledger is held by a predecessor "
+                   "execution host; waiting for it to exit\n";
+      if (::flock(descriptor_, LOCK_EX) == 0) {
+        return;
+      }
+    }
+    const auto detail = std::string(std::strerror(errno));
+    ::close(descriptor_);
+    descriptor_ = -1;
+    Fail("cannot own the Kernel Apply-fence ledger: " + detail);
   }
 
   ~FileLock() {
@@ -466,22 +450,15 @@ void ValidateConfigurations(
           "active-control-configuration rows are invalid or noncanonical");
 }
 
+// The predecessor-side rows an Apply fence pins at acquisition: every
+// predecessor controller domain must have its reconciled configuration.
 [[nodiscard]] std::vector<core::DomainActiveControlConfigurationDTO>
 SelectConfigurations(
     const std::vector<core::DomainActiveControlConfigurationDTO> &available,
-    const core::ConfigurationFenceScopeDTO &scope, const bool candidate_side) {
+    const core::ConfigurationFenceScopeDTO &scope) {
   std::vector<core::DomainActiveControlConfigurationDTO> result;
   for (const auto &domain : scope.domains) {
-    const bool required =
-        candidate_side ? domain.candidate_control_domain_revision.has_value()
-                       : domain.predecessor_control_domain_revision.has_value();
-    const auto *provider =
-        std::get_if<core::ProviderConfigurationFenceDomainDTO>(&domain.payload);
-    const bool provider_side =
-        provider &&
-        (candidate_side ? provider->candidate_provider.has_value()
-                        : provider->predecessor_provider.has_value());
-    if (!required || provider_side) {
+    if (!domain.has_controller_predecessor()) {
       continue;
     }
     const auto found = std::lower_bound(
@@ -498,25 +475,30 @@ SelectConfigurations(
   return result;
 }
 
-[[nodiscard]] core::ExpectedActiveControlConfigurationDTO
-SelectExpectedConfiguration(
+// The rows a held fence's status reports: the configurations actually active
+// now for the scope's controller domains. A domain with none (new to the
+// cell, or not installed yet) has nothing to report or restore, so neither a
+// before-effect release nor a post-publication release requires one.
+[[nodiscard]] std::vector<core::DomainActiveControlConfigurationDTO>
+ObservedConfigurations(
     const std::vector<core::DomainActiveControlConfigurationDTO> &available,
     const core::ConfigurationFenceScopeDTO &scope) {
-  Require(scope.domains.size() == 1U,
-          "route fence must name exactly one control domain");
-  const auto &domain_id = scope.domains.front().control_domain_id;
-  const auto found = std::lower_bound(
-      available.begin(), available.end(), domain_id,
-      [](const auto &configuration, const auto &candidate_domain_id) {
-        return configuration.control_domain_id < candidate_domain_id;
-      });
-  if (found == available.end() || found->control_domain_id != domain_id) {
-    return {core::ExpectedActiveControlConfigurationPresenceDTO::kAbsent,
-            std::nullopt, std::nullopt};
+  std::vector<core::DomainActiveControlConfigurationDTO> result;
+  for (const auto &domain : scope.domains) {
+    if (!domain.has_controller_side()) {
+      continue;
+    }
+    const auto found = std::lower_bound(
+        available.begin(), available.end(), domain.control_domain_id,
+        [](const auto &configuration, const auto &domain_id) {
+          return configuration.control_domain_id < domain_id;
+        });
+    if (found != available.end() &&
+        found->control_domain_id == domain.control_domain_id) {
+      result.push_back(*found);
+    }
   }
-  return {core::ExpectedActiveControlConfigurationPresenceDTO::kPresent,
-          found->active_control_configuration_id,
-          found->active_control_configuration_generation};
+  return result;
 }
 
 [[nodiscard]] std::string
@@ -527,42 +509,12 @@ FenceIdFor(const core::ApplyConfigurationFenceIntentDTO &intent,
          digest.substr(digest.size() - 16U);
 }
 
-[[nodiscard]] std::string
-FenceIdFor(const core::RouteConfigurationFenceIntentDTO &intent,
-           const std::uint64_t generation) {
-  const auto digest = content_identity::sha256_digest(
-      core::detail::EncodeRouteFenceIntentRecord(intent));
-  return "configuration-fence-" + std::to_string(generation) + "-" +
-         digest.substr(digest.size() - 16U);
-}
-
-enum class DurableFenceOwnerKind { kApply, kRoute, kSelectedBringUp };
-
-[[nodiscard]] constexpr std::string_view
-ToString(const DurableFenceOwnerKind kind) noexcept {
-  switch (kind) {
-  case DurableFenceOwnerKind::kApply:
-    return "apply";
-  case DurableFenceOwnerKind::kRoute:
-    return "route";
-  case DurableFenceOwnerKind::kSelectedBringUp:
-    return "selected_bring_up";
-  }
-  return {};
-}
-
 struct DurableFenceRow final {
-  DurableFenceOwnerKind owner_kind;
   std::string intent_bytes;
   std::string accepted_bytes;
   int state;
   std::optional<std::string> release_request_bytes;
   std::optional<std::string> release_receipt_bytes;
-};
-
-struct ActivePublication final {
-  core::ActiveBundlePublicationReceiptDTO receipt;
-  std::shared_ptr<const deployment::RetainedBundle> bundle;
 };
 
 [[nodiscard]] bool
@@ -731,12 +683,11 @@ ManagedKernelAdmissionObservation ManagedKernelAdmissionGate::Observe(
   Require(table != nullptr || !resource_table_was_bound_,
           "the bound Kernel resource table is no longer available");
   if (table == nullptr) {
-    return {0U, {}, {}, 0U, 0U};
+    return {0U, {}, 0U, 0U};
   }
   const auto snapshot = table->admission_snapshot(scope.resources);
   return {snapshot.operation_resource_generation,
           snapshot.active_control_configurations,
-          snapshot.route_published_active_control_configurations,
           snapshot.affected_queued_operation_count,
           snapshot.affected_active_operation_count};
 }
@@ -769,8 +720,8 @@ void ManagedKernelAdmissionGate::AcquireFenceDurably(
               observation.affected_active_operation_count == 0U,
           "affected operation admission is busy or changed before fence "
           "acquisition");
-  Require(SelectConfigurations(observation.active_control_configurations, scope,
-                               false) == expected_active_control_configurations,
+  Require(SelectConfigurations(observation.active_control_configurations,
+                               scope) == expected_active_control_configurations,
           "active control configuration changed before fence acquisition");
   for (const auto &held : held_fences_) {
     if (!ScopesOverlap(held.scope, scope))
@@ -787,46 +738,6 @@ void ManagedKernelAdmissionGate::AcquireFenceDurably(
   // observes it after its ledger result is durable; it cannot enter the gap.
   // On a persistence exception the in-process fence deliberately remains
   // held because the SQLite commit outcome may be uncertain.
-  commit_durable_fence();
-}
-
-void ManagedKernelAdmissionGate::AcquireRouteFenceDurably(
-    const core::ConfigurationFenceId &fence_id,
-    const core::ConfigurationFenceScopeDTO &scope,
-    const std::uint64_t expected_operation_resource_generation,
-    const core::ExpectedActiveControlConfigurationDTO
-        &expected_active_control_configuration,
-    const std::function<void()> &commit_durable_fence) {
-  Require(
-      !fence_id.empty() && scope.valid() && scope.domains.size() == 1U &&
-          expected_active_control_configuration.locally_valid(),
-      "route-fence acquisition identity, scope, or configuration is invalid");
-  Require(static_cast<bool>(commit_durable_fence),
-          "route-fence acquisition durable commit is absent");
-  std::lock_guard lock(*admission_mutex_);
-  const auto table = resource_table_.lock();
-  Require(table != nullptr || !resource_table_was_bound_,
-          "the bound Kernel resource table is no longer available");
-  const auto observation = table != nullptr
-                               ? table->admission_snapshot(scope.resources)
-                               : core::ResourceSlotAdmissionSnapshotDTO{};
-  Require(observation.operation_resource_generation ==
-                  expected_operation_resource_generation &&
-              observation.affected_queued_operation_count == 0U &&
-              observation.affected_active_operation_count == 0U,
-          "affected operation admission is busy or changed before route-fence "
-          "acquisition");
-  Require(
-      SelectExpectedConfiguration(
-          observation.route_published_active_control_configurations, scope) ==
-          expected_active_control_configuration,
-      "active control configuration changed before route-fence acquisition");
-  Require(
-      std::none_of(
-          held_fences_.begin(), held_fences_.end(),
-          [&](const auto &held) { return ScopesOverlap(held.scope, scope); }),
-      "an overlapping configuration fence already closes operation admission");
-  held_fences_.push_back({fence_id, scope});
   commit_durable_fence();
 }
 
@@ -926,23 +837,11 @@ void ManagedKernelAdmissionGate::RunWithExactHeldFence(
 }
 
 class ManagedKernelApplyFenceOwner::Impl final {
-  struct InstalledNativeCandidateObservation final {
-    std::shared_ptr<const deployment::RetainedBundle> bundle;
-    const core::ActiveBundlePublicationReceiptDTO &predecessor;
-    const core::CellAdmissionClaimDTO &parent;
-    const std::vector<core::InstalledProviderCandidateFactsDTO> &facts;
-    std::vector<core::ProviderConfigurationFenceLineageDTO> lineages;
-  };
 public:
   Impl(ManagedKernelApplyFenceOwnerConfig config,
        ManagedKernelAdmissionGate &admission_gate)
       : config_(ValidateConfig(std::move(config))),
         admission_gate_(admission_gate), lock_(config_.ledger_path),
-        bundle_source_(config_.retained_package_root,
-                       config_.candidate_retained_package_root.empty()
-                           ? std::nullopt
-                           : std::optional<std::filesystem::path>(
-                                 config_.candidate_retained_package_root)),
         publication_store_(
             config_.manager_state_root /
                 std::string(
@@ -971,29 +870,22 @@ public:
       const core::ConfigurationFenceAdmissionQueryDTO &query) const {
     std::lock_guard lock(mutex_);
     Require(query.valid(), "admission observation query is invalid");
-    std::unique_lock admission_lock(*admission_gate_.shared_admission_mutex(),
-                                    std::defer_lock);
-    if (HasProviderProof(query.affected_scope))
-      admission_lock.lock();
     const auto active = ReadActivePublication();
-    const auto provider_lineages = ValidateProviderConfigurations(
-        query.affected_scope, false, *active.bundle);
     const auto observation = admission_gate_.Observe(query.affected_scope);
     const auto configurations = SelectConfigurations(
-        observation.active_control_configurations, query.affected_scope, false);
-    const auto epoch = ExecutionHostEpoch(active.receipt);
+        observation.active_control_configurations, query.affected_scope);
+    const auto epoch = ExecutionHostEpoch(active);
     core::ConfigurationFenceAdmissionSnapshotDTO snapshot{
         query,
         epoch,
-        active.receipt.request.candidate_projection_revision,
-        active.receipt.durable_public_pointer_content_digest,
+        active.request.candidate_projection_revision,
+        active.durable_public_pointer_content_digest,
         observation.operation_resource_generation,
         core::ConfigurationFenceGeneration(ReadFenceGeneration()),
         configurations,
         observation.affected_queued_operation_count,
         observation.affected_active_operation_count,
-        Digest("manyforge.kernel-fence-admission-observation.seed.v1"),
-        provider_lineages};
+        Digest("manyforge.kernel-fence-admission-observation.seed.v1")};
     snapshot.result_digest = core::ContentDigest(
         content_identity::sha256_digest(EncodeResponse(snapshot)));
     Require(snapshot.presence_valid(),
@@ -1007,10 +899,6 @@ public:
               {}) {
     std::lock_guard lock(mutex_);
     Require(intent.valid(), "Apply-fence intent is invalid");
-    std::unique_lock admission_lock(*admission_gate_.shared_admission_mutex(),
-                                    std::defer_lock);
-    if (HasProviderProof(intent.scope))
-      admission_lock.lock();
     const auto intent_bytes = EncodeRequest(intent);
     if (const auto existing =
             ReadByRequest(intent.owner_request_context.request_owner_epoch,
@@ -1018,8 +906,6 @@ public:
       Require(existing->intent_bytes == intent_bytes && existing->state == 0,
               "request ID is bound to another or already released fence "
               "outcome");
-      Require(existing->owner_kind == DurableFenceOwnerKind::kApply,
-              "request ID is bound to a route-configuration fence");
       auto accepted = DecodeResponse<core::ConfigurationFenceAcceptedDTO>(
           existing->accepted_bytes);
       accepted.replay_status = core::RequestReplayStatusDTO::kReplayedExact;
@@ -1027,19 +913,23 @@ public:
               "durable exact-replay acceptance contradicts its intent");
       return accepted;
     }
-    Require(
+    // The ledger is bounded by eviction, never refusal: a full ledger drops
+    // its oldest released fence when this one is inserted (see below). Only
+    // a ledger full of held fences refuses.
+    const bool ledger_full =
         ReadSingleInteger(database_, "SELECT COUNT(*) FROM kernel_apply_fences",
-                          "durable fence record count") < kMaximumFenceRecords,
-        "durable fence ledger has reached its fixed record bound");
+                          "durable fence record count") >= kMaximumFenceRecords;
+    Require(!ledger_full ||
+                ReadSingleInteger(database_,
+                                  "SELECT COUNT(*) FROM kernel_apply_fences "
+                                  "WHERE state=1",
+                                  "durable released fence count") > 0,
+            "durable fence ledger is full of held fences");
 
     const auto active = ReadActivePublication();
-    Require(
-        ValidateProviderConfigurations(intent.scope, false, *active.bundle) ==
-            intent.expected_provider_lineages,
-        "provider predecessor lineage changed before Apply fence acquisition");
-    Require(active.receipt.request.candidate_retained_bundle_id ==
+    Require(active.request.candidate_retained_bundle_id ==
                     intent.expected_retained_bundle_id &&
-                active.receipt.request.candidate_graph_revision ==
+                active.request.candidate_graph_revision ==
                     intent.expected_graph_revision,
             "active predecessor changed before fence acquisition");
     const auto observed = admission_gate_.Observe(intent.scope);
@@ -1049,7 +939,7 @@ public:
                 observed.affected_active_operation_count == 0U,
             "affected operation admission is busy or changed");
     const auto active_configurations = SelectConfigurations(
-        observed.active_control_configurations, intent.scope, false);
+        observed.active_control_configurations, intent.scope);
     Require(active_configurations ==
                 intent.expected_active_control_configurations,
             "active control configuration changed before fence acquisition");
@@ -1073,24 +963,39 @@ public:
         intent.expected_active_control_configurations,
         [&] {
           Transaction transaction(database_);
+          if (ledger_full) {
+            // The oldest released fence is settled history. Held fences are
+            // never evicted (RestoreHeldFence, HeldApplyFence and the overlap
+            // check read only held rows). A released row serves only exact
+            // Release replay and status queries for its Apply, which the
+            // Manager settles from its own durable release record long before
+            // kMaximumFenceRecords newer fences exist. The ledger digest
+            // changes with this insert anyway.
+            Statement evict(
+                database_,
+                "DELETE FROM kernel_apply_fences WHERE fence_generation=("
+                "SELECT MIN(fence_generation) FROM kernel_apply_fences "
+                "WHERE state=1)");
+            Require(evict.Step() == SQLITE_DONE &&
+                        sqlite3_changes(database_) == 1,
+                    "durable fence ledger eviction failed");
+          }
           Statement insert(
               database_,
               "INSERT INTO kernel_apply_fences ("
-              "owner_kind,owner_id,owner_generation,request_id,request_owner_"
-              "epoch,"
+              "owner_id,owner_generation,request_id,request_owner_epoch,"
               "intent_blob,accepted_blob,fence_id,fence_generation,state,"
               "release_request_blob,release_receipt_blob) "
-              "VALUES (?,?,?,?,?,?,?,?,?,0,NULL,NULL)");
-          insert.Text(1, ToString(DurableFenceOwnerKind::kApply));
-          insert.Text(2, intent.owner_transaction.apply_id.value());
-          insert.Integer(3, intent.owner_transaction.apply_generation.value());
-          insert.Text(4, intent.owner_request_context.request_id.value());
-          insert.Text(5,
+              "VALUES (?,?,?,?,?,?,?,?,0,NULL,NULL)");
+          insert.Text(1, intent.owner_transaction.apply_id.value());
+          insert.Integer(2, intent.owner_transaction.apply_generation.value());
+          insert.Text(3, intent.owner_request_context.request_id.value());
+          insert.Text(4,
                       intent.owner_request_context.request_owner_epoch.value());
-          insert.Blob(6, intent_bytes);
-          insert.Blob(7, EncodeResponse(accepted));
-          insert.Text(8, accepted.configuration_fence_id.value());
-          insert.Integer(9, accepted.configuration_fence_generation.value());
+          insert.Blob(5, intent_bytes);
+          insert.Blob(6, EncodeResponse(accepted));
+          insert.Text(7, accepted.configuration_fence_id.value());
+          insert.Integer(8, accepted.configuration_fence_generation.value());
           Require(insert.Step() == SQLITE_DONE,
                   "durable fence insertion returned a row");
           Statement update(
@@ -1111,15 +1016,14 @@ public:
                                              const auto &scope) {
                 Statement statement(
                     database_,
-                    "SELECT owner_kind,intent_blob,accepted_blob,state,"
+                    "SELECT intent_blob,accepted_blob,state,"
                     "release_request_blob,release_receipt_blob "
                     "FROM kernel_apply_fences WHERE fence_id=?");
                 statement.Text(1, id.value());
                 const auto old = ReadOptionalRow(statement);
                 Require(
-                    old && old->state == 0 &&
-                        old->owner_kind == DurableFenceOwnerKind::kApply,
-                    "overlapping barrier is not an ordinary held Apply fence");
+                    old && old->state == 0,
+                    "overlapping barrier is not a held Apply fence");
                 const auto old_intent =
                     DecodeRequest<core::ApplyConfigurationFenceIntentDTO>(
                         old->intent_bytes);
@@ -1148,7 +1052,7 @@ public:
     std::lock_guard lock(mutex_);
     Require(query.valid(), "fence-attempt reconciliation query is invalid");
     const auto active = ReadActivePublication();
-    const auto epoch = ExecutionHostEpoch(active.receipt);
+    const auto epoch = ExecutionHostEpoch(active);
     const auto intent_bytes = EncodeRequest(query.persisted_intent);
     const auto existing = ReadByRequest(
         query.persisted_intent.owner_request_context.request_owner_epoch,
@@ -1163,8 +1067,7 @@ public:
         Digest("manyforge.kernel-fence-attempt-reconciliation.seed.v1"),
         std::nullopt};
     if (existing.has_value()) {
-      if (existing->owner_kind == DurableFenceOwnerKind::kApply &&
-          existing->intent_bytes == intent_bytes && existing->state == 0) {
+      if (existing->intent_bytes == intent_bytes && existing->state == 0) {
         result.state =
             core::ApplyFenceAcquireAttemptReconcileState::kAcceptedExact;
         result.accepted_fence =
@@ -1200,7 +1103,7 @@ public:
         ReadByFence(request.persisted_configuration_fence_id,
                     request.persisted_configuration_fence_generation);
     const auto active = ReadActivePublication();
-    const auto epoch = ExecutionHostEpoch(active.receipt);
+    const auto epoch = ExecutionHostEpoch(active);
     core::ApplyFenceReconcileEntryDTO entry{
         request.persisted_configuration_fence_id,
         request.persisted_configuration_fence_generation,
@@ -1217,8 +1120,6 @@ public:
     // composition bootstrap and add no stronger proof.
     const bool affected_admission_idle = true;
     if (row.has_value()) {
-      Require(row->owner_kind == DurableFenceOwnerKind::kApply,
-              "Apply rehydration names a route-configuration fence");
       const auto intent = DecodeRequest<core::ApplyConfigurationFenceIntentDTO>(
           row->intent_bytes);
       const auto accepted = DecodeResponse<core::ConfigurationFenceAcceptedDTO>(
@@ -1276,81 +1177,29 @@ public:
     return QueryStatusLocked(query);
   }
 
-  [[nodiscard]] core::ConfigurationFenceStatusDTO
-  QueryInstalledNativeApplyCandidateStatus(
-      const core::ConfigurationFenceStatusQueryDTO &query,
-      const core::ActiveBundlePublicationReceiptDTO &predecessor,
-      const core::CellAdmissionClaimDTO &parent,
-      const core::NativeApplyPlanDTO &plan,
-      const std::vector<core::InstalledProviderCandidateFactsDTO> &facts,
-      const std::function<void()> &revalidate_installed_attempt) const {
-    Require(query.valid() && predecessor.valid() && plan.apply.valid() &&
-                plan.apply.apply_id == query.owner_transaction.apply_id &&
-                plan.apply.apply_generation == query.owner_transaction.apply_generation &&
-                !plan.component_bring_up && revalidate_installed_attempt,
-            "installed NativeApply observation has invalid original authority");
-    // This exact ordinary identity is immutable, not a last-plan lookup.
-    // Verified product I/O and fresh facade facts precede admission locks.
-    auto bundle = bundle_source_.get_verified(plan.candidate_retained_bundle_id);
-    Require(bundle && bundle->value().cell_graph.cell_id == config_.cell_id &&
-                bundle->value().cell_graph.graph_revision == plan.candidate_graph_revision,
-            "installed NativeApply candidate product is unavailable");
-    std::set<core::ControllableComponentId> seen;
-    std::optional<core::RequestOwnerEpoch> source_owner;
-    for (const auto &fact : facts) {
-      const auto *source = std::get_if<core::InstalledNativeApplyCandidateSourceDTO>(&fact.source);
-      const auto planned = std::find_if(plan.components.begin(), plan.components.end(),
-          [&](const auto &row) { return row.component_id == fact.controllable_component_id; });
-      Require(source && source->apply == plan.apply && !source->lifecycle_owner_epoch.empty() &&
-                  (!source_owner || *source_owner == source->lifecycle_owner_epoch) &&
-                  seen.insert(fact.controllable_component_id).second &&
-                  fact.retained_bundle_id == plan.candidate_retained_bundle_id &&
-                  fact.graph_revision == plan.candidate_graph_revision &&
-                  planned != plan.components.end() && planned->generation.nonzero() &&
-                  planned->generation == fact.component_lifecycle_generation &&
-                  fact.domains.size() == fact.provider_occurrences.size(),
-              "installed NativeApply facts differ from its exact full plan");
-      source_owner = source->lifecycle_owner_epoch;
-      for (std::size_t index = 0; index < fact.domains.size(); ++index) {
-        const auto &domain = fact.domains[index];
-        const auto &occurrence = fact.provider_occurrences[index];
-        Require(domain.locally_valid() && occurrence.locally_valid() &&
-                    domain.control_domain_id == occurrence.control_domain_id &&
-                    domain.control_domain_revision == occurrence.control_domain_revision &&
-                    (!domain.provider() || core::ProviderDomainMatchesOccurrence(
-                        domain.control_domain_id, domain.control_domain_revision,
-                        domain.provider()->provider, domain.provider()->provider_runtime_epoch,
-                        occurrence)),
-                "installed NativeApply facts have a foreign provider occurrence");
-      }
-    }
-    std::vector<core::ProviderConfigurationFenceLineageDTO> lineages;
-    std::set<core::ControllableComponentId> required;
-    for (const auto &domain : query.expected_scope.domains) {
-      const auto *sides = std::get_if<core::ProviderConfigurationFenceDomainDTO>(&domain.payload);
-      if (!sides || !sides->candidate_provider) continue;
-      const auto component = sides->candidate_provider->controllable_component_id;
-      required.insert(component);
-      const auto fact = std::find_if(facts.begin(), facts.end(), [&](const auto &row) {
-        return row.controllable_component_id == component;
-      });
-      Require(fact != facts.end(), "installed NativeApply candidate coverage is incomplete");
-      const auto occurrence = std::find_if(fact->provider_occurrences.begin(), fact->provider_occurrences.end(),
-          [&](const auto &row) { return row.control_domain_id == domain.control_domain_id; });
-      Require(occurrence != fact->provider_occurrences.end(),
-              "installed NativeApply candidate domain is absent");
-      lineages.push_back({domain.control_domain_id, occurrence->provider_runtime_epoch,
-                          fact->component_lifecycle_generation});
-    }
-    Require(!required.empty() && required == seen,
-            "installed NativeApply facts have foreign or missing components");
-    InstalledNativeCandidateObservation observation{
-        std::move(bundle), predecessor, parent, facts, std::move(lineages)};
+  [[nodiscard]] std::optional<core::ConfigurationFenceStatusQueryDTO>
+  HeldApplyFence(const core::NamedApplyPublicationTransactionDTO &apply,
+                 const core::RuntimeEpoch &manager_runtime_epoch) const {
     std::lock_guard lock(mutex_);
-    // Existing ledger->composition order. Identity comparisons only, with
-    // no SQL, Kernel calls or effects; release composition before admission.
-    revalidate_installed_attempt();
-    return QueryStatusLocked(query, &observation);
+    Require(apply.valid() && !manager_runtime_epoch.empty(),
+            "held Apply-fence lookup is invalid");
+    Statement statement(database_,
+                        "SELECT accepted_blob FROM kernel_apply_fences WHERE "
+                        "owner_id=? AND owner_generation=? AND state=0");
+    statement.Text(1, apply.apply_id.value());
+    statement.Integer(2, apply.apply_generation.value());
+    if (statement.Step() != SQLITE_ROW)
+      return std::nullopt;
+    const auto accepted = DecodeResponse<core::ConfigurationFenceAcceptedDTO>(
+        statement.ColumnBlob(0));
+    Require(statement.Step() == SQLITE_DONE,
+            "held Apply fence is not unique");
+    return core::ConfigurationFenceStatusQueryDTO{
+        {apply.apply_id, apply.apply_generation},
+        accepted.configuration_fence_id,
+        accepted.configuration_fence_generation,
+        accepted.captured_scope,
+        manager_runtime_epoch};
   }
 
   void RunWithExactHeldPredecessor(
@@ -1360,10 +1209,6 @@ public:
       const core::ContentDigest &expected_predecessor_public_pointer_digest,
       const std::function<void()> &effect) const {
     std::lock_guard lock(mutex_);
-    std::unique_lock admission_lock(*admission_gate_.shared_admission_mutex(),
-                                    std::defer_lock);
-    if (HasProviderProof(query.expected_scope))
-      admission_lock.lock();
     Require(query.valid() &&
                 expected_predecessor_publication_generation.nonzero() &&
                 !expected_predecessor_public_pointer_digest.empty() &&
@@ -1373,8 +1218,6 @@ public:
                                  query.configuration_fence_generation);
     Require(row.has_value() && row->state == 0,
             "runtime composition does not name a durable held fence");
-    Require(row->owner_kind == DurableFenceOwnerKind::kApply,
-            "runtime composition names a route-configuration fence");
     const auto intent = DecodeRequest<core::ApplyConfigurationFenceIntentDTO>(
         row->intent_bytes);
     const auto accepted = DecodeResponse<core::ConfigurationFenceAcceptedDTO>(
@@ -1388,111 +1231,18 @@ public:
             "runtime composition conflicts with the durable held fence");
 
     const auto active = ReadActivePublication();
-    Require(ValidateProviderConfigurations(query.expected_scope, false,
-                                           *active.bundle) ==
-                intent.expected_provider_lineages,
-            "provider predecessor lineage changed before Apply effect");
-    Require(active.receipt.request.candidate_retained_bundle_id ==
+    Require(active.request.candidate_retained_bundle_id ==
                     intent.expected_retained_bundle_id &&
-                active.receipt.request.candidate_graph_revision ==
+                active.request.candidate_graph_revision ==
                     intent.expected_graph_revision &&
-                active.receipt.publication_generation ==
+                active.publication_generation ==
                     expected_predecessor_publication_generation &&
-                active.receipt.durable_public_pointer_content_digest ==
+                active.durable_public_pointer_content_digest ==
                     expected_predecessor_public_pointer_digest,
             "runtime composition predecessor publication changed while its "
             "fence was held");
     admission_gate_.RunWithExactHeldFence(query.configuration_fence_id,
-                                          query.expected_scope, [&] {
-                                            if (admission_lock.owns_lock())
-                                              admission_lock.unlock();
-                                            effect();
-                                          });
-  }
-
-  void RunWithExactHeldInstalledCandidate(
-      const core::ConfigurationFenceStatusQueryDTO &query,
-      core::ActiveBundlePublicationGeneration predecessor_generation,
-      const core::ContentDigest &predecessor_pointer_digest,
-      const core::CellAdmissionClaimDTO &parent,
-      const core::ProjectionRevisionDTO &candidate,
-      const std::vector<core::RuntimeProviderDomainConfigurationReadbackDTO>
-          &actual_candidate_configurations,
-      const std::function<void()> &effect) const {
-    Require(query.valid() && candidate.valid() && effect &&
-                predecessor_generation.nonzero() &&
-                !predecessor_pointer_digest.empty(),
-            "installed candidate handoff has invalid authority");
-    const auto bundle = bundle_source_.get_verified(candidate.retained_bundle_id);
-    Require(bundle && bundle->value().cell_graph.cell_id == config_.cell_id &&
-                bundle->value().cell_graph.graph_revision == candidate.graph_revision,
-            "installed candidate handoff product is unavailable");
-    std::unique_lock lock(mutex_);
-    std::unique_lock admission_lock(*admission_gate_.shared_admission_mutex());
-    const auto row = ReadByFence(query.configuration_fence_id,
-                                 query.configuration_fence_generation);
-    Require(row && row->state == 0 && row->owner_kind == DurableFenceOwnerKind::kApply,
-            "installed candidate handoff has no durable held Apply fence");
-    const auto intent = DecodeRequest<core::ApplyConfigurationFenceIntentDTO>(row->intent_bytes);
-    const auto accepted = DecodeResponse<core::ConfigurationFenceAcceptedDTO>(row->accepted_bytes);
-    Require(intent.owner_transaction == query.owner_transaction && accepted.matches(intent) &&
-                accepted.configuration_fence_id == query.configuration_fence_id &&
-                accepted.configuration_fence_generation == query.configuration_fence_generation &&
-                accepted.captured_scope == query.expected_scope,
-            "installed candidate handoff conflicts with its durable fence");
-    const auto kind = parent.intent.claim_kind;
-    Require((kind == core::CellAdmissionClaimKindDTO::kManagerApply &&
-                 parent.intent.owner_transaction_id == query.owner_transaction.apply_id.value()) ||
-                kind == core::CellAdmissionClaimKindDTO::kAuthoringMutation,
-            "installed candidate handoff parent has another transaction");
-    Require(static_cast<bool>(config_.selected_claim_recovery_receipt),
-            "installed candidate handoff has no actual parent source");
-    const core::CellAdmissionRecoveryReceiptQueryDTO parent_query{
-        parent.intent, parent, std::nullopt};
-    const auto held = config_.selected_claim_recovery_receipt(parent_query);
-    // Keep the existing candidate-handoff consumer contract: the actual
-    // owner supplies a validated HeldExact receipt for the complete claim.
-    Require(held.ok() && core::ValidateCellAdmissionRecoveryReceipt(held.value()).ok() &&
-                held.value().status == core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact &&
-                held.value().matched_claim == std::optional(parent),
-            "installed candidate handoff parent is no longer held exact");
-    const auto active = ReadActivePublication();
-    Require(active.receipt.publication_generation == predecessor_generation &&
-                active.receipt.durable_public_pointer_content_digest == predecessor_pointer_digest &&
-                active.receipt.request.candidate_retained_bundle_id == intent.expected_retained_bundle_id &&
-                active.receipt.request.candidate_graph_revision == intent.expected_graph_revision,
-            "installed candidate handoff lost its exact public predecessor");
-    std::vector<core::ProviderConfigurationFenceLineageDTO> lineages;
-    for (const auto &actual : actual_candidate_configurations) {
-      Require(actual.locally_valid() && actual.retained_bundle_id == candidate.retained_bundle_id &&
-                  actual.graph_revision == candidate.graph_revision,
-              "installed candidate handoff observation is foreign or invalid");
-      lineages.push_back({actual.domain.control_domain_id,
-          actual.provider_occurrence.provider_runtime_epoch, actual.component_lifecycle_generation});
-    }
-    ValidateInstalledCandidateConfigurations(query.expected_scope, *bundle, lineages);
-    admission_gate_.RunWithExactHeldFence(query.configuration_fence_id, query.expected_scope, [&] {
-      admission_lock.unlock();
-      lock.unlock();
-      effect();
-    });
-  }
-
-  void RunWithExactHeldOriginalApplyCandidate(
-      const core::ConfigurationFenceStatusQueryDTO &query,
-      core::ActiveBundlePublicationGeneration predecessor_generation,
-      const core::ContentDigest &predecessor_pointer_digest,
-      const core::ApplyComponentBringUpAuthorityDTO &parent,
-      const core::ProjectionRevisionDTO &candidate,
-      const std::vector<core::RuntimeProviderDomainConfigurationReadbackDTO>
-          &actual_candidate_configurations,
-      const std::function<void()> &effect) const {
-    Require(parent.valid() && parent.held_fence_query == query &&
-                parent.parent.owner == query.owner_transaction,
-            "original Apply candidate continuation has invalid authority");
-    RunWithExactHeldInstalledCandidate(query, predecessor_generation,
-        predecessor_pointer_digest, parent.parent_claim, candidate,
-        actual_candidate_configurations, effect);
+                                          query.expected_scope, effect);
   }
 
   void RunWithExactHeldSuccessor(
@@ -1512,8 +1262,7 @@ public:
             "fenced successor does not name the parent Apply");
     const auto row = ReadByFence(query.configuration_fence_id,
                                  query.configuration_fence_generation);
-    Require(row.has_value() && row->state == 0 &&
-                row->owner_kind == DurableFenceOwnerKind::kApply,
+    Require(row.has_value() && row->state == 0,
             "fenced successor has no held parent Apply fence");
     const auto intent = DecodeRequest<core::ApplyConfigurationFenceIntentDTO>(
         row->intent_bytes);
@@ -1536,7 +1285,7 @@ public:
     // the pre-publication step already verified the fenced predecessor. The
     // publication store keeps only recent receipts, so history is not re-read.
     const auto active = ReadActivePublication();
-    Require(active.receipt == successor,
+    Require(active == successor,
             "fenced successor is no longer the active publication");
     admission_gate_.RunWithExactHeldFence(query.configuration_fence_id,
                                           query.expected_scope, effect);
@@ -1578,8 +1327,6 @@ public:
                                  evidence.configuration_fence_generation);
     Require(row.has_value(),
             "released fence is absent from the durable ledger");
-    Require(row->owner_kind == DurableFenceOwnerKind::kApply,
-            "Apply release names a route-configuration fence");
     if (row->state == 1) {
       Require(row->release_request_bytes.has_value() &&
                   row->release_receipt_bytes.has_value() &&
@@ -1629,945 +1376,11 @@ public:
     return released;
   }
 
-  [[nodiscard]] core::RouteConfigurationFenceAdmissionSnapshotDTO
-  ObserveRouteConfigurationFenceAdmission(
-      const core::RouteConfigurationFenceAdmissionQueryDTO &query) const {
-    std::lock_guard lock(mutex_);
-    return ObserveRouteConfigurationFenceAdmissionLocked(query);
-  }
-
-  [[nodiscard]] core::RouteConfigurationFenceAcceptedDTO
-  AcquireRouteConfigurationFence(
-      const core::RouteConfigurationFenceIntentDTO &intent) {
-    std::lock_guard lock(mutex_);
-    Require(intent.locally_valid(),
-            "route-configuration fence intent is invalid");
-    const auto intent_bytes =
-        core::detail::EncodeRouteFenceIntentRecord(intent);
-    if (const auto existing =
-            ReadByRequest(intent.owner_request_context.request_owner_epoch,
-                          intent.owner_request_context.request_id)) {
-      Require(existing->owner_kind == DurableFenceOwnerKind::kRoute &&
-                  existing->intent_bytes == intent_bytes,
-              "request ID is bound to another configuration-fence outcome");
-      auto accepted = core::detail::DecodeRouteFenceAcceptedRecord(
-          existing->accepted_bytes);
-      accepted.replay_status = core::RequestReplayStatusDTO::kReplayedExact;
-      Require(accepted.matches(intent),
-              "durable route-fence replay contradicts its intent");
-      return accepted;
-    }
-    Require(
-        ReadSingleInteger(database_, "SELECT COUNT(*) FROM kernel_apply_fences",
-                          "durable fence record count") < kMaximumFenceRecords,
-        "durable fence ledger has reached its fixed record bound");
-
-    const core::RouteConfigurationFenceAdmissionQueryDTO query{
-        intent.route_selection_transaction_id,
-        intent.route_selection_transaction_generation,
-        intent.scope,
-        intent.expected_retained_bundle_id,
-        intent.expected_graph_revision,
-        intent.expected_active_control_configuration};
-    const auto snapshot = ObserveRouteConfigurationFenceAdmissionLocked(query);
-    Require(intent.matches(snapshot),
-            "route-fence admission changed before acquisition");
-
-    const auto predecessor_generation = ReadFenceGeneration();
-    Require(
-        predecessor_generation == intent.expected_fence_generation.value() &&
-            predecessor_generation < std::numeric_limits<std::uint64_t>::max(),
-        "configuration-fence generation changed before route acquisition");
-    const auto next_generation = predecessor_generation + 1U;
-    core::RouteConfigurationFenceAcceptedDTO accepted{
-        intent.owner_request_context.request_id,
-        core::RequestReplayStatusDTO::kAcceptedNew,
-        intent.route_selection_transaction_id,
-        intent.route_selection_transaction_generation,
-        core::ConfigurationFenceId(FenceIdFor(intent, next_generation)),
-        core::ConfigurationFenceGeneration(next_generation),
-        intent.scope,
-        intent.candidate_active_control_configuration_id,
-        intent.candidate_active_control_configuration_generation,
-        config_.now_ns(),
-        Digest("manyforge.kernel-route-fence-acceptance.seed.v1")};
-    accepted.acceptance_digest =
-        core::ContentDigest(content_identity::sha256_digest(
-            core::detail::EncodeRouteFenceAcceptedRecord(accepted)));
-    Require(accepted.matches(intent),
-            "constructed route-fence acceptance is invalid");
-
-    admission_gate_.AcquireRouteFenceDurably(
-        accepted.configuration_fence_id, accepted.captured_scope,
-        intent.expected_operation_resource_generation,
-        snapshot.current_active_control_configuration, [&] {
-          Transaction transaction(database_);
-          Statement insert(
-              database_,
-              "INSERT INTO kernel_apply_fences ("
-              "owner_kind,owner_id,owner_generation,request_id,"
-              "request_owner_epoch,intent_blob,accepted_blob,fence_id,"
-              "fence_generation,state,release_request_blob,"
-              "release_receipt_blob) VALUES (?,?,?,?,?,?,?,?,?,0,NULL,NULL)");
-          insert.Text(1, ToString(DurableFenceOwnerKind::kRoute));
-          insert.Text(2, intent.route_selection_transaction_id.value());
-          insert.Integer(3,
-                         intent.route_selection_transaction_generation.value());
-          insert.Text(4, intent.owner_request_context.request_id.value());
-          insert.Text(5,
-                      intent.owner_request_context.request_owner_epoch.value());
-          insert.Blob(6, intent_bytes);
-          insert.Blob(7,
-                      core::detail::EncodeRouteFenceAcceptedRecord(accepted));
-          insert.Text(8, accepted.configuration_fence_id.value());
-          insert.Integer(9, accepted.configuration_fence_generation.value());
-          Require(insert.Step() == SQLITE_DONE,
-                  "durable route-fence insertion returned a row");
-          Statement update(
-              database_,
-              "UPDATE kernel_apply_fence_meta SET fence_generation=? WHERE "
-              "id=1 AND fence_generation=?");
-          update.Integer(1, next_generation);
-          update.Integer(2, predecessor_generation);
-          Require(update.Step() == SQLITE_DONE &&
-                      sqlite3_changes(database_) == 1,
-                  "durable route-fence generation compare-and-swap failed");
-          transaction.Commit();
-        });
-    return accepted;
-  }
-
-  [[nodiscard]]
-  core::RouteConfigurationFenceAcquireAttemptReconciliationDTO
-  ReconcileRouteConfigurationFenceAcquireAttempt(
-      const core::RouteConfigurationFenceIntentDTO &intent) const {
-    std::lock_guard lock(mutex_);
-    Require(intent.locally_valid(),
-            "route-fence Acquire reconciliation intent is invalid");
-    const auto intent_bytes =
-        core::detail::EncodeRouteFenceIntentRecord(intent);
-    const auto existing =
-        ReadByRequest(intent.owner_request_context.request_owner_epoch,
-                      intent.owner_request_context.request_id);
-    if (!existing.has_value()) {
-      return {
-          intent,
-          core::RouteConfigurationFenceAcquireAttemptDispositionDTO::kNotSeen,
-          std::nullopt, std::nullopt, std::nullopt};
-    }
-    if (existing->owner_kind != DurableFenceOwnerKind::kRoute ||
-        existing->intent_bytes != intent_bytes) {
-      return {intent,
-              core::RouteConfigurationFenceAcquireAttemptDispositionDTO::
-                  kConflicting,
-              std::nullopt, std::nullopt,
-              core::ErrorDTO{"route_configuration_fence_request_conflict",
-                             "the durable request identity names another fence",
-                             {}}};
-    }
-    const auto accepted =
-        core::detail::DecodeRouteFenceAcceptedRecord(existing->accepted_bytes);
-    const core::RouteConfigurationFenceStatusQueryDTO query{
-        accepted.route_selection_transaction_id,
-        accepted.route_selection_transaction_generation,
-        accepted.configuration_fence_id,
-        accepted.configuration_fence_generation, accepted.captured_scope};
-    const auto status = ObserveRouteConfigurationFenceStatusLocked(query);
-    if (existing->state == 0) {
-      core::RouteConfigurationFenceAcquireAttemptReconciliationDTO result{
-          intent,
-          core::RouteConfigurationFenceAcquireAttemptDispositionDTO::
-              kAcceptedExact,
-          accepted, status, std::nullopt};
-      Require(result.locally_valid(),
-              "constructed exact route-fence reconciliation is invalid");
-      return result;
-    }
-    core::RouteConfigurationFenceAcquireAttemptReconciliationDTO result{
-        intent,
-        core::RouteConfigurationFenceAcquireAttemptDispositionDTO::kConflicting,
-        std::nullopt, status,
-        core::ErrorDTO{
-            "route_configuration_fence_already_released",
-            "the exact Acquire was accepted and its fence is already released",
-            {}}};
-    Require(result.locally_valid(),
-            "constructed released Acquire reconciliation is invalid");
-    return result;
-  }
-
-  [[nodiscard]] core::RouteConfigurationFenceStatusDTO
-  ObserveRouteConfigurationFenceStatus(
-      const core::RouteConfigurationFenceStatusQueryDTO &query) const {
-    std::lock_guard lock(mutex_);
-    return ObserveRouteConfigurationFenceStatusLocked(query);
-  }
-
-  [[nodiscard]] core::RouteConfigurationFenceReleasedDTO
-  ReleaseRouteConfigurationFence(
-      const core::RouteConfigurationFenceReleaseRequestDTO &request) {
-    std::lock_guard lock(mutex_);
-    Require(request.locally_valid(), "route-fence release request is invalid");
-    const auto request_bytes =
-        core::detail::EncodeRouteFenceReleaseRequestRecord(request);
-    const auto row =
-        ReadByFence(request.accepted_fence.configuration_fence_id,
-                    request.accepted_fence.configuration_fence_generation);
-    Require(row.has_value() && row->owner_kind == DurableFenceOwnerKind::kRoute,
-            "route-fence release identity is absent or foreign");
-    if (row->state == 1) {
-      Require(row->release_request_bytes == request_bytes &&
-                  row->release_receipt_bytes.has_value(),
-              "exact route-fence release replay conflicts with its receipt");
-      auto released = core::detail::DecodeRouteFenceReleasedRecord(
-          *row->release_receipt_bytes);
-      released.replay_status = core::RequestReplayStatusDTO::kReplayedExact;
-      return released;
-    }
-    const auto intent =
-        core::detail::DecodeRouteFenceIntentRecord(row->intent_bytes);
-    const auto accepted =
-        core::detail::DecodeRouteFenceAcceptedRecord(row->accepted_bytes);
-    Require(accepted == request.accepted_fence && accepted.matches(intent),
-            "route-fence release conflicts with its durable acceptance");
-    const core::RouteConfigurationFenceStatusQueryDTO query{
-        accepted.route_selection_transaction_id,
-        accepted.route_selection_transaction_generation,
-        accepted.configuration_fence_id,
-        accepted.configuration_fence_generation, accepted.captured_scope};
-    const auto held = ObserveRouteConfigurationFenceStatusLocked(query);
-    Require(held.state == core::RouteConfigurationFenceStateDTO::kHeld &&
-                held.evidence == request.held_evidence,
-            "route-fence release evidence is stale or no longer held");
-
-    core::RouteConfigurationFenceReleasedDTO released{
-        request,
-        core::RequestReplayStatusDTO::kAcceptedNew,
-        config_.now_ns(),
-        accepted.configuration_fence_id,
-        accepted.configuration_fence_generation,
-        Digest("manyforge.kernel-route-fence-released-scope.v1",
-               core::detail::EncodeRouteFenceAcceptedRecord(accepted)),
-        Digest("manyforge.kernel-route-fence-release-receipt.seed.v1")};
-    released.receipt_digest =
-        core::ContentDigest(content_identity::sha256_digest(
-            core::detail::EncodeRouteFenceReleasedRecord(released)));
-    Require(released.locally_valid(),
-            "constructed route-fence release receipt is invalid");
-    const auto receipt_bytes =
-        core::detail::EncodeRouteFenceReleasedRecord(released);
-    Transaction transaction(database_);
-    Statement update(
-        database_,
-        "UPDATE kernel_apply_fences SET state=1,release_request_blob=?,"
-        "release_receipt_blob=? WHERE fence_id=? AND fence_generation=? AND "
-        "owner_kind='route' AND state=0");
-    update.Blob(1, request_bytes);
-    update.Blob(2, receipt_bytes);
-    update.Text(3, accepted.configuration_fence_id.value());
-    update.Integer(4, accepted.configuration_fence_generation.value());
-    Require(update.Step() == SQLITE_DONE && sqlite3_changes(database_) == 1,
-            "durable route-fence release compare-and-swap failed");
-    transaction.Commit();
-    admission_gate_.ReleaseFence(accepted.configuration_fence_id,
-                                 accepted.captured_scope);
-    return released;
-  }
-
-  [[nodiscard]]
-  core::RouteConfigurationFenceReleaseAttemptReconciliationDTO
-  ReconcileRouteConfigurationFenceReleaseAttempt(
-      const core::RouteConfigurationFenceReleaseRequestDTO &request) const {
-    std::lock_guard lock(mutex_);
-    Require(request.locally_valid(),
-            "route-fence Release reconciliation request is invalid");
-    const auto row =
-        ReadByFence(request.accepted_fence.configuration_fence_id,
-                    request.accepted_fence.configuration_fence_generation);
-    if (!row.has_value() || row->owner_kind != DurableFenceOwnerKind::kRoute) {
-      return {request,
-              core::RouteConfigurationFenceReleaseAttemptDispositionDTO::
-                  kConflicting,
-              std::nullopt, std::nullopt,
-              core::ErrorDTO{"route_configuration_fence_release_conflict",
-                             "the release names an absent or foreign fence",
-                             {}}};
-    }
-    const auto encoded =
-        core::detail::EncodeRouteFenceReleaseRequestRecord(request);
-    const auto accepted =
-        core::detail::DecodeRouteFenceAcceptedRecord(row->accepted_bytes);
-    const core::RouteConfigurationFenceStatusQueryDTO query{
-        accepted.route_selection_transaction_id,
-        accepted.route_selection_transaction_generation,
-        accepted.configuration_fence_id,
-        accepted.configuration_fence_generation, accepted.captured_scope};
-    const auto status = ObserveRouteConfigurationFenceStatusLocked(query);
-    if (row->state == 1 && row->release_request_bytes == encoded &&
-        row->release_receipt_bytes.has_value()) {
-      const auto receipt = core::detail::DecodeRouteFenceReleasedRecord(
-          *row->release_receipt_bytes);
-      core::RouteConfigurationFenceReleaseAttemptReconciliationDTO result{
-          request,
-          core::RouteConfigurationFenceReleaseAttemptDispositionDTO::
-              kReleasedExact,
-          receipt, status, std::nullopt};
-      Require(result.locally_valid(),
-              "constructed exact route release reconciliation is invalid");
-      return result;
-    }
-    if (row->state == 0 && status.evidence == request.held_evidence) {
-      core::RouteConfigurationFenceReleaseAttemptReconciliationDTO result{
-          request,
-          core::RouteConfigurationFenceReleaseAttemptDispositionDTO::
-              kNotReleasedHeld,
-          std::nullopt, status, std::nullopt};
-      Require(result.locally_valid(),
-              "constructed held route release reconciliation is invalid");
-      return result;
-    }
-    core::RouteConfigurationFenceReleaseAttemptReconciliationDTO result{
-        request,
-        core::RouteConfigurationFenceReleaseAttemptDispositionDTO::kConflicting,
-        std::nullopt, status,
-        core::ErrorDTO{
-            "route_configuration_fence_release_conflict",
-            "the durable release outcome conflicts with the exact request",
-            {}}};
-    Require(result.locally_valid(),
-            "constructed conflicting route release reconciliation is invalid");
-    return result;
-  }
-
-  [[nodiscard]] core::RouteConfigurationFenceAdmissionSnapshotDTO
-  ObserveRouteConfigurationFenceAdmissionLocked(
-      const core::RouteConfigurationFenceAdmissionQueryDTO &query) const {
-    Require(query.locally_valid(), "route-fence admission query is invalid");
-    const auto active = ReadActivePublication();
-    Require(active.receipt.request.candidate_retained_bundle_id ==
-                    query.expected_retained_bundle_id &&
-                active.receipt.request.candidate_graph_revision ==
-                    query.expected_graph_revision,
-            "active publication differs from the route-fence expectation");
-    const auto observation = admission_gate_.Observe(query.scope);
-    const auto current = SelectExpectedConfiguration(
-        observation.route_published_active_control_configurations, query.scope);
-    Require(current == query.expected_active_control_configuration,
-            "active control configuration differs from the route expectation");
-    core::RouteConfigurationFenceAdmissionSnapshotDTO snapshot{
-        query,
-        ExecutionHostEpoch(active.receipt),
-        active.receipt.request.candidate_projection_revision,
-        active.receipt.publication_generation,
-        active.receipt.durable_public_pointer_content_digest,
-        observation.operation_resource_generation,
-        core::ConfigurationFenceGeneration(ReadFenceGeneration()),
-        current,
-        observation.affected_queued_operation_count,
-        observation.affected_active_operation_count,
-        Digest("manyforge.kernel-route-fence-admission-snapshot.seed.v1")};
-    snapshot.snapshot_digest =
-        core::ContentDigest(content_identity::sha256_digest(
-            core::detail::EncodeRouteFenceAdmissionSnapshotRecord(snapshot)));
-    Require(snapshot.locally_valid(),
-            "constructed route-fence admission snapshot is invalid");
-    return snapshot;
-  }
-
-  [[nodiscard]] core::RouteConfigurationFenceStatusDTO
-  ObserveRouteConfigurationFenceStatusLocked(
-      const core::RouteConfigurationFenceStatusQueryDTO &query) const {
-    Require(query.locally_valid(), "route-fence status query is invalid");
-    const auto row = ReadByFence(query.configuration_fence_id,
-                                 query.configuration_fence_generation);
-    Require(row.has_value() && row->owner_kind == DurableFenceOwnerKind::kRoute,
-            "route-fence status identity is absent or foreign");
-    const auto intent =
-        core::detail::DecodeRouteFenceIntentRecord(row->intent_bytes);
-    const auto accepted =
-        core::detail::DecodeRouteFenceAcceptedRecord(row->accepted_bytes);
-    Require(accepted.matches(intent) &&
-                accepted.route_selection_transaction_id ==
-                    query.route_selection_transaction_id &&
-                accepted.route_selection_transaction_generation ==
-                    query.route_selection_transaction_generation &&
-                accepted.configuration_fence_id ==
-                    query.configuration_fence_id &&
-                accepted.configuration_fence_generation ==
-                    query.configuration_fence_generation &&
-                accepted.captured_scope == query.expected_scope,
-            "route-fence status query conflicts with the durable fence");
-    if (row->state == 1) {
-      Require(row->release_receipt_bytes.has_value(),
-              "released route fence lacks its durable receipt");
-      const auto released = core::detail::DecodeRouteFenceReleasedRecord(
-          *row->release_receipt_bytes);
-      core::RouteConfigurationFenceStatusDTO status{
-          query,
-          released.request.held_evidence,
-          core::RouteConfigurationFenceStateDTO::kReleased,
-          false,
-          released,
-          {},
-          Digest("manyforge.kernel-route-fence-status.seed.v1"),
-          std::nullopt};
-      status.result_digest =
-          core::ContentDigest(content_identity::sha256_digest(
-              core::detail::EncodeRouteFenceStatusRecord(status)));
-      Require(status.locally_valid(),
-              "constructed released route-fence status is invalid");
-      return status;
-    }
-
-    const auto active = ReadActivePublication();
-    const auto observation = admission_gate_.Observe(query.expected_scope);
-    const auto current = SelectExpectedConfiguration(
-        observation.route_published_active_control_configurations,
-        query.expected_scope);
-    core::RouteConfigurationFenceReconciliationEvidenceDTO evidence{
-        ExecutionHostEpoch(active.receipt),
-        query.route_selection_transaction_id,
-        query.route_selection_transaction_generation,
-        query.configuration_fence_id,
-        query.configuration_fence_generation,
-        query.expected_scope,
-        observation.operation_resource_generation,
-        active.receipt.request.candidate_retained_bundle_id,
-        active.receipt.request.candidate_graph_revision,
-        active.receipt.request.candidate_projection_revision,
-        active.receipt.publication_generation,
-        active.receipt.durable_public_pointer_content_digest,
-        current,
-        observation.affected_queued_operation_count,
-        observation.affected_active_operation_count,
-        Digest("manyforge.kernel-route-fence-evidence.seed.v1")};
-    evidence.evidence_digest =
-        core::ContentDigest(content_identity::sha256_digest(
-            core::detail::EncodeRouteFenceEvidenceRecord(evidence)));
-    Require(evidence.locally_valid(),
-            "constructed route-fence reconciliation evidence is invalid");
-    core::RouteConfigurationFenceStatusDTO status{
-        query,
-        evidence,
-        core::RouteConfigurationFenceStateDTO::kHeld,
-        true,
-        std::nullopt,
-        {},
-        Digest("manyforge.kernel-route-fence-status.seed.v1"),
-        std::nullopt};
-    status.result_digest = core::ContentDigest(content_identity::sha256_digest(
-        core::detail::EncodeRouteFenceStatusRecord(status)));
-    Require(status.locally_valid(),
-            "constructed held route-fence status is invalid");
-    return status;
-  }
-
-  void ValidateSelectedClaimLocked(
-      const core::SelectedBringUpConfigurationFenceIntentDTO &intent) const {
-    Require(intent.valid() &&
-                static_cast<bool>(config_.selected_claim_recovery_receipt),
-            "selected fence has no current Kernel claim lookup");
-    const auto &claim = intent.selected_claim;
-    const auto receipt = config_.selected_claim_recovery_receipt(
-        {claim.intent, claim, std::nullopt});
-    Require(receipt.ok(), "selected admission claim lookup failed");
-    const auto &value = receipt.value();
-    Require(core::ValidateCellAdmissionRecoveryReceipt(value).ok() &&
-                value.status ==
-                    core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact &&
-                value.matched_claim == claim &&
-                std::find(value.held_claims.begin(), value.held_claims.end(),
-                          claim) != value.held_claims.end(),
-            "selected admission claim is absent, changed or no longer held");
-  }
-
-  [[nodiscard]] core::ConfigurationFenceAcceptedDTO AcquireSelectedBringUpFence(
-      const core::SelectedBringUpConfigurationFenceIntentDTO &intent) {
-    std::lock_guard lock(mutex_);
-    std::lock_guard admission_lock(*admission_gate_.shared_admission_mutex());
-    Require(intent.valid(), "selected fence intent is invalid");
-    const auto bytes = EncodeRequest(intent);
-    if (const auto row =
-            ReadByRequest(intent.owner_request_context.request_owner_epoch,
-                          intent.owner_request_context.request_id)) {
-      Require(row->owner_kind == DurableFenceOwnerKind::kSelectedBringUp &&
-                  row->intent_bytes == bytes && row->state == 0,
-              "selected request names another or released fence outcome");
-      auto accepted = DecodeResponse<core::ConfigurationFenceAcceptedDTO>(
-          row->accepted_bytes);
-      Require(intent.matches(accepted),
-              "selected durable acceptance contradicts intent");
-      ValidateSelectedClaimLocked(intent);
-      accepted.replay_status = core::RequestReplayStatusDTO::kReplayedExact;
-      return accepted;
-    }
-    ValidateSelectedClaimLocked(intent);
-    Require(
-        ReadSingleInteger(database_, "SELECT COUNT(*) FROM kernel_apply_fences",
-                          "durable fence record count") < kMaximumFenceRecords,
-        "durable fence ledger has reached its fixed record bound");
-    const auto active = ReadActivePublication();
-    Require(ValidateProviderConfigurations(intent.selected_scope, false,
-                                           *active.bundle) ==
-                intent.expected_admission.provider_lineages,
-            "selected provider predecessor lineage changed before fence "
-            "acquisition");
-    const auto &expected = intent.expected_admission;
-    Require(
-        active.receipt.publication_generation ==
-                intent.expected_publication_generation &&
-            active.receipt.durable_public_pointer_content_digest ==
-                expected.active_public_pointer_digest &&
-            active.receipt.request.candidate_projection_revision ==
-                expected.active_projection_revision &&
-            expected.execution_host_epoch.runtime_unit_id ==
-                config_.runtime_unit_id &&
-            expected.execution_host_epoch.runtime_epoch ==
-                config_.runtime_epoch &&
-            expected.execution_host_epoch.request_owner_epoch ==
-                config_.request_owner_epoch &&
-            expected.execution_host_epoch.durable_stop_fence_ledger_digest ==
-                LedgerDigest(),
-        "selected predecessor publication or execution owner changed");
-    const auto observation = admission_gate_.Observe(intent.selected_scope);
-    Require(observation.operation_resource_generation ==
-                    expected.operation_resource_generation &&
-                observation.affected_queued_operation_count == 0U &&
-                observation.affected_active_operation_count == 0U &&
-                SelectConfigurations(observation.active_control_configurations,
-                                     intent.selected_scope, false) ==
-                    expected.active_control_configurations,
-            "selected operations or predecessor configurations changed");
-    const auto previous = ReadFenceGeneration();
-    Require(previous == expected.configuration_fence_generation.value() &&
-                previous < std::numeric_limits<std::uint64_t>::max(),
-            "selected fence generation changed or exhausted");
-    const auto next = previous + 1U;
-    const auto hash = content_identity::sha256_digest(bytes);
-    core::ConfigurationFenceAcceptedDTO accepted{
-        core::ConfigurationFenceId("configuration-fence-" +
-                                   std::to_string(next) + "-" +
-                                   hash.substr(hash.size() - 16U)),
-        core::ConfigurationFenceGeneration(next), intent.selected_scope,
-        config_.now_ns(), core::RequestReplayStatusDTO::kAcceptedNew};
-    Require(intent.matches(accepted),
-            "constructed selected acceptance is invalid");
-    admission_gate_.AcquireFenceDurably(
-        accepted.configuration_fence_id, accepted.captured_scope,
-        expected.operation_resource_generation,
-        expected.active_control_configurations, [&] {
-          Transaction transaction(database_);
-          Statement insert(
-              database_,
-              "INSERT INTO kernel_apply_fences "
-              "(owner_kind,owner_id,owner_generation,request_id,request_owner_"
-              "epoch,intent_blob,accepted_blob,fence_id,fence_generation,state,"
-              "release_request_blob,release_receipt_blob) VALUES "
-              "(?,?,?,?,?,?,?,?,?,0,NULL,NULL)");
-          insert.Text(1, ToString(DurableFenceOwnerKind::kSelectedBringUp));
-          insert.Text(2, intent.lifecycle_transaction_id.value());
-          insert.Integer(3, intent.lifecycle_transaction_generation.value());
-          insert.Text(4, intent.owner_request_context.request_id.value());
-          insert.Text(5,
-                      intent.owner_request_context.request_owner_epoch.value());
-          insert.Blob(6, bytes);
-          insert.Blob(7, EncodeResponse(accepted));
-          insert.Text(8, accepted.configuration_fence_id.value());
-          insert.Integer(9, next);
-          Require(insert.Step() == SQLITE_DONE,
-                  "selected fence insertion returned a row");
-          Statement update(
-              database_,
-              "UPDATE kernel_apply_fence_meta SET fence_generation=? WHERE "
-              "id=1 AND fence_generation=?");
-          update.Integer(1, next);
-          update.Integer(2, previous);
-          Require(update.Step() == SQLITE_DONE &&
-                      sqlite3_changes(database_) == 1,
-                  "selected fence generation compare-and-swap failed");
-          transaction.Commit();
-        });
-    return accepted;
-  }
-
-  [[nodiscard]] core::SelectedBringUpConfigurationFenceReleasedDTO
-  ReleaseSelectedBringUpFence(
-      const core::SelectedBringUpConfigurationFenceReleaseDTO &request) {
-    std::lock_guard lock(mutex_);
-    std::lock_guard admission_lock(*admission_gate_.shared_admission_mutex());
-    Require(request.valid(), "fence release request is invalid");
-    const auto &evidence = request.reconciliation_evidence;
-    const auto row = ReadByFence(evidence.configuration_fence_id,
-                                 evidence.configuration_fence_generation);
-    Require(row.has_value(),
-            "released fence is absent from the durable ledger");
-    Require(row->owner_kind == DurableFenceOwnerKind::kSelectedBringUp,
-            "selected release names a foreign fence");
-    if (row->state == 1) {
-      Require(row->release_request_bytes.has_value() &&
-                  row->release_receipt_bytes.has_value() &&
-                  *row->release_request_bytes == EncodeRequest(request),
-              "exact release replay conflicts with the durable receipt");
-      Require(
-          !admission_gate_.exact_fence_is_held(evidence.configuration_fence_id,
-                                               evidence.reconciled_scope),
-          "selected release is durable but admission remains held; preserve "
-          "exclusion and reconcile the exact owner before proceeding");
-      return DecodeResponse<core::SelectedBringUpConfigurationFenceReleasedDTO>(
-          *row->release_receipt_bytes);
-    }
-    ValidateSelectedClaimLocked(
-        DecodeRequest<core::SelectedBringUpConfigurationFenceIntentDTO>(
-            row->intent_bytes));
-    const core::SelectedBringUpConfigurationFenceStatusQueryDTO query{
-        evidence.owner_transaction, evidence.configuration_fence_id,
-        evidence.configuration_fence_generation, evidence.reconciled_scope,
-        request.manager_runtime_epoch};
-    const auto status = SelectedStatusLocked(query);
-    const auto intent =
-        DecodeRequest<core::SelectedBringUpConfigurationFenceIntentDTO>(
-            row->intent_bytes);
-    Require(status.reconciliation_evidence.active_projection_revision ==
-                intent.candidate_projection_revision,
-            "selected successor projection has not been installed");
-    Require(
-        status.state == core::ConfigurationFenceState::kHeld &&
-            status.reconciliation_evidence == evidence &&
-            status.reconciliation_evidence.affected_queued_operation_count ==
-                0U &&
-            status.reconciliation_evidence.affected_active_operation_count ==
-                0U,
-        "fence release evidence is stale or affected work remains");
-    core::SelectedBringUpConfigurationFenceReleasedDTO released{
-        request, evidence.execution_host_epoch, config_.now_ns(),
-        core::RequestReplayStatusDTO::kAcceptedNew,
-        Digest("manyforge.kernel-selected-fence-release-receipt.v1",
-               EncodeRequest(request),
-               evidence.execution_host_epoch.durable_stop_fence_ledger_digest
-                   .value())};
-    Require(released.valid(), "constructed fence release receipt is invalid");
-    const auto request_bytes = EncodeRequest(request);
-    const auto receipt_bytes = EncodeResponse(released);
-    admission_gate_.ReleaseFenceDurably(
-        evidence.configuration_fence_id, evidence.reconciled_scope, [&] {
-          Transaction transaction(database_);
-          Statement update(
-              database_,
-              "UPDATE kernel_apply_fences SET state=1,release_request_blob=?,"
-              "release_receipt_blob=? WHERE fence_id=? AND fence_generation=? "
-              "AND "
-              "state=0");
-          update.Blob(1, request_bytes);
-          update.Blob(2, receipt_bytes);
-          update.Text(3, evidence.configuration_fence_id.value());
-          update.Integer(4, evidence.configuration_fence_generation.value());
-          Require(update.Step() == SQLITE_DONE &&
-                      sqlite3_changes(database_) == 1,
-                  "durable fence release compare-and-swap failed");
-          transaction.Commit();
-        });
-    return released;
-  }
-
-  [[nodiscard]] core::SelectedBringUpConfigurationFenceStatusDTO
-  SelectedStatusLocked(
-      const core::SelectedBringUpConfigurationFenceStatusQueryDTO &query)
-      const {
-    Require(query.valid(), "fence status query is invalid");
-    std::unique_lock admission_lock(*admission_gate_.shared_admission_mutex(),
-                                    std::defer_lock);
-    if (HasProviderProof(query.expected_scope))
-      admission_lock.lock();
-    const auto row = ReadByFence(query.configuration_fence_id,
-                                 query.configuration_fence_generation);
-    Require(row.has_value(), "fence status identity is unknown");
-    Require(row->owner_kind == DurableFenceOwnerKind::kSelectedBringUp,
-            "selected status query names a foreign fence");
-    const auto intent =
-        DecodeRequest<core::SelectedBringUpConfigurationFenceIntentDTO>(
-            row->intent_bytes);
-    const auto accepted = DecodeResponse<core::ConfigurationFenceAcceptedDTO>(
-        row->accepted_bytes);
-    Require(intent.owner() == query.owner_transaction &&
-                accepted.configuration_fence_id ==
-                    query.configuration_fence_id &&
-                accepted.configuration_fence_generation ==
-                    query.configuration_fence_generation &&
-                accepted.captured_scope == query.expected_scope,
-            "fence status query conflicts with the durable fence");
-    if (row->state == 1) {
-      Require(row->release_receipt_bytes.has_value(),
-              "released fence lacks its durable receipt");
-      const auto released =
-          DecodeResponse<core::SelectedBringUpConfigurationFenceReleasedDTO>(
-              *row->release_receipt_bytes);
-      const bool gate_held = admission_gate_.exact_fence_is_held(
-          query.configuration_fence_id, query.expected_scope);
-      if (gate_held) {
-        core::SelectedBringUpConfigurationFenceStatusDTO pending{
-            query,
-            released.request.reconciliation_evidence,
-            core::ConfigurationFenceState::kReleasePending,
-            true,
-            std::nullopt,
-            "preserve selected admission exclusion and obtain explicit owner "
-            "reconciliation of the durable release and held gate",
-            Digest("manyforge.kernel-selected-fence-release-pending.seed.v1"),
-            core::ErrorDTO{"selected_bring_up_fence_release_uncertain",
-                           "the release receipt is durable but its admission "
-                           "gate remains held",
-                           {}}};
-        pending.result_digest = core::ContentDigest(
-            content_identity::sha256_digest(EncodeResponse(pending)));
-        Require(pending.presence_valid(),
-                "constructed pending selected release status is invalid");
-        return pending;
-      }
-      core::SelectedBringUpConfigurationFenceStatusDTO status{
-          query,
-          released.request.reconciliation_evidence,
-          core::ConfigurationFenceState::kReleased,
-          false,
-          released,
-          {},
-          Digest("manyforge.kernel-selected-fence-status.v1",
-                 EncodeRequest(query), released.release_receipt_digest.value()),
-          std::nullopt};
-      Require(status.presence_valid(),
-              "constructed released fence status is invalid");
-      return status;
-    }
-
-    Require(admission_gate_.exact_fence_is_held(query.configuration_fence_id,
-                                                query.expected_scope),
-            "selected durable fence is absent from the admission gate");
-    const auto active = ReadActivePublication();
-    ValidateProviderConfigurations(query.expected_scope, true, *active.bundle);
-    const auto observation = admission_gate_.Observe(query.expected_scope);
-    const auto configurations = SelectConfigurations(
-        observation.active_control_configurations, query.expected_scope, true);
-    const auto epoch = ExecutionHostEpoch(active.receipt);
-    core::SelectedBringUpConfigurationFenceReconciliationEvidenceDTO evidence{
-        epoch,
-        query.owner_transaction,
-        query.configuration_fence_id,
-        query.configuration_fence_generation,
-        query.expected_scope,
-        observation.operation_resource_generation,
-        active.receipt.request.candidate_graph_revision,
-        active.receipt.request.candidate_projection_revision,
-        active.receipt.publication_generation,
-        active.receipt.durable_public_pointer_content_digest,
-        configurations,
-        observation.affected_queued_operation_count,
-        observation.affected_active_operation_count,
-        Digest(
-            "manyforge.kernel-selected-fence-reconciliation-evidence.seed.v1")};
-    Require(evidence.valid(),
-            "constructed fence reconciliation evidence is invalid");
-    core::SelectedBringUpConfigurationFenceStatusDTO status{
-        query,
-        evidence,
-        core::ConfigurationFenceState::kHeld,
-        true,
-        std::nullopt,
-        {},
-        Digest("manyforge.kernel-selected-fence-status.seed.v1"),
-        std::nullopt};
-    evidence.evidence_digest = core::ContentDigest(
-        content_identity::sha256_digest(EncodeResponse(status)));
-    status.reconciliation_evidence = evidence;
-    status.result_digest = core::ContentDigest(
-        content_identity::sha256_digest(EncodeResponse(status)));
-    Require(status.presence_valid(),
-            "constructed held fence status is invalid");
-    return status;
-  }
-
-  [[nodiscard]] core::SelectedBringUpConfigurationFenceStatusDTO
-  ObserveSelectedBringUpFenceStatus(
-      const core::SelectedBringUpConfigurationFenceStatusQueryDTO &query)
-      const {
-    std::lock_guard lock(mutex_);
-    return SelectedStatusLocked(query);
-  }
-
-  void RunWithExactHeldSelectedPredecessor(
-      const core::SelectedBringUpConfigurationFenceStatusQueryDTO &query,
-      const std::function<void()> &effect) const {
-    std::unique_lock lock(mutex_);
-    std::unique_lock admission_lock(*admission_gate_.shared_admission_mutex());
-    Require(query.valid() && static_cast<bool>(effect),
-            "selected fenced effect is invalid");
-    const auto row = ReadByFence(query.configuration_fence_id,
-                                 query.configuration_fence_generation);
-    Require(row && row->owner_kind == DurableFenceOwnerKind::kSelectedBringUp &&
-                row->state == 0,
-            "selected effect names an absent, foreign or released fence");
-    const auto intent =
-        DecodeRequest<core::SelectedBringUpConfigurationFenceIntentDTO>(
-            row->intent_bytes);
-    const auto accepted = DecodeResponse<core::ConfigurationFenceAcceptedDTO>(
-        row->accepted_bytes);
-    Require(intent.owner() == query.owner_transaction &&
-                intent.matches(accepted) &&
-                accepted.captured_scope == query.expected_scope,
-            "selected effect conflicts with durable intent");
-    Require(intent.expected_admission.execution_host_epoch.runtime_unit_id ==
-                    config_.runtime_unit_id &&
-                intent.expected_admission.execution_host_epoch.runtime_epoch ==
-                    config_.runtime_epoch,
-            "selected effect cannot reuse a predecessor from another execution "
-            "occurrence");
-    ValidateSelectedClaimLocked(intent);
-    const auto active = ReadActivePublication();
-    Require(ValidateProviderConfigurations(query.expected_scope, false,
-                                           *active.bundle) ==
-                intent.expected_admission.provider_lineages,
-            "selected provider predecessor lineage changed before effect");
-    Require(active.receipt.publication_generation ==
-                    intent.expected_publication_generation &&
-                active.receipt.durable_public_pointer_content_digest ==
-                    intent.expected_admission.active_public_pointer_digest,
-            "selected predecessor publication changed before effect");
-    // The gate pins this exact fence across process retirement outside shared
-    // locks, as the existing Apply interlock does. Release cannot pass the pin.
-    admission_gate_.RunWithExactHeldFence(query.configuration_fence_id,
-                                          query.expected_scope, [&] {
-                                            admission_lock.unlock();
-                                            lock.unlock();
-                                            effect();
-                                          });
-  }
-
-  [[nodiscard]] core::SelectedBringUpFenceAcquireAttemptReconcileResultDTO
-  ReconcileSelectedBringUpFenceAcquireAttempt(
-      const core::SelectedBringUpFenceAcquireAttemptQueryDTO &query) const {
-    std::lock_guard lock(mutex_);
-    Require(query.valid(), "selected acquire reconciliation query is invalid");
-    const auto &intent = query.persisted_intent;
-    core::SelectedBringUpFenceAcquireAttemptReconcileResultDTO result{
-        ExecutionHostEpoch(ReadActivePublication().receipt),
-        query,
-        core::ApplyFenceAcquireAttemptReconcileState::kNotSeen,
-        std::nullopt,
-        false,
-        {},
-        Digest("manyforge.kernel-selected-fence-acquire-reconcile.seed.v1"),
-        std::nullopt};
-    const auto row =
-        ReadByRequest(intent.owner_request_context.request_owner_epoch,
-                      intent.owner_request_context.request_id);
-    if (row) {
-      if (row->owner_kind == DurableFenceOwnerKind::kSelectedBringUp &&
-          row->intent_bytes == EncodeRequest(intent) && row->state == 0) {
-        const auto accepted =
-            DecodeResponse<core::ConfigurationFenceAcceptedDTO>(
-                row->accepted_bytes);
-        Require(intent.matches(accepted),
-                "selected acquire receipt contradicts intent");
-        result.state =
-            core::ApplyFenceAcquireAttemptReconcileState::kAcceptedExact;
-        result.accepted_fence = accepted;
-        result.admission_fenced = true;
-      } else {
-        result.state =
-            core::ApplyFenceAcquireAttemptReconcileState::kConflicting;
-        result.admission_fenced = true;
-        result.required_compensation_or_operator_direction =
-            "reconcile the exact selected fence outcome; do not repeat effects";
-        result.error =
-            core::ErrorDTO{"selected_bring_up_fence_request_conflict",
-                           "request names another or released fence",
-                           {}};
-      }
-    }
-    if (!row && !admission_gate_
-                     .current_fenced_resources(intent.selected_scope.resources)
-                     .empty()) {
-      result.state = core::ApplyFenceAcquireAttemptReconcileState::kUncertain;
-      result.admission_fenced = true;
-      result.required_compensation_or_operator_direction =
-          "keep selected admission closed and reconcile the uncertain durable "
-          "acquisition";
-      result.error = core::ErrorDTO{"selected_bring_up_fence_acquire_uncertain",
-                                    "the selected admission gate is held "
-                                    "without an exact durable request receipt",
-                                    {}};
-    }
-    result.result_digest = core::ContentDigest(
-        content_identity::sha256_digest(EncodeResponse(result)));
-    Require(result.presence_valid(),
-            "constructed selected acquire reconciliation is invalid");
-    return result;
-  }
-
-  [[nodiscard]] core::SelectedBringUpFenceReleaseAttemptReconcileResultDTO
-  ReconcileSelectedBringUpFenceReleaseAttempt(
-      const core::SelectedBringUpFenceReleaseAttemptQueryDTO &query) const {
-    std::lock_guard lock(mutex_);
-    Require(query.valid(), "selected release reconciliation is invalid");
-    const auto &evidence = query.persisted_request.reconciliation_evidence;
-    core::SelectedBringUpFenceReleaseAttemptReconcileResultDTO result{
-        query, core::SelectedBringUpFenceReleaseAttemptState::kConflicting,
-        std::nullopt, std::nullopt,
-        core::ErrorDTO{"selected_bring_up_fence_release_conflict",
-                       "release is absent or conflicts with the exact fence",
-                       {}}};
-    const auto row = ReadByFence(evidence.configuration_fence_id,
-                                 evidence.configuration_fence_generation);
-    if (row && row->owner_kind == DurableFenceOwnerKind::kSelectedBringUp) {
-      result.observed_status = SelectedStatusLocked(
-          {evidence.owner_transaction, evidence.configuration_fence_id,
-           evidence.configuration_fence_generation, evidence.reconciled_scope,
-           query.persisted_request.manager_runtime_epoch});
-      if (row->state == 1 &&
-          result.observed_status->state ==
-              core::ConfigurationFenceState::kReleasePending) {
-        result.state =
-            core::SelectedBringUpFenceReleaseAttemptState::kUncertain;
-        result.error =
-            core::ErrorDTO{"selected_bring_up_fence_release_uncertain",
-                           "the durable release and held admission gate "
-                           "require explicit owner reconciliation",
-                           {}};
-      } else if (row->state == 1 &&
-                 row->release_request_bytes ==
-                     EncodeRequest(query.persisted_request) &&
-                 row->release_receipt_bytes) {
-        result.state =
-            core::SelectedBringUpFenceReleaseAttemptState::kReleasedExact;
-        result.release_receipt =
-            DecodeResponse<core::SelectedBringUpConfigurationFenceReleasedDTO>(
-                *row->release_receipt_bytes);
-        result.error.reset();
-      } else if (row->state == 0 &&
-                 result.observed_status->reconciliation_evidence == evidence) {
-        result.state =
-            core::SelectedBringUpFenceReleaseAttemptState::kNotReleasedHeld;
-        result.error.reset();
-      }
-    }
-    Require(result.presence_valid(),
-            "constructed selected release reconciliation is invalid");
-    return result;
-  }
-
   [[nodiscard]] static ManagedKernelApplyFenceOwnerConfig
   ValidateConfig(ManagedKernelApplyFenceOwnerConfig config) {
     config.ledger_path = ValidateLedgerPath(std::move(config.ledger_path));
     config.manager_state_root = ExistingPlainDirectory(
         std::move(config.manager_state_root), "Manager state root");
-    config.retained_package_root = ExistingPlainDirectory(
-        std::move(config.retained_package_root), "retained-package root");
-    if (!config.candidate_retained_package_root.empty()) {
-      config.candidate_retained_package_root = ExistingPlainDirectory(
-          std::move(config.candidate_retained_package_root),
-          "candidate retained-package root");
-      RequireDisjointDirectories(config.retained_package_root,
-                                 config.candidate_retained_package_root,
-                                 "retained/activation roots");
-    }
     Require(!config.cell_id.empty() && !config.runtime_unit_id.empty() &&
                 !config.runtime_epoch.empty() &&
                 !config.request_owner_epoch.empty() &&
@@ -2647,8 +1460,7 @@ public:
       Exec(
           database_,
           "CREATE TABLE kernel_apply_fences ("
-          "owner_kind TEXT NOT NULL CHECK(owner_kind IN "
-          "('apply','route','selected_bring_up')),owner_id TEXT NOT NULL,"
+          "owner_id TEXT NOT NULL,"
           "owner_generation INTEGER NOT NULL CHECK("
           "owner_generation>0),request_id TEXT NOT NULL,request_owner_epoch "
           "TEXT NOT NULL,intent_blob BLOB NOT NULL,accepted_blob BLOB NOT NULL,"
@@ -2656,7 +1468,7 @@ public:
           "fence_generation>0),state INTEGER NOT NULL CHECK(state IN (0,1)),"
           "release_request_blob BLOB,release_receipt_blob BLOB,"
           "PRIMARY KEY(request_owner_epoch,request_id),"
-          "UNIQUE(owner_kind,owner_id,owner_generation),UNIQUE(fence_id),"
+          "UNIQUE(owner_id,owner_generation),UNIQUE(fence_id),"
           "UNIQUE(fence_generation),"
           "CHECK((state=0 AND release_request_blob IS "
           "NULL AND release_receipt_blob IS NULL) OR (state=1 AND "
@@ -2713,38 +1525,13 @@ public:
 
   void RestoreHeldFence() {
     Statement statement(database_,
-                        "SELECT owner_kind,intent_blob,accepted_blob,"
-                        "fence_id FROM "
-                        "kernel_apply_fences WHERE state=0 ORDER "
-                        "BY fence_generation");
+                        "SELECT accepted_blob FROM kernel_apply_fences WHERE "
+                        "state=0 ORDER BY fence_generation");
     while (statement.Step() == SQLITE_ROW) {
-      const auto owner_kind = statement.ColumnText(0);
-      if (owner_kind == ToString(DurableFenceOwnerKind::kApply)) {
-        const auto accepted =
-            DecodeResponse<core::ConfigurationFenceAcceptedDTO>(
-                statement.ColumnBlob(2));
-        admission_gate_.RestoreFence(accepted.configuration_fence_id,
-                                     accepted.captured_scope);
-      } else if (owner_kind == ToString(DurableFenceOwnerKind::kRoute)) {
-        const auto accepted = core::detail::DecodeRouteFenceAcceptedRecord(
-            statement.ColumnBlob(2));
-        admission_gate_.RestoreFence(accepted.configuration_fence_id,
-                                     accepted.captured_scope);
-      } else if (owner_kind ==
-                 ToString(DurableFenceOwnerKind::kSelectedBringUp)) {
-        const auto intent =
-            DecodeRequest<core::SelectedBringUpConfigurationFenceIntentDTO>(
-                statement.ColumnBlob(1));
-        const auto accepted =
-            DecodeResponse<core::ConfigurationFenceAcceptedDTO>(
-                statement.ColumnBlob(2));
-        Require(intent.matches(accepted),
-                "selected durable restoration contradicts intent");
-        admission_gate_.RestoreFence(accepted.configuration_fence_id,
-                                     accepted.captured_scope);
-      } else {
-        Fail("durable fence has an unknown owner kind");
-      }
+      const auto accepted = DecodeResponse<core::ConfigurationFenceAcceptedDTO>(
+          statement.ColumnBlob(0));
+      admission_gate_.RestoreFence(accepted.configuration_fence_id,
+                                   accepted.captured_scope);
     }
   }
 
@@ -2764,11 +1551,10 @@ public:
   ReadByRequest(const core::RequestOwnerEpoch &owner_epoch,
                 const core::RequestId &request_id) const {
     Statement statement(database_,
-                        "SELECT "
-                        "owner_kind,intent_blob,accepted_blob,"
-                        "state,release_request_blob,"
-                        "release_receipt_blob FROM kernel_apply_fences WHERE "
-                        "request_owner_epoch=? AND request_id=?");
+                        "SELECT intent_blob,accepted_blob,state,"
+                        "release_request_blob,release_receipt_blob FROM "
+                        "kernel_apply_fences WHERE request_owner_epoch=? AND "
+                        "request_id=?");
     statement.Text(1, owner_epoch.value());
     statement.Text(2, request_id.value());
     return ReadOptionalRow(statement);
@@ -2779,9 +1565,7 @@ public:
               const core::ConfigurationFenceGeneration generation) const {
     Statement statement(
         database_,
-        "SELECT "
-        "owner_kind,intent_blob,accepted_blob,state,"
-        "release_request_blob,"
+        "SELECT intent_blob,accepted_blob,state,release_request_blob,"
         "release_receipt_blob FROM kernel_apply_fences WHERE fence_id=? AND "
         "fence_generation=?");
     statement.Text(1, fence_id.value());
@@ -2794,22 +1578,10 @@ public:
     if (statement.Step() == SQLITE_DONE) {
       return std::nullopt;
     }
-    const auto owner_kind = statement.ColumnText(0);
-    Require(owner_kind == ToString(DurableFenceOwnerKind::kApply) ||
-                owner_kind == ToString(DurableFenceOwnerKind::kRoute) ||
-                owner_kind == ToString(DurableFenceOwnerKind::kSelectedBringUp),
-            "durable fence owner kind is invalid");
-    const auto kind = owner_kind == ToString(DurableFenceOwnerKind::kApply)
-                          ? DurableFenceOwnerKind::kApply
-                      : owner_kind == ToString(DurableFenceOwnerKind::kRoute)
-                          ? DurableFenceOwnerKind::kRoute
-                          : DurableFenceOwnerKind::kSelectedBringUp;
-    DurableFenceRow row{kind,
-                        statement.ColumnBlob(1),
-                        statement.ColumnBlob(2),
-                        static_cast<int>(statement.ColumnInteger(3)),
-                        statement.OptionalColumnBlob(4),
-                        statement.OptionalColumnBlob(5)};
+    DurableFenceRow row{statement.ColumnBlob(0), statement.ColumnBlob(1),
+                        static_cast<int>(statement.ColumnInteger(2)),
+                        statement.OptionalColumnBlob(3),
+                        statement.OptionalColumnBlob(4)};
     Require(statement.Step() == SQLITE_DONE,
             "durable fence identity is not unique");
     return row;
@@ -2821,121 +1593,20 @@ public:
     AppendField(bytes, config_.cell_id.value());
     AppendField(bytes, std::to_string(ReadFenceGeneration()));
     Statement statement(
-        database_, "SELECT "
-                   "owner_kind,intent_blob,accepted_blob,"
-                   "state,release_request_blob,"
-                   "release_receipt_blob FROM kernel_apply_fences ORDER BY "
-                   "fence_generation");
+        database_, "SELECT intent_blob,accepted_blob,state,"
+                   "release_request_blob,release_receipt_blob FROM "
+                   "kernel_apply_fences ORDER BY fence_generation");
     while (statement.Step() == SQLITE_ROW) {
-      AppendField(bytes, statement.ColumnText(0));
+      AppendField(bytes, statement.ColumnBlob(0));
       AppendField(bytes, statement.ColumnBlob(1));
-      AppendField(bytes, statement.ColumnBlob(2));
-      AppendField(bytes, std::to_string(statement.ColumnInteger(3)));
+      AppendField(bytes, std::to_string(statement.ColumnInteger(2)));
+      AppendField(bytes, statement.OptionalColumnBlob(3).value_or(""));
       AppendField(bytes, statement.OptionalColumnBlob(4).value_or(""));
-      AppendField(bytes, statement.OptionalColumnBlob(5).value_or(""));
     }
     return core::ContentDigest(content_identity::sha256_digest(bytes));
   }
 
-  [[nodiscard]] static bool
-  HasProviderProof(const core::ConfigurationFenceScopeDTO &scope) {
-    return std::any_of(
-        scope.domains.begin(), scope.domains.end(), [](const auto &domain) {
-          return std::holds_alternative<
-              core::ProviderConfigurationFenceDomainDTO>(domain.payload);
-        });
-  }
-
-  void ValidateInstalledCandidateConfigurations(
-      const core::ConfigurationFenceScopeDTO &scope,
-      const deployment::RetainedBundle &bundle,
-      const std::vector<core::ProviderConfigurationFenceLineageDTO> &lineages) const {
-    std::size_t index = 0;
-    for (const auto &domain : scope.domains) {
-      const auto *sides = std::get_if<core::ProviderConfigurationFenceDomainDTO>(&domain.payload);
-      if (!sides) continue;
-      if (!sides->candidate_provider) {
-        const auto sealed = std::find_if(bundle.value().cell_graph.control_domains.begin(),
-            bundle.value().cell_graph.control_domains.end(), [&](const auto &row) {
-              return row.control_domain_id == domain.control_domain_id;
-            });
-        Require(sealed == bundle.value().cell_graph.control_domains.end() || !sealed->provider(),
-                "removed provider remains in the qualified candidate closure");
-        Require(static_cast<bool>(config_.provider_configuration_source),
-                "removed provider has no authoritative Kernel absence lookup");
-        const auto current = config_.provider_configuration_source(domain.control_domain_id);
-        Require(current.ok() && !current.value(),
-                "removed provider remains installed in the current Kernel");
-      } else {
-        Require(index < lineages.size() && lineages[index].control_domain_id == domain.control_domain_id,
-                "installed Apply candidate provider coverage is incomplete");
-        ++index;
-      }
-    }
-    Require(index == lineages.size() &&
-                ValidateProviderConfigurations(scope, true, bundle) == lineages,
-            "installed Apply candidate driver or lifecycle generation changed");
-  }
-
-  std::vector<core::ProviderConfigurationFenceLineageDTO>
-  ValidateProviderConfigurations(
-      const core::ConfigurationFenceScopeDTO &scope, bool candidate_side,
-      const deployment::RetainedBundle &bundle) const {
-    std::vector<core::ProviderConfigurationFenceLineageDTO> lineages;
-    for (const auto &domain : scope.domains) {
-      const auto *sides =
-          std::get_if<core::ProviderConfigurationFenceDomainDTO>(
-              &domain.payload);
-      if (!sides)
-        continue;
-      const auto &proof = candidate_side ? sides->candidate_provider
-                                         : sides->predecessor_provider;
-      if (!proof)
-        continue; // Mixed replacements may have a controller on this side.
-      Require(static_cast<bool>(config_.provider_configuration_source),
-              "provider fence has no current Kernel configuration lookup");
-      const auto current =
-          config_.provider_configuration_source(domain.control_domain_id);
-      Require(current.ok() && current.value() &&
-                  current.value()->locally_valid(),
-              "provider fence has no exact installed Kernel configuration");
-      const auto &row = *current.value();
-      const auto &revision = candidate_side
-                                 ? domain.candidate_control_domain_revision
-                                 : domain.predecessor_control_domain_revision;
-      const auto sealed = std::find_if(
-          bundle.value().cell_graph.control_domains.begin(),
-          bundle.value().cell_graph.control_domains.end(),
-          [&](const auto &entry) {
-            return entry.control_domain_id == domain.control_domain_id;
-          });
-      Require(revision && row.domain.locally_valid() &&
-                  row.retained_bundle_id == bundle.retained_bundle_id() &&
-                  row.graph_revision ==
-                      bundle.value().cell_graph.graph_revision &&
-                  row.domain.control_domain_id == domain.control_domain_id &&
-                  row.domain.control_domain_revision == *revision &&
-                  sealed != bundle.value().cell_graph.control_domains.end() &&
-                  sealed->control_domain_revision == *revision &&
-                  sealed->provider() &&
-                  *sealed->provider() == row.domain.provider()->provider &&
-                  row.domain.provider()->provider.controllable_component_id ==
-                      proof->controllable_component_id &&
-                  row.domain.provider()->provider.provider_instance_id ==
-                      proof->provider_instance_id &&
-                  row.domain.provider()->provider.signal_configuration_digest ==
-                      proof->signal_configuration_digest &&
-                  row.domain.resource_ids() == proof->output_resources,
-              "provider fence configuration differs from its exact product and "
-              "occurrence");
-      lineages.push_back({domain.control_domain_id,
-                          row.provider_occurrence.provider_runtime_epoch,
-                          row.component_lifecycle_generation});
-    }
-    return lineages;
-  }
-
-  [[nodiscard]] ActivePublication ReadActivePublication() const {
+  [[nodiscard]] core::ActiveBundlePublicationReceiptDTO ReadActivePublication() const {
     const auto integrity = publication_store_.VerifyIntegrity();
     Require(integrity.cell_id == config_.cell_id &&
                 integrity.current_generation.nonzero(),
@@ -2948,16 +1619,7 @@ public:
                 result.value().durable_public_pointer_content_digest.value() ==
                     integrity.current_pointer_digest,
             "active publication cannot be independently verified");
-    auto bundle = bundle_source_.get_verified(
-        result.value().request.candidate_retained_bundle_id);
-    Require(bundle != nullptr,
-            "active publication's exact retained bundle is unavailable");
-    Require(bundle->value().cell_graph.cell_id == config_.cell_id,
-            "active publication's retained bundle names another cell");
-    Require(bundle->value().cell_graph.graph_revision ==
-                result.value().request.candidate_graph_revision,
-            "active publication's retained bundle has another graph revision");
-    return {std::move(result.value()), std::move(bundle)};
+    return std::move(result.value());
   }
 
   [[nodiscard]] core::ExecutionHostEpochDTO ExecutionHostEpoch(
@@ -2971,20 +1633,11 @@ public:
   }
 
   [[nodiscard]] core::ConfigurationFenceStatusDTO
-  QueryStatusLocked(const core::ConfigurationFenceStatusQueryDTO &query,
-                    const InstalledNativeCandidateObservation *candidate = nullptr) const {
+  QueryStatusLocked(const core::ConfigurationFenceStatusQueryDTO &query) const {
     Require(query.valid(), "fence status query is invalid");
-    std::unique_lock admission_lock(*admission_gate_.shared_admission_mutex(),
-                                    std::defer_lock);
-    if (HasProviderProof(query.expected_scope))
-      admission_lock.lock();
     const auto row = ReadByFence(query.configuration_fence_id,
                                  query.configuration_fence_generation);
     Require(row.has_value(), "fence status identity is unknown");
-    Require(!candidate || row->state == 0,
-            "installed NativeApply observation no longer has a held fence");
-    Require(row->owner_kind == DurableFenceOwnerKind::kApply,
-            "Apply status query names a route-configuration fence");
     const auto intent = DecodeRequest<core::ApplyConfigurationFenceIntentDTO>(
         row->intent_bytes);
     const auto accepted = DecodeResponse<core::ConfigurationFenceAcceptedDTO>(
@@ -3017,54 +1670,10 @@ public:
     }
 
     const auto active = ReadActivePublication();
-    if (candidate) {
-      Require(row->state == 0 && active.receipt == candidate->predecessor &&
-                  active.receipt.request.candidate_retained_bundle_id == intent.expected_retained_bundle_id &&
-                  active.receipt.request.candidate_graph_revision == intent.expected_graph_revision &&
-                  admission_gate_.exact_fence_is_held(query.configuration_fence_id, query.expected_scope),
-              "installed NativeApply lost its exact held predecessor");
-      const auto kind = candidate->parent.intent.claim_kind;
-      Require((kind == core::CellAdmissionClaimKindDTO::kManagerApply &&
-                   candidate->parent.intent.owner_transaction_id == query.owner_transaction.apply_id.value()) ||
-                  kind == core::CellAdmissionClaimKindDTO::kAuthoringMutation,
-              "installed NativeApply parent has another transaction");
-      Require(static_cast<bool>(config_.selected_claim_recovery_receipt),
-              "installed NativeApply has no actual held parent source");
-      const core::CellAdmissionRecoveryReceiptQueryDTO parent_query{
-          candidate->parent.intent, candidate->parent, std::nullopt};
-      const auto held = config_.selected_claim_recovery_receipt(parent_query);
-      Require(core::ValidateCellAdmissionRecoveryReceiptQuery(parent_query).ok() &&
-                  held.ok() && core::ValidateCellAdmissionRecoveryReceipt(held.value()).ok() &&
-                  held.value().status == core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact &&
-                  held.value().matched_claim == std::optional(candidate->parent),
-              "installed NativeApply parent is no longer held exact");
-      ValidateInstalledCandidateConfigurations(query.expected_scope, *candidate->bundle, candidate->lineages);
-      // Join the actual installed records to their current Kernel rows, not
-      // just to an epoch/generation projection. Eligibility is not inferred.
-      for (const auto &fact : candidate->facts) {
-        for (std::size_t index = 0; index < fact.domains.size(); ++index) {
-          const auto &domain = fact.domains[index];
-          if (!domain.provider()) continue;
-          const auto scoped = std::find_if(query.expected_scope.domains.begin(), query.expected_scope.domains.end(),
-              [&](const auto &row) { return row.control_domain_id == domain.control_domain_id; });
-          if (scoped == query.expected_scope.domains.end()) continue;
-          const auto current = config_.provider_configuration_source(domain.control_domain_id);
-          Require(current.ok() && current.value() &&
-                      current.value()->retained_bundle_id == fact.retained_bundle_id &&
-                      current.value()->graph_revision == fact.graph_revision &&
-                      current.value()->domain == domain &&
-                      current.value()->provider_occurrence == fact.provider_occurrences[index] &&
-                      current.value()->component_lifecycle_generation == fact.component_lifecycle_generation,
-                  "installed NativeApply facts no longer match their current Kernel rows");
-        }
-      }
-    } else {
-      ValidateProviderConfigurations(query.expected_scope, true, *active.bundle);
-    }
     const auto observation = admission_gate_.Observe(query.expected_scope);
-    const auto configurations = SelectConfigurations(
-        observation.active_control_configurations, query.expected_scope, true);
-    const auto epoch = ExecutionHostEpoch(active.receipt);
+    const auto configurations = ObservedConfigurations(
+        observation.active_control_configurations, query.expected_scope);
+    const auto epoch = ExecutionHostEpoch(active);
     core::ConfigurationFenceReconciliationEvidenceDTO evidence{
         epoch,
         query.owner_transaction,
@@ -3072,10 +1681,10 @@ public:
         query.configuration_fence_generation,
         query.expected_scope,
         observation.operation_resource_generation,
-        active.receipt.request.candidate_graph_revision,
-        active.receipt.request.candidate_projection_revision,
-        active.receipt.publication_generation,
-        active.receipt.durable_public_pointer_content_digest,
+        active.request.candidate_graph_revision,
+        active.request.candidate_projection_revision,
+        active.publication_generation,
+        active.durable_public_pointer_content_digest,
         configurations,
         observation.affected_queued_operation_count,
         observation.affected_active_operation_count,
@@ -3105,7 +1714,6 @@ public:
   ManagedKernelAdmissionGate &admission_gate_;
   FileLock lock_;
   sqlite3 *database_{};
-  deployment::FilesystemVerifiedRetainedBundleSource bundle_source_;
   component_manager::SqliteActiveBundlePublicationStore publication_store_;
   mutable std::mutex mutex_;
 };
@@ -3150,16 +1758,11 @@ core::ConfigurationFenceStatusDTO ManagedKernelApplyFenceOwner::QueryStatus(
   return impl_->QueryStatus(query);
 }
 
-core::ConfigurationFenceStatusDTO
-ManagedKernelApplyFenceOwner::QueryInstalledNativeApplyCandidateStatus(
-    const core::ConfigurationFenceStatusQueryDTO &query,
-    const core::ActiveBundlePublicationReceiptDTO &predecessor,
-    const core::CellAdmissionClaimDTO &parent,
-    const core::NativeApplyPlanDTO &plan,
-    const std::vector<core::InstalledProviderCandidateFactsDTO> &facts,
-    const std::function<void()> &revalidate_installed_attempt) const {
-  return impl_->QueryInstalledNativeApplyCandidateStatus(
-      query, predecessor, parent, plan, facts, revalidate_installed_attempt);
+std::optional<core::ConfigurationFenceStatusQueryDTO>
+ManagedKernelApplyFenceOwner::HeldApplyFence(
+    const core::NamedApplyPublicationTransactionDTO &apply,
+    const core::RuntimeEpoch &manager_runtime_epoch) const {
+  return impl_->HeldApplyFence(apply, manager_runtime_epoch);
 }
 
 void ManagedKernelApplyFenceOwner::RunWithExactHeldPredecessor(
@@ -3171,33 +1774,6 @@ void ManagedKernelApplyFenceOwner::RunWithExactHeldPredecessor(
   impl_->RunWithExactHeldPredecessor(
       query, expected_predecessor_publication_generation,
       expected_predecessor_public_pointer_digest, effect);
-}
-
-void ManagedKernelApplyFenceOwner::RunWithExactHeldInstalledCandidate(
-    const core::ConfigurationFenceStatusQueryDTO &query,
-    core::ActiveBundlePublicationGeneration predecessor_generation,
-    const core::ContentDigest &predecessor_pointer_digest,
-    const core::CellAdmissionClaimDTO &parent,
-    const core::ProjectionRevisionDTO &candidate,
-    const std::vector<core::RuntimeProviderDomainConfigurationReadbackDTO>
-        &actual_candidate_configurations,
-    const std::function<void()> &effect) const {
-  impl_->RunWithExactHeldInstalledCandidate(query, predecessor_generation,
-      predecessor_pointer_digest, parent, candidate, actual_candidate_configurations, effect);
-}
-
-void ManagedKernelApplyFenceOwner::RunWithExactHeldOriginalApplyCandidate(
-    const core::ConfigurationFenceStatusQueryDTO &query,
-    core::ActiveBundlePublicationGeneration predecessor_generation,
-    const core::ContentDigest &predecessor_pointer_digest,
-    const core::ApplyComponentBringUpAuthorityDTO &parent,
-    const core::ProjectionRevisionDTO &candidate,
-    const std::vector<core::RuntimeProviderDomainConfigurationReadbackDTO>
-        &actual_candidate_configurations,
-    const std::function<void()> &effect) const {
-  impl_->RunWithExactHeldOriginalApplyCandidate(
-      query, predecessor_generation, predecessor_pointer_digest, parent,
-      candidate, actual_candidate_configurations, effect);
 }
 
 void ManagedKernelApplyFenceOwner::RunWithExactHeldSuccessor(
@@ -3227,111 +1803,6 @@ void ManagedKernelApplyFenceOwner::RunWithExactHeldSuccessorReadback(
 core::ConfigurationFenceReleasedDTO ManagedKernelApplyFenceOwner::Release(
     const core::ConfigurationFenceReleaseDTO &request) {
   return impl_->Release(request);
-}
-
-core::Result<core::RouteConfigurationFenceAdmissionSnapshotDTO>
-ManagedKernelApplyFenceOwner::ObserveRouteConfigurationFenceAdmission(
-    const core::RouteConfigurationFenceAdmissionQueryDTO &query) const {
-  return InvokeRouteFencePort<
-      core::RouteConfigurationFenceAdmissionSnapshotDTO>(
-      [&] { return impl_->ObserveRouteConfigurationFenceAdmission(query); });
-}
-
-core::Result<core::RouteConfigurationFenceAcceptedDTO>
-ManagedKernelApplyFenceOwner::AcquireRouteConfigurationFence(
-    const core::RouteConfigurationFenceIntentDTO &intent) {
-  return InvokeRouteFencePort<core::RouteConfigurationFenceAcceptedDTO>(
-      [&] { return impl_->AcquireRouteConfigurationFence(intent); });
-}
-
-core::Result<core::RouteConfigurationFenceAcquireAttemptReconciliationDTO>
-ManagedKernelApplyFenceOwner::ReconcileRouteConfigurationFenceAcquireAttempt(
-    const core::RouteConfigurationFenceIntentDTO &intent) const {
-  return InvokeRouteFencePort<
-      core::RouteConfigurationFenceAcquireAttemptReconciliationDTO>([&] {
-    return impl_->ReconcileRouteConfigurationFenceAcquireAttempt(intent);
-  });
-}
-
-core::Result<core::RouteConfigurationFenceStatusDTO>
-ManagedKernelApplyFenceOwner::ObserveRouteConfigurationFenceStatus(
-    const core::RouteConfigurationFenceStatusQueryDTO &query) const {
-  return InvokeRouteFencePort<core::RouteConfigurationFenceStatusDTO>(
-      [&] { return impl_->ObserveRouteConfigurationFenceStatus(query); });
-}
-
-core::Result<core::RouteConfigurationFenceReleasedDTO>
-ManagedKernelApplyFenceOwner::ReleaseRouteConfigurationFence(
-    const core::RouteConfigurationFenceReleaseRequestDTO &request) {
-  return InvokeRouteFencePort<core::RouteConfigurationFenceReleasedDTO>(
-      [&] { return impl_->ReleaseRouteConfigurationFence(request); });
-}
-
-core::Result<core::RouteConfigurationFenceReleaseAttemptReconciliationDTO>
-ManagedKernelApplyFenceOwner::ReconcileRouteConfigurationFenceReleaseAttempt(
-    const core::RouteConfigurationFenceReleaseRequestDTO &request) const {
-  return InvokeRouteFencePort<
-      core::RouteConfigurationFenceReleaseAttemptReconciliationDTO>([&] {
-    return impl_->ReconcileRouteConfigurationFenceReleaseAttempt(request);
-  });
-}
-
-namespace {
-template <typename Value, typename Operation>
-core::Result<Value> InvokeSelectedFencePort(Operation &&operation) noexcept {
-  try {
-    return core::Result<Value>::Ok(operation());
-  } catch (const std::exception &error) {
-    return core::Result<Value>::Err(core::ErrorDTO{
-        "selected_bring_up_configuration_fence_rejected", error.what(), {}});
-  } catch (...) {
-    return core::Result<Value>::Err(
-        core::ErrorDTO{"selected_bring_up_configuration_fence_rejected",
-                       "selected fence operation failed",
-                       {}});
-  }
-}
-} // namespace
-core::Result<core::ConfigurationFenceAcceptedDTO>
-ManagedKernelApplyFenceOwner::AcquireSelectedBringUpFence(
-    const core::SelectedBringUpConfigurationFenceIntentDTO &value) {
-  return InvokeSelectedFencePort<core::ConfigurationFenceAcceptedDTO>(
-      [&] { return impl_->AcquireSelectedBringUpFence(value); });
-}
-core::Result<core::SelectedBringUpFenceAcquireAttemptReconcileResultDTO>
-ManagedKernelApplyFenceOwner::ReconcileSelectedBringUpFenceAcquireAttempt(
-    const core::SelectedBringUpFenceAcquireAttemptQueryDTO &value) const {
-  return InvokeSelectedFencePort<
-      core::SelectedBringUpFenceAcquireAttemptReconcileResultDTO>([&] {
-    return impl_->ReconcileSelectedBringUpFenceAcquireAttempt(value);
-  });
-}
-core::Result<core::SelectedBringUpConfigurationFenceStatusDTO>
-ManagedKernelApplyFenceOwner::ObserveSelectedBringUpFenceStatus(
-    const core::SelectedBringUpConfigurationFenceStatusQueryDTO &value) const {
-  return InvokeSelectedFencePort<
-      core::SelectedBringUpConfigurationFenceStatusDTO>(
-      [&] { return impl_->ObserveSelectedBringUpFenceStatus(value); });
-}
-core::Result<core::SelectedBringUpConfigurationFenceReleasedDTO>
-ManagedKernelApplyFenceOwner::ReleaseSelectedBringUpFence(
-    const core::SelectedBringUpConfigurationFenceReleaseDTO &value) {
-  return InvokeSelectedFencePort<
-      core::SelectedBringUpConfigurationFenceReleasedDTO>(
-      [&] { return impl_->ReleaseSelectedBringUpFence(value); });
-}
-core::Result<core::SelectedBringUpFenceReleaseAttemptReconcileResultDTO>
-ManagedKernelApplyFenceOwner::ReconcileSelectedBringUpFenceReleaseAttempt(
-    const core::SelectedBringUpFenceReleaseAttemptQueryDTO &value) const {
-  return InvokeSelectedFencePort<
-      core::SelectedBringUpFenceReleaseAttemptReconcileResultDTO>([&] {
-    return impl_->ReconcileSelectedBringUpFenceReleaseAttempt(value);
-  });
-}
-void ManagedKernelApplyFenceOwner::RunWithExactHeldSelectedPredecessor(
-    const core::SelectedBringUpConfigurationFenceStatusQueryDTO &query,
-    const std::function<void()> &effect) const {
-  impl_->RunWithExactHeldSelectedPredecessor(query, effect);
 }
 
 } // namespace manyforge::roboplan_backend

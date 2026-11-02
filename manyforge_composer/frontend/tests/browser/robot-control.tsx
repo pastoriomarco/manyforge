@@ -124,7 +124,7 @@ function App() {
       controls: groupsVisible ? { executionSelections: { groups: ['all', 'arm', 'grippers'].map((groupId) => ({
         groupId, state: 'running', stopAllowed: true, resumeAllowed: false,
       })) } } : null },
-    commandAllowed: (command: string) => groupsVisible && command === 'program_motion_stop',
+    runnerAllows: (command: string) => groupsVisible && command === 'program_motion_stop',
     stopMotion: (groups: string[]) => { groupCommands.push([...groups]); },
   } as unknown as ProgramRuntimeController;
   return <>

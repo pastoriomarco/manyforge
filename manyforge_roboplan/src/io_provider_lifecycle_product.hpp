@@ -2,22 +2,33 @@
 
 #include <functional>
 #include <manyforge_core/component_stream_health.hpp>
-#include <manyforge_core/fixed_cclc_port_registry.hpp>
-#include <manyforge_core/io_provider_lifecycle_catalog.hpp>
+#include <manyforge_core/ports/icomponent_adapter_port.hpp>
+#include <manyforge_core/time/iclock.hpp>
+#include <manyforge_core/types/component_lifecycle.hpp>
+#include <manyforge_core/types/lifecycle_provider_occurrence.hpp>
+#include <manyforge_core/types/provider_manifest.hpp>
 #include <manyforge_deployment/io_signal_catalog.hpp>
 #include <manyforge_roboplan/geometric_contact_input_provider.hpp>
+#include <manyforge_roboplan/io_output_writer.hpp>
 #include <manyforge_roboplan/mock_boolean_input_provider.hpp>
 #include <manyforge_roboplan/mock_boolean_output_provider.hpp>
-#include <manyforge_roboplan/retained_externally_managed_lifecycle_ports.hpp>
 #include <manyforge_roboplan/ros_boolean_input_provider.hpp>
 #include <manyforge_roboplan/ros_boolean_output_provider.hpp>
-#include <manyforge_roboplan/xarm_digital_input_provider.hpp>
 #include <memory>
 #include <mutex>
 #include <span>
 #include <variant>
 
 namespace manyforge::roboplan_backend::host_detail {
+
+/// The provider manifests of the host's generic I/O driver: I/O signals, and
+/// the model-free stream observers (pose source, AI model).
+inline constexpr std::string_view kIoProviderManifestId = "manyforge.provider.io_signals";
+inline constexpr std::string_view kPoseSourceProviderManifestId =
+    "manyforge.provider.pose_source";
+inline constexpr std::string_view kAiModelProviderManifestId = "manyforge.provider.ai_model";
+/// IO-1: a generic I/O device's optional silence stream (its ROS inputs).
+inline constexpr std::string_view kIoDeviceInputsStreamId = "inputs";
 
 struct IoProviderInputSourceInstallation final {
   std::vector<deployment::RetainedIoSignalConfiguration> rows;
@@ -44,36 +55,34 @@ struct IoProviderInputAcquisitionBaseline final {
   std::vector<core::IoSignalId> signals;
 };
 
-/// The actual generic I/O driver occurrence. The existing CCLC transaction
-/// remains the lifecycle authority; this record owns its real driver facts,
-/// delivery mutex, leaves and retained brand-port observation sequence.
-/// Arm-hosted GPIO belongs to the existing arm driver and never enters here.
+/// The actual generic I/O driver occurrence and the component adapter of its
+/// I/O provider component (CONTRACTS §6, §7): it owns its real driver facts,
+/// delivery mutex and leaves, reports the component's state and runs its
+/// lifecycle actions. Arm-hosted GPIO belongs to the arm's adapter and never
+/// enters here.
 class IoProviderDriverRecord final
-    : public std::enable_shared_from_this<IoProviderDriverRecord> {
+    : public core::IComponentAdapter,
+      public IIoOutputWriter,
+      public std::enable_shared_from_this<IoProviderDriverRecord> {
 public:
-  using InputLifecycleHook = std::function<core::Result<void>(
-      const core::LifecycleTransactionId &, bool planned_disabled)>;
+  using InputLifecycleHook = std::function<core::Result<void>(bool planned_disabled)>;
   using InputAcquisitionHook = std::function<core::Result<void>(
       std::span<const IoProviderInputAcquisitionBaseline>)>;
   static core::Result<std::shared_ptr<IoProviderDriverRecord>>
   Create(core::ResolvedLifecycleControlDomainScopeDTO domain,
          core::ResolvedLifecycleProviderOccurrenceDTO occurrence,
          core::ProviderManifestDTO manifest,
-         std::shared_ptr<core::IClock> clock,
-         core::Duration observation_freshness_ns,
-         core::Duration poll_period_ns);
+         std::shared_ptr<core::IClock> clock);
 
-  ~IoProviderDriverRecord();
+  ~IoProviderDriverRecord() override;
   IoProviderDriverRecord(const IoProviderDriverRecord &) = delete;
   IoProviderDriverRecord &operator=(const IoProviderDriverRecord &) = delete;
 
   const core::ResolvedLifecycleControlDomainScopeDTO &domain() const noexcept;
   const core::ResolvedLifecycleProviderOccurrenceDTO &
   occurrence() const noexcept;
-  const core::BrandLifecyclePlanCatalogDTO &catalog() const noexcept;
   const core::ProviderManifestDTO &manifest() const noexcept;
   core::IClock &clock() const noexcept;
-  core::BrandLifecyclePortRegistrationDTO brand_registration() const;
   core::RuntimeUnitEpochBindingDTO runtime_unit_epoch() const;
   bool resources_installed() const;
 
@@ -103,28 +112,46 @@ public:
                      InputLifecycleHook input_lifecycle = {},
                      InputAcquisitionHook input_acquisition = {});
 
-  core::Result<RetainedExternallyManagedDomainSnapshot>
-  ReadLifecycleSnapshot(const core::ControlDomainId &domain,
-                        core::TimePoint now);
-  core::Result<core::LifecycleDomainHealthDTO>
-  ReadLifecycleHealth(const core::ControlDomainId &domain,
-                      core::TimePoint now) const;
-  RetainedExternallyManagedPrimitiveOutcome
-  Dispatch(const core::BrandLifecyclePrimitiveIntentDTO &intent,
-           std::stop_token cancellation);
+  // CONTRACTS §6. State: `fault` for a driver fault, a lost transport while
+  // enabled or an exited supervised process; `offline` while the configured
+  // transport isn't reachable; streams from the host stream registry.
+  // IO-1 senders gone: once a ROS input topic had a publisher since install,
+  // every ROS input topic without one is `fault` (`fault_communication`)
+  // while enabled, held until Recover or Disable, and `offline` (reason
+  // `io_device_senders_gone`) otherwise; prepare, enable and recover are
+  // refused with that code until a sender is back. Publisher counts are read
+  // on the host's component tick. A stale `inputs` stream is
+  // `fault_stream_stale`.
+  // Actions: prepare (installed, reachable), enable (from prepared: resumes
+  // the leaves), disable (pauses them), recover (clears a driver fault and
+  // pauses). Capability `io_manual_write` when the component has outputs,
+  // plus `io_output_readback` when some are Mock outputs. Activity is
+  // `unknown` while an output's last write has an unknown outcome.
+  [[nodiscard]] core::ComponentState State(std::int64_t now_ns) const override;
+  [[nodiscard]] core::ActionResult Run(core::ComponentAction action,
+                                       std::stop_token stop) override;
+  [[nodiscard]] std::vector<core::Capability> capabilities() const override;
+
+  // CONTRACTS §6, §7: a manual write of one of this component's outputs,
+  // through the output provider of its channel (Mock or ROS bool). The
+  // channel's own gate refuses it while the component isn't enabled; a
+  // controller-owned output is refused before sending.
+  [[nodiscard]] SetOutputResult SetOutput(std::string_view signal_name,
+                                          std::variant<bool, double> value,
+                                          std::stop_token stop) override;
 
   // sim-plc / pose source: the exact supervised process serving this
   // component. Its typed exit fault (absent while it runs or after an ordered
   // stop; the source names the code, e.g. `simulated_plc_exited`) is a driver
-  // fault: prepare/enable/recover are refused and the standard cause is
-  // `fault`. A later Apply installs the restarted process's source,
+  // fault: prepare/enable/recover are refused and the component is in
+  // `fault_process_exited`. A later Apply installs the restarted process's source,
   // replacing this one; an empty source removes it.
   void SetSupervisedProcessFaultSource(
       std::function<std::optional<core::ErrorDTO>()> source);
 
   // CP9 model-free stream observers: pose source
-  // (`kPoseSourceLifecycleManifestId`) and AI model
-  // (`kAiModelLifecycleManifestId`). No I/O members. Its resources are the
+  // (`kPoseSourceProviderManifestId`) and AI model
+  // (`kAiModelProviderManifestId`). No I/O members. Its resources are the
   // declared stream recorders (ids equal to the domain's signal names: one
   // per pose binding, or the AI model's `endpoint`); installed means
   // resources and transport ready. The recorders live until Shutdown
@@ -133,14 +160,22 @@ public:
   core::Result<void> InstallObserverStreamsLocked(
       std::vector<std::unique_ptr<core::StreamRecorder>> streams);
 
+  // IO-1 silence budget: with `budget_ns` (the Deployment's
+  // `policies.component_streams` row for `(device, "inputs")`) a device with
+  // ROS inputs declares its `inputs` stream (a stale one faults the device);
+  // every message on those inputs records an arrival, also while paused.
+  // Without a row the stream is removed. A kept stream follows the
+  // registry's overrides for its budget.
+  core::Result<void> SetInputsStreamLocked(std::optional<std::int64_t> budget_ns);
+
   // Only the actual retiring driver owner calls this. An old activation that
   // transferred this retained record must release its pointer without it.
   void Shutdown();
 
 private:
-  struct State;
-  explicit IoProviderDriverRecord(std::unique_ptr<State> state);
-  std::unique_ptr<State> state_;
+  struct Driver;
+  explicit IoProviderDriverRecord(std::unique_ptr<Driver> state);
+  std::unique_ptr<Driver> state_;
 };
 
 } // namespace manyforge::roboplan_backend::host_detail

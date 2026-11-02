@@ -1,6 +1,8 @@
 #include "resource_addressed_execution_kernel_internal.hpp"
 #include <manyforge_core/time/stuck_drain_wait.hpp>
 
+#include <cstdio>
+
 namespace manyforge::core {
 
 std::string bounded_operation_journal_diagnostic_text(std::string_view value,
@@ -54,8 +56,12 @@ std::optional<KernelInternalFaultDTO> ResourceAddressedExecutionKernel::get_inte
 void ResourceAddressedExecutionKernel::retain_operation_journal_write_fault_locked(
     std::string_view write_kind, const ErrorDTO& failure, const OperationStateDTO* state,
     std::optional<RequestId> request_id) {
-  motion_admission_closed_ = true;
+  // Logged and carried on: a journal write fault blocks no motion (only the
+  // first is kept as the runtime-fault fact).
   if (operation_journal_write_fault_) return;
+  (void)std::fprintf(stderr, "manyforge_journal_write_fault kind=%.*s code=%s\n",
+                     static_cast<int>(write_kind.size()), write_kind.data(),
+                     failure.code.c_str());
   OperationJournalWriteFaultDTO fact{
       config_.request_owner_epoch,
       bounded_operation_journal_diagnostic_text(write_kind, 64U),
@@ -75,7 +81,6 @@ void ResourceAddressedExecutionKernel::retain_operation_journal_write_fault_lock
 void ResourceAddressedExecutionKernel::stamp_operation_capture_locked(ActiveOperation& operation,
                                                                       OperationStateDTO& state) {
   if (operation.last_capture_order == static_cast<std::uint64_t>(INT64_MAX)) {
-    motion_admission_closed_ = true;
     throw std::overflow_error("operation journal capture order exhausted");
   }
   for (auto& participant : state.participants) {
@@ -319,15 +324,6 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
   if (stop_projection_jobs_.empty() || stop_projection_jobs_.size() > maximum_projection_capacity) {
     throw std::invalid_argument("addressed Kernel forensic projection bound is invalid");
   }
-  if (config_.stop_surveillance.has_value()) {
-    const auto& surveillance = *config_.stop_surveillance;
-    if (surveillance.observer == nullptr || surveillance.policy.sample_cadence_ns <= 0 ||
-        surveillance.policy.checkpoint_interval_ns < surveillance.policy.sample_cadence_ns ||
-        surveillance.policy.retained_checkpoint_limit == 0U ||
-        surveillance.policy.retained_checkpoint_limit > kMaximumStopSurveillanceCheckpoints) {
-      throw std::invalid_argument("addressed Kernel Stop-surveillance owner is invalid");
-    }
-  }
   auto stop_facts = derive_stop_static_facts(registrations_, config_);
   stop_retained_bundle_id_ = std::move(stop_facts.retained_bundle_id);
   stop_graph_revision_ = std::move(stop_facts.graph_revision);
@@ -343,7 +339,6 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
   runtime_scale_replay_ledger_.reserve(config_.request_replay_capacity);
   runtime_scale_control_replay_ledger_.reserve(config_.request_replay_capacity);
   runtime_scale_control_settings_.reserve(registrations_.size());
-  stop_fault_recovery_replay_ledger_.reserve(config_.request_replay_capacity);
   operation_recovery_replay_ledger_.reserve(config_.request_replay_capacity);
   program_run_stop_fences_.reserve(config_.request_replay_capacity);
   global_io_rule_projection_queue_.reserve(config_.request_replay_capacity);
@@ -445,20 +440,10 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
       [this](const ProgramNodeAdmissionEvidenceDTO& evidence) {
         return validate_program_node_claim(evidence);
       },
-      [this] {
-        // Whether the latch closes cell admission; a carried latch does not.
-        std::lock_guard state_lock(state_mutex_);
-        const auto scope = stop_fault_admission_scope_locked();
-        return scope == StopFaultAdmissionScope::kCell || scope == StopFaultAdmissionScope::kClosing;
-      },
       config_.cell_admission_program_reset_status_source,
       [this](std::shared_ptr<IIoSignalService>* affected_service) {
         std::lock_guard state_lock(state_mutex_);
         return retire_program_blackboard_source_locked(affected_service);
-      },
-      [this] {
-        std::lock_guard state_lock(state_mutex_);
-        return stop_fault_admission_scope_locked();
       });
   refresh_execution_claims();  // construction is single-threaded
   if (recovery.value().recovered_stops.size() > kMaximumResidentStopTerminalRecords) {
@@ -468,9 +453,8 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
     cell_stop_generation_ = std::max(cell_stop_generation_, recovered.accepted.stop_generation);
     if (!recovered.terminal_certificate.has_value()) {
       // An accepted Stop with no projected terminal certificate is never
-      // reconstructed or redispatched. BeginOwnerEpoch supplies the complete
-      // current inventory fence for an unclosed predecessor; keep motion
-      // admission closed until the separate reconciliation owner clears it.
+      // reconstructed or redispatched. Motion admission waits until every
+      // component reports healthy and idle (the armed cell latch, R2).
       motion_admission_unreconciled_ = true;
       continue;
     }
@@ -503,76 +487,20 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
                                        std::nullopt},
         StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kRecorded, std::nullopt,
                                        std::nullopt},
-        recovered.surveillance.has_value()
-            ? StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kRecorded, std::nullopt,
-                                             std::nullopt}
-            : StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kNotApplicable,
-                                             std::nullopt, std::nullopt},
-        reference,
-        recovered.fault_latch,
-        recovered.surveillance};
-    if (stop_terminal_projection_field_error(status, certificate, recovered.fault_latch)
-            .has_value()) {
+        reference};
+    if (stop_terminal_projection_field_error(status, certificate).has_value()) {
       throw std::runtime_error("recovered Stop terminal projection is invalid");
     }
-    std::unique_ptr<StopSurveillanceReducerState> recovered_surveillance_state;
-    std::int64_t next_surveillance_sample_ns = 0;
-    std::int64_t next_surveillance_checkpoint_ns = 0;
-    // M6b: a clear ends surveillance (Recover may clear on current rest while
-    // the latest checkpoint is still monitoring); a cleared latch's
-    // surveillance is history only and is not resumed.
-    const bool latch_cleared = recovered.fault_latch.has_value() &&
-                               recovered.fault_latch->state == StopFaultLatchStateDTO::kCleared;
-    if (recovered.surveillance.has_value() && !latch_cleared) {
-      if (!config_.stop_surveillance.has_value() || !recovered.fault_latch.has_value()) {
-        motion_admission_closed_ = true;
-      } else {
-        auto source_plans = stop_surveillance_source_plans(certificate);
-        if (!source_plans.ok()) {
-          throw std::runtime_error("recovered Stop surveillance sources are unavailable");
-        }
-        auto adopted = AdoptStopSurveillanceReducerState(
-            config_.request_owner_epoch, certificate, *recovered.fault_latch,
-            *recovered.surveillance, std::move(source_plans.value()));
-        if (!adopted.ok()) {
-          throw std::runtime_error("recovered Stop surveillance checkpoint is invalid");
-        }
-        recovered_surveillance_state =
-            std::make_unique<StopSurveillanceReducerState>(std::move(adopted.value()));
-        const auto now = clock_.now();
-        const auto& policy = config_.stop_surveillance->policy;
-        if (now > std::numeric_limits<std::int64_t>::max() - policy.sample_cadence_ns ||
-            now > std::numeric_limits<std::int64_t>::max() - policy.checkpoint_interval_ns) {
-          throw std::runtime_error("recovered Stop surveillance deadline is exhausted");
-        }
-        next_surveillance_sample_ns = now + policy.sample_cadence_ns;
-        next_surveillance_checkpoint_ns = now + policy.checkpoint_interval_ns;
-      }
-    }
-    stop_terminal_history_.push_back(std::make_unique<StopTerminalRecord>(StopTerminalRecord{
-        std::move(status), certificate, recovered.fault_latch, std::nullopt,
-        std::move(recovered_surveillance_state), std::nullopt, 0U, false, std::nullopt,
-        next_surveillance_sample_ns, next_surveillance_checkpoint_ns}));
-    if (recovered.fault_latch.has_value()) {
-      cell_stop_fault_latch_generation_ =
-          std::max(cell_stop_fault_latch_generation_, recovered.fault_latch->latch_generation);
-      if (recovered.fault_latch->state != StopFaultLatchStateDTO::kCleared &&
-          (!active_stop_fault_latch_.has_value() ||
-           active_stop_fault_latch_->latch_generation < recovered.fault_latch->latch_generation)) {
-        active_stop_fault_latch_ = recovered.fault_latch;
-        motion_admission_closed_ = true;
-      }
-    }
-    if (recovered.surveillance.has_value() && !latch_cleared &&
-        recovered.surveillance->state == StopPostTerminalSurveillanceStateDTO::kMonitoring) {
-      motion_admission_closed_ = true;
-    }
+    stop_terminal_history_.push_back(std::make_unique<StopTerminalRecord>(
+        StopTerminalRecord{std::move(status), certificate, std::nullopt}));
   }
   if (recovery.value().replaced_unclosed_owner_epoch.has_value()) {
     motion_admission_unreconciled_ = true;
   }
   if (!recovery.value().unreconciled_resources.empty()) {
     motion_admission_unreconciled_ = true;
+    recovered_orphan_resources_ = recovery.value().unreconciled_resources;
+    std::sort(recovered_orphan_resources_.begin(), recovered_orphan_resources_.end());
     auto marked = resource_slots_->mark_unreconciled_external_or_orphan_goal(
         recovery.value().unreconciled_resources);
     if (!marked.ok()) {
@@ -581,14 +509,6 @@ ResourceAddressedExecutionKernel::ResourceAddressedExecutionKernel(
     }
   }
 
-  for (const auto& record : stop_terminal_history_) {
-    if (record != nullptr && record->surveillance_state != nullptr &&
-        record->surveillance_state->projection.state ==
-            StopPostTerminalSurveillanceStateDTO::kMonitoring) {
-      ScheduleStopSurveillance(record->certificate.stop_certificate_id,
-                               record->next_surveillance_sample_ns);
-    }
-  }
   try {
     for (const auto& registration : registrations_) {
       if (std::any_of(engine_subscriptions_.begin(), engine_subscriptions_.end(),
@@ -623,8 +543,8 @@ ResourceAddressedExecutionKernel::~ResourceAddressedExecutionKernel() {
   // Engine callbacks are the outermost asynchronous ingress. Closing the
   // guard first prevents a callback already copied by a publisher from
   // acquiring the Kernel. Unsubscribe removes future snapshots, and Drain
-  // waits for callbacks that entered before Close while all state, scheduled
-  // surveillance, and worker lanes they may reach are still alive and open.
+  // waits for callbacks that entered before Close while all state and worker
+  // lanes they may reach are still alive and open.
   engine_event_ingress_->Close();
   for (const auto& subscription : engine_subscriptions_) {
     subscription.engine->unsubscribe_events(subscription.handle);
@@ -639,41 +559,6 @@ ResourceAddressedExecutionKernel::~ResourceAddressedExecutionKernel() {
     static_cast<void>(retire_program_blackboard_source_locked());
   }
 
-  std::vector<ScheduleHandle> surveillance_handles;
-  if (config_.stop_surveillance.has_value()) {
-    {
-      std::unique_lock state_lock(state_mutex_);
-      stop_surveillance_shutting_down_ = true;
-      WaitForDrain("kernel.stop_surveillance_schedule_publications", std::chrono::seconds(5),
-                   [&](std::chrono::nanoseconds bound) {
-                     return stop_surveillance_schedule_cv_.wait_for(state_lock, bound, [&] {
-                       return stop_surveillance_schedule_publications_ == 0U;
-                     });
-                   });
-      for (const auto& record : stop_terminal_history_) {
-        if (record != nullptr && record->surveillance_schedule_handle.has_value()) {
-          surveillance_handles.push_back(*record->surveillance_schedule_handle);
-          record->surveillance_schedule_handle.reset();
-          record->surveillance_callback_pending = false;
-        }
-      }
-    }
-    for (const auto handle : surveillance_handles) {
-      try {
-        scheduler_.cancel(handle);
-      } catch (...) {
-        std::terminate();
-      }
-    }
-    try {
-      WaitForDrain("kernel.scheduler_monitoring_lane", std::chrono::seconds(5),
-                   [&](std::chrono::nanoseconds bound) {
-                     return scheduler_.drain_for(SchedulerPriority::Monitoring, bound);
-                   });
-    } catch (...) {
-      std::terminate();
-    }
-  }
   // With participant events drained, each lane can close its own ingress and
   // settle all causally accepted work before its worker object is retired.
   if (operation_control_executor_ != nullptr) {

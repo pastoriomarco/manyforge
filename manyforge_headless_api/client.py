@@ -22,6 +22,7 @@ from .native import (
     MAX_VIEWER_MODEL_URDF_BYTES,
     ViewerModelAsset,
     strict_json_object,
+    strict_json_value,
 )
 from .program_binding_transport import ProgramBindingTransportError
 from .program_runner_client import persistent_values_path
@@ -329,7 +330,8 @@ class HeadlessHttpClient:
         *,
         status_code: int,
         maximum_response_bytes: int,
-    ) -> dict[str, Any]:
+        array: bool = False,
+    ) -> Any:
         try:
             text = payload.decode("utf-8", errors="strict")
         except UnicodeDecodeError as exc:
@@ -339,17 +341,31 @@ class HeadlessHttpClient:
                 status_code,
             ) from exc
         try:
-            return strict_json_object(
-                text,
-                label="headless HTTP response",
-                maximum_bytes=maximum_response_bytes,
-            )
+            if array and status_code < 400:
+                value = strict_json_value(
+                    text,
+                    label="headless HTTP response",
+                    maximum_bytes=maximum_response_bytes,
+                )
+            else:
+                return strict_json_object(
+                    text,
+                    label="headless HTTP response",
+                    maximum_bytes=maximum_response_bytes,
+                )
         except RuntimeError as exc:
             raise HeadlessClientError(
                 getattr(exc, "code", "headless_http_response_invalid"),
                 str(exc),
                 status_code,
             ) from exc
+        if not isinstance(value, list):
+            raise HeadlessClientError(
+                "headless_http_response_invalid",
+                "headless API response root must be an array",
+                status_code,
+            )
+        return value
 
     def request(
         self,
@@ -371,6 +387,20 @@ class HeadlessHttpClient:
             payload,
             status_code=status_code,
             maximum_response_bytes=maximum,
+        )
+        if status_code >= 400:
+            raise self._error_from_response(value, status_code)
+        return value
+
+    def request_array(self, path: str) -> list[Any]:
+        """GET of an endpoint whose body is a plain JSON array."""
+
+        payload, status_code, maximum = self._request_payload("GET", path)
+        value = self._decode_response(
+            payload,
+            status_code=status_code,
+            maximum_response_bytes=maximum,
+            array=True,
         )
         if status_code >= 400:
             raise self._error_from_response(value, status_code)
@@ -566,12 +596,6 @@ class HeadlessHttpClient:
     def runtime(self) -> dict[str, Any]:
         return self.request("GET", "/api/runtime")
 
-    def component_overview(self) -> dict[str, Any]:
-        return self.request("GET", "/api/component-overview")
-
-    def component_overview_payload(self) -> bytes:
-        return self.get_json_payload("/api/component-overview")
-
     def authoring_admission(self) -> dict[str, Any]:
         return self.request("GET", "/api/cell/authoring-admission")
 
@@ -597,100 +621,64 @@ class HeadlessHttpClient:
             body=body,
         )
 
+    # Component model v2 (CONTRACTS §1, §2, §5, §7, §10).
+
+    @staticmethod
+    def _path_identity(prefix: str, identity: str, suffix: str = "") -> str:
+        if not identity or len(identity.encode("utf-8")) > 256:
+            raise ValueError("identity must be bounded non-empty text")
+        if "/" in identity or ".." in identity:
+            raise ValueError("identity is invalid for an HTTP path")
+        return f"{prefix}/{identity}{suffix}"
+
+    def components(self) -> list[Any]:
+        return self.request_array("/api/components")
+
+    def component_action(self, component_id: str, action: str) -> dict[str, Any]:
+        return self.request(
+            "POST",
+            self._path_identity("/api/components", component_id, "/actions"),
+            body={"action": action},
+        )
+
+    def component_actions(self, action: str, component_ids: Sequence[str]) -> dict[str, Any]:
+        return self.request(
+            "POST",
+            "/api/components/actions",
+            body={"action": action, "component_ids": list(component_ids)},
+        )
+
+    def cell_latch(self) -> dict[str, Any]:
+        return self.request("GET", "/api/cell/latch")
+
+    def io_signals(self) -> list[Any]:
+        return self.request_array("/api/io")
+
+    def set_io_output(self, signal_id: str, value: bool | float) -> dict[str, Any]:
+        # CONTRACTS §7: `signal_id` is `<component_id>/<signal_name>`.
+        component_id, _, signal_name = signal_id.partition("/")
+        return self.request(
+            "POST",
+            self._path_identity(
+                self._path_identity("/api/io", component_id), signal_name, "/set"
+            ),
+            body={"value": value},
+        )
+
+    def program_readiness(self) -> dict[str, Any]:
+        return self.request("GET", "/api/program/readiness")
+
     def health(self) -> dict[str, Any]:
         return self.request("GET", "/api/health")
 
     def manager_status(self) -> dict[str, Any]:
         return self.request("GET", "/api/manager/status")
 
-    def canonical_empty_selection(self) -> dict[str, Any]:
-        return self.request("GET", "/api/manager/canonical-empty-selection")
-
-    def lifecycle_target_retirement_offer(self) -> dict[str, Any]:
-        return self.request("GET", "/api/cclc/targets/retirement-offer")
-
-    def retire_lifecycle_targets(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        return self.request("POST", "/api/cclc/targets/retire", body=body)
-
-    def lifecycle_target_retirement_result(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        return self.request("POST", "/api/cclc/targets/retire/result", body=body)
-
-    def lifecycle_owner_settlement(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        return self.request("POST", "/api/cclc/targets/settlement", body=body)
-
     def manager_graph(self) -> dict[str, Any]:
         return self.request("GET", "/api/manager/graph")
 
     def manager_diff(self) -> dict[str, Any]:
         return self.request("GET", "/api/manager/diff")
-
-    @staticmethod
-    def _cclc_identity_path(prefix: str, identity: str) -> str:
-        if not identity or len(identity.encode("utf-8")) > 256:
-            raise ValueError("CCLC identity must be bounded non-empty text")
-        if "/" in identity or ".." in identity:
-            raise ValueError("CCLC identity is invalid for an HTTP path")
-        return f"{prefix}/{identity}"
-
-    def cclc_component(self, component_id: str) -> dict[str, Any]:
-        return self.request(
-            "GET", self._cclc_identity_path("/api/cclc/components", component_id)
-        )
-
-    def cclc_component_lifecycle_snapshot(self, component_id: str) -> dict[str, Any]:
-        return self.request(
-            "GET", self._cclc_identity_path("/api/cclc/components", component_id)
-            + "/lifecycle-snapshot",
-        )
-
-    def cclc_owner_identity(self) -> dict[str, Any]:
-        return self.request("GET", "/api/cclc/owner")
-
-    def cclc_route_templates(self, component_id: str) -> dict[str, Any]:
-        return self.request(
-            "GET",
-            self._cclc_identity_path("/api/cclc/components", component_id)
-            + "/route-templates",
-        )
-
-    def component_process_stop_offer(self, component_id: str) -> dict[str, Any]:
-        return self.request("GET", self._cclc_identity_path("/api/cclc/components", component_id) + "/process/stop-offer")
-
-    def stop_component_process(self, component_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
-        return self.request("POST", self._cclc_identity_path("/api/cclc/components", component_id)
-                            + "/process/stop", body=body)
-
-    def component_process_stop_result(self, component_id: str, body: Mapping[str, Any]) -> dict[str, Any]:
-        return self.request("POST", self._cclc_identity_path("/api/cclc/components", component_id)
-                            + "/process/stop/result", body=body)
-
-    def submit_component_lifecycle(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        return self.request("POST", "/api/cclc/lifecycle/requests", body=body)
-
-    def component_lifecycle_request_result(
-        self, body: Mapping[str, Any]
-    ) -> dict[str, Any]:
-        return self.request("POST", "/api/cclc/lifecycle/requests/result", body=body)
-
-    def component_lifecycle_status(self, transaction_id: str) -> dict[str, Any]:
-        return self.request(
-            "GET",
-            self._cclc_identity_path(
-                "/api/cclc/lifecycle/transactions", transaction_id
-            ),
-        )
-
-    def submit_route_selection(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        return self.request("POST", "/api/cclc/routes/requests", body=body)
-
-    def route_selection_request_result(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        return self.request("POST", "/api/cclc/routes/requests/result", body=body)
-
-    def route_selection_status(self, transaction_id: str) -> dict[str, Any]:
-        return self.request(
-            "GET",
-            self._cclc_identity_path("/api/cclc/routes/transactions", transaction_id),
-        )
 
     def node_environment(self) -> dict[str, Any]:
         return self.request("GET", "/api/node-environment")
@@ -1053,6 +1041,24 @@ class HeadlessHttpClient:
             timeout_seconds=timeout_seconds,
         )
 
+    def manager_apply_release_for_new(
+        self,
+        request_context: ManagerApplyAcknowledgementContext | Mapping[str, Any],
+        *,
+        timeout_seconds: float | None = None,
+    ) -> dict[str, Any]:
+        context = (
+            request_context
+            if isinstance(request_context, ManagerApplyAcknowledgementContext)
+            else ManagerApplyAcknowledgementContext.model_validate(request_context)
+        )
+        return self.request(
+            "POST",
+            "/api/manager/apply/release-for-new",
+            body={"request_context": context.model_dump(mode="json", exclude_none=True)},
+            timeout_seconds=timeout_seconds,
+        )
+
     def execution_diagnostics(self) -> dict[str, Any]:
         return self.request("GET", "/api/execution/diagnostics")
 
@@ -1151,21 +1157,6 @@ class HeadlessHttpClient:
 
     def full_stop(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/execution/full-stop", body=body)
-
-    def stop_fault(self) -> dict[str, Any]:
-        return self.request("GET", "/api/execution/stop-fault")
-
-    def recover_stop_fault(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        return self.request("POST", "/api/execution/stop-fault/recover", body=body)
-
-    def cell_recover(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        return self.request("POST", "/api/execution/cell-recover", body=body)
-
-    def cell_recover_abort(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        return self.request("POST", "/api/execution/cell-recover/abort", body=body)
-
-    def force_close(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        return self.request("POST", "/api/execution/force-close", body=body)
 
     def set_runtime_scale_control(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request("POST", "/api/execution/runtime-scale-control", body=body)
@@ -1277,6 +1268,12 @@ class HeadlessHttpClient:
 
     def historian_health(self) -> dict[str, Any]:
         return self.request("GET", "/api/execution/history/health")
+
+    def record_apply_outcome(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """One Load/New/Apply/Revert terminal into History."""
+        return self.request(
+            "POST", "/api/execution/history/apply-outcomes", body=body
+        )
 
     def reconcile_historian(self, body: Mapping[str, Any]) -> dict[str, Any]:
         return self.request(

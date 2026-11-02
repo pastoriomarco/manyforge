@@ -2,7 +2,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { describe, expect, it, vi } from 'vitest';
 
 import { statusFixture } from '../testFixtures/robotControl';
-import { trialEAssignment, trialEDeployment, trialEProgram } from '../testFixtures/trialESignal';
+import { trialEAssignment, trialEDeployment, trialEProgram } from '../testFixtures/mockLite6SignalMoves';
 import type {
   CatalogEntry, CatalogParameter, DeploymentWorkspaceResponse, JsonValue, ProgramTreeNode,
 } from '../types/api';
@@ -29,7 +29,7 @@ const roleParams = [
   param('resource_role', { type: 'string', 'x-manyforge-semantic-type': 'resource_role' }),
 ];
 
-/** Trial E with probe_contact as a change-only ROS Bool input. */
+/** The signal_moves Program with probe_contact as a change-only ROS Bool input. */
 function changeOnlyProbeDeployment(): Record<string, JsonValue> {
   const document = trialEDeployment();
   const station = (document.components as Array<Record<string, JsonValue>>)[1];

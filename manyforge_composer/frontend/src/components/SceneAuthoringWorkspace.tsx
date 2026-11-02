@@ -22,7 +22,7 @@ import {
 } from '../hooks/useHeadlessState';
 import type { HeadlessStateSource } from '../hooks/useHeadlessState';
 import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
-import { browserRequestIdentity } from '../hooks/useCCLC';
+import { browserRequestIdentity } from '../utils/requestIdentity';
 import { useCardPanelLayout } from '../hooks/useCardPanelLayout';
 import { SettingsSubheading } from './SettingsScope';
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
@@ -1705,6 +1705,11 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
     headlessState.snapshot,
     headlessState.transportStatus,
   );
+  // Arm and gripper components: manual output writes wait while one is busy (§7).
+  const motionComponentIds = useMemo(() => new Set([
+    ...(robotControl.selectedStatus?.directControlTargets ?? []),
+    ...(robotControl.selectedStatus?.directControlGripperTargets ?? []),
+  ].map((target) => target.controllableComponentId)), [robotControl.selectedStatus]);
   const modelPresentation = useMemo(() => viewerModelPresentation(
     headlessState.snapshot,
     headlessState.transportStatus,
@@ -2399,6 +2404,7 @@ const SceneViewerBridge = memo(function SceneViewerBridge({
           ioSignalBindings={robotControl.selectedStatus?.ioSignalBindings}
           systemSignals={robotControl.selectedStatus?.systemSignals}
           controlSource={robotControl.controlSource}
+          motionComponentIds={motionComponentIds}
         />
       )}
       robotControlBlocked={robotControl.state.phase === 'blocked'}

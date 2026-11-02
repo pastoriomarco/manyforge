@@ -58,8 +58,8 @@ resolve_simulated_plc_config_dir(const char *config_dir_env,
 /// A plan only for a simulated unit (a ROS unit hosting no component with
 /// measured, i.e. real, state authority) whose device rows use the generic
 /// `ros_bool` / `ros_set_bool` profiles (Mock rows are ignored). Any
-/// robot-provided row (`ur_io_states`, `ur_set_io`, `ros2_control_gpio`, or
-/// another non-generic profile) or no generic ROS row yields no plan.
+/// robot-provided row (`ros2_control_gpio` or another non-generic profile) or
+/// no generic ROS row yields no plan.
 [[nodiscard]] std::optional<SimulatedPlcPlan>
 plan_simulated_plc(bool simulated_unit, std::string device_id,
                    const std::vector<SimulatedPlcRow> &rows,

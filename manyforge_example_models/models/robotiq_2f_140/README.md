@@ -6,7 +6,7 @@ origin, now relative to `robotiq_2f_140_mount`. Mounted on a robot's `flange` wi
 identity pose, every link sits exactly where the combined model had it.
 
 Derived from the combined bundle `../ur10e_robotiq_2f_140` by
-`scripts/models/cut_combined_model.py` (merge 6, robot/gripper split), cut at
+`scripts/models/cut_combined_model.py` (robot/tool split), cut at
 the fixed joint `gripper_base_joint`. The arm half is `../ur10e`.
 
 ```bash
@@ -25,12 +25,15 @@ Contents:
   same cut of the combined `.structural` pair. They differ from the files
   above only by the two collision `<material>` children and the HPP
   `<gripper>` element, which are this tool's (see the combined README).
-- `component.yaml`: the component descriptor.
+- `component.yaml`: the component descriptor. Kind `tool` (`robotiq.robotiq_2f_140`), lanes `mock` and `isaac`.
+- `mock_controllers.yaml`: the controllers of its Mock lane row (`controllers_file`).
 
 Element text, geometry, origins, limits and vendor tags are copied unchanged;
 only `<robot name>` and the mount joint's parent link differ. The cut drops the
-combined SRDF's collision pairs that cross the mount; Apply disables collisions
-between the two rigid link groups that meet at a mount instead.
+combined SRDF's collision pairs that cross the mount. Apply disables collisions
+between the two rigid link groups that meet at a mount; any other arm-tool
+pairs that never touch are listed on the Deployment's attachment row
+(`collision_exclusions`; Components page: **Collision exclusions with parent**).
 
 Meshes are not copied: the mesh URIs keep pointing into `../ur10e_robotiq_2f_140/meshes/`,
 and the model family's `accepted_package_uri_prefix` and `resource_root` name

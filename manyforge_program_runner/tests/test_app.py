@@ -17,9 +17,11 @@ from manyforge_headless_api.models import (
     ProgramRunStopRequest,
     ProgramScenePreparationRequest,
 )
+from manyforge_headless_api.component_model import RUN_REFUSAL_CODES
 from manyforge_program_runner.app import (
     ProgramControlStateSource,
     _serve_program_control_state,
+    _status,
     create_app,
 )
 from manyforge_program_runner.models import (
@@ -506,7 +508,6 @@ def test_private_surface_projects_owner_facts_and_manages_lifecycle() -> None:
                 "request_id": "request.motion-start.1",
                 "program_run_id": "program-run.1",
                 "expected_owner_epoch": "program-runner.epoch.1",
-                "expected_run_revision": 1,
                 "expected_selection_revision": 0,
                 "group_ids": ["robot_group"],
                 "reason": "initial operator motion Run",
@@ -907,3 +908,10 @@ def test_started_then_failed_response_preserves_actual_identity_and_native_detai
     assert response.json() == {"detail": {"code": code,
         "message": "Owner outcome", "details": details,
         "producer": "program_runner"}}
+
+
+def test_run_refusals_are_409_not_5xx() -> None:
+    # A readiness or run refusal is known before any effect: never 5xx.
+    for code in RUN_REFUSAL_CODES:
+        assert _status(code) == 409, code
+    assert _status("program_runner_unavailable") == 503

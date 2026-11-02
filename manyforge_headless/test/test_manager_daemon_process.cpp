@@ -22,7 +22,7 @@
 #include <limits>
 #include <manyforge_component_manager/durable_store_set.hpp>
 #include <manyforge_component_manager/manager_apply_journal.hpp>
-#include <manyforge_component_manager/native_execution_runtime_unit_admission.hpp>
+#include <manyforge_component_manager/execution_host_unit_admission.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
 #include <manyforge_core/types/cell_admission.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
@@ -409,8 +409,9 @@ RequiredMember(const content_identity::CanonicalValue &value,
 
 /// Whether one Manager source value pairs its active publication with an
 /// Apply history of the same generation: publication 1 is the bootstrap and
-/// each later one is exactly one committed named Apply (the invariant Headless
-/// enforces as program_activation_history_incomplete).
+/// each later one is exactly one committed named Apply. These short sessions
+/// evict nothing, so the counts match exactly (Headless itself only refuses
+/// more committed Applies than publications: program_activation_history_incomplete).
 bool ManagerSourceHistoryIsOneGeneration(
     const content_identity::CanonicalValue &payload) {
   const auto generation =
@@ -462,20 +463,27 @@ ReadRuntimeOfferProjection(const content_identity::CanonicalValue &payload) {
   };
 }
 
+/// What generate_manager_apply_package writes for every profile: one example
+/// Scenario cell (the physical candidate), Close (the Apply of the empty
+/// intent), the cell-scoped canonical-empty predecessor, the fixture Program
+/// and its prepared activations.
 struct ManagerApplyFixtureMetadata final {
   std::string admission_filename;
-  std::string candidate_retained_bundle_id;
   std::string cell_id;
-  std::string deployment_artifact_id;
-  std::string deployment_revision;
+  std::string close_deployment_artifact_id;
+  std::string close_deployment_revision;
+  std::string close_retained_bundle_id;
   std::string physical_candidate_retained_bundle_id;
   std::string physical_deployment_artifact_id;
   std::string physical_deployment_revision;
+  std::string predecessor_graph_revision;
+  std::string predecessor_retained_bundle_id;
+  /// The stored prepared activation of the physical cell for the
+  /// `program_apply_fixture` Scenario.
+  std::string prepared_activation_id;
   std::string program_binding_id;
   std::string program_id;
   std::string program_revision;
-  std::string predecessor_graph_revision;
-  std::string predecessor_retained_bundle_id;
   content_identity::CanonicalValue program_role_assignment;
 };
 
@@ -489,72 +497,29 @@ ManagerApplyFixtureMetadata ReadManagerApplyFixtureMetadata(
   const std::string bytes{std::istreambuf_iterator<char>(stream),
                           std::istreambuf_iterator<char>()};
   const auto root = deployment::parse_strict_json_model_yaml(bytes).root();
-  if (!root.is_object() || root.as_object().size() != 14U ||
+  if (!root.is_object() || root.as_object().size() != 16U ||
       content_identity::canonical_json(root) != bytes) {
     throw std::runtime_error("Manager Apply fixture metadata is invalid");
   }
+  static_cast<void>(RequiredText(root, "physical_graph_revision"));
+  const auto &prepared = RequiredMember(root, "prepared_activations");
   return {
       RequiredText(root, "admission_filename"),
-      RequiredText(root, "candidate_retained_bundle_id"),
       RequiredText(root, "cell_id"),
-      RequiredText(root, "deployment_artifact_id"),
-      RequiredText(root, "deployment_revision"),
+      RequiredText(root, "close_deployment_artifact_id"),
+      RequiredText(root, "close_deployment_revision"),
+      RequiredText(root, "close_retained_bundle_id"),
       RequiredText(root, "physical_candidate_retained_bundle_id"),
       RequiredText(root, "physical_deployment_artifact_id"),
       RequiredText(root, "physical_deployment_revision"),
+      RequiredText(root, "predecessor_graph_revision"),
+      RequiredText(root, "predecessor_retained_bundle_id"),
+      RequiredText(RequiredMember(prepared, "program_apply_fixture"),
+                   "prepared_activation_id"),
       RequiredText(root, "program_binding_id"),
       RequiredText(root, "program_id"),
       RequiredText(root, "program_revision"),
-      RequiredText(root, "predecessor_graph_revision"),
-      RequiredText(root, "predecessor_retained_bundle_id"),
       RequiredMember(root, "program_role_assignment"),
-  };
-}
-
-struct GripperOnlyManagerApplyFixtureMetadata final {
-  std::string admission_filename;
-  std::string cell_id;
-  std::string prepared_activation_id;
-  std::string physical_candidate_retained_bundle_id;
-  std::string physical_deployment_artifact_id;
-  std::string physical_deployment_revision;
-  std::string predecessor_graph_revision;
-  std::string predecessor_retained_bundle_id;
-};
-
-GripperOnlyManagerApplyFixtureMetadata ReadGripperOnlyManagerApplyFixtureMetadata(
-    const std::filesystem::path &metadata_path =
-        MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_METADATA) {
-  std::ifstream stream(metadata_path, std::ios::binary);
-  if (!stream) {
-    throw std::runtime_error("gripper-only Manager Apply fixture metadata is absent");
-  }
-  const std::string bytes{std::istreambuf_iterator<char>(stream),
-                          std::istreambuf_iterator<char>()};
-  const auto root = deployment::parse_strict_json_model_yaml(bytes).root();
-  if (!root.is_object() || root.as_object().size() != 11U ||
-      content_identity::canonical_json(root) != bytes) {
-    throw std::runtime_error(
-        "gripper-only Manager Apply fixture metadata is invalid");
-  }
-  const auto &prepared = RequiredMember(root, "prepared_activations");
-  if (!prepared.is_object() || prepared.as_object().empty()) {
-    throw std::runtime_error(
-        "gripper-only Manager Apply fixture has no prepared activations");
-  }
-  static_cast<void>(RequiredText(root, "physical_graph_revision"));
-  static_cast<void>(RequiredText(root, "program_binding_id"));
-  static_cast<void>(RequiredText(root, "program_revision"));
-  const auto &apply_activation = RequiredMember(prepared, "program_apply_fixture");
-  return {
-      RequiredText(root, "admission_filename"),
-      RequiredText(root, "cell_id"),
-      RequiredText(apply_activation, "prepared_activation_id"),
-      RequiredText(root, "physical_candidate_retained_bundle_id"),
-      RequiredText(root, "physical_deployment_artifact_id"),
-      RequiredText(root, "physical_deployment_revision"),
-      RequiredText(root, "predecessor_graph_revision"),
-      RequiredText(root, "predecessor_retained_bundle_id"),
   };
 }
 
@@ -1369,10 +1334,7 @@ std::string ApplyRequest(
     // "receipt" echoes the previewed impact digest (explicit acceptance), an
     // empty value accepts nothing, anything else is sent verbatim.
     const std::string_view accepted_impact = "receipt",
-    const std::string_view prepared_activation_id_override = {},
-    const deployment::CanonicalEmptyRetainedBundleAdmission *sealed_admission =
-        nullptr,
-    const std::string_view scene_initialization = "preserve") {
+    const std::string_view prepared_activation_id_override = {}) {
   using content_identity::CanonicalValue;
   std::string resolved_graph_revision(expected_graph_revision);
   std::string resolved_retained_bundle_id(expected_retained_bundle_id);
@@ -1445,8 +1407,7 @@ std::string ApplyRequest(
           const auto prepared =
               deployment::FilesystemPreparedActivationRepository(
                   directory.activation_root())
-                  .get_verified(core::ContentDigest(prepared_activation_id),
-                                sealed_admission);
+                  .get_verified(core::ContentDigest(prepared_activation_id));
           if (prepared == nullptr) {
             throw std::runtime_error(
                 "Manager Apply fixture prepared activation is unavailable");
@@ -1519,7 +1480,7 @@ std::string ApplyRequest(
       {"expected_current", expected},
       {"prepared_activation", prepared_summary},
       {"reject_if_affected_busy", CanonicalValue(true)},
-      {"scene_initialization", CanonicalValue(std::string(scene_initialization))},
+      {"scene_initialization", CanonicalValue("preserve")},
       {"request_id", CanonicalValue(std::string(request_id))},
       {"request_owner_epoch", CanonicalValue(std::string(manager_owner_epoch))},
       {"source_label", CanonicalValue("manager-process-test")},
@@ -2010,75 +1971,26 @@ TEST(ManagerDaemonProcess, ApplyAcknowledgementRequiresAnExactRequestContext) {
   }
 }
 
-TEST(ManagerDaemonProcess, CanonicalEmptySelectionIsClosedAndPassive) {
+// N7: New's release finds no failed Apply holding a fresh cell; the command
+// takes only its request context.
+TEST(ManagerDaemonProcess, ApplyReleaseForNewReleasesNothingOnAFreshCell) {
   using content_identity::CanonicalValue;
   DaemonDirectory directory;
   ManagerProcess manager(directory);
   manager.WaitReady(directory);
-  const deployment::FilesystemCanonicalEmptyRetainedBundleSource source(
-      MANYFORGE_HEADLESS_TEST_CANONICAL_EMPTY_PACKAGE_ROOT);
-  const auto admission = source.load_verified();
-  AtomicSourceSnapshotChannel manager_source(directory.publication_root(),
-                                             "manager-source.json");
-  const auto before = manager_source.Read();
-  ASSERT_TRUE(before.has_value());
-  EXPECT_TRUE(ManagerSourceHistoryIsOneGeneration(before->payload));
-  const auto bytes = SendCommand(
-      directory.socket_path(),
-      R"({"api_version":"manyforge.manager_command.v1","command":"canonical_empty_selection"})");
-  const auto response = deployment::parse_strict_json_model_yaml(bytes).root();
-  ASSERT_EQ(response.as_object().size(), 3U);
-  EXPECT_EQ(RequiredMember(response, "api_version"),
-            CanonicalValue("manyforge.manager_command_response.v1"));
-  ASSERT_EQ(RequiredMember(response, "ok"), CanonicalValue(true)) << bytes;
-  const auto &selection = RequiredMember(response, "canonical_empty_selection");
-  ASSERT_EQ(selection.as_object().size(), 7U);
-  EXPECT_EQ(RequiredMember(selection, "request_owner_epoch"),
-            CanonicalValue(before->source_owner_epoch));
-  EXPECT_EQ(RequiredMember(selection, "cell_id"),
-            CanonicalValue(admission.cell_id().value()));
-  EXPECT_EQ(RequiredMember(selection, "deployment_artifact_id"),
-            CanonicalValue(admission.deployment_artifact_id().value()));
-  EXPECT_EQ(RequiredMember(selection, "deployment_revision"),
-            CanonicalValue(admission.deployment_revision().value()));
-  EXPECT_EQ(RequiredMember(selection, "candidate_retained_bundle_id"),
-            CanonicalValue(admission.retained_bundle_id().value()));
-  EXPECT_EQ(RequiredMember(selection, "candidate_graph_revision"),
-            CanonicalValue(admission.graph_revision().value()));
-  EXPECT_EQ(RequiredMember(selection, "admission_digest"),
-            CanonicalValue(admission.admission_digest().value()));
-  EXPECT_EQ(
-      SendCommand(
-          directory.socket_path(),
-          R"({"api_version":"manyforge.manager_command.v1","command":"canonical_empty_selection"})"),
-      bytes);
-  for (
-      const std::string_view request :
-      {std::string_view("{"),
-       std::string_view(
-           R"({"api_version":"manyforge.manager_command.v1","command":false})"),
-       std::string_view(
-           R"({"api_version":false,"command":"canonical_empty_selection"})"),
-       std::string_view(
-           R"({"api_version":"manyforge.manager_command.v1","command":"canonical_empty_selection","extra":true})")}) {
-    const auto rejected_bytes =
-        SendCommand(directory.socket_path(), std::string(request));
-    const auto rejected =
-        deployment::parse_strict_json_model_yaml(rejected_bytes).root();
-    EXPECT_EQ(RequiredMember(rejected, "ok"), CanonicalValue(false))
-        << rejected_bytes;
+  const auto valid = SendCommand(directory.socket_path(),
+      R"({"api_version":"manyforge.manager_command.v1","command":"apply_release_for_new","request_context":{"request_id":"new.1","source_label":"composer"}})");
+  const auto released = deployment::parse_strict_json_model_yaml(valid).root();
+  EXPECT_EQ(RequiredMember(released, "ok"), CanonicalValue(true)) << valid;
+  EXPECT_EQ(RequiredMember(released, "released"), CanonicalValue(nullptr)) << valid;
+  for (const auto *request : {
+      R"({"api_version":"manyforge.manager_command.v1","command":"apply_release_for_new"})",
+      R"({"api_version":"manyforge.manager_command.v1","apply_generation":1,"apply_id":"apply.absent","command":"apply_release_for_new","request_context":{"request_id":"new.1","source_label":"composer"}})"}) {
+    const auto bytes = SendCommand(directory.socket_path(), request);
+    const auto rejected = deployment::parse_strict_json_model_yaml(bytes).root();
     EXPECT_EQ(RequiredMember(RequiredMember(rejected, "error"), "code"),
-              CanonicalValue("invalid_request"))
-        << rejected_bytes;
+              CanonicalValue("invalid_request")) << bytes;
   }
-  const auto after = manager_source.Read();
-  ASSERT_TRUE(after.has_value());
-  EXPECT_TRUE(ManagerSourceHistoryIsOneGeneration(after->payload));
-  EXPECT_EQ(after->source_owner_epoch, before->source_owner_epoch);
-  EXPECT_EQ(RequiredMember(after->payload, "active"),
-            RequiredMember(before->payload, "active"));
-  EXPECT_EQ(RequiredMember(after->payload, "apply"),
-            RequiredMember(before->payload, "apply"));
 }
 
 TEST(ManagerDaemonProcess,
@@ -2681,19 +2593,6 @@ TEST(ManagerDaemonProcess,
   std::filesystem::rename(selected_root, displaced_root);
   ASSERT_TRUE(std::filesystem::create_directory(selected_root));
 
-  const auto selection_bytes = SendCommand(
-      directory.socket_path(),
-      R"({"api_version":"manyforge.manager_command.v1","command":"canonical_empty_selection"})");
-  const auto selection =
-      deployment::parse_strict_json_model_yaml(selection_bytes).root();
-  EXPECT_EQ(RequiredMember(selection, "ok"),
-            content_identity::CanonicalValue(false))
-      << selection_bytes;
-  EXPECT_EQ(RequiredMember(RequiredMember(selection, "error"), "code"),
-            content_identity::CanonicalValue("full_stack_restart_required"))
-      << selection_bytes;
-  EXPECT_EQ(ReadDirectChildren(manager.pid()), children_before_replacement);
-
   const auto reconcile = SendCommand(
       directory.socket_path(),
       R"({"api_version":"manyforge.manager_command.v1","command":"reconcile"})");
@@ -2973,10 +2872,12 @@ TEST(ManagerDaemonProcess,
   EXPECT_TRUE(WIFEXITED(stopped));
 }
 
-void RunGripperOnlyNativeApply(const std::string_view close_initialization) {
-  const auto fixture = ReadGripperOnlyManagerApplyFixtureMetadata();
+TEST(ManagerDaemonProcess,
+     RobotiqPositionHostApplyPublishesAControllableCellWithoutMotion) {
+  const auto fixture = ReadManagerApplyFixtureMetadata(
+      MANYFORGE_HEADLESS_TEST_ROBOTIQ_POSITION_METADATA);
   DaemonDirectory directory(true);
-  std::filesystem::copy(MANYFORGE_HEADLESS_TEST_GRIPPER_ONLY_PACKAGE_ROOT,
+  std::filesystem::copy(MANYFORGE_HEADLESS_TEST_ROBOTIQ_POSITION_PACKAGE_ROOT,
                         directory.apply_package_root(),
                         std::filesystem::copy_options::recursive);
   const deployment::FilesystemPreparedActivationRepository package_activations(
@@ -3006,7 +2907,7 @@ void RunGripperOnlyNativeApply(const std::string_view close_initialization) {
       fixture.physical_deployment_revision,
       fixture.predecessor_graph_revision,
       fixture.predecessor_retained_bundle_id,
-      "manager-gripper-only-apply.1", {}, false, "receipt",
+      "manager-robotiq-position-apply.1", {}, false, "receipt",
       fixture.prepared_activation_id);
   const auto submitted = SendCommand(directory.socket_path(), request);
   ASSERT_NE(submitted.find("\"apply_id\""), std::string::npos)
@@ -3038,208 +2939,12 @@ void RunGripperOnlyNativeApply(const std::string_view close_initialization) {
       << status;
   EXPECT_EQ(status.find("execution.trajectory.execute"), std::string::npos)
       << status;
-
-  AtomicSourceSnapshotChannel scene_source(directory.publication_root(),
-                                           "logical-scene-source.json");
-  if (close_initialization == "initialize") {
-    // Populate the actual Scene owner before testing the Close Apply.
-    const auto before_add = scene_source.Read();
-    ASSERT_TRUE(before_add.has_value());
-    const auto added = SendCommand(
-        directory.socket_path(),
-        SceneAddRequest(*before_add, "manager-close-scene-object.1",
-                        WaitForAuthoringAdmission(directory).admission_generation));
-    ASSERT_NE(added.find("\"ok\":true"), std::string::npos) << added;
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    std::optional<SourceSnapshot> observed;
-    while (std::chrono::steady_clock::now() < deadline) {
-      observed = scene_source.Read();
-      if (observed.has_value() &&
-          content_identity::canonical_json(RequiredMember(observed->payload, "snapshot"))
-                  .find("scene-process-box") != std::string::npos) {
-        break;
-      }
-      std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-    ASSERT_TRUE(observed.has_value());
-    ASSERT_NE(content_identity::canonical_json(RequiredMember(observed->payload, "snapshot"))
-                  .find("scene-process-box"), std::string::npos);
-  }
-
-  // The first physical Apply used the selected-product path, not the current
-  // bootstrap builder. Empty installation must retain that exact ownership
-  // through the interval before the public pointer switches to empty.
-  const auto native_children = ReadDirectChildren(manager.pid());
-  ASSERT_FALSE(native_children.empty());
-  const deployment::FilesystemCanonicalEmptyRetainedBundleSource empty_source(
-      directory.apply_package_root(), fixture.admission_filename);
-  const auto empty_admission = empty_source.load_verified();
-  const deployment::FilesystemVerifiedCatalogArtifactSource empty_catalog(
-      directory.apply_package_root());
-  const deployment::FilesystemVerifiedRawArtifactSource empty_raw(
-      directory.apply_package_root());
-  const auto empty_prepared = deployment::assemble_sealed_canonical_empty_activation(
-      empty_admission, empty_catalog, empty_raw);
-  ASSERT_TRUE(daemon_activations.put_if_absent(empty_prepared));
-  const auto empty_request = ApplyRequest(
-      directory, initial->source_owner_epoch,
-      WaitForAuthoringAdmission(directory).admission_generation,
-      empty_admission.deployment_artifact_id().value(),
-      empty_admission.deployment_revision().value(), "current-graph",
-      "current-bundle", "manager-gripper-only-empty.2", {}, false, "receipt",
-      empty_prepared.prepared_activation_id().value(), &empty_admission,
-      close_initialization);
-  if (close_initialization == "initialize") {
-    component_manager::SqliteManagerApplyJournal journal(
-        directory.manager_root() /
-            std::string(component_manager::kManagerApplyJournalFilename),
-        core::CellId(fixture.cell_id));
-    const auto inventory_before = journal.ReadStatusInventory().size();
-    const auto admission_before = ReadAuthoringAdmissionProjection(directory);
-    const auto scene_before = scene_source.Read();
-    const auto manager_before = manager_source.Read();
-    ASSERT_TRUE(scene_before.has_value());
-    ASSERT_TRUE(manager_before.has_value());
-    const auto expect_no_effect = [&] {
-      EXPECT_EQ(journal.ReadStatusInventory().size(), inventory_before);
-      const auto admission_after = ReadAuthoringAdmissionProjection(directory);
-      EXPECT_EQ(admission_after.authoring_allowed, admission_before.authoring_allowed);
-      EXPECT_EQ(admission_after.admission_generation, admission_before.admission_generation);
-      const auto scene_after = scene_source.Read();
-      const auto manager_after = manager_source.Read();
-      ASSERT_TRUE(scene_after.has_value());
-      ASSERT_TRUE(manager_after.has_value());
-      EXPECT_EQ(RequiredMember(scene_after->payload, "snapshot"),
-                RequiredMember(scene_before->payload, "snapshot"));
-      EXPECT_EQ(RequiredMember(manager_after->payload, "active"),
-                RequiredMember(manager_before->payload, "active"));
-      EXPECT_EQ(RequiredMember(manager_after->payload, "apply"),
-                RequiredMember(manager_before->payload, "apply"));
-    };
-    // A forged but internally consistent sealed summary must not pass the
-    // stored activation/admission check. No Apply is accepted for it.
-    auto forged = empty_request;
-    auto forged_origin = *empty_prepared.sealed_canonical_empty_origin();
-    forged_origin.admission_digest = core::ContentDigest(
-        "sha256:" + std::string(64U, '0'));
-    const auto replace_once = [&forged](const std::string &from,
-                                        const std::string &to) {
-      const auto position = forged.find(from);
-      ASSERT_NE(position, std::string::npos);
-      forged.replace(position, from.size(), to);
-    };
-    replace_once(empty_admission.admission_digest().value(),
-                 forged_origin.admission_digest.value());
-    replace_once(empty_prepared.captured_input_digest().value(),
-                 deployment::sealed_canonical_empty_capture_digest(forged_origin)
-                     .value());
-    const auto bytes = SendCommand(directory.socket_path(), forged);
-    const auto rejected = deployment::parse_strict_json_model_yaml(bytes).root();
-    EXPECT_EQ(RequiredMember(rejected, "ok"), content_identity::CanonicalValue(false))
-        << bytes;
-    EXPECT_EQ(RequiredText(RequiredMember(rejected, "error"), "code"),
-              "prepared_activation_unverified") << bytes;
-    expect_no_effect();
-
-    auto unsupported = empty_request;
-    const std::string kind = "\"kind\":\"sealed_canonical_empty\"";
-    const auto position = unsupported.find(kind);
-    ASSERT_NE(position, std::string::npos);
-    unsupported.replace(position, kind.size(), "\"kind\":\"unsupported\"");
-    const auto unsupported_bytes = SendCommand(directory.socket_path(), unsupported);
-    const auto unsupported_result =
-        deployment::parse_strict_json_model_yaml(unsupported_bytes).root();
-    EXPECT_EQ(RequiredText(RequiredMember(unsupported_result, "error"), "code"),
-              "invalid_request") << unsupported_bytes;
-    expect_no_effect();
-  }
-  const auto empty_submitted = SendCommand(directory.socket_path(), empty_request);
-  ASSERT_NE(empty_submitted.find("\"apply_id\""), std::string::npos)
-      << empty_submitted;
-  auto emptied = empty_submitted;
-  const auto empty_status_request = ApplyStatusRequest(empty_submitted);
-  const auto empty_deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(20);
-  while (emptied.find("\"state\":\"succeeded\"") == std::string::npos &&
-         std::chrono::steady_clock::now() < empty_deadline) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    emptied = SendCommand(directory.socket_path(), empty_status_request);
-  }
-  ASSERT_NE(emptied.find("\"state\":\"succeeded\""), std::string::npos)
-      << emptied << "\nmanager stderr:\n" << ReadStartupStderr(directory);
-  EXPECT_TRUE(WaitForAuthoringAdmission(directory).authoring_allowed);
-  const auto empty_current = manager_source.Read();
-  ASSERT_TRUE(empty_current.has_value());
-  EXPECT_EQ(empty_current->source_owner_epoch, initial->source_owner_epoch);
-  const auto &empty_active = RequiredMember(empty_current->payload, "active");
-  EXPECT_EQ(RequiredMember(empty_active, "canonical_empty"),
-            content_identity::CanonicalValue(true));
-  EXPECT_EQ(RequiredText(empty_active, "retained_bundle_id"),
-            empty_admission.retained_bundle_id().value());
-  EXPECT_EQ(RequiredText(empty_active, "graph_revision"),
-            empty_admission.graph_revision().value());
-  if (close_initialization == "initialize") {
-    const auto records = content_identity::canonical_json(
-        RequiredMember(empty_current->payload, "apply"));
-    EXPECT_NE(records.find("\"scene_initialization\":\"initialize\""),
-              std::string::npos) << records;
-    const auto replay = SendCommand(directory.socket_path(), empty_request);
-    EXPECT_NE(replay.find("\"replay_status\":\"replayed_exact\""),
-              std::string::npos) << replay;
-  }
-  EXPECT_EQ(ReadDirectChildren(manager.pid()), native_children);
-  EXPECT_EQ(ReadStartupStderr(directory).find(
-                "native composition phase: materializing runtime"),
-            std::string::npos);
-
-  // A fresh explicit Apply still owns the normal selected-product route.
-  // Use the actual empty predecessor and a new request, never retry a mutation.
-  const auto reapplied_submission = SendCommand(directory.socket_path(), ApplyRequest(
-      directory, empty_current->source_owner_epoch,
-      WaitForAuthoringAdmission(directory).admission_generation,
-      fixture.physical_deployment_artifact_id,
-      fixture.physical_deployment_revision,
-      empty_admission.graph_revision().value(),
-      empty_admission.retained_bundle_id().value(),
-      "manager-gripper-only-reapply.3", {}, false, "receipt",
-      fixture.prepared_activation_id));
-  ASSERT_NE(reapplied_submission.find("\"apply_id\""), std::string::npos)
-      << reapplied_submission;
-  EXPECT_NE(ApplyStatusRequest(reapplied_submission), empty_status_request);
-  auto reapplied = reapplied_submission;
-  const auto reapply_status_request = ApplyStatusRequest(reapplied_submission);
-  const auto reapply_deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(20);
-  while (reapplied.find("\"state\":\"succeeded\"") == std::string::npos &&
-         std::chrono::steady_clock::now() < reapply_deadline) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    reapplied = SendCommand(directory.socket_path(), reapply_status_request);
-  }
-  ASSERT_NE(reapplied.find("\"state\":\"succeeded\""), std::string::npos)
-      << reapplied << "\nmanager stderr:\n" << ReadStartupStderr(directory);
-  const auto reopened = WaitForExecutionReady(
-      directory, fixture.physical_candidate_retained_bundle_id);
-  EXPECT_EQ(reopened.owner_epoch, ready.owner_epoch);
-  EXPECT_TRUE(WaitForAuthoringAdmission(directory).authoring_allowed);
-  EXPECT_EQ(ReadDirectChildren(manager.pid()), native_children);
-  EXPECT_EQ(ReadStartupStderr(directory).find(
-                "native composition phase: materializing runtime"),
-            std::string::npos);
-}
-
-TEST(ManagerDaemonProcess,
-     GripperOnlyNativeApplyPublishesAControllableCellWithoutMotion) {
-  RunGripperOnlyNativeApply("preserve");
-}
-
-TEST(ManagerDaemonProcess, SealedCanonicalEmptyCloseInitializesScene) {
-  RunGripperOnlyNativeApply("initialize");
 }
 
 TEST(
     ManagerDaemonProcess,
     PneumaticCommandedFeedbackAliasInitialApplyPublishesAControllableCellWithoutMotion) {
-  const auto fixture = ReadGripperOnlyManagerApplyFixtureMetadata(
+  const auto fixture = ReadManagerApplyFixtureMetadata(
       MANYFORGE_HEADLESS_TEST_PNEUMATIC_COMMANDED_FEEDBACK_METADATA);
   DaemonDirectory directory(true);
   std::filesystem::copy(
@@ -3264,8 +2969,9 @@ TEST(
   EXPECT_EQ(gripper.actuation_kind, "pneumatic");
   EXPECT_EQ(gripper.output_mode, core::GripperOutputMode::kCommanded);
   ASSERT_EQ(configuration.controller_profiles.size(), 1U);
-  EXPECT_EQ(configuration.controller_profiles.front().mock_profile,
-            std::optional<std::string>("lite6_lite_gripper"));
+  EXPECT_EQ(configuration.controller_profiles.front().lane, "mock");
+  EXPECT_EQ(configuration.controller_profiles.front().model_family_id,
+            "lite_gripper");
   const auto command_binding = std::find_if(
       graph.control_bindings.begin(), graph.control_bindings.end(),
       [](const auto &binding) {
@@ -3338,7 +3044,19 @@ TEST(
   const auto ready = WaitForExecutionReady(
       directory, fixture.physical_candidate_retained_bundle_id);
   EXPECT_FALSE(ready.owner_epoch.empty());
-  const auto current = manager_source.Read();
+  // The Manager's own source refreshes on its next observation cycle, which
+  // may follow the Apply's terminal record and the host's readiness.
+  auto current = manager_source.Read();
+  const auto source_deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while ((!current.has_value() ||
+          RequiredText(RequiredMember(current->payload, "active"),
+                       "retained_bundle_id") !=
+              fixture.physical_candidate_retained_bundle_id) &&
+         std::chrono::steady_clock::now() < source_deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    current = manager_source.Read();
+  }
   ASSERT_TRUE(current.has_value());
   EXPECT_EQ(RequiredText(RequiredMember(current->payload, "active"),
                          "retained_bundle_id"),
@@ -3357,8 +3075,8 @@ TEST(ManagerDaemonProcess,
   const auto fixture_a = ReadManagerApplyFixtureMetadata();
   const auto fixture_b = ReadManagerApplyFixtureMetadata(
       MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_REPLACEMENT_METADATA);
-  ASSERT_EQ(fixture_a.candidate_retained_bundle_id,
-            fixture_b.candidate_retained_bundle_id);
+  ASSERT_EQ(fixture_a.close_retained_bundle_id,
+            fixture_b.close_retained_bundle_id);
 
   const std::filesystem::path package_a =
       MANYFORGE_HEADLESS_TEST_MANAGER_APPLY_PACKAGE_ROOT;
@@ -3374,7 +3092,7 @@ TEST(ManagerDaemonProcess,
   const auto identity_a = ReadNativePackageIdentity(
       package_a, fixture_a.physical_candidate_retained_bundle_id,
       directory_a.installed_root() / "manyforge_ros2_control_execution_host");
-  ASSERT_TRUE(component_manager::VerifyNativeExecutionRuntimeUnitForHost(
+  ASSERT_TRUE(component_manager::VerifyExecutionHostUnitForHost(
                   *identity_a.bundle,
                   identity_a.bundle->value()
                       .cell_graph.runtime_units.front()
@@ -3451,7 +3169,7 @@ TEST(ManagerDaemonProcess,
   const auto identity_b = ReadNativePackageIdentity(
       package_b, fixture_b.physical_candidate_retained_bundle_id,
       directory_b.installed_root() / "manyforge_ros2_control_execution_host");
-  ASSERT_TRUE(component_manager::VerifyNativeExecutionRuntimeUnitForHost(
+  ASSERT_TRUE(component_manager::VerifyExecutionHostUnitForHost(
                   *identity_b.bundle,
                   identity_b.bundle->value()
                       .cell_graph.runtime_units.front()
@@ -3546,15 +3264,15 @@ TEST(ManagerDaemonProcess,
   ASSERT_TRUE(before.has_value());
   const auto admission =
       WaitForAuthoringAdmission(directory).admission_generation;
-  // The runtime-only candidate has none of the fixture Program's components:
-  // the Program becomes non-executable, a destructive impact (H1a).
+  // Close (the Apply of the empty intent) has none of the fixture Program's
+  // components: the Program becomes non-executable, a destructive impact (H1a).
   std::string last_request;
   const auto submit = [&](const std::string_view request_id,
                           const std::string_view accepted) {
     last_request =
         ApplyRequest(directory, before->source_owner_epoch, admission,
-                     fixture.deployment_artifact_id,
-                     fixture.deployment_revision,
+                     fixture.close_deployment_artifact_id,
+                     fixture.close_deployment_revision,
                      fixture.predecessor_graph_revision,
                      fixture.predecessor_retained_bundle_id, request_id, {},
                      false, accepted);
@@ -4156,24 +3874,20 @@ TEST(ManagerDaemonProcess,
   EXPECT_EQ(RequiredText(RequiredMember(before->payload, "active"),
                          "retained_bundle_id"),
             predecessor_id);
-  const auto cclc_command = [&](const std::string &command,
-                                CanonicalValue payload) {
+  // CONTRACTS §1/§2: the component model and component actions are served
+  // on the execution host's Stop control socket.
+  const auto control_command = [&](CanonicalValue::Object request) {
+    request.emplace_back("api_version",
+                         CanonicalValue("manyforge.execution_command.v1"));
     const auto bytes = SendCommand(
-        directory.execution_run_root() / "cclc-command.sock",
-        content_identity::canonical_json(CanonicalValue(CanonicalValue::Object{
-            {"api_version", CanonicalValue("manyforge.cclc_open_request.v1")},
-            {"command", CanonicalValue(command)},
-            {"payload", std::move(payload)}})));
+        directory.execution_run_root() / "execution-control.sock",
+        content_identity::canonical_json(CanonicalValue(std::move(request))));
     const auto response =
         deployment::parse_strict_json_model_yaml(bytes).root();
     if (RequiredMember(response, "ok") != CanonicalValue(true))
-      throw std::runtime_error("Actual CCLC read failed: " + bytes);
-    return RequiredMember(response, "result");
+      throw std::runtime_error("Actual component command failed: " + bytes);
+    return response;
   };
-  const auto original_owner = RequiredText(
-      cclc_command("owner_identity", CanonicalValue(CanonicalValue::Object{})),
-      "request_owner_epoch");
-  ASSERT_FALSE(original_owner.empty());
   // Events use the stable owner/journal even before a physical product exists.
   const auto idle_identity = deployment::parse_strict_json_model_yaml(SendCommand(
       directory.execution_socket_path(),
@@ -4332,28 +4046,20 @@ TEST(ManagerDaemonProcess,
   const auto inventory = journal.ReadStatusInventory();
   ASSERT_EQ(inventory.size(), 1U);
   const auto &status = inventory.front();
-  EXPECT_FALSE(status.bring_up_plan.has_value());
-  EXPECT_TRUE(status.bring_up_child_proofs.empty());
   ASSERT_TRUE(status.fence_released.has_value());
   ASSERT_TRUE(status.publication_receipt.has_value());
 
   const auto read_component = [&] {
-    return cclc_command(
-        "component_snapshot",
-        CanonicalValue(CanonicalValue::Object{
-            {"controllable_component_id", CanonicalValue(component)}}));
+    const auto model = control_command(
+        {{"command", CanonicalValue("read_component_model")}});
+    for (const auto &state :
+         RequiredMember(model, "component_states").as_array())
+      if (RequiredText(state, "component_id") == component) return state;
+    throw std::runtime_error("Actual component state is absent: " +
+                             content_identity::canonical_json(model));
   };
-  auto snapshot = read_component();
-  EXPECT_EQ(RequiredText(snapshot, "retained_bundle_id"), candidate_id);
-  EXPECT_EQ(RequiredText(snapshot, "graph_revision"),
-            candidate->value().cell_graph.graph_revision.value());
-  EXPECT_EQ(RequiredText(snapshot, "component_lifecycle_state"), "declared");
-  EXPECT_EQ(RequiredMember(snapshot, "lifecycle_target"),
-            CanonicalValue(nullptr));
-  EXPECT_EQ(RequiredText(cclc_command("owner_identity",
-                                      CanonicalValue(CanonicalValue::Object{})),
-                         "request_owner_epoch"),
-            original_owner);
+  // An added component starts not prepared; the operator prepares it.
+  EXPECT_EQ(RequiredText(read_component(), "lifecycle"), "not_prepared");
 
   const auto observe_ros = [&](const std::string &state, const std::string &label) {
     const auto output = directory.execution_run_root() / (label + ".ros-observation.json");
@@ -4479,7 +4185,7 @@ TEST(ManagerDaemonProcess,
             {"max_tcp_linear_speed_mps", CanonicalValue(nullptr)}})},
         {"timeouts", CanonicalValue(CanonicalValue::Object{
             {"planning_timeout_s", CanonicalValue(2.0)}, {"execution_timeout_s", CanonicalValue(10.0)}})},
-        {"cache_mode", CanonicalValue("default")}, {"planning_profile", CanonicalValue("first_feasible")},
+        {"cache_mode", CanonicalValue("default")},
         {"target_mode", CanonicalValue("absolute")}, {"target_reference", CanonicalValue(nullptr)},
         {"offset_reference", CanonicalValue(nullptr)},
         {"motion", CanonicalValue(CanonicalValue::Object{
@@ -4532,120 +4238,44 @@ TEST(ManagerDaemonProcess,
     return deployment::parse_strict_json_model_yaml(submitted_motion).root();
   };
 
-  const auto explicit_lifecycle = [&](const std::string &intent) {
-    const auto current = read_component();
-    CanonicalValue::Array expected_domains;
-    for (const auto &domain : RequiredMember(current, "domains").as_array()) {
-      const auto &active =
-          RequiredMember(domain, "active_control_configuration");
-      CanonicalValue expected_active(
-          CanonicalValue::Object{{"presence", CanonicalValue("absent")}});
-      if (active.is_object()) {
-        expected_active = CanonicalValue(CanonicalValue::Object{
-            {"presence", CanonicalValue("present")},
-            {"active_control_configuration_id",
-             RequiredMember(active, "active_control_configuration_id")},
-            {"active_control_configuration_generation",
-             RequiredMember(active,
-                            "active_control_configuration_generation")}});
-      }
-      expected_domains.emplace_back(CanonicalValue::Object{
-          {"kind", RequiredMember(domain, "kind")},
-          {"control_domain_id", RequiredMember(domain, "control_domain_id")},
-          {"control_domain_revision",
-           RequiredMember(domain, "control_domain_revision")},
-          {"controller_topology_id",
-           RequiredMember(domain, "controller_topology_id")},
-          {"topology_revision", RequiredMember(domain, "topology_revision")},
-          {"expected_active_control_configuration", std::move(expected_active)},
-          {"expected_control_bindings",
-           RequiredMember(domain, "current_control_bindings")}});
-    }
-    const auto result = cclc_command(
-        "lifecycle_submit",
-        CanonicalValue(CanonicalValue::Object{
-            {"controllable_component_id", CanonicalValue(component)},
-            {"intent", CanonicalValue(intent)},
-            {"expected_graph_revision",
-             RequiredMember(current, "graph_revision")},
-            {"expected_component_lifecycle_generation",
-             RequiredMember(current, "component_lifecycle_generation")},
-            {"expected_control_domains",
-             CanonicalValue(std::move(expected_domains))},
-            {"expected_admission_generation",
-             CanonicalValue(static_cast<double>(
-                 WaitForAuthoringAdmission(directory).admission_generation))},
-            {"request_context",
-             CanonicalValue(CanonicalValue::Object{
-                 {"request_id", CanonicalValue("empty-ros-one-mock." + intent)},
-                 {"request_owner_epoch", CanonicalValue(original_owner)},
-                 {"source_label",
-                  CanonicalValue("manager_ros_apply_fixture")}})}}));
-    const auto &acceptance = RequiredMember(result, "acceptance");
-    if (!acceptance.is_object())
-      throw std::runtime_error("Explicit lifecycle was not accepted: " +
-                               content_identity::canonical_json(result));
-    const auto transaction_id =
-        RequiredText(acceptance, "lifecycle_transaction_id");
+  // Runs one component action and waits for its result in the component's
+  // state (CONTRACTS §2: `202`-style acceptance, then `last_action`).
+  const auto run_action = [&](const std::string &action) {
+    const auto accepted = control_command(
+        {{"command", CanonicalValue("component_action")},
+         {"request", CanonicalValue(CanonicalValue::Object{
+                         {"action", CanonicalValue(action)},
+                         {"component_id", CanonicalValue(component)}})}});
+    const auto started =
+        RequiredMember(RequiredMember(accepted, "accepted"), "started_at_ns");
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(20);
-    CanonicalValue actual(nullptr);
     while (std::chrono::steady_clock::now() < deadline) {
-      actual = cclc_command(
-          "lifecycle_status",
-          CanonicalValue(CanonicalValue::Object{
-              {"lifecycle_transaction_id", CanonicalValue(transaction_id)}}));
-      if (RequiredMember(actual, "terminal_result") != CanonicalValue(nullptr))
-        break;
+      const auto state = read_component();
+      const auto *last = state.find_object_member("last_action");
+      if (state.find_object_member("action") == nullptr && last != nullptr &&
+          RequiredText(*last, "action") == action &&
+          RequiredMember(*last, "started_at_ns") == started) {
+        if (RequiredText(*last, "outcome") != "succeeded")
+          throw std::runtime_error("Component action did not succeed: " +
+                                   content_identity::canonical_json(state));
+        return state;
+      }
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
-    if (RequiredMember(actual, "terminal_result") !=
-        CanonicalValue("succeeded"))
-      throw std::runtime_error("Explicit lifecycle did not succeed: " +
-                               content_identity::canonical_json(actual));
-    EXPECT_EQ(RequiredText(actual, "status_owner_epoch"), original_owner);
-    EXPECT_EQ(RequiredMember(actual, "acceptance"), acceptance);
-    return actual;
+    throw std::runtime_error("Component action did not finish: " + action);
   };
-  const auto prepared = explicit_lifecycle("prepare");
-  EXPECT_EQ(RequiredText(prepared, "current_state"), "prepared");
-  // The whole authored component includes its gripper domain. An already
-  // active gripper must not be hidden by the aggregate component state.
-  const auto &prepared_domains = RequiredMember(prepared, "domains").as_array();
-  ASSERT_EQ(prepared_domains.size(),
-            candidate->value().desired_control_configurations.size());
-  for (const auto &domain : prepared_domains) {
-    ASSERT_EQ(RequiredText(domain, "current_state"), "prepared");
-    EXPECT_TRUE(
-        std::any_of(candidate->value().desired_control_configurations.begin(),
-                    candidate->value().desired_control_configurations.end(),
-                    [&](const auto &desired) {
-                      return desired.control_domain_id.value() ==
-                             RequiredText(domain, "control_domain_id");
-                    }));
-  }
-  snapshot = read_component();
-  EXPECT_EQ(RequiredText(snapshot, "component_lifecycle_state"), "prepared");
-  EXPECT_EQ(RequiredText(RequiredMember(snapshot, "lifecycle_target"),
-                         "requested_state"),
-            "prepared");
+  EXPECT_EQ(RequiredText(run_action("prepare"), "lifecycle"), "prepared");
   EXPECT_EQ(RequiredMember(read_command_gate(), "command_eligible"),
             CanonicalValue(false));
 
+  // A prepared component takes no command.
   const auto refused_motion = submit_current_joint_hold("empty-ros-one-mock.prepared-motion");
   ASSERT_EQ(RequiredMember(refused_motion, "ok"), CanonicalValue(false))
       << content_identity::canonical_json(refused_motion);
-  EXPECT_EQ(RequiredText(RequiredMember(RequiredMember(refused_motion, "error"), "details"), "reason"),
-            "component_command_not_eligible") << content_identity::canonical_json(refused_motion);
 
-  const auto enabled = explicit_lifecycle("enable");
-  EXPECT_EQ(RequiredText(enabled, "current_state"), "active");
+  EXPECT_EQ(RequiredText(run_action("enable"), "lifecycle"), "enabled");
   observe_ros("active", "after-enable");
-  snapshot = read_component();
-  EXPECT_EQ(RequiredText(snapshot, "component_lifecycle_state"), "active");
-  EXPECT_EQ(RequiredText(RequiredMember(snapshot, "lifecycle_target"),
-                         "requested_state"),
-            "active");
   const auto ready_deadline =
       std::chrono::steady_clock::now() + std::chrono::seconds(20);
   CanonicalValue command_gate(nullptr);
@@ -4659,7 +4289,7 @@ TEST(ManagerDaemonProcess,
   EXPECT_EQ(RequiredMember(command_gate, "command_eligible"),
             CanonicalValue(true));
   // These private commands require the genuine managed cell above. The
-  // standalone CLI cannot construct this stable-cell/CCLC owner relationship.
+  // standalone CLI cannot construct this stable-cell owner relationship.
   const auto execution_command = [&](CanonicalValue::Object request) {
     const auto bytes = SendCommand(directory.execution_socket_path(),
         content_identity::canonical_json(CanonicalValue(std::move(request))));
@@ -4728,62 +4358,6 @@ TEST(ManagerDaemonProcess,
     ASSERT_EQ(RequiredMember(invalid, "ok"), CanonicalValue(false));
     EXPECT_EQ(RequiredText(RequiredMember(invalid, "error"), "code"), "execution_command_invalid");
   }
-  EXPECT_EQ(RequiredText(cclc_command("owner_identity",
-                                      CanonicalValue(CanonicalValue::Object{})),
-                         "request_owner_epoch"),
-            original_owner);
-  const auto &domains = RequiredMember(snapshot, "domains").as_array();
-  ASSERT_EQ(domains.size(),
-            candidate->value().desired_control_configurations.size());
-  const auto &enabled_domains = RequiredMember(enabled, "domains").as_array();
-  ASSERT_EQ(enabled_domains.size(), domains.size());
-  for (const auto &desired :
-       candidate->value().desired_control_configurations) {
-    const auto domain =
-        std::find_if(domains.begin(), domains.end(), [&](const auto &row) {
-          return RequiredText(row, "control_domain_id") ==
-                 desired.control_domain_id.value();
-        });
-    ASSERT_NE(domain, domains.end());
-    // Lifecycle state belongs to the actual Enable transaction status;
-    // component snapshot domains contain the current route/configuration closure.
-    const auto enabled_domain = std::find_if(
-        enabled_domains.begin(), enabled_domains.end(), [&](const auto &row) {
-          return RequiredText(row, "control_domain_id") ==
-                 desired.control_domain_id.value();
-        });
-    ASSERT_NE(enabled_domain, enabled_domains.end());
-    EXPECT_EQ(RequiredText(*enabled_domain, "current_state"), "active");
-    const auto &configuration =
-        RequiredMember(*domain, "active_control_configuration");
-    ASSERT_TRUE(configuration.is_object());
-    EXPECT_EQ(RequiredText(configuration, "state"), "reconciled");
-    EXPECT_GT(
-        RequiredMember(configuration, "active_control_configuration_generation")
-            .as_number(),
-        0.0);
-    EXPECT_FALSE(RequiredText(configuration, "source_runtime_epoch").empty());
-    EXPECT_EQ(RequiredText(configuration, "control_domain_revision"),
-              desired.control_domain_revision.value());
-    EXPECT_EQ(RequiredText(configuration, "activation_set_id"),
-              desired.activation_set_id.value());
-    const auto &routes =
-        RequiredMember(configuration, "binding_routes").as_array();
-    ASSERT_EQ(routes.size(), desired.binding_routes.size());
-    for (const auto &route : desired.binding_routes) {
-      EXPECT_TRUE(
-          std::any_of(routes.begin(), routes.end(), [&](const auto &row) {
-            return RequiredText(row, "control_binding_id") ==
-                       route.control_binding_id.value() &&
-                   RequiredText(row, "control_route_id") ==
-                       route.control_route_id.value() &&
-                   RequiredText(row, "control_binding_revision") ==
-                       route.control_binding_revision.value();
-          }));
-    }
-  }
-  EXPECT_FALSE(
-      RequiredMember(snapshot, "provider_occurrences").as_array().empty());
   // Submit, rather than preview, consumes the real current route/readiness,
   // ordinary manual Cell claim and configured resource admission gate.
   static_cast<void>(WaitForAuthoringAdmission(directory));
@@ -4896,9 +4470,8 @@ TEST(ManagerDaemonProcess,
                            {field, std::move(payload)}}))))
         .root();
   };
-  // Explicit uncertainty acknowledgement is a Reset-only closed extension.
-  // The target is absent, so valid shapes reach Kernel validation without an
-  // output write or accepting any operator recovery proof.
+  // The target is absent, so a valid Reset reaches Kernel validation without
+  // an output write.
   CanonicalValue::Object reset_request{
       {"request_context",
        CanonicalValue(CanonicalValue::Object{
@@ -4909,53 +4482,10 @@ TEST(ManagerDaemonProcess,
       {"operation_id", CanonicalValue("operation.absent-output")},
       {"expected_operation_revision", CanonicalValue(1.0)},
       {"reason", CanonicalValue(nullptr)}};
-  const CanonicalValue acknowledgement(
-      CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
-          {"operation_id", CanonicalValue("operation.absent-output")},
-          {"operation_revision", CanonicalValue(1.0)}})});
-  for (const bool explicit_ack : {false, true}) {
-    auto request = reset_request;
-    if (explicit_ack)
-      request.emplace_back("acknowledged_uncertain_outputs", acknowledgement);
-    const auto decoded =
-        io_command("reset", "request", CanonicalValue(request));
-    ASSERT_EQ(RequiredMember(decoded, "ok"), CanonicalValue(false));
-    EXPECT_NE(RequiredText(RequiredMember(decoded, "error"), "code"),
-              "execution_command_invalid");
-  }
-  for (const auto &invalid_ack :
-       {CanonicalValue(nullptr), CanonicalValue(true),
-        CanonicalValue(
-            CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
-                {"operation_id", CanonicalValue("operation.absent-output")},
-                {"operation_revision", CanonicalValue(0.0)}})}),
-        CanonicalValue(
-            CanonicalValue::Array{acknowledgement.as_array().front(),
-                                  acknowledgement.as_array().front()}),
-        CanonicalValue(CanonicalValue::Array{
-            CanonicalValue(CanonicalValue::Object{
-                {"operation_id", CanonicalValue("z")},
-                {"operation_revision", CanonicalValue(1.0)}}),
-            CanonicalValue(CanonicalValue::Object{
-                {"operation_id", CanonicalValue("a")},
-                {"operation_revision", CanonicalValue(1.0)}})}),
-        CanonicalValue(
-            CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
-                {"operation_id", CanonicalValue("operation.absent-output")},
-                {"operation_revision", CanonicalValue(1.0)},
-                {"unexpected", CanonicalValue(false)}})})}) {
-    auto malformed = reset_request;
-    malformed.emplace_back("acknowledged_uncertain_outputs", invalid_ack);
-    const auto refused =
-        io_command("reset", "request", CanonicalValue(malformed));
-    EXPECT_EQ(RequiredText(RequiredMember(refused, "error"), "code"),
-              "execution_command_invalid");
-  }
-  auto wrong_control = reset_request;
-  wrong_control.emplace_back("acknowledged_uncertain_outputs", acknowledgement);
-  const auto wrong_ack = io_command("acknowledge_completed", "request",
-                                    CanonicalValue(wrong_control));
-  EXPECT_EQ(RequiredText(RequiredMember(wrong_ack, "error"), "code"),
+  const auto decoded =
+      io_command("reset", "request", CanonicalValue(reset_request));
+  ASSERT_EQ(RequiredMember(decoded, "ok"), CanonicalValue(false));
+  EXPECT_NE(RequiredText(RequiredMember(decoded, "error"), "code"),
             "execution_command_invalid");
 
   CanonicalValue::Object io_token{
@@ -5244,7 +4774,6 @@ TEST(ManagerDaemonProcess,
       {"expected_assessment_revision", CanonicalValue(1.0)},
       {"expected_control_command_epoch", CanonicalValue(0.0)},
       {"expected_execution_id", CanonicalValue(1.0)},
-      {"expected_latch_id", CanonicalValue("")},
       {"expected_stop_certificate_id", CanonicalValue("")},
       {"expected_stop_owner_generation", CanonicalValue(0.0)},
       {"reason", CanonicalValue("wire validation only")}};
@@ -5359,7 +4888,7 @@ TEST(ManagerDaemonProcess,
                                "active_projection"),
                 "retained_bundle_id"),
             candidate_id);
-  static_cast<void>(explicit_lifecycle("disable"));
+  EXPECT_EQ(RequiredText(run_action("disable"), "lifecycle"), "prepared");
   observe_ros("inactive", "after-disable");
   EXPECT_EQ(RequiredMember(read_command_gate(), "command_eligible"), CanonicalValue(false));
 
@@ -5369,8 +4898,6 @@ TEST(ManagerDaemonProcess,
             std::string::npos);
   const auto replay_inventory = journal.ReadStatusInventory();
   ASSERT_EQ(replay_inventory.size(), 1U);
-  EXPECT_FALSE(replay_inventory.front().bring_up_plan.has_value());
-  EXPECT_TRUE(replay_inventory.front().bring_up_child_proofs.empty());
 
   // Let the actual Manager child owner settle normal runtime shutdown before
   // the successful fixture removes the controller launch artifact directory.

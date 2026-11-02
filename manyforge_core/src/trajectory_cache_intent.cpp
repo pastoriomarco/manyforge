@@ -159,11 +159,6 @@ void mix_resolved_binding(IntentIdentityBuilder& identity,
   }
   mix_resolved_frame(identity, binding.base_frame);
   mix_resolved_frame(identity, binding.tcp_frame);
-  // A trajectory retimed for one speed-check set is not reused for another.
-  if (!binding.speed_check_frames.empty()) {
-    identity.mix(static_cast<std::uint64_t>(binding.speed_check_frames.size()));
-    for (const auto& frame : binding.speed_check_frames) mix_resolved_frame(identity, frame);
-  }
   identity.mix(static_cast<std::uint64_t>(binding.component_attachment_revisions.size()));
   for (const auto& revision : binding.component_attachment_revisions) {
     identity.mix(revision.value());
@@ -223,12 +218,13 @@ void mix_motion(IntentIdentityBuilder& identity, const ResolvedMotionSpecDTO& mo
           }
           identity.mix(value.max_translation_step_m)
               .mix(value.max_rotation_step_rad)
-              .mix(static_cast<std::int64_t>(value.speed_mode))
+              .mix(value.speed_mode ? static_cast<std::int64_t>(*value.speed_mode) : -1)
               .mix(value.max_angular_speed_rad_s)
               .mix(value.max_linear_acceleration_mps2)
               .mix(value.max_angular_acceleration_rad_s2)
               .mix(static_cast<std::int64_t>(value.fallback_policy))
-              .mix(value.max_blend_deviation_rad);
+              .mix(static_cast<std::uint64_t>(value.blend_radii_m.size()));
+          for (const double radius : value.blend_radii_m) identity.mix(radius);
         }
       },
       motion);
@@ -250,11 +246,19 @@ TrajectoryCacheKey trajectory_cache_key(const ExecuteRequestDTO& request) {
 
 std::string trajectory_cache_intent_identity(const ExecuteRequestDTO& request) {
   IntentIdentityBuilder identity;
-  identity.mix("manyforge_core/trajectory_cache_intent/v6");
+  identity.mix("manyforge_core/trajectory_cache_intent/v7");
   mix_resolved_binding(identity, request.binding);
   identity.mix(request.contact_policy_id)
       .mix(static_cast<std::int64_t>(request.target_mode))
-      .mix(static_cast<std::int64_t>(request.planning_profile))
+      .mix(static_cast<std::int64_t>(request.planner.search.has_value()
+                                         ? static_cast<int>(*request.planner.search)
+                                         : -1))
+      .mix(static_cast<std::int64_t>(request.planner.optimize.has_value()
+                                         ? static_cast<int>(*request.planner.optimize)
+                                         : -1))
+      .mix(static_cast<std::int64_t>(request.planner.n.value_or(0U)))
+      .mix(request.planner.collision_check_step_rad.value_or(0.0))
+      .mix(static_cast<std::int64_t>(request.planner.max_nodes.value_or(0U)))
       .mix(static_cast<std::int64_t>(request.target_reference.has_value()));
   if (request.target_reference.has_value()) {
     mix_reference(identity, *request.target_reference);

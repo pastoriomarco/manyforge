@@ -33,7 +33,6 @@
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 #include <manyforge_deployment/retained_bundle.hpp>
 #include <manyforge_core/runtime_contract_manifest_codec.hpp>
-#include <manyforge_core/component_lifecycle_value_codec.hpp>
 #include "lite6_controllable_retention_fixture.hpp"
 #include "runtime_only_retention_fixture.hpp"
 
@@ -68,7 +67,7 @@ using core::ProductContractRevision;
 using core::ProductId;
 using core::ProjectionHealthDTO;
 using core::ProjectionHealthState;
-using core::ProjectionNativeRuntimeBindingDTO;
+using core::ProjectionExecutionHostBindingDTO;
 using core::ProjectionRevisionDTO;
 using core::PublicRequestContextDTO;
 using core::RequestId;
@@ -287,7 +286,7 @@ manyforge::deployment::ApplyComponentDeltaDTO ReplacingDelta() {
       ContentDigest(std::string(kDigestTwo)),
       {ControlDomainId("arm")},
       {ControlDomainId("arm")},
-      {std::string(manyforge::deployment::kApplyComponentReasonBindings)}};
+      {std::string(manyforge::deployment::kComponentSpecBindings)}};
   const manyforge::deployment::ApplyComponentChangeDTO tool{
       ControllableComponentId("tool-1"),
       manyforge::deployment::ApplyComponentDisposition::kRetain,
@@ -435,198 +434,6 @@ PrivateMaterialization() {
       512U,
   };
 }
-ManagerApplyBringUpPlanDTO
-BringUpPlan(const ManagerApplyIntentDTO &parent = Intent(),
-            core::ComponentLifecycleIntentKindDTO kind = core::ComponentLifecycleIntentKindDTO::kPrepare) {
-  const ProjectionRevisionDTO candidate{
-      parent.candidate_retained_bundle_id, parent.candidate_graph_revision,
-      parent.expected_active_projection_revision.scene_revision};
-  const core::ExpectedActiveControlConfigurationDTO expected_configuration{
-      core::ExpectedActiveControlConfigurationPresenceDTO::kAbsent,
-      std::nullopt, std::nullopt};
-  const core::ExpectedControlBindingRevisionDTO expected_binding{
-      ControlBindingId("arm-jtc"), ControlBindingRevision("binding-r2"),
-      core::ControlRouteId("route-1")};
-  const core::ExpectedControlDomainRevisionDTO expected_domain{
-      ControlDomainId("arm"), ControlDomainRevision("domain-r2"),
-      core::ControllerTopologyId("topology-1"),
-      core::TopologyRevision("topology-revision-1"), expected_configuration,
-      {expected_binding}};
-  core::ComponentLifecycleIntentDTO intent{
-      {RequestId("bring-up-robot-1"), RequestOwnerEpoch("child-owner-1"),
-       "test", std::nullopt},
-      ControllableComponentId("robot-1"),
-      kind,
-      parent.expected_active_projection_revision.graph_revision,
-      core::ComponentLifecycleGeneration(1U),
-      {expected_domain},
-      std::nullopt,
-      {},
-      core::AdmissionGeneration(7U),
-      std::nullopt};
-  ManagerApplyBringUpChildRequestDTO child{
-      intent,
-      candidate,
-      ContentDigest(std::string(kDigestTwo)),
-      512U,
-      RuntimeUnitId("kernel-runtime"),
-      RuntimeEpoch("kernel-epoch-1"),
-      RuntimeEpoch("manager-epoch-1")};
-  const ManagerApplyPrivateMaterializationDTO materialization{
-      candidate.scene_revision.content_hash,
-      parent.apply_id,
-      parent.apply_generation,
-      candidate,
-      child.candidate_retained_bundle_digest,
-      child.candidate_retained_bundle_bytes};
-  const auto digest =
-      ComputeManagerApplyPrivateMaterializationDigest(materialization);
-  return {
-      parent.apply_id,
-      parent.apply_generation,
-      ComputeManagerApplyIntentDigest(parent),
-      {ControllableComponentId("robot-1"), ControllableComponentId("tool-1")},
-      {child},
-      {core::NamedApplyPublicationTransactionDTO{parent.apply_id,
-                                                 parent.apply_generation},
-       candidate, candidate.retained_bundle_id, candidate.graph_revision,
-       ActiveBundlePublicationGeneration(3U), digest},
-      ContentDigest(std::string(kDigestOne))};
-}
-
-core::ComponentLifecycleStatusDTO
-BringUpChildStatus(const ManagerApplyBringUpIntentWriteResult &parent,
-                   const PersistedManagerApplyFenceAcceptance &fence,
-                   ManagerApplyBringUpChildPhase phase) {
-  const auto &child = parent.plan.plan.children.front();
-  const auto &intent = child.intent;
-  const core::ComponentLifecycleAcceptedDTO acceptance{
-      intent.request_context.request_id,
-      core::RequestReplayStatusDTO::kAcceptedNew,
-      core::LifecycleTransactionId("apply-component-1"),
-      core::LifecycleTransactionGeneration(1U),
-      core::ComponentLifecycleGeneration(
-          intent.expected_component_lifecycle_generation.value() + 1U),
-      42LL,
-      1000LL};
-  const core::ComponentLifecycleRequestedStateDTO requested{
-      core::ComponentLifecycleRequestedStatePresenceDTO::kResolved,
-      intent.intent == core::ComponentLifecycleIntentKindDTO::kDisable
-          ? core::ComponentLifecycleStateDTO::kDisabled
-          : (intent.intent == core::ComponentLifecycleIntentKindDTO::kPrepare
-              ? core::ComponentLifecycleStateDTO::kPrepared
-              : core::ComponentLifecycleStateDTO::kActive)};
-  const bool accepted = phase == ManagerApplyBringUpChildPhase::kAccepted;
-  const bool terminal = phase == ManagerApplyBringUpChildPhase::kTerminal;
-  const core::ResolvedLifecycleControlDomainScopeDTO scope{
-      ControlDomainId("arm"),
-      ControlDomainRevision(accepted ? "domain-r1" : "domain-r2"),
-      core::ControllerTopologyId("topology-1"),
-      core::TopologyRevision("topology-revision-1"),
-      std::nullopt,
-      {{ControlBindingId("arm-jtc"),
-        ControlBindingRevision(accepted ? "binding-r1" : "binding-r2"),
-        core::ControlRouteId("route-1")}},
-      {ResourceId("joint-1"), ResourceId("joint-2")}};
-  const core::ResolvedLifecycleProviderOccurrenceDTO occurrence{
-      scope.control_domain_id,
-      scope.control_domain_revision,
-      core::ProviderInstanceId("provider-1"),
-      core::ProviderManifestId("manifest-1"),
-      core::ProviderManifestRevision("manifest-r1"),
-      child.runtime_unit_id,
-      child.runtime_epoch,
-      ContentDigest(std::string(kDigestThree))};
-  const core::CellAdmissionClaimDTO claim{
-      {core::CellAdmissionClaimKindDTO::kManagerApply,
-       core::CellAdmissionOwnerRoleDTO::kManager,
-       parent.intent.intent.request_context.request_owner_epoch,
-       parent.intent.intent.apply_id.value(),
-       parent.intent.intent.request_context.request_id,
-       parent.plan.plan_digest,
-       *parent.intent.intent.expected_admission_generation,
-       {},
-       std::nullopt,
-       std::nullopt},
-      core::CellAdmissionClaimGeneration(8U),
-      *parent.intent.intent.expected_admission_generation,
-      42LL};
-  const core::ApplyComponentBringUpReferenceDTO reference{
-      {parent.intent.intent.apply_id, parent.intent.intent.apply_generation},
-      parent.plan.plan_digest};
-  const core::ApplyComponentBringUpAuthorityDTO authority{
-      reference,
-      claim,
-      {reference.owner, fence.accepted_fence.configuration_fence_id,
-       fence.accepted_fence.configuration_fence_generation,
-       fence.accepted_fence.captured_scope, child.manager_runtime_epoch}};
-  core::ComponentLifecycleStatusDTO status{
-      acceptance,
-      intent,
-      accepted   ? 1U
-      : terminal ? 3U
-                 : 2U,
-      intent.request_context.request_owner_epoch,
-      core::ComponentLifecycleStateDTO::kDeclared,
-      accepted ? core::ComponentLifecycleStateDTO::kDeclared : *requested.state,
-      requested,
-      accepted   ? core::ComponentLifecycleTransactionPhaseDTO::kAccepted
-      : terminal ? core::ComponentLifecycleTransactionPhaseDTO::kSucceeded
-                 : core::ComponentLifecycleTransactionPhaseDTO::kVerifying,
-      {{scope.control_domain_id,
-        intent.expected_control_domains.front(),
-        scope,
-        occurrence,
-        core::ComponentLifecycleStateDTO::kDeclared,
-        accepted ? core::ComponentLifecycleStateDTO::kDeclared
-                 : *requested.state,
-        requested,
-        accepted ? core::ComponentLifecycleDomainActionStateDTO::kReserved
-                 : core::ComponentLifecycleDomainActionStateDTO::kSucceeded,
-        {},
-        std::nullopt}},
-      false,
-      terminal ? std::optional<core::ComponentLifecycleTerminalResultDTO>(
-                     core::ComponentLifecycleTerminalResultDTO::kSucceeded)
-               : std::nullopt,
-      std::nullopt,
-      42LL,
-      accepted   ? 42LL
-      : terminal ? 44LL
-                 : 43LL,
-      terminal ? 0LL : 900LL};
-  status.apply_bring_up = core::ApplyComponentBringUpEvidenceDTO{
-      authority,
-      authority.held_fence_query.expected_scope,
-      core::ApplyDelegatedComponentLifecycleSemanticRequestDigest(
-          intent, child.candidate_projection_revision,
-          child.candidate_retained_bundle_digest,
-          child.candidate_retained_bundle_bytes, child.runtime_unit_id,
-          child.runtime_epoch, child.manager_runtime_epoch, reference),
-      child.candidate_projection_revision,
-      child.candidate_retained_bundle_digest,
-      child.candidate_retained_bundle_bytes,
-      {child.runtime_unit_id, child.runtime_epoch},
-      std::nullopt,
-      std::nullopt,
-      std::nullopt};
-  return status;
-}
-
-ManagerApplyBringUpChildProofDTO
-BringUpChildProof(const ManagerApplyBringUpIntentWriteResult &parent,
-                  const PersistedManagerApplyFenceAcceptance &fence,
-                  ManagerApplyBringUpChildPhase phase) {
-  const auto status = BringUpChildStatus(parent, fence, phase);
-  return {parent.plan.plan.apply_id,
-          parent.plan.plan.apply_generation,
-          parent.plan.plan_digest,
-          parent.plan.plan.children.front().intent.controllable_component_id,
-          phase,
-          {core::RequestReplayStatusDTO::kAcceptedNew, status.acceptance,
-           status, std::nullopt, std::nullopt}};
-}
-
 ManagerApplyPublicationReceiptDTO PublicationReceipt(
     const PersistedManagerApplyPrivateMaterialization &materialization) {
   const auto &record = materialization.private_materialization;
@@ -847,356 +654,6 @@ void ExpectNoSqliteSidecars(const std::filesystem::path &path) {
   EXPECT_FALSE(std::filesystem::exists(path.string() + "-wal"));
   EXPECT_FALSE(std::filesystem::exists(path.string() + "-shm"));
   EXPECT_FALSE(std::filesystem::exists(path.string() + "-journal"));
-}
-
-std::shared_ptr<const deployment::RetainedBundle>
-NativeParentCandidate(const std::filesystem::path &root,
-                      const bool components) {
-  deployment::FilesystemBuildManifestRepository manifests(root);
-  deployment::FilesystemCatalogArtifactStore catalogs(root);
-  deployment::FilesystemRawArtifactStore raw_artifacts(root);
-  deployment::FilesystemRetainedBundleRepository bundles(root);
-  if (components) {
-    auto fixture =
-        deployment::test::make_lite6_ros2_control_shared_consumer_retention_fixture(
-            "runtime_only_cell");
-    const deployment::test::Lite6ControllableCompilerInputArtifactSource source(
-        fixture);
-    return deployment::detail::RetainedBundleMaterializer::
-        materialize_store_and_reload_production(
-            fixture.qualified, manifests, source,
-            fixture.structural_preparations(), catalogs, raw_artifacts,
-            bundles);
-  }
-  auto fixture = deployment::test::make_runtime_only_retention_fixture();
-  const deployment::test::RuntimeOnlyCompilerInputArtifactSource source(
-      fixture.runtime_profile);
-  return deployment::detail::RetainedBundleMaterializer::
-      materialize_store_and_reload_production(fixture.qualified, manifests,
-                                              source, {}, catalogs,
-                                              raw_artifacts, bundles);
-}
-
-struct NativeParentReadFixture final {
-  core::NativeApplyPlanDTO plan;
-  core::CellAdmissionClaimDTO claim;
-  core::CellAdmissionRecoveryReceiptQueryDTO query;
-  core::CellAdmissionRecoveryReceiptDTO receipt;
-};
-
-core::CellAdmissionRecoveryReceiptDTO
-HeldNativeParent(const core::CellAdmissionClaimDTO &claim) {
-  return {core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact,
-          RequestOwnerEpoch("kernel-original-parent"),
-          core::AdmissionGeneration(9U),
-          claim,
-          std::nullopt,
-          std::nullopt,
-          {claim},
-          {{claim.intent.owner_role,
-            RequestOwnerEpoch("replacement-owner-observer")}}};
-}
-
-// These fixtures exercise the storage joins. The named coordinator's separate
-// test obtains the same early/later codes from the actual Prepare/Finalize
-// catch.
-NativeParentReadFixture WriteNativeParent(
-    const std::filesystem::path &path,
-    const std::filesystem::path &package_root,
-    const deployment::RetainedBundle &candidate, const bool authoring = false,
-    const std::string &failure_code = "runtime_composition_preparation_failed",
-    const ManagerApplyPhase phase = ManagerApplyPhase::kRuntimeConverged,
-    const bool materialized = false,
-    const deployment::RetainedBundle *predecessor = nullptr,
-    const bool linked = false, const bool holding = false,
-    // A known `failed` terminal with this cause code instead of unknown_effect.
-    const std::optional<std::string> &known_cause_code = std::nullopt) {
-  const auto &original = predecessor == nullptr ? candidate : *predecessor;
-  auto intent = authoring ? ParentClaimIntent() : Intent();
-  intent.cell_id = candidate.value().cell_graph.cell_id;
-  intent.candidate_retained_bundle_id = candidate.retained_bundle_id();
-  intent.candidate_graph_revision = candidate.value().cell_graph.graph_revision;
-  intent.expected_active_projection_revision.retained_bundle_id =
-      original.retained_bundle_id();
-  intent.expected_active_projection_revision.graph_revision =
-      original.value().cell_graph.graph_revision;
-  intent.prepared_activation.deployment_artifact_id =
-      candidate.value().deployment_artifact_id;
-  intent.prepared_activation.deployment_revision =
-      candidate.value().deployment_revision;
-  SqliteManagerApplyJournal journal(path, intent.cell_id);
-  std::optional<ManagerApplyBringUpIntentWriteResult> linked_parent;
-  if (linked) {
-    auto plan = BringUpPlan(intent);
-    plan.configured_components.clear();
-    for (const auto &component :
-         candidate.value().cell_graph.controllable_components)
-      plan.configured_components.push_back(component.controllable_component_id);
-    auto &child = plan.children.front();
-    child.intent.controllable_component_id = plan.configured_components.front();
-    child.intent.expected_control_domains.clear();
-    child.runtime_unit_id = candidate.value()
-                                .cell_graph.control_bindings.front()
-                                .provider_runtime_unit_id;
-    child.candidate_retained_bundle_digest =
-        ContentDigest(deployment::sha256_digest(candidate.canonical_bytes()));
-    child.candidate_retained_bundle_bytes = candidate.canonical_bytes().size();
-    for (const auto &desired :
-         candidate.value().desired_control_configurations) {
-      std::vector<core::ExpectedControlBindingRevisionDTO> bindings;
-      for (const auto &route : desired.binding_routes)
-        bindings.push_back({route.control_binding_id,
-                            route.control_binding_revision,
-                            route.control_route_id});
-      const core::ExpectedActiveControlConfigurationDTO expected_configuration{
-          core::ExpectedActiveControlConfigurationPresenceDTO::kAbsent,
-          std::nullopt, std::nullopt};
-      const core::ExpectedControlDomainRevisionDTO expected_domain{
-          desired.control_domain_id, desired.control_domain_revision,
-          desired.controller_topology_id, desired.topology_revision,
-          expected_configuration, bindings};
-      child.intent.expected_control_domains.push_back(expected_domain);
-    }
-    plan.expected_publication.private_materialization_content_digest =
-        ComputeManagerApplyPrivateMaterializationDigest(
-            {child.candidate_projection_revision.scene_revision.content_hash,
-             intent.apply_id, intent.apply_generation,
-             child.candidate_projection_revision,
-             child.candidate_retained_bundle_digest,
-             child.candidate_retained_bundle_bytes});
-    linked_parent = journal.EnsureBringUpIntent(intent, plan);
-  }
-  const auto persisted = linked_parent ? linked_parent->intent
-                                       : journal.EnsureIntent(intent).record;
-  auto fence = FenceIntent();
-  fence.owner_request_context = intent.request_context;
-  fence.scope =
-      deployment::derive_apply_configuration_fence_scope(original, candidate);
-  fence.expected_retained_bundle_id = original.retained_bundle_id();
-  fence.expected_graph_revision = original.value().cell_graph.graph_revision;
-  fence.expected_active_control_configurations.clear();
-  for (const auto &domain : fence.scope.domains)
-    if (domain.predecessor_control_domain_revision)
-      fence.expected_active_control_configurations.push_back(
-          {domain.control_domain_id,
-           core::ActiveControlConfigurationId("test-original-configuration"),
-           core::ActiveControlConfigurationGeneration(4U)});
-  const auto delta =
-      deployment::derive_apply_component_delta(original, candidate);
-  const auto affected =
-      journal
-          .EnsureAffectedScope(persisted.intent_digest,
-                               {intent.apply_id, intent.apply_generation,
-                                fence.scope, fence.busy_disposition, delta})
-          .record;
-  const auto attempt =
-      journal
-          .EnsureFenceAttempt(persisted.intent_digest,
-                              affected.affected_scope_digest, fence)
-          .record;
-  auto accepted = AcceptedFence();
-  accepted.captured_scope = fence.scope;
-  const auto acceptance =
-      journal
-          .EnsureFenceAcceptance(intent.apply_id, intent.apply_generation,
-                                 attempt.fence_attempt_digest, accepted)
-          .record;
-  deployment::FilesystemVerifiedRetainedProductArtifactSource artifacts(
-      package_root);
-  auto convergence = RuntimeIntent(acceptance.acceptance_digest, true);
-  convergence.candidate_retained_bundle_id =
-      intent.candidate_retained_bundle_id;
-  convergence.candidate_graph_revision = intent.candidate_graph_revision;
-  convergence.runtime_units = BuildVerifiedRuntimeConvergencePlan(
-      candidate, artifacts, "linux",
-      {"posix.1-2017",
-       std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)});
-  const auto runtime =
-      journal
-          .EnsureRuntimeConvergenceIntent(persisted.intent_digest, convergence)
-          .record;
-  auto ready =
-      RuntimeStagedReady(runtime.runtime_convergence_intent_digest, 1U, true);
-  for (const auto &row : convergence.runtime_units) {
-    auto evidence =
-        RuntimeStagedReady(ContentDigest(std::string(kDigestOne)), 1U)
-            .runtime_units.front();
-    evidence.runtime_unit_id = row.runtime_unit_id;
-    evidence.lifecycle_control = row.lifecycle_control;
-    evidence.candidate_disposition = row.candidate_disposition;
-    evidence.observed_product_identity = row.product_identity;
-    evidence.observed_configuration_identity = row.configuration_identity;
-    evidence.observed_runtime_contract_offer_digest =
-        row.runtime_contract_offer_digest;
-    evidence.ready_runtime_role_ids = row.required_runtime_role_ids;
-    for (const auto &dependency : row.dependency_runtime_unit_ids)
-      evidence.dependency_runtime_epochs.push_back(
-          {dependency, RuntimeEpoch("actual-test-dependency-epoch")});
-    ready.runtime_units.push_back(std::move(evidence));
-  }
-  static_cast<void>(journal.EnsureRuntimeStagedReady(ready));
-  if (linked_parent) {
-    for (const auto proof_phase : {ManagerApplyBringUpChildPhase::kAccepted,
-                                   ManagerApplyBringUpChildPhase::kHolding}) {
-      if (proof_phase == ManagerApplyBringUpChildPhase::kHolding && !holding)
-        break;
-      auto proof = BringUpChildProof(*linked_parent, acceptance, proof_phase);
-      auto &status = *proof.result.status;
-      status.previous_state.reset();
-      const bool installed =
-          proof_phase == ManagerApplyBringUpChildPhase::kHolding;
-      if (!installed)
-        status.current_state.reset();
-      status.domains.clear();
-      for (const auto &expected : linked_parent->plan.plan.children.front()
-                                      .intent.expected_control_domains) {
-        std::optional<core::ResolvedLifecycleControlDomainScopeDTO> scope;
-        std::optional<core::ResolvedLifecycleProviderOccurrenceDTO> provider;
-        if (installed) {
-          std::vector<core::ExpectedControlBindingRevisionDTO> bindings;
-          std::set<ResourceId> resources;
-          const core::ControlBindingDTO *first_binding = nullptr;
-          for (const auto &binding :
-               candidate.value().cell_graph.control_bindings)
-            if (binding.control_domain_id == expected.control_domain_id) {
-              if (first_binding == nullptr)
-                first_binding = &binding;
-              const auto route = std::find_if(
-                  expected.controller().expected_control_bindings.begin(),
-                  expected.controller().expected_control_bindings.end(), [&](const auto& value) {
-                    return value.control_binding_id == binding.control_binding_id;
-                  });
-              bindings.push_back({binding.control_binding_id,
-                                  binding.control_binding_revision,
-                                  route->control_route_id});
-              for (const auto &resource : binding.resource_bindings)
-                resources.insert(resource.resource_id);
-            }
-          scope = core::ResolvedLifecycleControlDomainScopeDTO{
-              expected.control_domain_id,
-              expected.control_domain_revision,
-              expected.controller().controller_topology_id,
-              expected.controller().topology_revision,
-              std::nullopt,
-              bindings,
-              {resources.begin(), resources.end()}};
-          provider = core::ResolvedLifecycleProviderOccurrenceDTO{
-              expected.control_domain_id,
-              expected.control_domain_revision,
-              first_binding->provider_instance_id,
-              first_binding->provider_manifest_id,
-              first_binding->provider_manifest_revision,
-              linked_parent->plan.plan.children.front().runtime_unit_id,
-              linked_parent->plan.plan.children.front().runtime_epoch,
-              ContentDigest(std::string(kDigestThree))};
-        }
-        const auto observed =
-            installed ? status.requested_state.state : std::nullopt;
-        status.domains.push_back(
-            {expected.control_domain_id,
-             expected,
-             scope,
-             provider,
-             observed,
-             observed,
-             status.requested_state,
-             installed
-                 ? core::ComponentLifecycleDomainActionStateDTO::kSucceeded
-                 : core::ComponentLifecycleDomainActionStateDTO::kReserved,
-             {},
-             std::nullopt});
-      }
-      if (!proof.result.locally_valid())
-        throw std::runtime_error(
-            "native parent delegated proof fixture is invalid");
-      static_cast<void>(journal.EnsureBringUpChildProof(proof));
-    }
-  }
-  if (materialized) {
-    auto materialization = PrivateMaterialization();
-    materialization.candidate_projection_revision.retained_bundle_id =
-        candidate.retained_bundle_id();
-    materialization.candidate_projection_revision.graph_revision =
-        intent.candidate_graph_revision;
-    static_cast<void>(journal.EnsurePrivateMaterialization(materialization));
-  }
-  if (!failure_code.empty())
-    static_cast<void>(journal.EnsureTerminalOutcome(
-        {intent.apply_id, intent.apply_generation, std::nullopt, std::nullopt,
-         std::nullopt, std::nullopt,
-         known_cause_code ? ManagerApplyTerminalOutcomeState::kFailed
-                          : ManagerApplyTerminalOutcomeState::kUnknownEffect,
-         ManagerApplyFailureEvidenceDTO{
-             persisted.intent_digest, phase, failure_code,
-             "original retained preparation exception",
-             known_cause_code ? ManagerApplyEffectDisposition::kKnown
-                              : ManagerApplyEffectDisposition::kUnknown,
-             known_cause_code.value_or("typed_cause_code"),
-             {},
-             "component_manager",
-             ManagerApplyEffectBoundary::kUnknown}}));
-  core::NativeApplyPlanDTO plan{{intent.apply_id, intent.apply_generation},
-                                candidate.retained_bundle_id(),
-                                intent.candidate_graph_revision,
-                                {},
-                                {},
-                                {},
-                                {},
-                                {},
-                                {}};
-  for (const auto &row : delta.components) {
-    if (row.candidate_runtime_identity)
-      plan.components.push_back({row.controllable_component_id,
-                                 core::ComponentLifecycleStateDTO::kDeclared,
-                                 core::ComponentLifecycleGeneration(3U)});
-    if (row.disposition == deployment::ApplyComponentDisposition::kRetain)
-      plan.retained_components.push_back(row.controllable_component_id);
-    if (row.disposition == deployment::ApplyComponentDisposition::kRemove)
-      plan.removed_components.push_back(row.controllable_component_id);
-  }
-  for (const auto &desired : candidate.value().desired_control_configurations) {
-    plan.routes.push_back({desired.control_domain_id,
-                           core::ActiveControlConfigurationGeneration(4U)});
-    if (std::any_of(
-            delta.components.begin(), delta.components.end(),
-            [&](const auto &row) {
-              return row.disposition ==
-                         deployment::ApplyComponentDisposition::kRetain &&
-                     std::binary_search(row.candidate_domains.begin(),
-                                        row.candidate_domains.end(),
-                                        desired.control_domain_id);
-            }))
-      plan.retained_domains.push_back(desired.control_domain_id);
-  }
-  for (const auto &desired : original.value().desired_control_configurations)
-    if (std::none_of(candidate.value().desired_control_configurations.begin(),
-                     candidate.value().desired_control_configurations.end(),
-                     [&](const auto &value) {
-                       return value.control_domain_id ==
-                              desired.control_domain_id;
-                     }))
-      plan.removed_domains.push_back(desired.control_domain_id);
-  const core::CellAdmissionClaimDTO claim =
-      intent.parent_authoring_claim.value_or(core::CellAdmissionClaimDTO{
-          {core::CellAdmissionClaimKindDTO::kManagerApply,
-           core::CellAdmissionOwnerRoleDTO::kManager,
-           intent.request_context.request_owner_epoch,
-           intent.apply_id.value(),
-           intent.request_context.request_id,
-           linked_parent ? linked_parent->plan.plan_digest
-                         : persisted.intent_digest,
-           core::AdmissionGeneration(7U),
-           {},
-           std::nullopt,
-           std::nullopt,
-           std::nullopt},
-          core::CellAdmissionClaimGeneration(linked_parent ? 8U : 3U),
-          core::AdmissionGeneration(7U),
-          42LL});
-  return {std::move(plan),
-          claim,
-          {claim.intent, claim, std::nullopt},
-          HeldNativeParent(claim)};
 }
 
 TEST(ManagerApplyJournalIntegrity,
@@ -2697,7 +2154,7 @@ TEST(ManagerApplyJournal, UncommittedChildWriteDisappearsOnRecovery) {
         "program_binding_id,prepared_activation_id,"
         "prepared_activation_receipt_json,"
         "expected_admission_generation,parent_authoring_claim,scene_"
-        "initialization,intent_digest"
+        "initialization,intent_digest,accepted_sequence"
         ") VALUES ("
         "'apply-uncommitted',1,'request-uncommitted','owner-epoch-1',"
         "'child',NULL,'predecessor-bundle','predecessor-graph','" +
@@ -2716,7 +2173,7 @@ TEST(ManagerApplyJournal, UncommittedChildWriteDisappearsOnRecovery) {
         "16161616','{\"schema_version\":\"test.prepared_activation_receipt."
         "v1\"}',"
         "7,NULL,'preserve','sha256:"
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'"
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',999"
         ");";
     if (sqlite3_exec(database, sql.c_str(), nullptr, nullptr, nullptr) !=
         SQLITE_OK) {
@@ -2950,14 +2407,8 @@ TEST(ManagerApplyJournalIntegrity, DetectsRawGenerationDeletionOnReopen) {
                                          "owner-epoch-1", "candidate-bundle-2"))
                     .inserted);
   }
-  ExecSql(path, "DROP TRIGGER manager_apply_intents_no_delete;"
-                "DELETE FROM manager_apply_intents "
-                "WHERE apply_id='apply-1' AND apply_generation=1;"
-                "CREATE TRIGGER manager_apply_intents_no_delete "
-                "BEFORE DELETE ON manager_apply_intents "
-                "BEGIN "
-                "SELECT RAISE(ABORT, 'manager_apply_intents is immutable'); "
-                "END;");
+  ExecSql(path, "DELETE FROM manager_apply_intents "
+                "WHERE apply_id='apply-1' AND apply_generation=1;");
   EXPECT_THROW(SqliteManagerApplyJournal(path, CellId("cell-1")),
                ManagerApplyJournalIntegrityError);
 }
@@ -3020,6 +2471,175 @@ TEST(ManagerApplyJournal, IntentInventoryIsExhaustionBounded) {
       Intent("apply-0", 1U, "request-0", "owner-epoch-1", "candidate-0"));
   EXPECT_FALSE(replay.inserted);
   EXPECT_EQ(replay.record, *first_record);
+  EXPECT_EQ(journal.VerifyIntegrity().apply_intent_count,
+            static_cast<std::int64_t>(kMaximumManagerApplyIntents));
+}
+
+// One complete successful Apply whose fence and publication identities are
+// unique to `index`. Returns its fence-release request for reuse.
+core::ConfigurationFenceReleaseDTO EnsureSucceededApply(SqliteManagerApplyJournal &journal,
+                                                  const std::string &apply_id,
+                                                  const std::size_t index) {
+  const ApplyId id(apply_id);
+  const ApplyGeneration generation(1U);
+  const auto intent =
+      journal.EnsureIntent(Intent(apply_id, 1U, "request-" + apply_id)).record;
+  auto fence_intent = FenceIntent();
+  fence_intent.owner_request_context = intent.intent.request_context;
+  fence_intent.owner_transaction = {id, generation};
+  const auto attempt =
+      EnsureAttempt(journal, intent.intent_digest, fence_intent).record;
+  auto accepted = AcceptedFence();
+  accepted.configuration_fence_id = ConfigurationFenceId("fence-" + std::to_string(index));
+  const auto acceptance = journal.EnsureFenceAcceptance(
+      id, generation, attempt.fence_attempt_digest, accepted).record;
+  auto runtime = RuntimeIntent(acceptance.acceptance_digest, true);
+  runtime.apply_id = id;
+  const auto runtime_record =
+      journal.EnsureRuntimeConvergenceIntent(intent.intent_digest, runtime).record;
+  auto staged = RuntimeStagedReady(
+      runtime_record.runtime_convergence_intent_digest, 1U, true);
+  staged.apply_id = id;
+  static_cast<void>(journal.EnsureRuntimeStagedReady(staged));
+  auto materialization_value = PrivateMaterialization();
+  materialization_value.apply_id = id;
+  const auto materialization =
+      journal.EnsurePrivateMaterialization(materialization_value).record;
+  auto publication_value = PublicationReceipt(materialization);
+  publication_value.publication_receipt.request.expected_previous_publication_generation =
+      ActiveBundlePublicationGeneration(999U + index);
+  publication_value.publication_receipt.publication_generation =
+      ActiveBundlePublicationGeneration(1000U + index);
+  const auto publication =
+      journal.EnsurePublicationReceipt(publication_value).record;
+  const SelectedBundleTransitionRecords records{materialization, publication};
+  auto release = FenceReleaseIntent(records, acceptance);
+  release.release_request.reconciliation_evidence.owner_transaction = {id, generation};
+  release.release_request.reconciliation_evidence.execution_host_epoch
+      .publication_generation = ActiveBundlePublicationGeneration(1000U + index);
+  const auto release_intent = journal.EnsureFenceReleaseIntent(release).record;
+  const auto released =
+      journal.EnsureFenceReleased(FenceReleased(release_intent)).record;
+  static_cast<void>(
+      journal.EnsureTerminalOutcome(TerminalOutcome(records, released)));
+  return release.release_request;
+}
+
+// A failure proven before effect at acceptance: no claim or fence remains.
+void EnsureRefusedApply(SqliteManagerApplyJournal &journal,
+                        const std::string &apply_id) {
+  const auto intent =
+      journal.EnsureIntent(Intent(apply_id, 1U, "request-" + apply_id)).record;
+  static_cast<void>(journal.EnsureTerminalOutcome({
+      ApplyId(apply_id), ApplyGeneration(1U), std::nullopt, std::nullopt,
+      std::nullopt, std::nullopt, ManagerApplyTerminalOutcomeState::kFailed,
+      ManagerApplyFailureEvidenceDTO{
+          intent.intent_digest, ManagerApplyPhase::kAccepted,
+          "apply_admission_failed", "Kernel refused admission",
+          ManagerApplyEffectDisposition::kKnown, "admission_refused", {},
+          "component_manager", ManagerApplyEffectBoundary::kBeforeEffect},
+  }));
+}
+
+TEST(ManagerApplyJournal, FullInventoryEvictsOnlyAppliesNoOwnerStillNeeds) {
+  TemporaryDirectory directory;
+  SqliteManagerApplyJournal journal(directory.path() / "apply.sqlite3",
+                                    CellId("cell-1"));
+  // N7: an unknown-effect failure that still holds its accepted fence.
+  const ApplyId held("held-0");
+  const auto held_intent =
+      journal.EnsureIntent(Intent("held-0", 1U, "request-held-0")).record;
+  auto held_fence = FenceIntent();
+  held_fence.owner_request_context = held_intent.intent.request_context;
+  held_fence.owner_transaction = {held, ApplyGeneration(1U)};
+  const auto held_attempt =
+      EnsureAttempt(journal, held_intent.intent_digest, held_fence).record;
+  auto held_accepted = AcceptedFence();
+  held_accepted.configuration_fence_id = ConfigurationFenceId("fence-held");
+  const auto held_acceptance =
+      journal.EnsureFenceAcceptance(held, ApplyGeneration(1U),
+                                    held_attempt.fence_attempt_digest, held_accepted)
+          .record;
+  static_cast<void>(journal.EnsureTerminalOutcome({
+      held, ApplyGeneration(1U), std::nullopt, std::nullopt, std::nullopt,
+      std::nullopt, ManagerApplyTerminalOutcomeState::kUnknownEffect,
+      ManagerApplyFailureEvidenceDTO{
+          held_intent.intent_digest, ManagerApplyPhase::kFenceAccepted,
+          "runtime_initialization_failed", "effects unknown",
+          ManagerApplyEffectDisposition::kUnknown, "typed_cause_code", {},
+          "component_manager", ManagerApplyEffectBoundary::kUnknown},
+  }));
+  ASSERT_TRUE(FailedApplyNewReleaseEligible(
+      *journal.ReadStatus(held, ApplyGeneration(1U))));
+
+  // 300+ sequential terminal, released Applies: every tenth succeeds.
+  std::optional<core::ConfigurationFenceReleaseDTO> donor_release;
+  std::size_t successes = 0U;
+  for (std::size_t index = 0U; index < 320U; ++index) {
+    const auto apply_id = "apply-" + std::to_string(index);
+    if (index % 10U == 0U)
+      donor_release = EnsureSucceededApply(journal, apply_id, ++successes);
+    else
+      EnsureRefusedApply(journal, apply_id);
+    ASSERT_TRUE(journal.ReadStatus(held, ApplyGeneration(1U))) << index;
+    if (index % 10U != 9U)
+      continue;
+    const auto report = journal.VerifyIntegrity();
+    ASSERT_LE(report.apply_intent_count,
+              static_cast<std::int64_t>(kMaximumManagerApplyIntents)) << index;
+    ASSERT_LE(report.terminal_outcome_count, report.apply_intent_count);
+    ASSERT_LE(report.publication_receipt_count,
+              static_cast<std::int64_t>(kMaximumManagerApplyPublicationReceipts));
+    ASSERT_TRUE(journal.ReadStatus(ApplyId(apply_id), ApplyGeneration(1U)));
+  }
+  EXPECT_EQ(journal.VerifyIntegrity().apply_intent_count,
+            static_cast<std::int64_t>(kMaximumManagerApplyIntents));
+  EXPECT_FALSE(journal.ReadStatus(ApplyId("apply-0"), ApplyGeneration(1U)));
+  // The newest success (apply-310) is retained although older than the rest.
+  EXPECT_TRUE(journal.ReadStatus(ApplyId("apply-310"), ApplyGeneration(1U)));
+
+  // An in-flight Apply is never evicted.
+  static_cast<void>(
+      journal.EnsureIntent(Intent("in-flight", 1U, "request-in-flight")));
+  for (std::size_t index = 320U; index < 600U; ++index) {
+    EnsureRefusedApply(journal, "apply-" + std::to_string(index));
+    ASSERT_TRUE(journal.ReadStatus(ApplyId("in-flight"), ApplyGeneration(1U)));
+    ASSERT_TRUE(journal.ReadStatus(held, ApplyGeneration(1U)));
+  }
+  EXPECT_TRUE(journal.ReadStatus(ApplyId("apply-310"), ApplyGeneration(1U)));
+
+  // Once its fence and claim are released the held Apply is the oldest
+  // evictable one.
+  ASSERT_TRUE(donor_release.has_value());
+  auto release = *donor_release;
+  auto &evidence = release.reconciliation_evidence;
+  evidence.owner_transaction = {held, ApplyGeneration(1U)};
+  evidence.configuration_fence_id = held_acceptance.accepted_fence.configuration_fence_id;
+  evidence.configuration_fence_generation =
+      held_acceptance.accepted_fence.configuration_fence_generation;
+  const auto &predecessor = held_intent.intent.expected_active_projection_revision;
+  evidence.active_projection_revision.retained_bundle_id = predecessor.retained_bundle_id;
+  evidence.active_projection_revision.graph_revision = predecessor.graph_revision;
+  evidence.active_graph_revision = predecessor.graph_revision;
+  evidence.active_projection_revision.scene_revision.scene_id =
+      predecessor.scene_revision.scene_id;
+  journal.BeginFailedApplyRelease(held, ApplyGeneration(1U),
+                                  RequestId("acknowledge-held"), "test", release);
+  EnsureRefusedApply(journal, "apply-600");
+  EXPECT_TRUE(journal.ReadStatus(held, ApplyGeneration(1U)));
+  journal.CompleteFailedApplyRelease(
+      held, ApplyGeneration(1U),
+      core::ConfigurationFenceReleasedDTO{
+          release, release.reconciliation_evidence.execution_host_epoch,
+          987654321LL, core::RequestReplayStatusDTO::kAcceptedNew,
+          ContentDigest(std::string(kDigestTwo))});
+  EnsureRefusedApply(journal, "apply-601");
+  EXPECT_TRUE(journal.ReadStatus(held, ApplyGeneration(1U)));
+  journal.CompleteFailedApplyAcknowledgement(held, ApplyGeneration(1U));
+  EnsureRefusedApply(journal, "apply-602");
+  EXPECT_FALSE(journal.ReadStatus(held, ApplyGeneration(1U)));
+  EXPECT_FALSE(journal.ReadRequest(RequestOwnerEpoch("owner-epoch-1"),
+                                   RequestId("request-held-0")));
   EXPECT_EQ(journal.VerifyIntegrity().apply_intent_count,
             static_cast<std::int64_t>(kMaximumManagerApplyIntents));
 }
@@ -4017,505 +3637,7 @@ TEST(ManagerApplyCompletionJournal,
 }
 
 } // namespace
-TEST(ManagerNativeApplyParentRead,
-     ReopensExactPreparationFailureWithOriginalHeldExclusion) {
-  TemporaryDirectory package;
-  const auto candidate = NativeParentCandidate(package.path(), false);
-  ASSERT_TRUE(candidate);
-  for (const bool authoring : {false, true}) {
-    TemporaryDirectory state;
-    const auto path = state.path() / "early-parent.sqlite3";
-    const auto fixture =
-        WriteNativeParent(path, package.path(), *candidate, authoring);
-    ASSERT_TRUE(
-        core::ValidateCellAdmissionRecoveryReceiptQuery(fixture.query).ok());
-    ASSERT_TRUE(
-        core::ValidateCellAdmissionRecoveryReceipt(fixture.receipt).ok());
-    const auto cell = candidate->value().cell_graph.cell_id;
-    const auto before = ReadFileBytes(path);
-    const auto general = ReadNativeApplyParentStatusReadOnly(
-        path, cell, fixture.plan, *candidate);
-    ASSERT_TRUE(general.ok()) << general.error().message;
-    const auto early = ReadNativeApplyPreparationFailureReadOnly(
-        path, cell, fixture.plan, *candidate, fixture.claim, fixture.query,
-        fixture.receipt);
-    ASSERT_TRUE(early.ok()) << early.error().message;
-    ASSERT_TRUE(early.value());
-    EXPECT_EQ(early.value()->intent, general.value().intent);
-    EXPECT_EQ(early.value()->terminal_outcome,
-              general.value().terminal_outcome);
-    ASSERT_TRUE(early.value()->terminal_outcome);
-    EXPECT_EQ(early.value()->terminal_outcome->terminal_outcome.state,
-              ManagerApplyTerminalOutcomeState::kUnknownEffect);
-    EXPECT_FALSE(early.value()->private_materialization);
-    EXPECT_FALSE(early.value()->publication_receipt);
-    EXPECT_FALSE(early.value()->fence_release_intent);
-    EXPECT_FALSE(early.value()->fence_released);
-    EXPECT_EQ(fixture.receipt.held_claims, std::vector{fixture.claim});
-    EXPECT_EQ(ReadFileBytes(path), before);
-    SqliteManagerApplyJournal reopened(path, cell);
-    EXPECT_EQ(reopened.ReadTerminalOutcome(fixture.plan.apply.apply_id,
-                                           fixture.plan.apply.apply_generation),
-              early.value()->terminal_outcome);
-    EXPECT_EQ(reopened.VerifyIntegrity().fence_released_count, 0);
-    const auto absent = state.path() / "missing-parent.sqlite3";
-    EXPECT_FALSE(ReadNativeApplyParentStatusReadOnly(absent, cell, fixture.plan,
-                                                     *candidate)
-                     .ok());
-    EXPECT_FALSE(std::filesystem::exists(absent));
-  }
-}
-
-TEST(ManagerNativeApplyParentRead,
-     LaterCodeWrongPhaseInstallationAndPendingRemainUnclassified) {
-  TemporaryDirectory package;
-  const auto candidate = NativeParentCandidate(package.path(), false);
-  ASSERT_TRUE(candidate);
-  for (const auto &[code, phase, materialized] :
-       std::vector<std::tuple<std::string, ManagerApplyPhase, bool>>{
-           {"runtime_composition_finalization_failed",
-            ManagerApplyPhase::kRuntimeConverged, false},
-           {"initial_scene_installation_failed",
-            ManagerApplyPhase::kRuntimeConverged, false},
-           {"publication_failed", ManagerApplyPhase::kRuntimeConverged, false},
-           {"runtime_composition_preparation_failed",
-            ManagerApplyPhase::kFenceAccepted, false},
-           {"runtime_composition_preparation_failed",
-            ManagerApplyPhase::kRuntimeConverged, true},
-           {"", ManagerApplyPhase::kRuntimeConverged, false}}) {
-    SCOPED_TRACE(code);
-    TemporaryDirectory state;
-    const auto path = state.path() / "later-parent.sqlite3";
-    const auto fixture = WriteNativeParent(path, package.path(), *candidate,
-                                           false, code, phase, materialized);
-    const auto cell = candidate->value().cell_graph.cell_id;
-    const auto read = ReadNativeApplyParentStatusReadOnly(
-        path, cell, fixture.plan, *candidate);
-    ASSERT_TRUE(read.ok()) << read.error().message;
-    EXPECT_EQ(read.value().terminal_outcome.has_value(), !code.empty());
-    const auto early = ReadNativeApplyPreparationFailureReadOnly(
-        path, cell, fixture.plan, *candidate, fixture.claim, fixture.query,
-        fixture.receipt);
-    ASSERT_TRUE(early.ok()) << early.error().message;
-    EXPECT_FALSE(early.value());
-  }
-}
-
-TEST(ManagerNativeApplyParentRead,
-     ScenarioCompositionRefusalIsTheSameEarlyPreparationFailure) {
-  TemporaryDirectory package;
-  const auto candidate = NativeParentCandidate(package.path(), false);
-  ASSERT_TRUE(candidate);
-  // Only the host's typed refusal makes a known `failed` Prepare early.
-  for (const auto &[cause, classified] :
-       std::vector<std::pair<std::string, bool>>{
-           {std::string(kScenarioCompositionRefusedCode), true},
-           {"typed_cause_code", false}}) {
-    SCOPED_TRACE(cause);
-    TemporaryDirectory state;
-    const auto path = state.path() / "refused-parent.sqlite3";
-    const auto fixture = WriteNativeParent(
-        path, package.path(), *candidate, false,
-        "runtime_composition_preparation_failed",
-        ManagerApplyPhase::kRuntimeConverged, false, nullptr, false, false,
-        cause);
-    const auto cell = candidate->value().cell_graph.cell_id;
-    const auto early = ReadNativeApplyPreparationFailureReadOnly(
-        path, cell, fixture.plan, *candidate, fixture.claim, fixture.query,
-        fixture.receipt);
-    ASSERT_TRUE(early.ok()) << early.error().message;
-    ASSERT_EQ(early.value().has_value(), classified);
-    if (classified) {
-      EXPECT_EQ(early.value()->terminal_outcome->terminal_outcome.state,
-                ManagerApplyTerminalOutcomeState::kFailed);
-    }
-  }
-}
-
-TEST(ManagerNativeApplyParentRead,
-     RejectsForeignPlanClaimAndNonExactRecoveryEvidence) {
-  TemporaryDirectory package;
-  TemporaryDirectory state;
-  const auto candidate = NativeParentCandidate(package.path(), false);
-  ASSERT_TRUE(candidate);
-  const auto path = state.path() / "foreign-parent.sqlite3";
-  const auto fixture = WriteNativeParent(path, package.path(), *candidate);
-  const auto cell = candidate->value().cell_graph.cell_id;
-  const auto baseline = ReadNativeApplyPreparationFailureReadOnly(
-      path, cell, fixture.plan, *candidate, fixture.claim, fixture.query,
-      fixture.receipt);
-  ASSERT_TRUE(baseline.ok()) << baseline.error().message;
-  ASSERT_TRUE(baseline.value());
-  const auto reject_plan = [&](const auto &mutate) {
-    auto plan = fixture.plan;
-    mutate(plan);
-    EXPECT_FALSE(
-        ReadNativeApplyParentStatusReadOnly(path, cell, plan, *candidate).ok());
-  };
-  reject_plan([](auto &p) { p.apply.apply_id = ApplyId("foreign-apply"); });
-  reject_plan([](auto &p) { p.apply.apply_generation = ApplyGeneration(2U); });
-  reject_plan([](auto &p) {
-    p.candidate_retained_bundle_id = RetainedBundleId("foreign-candidate");
-  });
-  reject_plan([](auto &p) {
-    p.candidate_graph_revision = GraphRevision("foreign-graph");
-  });
-  reject_plan([](auto &p) {
-    p.removed_components.push_back(ControllableComponentId("invented-removal"));
-  });
-  reject_plan([](auto &p) {
-    p.removed_domains.push_back(ControlDomainId("invented-removal"));
-  });
-  EXPECT_FALSE(ReadNativeApplyParentStatusReadOnly(path, CellId("foreign-cell"),
-                                                   fixture.plan, *candidate)
-                   .ok());
-  const auto reject_claim = [&](const auto &mutate) {
-    auto claim = fixture.claim;
-    mutate(claim.intent);
-    const core::CellAdmissionRecoveryReceiptQueryDTO query{claim.intent, claim,
-                                                           std::nullopt};
-    EXPECT_FALSE(ReadNativeApplyPreparationFailureReadOnly(
-                     path, cell, fixture.plan, *candidate, claim, query,
-                     HeldNativeParent(claim))
-                     .ok());
-  };
-  reject_claim(
-      [](auto &i) { i.owner_epoch = RequestOwnerEpoch("foreign-owner"); });
-  reject_claim([](auto &i) { i.request_id = RequestId("foreign-request"); });
-  reject_claim([](auto &i) { i.owner_transaction_id = "foreign-transaction"; });
-  reject_claim([](auto &i) {
-    i.request_payload_digest = ContentDigest(std::string(kDigestTwo));
-  });
-  reject_claim([](auto &i) {
-    i.expected_admission_generation = core::AdmissionGeneration(9U);
-  });
-  auto query = fixture.query;
-  query.expected_claim->claim_generation =
-      core::CellAdmissionClaimGeneration(4U);
-  EXPECT_FALSE(ReadNativeApplyPreparationFailureReadOnly(
-                   path, cell, fixture.plan, *candidate, fixture.claim, query,
-                   fixture.receipt)
-                   .ok());
-  auto receipt = fixture.receipt;
-  receipt.matched_claim->acquired_admission_generation =
-      core::AdmissionGeneration(10U);
-  receipt.held_claims = {*receipt.matched_claim};
-  EXPECT_FALSE(ReadNativeApplyPreparationFailureReadOnly(
-                   path, cell, fixture.plan, *candidate, fixture.claim,
-                   fixture.query, receipt)
-                   .ok());
-  receipt = fixture.receipt;
-  receipt.status = core::CellAdmissionRecoveryReceiptStatusDTO::kUnknown;
-  receipt.matched_claim.reset();
-  EXPECT_FALSE(ReadNativeApplyPreparationFailureReadOnly(
-                   path, cell, fixture.plan, *candidate, fixture.claim,
-                   fixture.query, receipt)
-                   .ok());
-  // Authoring transfer retains the complete stored claim, not just its intent.
-  const auto authoring_path = state.path() / "authoring-parent.sqlite3";
-  auto authoring =
-      WriteNativeParent(authoring_path, package.path(), *candidate, true);
-  authoring.claim.claim_generation = core::CellAdmissionClaimGeneration(99U);
-  authoring.query = {authoring.claim.intent, authoring.claim, std::nullopt};
-  authoring.receipt = HeldNativeParent(authoring.claim);
-  EXPECT_FALSE(ReadNativeApplyPreparationFailureReadOnly(
-                   authoring_path, cell, authoring.plan, *candidate,
-                   authoring.claim, authoring.query, authoring.receipt)
-                   .ok());
-}
-
-TEST(ManagerNativeApplyParentRead,
-     JoinsHealthyRetainedComponentsAndRoutesOutsideEmptyFence) {
-  TemporaryDirectory package;
-  TemporaryDirectory state;
-  const auto candidate = NativeParentCandidate(package.path(), true);
-  ASSERT_TRUE(candidate);
-  const auto path = state.path() / "retained-closure.sqlite3";
-  const auto fixture = WriteNativeParent(path, package.path(), *candidate);
-  ASSERT_FALSE(fixture.plan.components.empty());
-  ASSERT_FALSE(fixture.plan.routes.empty());
-  const auto cell = candidate->value().cell_graph.cell_id;
-  const auto read =
-      ReadNativeApplyParentStatusReadOnly(path, cell, fixture.plan, *candidate);
-  ASSERT_TRUE(read.ok()) << read.error().message;
-  ASSERT_TRUE(read.value().affected_scope);
-  EXPECT_TRUE(read.value()
-                  .affected_scope->affected_scope.scope
-                  .controllable_component_ids.empty());
-  EXPECT_EQ(fixture.plan.retained_components.size(),
-            candidate->value().cell_graph.controllable_components.size());
-  EXPECT_EQ(fixture.plan.retained_domains.size(),
-            candidate->value().desired_control_configurations.size());
-  const auto reject_plan = [&](const auto &mutate) {
-    auto plan = fixture.plan;
-    mutate(plan);
-    EXPECT_FALSE(
-        ReadNativeApplyParentStatusReadOnly(path, cell, plan, *candidate).ok());
-  };
-  reject_plan([](auto &p) { p.components.clear(); });
-  reject_plan([](auto &p) { p.components.push_back(p.components.front()); });
-  reject_plan([](auto &p) { p.routes.clear(); });
-  reject_plan([](auto &p) { p.retained_components.clear(); });
-  reject_plan([](auto &p) { p.retained_domains.clear(); });
-  reject_plan([](auto &p) {
-    p.components.front().generation = core::ComponentLifecycleGeneration(0U);
-  });
-  reject_plan([](auto &p) {
-    p.routes.front().generation = core::ActiveControlConfigurationGeneration(
-        std::numeric_limits<std::uint64_t>::max());
-  });
-  TemporaryDirectory foreign_package;
-  const auto foreign_candidate =
-      NativeParentCandidate(foreign_package.path(), false);
-  ASSERT_TRUE(foreign_candidate);
-  EXPECT_FALSE(ReadNativeApplyParentStatusReadOnly(path, cell, fixture.plan,
-                                                   *foreign_candidate)
-                   .ok());
-}
-
-TEST(ManagerNativeApplyParentRead,
-     JoinsActualRemovedMembershipFromSameCellSealedDelta) {
-  TemporaryDirectory previous_package;
-  TemporaryDirectory candidate_package;
-  TemporaryDirectory state;
-  const auto previous = NativeParentCandidate(previous_package.path(), true);
-  const auto candidate = NativeParentCandidate(candidate_package.path(), false);
-  ASSERT_TRUE(previous);
-  ASSERT_TRUE(candidate);
-  ASSERT_EQ(previous->value().cell_graph.cell_id,
-            candidate->value().cell_graph.cell_id);
-  const auto path = state.path() / "removed-closure.sqlite3";
-  const auto fixture = WriteNativeParent(
-      path, candidate_package.path(), *candidate, false,
-      "runtime_composition_preparation_failed",
-      ManagerApplyPhase::kRuntimeConverged, false, previous.get());
-  ASSERT_FALSE(fixture.plan.removed_components.empty());
-  ASSERT_FALSE(fixture.plan.removed_domains.empty());
-  EXPECT_TRUE(fixture.plan.components.empty());
-  EXPECT_TRUE(fixture.plan.routes.empty());
-  const auto cell = candidate->value().cell_graph.cell_id;
-  const auto read = ReadNativeApplyPreparationFailureReadOnly(
-      path, cell, fixture.plan, *candidate, fixture.claim, fixture.query,
-      fixture.receipt);
-  ASSERT_TRUE(read.ok()) << read.error().message;
-  ASSERT_TRUE(read.value());
-  auto foreign = fixture.plan;
-  foreign.removed_components.clear();
-  EXPECT_FALSE(
-      ReadNativeApplyParentStatusReadOnly(path, cell, foreign, *candidate)
-          .ok());
-  foreign = fixture.plan;
-  foreign.removed_domains.clear();
-  EXPECT_FALSE(
-      ReadNativeApplyParentStatusReadOnly(path, cell, foreign, *candidate)
-          .ok());
-}
-
-TEST(ManagerNativeApplyParentRead,
-     LinkedParentUsesSealedClaimAndRefusesInstalledChildProof) {
-  TemporaryDirectory previous_package;
-  TemporaryDirectory candidate_package;
-  const auto previous = NativeParentCandidate(previous_package.path(), false);
-  const auto candidate = NativeParentCandidate(candidate_package.path(), true);
-  ASSERT_TRUE(previous);
-  ASSERT_TRUE(candidate);
-  ASSERT_EQ(previous->value().cell_graph.cell_id,
-            candidate->value().cell_graph.cell_id);
-  for (const bool holding : {false, true}) {
-    TemporaryDirectory state;
-    const auto path = state.path() / "linked-prepare.sqlite3";
-    const auto fixture =
-        WriteNativeParent(path, candidate_package.path(), *candidate, false,
-                          "runtime_composition_preparation_failed",
-                          ManagerApplyPhase::kRuntimeConverged, false,
-                          previous.get(), true, holding);
-    const auto cell = candidate->value().cell_graph.cell_id;
-    const auto retained = ReadNativeApplyParentStatusReadOnly(
-        path, cell, fixture.plan, *candidate);
-    ASSERT_TRUE(retained.ok()) << retained.error().message;
-    ASSERT_TRUE(retained.value().bring_up_plan);
-    EXPECT_EQ(fixture.claim.intent.request_payload_digest,
-              retained.value().bring_up_plan->plan_digest);
-    EXPECT_NE(fixture.claim.intent.request_payload_digest,
-              retained.value().intent.intent_digest);
-    // Actual Q91 acquisition keeps the Manager claim's ordinary empty scope.
-    // Its nonempty aggregate is carried separately by the held Apply fence.
-    EXPECT_TRUE(fixture.claim.intent.scope.resources.empty());
-    EXPECT_TRUE(fixture.claim.intent.scope.configurations.empty());
-    ASSERT_TRUE(retained.value().fence_acceptance);
-    ASSERT_FALSE(retained.value().fence_acceptance->accepted_fence.captured_scope
-                     .resources.empty());
-    EXPECT_EQ(retained.value().bring_up_child_proofs.size(), holding ? 2U : 1U);
-    const auto read = ReadNativeApplyPreparationFailureReadOnly(
-        path, cell, fixture.plan, *candidate, fixture.claim, fixture.query,
-        fixture.receipt);
-    ASSERT_TRUE(read.ok()) << read.error().message;
-    EXPECT_EQ(read.value().has_value(), !holding);
-    auto scoped = fixture.claim;
-    scoped.intent.scope.resources = retained.value().fence_acceptance
-                                        ->accepted_fence.captured_scope.resources;
-    EXPECT_FALSE(ReadNativeApplyPreparationFailureReadOnly(
-                     path, cell, fixture.plan, *candidate, scoped,
-                     {scoped.intent, scoped, std::nullopt},
-                     HeldNativeParent(scoped))
-                     .ok());
-    auto ordinary = fixture.claim;
-    ordinary.intent.request_payload_digest =
-        retained.value().intent.intent_digest;
-    EXPECT_FALSE(ReadNativeApplyPreparationFailureReadOnly(
-                     path, cell, fixture.plan, *candidate, ordinary,
-                     {ordinary.intent, ordinary, std::nullopt},
-                     HeldNativeParent(ordinary))
-                     .ok());
-    auto foreign = fixture.claim;
-    foreign.claim_generation = core::CellAdmissionClaimGeneration(100U);
-    EXPECT_FALSE(ReadNativeApplyPreparationFailureReadOnly(
-                     path, cell, fixture.plan, *candidate, foreign,
-                     {foreign.intent, foreign, std::nullopt},
-                     HeldNativeParent(foreign))
-                     .ok());
-  }
-}
-
-TEST(ManagerNativeApplyParentRead,
-     VerifiesTouchedChainAndFailureIntentDigestInFreshSnapshot) {
-  TemporaryDirectory package;
-  TemporaryDirectory state;
-  const auto candidate = NativeParentCandidate(package.path(), false);
-  ASSERT_TRUE(candidate);
-  const auto path = state.path() / "corrupt-inventory.sqlite3";
-  const auto fixture = WriteNativeParent(path, package.path(), *candidate);
-  const auto cell = candidate->value().cell_graph.cell_id;
-  {
-    SqliteManagerApplyJournal journal(path, cell);
-    auto foreign_row = Intent("other-apply", 1U, "other-request");
-    foreign_row.cell_id = cell;
-    static_cast<void>(journal.EnsureIntent(foreign_row));
-  }
-  ASSERT_TRUE(
-      ReadNativeApplyParentStatusReadOnly(path, cell, fixture.plan, *candidate)
-          .ok());
-  ExecSql(
-      path,
-      "DROP TRIGGER manager_apply_intents_no_update;"
-      "UPDATE manager_apply_intents SET source_label='tampered' WHERE "
-      "apply_id='other-apply';"
-      "CREATE TRIGGER manager_apply_intents_no_update BEFORE UPDATE ON "
-      "manager_apply_intents "
-      "BEGIN SELECT RAISE(ABORT, 'manager_apply_intents is immutable'); END;");
-  EXPECT_TRUE(
-      ReadNativeApplyParentStatusReadOnly(path, cell, fixture.plan, *candidate)
-          .ok());
-  ExecSql(
-      path,
-      "DROP TRIGGER manager_apply_intents_no_update;"
-      "UPDATE manager_apply_intents SET source_label='component-manager-test' "
-      "WHERE apply_id='other-apply';"
-      "CREATE TRIGGER manager_apply_intents_no_update BEFORE UPDATE ON "
-      "manager_apply_intents "
-      "BEGIN SELECT RAISE(ABORT, 'manager_apply_intents is immutable'); END;");
-  ASSERT_TRUE(
-      ReadNativeApplyParentStatusReadOnly(path, cell, fixture.plan, *candidate)
-          .ok());
-  ExecSql(path, "DROP TRIGGER manager_apply_terminal_outcomes_no_update;"
-                "UPDATE manager_apply_terminal_outcomes SET intent_digest='" +
-                    std::string(kDigestTwo) +
-                    "';"
-                    "CREATE TRIGGER manager_apply_terminal_outcomes_no_update "
-                    "BEFORE UPDATE ON manager_apply_terminal_outcomes "
-                    "BEGIN SELECT RAISE(ABORT, "
-                    "'manager_apply_terminal_outcomes is immutable'); END;");
-  EXPECT_FALSE(ReadNativeApplyPreparationFailureReadOnly(
-                   path, cell, fixture.plan, *candidate, fixture.claim,
-                   fixture.query, fixture.receipt)
-                   .ok());
-}
-TEST(ManagerApplyBringUpJournal,
-     CapturesCompletePlanAtomicallyAndReplaysWithoutReminting) {
-  TemporaryDirectory directory;
-  const auto path = directory.path() / "bring-up.sqlite3";
-  const auto parent = Intent();
-  auto plan = BringUpPlan(parent);
-  ASSERT_TRUE(plan.valid());
-  // There is no one-child restriction: the immutable configured subset may
-  // contain several distinct actual original component requests.
-  auto second = plan.children.front();
-  second.intent.controllable_component_id = ControllableComponentId("tool-1");
-  second.intent.request_context.request_id = RequestId("bring-up-tool-1");
-  second.intent.intent = core::ComponentLifecycleIntentKindDTO::kEnable;
-  plan.children.push_back(second);
-  ASSERT_TRUE(plan.valid());
-  std::optional<PersistedManagerApplyBringUpPlan> expected;
-  {
-    SqliteManagerApplyJournal journal(path, parent.cell_id);
-    const auto inserted = journal.EnsureBringUpIntent(parent, plan);
-    EXPECT_TRUE(inserted.inserted);
-    expected = inserted.plan;
-    EXPECT_EQ(inserted.intent.intent_digest,
-              ComputeManagerApplyIntentDigest(parent));
-    EXPECT_EQ(inserted.plan.plan_digest,
-              ComputeManagerApplyBringUpPlanDigest(plan));
-    EXPECT_FALSE(journal.EnsureBringUpIntent(parent, plan).inserted);
-    EXPECT_EQ(journal.ReadBringUpPlanByRequest(
-                  parent.request_context.request_owner_epoch,
-                  parent.request_context.request_id),
-              expected);
-    const auto inventory = journal.ReadStatusInventory();
-    ASSERT_EQ(inventory.size(), 1U);
-    EXPECT_EQ(inventory.front().bring_up_plan, expected);
-    EXPECT_TRUE(inventory.front().bring_up_child_proofs.empty());
-    EXPECT_EQ(journal.VerifyIntegrity().bring_up_plan_count, 1);
-    // An ordinary identity observation stays byte-identical. The coordinator
-    // must classify the linked parent before any ordinary continuation.
-    EXPECT_EQ(journal.EnsureIntent(parent).record, inserted.intent);
-  }
-  SqliteManagerApplyJournal restored(path, parent.cell_id);
-  EXPECT_EQ(restored.ReadBringUpPlan(parent.apply_id, parent.apply_generation),
-            expected);
-}
-
-TEST(ManagerApplyBringUpJournal, ReadOnlyClaimIntentResolvesOnlyExactRetainedParent) {
-  TemporaryDirectory directory;
-  const auto path = directory.path() / "parent-claim-intent-read.sqlite3";
-  const auto parent = Intent();
-  const auto claim = [&] {
-    SqliteManagerApplyJournal journal(path, parent.cell_id);
-    const auto accepted_plan = journal.EnsureBringUpIntent(parent, BringUpPlan(parent));
-    return core::CellAdmissionClaimIntentDTO{
-        core::CellAdmissionClaimKindDTO::kManagerApply,
-        core::CellAdmissionOwnerRoleDTO::kManager,
-        parent.request_context.request_owner_epoch, parent.apply_id.value(),
-        parent.request_context.request_id, accepted_plan.plan.plan_digest,
-        *parent.expected_admission_generation, {}, std::nullopt, std::nullopt};
-  }();
-  const auto before = ReadFileBytes(path);
-  const auto observed = ReadManagerApplyBringUpStatusReadOnly(path, parent.cell_id, claim);
-  ASSERT_TRUE(observed.ok()) << observed.error().message;
-  EXPECT_EQ(observed.value().intent.intent, parent);
-  ASSERT_TRUE(observed.value().bring_up_plan);
-  EXPECT_EQ(observed.value().bring_up_plan->plan_digest, claim.request_payload_digest);
-  EXPECT_FALSE(observed.value().fence_attempt);
-  EXPECT_FALSE(observed.value().terminal_outcome);
-  const auto reject = [&](const auto &mutate) {
-    auto foreign = claim;
-    mutate(foreign);
-    EXPECT_FALSE(ReadManagerApplyBringUpStatusReadOnly(path, parent.cell_id, foreign).ok());
-  };
-  reject([](auto &value) { value.owner_epoch = RequestOwnerEpoch("foreign-owner"); });
-  reject([](auto &value) { value.request_id = RequestId("foreign-request"); });
-  reject([](auto &value) { value.owner_transaction_id = "foreign-apply"; });
-  reject([](auto &value) { value.request_payload_digest = ContentDigest(std::string(kDigestTwo)); });
-  reject([](auto &value) { value.expected_admission_generation = core::AdmissionGeneration(8U); });
-  reject([](auto &value) { value.owner_role = core::CellAdmissionOwnerRoleDTO::kAuthoringOwner; });
-  EXPECT_FALSE(ReadManagerApplyBringUpStatusReadOnly(path, CellId("foreign-cell"), claim).ok());
-  EXPECT_EQ(ReadFileBytes(path), before);
-  // A live-WAL read may create SQLite bookkeeping; retained main bytes stay exact.
-  const auto absent = directory.path() / "absent-claim-parent.sqlite3";
-  EXPECT_FALSE(ReadManagerApplyBringUpStatusReadOnly(absent, parent.cell_id, claim).ok());
-  EXPECT_FALSE(std::filesystem::exists(absent));
-}
-
-TEST(ManagerApplyBringUpJournal, ReadOnlyClaimIntentPositivelyDistinguishesOrdinaryParent) {
+TEST(ManagerApplyJournal, ReadOnlyClaimIntentResolvesOrdinaryParent) {
   TemporaryDirectory directory;
   const auto path = directory.path() / "ordinary-parent-claim-read.sqlite3";
   const auto parent = Intent();
@@ -4530,21 +3652,24 @@ TEST(ManagerApplyBringUpJournal, ReadOnlyClaimIntentPositivelyDistinguishesOrdin
       parent.request_context.request_id, durable.intent_digest,
       *parent.expected_admission_generation, {}, std::nullopt, std::nullopt};
   const auto before = ReadFileBytes(path);
-  const auto ordinary = ReadManagerApplyBringUpStatusReadOnly(path, parent.cell_id, claim);
+  const auto ordinary = ReadManagerApplyStatusByClaimIntentReadOnly(path, parent.cell_id, claim);
   ASSERT_TRUE(ordinary.ok()) << ordinary.error().message;
   EXPECT_EQ(ordinary.value().intent, durable);
-  EXPECT_FALSE(ordinary.value().bring_up_plan);
   auto foreign = claim;
   foreign.request_payload_digest = ContentDigest(std::string(kDigestTwo));
-  EXPECT_FALSE(ReadManagerApplyBringUpStatusReadOnly(path, parent.cell_id, foreign).ok());
+  EXPECT_FALSE(ReadManagerApplyStatusByClaimIntentReadOnly(path, parent.cell_id, foreign).ok());
   foreign = claim;
   foreign.expected_admission_generation = core::AdmissionGeneration(8U);
-  EXPECT_FALSE(ReadManagerApplyBringUpStatusReadOnly(path, parent.cell_id, foreign).ok());
-  // A linked-only reference cannot turn this positive ordinary observation
-  // into a configured child plan or an acquired claim.
-  EXPECT_FALSE(ReadManagerApplyBringUpStatusReadOnly(path, parent.cell_id,
-      core::ApplyComponentBringUpReferenceDTO{{parent.apply_id, parent.apply_generation},
-          durable.intent_digest}).ok());
+  EXPECT_FALSE(ReadManagerApplyStatusByClaimIntentReadOnly(path, parent.cell_id, foreign).ok());
+  foreign = claim;
+  foreign.owner_role = core::CellAdmissionOwnerRoleDTO::kAuthoringOwner;
+  EXPECT_FALSE(ReadManagerApplyStatusByClaimIntentReadOnly(path, parent.cell_id, foreign).ok());
+  EXPECT_FALSE(ReadManagerApplyStatusByClaimIntentReadOnly(path, CellId("foreign-cell"), claim).ok());
+  const auto absent = directory.path() / "absent-claim-parent.sqlite3";
+  const auto missing = ReadManagerApplyStatusByClaimIntentReadOnly(absent, parent.cell_id, claim);
+  ASSERT_FALSE(missing.ok());
+  EXPECT_EQ(missing.error().code, "manager_apply_configuration_read_unavailable");
+  EXPECT_FALSE(std::filesystem::exists(absent));
   EXPECT_EQ(ReadFileBytes(path), before);
 }
 
@@ -4580,7 +3705,6 @@ TEST(ManagerApplyJournal, ReadOnlyConfigurationParentKeepsDirectAndAuthoringGram
     const auto observed = ReadManagerApplyConfigurationStatusReadOnly(path, parent.cell_id, apply, claim);
     ASSERT_TRUE(observed.ok()) << observed.error().message;
     EXPECT_EQ(observed.value().intent, durable);
-    EXPECT_FALSE(observed.value().bring_up_plan);
     auto foreign = claim;
     if (authoring) foreign.claim_generation = core::CellAdmissionClaimGeneration(4U);
     else foreign.intent.request_payload_digest = ContentDigest(std::string(kDigestTwo));
@@ -4603,404 +3727,15 @@ TEST(ManagerApplyJournal, ReadOnlyConfigurationParentKeepsDirectAndAuthoringGram
   }
 }
 
-TEST(ManagerApplyJournal, ReadOnlyConfigurationParentRefusesLinkedPlanWithoutChangingBytes) {
-  TemporaryDirectory directory;
-  const auto path = directory.path() / "linked-is-not-config.sqlite3";
-  const auto parent = Intent();
-  const auto linked = [&] {
-    SqliteManagerApplyJournal journal(path, parent.cell_id);
-    return journal.EnsureBringUpIntent(parent, BringUpPlan(parent));
-  }();
-  const core::CellAdmissionClaimDTO claim{
-      {core::CellAdmissionClaimKindDTO::kManagerApply, core::CellAdmissionOwnerRoleDTO::kManager,
-       parent.request_context.request_owner_epoch, parent.apply_id.value(), parent.request_context.request_id,
-       linked.plan.plan_digest, *parent.expected_admission_generation, {}, std::nullopt, std::nullopt},
-      core::CellAdmissionClaimGeneration(3U), core::AdmissionGeneration(7U), 42};
-  const auto before = ReadFileBytes(path);
-  const auto refused = ReadManagerApplyConfigurationStatusReadOnly(path, parent.cell_id,
-      {parent.apply_id, parent.apply_generation}, claim);
-  ASSERT_FALSE(refused.ok());
-  EXPECT_EQ(refused.error().details.at("integrity_detail"), "configuration parent has linked bring-up plan");
-  EXPECT_EQ(ReadFileBytes(path), before);
-}
-
-TEST(ManagerApplyBringUpJournal, ReadOnlyParentJoinsExactPlanWithoutCreatingAuthority) {
-  TemporaryDirectory directory;
-  const auto path = directory.path() / "parent-read.sqlite3";
-  const auto parent = Intent();
-  const core::ApplyFenceOwnerDTO owner{parent.apply_id, parent.apply_generation};
-  core::ApplyComponentBringUpReferenceDTO reference{
-      owner,
-      core::ContentDigest(std::string(kDigestOne))};
-  {
-    SqliteManagerApplyJournal journal(path, parent.cell_id);
-    const auto accepted = journal.EnsureBringUpIntent(parent, BringUpPlan(parent));
-    reference.plan_digest = accepted.plan.plan_digest;
-    const auto current = journal.ReadStatus(parent.apply_id, parent.apply_generation);
-    ASSERT_TRUE(current);
-    const auto observed = ReadManagerApplyBringUpStatusReadOnly(path, parent.cell_id, reference);
-    ASSERT_TRUE(observed.ok()) << observed.error().message;
-    EXPECT_EQ(observed.value().intent, current->intent);
-    EXPECT_FALSE(observed.value().affected_scope);
-    EXPECT_FALSE(current->affected_scope);
-    EXPECT_FALSE(observed.value().fence_attempt);
-    EXPECT_FALSE(current->fence_attempt);
-    EXPECT_FALSE(observed.value().fence_acceptance);
-    EXPECT_FALSE(current->fence_acceptance);
-    EXPECT_FALSE(observed.value().runtime_convergence_intent);
-    EXPECT_FALSE(current->runtime_convergence_intent);
-    EXPECT_FALSE(observed.value().latest_runtime_staged_ready);
-    EXPECT_FALSE(current->latest_runtime_staged_ready);
-    EXPECT_FALSE(observed.value().private_materialization);
-    EXPECT_FALSE(current->private_materialization);
-    EXPECT_FALSE(observed.value().publication_receipt);
-    EXPECT_FALSE(current->publication_receipt);
-    EXPECT_FALSE(observed.value().fence_release_intent);
-    EXPECT_FALSE(current->fence_release_intent);
-    EXPECT_FALSE(observed.value().fence_released);
-    EXPECT_FALSE(current->fence_released);
-    EXPECT_FALSE(observed.value().terminal_outcome);
-    EXPECT_FALSE(current->terminal_outcome);
-    EXPECT_EQ(observed.value().bring_up_plan, current->bring_up_plan);
-    EXPECT_TRUE(observed.value().bring_up_child_proofs.empty());
-    EXPECT_TRUE(current->bring_up_child_proofs.empty());
-    EXPECT_FALSE(observed.value().fence_acceptance);
-    EXPECT_FALSE(observed.value().terminal_outcome);
-    auto foreign = reference;
-    foreign.plan_digest = core::ContentDigest(std::string(kDigestTwo));
-    EXPECT_FALSE(ReadManagerApplyBringUpStatusReadOnly(path, parent.cell_id, foreign).ok());
-    foreign = reference;
-    foreign.owner.apply_generation = core::ApplyGeneration(parent.apply_generation.value() + 1U);
-    EXPECT_FALSE(ReadManagerApplyBringUpStatusReadOnly(path, parent.cell_id, foreign).ok());
-    EXPECT_FALSE(ReadManagerApplyBringUpStatusReadOnly(path, CellId("foreign-cell"), reference).ok());
-    EXPECT_EQ(journal.VerifyIntegrity().apply_intent_count, 1);
-  }
-  const auto before = ReadFileBytes(path);
-  const auto reopened = ReadManagerApplyBringUpStatusReadOnly(path, parent.cell_id, reference);
-  ASSERT_TRUE(reopened.ok());
-  EXPECT_EQ(reopened.value().bring_up_plan->plan_digest, reference.plan_digest);
-  EXPECT_EQ(ReadFileBytes(path), before);
-  // A live-WAL read may create SQLite bookkeeping; retained main bytes stay exact.
-  const auto absent_path = directory.path() / "never-created.sqlite3";
-  EXPECT_FALSE(ReadManagerApplyBringUpStatusReadOnly(absent_path, parent.cell_id, reference).ok());
-  EXPECT_FALSE(std::filesystem::exists(absent_path));
-}
-
-TEST(ManagerApplyBringUpJournal,
-     ConflictingOrInvalidPlanLeavesNoUnlinkedParent) {
-  TemporaryDirectory directory;
-  SqliteManagerApplyJournal journal(directory.path() / "atomic.sqlite3",
-                                    CellId("cell-1"));
-  const auto parent = Intent();
-  auto plan = BringUpPlan(parent);
-  plan.expected_publication.candidate_projection_revision.scene_revision
-      .revision_id += 1U;
-  plan.children.front().candidate_projection_revision =
-      plan.expected_publication.candidate_projection_revision;
-  EXPECT_THROW(static_cast<void>(journal.EnsureBringUpIntent(parent, plan)),
-               ManagerApplyJournalIntegrityError);
-  EXPECT_FALSE(
-      journal.ReadIntent(parent.apply_id, parent.apply_generation).has_value());
-  EXPECT_FALSE(journal.ReadBringUpPlan(parent.apply_id, parent.apply_generation)
-                   .has_value());
-  EXPECT_EQ(journal.VerifyIntegrity().apply_intent_count, 0);
-  plan = BringUpPlan(parent);
-  const auto original = journal.EnsureBringUpIntent(parent, plan);
-  plan.children.front().runtime_epoch = RuntimeEpoch("foreign-host-epoch");
-  EXPECT_THROW(static_cast<void>(journal.EnsureBringUpIntent(parent, plan)),
-               ManagerApplyJournalConflictError);
-  EXPECT_EQ(journal.ReadBringUpPlan(parent.apply_id, parent.apply_generation),
-            original.plan);
-}
-
-TEST(ManagerApplyBringUpJournal,
-     DoesNotRetrofitOrRepurposeOrdinaryAuthoringAuthority) {
-  TemporaryDirectory directory;
-  SqliteManagerApplyJournal journal(directory.path() / "ordinary.sqlite3",
-                                    CellId("cell-1"));
-  const auto parent = Intent();
-  const auto ordinary = journal.EnsureIntent(parent);
-  EXPECT_THROW(static_cast<void>(
-                   journal.EnsureBringUpIntent(parent, BringUpPlan(parent))),
-               ManagerApplyJournalConflictError);
-  EXPECT_EQ(journal.ReadIntent(parent.apply_id, parent.apply_generation),
-            ordinary.record);
-  EXPECT_FALSE(journal.ReadBringUpPlan(parent.apply_id, parent.apply_generation)
-                   .has_value());
-  const auto authoring = ParentClaimIntent();
-  auto plan = BringUpPlan(authoring);
-  EXPECT_THROW(static_cast<void>(journal.EnsureBringUpIntent(authoring, plan)),
-               ManagerApplyJournalConflictError);
-}
-
-TEST(ManagerApplyBringUpJournal,
-     LinkedMaterializationRequiresActualEveryChildHoldingProof) {
-  TemporaryDirectory directory;
-  SqliteManagerApplyJournal journal(directory.path() / "holding.sqlite3",
-                                    CellId("cell-1"));
-  const auto plan = BringUpPlan();
-  static_cast<void>(journal.EnsureBringUpIntent(Intent(), plan));
-  const auto &child = plan.children.front();
-  const ManagerApplyPrivateMaterializationDTO materialization{
-      child.candidate_projection_revision.scene_revision.content_hash,
-      plan.apply_id,
-      plan.apply_generation,
-      child.candidate_projection_revision,
-      child.candidate_retained_bundle_digest,
-      child.candidate_retained_bundle_bytes};
-  EXPECT_THROW(
-      static_cast<void>(journal.EnsurePrivateMaterialization(materialization)),
-      ManagerApplyJournalIntegrityError);
-  EXPECT_FALSE(
-      journal.ReadPrivateMaterialization(plan.apply_id, plan.apply_generation)
-          .has_value());
-  EXPECT_EQ(journal.VerifyIntegrity().private_materialization_count, 0);
-}
-
-TEST(ManagerApplyBringUpJournal,
-     RetiredDomainHoldingRequiresNoAttemptOrError) {
-  TemporaryDirectory directory;
-  SqliteManagerApplyJournal journal(directory.path() / "retired.sqlite3",
-                                    CellId("cell-1"));
-  const auto parent = journal.EnsureBringUpIntent(Intent(), BringUpPlan());
-  auto intent = FenceIntent();
-  intent.scope.domains.push_back({ControlDomainId("retired"),
-                                  ControlDomainRevision("retired-r1"), std::nullopt});
-  intent.scope.bindings.push_back({ControlBindingId("retired-jtc"),
-                                   ControlBindingRevision("retired-binding-r1"), std::nullopt});
-  intent.scope.resources.push_back(ResourceId("joint-3"));
-  // A controller domain with a predecessor names its active configuration.
-  intent.expected_active_control_configurations.push_back(
-      {ControlDomainId("retired"), core::ActiveControlConfigurationId("retired-mode"),
-       core::ActiveControlConfigurationGeneration(1U)});
-  const auto attempt = EnsureAttempt(journal, parent.intent.intent_digest, intent);
-  auto accepted_fence = AcceptedFence();
-  accepted_fence.captured_scope = intent.scope;
-  const auto fence = journal.EnsureFenceAcceptance(
-      parent.intent.intent.apply_id, parent.intent.intent.apply_generation,
-      attempt.record.fence_attempt_digest, accepted_fence).record;
-  const auto proof_with_retired = [&](ManagerApplyBringUpChildPhase phase) {
-    auto proof = BringUpChildProof(parent, fence, phase);
-    auto &status = *proof.result.status;
-    const core::ResolvedLifecycleControlDomainScopeDTO scope{
-        ControlDomainId("retired"), ControlDomainRevision("retired-r1"),
-        core::ControllerTopologyId("topology-1"), core::TopologyRevision("topology-revision-1"),
-        std::nullopt,
-        {{ControlBindingId("retired-jtc"), ControlBindingRevision("retired-binding-r1"),
-          core::ControlRouteId("route-1")}},
-        {ResourceId("joint-3")}};
-    const auto &child = parent.plan.plan.children.front();
-    const core::ResolvedLifecycleProviderOccurrenceDTO provider{
-        scope.control_domain_id, scope.control_domain_revision,
-        core::ProviderInstanceId("provider-1"), core::ProviderManifestId("manifest-1"),
-        core::ProviderManifestRevision("manifest-r1"), child.runtime_unit_id,
-        child.runtime_epoch, ContentDigest(std::string(kDigestThree))};
-    status.domains.push_back({scope.control_domain_id, std::nullopt, scope, provider,
-        core::ComponentLifecycleStateDTO::kDeclared,
-        core::ComponentLifecycleStateDTO::kDeclared, status.requested_state,
-        core::ComponentLifecycleDomainActionStateDTO::kNotStarted, {}, std::nullopt});
-    return proof;
-  };
-  const auto accepted = proof_with_retired(ManagerApplyBringUpChildPhase::kAccepted);
-  const auto holding = proof_with_retired(ManagerApplyBringUpChildPhase::kHolding);
-  ASSERT_TRUE(accepted.result.locally_valid());
-  ASSERT_TRUE(holding.result.locally_valid());
-  static_cast<void>(journal.EnsureBringUpChildProof(accepted));
-
-  auto attempted = holding;
-  auto &attempted_status = *attempted.result.status;
-  auto &retired = attempted_status.domains.back();
-  const auto &provider = *retired.resolved_provider_occurrence;
-  retired.primitive_attempts.push_back({
-      attempted_status.acceptance.lifecycle_transaction_id,
-      attempted_status.acceptance.lifecycle_transaction_generation,
-      attempted_status.accepted_intent.controllable_component_id,
-      retired.control_domain_id, provider.control_domain_revision,
-      provider.provider_instance_id, provider.provider_manifest_id,
-      provider.provider_manifest_revision, provider.provider_runtime_unit_id,
-      provider.provider_runtime_epoch, core::LifecyclePrimitiveId("transition.prepare"),
-      core::LifecyclePrimitiveAttemptId("retired-attempt"), 1U,
-      core::LifecycleTransitionOutcomeDTO::kSucceeded, std::nullopt});
-  ASSERT_TRUE(attempted.result.locally_valid());
-  EXPECT_THROW(static_cast<void>(journal.EnsureBringUpChildProof(attempted)),
-               ManagerApplyJournalIntegrityError);
-
-  auto failed = holding;
-  failed.result.status->domains.back().action_state = core::ComponentLifecycleDomainActionStateDTO::kFailed;
-  failed.result.status->domains.back().error = core::ErrorDTO{"retired_error", "retired domain failed", {}};
-  ASSERT_TRUE(failed.result.locally_valid());
-  EXPECT_THROW(static_cast<void>(journal.EnsureBringUpChildProof(failed)),
-               ManagerApplyJournalIntegrityError);
-  EXPECT_TRUE(journal.EnsureBringUpChildProof(holding).inserted);
-}
-
-TEST(ManagerApplyBringUpJournal,
-     RetainsExactNoAdmissionRejectionAndRefusesForeignChild) {
-  TemporaryDirectory directory;
-  SqliteManagerApplyJournal journal(directory.path() / "rejection.sqlite3",
-                                    CellId("cell-1"));
-  const auto accepted = journal.EnsureBringUpIntent(Intent(), BringUpPlan());
-  ManagerApplyBringUpChildProofDTO proof{
-      accepted.plan.plan.apply_id,
-      accepted.plan.plan.apply_generation,
-      accepted.plan.plan_digest,
-      ControllableComponentId("robot-1"),
-      ManagerApplyBringUpChildPhase::kAccepted,
-      {core::RequestReplayStatusDTO::kAcceptedNew, std::nullopt, std::nullopt,
-       core::ErrorDTO{"not_qualified", "actual owner refused bring-up", {{"effect", "not_started"}}},
-       std::nullopt}};
-  ASSERT_TRUE(proof.result.locally_valid());
-  const auto retained = journal.EnsureBringUpChildProof(proof);
-  EXPECT_TRUE(retained.inserted);
-  EXPECT_FALSE(journal.EnsureBringUpChildProof(proof).inserted);
-  const auto read = journal.ReadBringUpChildProof(
-      proof.apply_id, proof.apply_generation, proof.controllable_component_id,
-      proof.phase);
-  ASSERT_TRUE(read.has_value());
-  EXPECT_EQ(read->proof_digest, retained.record.proof_digest);
-  EXPECT_EQ(read->proof.result.rejection, proof.result.rejection);
-  proof.controllable_component_id = ControllableComponentId("tool-1");
-  EXPECT_THROW(static_cast<void>(journal.EnsureBringUpChildProof(proof)),
-               ManagerApplyJournalIntegrityError);
-  EXPECT_EQ(journal.VerifyIntegrity().bring_up_child_proof_count, 1);
-}
-
-TEST(ManagerApplyBringUpJournal, ChangedPlanCannotHideBehindVerifiedReadCache) {
-  TemporaryDirectory directory;
-  const auto path = directory.path() / "tamper-plan.sqlite3";
-  SqliteManagerApplyJournal journal(path, CellId("cell-1"));
-  const auto accepted = journal.EnsureBringUpIntent(Intent(), BringUpPlan());
-  ASSERT_TRUE(journal
-                  .ReadBringUpPlan(accepted.plan.plan.apply_id,
-                                   accepted.plan.plan.apply_generation)
-                  .has_value());
-  ExecSql(path, "DROP TRIGGER manager_apply_bring_up_plans_no_update;"
-                "UPDATE manager_apply_bring_up_plans SET plan_encoding=X'00';"
-                "CREATE TRIGGER manager_apply_bring_up_plans_no_update BEFORE "
-                "UPDATE ON manager_apply_bring_up_plans "
-                "BEGIN SELECT RAISE(ABORT, 'manager_apply_bring_up_plans is "
-                "immutable'); END;");
-  EXPECT_THROW(
-      static_cast<void>(journal.ReadBringUpPlan(
-          accepted.plan.plan.apply_id, accepted.plan.plan.apply_generation)),
-      ManagerApplyJournalIntegrityError);
-  EXPECT_THROW(static_cast<void>(journal.ReadStatusInventory()),
-               ManagerApplyJournalIntegrityError);
-  EXPECT_THROW(static_cast<void>(journal.VerifyIntegrity()),
-               ManagerApplyJournalIntegrityError);
-}
-
-TEST(ManagerApplyBringUpJournal,
-     JoinsActualHoldingPublicationTerminalFenceAndParentClaimForRequestedTargets) {
-  for (const auto kind : {core::ComponentLifecycleIntentKindDTO::kPrepare,
-                          core::ComponentLifecycleIntentKindDTO::kEnable,
-                          core::ComponentLifecycleIntentKindDTO::kDisable}) {
-  TemporaryDirectory directory;
-  const auto path = directory.path() / "settlement.sqlite3";
-  SqliteManagerApplyJournal journal(path, CellId("cell-1"));
-  const auto parent = journal.EnsureBringUpIntent(Intent(), BringUpPlan(Intent(), kind));
-  const auto attempt = EnsureAttempt(journal, parent.intent.intent_digest);
-  const auto fence =
-      journal
-          .EnsureFenceAcceptance(parent.intent.intent.apply_id,
-                                 parent.intent.intent.apply_generation,
-                                 attempt.record.fence_attempt_digest,
-                                 AcceptedFence())
-          .record;
-  const auto accepted = BringUpChildProof(
-      parent, fence, ManagerApplyBringUpChildPhase::kAccepted);
-  const auto holding =
-      BringUpChildProof(parent, fence, ManagerApplyBringUpChildPhase::kHolding);
-  const auto terminal = BringUpChildProof(
-      parent, fence, ManagerApplyBringUpChildPhase::kTerminal);
-  ASSERT_TRUE(accepted.result.locally_valid());
-  ASSERT_TRUE(holding.result.locally_valid());
-  ASSERT_TRUE(terminal.result.locally_valid());
-  static_cast<void>(journal.EnsureBringUpChildProof(accepted));
-  auto foreign = holding;
-  foreign.result.status->apply_bring_up->parent_authority.parent_claim
-      .claim_generation = core::CellAdmissionClaimGeneration(9U);
-  EXPECT_THROW(static_cast<void>(journal.EnsureBringUpChildProof(foreign)),
-               ManagerApplyJournalIntegrityError);
-  static_cast<void>(journal.EnsureBringUpChildProof(holding));
-  EXPECT_THROW(static_cast<void>(journal.EnsureBringUpChildProof(terminal)),
-               ManagerApplyJournalIntegrityError);
-  const auto &child = parent.plan.plan.children.front();
-  const auto materialization =
-      journal
-          .EnsurePrivateMaterialization(
-              {child.candidate_projection_revision.scene_revision.content_hash,
-               parent.intent.intent.apply_id,
-               parent.intent.intent.apply_generation,
-               child.candidate_projection_revision,
-               child.candidate_retained_bundle_digest,
-               child.candidate_retained_bundle_bytes})
-          .record;
-  // Selected proof is counted only for this exact linked parent. It does not
-  // fabricate an ordinary runtime staging record to satisfy cardinality.
-  EXPECT_EQ(journal.VerifyIntegrity().runtime_staged_ready_count, 0);
-  EXPECT_EQ(journal.VerifyIntegrity().private_materialization_count, 1);
-  const auto publication =
-      journal
-          .EnsurePublicationReceipt(
-              {materialization.private_materialization_content_digest,
-               {parent.plan.plan.expected_publication,
-                ActiveBundlePublicationGeneration(4U),
-                ContentDigest(std::string(kDigestOne))}})
-          .record;
-  const SelectedBundleTransitionRecords transition{materialization,
-                                                   publication};
-  EXPECT_THROW(static_cast<void>(journal.EnsureFenceReleaseIntent(
-                   FenceReleaseIntent(transition, fence))),
-               ManagerApplyJournalIntegrityError);
-  static_cast<void>(journal.EnsureBringUpChildProof(terminal));
-  const auto completed = EnsureApplyCompletion(journal, transition);
-  const auto claim =
-      accepted.result.status->apply_bring_up->parent_authority.parent_claim;
-  core::CellAdmissionClaimReleaseDTO release{
-      claim.intent.owner_role,
-      claim.intent.owner_epoch,
-      claim.intent.owner_transaction_id,
-      claim.intent.request_id,
-      claim.intent.request_payload_digest,
-      claim.acquired_admission_generation,
-      claim.claim_generation,
-      {core::CellAdmissionSettlementKindDTO::kTerminalEffectsSettled,
-       completed.terminal.terminal_outcome_digest}};
-  EXPECT_FALSE(ValidateManagerApplyCellAdmissionSettlementReadOnly(
-                   path, CellId("cell-1"), claim, release)
-                   .ok());
-  // Even an ordinary-looking intent-digest claim cannot classify this linked
-  // parent through the ordinary settlement reader.
-  auto ordinary_claim = claim;
-  ordinary_claim.intent.request_payload_digest = parent.intent.intent_digest;
-  auto ordinary_release = release;
-  ordinary_release.request_payload_digest = parent.intent.intent_digest;
-  EXPECT_FALSE(ValidateManagerApplyCellAdmissionSettlementReadOnly(
-                   path, CellId("cell-1"), ordinary_claim, ordinary_release).ok());
-  EXPECT_TRUE(ValidateManagerApplyBringUpCellAdmissionSettlementReadOnly(
-                  path, CellId("cell-1"), claim, release)
-                  .ok());
-  release.claim_generation = core::CellAdmissionClaimGeneration(9U);
-  EXPECT_FALSE(ValidateManagerApplyBringUpCellAdmissionSettlementReadOnly(
-                   path, CellId("cell-1"), claim, release)
-                   .ok());
-  const auto inventory = journal.ReadStatusInventory();
-  ASSERT_EQ(inventory.size(), 1U);
-  EXPECT_EQ(inventory.front().bring_up_child_proofs.size(), 3U);
-  EXPECT_EQ(journal.VerifyIntegrity().bring_up_child_proof_count, 3);
-  }
-}
-
 TEST(ManagerApplyJournalIntegrity,
-     RefusesV19InterruptedIntentWithActionablePreservationMessage) {
+     RefusesV20InterruptedIntentWithActionablePreservationMessage) {
   TemporaryDirectory directory;
-  const auto path = directory.path() / "interrupted-v19.sqlite3";
+  const auto path = directory.path() / "interrupted-v20.sqlite3";
   {
     SqliteManagerApplyJournal owner(path, CellId("cell-1"));
     static_cast<void>(owner.EnsureIntent(Intent()));
   }
-  ExecSql(path, "PRAGMA user_version=19;");
+  ExecSql(path, "PRAGMA user_version=20;");
   const auto before = ReadFileBytes(path);
   try {
     SqliteManagerApplyJournal refused(path, CellId("cell-1"));
@@ -5008,8 +3743,8 @@ TEST(ManagerApplyJournalIntegrity,
   } catch (const ManagerApplyJournalIntegrityError &error) {
     const std::string message(error.what());
     EXPECT_NE(message.find(path.string()), std::string::npos);
-    EXPECT_NE(message.find("version 19"), std::string::npos);
-    EXPECT_NE(message.find("v20"), std::string::npos);
+    EXPECT_NE(message.find("version 20"), std::string::npos);
+    EXPECT_NE(message.find("v22"), std::string::npos);
     EXPECT_NE(message.find("Preserve"), std::string::npos);
     EXPECT_NE(message.find("interrupted"), std::string::npos);
     EXPECT_NE(message.find("reconcile"), std::string::npos);
@@ -5055,10 +3790,6 @@ TEST(ManagerApplyJournal,
       {},
       occurrence.output_resources};
   fence.expected_active_control_configurations.clear();
-  fence.expected_provider_lineages = {
-      {ControlDomainId("io.domain"),
-       core::RuntimeEpoch("actual.provider.epoch"),
-       core::ComponentLifecycleGeneration(7U)}};
   ASSERT_TRUE(fence.valid());
   {
     SqliteManagerApplyJournal journal(database, CellId("cell-1"));
@@ -5082,8 +3813,6 @@ TEST(ManagerApplyJournal,
       reopened.ReadFenceAttempt(ApplyId("apply-1"), ApplyGeneration(1U));
   ASSERT_TRUE(attempt);
   EXPECT_EQ(attempt->fence_intent.scope, fence.scope);
-  EXPECT_EQ(attempt->fence_intent.expected_provider_lineages,
-            fence.expected_provider_lineages);
   EXPECT_TRUE(
       attempt->fence_intent.expected_active_control_configurations.empty());
 }

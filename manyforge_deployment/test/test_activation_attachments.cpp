@@ -223,6 +223,41 @@ TEST(ActivationB5, ParsesAMountPrimaryAndAComponentDefaultTcp) {
   EXPECT_TRUE(intent.attachments.as_array().front().find_object_member("primary")->as_bool());
 }
 
+Value Exclusions(Array pairs) {
+  auto row = Mount().as_object();
+  row.emplace_back("collision_exclusions", Value(std::move(pairs)));
+  return Value(std::move(row));
+}
+
+Value ExclusionPair(Value child_link, Value parent_link) {
+  return Value(Object{{"child_link", std::move(child_link)},
+                      {"parent_link", std::move(parent_link)}});
+}
+
+// MOUNT_COLLISION_EXCLUSIONS_PLAN: a mount's optional authored pairs; `[]`
+// is the same as absent; repeated, non-text and unknown-field pairs refused.
+TEST(ActivationMountCollisionExclusions, ParsesPairsAndRefusesMalformedOnes) {
+  const Array components{Physical("lite6_robot", true), Physical("lite_gripper", false)};
+  EXPECT_NO_THROW((void)Parse(components, Array{Exclusions(Array{
+      ExclusionPair(Value("lite_gripper_left_finger"), Value("link5")),
+      ExclusionPair(Value("lite_gripper_left_finger"), Value("link4"))})}));
+  EXPECT_NO_THROW((void)Parse(components, Array{Exclusions(Array{})}));
+  const auto pair = ExclusionPair(Value("lite_gripper_left_finger"), Value("link4"));
+  auto extra = pair.as_object();
+  extra.emplace_back("reason", Value("Never"));
+  for (auto bad : {Array{pair, pair},
+                   Array{ExclusionPair(Value("lite_gripper_left_finger"), Value(4.0))},
+                   Array{ExclusionPair(Value(""), Value("link4"))},
+                   Array{Value(std::move(extra))}}) {
+    EXPECT_THROW((void)Parse(components, Array{Exclusions(std::move(bad))}),
+                 std::invalid_argument);
+  }
+  auto not_array = Mount().as_object();
+  not_array.emplace_back("collision_exclusions", Value("link4"));
+  EXPECT_THROW((void)Parse(components, Array{Value(std::move(not_array))}),
+               std::invalid_argument);
+}
+
 TEST(ActivationB5, RefusesMalformedPrimaryOrDefaultTcp) {
   EXPECT_THROW((void)Parse(Array{Physical("lite6_robot", true), Physical("lite_gripper", false)},
                            Array{Primary(Mount(), Value("yes"))}),

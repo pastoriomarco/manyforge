@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>manyforge_perception_interfaces</name>
-  <version>0.1.0</version>
+  <version>0.2.0</version>
   <description>Request-driven single-capture multi-instance pose action.</description>
   <maintainer email="pastoriomarco@gmail.com">Marco Pastorio</maintainer>
   <license>Apache-2.0</license>

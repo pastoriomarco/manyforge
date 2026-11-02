@@ -243,6 +243,7 @@ def test_zero_client_demand_keeps_the_one_program_reader_running() -> None:
                         execution_identity_response={},
                         execution_targets_response={},
                         execution_control_response={},
+                        component_model=None,
                         errors={},
                     )
                 ),
@@ -320,7 +321,6 @@ def test_held_operation_failure_is_active_once(source_and_observer) -> None:
         (None, True),
         ([], True),
         ([_failure_row(recovery_class="runtime_collision")], False),
-        ([_failure_row(recovery_class="stop_fault_intervention")], False),
         (
             [_failure_row(facts=[{"kind": "local_failure", "effect": "effect_uncertain"}])],
             False,

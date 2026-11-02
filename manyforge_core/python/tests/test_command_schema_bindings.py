@@ -18,7 +18,7 @@ COMMAND_SCHEMA_PATH = (
     / "gripper.command_position.v1.yaml"
 )
 COMMAND_SCHEMA_CLOSED_SCHEMA_REVISION = (
-    "sha256:fdce9bb1facd259bde85f502197fd534dc05346a030605a55aa951d9e88c73dd"
+    "sha256:4f23fe66c0dd587d998a52a7b166bddd22d7ab8e5b28caacc48373ff373dcd84"
 )
 
 

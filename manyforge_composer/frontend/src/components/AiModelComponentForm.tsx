@@ -6,6 +6,7 @@ import type { JsonValue } from '../types/api';
 import { jsonObject, type JsonObject } from '../utils/poseSourceAuthoring';
 import { DraftTextInput } from './common/DraftInputs';
 import type { FocusedEditorScope } from './DeploymentFocusedEditor';
+import type { EffectiveValues } from '../types/components';
 import { LifecycleBudgetField } from './LifecycleBudgetField';
 
 /**
@@ -55,8 +56,9 @@ function validBaseUrl(value: string): string | null {
   }
 }
 
-function AiModelComponentForm({ controller, component }: {
+function AiModelComponentForm({ controller, effective, component }: {
   controller: DeploymentWorkspaceController;
+  effective: EffectiveValues | null;
   component: AiModelComponent;
 }) {
   const configuration = component.runtimeConfiguration;
@@ -80,7 +82,7 @@ function AiModelComponentForm({ controller, component }: {
   return (
     <section className="deployment-pose-source" aria-label={`${prefix} AI model`}>
       <header><strong>{prefix}</strong></header>
-      <LifecycleBudgetField controller={controller} componentIndex={component.index}
+      <LifecycleBudgetField controller={controller} effective={effective} componentIndex={component.index}
         componentId={component.componentId} disabled={disabled} />
       {field('Base URL', 'base_url', validBaseUrl, (value) => value.trim())}
       {field('Model', 'model', (value) => (value.trim() ? null : 'Enter the served model name.'),
@@ -246,8 +248,10 @@ function AssistantModelAliases({ controller, profileId, components }: {
  * component's page shows only its form; the cell settings show only the
  * assistant's model aliases, which choose among the components.
  */
-export function AiModelComponentSection({ controller, scope = 'all' }: {
+export function AiModelComponentSection({ controller, effective = null, scope = 'all' }: {
   controller: DeploymentWorkspaceController;
+  /** `GET /api/deployment/effective` (CONTRACTS §11), read once by the editor. */
+  effective?: EffectiveValues | null;
   scope?: FocusedEditorScope;
 }) {
   const document = controller.workspace?.draft.document ?? null;
@@ -274,7 +278,8 @@ export function AiModelComponentSection({ controller, scope = 'all' }: {
       <div className="deployment-focused-body">
         {components.length === 0 && !adding && <p className="muted">No AI model is declared.</p>}
         {components.map((component) => (
-          <AiModelComponentForm key={component.componentId} controller={controller} component={component} />
+          <AiModelComponentForm key={component.componentId} controller={controller} effective={effective}
+            component={component} />
         ))}
         {scope === 'all' && (adding ? (
           <AddAiModelForm controller={controller} existing={componentIds(document)}

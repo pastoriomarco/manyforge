@@ -1,7 +1,5 @@
 import type {
   JsonValue,
-  ManagerDeploymentCandidatePreviewResponse,
-  ManagerDeploymentImpactComponent,
   SourceModelTarget,
 } from '../types/api';
 import {
@@ -14,8 +12,10 @@ import type {
   ComponentCatalogEntry,
   ComponentCatalogKind,
   ComponentProfileFacts,
+  MachineCatalogEntry,
 } from '../types/componentCatalog';
 import { draftAttachments, fromDraft } from '../state/kinematicIndex';
+import { componentTree, flattenComponentTree } from '../state/componentPresentation';
 
 /**
  * Pure helpers of the Components section (one page per component) and of the
@@ -34,8 +34,16 @@ export interface ComponentManagerRow {
   kind: ComponentCatalogKind | null;
   /** A mounted tool's parent interface, `<robot>.<interface>`; null otherwise. */
   mount: string | null;
+  /** A member's owner component (CONTRACTS §16); null for owners and owner-less components. */
+  owner: string | null;
+  /** A member's slot in its machine (`arm`, `controller_io`, ...); null otherwise. */
+  role: string | null;
+  /** False for a deactivated member (`active: false`): it stays in the Draft, the compiler leaves it out. */
+  active: boolean;
   /** `applied`: in both; `added`: Draft only (runs after Apply); `removed`: Applied only. */
   change: 'applied' | 'added' | 'removed';
+  /** Its level in the list's tree: 0 at the top, +1 under its owner or the component it is mounted on. */
+  depth: number;
 }
 
 export interface RoleFeedback {
@@ -50,17 +58,21 @@ export interface RoleFeedback {
 }
 
 export const COMPONENT_KIND_LABELS: Record<ComponentCatalogKind, string> = {
+  machine: 'Machine',
   robot: 'Robot',
   tool: 'Tool',
   io_device: 'I/O device',
   pose_source: 'Pose source',
   ai_model: 'AI model',
+  sensor: 'Sensor',
 };
 
-const MODEL_FREE_KINDS: Record<string, ComponentCatalogKind> = {
+/** The kind a row's `runtime_kind` names (other rows carry a robot or tool model). */
+const RUNTIME_KINDS: Record<string, ComponentCatalogKind> = {
   io_provider: 'io_device',
   pose_source: 'pose_source',
   ai_model: 'ai_model',
+  sensor: 'sensor',
 };
 
 /** The Deployment intent's component id rule (`deployment_intent.py`). */
@@ -75,14 +87,54 @@ function strings(value: JsonValue | undefined): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
 }
 
-/** A model row is a tool when its component type is tagged `tool`, else a robot. */
+/**
+ * A model row is a tool when its component type is tagged `tool`, else a
+ * robot; a member without a model source is an I/O bank (its signals come
+ * from its model, CONTRACTS §16).
+ */
 export function componentKindOf(
   row: Record<string, JsonValue>,
   facts?: ComponentProfileFacts,
 ): ComponentCatalogKind {
   const runtimeKind = record(row.configuration)?.runtime_kind;
-  return (typeof runtimeKind === 'string' ? MODEL_FREE_KINDS[runtimeKind] : undefined)
+  return (typeof runtimeKind === 'string' ? RUNTIME_KINDS[runtimeKind] : undefined)
+    ?? (typeof row.owner === 'string' && row.model_source === undefined ? 'io_device' : undefined)
     ?? (facts?.tags.includes('tool') ? 'tool' : 'robot');
+}
+
+/** The owner a Draft row names (CONTRACTS §16), or null. */
+export function ownerOf(row: Record<string, JsonValue>): string | null {
+  return typeof row.owner === 'string' ? row.owner : null;
+}
+
+/** The Draft rows of the members of `ownerId`, in Draft order. */
+export function machineMembers(
+  document: Record<string, JsonValue> | null,
+  ownerId: string,
+): Array<Record<string, JsonValue>> {
+  return draftComponents(document).filter((row) => ownerOf(row) === ownerId);
+}
+
+/**
+ * The Draft's `components` and `attachments` without a machine: the owner,
+ * its members and every attachment naming one of them (a tool mounted on the
+ * arm stays in the Draft, unmounted).
+ */
+export function withoutMachine(
+  document: Record<string, JsonValue>,
+  ownerId: string,
+): { components: JsonValue[]; attachments: JsonValue[] } {
+  const removed = new Set([ownerId, ...machineMembers(document, ownerId).map((row) => row.component_id as string)]);
+  const components = Array.isArray(document.components) ? document.components : [];
+  const attachments = Array.isArray(document.attachments) ? document.attachments : [];
+  const named = (value: JsonValue, side: 'parent' | 'child') => {
+    const id = record(record(value)?.[side])?.component_id;
+    return typeof id === 'string' && removed.has(id);
+  };
+  return {
+    components: components.filter((value) => !removed.has(String(record(value)?.component_id))),
+    attachments: attachments.filter((value) => !named(value, 'parent') && !named(value, 'child')),
+  };
 }
 
 /** The tool mounted on a component's `flange` in the Draft, or null. */
@@ -157,30 +209,71 @@ export function componentManagerRows(
   const applied = new Set(appliedIds ?? []);
   if (document?.api_version !== 'manyforge.deployment_intent.v2') {
     return [...applied].sort().map((id): ComponentManagerRow => ({
-      componentId: id, profileId: null, kind: null, mount: null, change: 'applied',
+      componentId: id, profileId: null, kind: null, mount: null, owner: null, role: null, active: true, change: 'applied',
+      depth: 0,
     }));
   }
   const draft = draftComponents(document);
   const draftIds = new Set(draft.map((row) => row.component_id as string));
+  const owners = new Set(draft.flatMap((row) => ownerOf(row) ?? []));
   const mounts = new Map(draftAttachments(document).map((row) => [
     row.child.componentId, `${row.parent.componentId}.${row.parent.interface}`,
   ]));
-  return [
+  const parents = mountParents(document);
+  return componentListTree([
     ...draft.map((row): ComponentManagerRow => {
+      const id = row.component_id as string;
       const profileId = typeof row.component_profile_id === 'string' ? row.component_profile_id : null;
-      const mount = mounts.get(row.component_id as string) ?? null;
+      const mount = mounts.get(id) ?? null;
       return {
-        componentId: row.component_id as string,
+        componentId: id,
         profileId,
-        kind: mount !== null ? 'tool' : componentKindOf(row, profileId === null ? undefined : profiles[profileId]),
+        kind: mount !== null ? 'tool' : owners.has(id) ? 'machine'
+          : componentKindOf(row, profileId === null ? undefined : profiles[profileId]),
         mount,
-        change: applied.has(row.component_id as string) ? 'applied' : 'added',
+        owner: ownerOf(row),
+        role: typeof row.role === 'string' ? row.role : null,
+        active: row.active !== false,
+        change: applied.has(id) ? 'applied' : 'added',
+        depth: 0,
       };
     }),
     ...[...applied].filter((id) => !draftIds.has(id)).map((id): ComponentManagerRow => ({
-      componentId: id, profileId: null, kind: null, mount: null, change: 'removed',
+      componentId: id, profileId: null, kind: null, mount: null, owner: null, role: null, active: true, change: 'removed',
+      depth: 0,
     })),
-  ].sort((left, right) => left.componentId.localeCompare(right.componentId));
+  ].sort((left, right) => left.componentId.localeCompare(right.componentId)), parents);
+}
+
+/** Sorted rows as one tree: members under their owner (CONTRACTS §16), a mounted component under its parent. */
+function componentListTree(
+  rows: ComponentManagerRow[],
+  mounts: Readonly<Record<string, string>>,
+): ComponentManagerRow[] {
+  return flattenComponentTree(componentTree(rows, (row) => row.componentId,
+    (row) => row.owner ?? mounts[row.componentId] ?? null))
+    .map(({ item, depth }) => ({ ...item, depth }));
+}
+
+/** Each mounted component's parent component in the Draft's `attachments[]` (child id to parent id). */
+export function mountParents(document: Record<string, JsonValue> | null): Record<string, string> {
+  return Object.fromEntries(draftAttachments(document).map((row) => [row.child.componentId, row.parent.componentId]));
+}
+
+/** A member slot's own label, in place of its kind; other slots show after the kind. */
+const ROLE_LABELS: Readonly<Record<string, string>> = { arm: 'Arm' };
+
+/**
+ * A list row's secondary text: its kind (a mounted tool with its interface,
+ * the whole mount when its parent isn't the row above it; a member by its
+ * slot), then its model. An I/O member shows its slot instead of its model.
+ */
+export function componentRowText(row: ComponentManagerRow, underParent: boolean): string {
+  const roleLabel = row.role === null ? undefined : ROLE_LABELS[row.role];
+  const kind = row.mount !== null ? `Tool on ${underParent ? row.mount.slice(row.mount.lastIndexOf('.') + 1) : row.mount}`
+    : roleLabel ?? (row.kind === null ? 'Component' : COMPONENT_KIND_LABELS[row.kind]);
+  const detail = row.role !== null && roleLabel === undefined ? row.role : row.profileId;
+  return detail === null ? kind : `${kind} · ${detail}`;
 }
 
 /** `id`, or the first `id_N` not in `taken`. */
@@ -191,6 +284,42 @@ export function nextFreeComponentId(id: string, taken: ReadonlySet<string>): str
   }
 }
 
+/** A member's default id (CONTRACTS §11, §16). */
+export function defaultMemberId(ownerId: string, role: string): string {
+  return `${ownerId}_${role}`;
+}
+
+/**
+ * Add component for a machine model (CONTRACTS §11, §16; MACHINES-BOUNDARY
+ * §5): one entry with the model's ready rows as they are (ids
+ * `default_owner_id` and `<default_owner_id>_<role>`, inner references
+ * included): the owner on `lane`, each member naming its owner and role.
+ * Id edits rename them like any catalog entry (`renameComponentRows`).
+ */
+export function machineCatalogEntry(
+  machine: MachineCatalogEntry,
+  lane: string,
+  profiles: Readonly<Record<string, ComponentProfileFacts>>,
+): ComponentCatalogEntry {
+  const ownerId = machine.defaultOwnerId;
+  const members = machine.members.map((member): Record<string, JsonValue> => ({
+    ...member.row, owner: ownerId, role: member.role,
+  }));
+  const armProfile = members.find((row) => row.model_source !== undefined)?.component_profile_id;
+  return {
+    entryId: `machine/${machine.modelId}`,
+    kind: 'machine',
+    componentId: ownerId,
+    componentProfileId: machine.modelId,
+    modelFamilyId: null,
+    tags: typeof armProfile === 'string' ? profiles[armProfile]?.tags ?? [] : [],
+    lane,
+    description: machine.title,
+    sources: [],
+    components: [{ ...machine.ownerRow, lane }, ...members],
+  };
+}
+
 /** A frame prefix derived from a component id (letters, digits, `_`, ending in `/`). */
 export function framePrefixFor(componentId: string): string {
   return `${componentId.replace(/[^A-Za-z0-9_]/g, '_')}/`;
@@ -198,8 +327,8 @@ export function framePrefixFor(componentId: string): string {
 
 /**
  * The rows with components renamed: every `component_id` and
- * `controllable_component_id` naming a renamed component, and every
- * `source_id` it prefixes (`<id>.<signal>`).
+ * `controllable_component_id` naming a renamed component, a member row's
+ * `owner` (CONTRACTS §16), and every `source_id` it prefixes (`<id>.<signal>`).
  */
 export function renameComponentRows(
   rows: ReadonlyArray<Record<string, JsonValue>>,
@@ -221,13 +350,17 @@ export function renameComponentRows(
     }
     return value;
   };
-  return rows.map((row) => rename(row, null) as Record<string, JsonValue>);
+  return rows.map((row) => {
+    const renamed = rename(row, null) as Record<string, JsonValue>;
+    const owner = ownerOf(row);
+    return owner !== null && renames[owner] !== undefined ? { ...renamed, owner: renames[owner] } : renamed;
+  });
 }
 
 /**
  * The rows with every `robot_component_id` naming `robotId`: an added tool's
- * I/O companions (e.g. `xarm_digital` on the robot controller) talk to the
- * robot the tool is mounted on.
+ * rows that follow the robot the tool is mounted on (e.g. a geometric contact
+ * input). A member's `owner` is not a robot reference and stays.
  */
 export function withMountRobot(
   rows: ReadonlyArray<Record<string, JsonValue>>,
@@ -314,27 +447,6 @@ export function roleFeedback(
 export function rolesFittingEntry(entry: ComponentCatalogEntry, feedback: readonly RoleFeedback[]): RoleFeedback[] {
   return feedback.filter((role) => role.status === 'unbound' && role.requiredTags.length > 0
     && role.requiredTags.every((tag) => entry.tags.includes(tag)));
-}
-
-export interface PreviewRecordChange {
-  recordKind: string;
-  added: string[];
-  changed: string[];
-  removed: string[];
-}
-
-/** What a Manager preview changes: component dispositions and record diffs. */
-export function previewChanges(preview: ManagerDeploymentCandidatePreviewResponse): {
-  components: ManagerDeploymentImpactComponent[];
-  records: PreviewRecordChange[];
-} {
-  return {
-    components: preview.impact.components.filter((row) => row.disposition !== 'retain'),
-    records: Object.entries(preview.diff)
-      .filter(([, diff]) => diff.added.length + diff.changed.length + diff.removed.length > 0)
-      .map(([recordKind, diff]) => ({ recordKind, ...diff }))
-      .sort((left, right) => left.recordKind.localeCompare(right.recordKind)),
-  };
 }
 
 /** One Applied target of a component with its frames (source model). */
@@ -438,8 +550,8 @@ function pneumaticReferences(row: Record<string, JsonValue>): ComponentSignal[] 
  * The I/O signals around one component in the Draft: those it declares
  * (`owned`), other components' signals it uses (`uses`: a pneumatic gripper's
  * valves and sensors), and other components' signals that use it (`usedBy`:
- * its own signals in another gripper's pneumatic I/O, an xArm pin on this
- * robot, a geometric-contact input that follows the robot's Active TCP).
+ * its own signals in another gripper's pneumatic I/O, a geometric-contact
+ * input that follows the robot's Active TCP).
  */
 export function componentSignals(
   document: Record<string, JsonValue> | null,
@@ -453,9 +565,7 @@ export function componentSignals(
     })),
     ...outputs.filter((draft) => draft.componentId === componentId).map((draft): ComponentSignal => ({
       componentId, signalName: draft.signalName, direction: 'output',
-      detail: draft.profile === 'xarm_digital'
-        ? `xArm ${draft.robotComponentId} ${draft.bank} digital output pin ${draft.pin}`
-        : IO_OUTPUT_PROFILE_LABELS[draft.profile],
+      detail: IO_OUTPUT_PROFILE_LABELS[draft.profile],
     })),
   ];
   const rows = gripperRows(document);
@@ -471,13 +581,6 @@ export function componentSignals(
         .map((reference): ComponentSignal => ({
           ...reference, detail: `${reference.detail} of ${String(row.controllable_component_id)}`,
         })))),
-    ...[...inputs, ...outputs].filter((draft) => draft.componentId !== componentId
-      && draft.profile === 'xarm_digital' && draft.robotComponentId === componentId)
-      .map((draft): ComponentSignal => ({
-        componentId: draft.componentId, signalName: draft.signalName,
-        direction: 'echoEnabled' in draft ? 'input' : 'output',
-        detail: `${draft.bank} digital pin ${draft.pin} on this robot`,
-      })),
     ...inputs.filter((draft) => draft.componentId !== componentId
       && draft.profile === 'geometric_contact' && draft.robotComponentId === componentId)
       .map((draft): ComponentSignal => ({

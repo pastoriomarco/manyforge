@@ -41,7 +41,6 @@ from manyforge_behavior.nodes.v2_owner import (
     GripperStatusWaitAdapter,
     IoInputWaitAdapter,
     InterruptMotionTaskAdapter,
-    IoOutputCommandAdapter,
     MotionTaskAdapter,
 )
 from manyforge_behavior.nodes.v2_pure import (
@@ -107,6 +106,8 @@ class NodeAdapterBuildContext:
     motion_attention: Callable[[str, str], None] | None = None
     # Receives each automatic retry's audit fact (the run's own audit list).
     audit_sink: Callable[[dict[str, Any]], None] | None = None
+    # The Runner's execution transport timeout (s); owner task nodes need it.
+    transport_timeout_s: float | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.name, str) or not self.name:
@@ -264,6 +265,12 @@ def _required_program_clock(context: NodeAdapterBuildContext) -> ProgramClock:
     return context.program_clock
 
 
+def _required_transport_timeout(context: NodeAdapterBuildContext) -> float:
+    if context.transport_timeout_s is None:
+        raise ValueError("an owner task node requires the Runner's transport timeout")
+    return context.transport_timeout_s
+
+
 def _required_input_resolver(
     context: NodeAdapterBuildContext,
 ) -> NodeAttemptInputResolver:
@@ -327,7 +334,6 @@ def _owner_task_builder(
             GripperCommandAdapter if gripper_command
             else InterruptMotionTaskAdapter if interrupt_motion
             else MotionTaskAdapter if motion
-            else IoOutputCommandAdapter if node_id == "io.set_output"
             else OwnerTaskAdapter
         )
         timing = ({
@@ -353,6 +359,7 @@ def _owner_task_builder(
             input_resolver=_required_input_resolver(context),
             port=port,  # type: ignore[arg-type]
             owner_port_name=port_name,
+            transport_timeout_s=_required_transport_timeout(context),
             intervention_port=context.ports.program_interventions,
             output_key_parameter=output_key_parameter,
             blackboard_read_parameters=blackboard_read_parameters,
@@ -572,6 +579,9 @@ _TASK_OWNER_PORTS: Final[Mapping[str, str]] = MappingProxyType(
 )
 _INVOCATION_OWNER_PORTS: Final[Mapping[str, str]] = MappingProxyType(
     {
+        # Global rule activation is one immediate Kernel call, like the
+        # Kernel's I/O signal invocations (`rules.set_active`).
+        "kernel.rules": "io_signals",
         "model.kinematics": "model_queries",
         "scene.carried_attachment": "scene_transactions",
         "scene.query": "scene_transactions",
@@ -641,11 +651,13 @@ def _definition_for(
     task_port = _TASK_OWNER_PORTS.get(entry.execution.owner_api)
     invocation_port = _INVOCATION_OWNER_PORTS.get(entry.execution.owner_api)
     if entry.execution.owner_api == "kernel.command_target":
-        if row.node_id in {"gripper.command_position", "io.set_output"}:
+        if row.node_id == "gripper.command_position":
             task_port = "kernel_operations"
         elif row.node_id in {"gripper.check_status", "gripper.wait_for_status"}:
             invocation_port = "gripper_status"
-        elif row.node_id in {"io.get_input", "io.check_input"}:
+        elif row.node_id in {
+            "io.get_input", "io.check_input", "io.set_output", "io.clear_outside_change"
+        }:
             invocation_port = "io_signals"
         elif row.node_id == "io.wait_for_input":
             return _AdapterDefinition(

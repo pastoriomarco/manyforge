@@ -1,19 +1,26 @@
-import { useState } from 'react';
+import { useState, type CSSProperties } from 'react';
 
 import {
-  DeploymentDraftChangedError,
+  cellApplyErrorText,
   type DeploymentWorkspaceController,
 } from '../hooks/useDeploymentWorkspace';
-import { errorMessage } from '../state/structuralResource';
 import { deploymentActionUnavailableReason } from '../state/documentStates';
+import { busyLabel, busyReason } from '../state/busyOperation';
+import type { ApplyPreview, ComponentState } from '../types/components';
+import {
+  componentStateDetail,
+  componentSummary,
+  componentTone,
+  LIFECYCLE_LABELS,
+  TONE_BADGE_CLASSES,
+} from '../state/componentPresentation';
+import { ApplyImpact } from './ApplyImpact';
 import type {
-  DeploymentCandidateOperationResponse,
   ManagerDiffProjection,
   ManagerGraphProjection,
 } from '../types/api';
 import {
-  COMPONENT_KIND_LABELS,
-  previewChanges,
+  componentRowText,
   type ComponentManagerRow,
   type ComponentManagerTab,
   type RoleFeedback,
@@ -22,7 +29,8 @@ import {
 /**
  * The Deployment tab pieces (Overview, Roles, Cell settings, Changes) and the
  * Components section's list: a thin client of the Deployment Draft routes,
- * Manager status/preview/Apply and CCLC. It owns no lifecycle or Applied state.
+ * the server-side Preview/Apply and the pushed component states. It owns no
+ * lifecycle or Applied state.
  */
 
 const TAB_LABELS: Record<ComponentManagerTab, string> = {
@@ -124,24 +132,29 @@ export function ComponentManagerSummary({ controller, rows, feedback, graph, dif
   );
 }
 
-/** One list row's live health (CCLC): dot class, lifecycle state and verdict. */
-export interface ComponentRowHealth {
-  dotClass: string;
-  state: string;
-  message: string;
-}
+const DEACTIVATED_TITLE = 'Deactivated: it stays in the Deployment and is left out of the cell at the next Apply.';
+
+const CHANGE_BADGES: Record<Exclude<ComponentManagerRow['change'], 'applied'>, string> = {
+  added: 'Added',
+  removed: 'Removed',
+};
 
 /**
- * The Draft's components and Applied-only ones, each with its kind, mount,
- * lifecycle state and health; a row selects the component's page.
+ * The Draft's components and Applied-only ones as one tree (CONTRACTS §16):
+ * a machine's members under it, a mounted tool under the component it is
+ * mounted on. Each row (the house row of Scene objects and Catalog): the id
+ * over its kind and model, its state as a badge at the right; depth indents
+ * the whole row; a deactivated member greyed with an Off badge. A row
+ * selects the component's page.
  */
-export function ComponentList({ rows, health = {}, selectedId, onSelect }: {
+export function ComponentList({ rows, states = {}, selectedId, onSelect }: {
   rows: readonly ComponentManagerRow[];
-  /** Health of the components in Manager Applied (by id); others have none yet. */
-  health?: Readonly<Record<string, ComponentRowHealth>>;
+  /** The pushed state of each component in the cell (by id); others have none yet. */
+  states?: Readonly<Record<string, ComponentState>>;
   selectedId: string | null;
   onSelect: (componentId: string) => void;
 }) {
+  const all = Object.values(states);
   return (
     <section className="dcard" aria-labelledby="component-manager-list-title">
       <header>
@@ -151,29 +164,29 @@ export function ComponentList({ rows, health = {}, selectedId, onSelect }: {
       {rows.length === 0 && (
         <p className="muted">The Deployment has no components yet. Add one below.</p>
       )}
-      <div className="drows">
+      <div className="drows component-list">
         {rows.map((row) => {
-          const rowHealth = health[row.componentId];
+          const state = row.active && row.change === 'applied' ? states[row.componentId] : undefined;
+          const detail = state === undefined ? null : componentStateDetail(state, all);
+          const badge = !row.active ? 'Off'
+            : row.change !== 'applied' ? CHANGE_BADGES[row.change]
+              : state === undefined ? 'Applied' : LIFECYCLE_LABELS[state.lifecycle];
           return (
             <button key={row.componentId} type="button"
-              className={`dpick${selectedId === row.componentId ? ' selected' : ''}`}
+              className={`dpick component-row${selectedId === row.componentId ? ' selected' : ''}${row.active ? '' : ' component-inactive'}`}
+              style={{ '--component-depth': row.depth } as CSSProperties}
               aria-pressed={selectedId === row.componentId}
-              title={rowHealth?.message ?? CHANGE_LABELS[row.change]}
+              title={!row.active ? DEACTIVATED_TITLE
+                : state === undefined ? CHANGE_LABELS[row.change] : componentSummary(state, all)}
               onClick={() => onSelect(row.componentId)}>
+              <strong>{row.componentId}</strong>
               <span>
-                <strong>{row.mount === null ? row.componentId : `${row.componentId} → ${row.mount}`}</strong>
-                <small>
-                  {row.kind === null ? 'Component' : COMPONENT_KIND_LABELS[row.kind]}
-                  {row.profileId !== null ? ` · ${row.profileId}` : ''}
-                </small>
+                <small>{componentRowText(row, row.owner === null && row.depth > 0)}</small>
+                {detail !== null && <small>{detail}</small>}
               </span>
-              <small>
-                {rowHealth !== undefined && (
-                  <><span className={`component-dot ${rowHealth.dotClass}`} aria-hidden="true" />{' '}</>
-                )}
-                {row.change !== 'applied' ? CHANGE_LABELS[row.change]
-                  : rowHealth !== undefined ? `${rowHealth.state} · ${rowHealth.message}` : 'Applied'}
-              </small>
+              <span className={!row.active ? 'status-pill status-pill-off'
+                : state === undefined ? TONE_BADGE_CLASSES.neutral
+                  : TONE_BADGE_CLASSES[componentTone(state)]}>{badge}</span>
             </button>
           );
         })}
@@ -218,16 +231,15 @@ export function RoleFeedbackCard({ feedback }: { feedback: readonly RoleFeedback
 interface PreviewState {
   draftId: string;
   draftRevision: number;
-  response: DeploymentCandidateOperationResponse;
+  preview: ApplyPreview;
 }
 
-/** Changes: Manager's convergence diff of the Draft against Applied, then one confirmed Apply. */
+/** Changes: the Preview's per-component impact (CONTRACTS §11), then one confirmed Apply. */
 export function ComponentManagerChanges({ controller, rows }: {
   controller: DeploymentWorkspaceController;
   rows: readonly ComponentManagerRow[];
 }) {
   const [preview, setPreview] = useState<PreviewState | null>(null);
-  const [previewing, setPreviewing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const workspace = controller.workspace;
   const draft = workspace?.draft ?? null;
@@ -235,36 +247,18 @@ export function ComponentManagerChanges({ controller, rows }: {
     && preview.draftId === draft.id && preview.draftRevision === draft.revision;
   const applyReason = deploymentActionUnavailableReason(
     workspace, 'apply', controller.documentUnavailableReason,
-  ) ?? (!current ? 'Preview the current Draft first.' : null);
+  );
   const pending = rows.filter((row) => row.change !== 'applied');
-  const candidate = preview?.response.result.candidatePreview ?? null;
-  const changes = candidate === null ? null : previewChanges(candidate);
 
   const runPreview = async () => {
     if (draft === null) return;
     const captured = { draftId: draft.id, draftRevision: draft.revision };
-    setPreviewing(true);
     setError(null);
     try {
-      const response = await controller.previewDraft();
-      if (response === null) setError(controller.mutationUnavailableReason ?? 'Preview is unavailable now.');
-      else setPreview({ ...captured, response });
+      const next = await controller.previewApply();
+      if (next !== null) setPreview({ ...captured, preview: next });
     } catch (reason: unknown) {
-      setError(errorMessage(reason, 'Manager preview failed.'));
-    } finally {
-      setPreviewing(false);
-    }
-  };
-  const apply = async () => {
-    if (preview === null) return;
-    setError(null);
-    try {
-      await controller.applyDraft({
-        expectedDraft: { draftId: preview.draftId, draftRevision: preview.draftRevision },
-      });
-    } catch (reason: unknown) {
-      if (!(reason instanceof DeploymentDraftChangedError)) throw reason;
-      setError(`${reason.message} Preview again.`);
+      setError(cellApplyErrorText(reason, 'Preview failed.'));
     }
   };
 
@@ -283,11 +277,15 @@ export function ComponentManagerChanges({ controller, rows }: {
         </dd></div>
       </dl>
       <div className="dactions">
-        <button type="button" disabled={draft?.document == null || previewing || controller.busy}
-          onClick={() => { void runPreview(); }}>{previewing ? 'Previewing…' : 'Preview changes'}</button>
+        <button type="button" disabled={draft?.document == null || controller.busy}
+          title={busyReason(controller.busyOperation) ?? undefined}
+          onClick={() => { void runPreview(); }}>{busyLabel(controller.busyOperation, 'preview', 'Preview changes')}</button>
         <button type="button" className="primary-action" disabled={applyReason !== null || controller.busy}
-          title={applyReason ?? 'Apply this exact Draft; Manager asks once to confirm component bring-up or removal.'}
-          onClick={() => { void apply(); }}>{controller.applying ? 'Applying' : 'Apply…'}</button>
+          title={applyReason ?? busyReason(controller.busyOperation)
+            ?? 'Preview this Draft and confirm its impact; the affected components come back prepared.'}
+          onClick={() => { void controller.applyDraft(); }}>
+          {busyLabel(controller.busyOperation, ['apply_preview', 'apply'], 'Apply…')}
+        </button>
       </div>
       {/* Yellow: a refused Preview or Apply changed nothing (M55 notice rule). */}
       {error !== null && <p className="inline-message severity-warning" role="alert">{error}</p>}
@@ -296,59 +294,11 @@ export function ComponentManagerChanges({ controller, rows }: {
           The Draft changed after this preview. Preview again before Apply.
         </p>
       )}
-      {candidate !== null && changes !== null && (
-        <div className="drows" aria-label="Manager preview">
-          <p>
-            {candidate.converged
-              ? 'Manager Applied already runs this Draft: Apply changes no component.'
-              : candidate.impact.destructive
-                ? 'Apply stops and changes running components (listed below).'
-                : 'Apply brings up or reconfigures the components listed below.'}
-          </p>
-          {changes.components.length > 0 && (
-            <dl>
-              {changes.components.map((row) => (
-                <div key={row.controllable_component_id}>
-                  <dt>{row.controllable_component_id}</dt>
-                  <dd>{row.disposition}{row.replacement_reasons.length > 0
-                    ? ` · ${row.replacement_reasons.join(', ')}` : ''}</dd>
-                </div>
-              ))}
-            </dl>
-          )}
-          {candidate.impact.detachedComponents.length > 0 && (
-            <p>Detached at their authored pose: {candidate.impact.detachedComponents.join(', ')}.</p>
-          )}
-          {!candidate.impact.program.executable && (
-            <p className="inline-message severity-warning">
-              The Program will not be executable after this Apply:
-              {' '}{candidate.impact.program.unresolvedReferences
-                .map((reference) => `${reference.component_role_id} (${reference.reason})`).join(', ')}.
-            </p>
-          )}
-          {changes.records.length > 0 && (
-            <details>
-              <summary>Compiled record changes ({changes.records.length} kinds)</summary>
-              <dl>
-                {changes.records.map((record) => (
-                  <div key={record.recordKind}>
-                    <dt>{record.recordKind}</dt>
-                    <dd>
-                      {record.added.length > 0 ? `+${record.added.length} ` : ''}
-                      {record.changed.length > 0 ? `~${record.changed.length} ` : ''}
-                      {record.removed.length > 0 ? `−${record.removed.length}` : ''}
-                    </dd>
-                  </div>
-                ))}
-              </dl>
-            </details>
-          )}
-        </div>
-      )}
+      {preview !== null && <ApplyImpact preview={preview.preview} />}
       <p className="field-help">
-        Preview compiles the Draft and asks Manager for the exact convergence diff; it changes
-        nothing. Apply sends this same Draft once; when components are brought up, replaced or
-        removed, Manager asks for one confirmation in the Apply dialog.
+        Preview shows which components the Draft adds, removes or restarts; it changes nothing.
+        Apply asks once to confirm that impact; the server disables, applies and prepares the
+        affected components, and the others keep running. Enable them afterwards.
       </p>
     </section>
   );

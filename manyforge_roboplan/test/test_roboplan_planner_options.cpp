@@ -5,13 +5,22 @@
 using namespace manyforge::roboplan_backend;
 using namespace manyforge::core;
 
+namespace {
+[[nodiscard]] PlannerSettingsDTO step_settings(double step) {
+  PlannerSettingsDTO settings;
+  settings.collision_check_step_rad = step;
+  return settings;
+}
+}  // namespace
+
 TEST(RoboPlanCompatibilityOptionsTest,
-     ProductionDefaultsPreserveQualifiedRoboPlan04Policy) {
+     ProductionDefaultsAreRrtConnectFirstPath) {
   const auto rrt = production_rrt_options("arm", 2.5);
   EXPECT_EQ(rrt.group_name, "arm");
   EXPECT_DOUBLE_EQ(rrt.max_planning_time, 2.5);
   EXPECT_EQ(rrt.max_nodes, 5000);
   EXPECT_DOUBLE_EQ(rrt.collision_check_step_size, 0.05);
+  EXPECT_TRUE(rrt.rrt_connect);
   EXPECT_FALSE(rrt.rrt_star);
   EXPECT_TRUE(rrt.fast_return);
 
@@ -54,22 +63,22 @@ TEST(RoboPlanCompatibilityOptionsTest,
   // M6 decision 18: the step is settable (Deployment collision_check_step_rad)
   // and validation uses the same value. Retries keep the finer of it and 0.01.
   EXPECT_DOUBLE_EQ(kDefaultCollisionCheckStepRad, 0.05);
-  const auto coarse = production_rrt_options("arm", 2.5, 0U, 0.08);
+  const auto coarse = production_rrt_options("arm", 2.5, 0U, step_settings(0.08));
   EXPECT_DOUBLE_EQ(coarse.collision_check_step_size, 0.08);
   EXPECT_DOUBLE_EQ(production_shortcutting_options("arm", 42U, 0U, 0.08).max_step_size,
                    0.08);
-  EXPECT_DOUBLE_EQ(production_rrt_options("arm", 2.5, 1U, 0.08).collision_check_step_size,
+  EXPECT_DOUBLE_EQ(production_rrt_options("arm", 2.5, 1U, step_settings(0.08)).collision_check_step_size,
                    0.01);
-  const auto fine = production_rrt_options("arm", 2.5, 0U, 0.004);
+  const auto fine = production_rrt_options("arm", 2.5, 0U, step_settings(0.004));
   EXPECT_DOUBLE_EQ(fine.collision_check_step_size, 0.004);
-  EXPECT_DOUBLE_EQ(production_rrt_options("arm", 2.5, 2U, 0.004).collision_check_step_size,
+  EXPECT_DOUBLE_EQ(production_rrt_options("arm", 2.5, 2U, step_settings(0.004)).collision_check_step_size,
                    0.004);
   EXPECT_DOUBLE_EQ(production_shortcutting_options("arm", 42U, 1U, 0.004).max_step_size,
                    0.004);
   // One rule, shared with validation of the attempt's trajectory.
   for (const std::uint32_t attempt : {0U, 1U, 5U}) {
     for (const double step : {0.08, 0.004}) {
-      EXPECT_DOUBLE_EQ(production_rrt_options("arm", 2.5, attempt, step).collision_check_step_size,
+      EXPECT_DOUBLE_EQ(production_rrt_options("arm", 2.5, attempt, step_settings(step)).collision_check_step_size,
                        collision_check_step_for_attempt(step, attempt));
     }
   }
@@ -88,32 +97,46 @@ TEST(RoboPlanCompatibilityOptionsTest,
   }
 }
 
-TEST(RoboPlanCompatibilityOptionsTest,
-     PortablePlanningProfilesMapToExplicitRoboPlanPolicies) {
-  const auto base_rrt = production_rrt_options("arm", 2.5);
-  const auto first = planning_profile_rrt_options(
-      base_rrt, PlanningProfileDTO::kFirstFeasible);
-  EXPECT_FALSE(first.rrt_star);
-  EXPECT_TRUE(first.fast_return);
+TEST(RoboPlanCompatibilityOptionsTest, PlannerBlockMapsToRoboPlanRrtOptions) {
+  PlannerSettingsDTO planner;
+  planner.search = PlannerSearchDTO::kRrt;
+  planner.max_nodes = 1234U;
+  const auto rrt = production_rrt_options("arm", 2.5, 0U, planner);
+  EXPECT_FALSE(rrt.rrt_connect);
+  EXPECT_EQ(rrt.max_nodes, 1234U);
+  EXPECT_FALSE(rrt.rrt_star);
+  EXPECT_TRUE(rrt.fast_return);
 
-  const auto balanced = planning_profile_rrt_options(
-      base_rrt, PlanningProfileDTO::kBalanced);
-  EXPECT_TRUE(balanced.rrt_star);
-  EXPECT_TRUE(balanced.fast_return);
+  planner.search = PlannerSearchDTO::kRrtConnect;
+  planner.optimize = PlannerOptimizeDTO::kRrtStar;
+  const auto star = production_rrt_options("arm", 2.5, 0U, planner);
+  EXPECT_TRUE(star.rrt_connect);
+  EXPECT_TRUE(star.rrt_star);
+  EXPECT_FALSE(star.fast_return);
 
-  const auto quality = planning_profile_rrt_options(
-      base_rrt, PlanningProfileDTO::kQualityBounded);
-  EXPECT_TRUE(quality.rrt_star);
-  EXPECT_FALSE(quality.fast_return);
+  // best_of_n repeats first-path plans; the candidate computer keeps the
+  // shortest.
+  planner.optimize = PlannerOptimizeDTO::kBestOfN;
+  const auto best = production_rrt_options("arm", 2.5, 0U, planner);
+  EXPECT_FALSE(best.rrt_star);
+  EXPECT_TRUE(best.fast_return);
+}
 
-  const auto base_ik = production_planning_ik_options("arm");
-  EXPECT_TRUE(planning_profile_ik_options(
-                  base_ik, PlanningProfileDTO::kFirstFeasible)
-                  .fast_return);
-  EXPECT_TRUE(planning_profile_ik_options(
-                  base_ik, PlanningProfileDTO::kBalanced)
-                  .fast_return);
-  EXPECT_FALSE(planning_profile_ik_options(
-                   base_ik, PlanningProfileDTO::kQualityBounded)
-                   .fast_return);
+TEST(RoboPlanCompatibilityOptionsTest, MotionOverrideReplacesOnlyItsMembers) {
+  PlannerSettingsDTO defaults;
+  defaults.n = 6U;
+  PlannerOverrideDTO override_value;
+  override_value.optimize = PlannerOptimizeDTO::kBestOfN;
+  override_value.collision_check_step_rad = 0.02;
+  const auto resolved = resolve_planner_settings(defaults, override_value);
+  EXPECT_EQ(resolved.search, PlannerSearchDTO::kRrtConnect);
+  EXPECT_EQ(resolved.optimize, PlannerOptimizeDTO::kBestOfN);
+  EXPECT_EQ(resolved.n, 6U);
+  EXPECT_DOUBLE_EQ(resolved.collision_check_step_rad, 0.02);
+  EXPECT_EQ(resolved.max_nodes, kDefaultPlannerMaxNodes);
+  EXPECT_EQ(resolve_planner_settings(defaults, {}), defaults);
+
+  EXPECT_TRUE(valid_planner_override(override_value));
+  override_value.n = 1U;
+  EXPECT_FALSE(valid_planner_override(override_value));
 }

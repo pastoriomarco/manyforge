@@ -38,7 +38,7 @@ using manyforge::core::CapabilityProviderBindingRevision;
 using manyforge::core::CellId;
 using manyforge::core::ContentDigest;
 using manyforge::core::GraphRevision;
-using manyforge::core::ProjectionNativeRuntimeBindingDTO;
+using manyforge::core::ProjectionExecutionHostBindingDTO;
 using manyforge::core::ProjectionRevisionDTO;
 using manyforge::core::RetainedBundleId;
 using manyforge::core::RuntimeEpoch;
@@ -448,7 +448,7 @@ std::string SemanticDigest(
 }
 
 std::string NativeBindingsProjection(
-    const std::vector<ProjectionNativeRuntimeBindingDTO>& bindings) {
+    const std::vector<ProjectionExecutionHostBindingDTO>& bindings) {
   std::string result{"["};
   for (std::size_t index = 0U; index < bindings.size(); ++index) {
     if (index != 0U) {
@@ -488,7 +488,7 @@ EncodedIntent EncodeIntent(const ManagerBootstrapIntentDTO& intent) {
   ValidateDigest(
       intent.canonical_empty_graph_revision.value(),
       "canonical_empty_graph_revision");
-  for (const auto& binding : intent.native_runtime_bindings) {
+  for (const auto& binding : intent.execution_host_bindings) {
     ValidateBoundedIdentity(
         binding.provider_binding_id.value(), "provider_binding_id");
     ValidateBoundedIdentity(
@@ -501,9 +501,9 @@ EncodedIntent EncodeIntent(const ManagerBootstrapIntentDTO& intent) {
   const auto generation =
       CheckedSigned(intent.bootstrap_generation.value(), "bootstrap_generation");
   const auto bindings_projection =
-      NativeBindingsProjection(intent.native_runtime_bindings);
+      NativeBindingsProjection(intent.execution_host_bindings);
   const auto bindings_digest =
-      SemanticDigest("native-runtime-binding-set", bindings_projection);
+      SemanticDigest("execution-host-binding-set", bindings_projection);
   const auto intent_digest = SemanticDigest(
       "bootstrap-intent",
       JsonObject({
@@ -517,7 +517,7 @@ EncodedIntent EncodeIntent(const ManagerBootstrapIntentDTO& intent) {
               intent.canonical_empty_retained_bundle_id.value()),
           StringField("cell_id", intent.cell_id.value()),
           StringField(
-              "native_runtime_binding_set_digest", bindings_digest),
+              "execution_host_binding_set_digest", bindings_digest),
       }));
   return {
       generation,
@@ -661,7 +661,7 @@ void ValidateBootstrapJournalMetadata(
           static_cast<std::int64_t>(kMaximumBootstrapAttempts) ||
       row.Integer(6) !=
           static_cast<std::int64_t>(
-              kMaximumBootstrapNativeRuntimeBindings) ||
+              kMaximumBootstrapExecutionHostBindings) ||
       row.Integer(7) !=
           kMaximumBootstrapJournalDatabasePageImageBytes) {
     throw ManagerBootstrapJournalIntegrityError(
@@ -733,19 +733,19 @@ bool ManagerBootstrapIntentDTO::valid() const noexcept {
   if (bootstrap_id.empty() || !bootstrap_generation.nonzero() ||
       cell_id.empty() || canonical_empty_retained_bundle_id.empty() ||
       canonical_empty_graph_revision.empty() ||
-      native_runtime_bindings.size() >
-          kMaximumBootstrapNativeRuntimeBindings) {
+      execution_host_bindings.size() >
+          kMaximumBootstrapExecutionHostBindings) {
     return false;
   }
-  for (std::size_t index = 0U; index < native_runtime_bindings.size();
+  for (std::size_t index = 0U; index < execution_host_bindings.size();
        ++index) {
-    if (!native_runtime_bindings[index].valid()) {
+    if (!execution_host_bindings[index].valid()) {
       return false;
     }
     if (index != 0U &&
         !manyforge::core::CanonicalProjectionNativeBindingLess(
-            native_runtime_bindings[index - 1U],
-            native_runtime_bindings[index])) {
+            execution_host_bindings[index - 1U],
+            execution_host_bindings[index])) {
       return false;
     }
   }
@@ -991,7 +991,7 @@ class SqliteManagerBootstrapJournal::Impl final {
           "INSERT INTO bootstrap_journal_metadata ("
           "singleton,schema_id,schema_version,schema_artifact_digest,cell_id,"
           "maximum_bootstrap_attempts,"
-          "maximum_native_runtime_bindings_per_attempt,"
+          "maximum_execution_host_bindings_per_attempt,"
           "maximum_main_database_page_image_bytes"
           ") VALUES (1,?,?,?,?,?,?,?)");
       metadata.Bind(1, kManagerBootstrapJournalSchemaId);
@@ -1005,7 +1005,7 @@ class SqliteManagerBootstrapJournal::Impl final {
       metadata.Bind(
           6,
           static_cast<std::int64_t>(
-              kMaximumBootstrapNativeRuntimeBindings));
+              kMaximumBootstrapExecutionHostBindings));
       metadata.Bind(7, kMaximumBootstrapJournalDatabasePageImageBytes);
       static_cast<void>(metadata.Step());
     } else if (
@@ -1078,7 +1078,7 @@ class SqliteManagerBootstrapJournal::Impl final {
         "SELECT bootstrap_id,bootstrap_generation,"
         "canonical_empty_retained_bundle_id,"
         "canonical_empty_graph_revision,"
-        "native_runtime_binding_set_digest,intent_digest "
+        "execution_host_binding_set_digest,intent_digest "
         "FROM manager_bootstrap_intents "
         "WHERE bootstrap_id=? AND bootstrap_generation=?");
     row.Bind(1, requested_bootstrap_id.value());
@@ -1105,7 +1105,7 @@ class SqliteManagerBootstrapJournal::Impl final {
         database_,
         "SELECT ordinal,provider_binding_id,provider_binding_revision,"
         "runtime_unit_id,runtime_epoch "
-        "FROM manager_bootstrap_native_runtime_bindings "
+        "FROM manager_bootstrap_execution_host_bindings "
         "WHERE bootstrap_id=? AND bootstrap_generation=? "
         "ORDER BY ordinal LIMIT ?");
     binding_rows.Bind(
@@ -1115,19 +1115,19 @@ class SqliteManagerBootstrapJournal::Impl final {
     binding_rows.Bind(
         3,
         static_cast<std::int64_t>(
-            kMaximumBootstrapNativeRuntimeBindings + 1U));
-    std::vector<ProjectionNativeRuntimeBindingDTO> bindings;
+            kMaximumBootstrapExecutionHostBindings + 1U));
+    std::vector<ProjectionExecutionHostBindingDTO> bindings;
     while (binding_rows.Step()) {
-      if (bindings.size() >= kMaximumBootstrapNativeRuntimeBindings) {
+      if (bindings.size() >= kMaximumBootstrapExecutionHostBindings) {
         throw ManagerBootstrapJournalIntegrityError(
-            "stored native runtime binding count exceeds its ceiling");
+            "stored execution host binding count exceeds its ceiling");
       }
       if (binding_rows.Integer(0) !=
           static_cast<std::int64_t>(bindings.size())) {
         throw ManagerBootstrapJournalIntegrityError(
-            "stored native runtime binding ordinals are not contiguous");
+            "stored execution host binding ordinals are not contiguous");
       }
-      bindings.push_back(ProjectionNativeRuntimeBindingDTO{
+      bindings.push_back(ProjectionExecutionHostBindingDTO{
           CapabilityProviderBindingId(binding_rows.Text(1)),
           CapabilityProviderBindingRevision(binding_rows.Text(2)),
           RuntimeUnitId(binding_rows.Text(3)),
@@ -1296,14 +1296,14 @@ class SqliteManagerBootstrapJournal::Impl final {
         database_, "SELECT COUNT(*) FROM manager_bootstrap_intents");
     const auto binding_count = ScalarInteger(
         database_,
-        "SELECT COUNT(*) FROM manager_bootstrap_native_runtime_bindings");
+        "SELECT COUNT(*) FROM manager_bootstrap_execution_host_bindings");
     const auto accepted_count = ScalarInteger(
         database_,
         "SELECT COUNT(*) FROM manager_bootstrap_accepted_targets");
     constexpr auto kMaximumBindingRows =
         static_cast<std::int64_t>(kMaximumBootstrapAttempts) *
         static_cast<std::int64_t>(
-            kMaximumBootstrapNativeRuntimeBindings);
+            kMaximumBootstrapExecutionHostBindings);
     if (intent_count < 0 ||
         intent_count >
             static_cast<std::int64_t>(kMaximumBootstrapAttempts) ||
@@ -1346,7 +1346,7 @@ class SqliteManagerBootstrapJournal::Impl final {
             "bootstrap attempt inventory references a missing intent");
       }
       observed_binding_count += static_cast<std::int64_t>(
-          intent->intent.native_runtime_bindings.size());
+          intent->intent.execution_host_bindings.size());
       if (AcceptedTargetLocked(*intent).has_value()) {
         ++observed_accepted_count;
       }
@@ -1469,7 +1469,7 @@ SqliteManagerBootstrapJournal::EnsureIntent(
       "bootstrap_id,bootstrap_generation,"
       "canonical_empty_retained_bundle_id,"
       "canonical_empty_graph_revision,"
-      "native_runtime_binding_set_digest,intent_digest"
+      "execution_host_binding_set_digest,intent_digest"
       ") VALUES (?,?,?,?,?,?)");
   insert.Bind(1, intent.bootstrap_id.value());
   insert.Bind(2, encoded.generation);
@@ -1480,12 +1480,12 @@ SqliteManagerBootstrapJournal::EnsureIntent(
   static_cast<void>(insert.Step());
 
   for (std::size_t index = 0U;
-       index < intent.native_runtime_bindings.size();
+       index < intent.execution_host_bindings.size();
        ++index) {
-    const auto& binding = intent.native_runtime_bindings[index];
+    const auto& binding = intent.execution_host_bindings[index];
     Statement binding_insert(
         impl_->database_,
-        "INSERT INTO manager_bootstrap_native_runtime_bindings ("
+        "INSERT INTO manager_bootstrap_execution_host_bindings ("
         "bootstrap_id,bootstrap_generation,ordinal,provider_binding_id,"
         "provider_binding_revision,runtime_unit_id,runtime_epoch"
         ") VALUES (?,?,?,?,?,?,?)");

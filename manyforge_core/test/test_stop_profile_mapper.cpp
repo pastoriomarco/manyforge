@@ -531,7 +531,7 @@ TEST(StopProfileMapper, ProjectsOneCompleteLaneNeutralEvidenceObject) {
   ControlledStopResultDTO result;
   result.accepted = true;
   result.executed_stop_mode = MotionInterruptStopMode::kSoftOnPath;
-  result.stop_command_source = MotionInterruptStopCommandSource::kNativeSimulatedPathRamp;
+  result.stop_command_source = MotionInterruptStopCommandSource::kFjtPreemptPathRamp;
   result.backend_stop_confirmed = true;
   result.confirmation_latency_ns = 1'000'000'000;
   result.stop_distance_rad = 0.12;
@@ -548,7 +548,7 @@ TEST(StopProfileMapper, ProjectsOneCompleteLaneNeutralEvidenceObject) {
             "sha256:policy");
   EXPECT_EQ(std::get<std::string>(object->at("actual_stop_mode").value), "soft_on_path");
   EXPECT_EQ(std::get<std::string>(object->at("stop_command_source").value),
-            "native_simulated_path_ramp");
+            "fjt_preempt_path_ramp");
   const auto* diagnostics = std::get_if<JsonObjectDTO>(&object->at("provider_diagnostics").value);
   ASSERT_NE(diagnostics, nullptr);
   EXPECT_EQ(std::get<std::string>(diagnostics->at("retimer").value), "quintic");

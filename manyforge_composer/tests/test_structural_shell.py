@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import BaseModel
 from manyforge_behavior.catalog import NodeCatalog
 from manyforge_behavior.node_environment import BUILTIN_CATALOG_PATH
 
@@ -53,7 +54,7 @@ def test_health_and_catalog_report_structural_only_state() -> None:
     catalog = client.get("/api/catalog")
     assert catalog.status_code == 200
     payload = catalog.json()
-    assert len(payload["entries"]) == 50  # motion.set_tcp
+    assert len(payload["entries"]) == 52  # rules.set_active, io.clear_outside_change
     assert payload["apiVersion"] == "manyforge.node_catalog.v2"
     assert payload["contentVersion"] == NodeCatalog(BUILTIN_CATALOG_PATH).content_version
     assert payload["catalogId"] == "manyforge_builtin"
@@ -92,7 +93,7 @@ def test_health_and_catalog_report_structural_only_state() -> None:
     assert environment.status_code == 200
     environment_payload = environment.json()
     assert environment_payload["catalog"]["catalogDigest"] == payload["catalogDigest"]
-    assert len(environment_payload["executableRegistry"]) == 50
+    assert len(environment_payload["executableRegistry"]) == 52
 
 
 def test_removed_runtime_routes_fail_with_one_typed_unavailable_reason() -> None:
@@ -992,9 +993,15 @@ def test_scenario_folder_browser_is_bounded(
     assert response.status_code == 413
 
 
+class _ValidatedBody(BaseModel):
+    # Module level: under postponed annotations FastAPI resolves an endpoint's
+    # annotation in the module namespace, so a function-local model would be
+    # read as a query parameter.
+    name: str
+
+
 def test_typed_refusals_name_their_producer_and_share_the_validation_shape() -> None:
     from fastapi import HTTPException
-    from pydantic import BaseModel
 
     app = create_app(
         ComposerState(),
@@ -1016,10 +1023,7 @@ def test_typed_refusals_name_their_producer_and_share_the_validation_shape() -> 
     def plain_refusal() -> None:
         raise HTTPException(status_code=404, detail="Not here")
 
-    class Body(BaseModel):
-        name: str
-
-    def validated(body: Body) -> dict[str, str]:
+    def validated(body: _ValidatedBody) -> dict[str, str]:
         return {"name": body.name}
 
     for path, endpoint, methods in (

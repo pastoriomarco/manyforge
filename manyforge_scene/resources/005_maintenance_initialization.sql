@@ -25,9 +25,12 @@ CREATE TABLE IF NOT EXISTS logical_scene_maintenance_initialization_migrations (
         REFERENCES logical_scene_store_metadata (singleton)
 ) STRICT;
 
+-- initialization_sequence is strictly increasing; at the bound the owner
+-- evicts the oldest initialization no reader still needs.
 CREATE TABLE IF NOT EXISTS logical_scene_maintenance_initialization_intents (
     initialization_sequence INTEGER PRIMARY KEY CHECK (
-        initialization_sequence > 0 AND initialization_sequence <= 256
+        initialization_sequence > 0
+        AND initialization_sequence <= 9007199254740991
     ),
     apply_id TEXT NOT NULL,
     apply_generation INTEGER NOT NULL CHECK (
@@ -154,8 +157,8 @@ INSERT OR IGNORE INTO logical_scene_maintenance_migration_state(
 )
 SELECT 1, EXISTS(
     SELECT 1
-    FROM logical_scene_native_runtime_recovery_intents AS i
-    LEFT JOIN logical_scene_native_runtime_recovery_completions AS c
+    FROM logical_scene_execution_host_recovery_intents AS i
+    LEFT JOIN logical_scene_execution_host_recovery_completions AS c
         USING(recovery_generation)
     WHERE c.recovery_generation IS NULL
       AND i.structural_lineage_generation = (
@@ -174,7 +177,7 @@ SELECT 1, EXISTS(
     WHERE f.apply_id IS NULL AND d.apply_id IS NULL
 );
 
-CREATE TABLE IF NOT EXISTS logical_scene_migrated_active_native_runtime_bindings (
+CREATE TABLE IF NOT EXISTS logical_scene_migrated_active_execution_host_bindings (
     binding_ordinal INTEGER PRIMARY KEY CHECK (
         binding_ordinal >= 0 AND binding_ordinal < 256
     ),
@@ -186,16 +189,16 @@ CREATE TABLE IF NOT EXISTS logical_scene_migrated_active_native_runtime_bindings
 
 -- Prefer the latest fully completed runtime replacement. If none exists,
 -- preserve the binding set of the latest finalized structural deployment.
-INSERT OR IGNORE INTO logical_scene_migrated_active_native_runtime_bindings
+INSERT OR IGNORE INTO logical_scene_migrated_active_execution_host_bindings
 SELECT b.binding_ordinal,b.provider_binding_id,b.provider_binding_revision,
        b.runtime_unit_id,b.runtime_epoch
-FROM logical_scene_native_runtime_recovery_bindings AS b
-INNER JOIN logical_scene_native_runtime_recovery_intents AS i
+FROM logical_scene_execution_host_recovery_bindings AS b
+INNER JOIN logical_scene_execution_host_recovery_intents AS i
     USING(recovery_generation)
 WHERE b.recovery_generation = (
     SELECT max(c.recovery_generation)
-    FROM logical_scene_native_runtime_recovery_completions AS c
-    INNER JOIN logical_scene_native_runtime_recovery_intents AS i2
+    FROM logical_scene_execution_host_recovery_completions AS c
+    INNER JOIN logical_scene_execution_host_recovery_intents AS i2
         USING(recovery_generation)
     WHERE i2.structural_lineage_generation = (
         SELECT max(s2.lineage_generation)
@@ -206,7 +209,7 @@ WHERE b.recovery_generation = (
 )
 ORDER BY b.binding_ordinal;
 
-INSERT OR IGNORE INTO logical_scene_migrated_active_native_runtime_bindings
+INSERT OR IGNORE INTO logical_scene_migrated_active_execution_host_bindings
 SELECT row_number() OVER (ORDER BY r.provider_binding_id,
                                    r.provider_binding_revision) - 1,
        r.provider_binding_id,r.provider_binding_revision,
@@ -218,7 +221,7 @@ INNER JOIN logical_scene_named_apply_finalizations AS f
     USING(apply_id,apply_generation,projection_stage_generation)
 WHERE r.disposition != 'removed'
   AND NOT EXISTS (
-      SELECT 1 FROM logical_scene_migrated_active_native_runtime_bindings
+      SELECT 1 FROM logical_scene_migrated_active_execution_host_bindings
   )
   AND s.lineage_generation = (
       SELECT max(s2.lineage_generation)
@@ -238,10 +241,10 @@ DROP TRIGGER IF EXISTS logical_scene_transaction_intents_no_delete;
 DROP TRIGGER IF EXISTS logical_scene_request_outcomes_no_delete;
 DROP TRIGGER IF EXISTS logical_scene_projection_attempts_no_delete;
 DROP TRIGGER IF EXISTS logical_scene_projection_results_no_delete;
-DROP TRIGGER IF EXISTS logical_scene_native_runtime_recovery_intents_no_delete;
-DROP TRIGGER IF EXISTS logical_scene_native_runtime_recovery_bindings_no_delete;
-DROP TRIGGER IF EXISTS logical_scene_native_runtime_recovery_results_no_delete;
-DROP TRIGGER IF EXISTS logical_scene_native_runtime_recovery_completions_no_delete;
+DROP TRIGGER IF EXISTS logical_scene_execution_host_recovery_intents_no_delete;
+DROP TRIGGER IF EXISTS logical_scene_execution_host_recovery_bindings_no_delete;
+DROP TRIGGER IF EXISTS logical_scene_execution_host_recovery_results_no_delete;
+DROP TRIGGER IF EXISTS logical_scene_execution_host_recovery_completions_no_delete;
 CREATE TABLE logical_scene_history_state_ua4 (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     compaction_generation INTEGER NOT NULL CHECK (
@@ -303,8 +306,6 @@ CREATE TABLE logical_scene_history_state_ua4 (
          AND checkpoint_snapshot_json IS NULL)
         OR
         (compaction_generation > 0
-         AND compacted_through_transaction_sequence > 0
-         AND compacted_through_owner_event_sequence > 0
          AND request_epoch_generation > 1
          AND checkpoint_retained_bundle_id IS NOT NULL
          AND checkpoint_graph_revision IS NOT NULL
@@ -433,18 +434,18 @@ DROP TABLE IF EXISTS logical_scene_named_apply_activation_selections;
 DROP TABLE IF EXISTS logical_scene_named_apply_native_transition_rows;
 DROP TABLE IF EXISTS logical_scene_named_apply_native_intents;
 
-DROP TRIGGER IF EXISTS logical_scene_native_runtime_recovery_intents_no_update;
-DROP TRIGGER IF EXISTS logical_scene_native_runtime_recovery_intents_no_delete;
-DROP TRIGGER IF EXISTS logical_scene_native_runtime_recovery_bindings_no_update;
-DROP TRIGGER IF EXISTS logical_scene_native_runtime_recovery_bindings_no_delete;
-DROP TRIGGER IF EXISTS logical_scene_native_runtime_recovery_results_no_update;
-DROP TRIGGER IF EXISTS logical_scene_native_runtime_recovery_results_no_delete;
-DROP TRIGGER IF EXISTS logical_scene_native_runtime_recovery_completions_no_update;
-DROP TRIGGER IF EXISTS logical_scene_native_runtime_recovery_completions_no_delete;
-DROP TABLE IF EXISTS logical_scene_native_runtime_recovery_results;
-DROP TABLE IF EXISTS logical_scene_native_runtime_recovery_completions;
-DROP TABLE IF EXISTS logical_scene_native_runtime_recovery_bindings;
-DROP TABLE IF EXISTS logical_scene_native_runtime_recovery_intents;
+DROP TRIGGER IF EXISTS logical_scene_execution_host_recovery_intents_no_update;
+DROP TRIGGER IF EXISTS logical_scene_execution_host_recovery_intents_no_delete;
+DROP TRIGGER IF EXISTS logical_scene_execution_host_recovery_bindings_no_update;
+DROP TRIGGER IF EXISTS logical_scene_execution_host_recovery_bindings_no_delete;
+DROP TRIGGER IF EXISTS logical_scene_execution_host_recovery_results_no_update;
+DROP TRIGGER IF EXISTS logical_scene_execution_host_recovery_results_no_delete;
+DROP TRIGGER IF EXISTS logical_scene_execution_host_recovery_completions_no_update;
+DROP TRIGGER IF EXISTS logical_scene_execution_host_recovery_completions_no_delete;
+DROP TABLE IF EXISTS logical_scene_execution_host_recovery_results;
+DROP TABLE IF EXISTS logical_scene_execution_host_recovery_completions;
+DROP TABLE IF EXISTS logical_scene_execution_host_recovery_bindings;
+DROP TABLE IF EXISTS logical_scene_execution_host_recovery_intents;
 
 DROP TRIGGER IF EXISTS logical_scene_named_apply_stages_no_update;
 DROP TRIGGER IF EXISTS logical_scene_named_apply_stages_no_delete;
@@ -473,13 +474,13 @@ BEFORE DELETE ON logical_scene_maintenance_migration_state
 BEGIN
     SELECT RAISE(ABORT, 'logical_scene maintenance migration state is immutable');
 END;
-CREATE TRIGGER IF NOT EXISTS logical_scene_migrated_active_native_runtime_bindings_no_update
-BEFORE UPDATE ON logical_scene_migrated_active_native_runtime_bindings
+CREATE TRIGGER IF NOT EXISTS logical_scene_migrated_active_execution_host_bindings_no_update
+BEFORE UPDATE ON logical_scene_migrated_active_execution_host_bindings
 BEGIN
     SELECT RAISE(ABORT, 'logical_scene migrated active bindings are immutable');
 END;
-CREATE TRIGGER IF NOT EXISTS logical_scene_migrated_active_native_runtime_bindings_no_delete
-BEFORE DELETE ON logical_scene_migrated_active_native_runtime_bindings
+CREATE TRIGGER IF NOT EXISTS logical_scene_migrated_active_execution_host_bindings_no_delete
+BEFORE DELETE ON logical_scene_migrated_active_execution_host_bindings
 BEGIN
     SELECT RAISE(ABORT, 'logical_scene migrated active bindings are immutable');
 END;
@@ -494,6 +495,8 @@ BEGIN
     SELECT RAISE(ABORT, 'logical_scene migrated structural completions are immutable');
 END;
 
+-- Rows are immutable. Only the owner's bounded eviction of the oldest settled
+-- initialization deletes them, inside its compaction_in_progress window.
 CREATE TRIGGER IF NOT EXISTS logical_scene_maintenance_initialization_intents_no_update
 BEFORE UPDATE ON logical_scene_maintenance_initialization_intents
 BEGIN
@@ -501,6 +504,8 @@ BEGIN
 END;
 CREATE TRIGGER IF NOT EXISTS logical_scene_maintenance_initialization_intents_no_delete
 BEFORE DELETE ON logical_scene_maintenance_initialization_intents
+WHEN (SELECT compaction_in_progress FROM logical_scene_history_state
+      WHERE singleton = 1) != 1
 BEGIN
     SELECT RAISE(ABORT, 'logical_scene maintenance intents are immutable');
 END;
@@ -511,6 +516,8 @@ BEGIN
 END;
 CREATE TRIGGER IF NOT EXISTS logical_scene_maintenance_initialization_bindings_no_delete
 BEFORE DELETE ON logical_scene_maintenance_initialization_bindings
+WHEN (SELECT compaction_in_progress FROM logical_scene_history_state
+      WHERE singleton = 1) != 1
 BEGIN
     SELECT RAISE(ABORT, 'logical_scene maintenance bindings are immutable');
 END;
@@ -533,6 +540,8 @@ BEGIN
 END;
 CREATE TRIGGER IF NOT EXISTS logical_scene_maintenance_initialization_results_no_delete
 BEFORE DELETE ON logical_scene_maintenance_initialization_results
+WHEN (SELECT compaction_in_progress FROM logical_scene_history_state
+      WHERE singleton = 1) != 1
 BEGIN
     SELECT RAISE(ABORT, 'logical_scene maintenance terminal results are immutable');
 END;
@@ -543,6 +552,8 @@ BEGIN
 END;
 CREATE TRIGGER IF NOT EXISTS logical_scene_maintenance_initialization_completions_no_delete
 BEFORE DELETE ON logical_scene_maintenance_initialization_completions
+WHEN (SELECT compaction_in_progress FROM logical_scene_history_state
+      WHERE singleton = 1) != 1
 BEGIN
     SELECT RAISE(ABORT, 'logical_scene maintenance completions are immutable');
 END;

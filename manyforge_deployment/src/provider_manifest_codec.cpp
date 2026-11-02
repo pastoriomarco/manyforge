@@ -1,6 +1,5 @@
 #include "manyforge_deployment/provider_manifest_codec.hpp"
 
-#include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
 #include <manyforge_core/types/capability_definition.hpp>
 
 #include <algorithm>
@@ -213,20 +212,6 @@ decode_normalized(const CanonicalValue &normalized) {
     });
   }
 
-  std::optional<core::ProviderLifecyclePlanCatalogDeclarationDTO>
-      lifecycle_plan_catalog;
-  if (const auto *declaration =
-          normalized.find_object_member("lifecycle_plan_catalog");
-      declaration != nullptr) {
-    lifecycle_plan_catalog.emplace(
-        core::SchemaId(
-            require_string(require_member(*declaration, "catalog_api_version"),
-                           "lifecycle_plan_catalog.catalog_api_version")),
-        core::ContentDigest(
-            require_string(require_member(*declaration, "semantic_digest"),
-                           "lifecycle_plan_catalog.semantic_digest")));
-  }
-
   return {
       core::ProviderManifestId(
           require_string(require_member(normalized, "provider_manifest_id"),
@@ -236,48 +221,8 @@ decode_normalized(const CanonicalValue &normalized) {
           "provider_manifest_revision")),
       std::move(capabilities),
       std::move(contracts),
-      std::move(lifecycle_plan_catalog),
+      std::nullopt,
   };
-}
-
-[[nodiscard]] bool
-is_lifecycle_capability(const core::CapabilityId &capability_id) {
-  constexpr std::string_view prefix = "component.lifecycle.";
-  return capability_id.value().starts_with(prefix);
-}
-
-void validate_lifecycle_catalog_declaration(
-    const core::ProviderManifestDTO &manifest) {
-  const bool offers_lifecycle =
-      std::any_of(manifest.offered_capabilities.begin(),
-                  manifest.offered_capabilities.end(), [](const auto &offer) {
-                    return is_lifecycle_capability(offer.capability_id);
-                  });
-  if (offers_lifecycle != manifest.lifecycle_plan_catalog.has_value()) {
-    fail("provider-manifest lifecycle capabilities and catalog declaration "
-         "must be present together");
-  }
-  if (!manifest.lifecycle_plan_catalog.has_value()) {
-    return;
-  }
-  if (manifest.lifecycle_plan_catalog->catalog_api_version.value() !=
-      core::kBrandLifecyclePlanCatalogApiVersion) {
-    fail("provider-manifest lifecycle catalog selects an unsupported API "
-         "version");
-  }
-  if (!content_identity::is_sha256_digest(
-          manifest.lifecycle_plan_catalog->semantic_digest.value())) {
-    fail("provider-manifest lifecycle catalog semantic digest is invalid");
-  }
-  const auto observe = std::find_if(
-      manifest.offered_capabilities.begin(),
-      manifest.offered_capabilities.end(), [](const auto &offer) {
-        return offer.capability_id.value() == "component.lifecycle.observe";
-      });
-  if (observe == manifest.offered_capabilities.end()) {
-    fail("provider-manifest lifecycle catalog requires the lifecycle observe "
-         "capability");
-  }
 }
 
 void validate_capability_references(const core::ProviderManifestDTO &manifest) {
@@ -369,7 +314,6 @@ QualifiedProviderManifest resolve_and_qualify_provider_manifest(
   validate_capability_references(decoded);
   validate_provider_contract_schemas(decoded);
   validate_endpoint_role_closure(decoded);
-  validate_lifecycle_catalog_declaration(decoded);
   if (decoded.provider_manifest_id != reference.record_id ||
       decoded.provider_manifest_revision != reference.record_revision) {
     fail("provider-manifest typed ID/revision selector does not match its "

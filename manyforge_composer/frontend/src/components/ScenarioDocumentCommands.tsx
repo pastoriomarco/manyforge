@@ -8,15 +8,10 @@ import {
 } from 'react';
 
 import { api } from '../api/client';
-import { parseLogicalSceneProjection } from '../api/parsers';
-import { sameAuthoringWorkspaceIdentity } from '../hooks/useHeadlessState';
-import { closeErrorCode, managerPublicationMatches } from '../state/scenarioClose';
-import { errorCatalogRow } from '../state/commandRefusal';
-import type { ProgramWorkspaceController, ScenarioReplacementIdentity } from '../hooks/useProgramWorkspace';
+import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
 import type {
   ScenarioDocumentEntry,
   ScenarioDocumentIndexResponse,
-  ManagerActiveProjection,
 } from '../types/api';
 import { FolderPicker } from './FolderPicker';
 import { OverlayPanel } from './OverlayPanel';
@@ -29,20 +24,15 @@ import {
   scenarioProjectStem,
   SCENARIO_NAME_MAX,
 } from '../state/newScenario';
+import { busyLabel, busyReason, type BusyOperation } from '../state/busyOperation';
 import { errorMessage } from '../state/structuralResource';
 
 type ScenarioAction = 'new' | 'save_as' | 'load';
 type SaveAsMode = 'project' | 'portable';
 interface ReplacementConfirmation {
-  /** New loads the built-in Untitled Scenario, so it has no path. */
+  /** New ends on the empty cell, so it has no path. */
   kind: 'new' | 'load';
   path: string | null;
-  confirmDiscard: boolean;
-  predecessor: ManagerActiveProjection;
-  confirmed: ScenarioReplacementIdentity;
-}
-interface AfterCloseReplacement extends ReplacementConfirmation {
-  closed: ManagerActiveProjection;
 }
 
 interface ScenarioDocumentCommandsProps {
@@ -50,65 +40,45 @@ interface ScenarioDocumentCommandsProps {
   /** The Deployment Draft differs from its Saved baseline. */
   deploymentDirty?: boolean;
   localInvalidEdit?: boolean;
-  /** GUI composition of the existing owner commands; resolves only on exact empty proof. */
-  closeScenario?: (expected: ManagerActiveProjection, confirmed?: ScenarioReplacementIdentity, callerSignal?: AbortSignal) => Promise<ManagerActiveProjection | null>;
-  /** Item 37: the operator's Force close, offered after a refused Close. */
-  forceCloseScenario?: (expected: ManagerActiveProjection, confirmed?: ScenarioReplacementIdentity, callerSignal?: AbortSignal) => Promise<ManagerActiveProjection | null>;
-  closeUnavailableReason?: string | null;
-  closeProgress?: string | null;
   /** Robots are moving (Program motion not held, or a manual operation). */
   motionActive?: boolean;
-}
-
-function confirmedAttachedParts(identity: ScenarioReplacementIdentity): string[] {
-  const scene = identity.closeScene;
-  if (!scene?.available || scene.freshness !== 'fresh' || scene.knownGaps.length > 0 || scene.payload === null)
-    return [];
-  try {
-    return parseLogicalSceneProjection(scene.payload).snapshot?.carried_object_attachments
-      .map((attachment) => attachment.scene_resource_id) ?? [];
-  } catch {
-    return [];
-  }
+  /** The components now in the cell (CONTRACTS §1); null while not known. */
+  cellComponents?: readonly string[] | null;
 }
 
 function scenarioEntryKey(entry: ScenarioDocumentEntry): string {
   return `${entry.sourceKind}:${entry.path ?? entry.scenarioId ?? entry.name}`;
 }
 
-function forceCloseStopRefusalMessage(error: unknown): string | null {
-  if (closeErrorCode(error) !== 'scenario_force_close_stop_unconfirmed') return null;
-  const details = (error as {
-    structuredError?: { details?: Record<string, unknown> | null };
-  } | null)?.structuredError?.details;
-  const catalogCode = details?.reason === 'stop_not_contained'
-    ? 'scenario_force_close_stop_not_contained'
-    : details?.reason === 'stop_pending'
-      ? 'scenario_force_close_stop_pending'
-      : null;
-  return catalogCode === null ? null : errorCatalogRow(catalogCode)?.[0] ?? null;
-}
-
-/** One icon-only header command; the tooltip shows at once on hover/focus. */
+/**
+ * One icon-only header command; the tooltip shows at once on hover/focus.
+ * While one of its `commands` runs, the tooltip is its busy label.
+ */
 function ScenarioIconButton({
   label,
   reason,
   disabled,
+  operation,
+  commands,
   onClick,
   children,
 }: {
   label: string;
   reason?: string | null;
   disabled: boolean;
+  operation: BusyOperation | null;
+  commands: string | readonly string[];
   onClick: (event: MouseEvent<HTMLButtonElement>) => void;
   children: ReactNode;
 }) {
+  const busy = busyLabel(operation, commands, label);
   return (
     <button
       type="button"
       className="scenario-command"
       aria-label={label}
-      data-tooltip={disabled && reason ? `${label}: ${reason}` : label}
+      aria-busy={busy !== label || undefined}
+      data-tooltip={busy !== label ? busy : disabled && reason ? `${label}: ${reason}` : label}
       disabled={disabled}
       onClick={onClick}
     >
@@ -127,21 +97,22 @@ export function ScenarioDocumentCommands({
   controller,
   deploymentDirty = false,
   localInvalidEdit = false,
-  closeScenario,
-  forceCloseScenario,
-  closeUnavailableReason = null,
-  closeProgress = null,
   motionActive = false,
+  cellComponents = [],
 }: ScenarioDocumentCommandsProps) {
   // Document actions wait while robots move (maintainer, 2026-10-16).
   const motionReason = motionActive ? 'Not available while robots are moving. Stop motion first.' : null;
   const {
     state,
+    busyOperation: operation,
     documentUnavailableReason,
+    scenarioReplacementUnavailableReason,
     saveScenarioDocument,
     exportScenarioDocument,
     scenarioDocumentPath,
     scenarioDocument,
+    newScenarioDocument,
+    loadScenarioDocument,
   } = controller;
   const [action, setAction] = useState<ScenarioAction | null>(null);
   const [saveAsMode, setSaveAsMode] = useState<SaveAsMode>('project');
@@ -155,26 +126,18 @@ export function ScenarioDocumentCommands({
   const [savePickerOpen, setSavePickerOpen] = useState(false);
   const [scenarioName, setScenarioName] = useState('');
   const [scenarioDescription, setScenarioDescription] = useState('');
-  const [currentApplied, setCurrentApplied] = useState<ManagerActiveProjection | null>(null);
   const [newError, setNewError] = useState<string | null>(null);
   const [replacementPending, setReplacementPending] = useState(false);
-  const replacementInFlight = useRef<false | 'closing' | 'waiting' | 'submitting'>(false);
+  const replacementInFlight = useRef(false);
   const [confirmation, setConfirmation] = useState<ReplacementConfirmation | null>(null);
-  const [afterClose, setAfterClose] = useState<AfterCloseReplacement | null>(null);
-  // Item 37: the replacement whose Close was refused, and the open confirmation.
-  const [forceCloseOffer, setForceCloseOffer] = useState<{ kind: 'new' | 'load'; path: string | null } | null>(null);
-  const [forceConfirmation, setForceConfirmation] = useState<ReplacementConfirmation | null>(null);
   const replacementMounted = useRef(true);
-  const closeCallerAbort = useRef<AbortController | null>(null);
   useEffect(() => {
     replacementMounted.current = true;
-    return () => {
-      replacementMounted.current = false; replacementInFlight.current = false;
-      closeCallerAbort.current?.abort(new Error('Scenario Close caller was unmounted.'));
-    };
+    return () => { replacementMounted.current = false; };
   }, []);
-  const latestController = useRef(controller);
-  useEffect(() => { latestController.current = controller; }, [controller]);
+  // The refusal the workspace shows for a refused New or Load.
+  const latestError = useRef<string | null>(null);
+  latestError.current = state.error;
   // Entry names of the folder Save As writes into, so a clash shows at once.
   const [locationEntries, setLocationEntries] = useState<ReadonlySet<string> | null>(null);
   // Export writes `<exportParent>/<open project folder name>`, keeping the
@@ -185,33 +148,32 @@ export function ScenarioDocumentCommands({
   const scenarioDirectoryRef = useRef('');
   const returnFocus = useRef<HTMLElement | null>(null);
   const workspace = state.workspace;
-  const managedComponents = currentApplied?.cellGraph.controllable_components;
-  const managedComponentNames = Array.isArray(managedComponents)
-    ? managedComponents.flatMap((row) => row !== null && typeof row === 'object'
-      && !Array.isArray(row) && typeof row.controllable_component_id === 'string'
-      ? [row.controllable_component_id] : []) : [];
   const authoring = workspace?.draft.authoring ?? null;
   const busy = replacementPending || state.status === 'loading'
     || (state.status === 'ready' && state.pendingAction !== null);
+  const busyText = busyReason(operation) ?? 'Another operation is in progress.';
   const blockReason = localInvalidEdit
     ? 'Review or discard the invalid local field edit first.'
     : busy
-      ? 'Another operation is in progress.'
+      ? busyText
       : documentUnavailableReason;
-  // Ordinary document actions require Idle. New and Load close first; that
-  // Close prepares the exact stopped/idle cycle.
+  // Ordinary document actions require Idle. New and Load are the server's
+  // one Apply path (CONTRACTS §11); the server refuses them during a run.
   const blocked = busy || documentUnavailableReason !== null || localInvalidEdit || workspace === null;
-  const closeEntryReason = localInvalidEdit
+  const replacementEntryReason = localInvalidEdit
     ? 'Review or discard the invalid local field edit first.'
-    : busy ? 'Another operation is in progress.'
+    : busy ? busyText
       : workspace === null ? 'Program workspace is not loaded.'
-        : closeScenario === undefined ? 'Scenario Close is unavailable.'
-          : closeUnavailableReason;
-  const replacementEntryReason = closeEntryReason === null ? null : blockReason === null ? null : closeEntryReason;
+        // A finished or stopped run is the server's to decide (R3).
+        : scenarioReplacementUnavailableReason ?? null;
   const hasUnsavedChanges = workspace?.hasUnsavedChanges === true || deploymentDirty;
-  const replaceNeedsConfirmation = workspace?.hasUnsavedChanges === true
+  const draftDiscarded = workspace?.hasUnsavedChanges === true
     || workspace?.hasUnappliedChanges === true
     || deploymentDirty;
+  // New and Load stop and replace whatever is in the cell: they ask
+  // once when it isn't empty (or isn't known), or when Drafts would be lost.
+  const cellOccupied = cellComponents === null || cellComponents.length > 0;
+  const replaceNeedsConfirmation = cellOccupied || draftDiscarded;
   // The built-in Untitled Scenario is never written: only Save As places it.
   const readOnly = scenarioDocument.readOnly;
   const ownProject = readOnly ? null : scenarioDocumentPath;
@@ -291,22 +253,6 @@ export function ScenarioDocumentCommands({
     setSelectedScenarioKey(scenarioEntryKey(entry));
   };
 
-  useEffect(() => {
-    if (action !== 'new' && action !== 'load') return;
-    const abort = new AbortController();
-    setCurrentApplied(null);
-    setNewError(null);
-    void api.manager.status(abort.signal).then((value) => {
-      if (abort.signal.aborted) return;
-      if (!value.source.available || value.source.freshness !== 'fresh' || !value.status.managerReady) {
-        setNewError('Current Applied Deployment cannot be verified.');
-      } else setCurrentApplied(value.status.active);
-    }).catch((error: unknown) => {
-      if (!abort.signal.aborted) setNewError(errorMessage(error, 'Applied Deployment is unavailable.'));
-    });
-    return () => abort.abort();
-  }, [action]);
-
   // Names already present in the chosen location, so a clash shows at once.
   const locationDirectory = action === 'save_as'
     ? (saveAsMode === 'portable' ? exportParent : saveDirectory) : null;
@@ -322,13 +268,9 @@ export function ScenarioDocumentCommands({
   }, [locationDirectory]);
 
   const closeAction = useCallback(() => {
-    if (replacementInFlight.current && replacementInFlight.current !== 'waiting') return;
-    replacementInFlight.current = false;
-    setAfterClose(null);
+    if (replacementInFlight.current) return;
     setConfirmation(null);
-    setForceCloseOffer(null);
-    setForceConfirmation(null);
-    setReplacementPending(false);
+    setNewError(null);
     setAction(null);
     setConfirmOverwrite(false);
   }, []);
@@ -337,7 +279,7 @@ export function ScenarioDocumentCommands({
     event: MouseEvent<HTMLButtonElement>,
   ) => {
     returnFocus.current = event.currentTarget;
-    if (next === 'new') setCurrentApplied(null);
+    setNewError(null);
     setConfirmOverwrite(false);
     setLoadPickerOpen(false);
     if (next === 'save_as') {
@@ -365,189 +307,78 @@ export function ScenarioDocumentCommands({
     closeAction();
   };
 
-  // New and every Load (also of the Scenario that is currently applied) go
-  // through Close first; Load never reapplies over a Scenario.
+  // New and Load replace the Scenario through the server's one Apply path:
+  // New is the Apply of the empty cell; Load is New, then Apply of the file.
   const replacesScenario = action === 'new' || action === 'load';
-  const closeUnavailable = replacesScenario
-    && (closeScenario === undefined || closeUnavailableReason !== null);
   const replacementReason = newError ?? (replacementPending ? null
-    : (replacesScenario ? closeEntryReason : blockReason)
-      ?? (closeUnavailable ? 'Scenario Close is unavailable.' : null));
-  const selectedIdentityUnknown = action === 'load' && selectedScenarioDocument !== null
-    && selectedScenarioDocument.scenarioId === null;
-  const completeReplacement = async (kind: 'new' | 'load', acknowledged?: ReplacementConfirmation, force = false) => {
-    if (replacementInFlight.current || currentApplied === null) return;
-    // Force close follows a refused Close: that refusal is the shown error.
-    const entryReason = force ? closeEntryReason : replacementReason;
-    if (entryReason !== null || (kind === 'load' && selectedIdentityUnknown)) {
-      if (acknowledged !== undefined) {
-        setConfirmation(null);
-        setNewError(entryReason ?? 'Selected Scenario identity cannot be verified.');
-      }
-      return;
-    }
-    const expected = acknowledged?.predecessor ?? currentApplied;
-    const confirmedPath = kind === 'new' ? null : acknowledged?.path ?? selectedScenarioPath;
-    const confirmed = acknowledged?.confirmed ?? latestController.current.scenarioReplacementIdentity;
-    if (confirmed === null) {
-      setNewError('The shared workspace is not current. No replacement was requested.');
-      return;
-    }
-    if (acknowledged !== undefined) {
-      const current = latestController.current.scenarioReplacementIdentity;
-      if (current === null || localInvalidEdit
-        || !sameAuthoringWorkspaceIdentity(current.authoring, acknowledged.confirmed.authoring)
-        || !managerPublicationMatches(current.managerActive, acknowledged.predecessor)) {
-        setConfirmation(null);
-        setNewError('The confirmed workspace, Draft or Applied publication changed. No replacement was requested.');
-        return;
-      }
-    }
-    if (kind === 'load' && confirmedPath === null) return;
-    if ((!expected.canonicalEmpty || replaceNeedsConfirmation || confirmedAttachedParts(confirmed).length > 0) && acknowledged === undefined) {
-      setConfirmation({ kind, path: confirmedPath, confirmDiscard: true,
-        predecessor: expected, confirmed });
+    : replacesScenario ? replacementEntryReason : blockReason);
+  const completeReplacement = async (kind: 'new' | 'load', acknowledged = false) => {
+    if (replacementInFlight.current) return;
+    const path = kind === 'load' ? selectedScenarioPath : null;
+    if (replacementEntryReason !== null || (kind === 'load' && path === null)) return;
+    // Stopping the cell's components or discarding Draft changes is the
+    // operator's choice: one confirmation, the same for New and Load.
+    if (replaceNeedsConfirmation && !acknowledged) {
+      setConfirmation({ kind, path });
       return;
     }
     setConfirmation(null);
-    replacementInFlight.current = 'closing';
+    replacementInFlight.current = true;
     setReplacementPending(true);
     setNewError(null);
-    setForceCloseOffer(null);
-    let deferredAfterClose = false;
+    let refusal: string | null = null;
+    const onRefusal = (message: string) => { refusal = message; };
     try {
-      const close = force ? forceCloseScenario : closeScenario;
-      if (close === undefined) throw new Error('Scenario Close is unavailable.');
-      const empty = await close(expected, confirmed,
-        (closeCallerAbort.current = new AbortController()).signal);
+      const result = kind === 'new' ? await newScenarioDocument(onRefusal)
+        : await loadScenarioDocument(path as string, onRefusal);
       if (!replacementMounted.current) return;
-      if (empty === null) {
-        setNewError('Scenario Close is refused or unresolved; no replacement was requested.');
-        if (!force) setForceCloseOffer({ kind, path: confirmedPath });
-        return;
-      }
-      if (!empty.canonicalEmpty) throw new Error('Scenario Close has no current canonical-empty proof.');
-      replacementInFlight.current = 'waiting';
-      deferredAfterClose = true;
-      setAfterClose({ kind, path: confirmedPath, confirmDiscard: true,
-        predecessor: expected, closed: empty, confirmed });
-    } catch (error: unknown) {
-      const message = force
-        ? forceCloseStopRefusalMessage(error)
-          ?? errorMessage(error, 'Scenario replacement is unresolved.')
-        : errorMessage(error, 'Scenario replacement is unresolved.');
-      if (!replacementMounted.current) latestController.current.reportCloseCancellation(message);
-      else {
-        setNewError(message);
-        // Item 37: a refused Close offers Force close; a refused Force close does not repeat it.
-        if (!force) setForceCloseOffer({ kind, path: confirmedPath });
-      }
+      if (result !== null) setAction(null);
+      else setNewError(refusal ?? latestError.current
+        ?? `${kind === 'new' ? 'New' : 'Load'} was refused; nothing was retried.`);
     } finally {
-      closeCallerAbort.current = null;
-      if (!deferredAfterClose) {
-        replacementInFlight.current = false;
-        setReplacementPending(false);
-      }
-    }
-  };
-  // New has no form: it closes and opens Untitled once the Applied state is read.
-  useEffect(() => {
-    if (action === 'new' && currentApplied !== null && confirmation === null
-      && !replacementPending && replacementReason === null) void completeReplacement('new');
-  }, [action, currentApplied, confirmation, replacementPending, replacementReason]);
-  useEffect(() => {
-    if (afterClose === null || replacementInFlight.current !== 'waiting') return;
-    const admission = controller.scenarioCloseHandoff(afterClose.predecessor, afterClose.closed, afterClose.confirmed);
-    if (admission.status === 'waiting' && !localInvalidEdit) return;
-    // Claim before invoking the ordinary mutation: StrictMode and later owner
-    // publications must never send this already-confirmed replacement twice.
-    replacementInFlight.current = 'submitting';
-    setAfterClose(null);
-    if (admission.status === 'refused' || localInvalidEdit) {
-      setNewError(localInvalidEdit ? 'The local edit changed. No replacement was sent.'
-        : admission.message ?? 'Scenario replacement is not admitted.');
       replacementInFlight.current = false;
-      setReplacementPending(false);
-      return;
+      if (replacementMounted.current) setReplacementPending(false);
     }
-    void (async () => {
-      try {
-        if (!replacementMounted.current) return;
-        let authoringRefusal: string | null = null;
-        const result = afterClose.kind === 'new'
-          ? await controller.newScenarioDocument(afterClose.confirmDiscard, afterClose.confirmed.authoring)
-          : afterClose.path !== null
-            ? await controller.loadScenarioDocument(
-              afterClose.path, afterClose.confirmDiscard, afterClose.confirmed.authoring,
-              (message) => { authoringRefusal = message; },
-            ) : null;
-        if (result !== null) setAction(null);
-        else setNewError(authoringRefusal
-          ?? 'Scenario closed, but the replacement was refused or is unresolved. Review the current backend status; nothing was retried.');
-      } catch (error: unknown) {
-        setNewError(errorMessage(error, 'Scenario replacement is unresolved.'));
-      } finally {
-        replacementInFlight.current = false;
-        setReplacementPending(false);
-      }
-    })();
-  }, [afterClose, controller, localInvalidEdit]);
-  const confirmForceClose = () => {
-    const confirmed = forceConfirmation;
-    setForceConfirmation(null);
-    if (confirmed === null) return;
-    void completeReplacement(confirmed.kind, confirmed, true);
   };
-  const forceCloseAction = forceCloseOffer !== null && forceCloseScenario !== undefined && !replacementPending
-    ? <div className="dialog-actions">
-      <button type="button" className="danger-button" onClick={() => {
-        const confirmed = latestController.current.scenarioReplacementIdentity;
-        if (confirmed === null || currentApplied === null) {
-          setNewError('The shared workspace is not current. Force close was not started.');
-          return;
-        }
-        setForceConfirmation({ kind: forceCloseOffer.kind, path: forceCloseOffer.path, confirmDiscard: true,
-          predecessor: currentApplied, confirmed });
-      }}>Force close…</button>
-    </div>
-    : null;
-  const afterCloseMessage = afterClose === null ? null
-    : controller.scenarioCloseHandoff(afterClose.predecessor, afterClose.closed, afterClose.confirmed).message;
-  const emptyConfirmation = (confirmation?.predecessor ?? currentApplied)?.canonicalEmpty === true;
-  const attachedParts = confirmation === null ? [] : confirmedAttachedParts(confirmation.confirmed);
-  const forceAttachedParts = forceConfirmation === null ? [] : confirmedAttachedParts(forceConfirmation.confirmed);
-  // Same look as the Reset/Execute confirmations: a short lead, the consequences
-  // as a list, then what stays physically true.
-  const closeWarning = emptyConfirmation
+  // New has no form: it asks only when Draft changes would be discarded.
+  useEffect(() => {
+    if (action === 'new' && confirmation === null && !replacementPending && newError === null
+      && replacementEntryReason === null) void completeReplacement('new');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [action]);
+  // Same look as the Reset/Execute confirmations: a short lead, the
+  // consequences as a list, then what stays physically true.
+  const replaceWarning = !cellOccupied
     ? <>
       <p>Discard the current Draft and continue?</p>
-      {replaceNeedsConfirmation && <p>Current unsaved and unapplied Draft changes will be discarded.</p>}
+      <p>Current unsaved and unapplied Draft changes will be discarded.</p>
     </>
     : <>
       <p>
-        The current Scenario is closed first:
-        {managedComponentNames.length > 0 && ` ${managedComponentNames.join(', ')}.`}
+        The current Scenario is closed first
+        {cellComponents === null ? '; its components could not be read.'
+          : `: ${cellComponents.join(', ')}.`}
       </p>
       <ul>
-        <li>a finished, stopped or held Program is Reset first, ending the run;</li>
-        <li>carried objects are detached in the Scene at their current pose;</li>
-        <li>active targets are retired, open component incidents acknowledged (recorded in History), eligible components disabled without a recovery and their processes stopped; a faulted component is only process-stopped; if its Disable fails, a component left declared, disabled or faulted is process-stopped and Close continues, while one still prepared, active or degraded refuses Close (Force close stays available);</li>
-        <li>an unknown output or operation effect refuses Close;</li>
-        <li>an open cell Stop fault is kept, and Recover cell cannot clear it while Close is in progress: no robot moves in the next Scenario until you load its robots and press Recover cell;</li>
-        {replaceNeedsConfirmation
-          && <li>Current unsaved and unapplied Draft changes will be discarded.</li>}
+        <li>a finished or stopped Program run is Reset first, ending the run;</li>
+        <li>every component of the current cell is disabled and its processes are stopped;</li>
+        {confirmation?.kind === 'load'
+          && <li>the loaded Scenario&apos;s components are started and come back prepared, not enabled;</li>}
+        {draftDiscarded && <li>Current unsaved and unapplied Draft changes will be discarded.</li>}
       </ul>
-      <p>Robot positions may be unknown after Close. Robots and physically held parts may remain;
-        account for them before using the next cell.</p>
+      <p>Robots and physically held parts may remain; account for them before using the next cell.</p>
     </>;
+  const confirmationTitle = confirmation?.kind === 'new' ? 'New Scenario?' : 'Load Scenario?';
 
   return (
     <>
       <div className="scenario-commands" role="group" aria-label="Scenario">
         <ScenarioIconButton
           label="New"
-          reason={motionReason ?? closeEntryReason}
-          disabled={motionReason !== null || closeEntryReason !== null}
+          reason={motionReason ?? replacementEntryReason}
+          disabled={motionReason !== null || replacementEntryReason !== null}
+          operation={operation}
+          commands="new"
           onClick={(event) => beginAction('new', event)}
         >
           <path d="M3.5 2.5h5.75L12.5 5.75v7.75a.5.5 0 0 1-.5.5H3.5a.5.5 0 0 1-.5-.5V3a.5.5 0 0 1 .5-.5z" />
@@ -558,6 +389,8 @@ export function ScenarioDocumentCommands({
           reason={motionReason ?? blockReason
             ?? (readOnly ? 'The Untitled Scenario is read-only. Use Save Scenario as.' : 'Scenario already matches Saved.')}
           disabled={motionReason !== null || blocked || readOnly || (saveTarget !== null && !hasUnsavedChanges)}
+          operation={operation}
+          commands="save"
           onClick={(event) => {
             if (saveTarget === null) {
               beginAction('save_as', event);
@@ -573,6 +406,8 @@ export function ScenarioDocumentCommands({
           label="Save Scenario as"
           reason={motionReason ?? blockReason}
           disabled={motionReason !== null || blocked}
+          operation={operation}
+          commands={['save_as', 'export']}
           onClick={(event) => beginAction('save_as', event)}
         >
           <path d="M3 2.5h6.5L12 5v3" />
@@ -584,15 +419,19 @@ export function ScenarioDocumentCommands({
           label="Load Scenario"
           reason={motionReason ?? replacementEntryReason}
           disabled={motionReason !== null || replacementEntryReason !== null}
+          operation={operation}
+          commands="load"
           onClick={(event) => beginAction('load', event)}
         >
           <path d="M2 4.5a.5.5 0 0 1 .5-.5H6l1.5 1.5h6a.5.5 0 0 1 .5.5V7H2z" />
           <path d="M2 7h12.5l-1.6 5.6a.5.5 0 0 1-.5.4H3.3a.5.5 0 0 1-.5-.4L2 7z" />
         </ScenarioIconButton>
+        {newError !== null && action === null
+          && <p className="inline-message severity-error" role="status">{newError}</p>}
       </div>
 
       <OverlayPanel
-        open={action !== null && confirmation === null && !forceConfirmation}
+        open={action !== null && confirmation === null}
         title={action === 'new' ? 'New Scenario' : action === 'save_as' ? 'Save Scenario as' : 'Load Scenario'}
         titleId="scenario-action-dialog-title"
         compact={false}
@@ -600,13 +439,10 @@ export function ScenarioDocumentCommands({
         returnFocusRef={returnFocus}
       >
         {action === 'new' && <div className="document-dialog">
-          <p>Close the current Scenario and open an empty Untitled Scenario. Use Save Scenario as to name and place it.</p>
-          {currentApplied === null && <p role="status">Checking the current Scenario…</p>}
+          <p>Empty the cell and open the empty Untitled Scenario. Use Save Scenario as to name and place it.</p>
           {replacementReason && <p className="inline-message severity-error" role="status">{replacementReason}</p>}
-          {forceCloseAction}
-          {afterCloseMessage && <p role="status">{afterCloseMessage}</p>}
           <div className="dialog-actions">
-            <button type="button" onClick={closeAction} disabled={replacementPending && afterClose === null}>Cancel</button>
+            <button type="button" onClick={closeAction} disabled={replacementPending}>Cancel</button>
           </div>
         </div>}
 
@@ -818,62 +654,37 @@ export function ScenarioDocumentCommands({
               )}
             </section>
             {replacementReason && <p className="inline-message severity-error" role="status">{replacementReason}</p>}
-            {forceCloseAction}
-            {afterCloseMessage && <p role="status">{afterCloseMessage}</p>}
-            {selectedIdentityUnknown && <p role="status">Selected Scenario identity cannot be verified.</p>}
             <div className="dialog-actions new-scenario-actions">
-              <button type="button" onClick={closeAction} disabled={replacementPending && afterClose === null}>Cancel</button>
+              <button type="button" onClick={closeAction} disabled={replacementPending}>Cancel</button>
               <button
                 type="button"
                 className="primary-action"
-                disabled={busy || currentApplied === null || replacementReason !== null || selectedIdentityUnknown || selectedScenarioPath === null}
+                disabled={busy || (replacementReason !== null && newError === null) || selectedScenarioPath === null}
                 title={replacementReason ?? undefined}
                 onClick={() => {
                   if (selectedScenarioPath === null) return;
                   void completeReplacement('load');
                 }}
               >
-                Load Scenario
+                {busyLabel(operation, 'load', 'Load Scenario')}
               </button>
             </div>
           </div>
         )}
-        {replacementPending && afterClose === null && <p className="scenario-replacement-status" role="status">{closeProgress ?? 'Scenario replacement is in progress.'}</p>}
+        {replacementPending && <p className="scenario-replacement-status" role="status">Scenario replacement is in progress.</p>}
 
       </OverlayPanel>
       <OverlayPanel open={confirmation !== null}
-        title="Close Scenario?"
+        title={confirmationTitle}
         titleId="scenario-replacement-confirmation-title" kind="dialog" compact
         onClose={() => { if (confirmation?.kind === 'new') closeAction(); else setConfirmation(null); }}>
         <div className="dialog-copy transport-confirmation">
-          {closeWarning}
-          {attachedParts.length > 0 && <p>Attached parts to detach and remove: {attachedParts.join(', ')}.</p>}
+          {replaceWarning}
           <div className="dialog-actions">
             <button type="button" onClick={() => { if (confirmation?.kind === 'new') closeAction(); else setConfirmation(null); }}>Cancel</button>
             <button type="button" className="danger-button" onClick={() => {
-              if (confirmation !== null) void completeReplacement(confirmation.kind, confirmation);
-            }}>Close and continue</button>
-          </div>
-        </div>
-      </OverlayPanel>
-      <OverlayPanel open={forceConfirmation !== null}
-        title="Force close Scenario?"
-        titleId="scenario-force-close-confirmation-title" kind="dialog" compact
-        onClose={() => setForceConfirmation(null)}>
-        <div className="dialog-copy transport-confirmation">
-          <p>Close was refused. Force close ends the Scenario anyway, without proving what the stuck operations did:</p>
-          <ul>
-            <li>a cell Full Stop is sent first and must be confirmed; if it is not, Force close stops there;</li>
-            <li>stuck or uncertain operations are moved into History as force-closed, with what was left unknown; a motion block left by an operation whose closure outcome is unknown is cleared (robots still need Prepare and Enable);</li>
-            <li>carried objects are detached in the Scene at their current pose (one whose detach is refused, for example because its robot&apos;s process is already gone, stays attached); then every component is disabled where possible and its processes are stopped;</li>
-            <li>Force close never commands an output: an output&apos;s physical state may stay unknown, and a write already queued in a remote device may still act;</li>
-            <li>an open cell Stop fault is kept: no robot moves in the next Scenario until you load its robots and press Recover cell.</li>
-          </ul>
-          {forceAttachedParts.length > 0 && <p>Attached parts: {forceAttachedParts.join(', ')}. A part whose detach is refused stays attached.</p>}
-          <p>Check every output, valve and gripper physically before the next Run.</p>
-          <div className="dialog-actions">
-            <button type="button" onClick={() => setForceConfirmation(null)}>Cancel</button>
-            <button type="button" className="danger-button" onClick={confirmForceClose}>Force close and continue</button>
+              if (confirmation !== null) void completeReplacement(confirmation.kind, true);
+            }}>{confirmation?.kind === 'new' ? 'Empty the cell and continue' : 'Load Scenario'}</button>
           </div>
         </div>
       </OverlayPanel>

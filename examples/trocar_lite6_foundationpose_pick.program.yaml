@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: trocar_lite6_foundationpose_pick
-program_revision: sha256:ce09d041e1a7e9d5629c3ed8c679a16886f2792429244cf8a5750e71f5c8e07d
+program_revision: sha256:68793950ea0f3d4d8a08f5eefa57ddb51af7dafe997254ea6a397841f1b07491
 program_profile: composable-cell-v1
 name: trocar_lite6_foundationpose_pick
 description: Retained Isaac-compatible Lite6 trocar pick Program. The Manager latches the FoundationPose
@@ -52,12 +52,6 @@ target_roles:
       parameters: {}
       disposition: required
     - capability_id: planning.motion.pose_goal
-      parameters: {}
-      disposition: required
-    - capability_id: planning.profile.balanced
-      parameters: {}
-      disposition: required
-    - capability_id: planning.profile.first_feasible
       parameters: {}
       disposition: required
     - capability_id: planning.trajectory.time_parameterized
@@ -340,7 +334,6 @@ tree:
         search_strategy: first_feasible
         translation_step_m: 0.01
         rotation_step_deg: 15.0
-      planning_profile: first_feasible
       motion_options:
         approach_velocity_scale: 0.35
         descend_velocity_scale: 0.35

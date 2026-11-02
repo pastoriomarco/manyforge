@@ -1,7 +1,12 @@
 # UR5e + Robotiq 2F-85
 
-Self-contained, generation-time-expanded ManyForge model. The runtime does
-not depend on ROS, Xacro, MoveIt, or the upstream repositories.
+Self-contained, generation-time-expanded ManyForge model. Loading it needs
+no ROS, Xacro, MoveIt or the upstream repositories.
+
+This bundle has no `component.yaml` and isn't placed in a Deployment: it is
+the source of the split models `../ur5e` (the arm) and `../robotiq_2f_85` (the
+tool), which are placed as separate components with the tool mounted on the
+arm's `flange`. It holds their meshes, licenses and upstream sources.
 
 Sources and licenses:
 

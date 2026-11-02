@@ -24,18 +24,9 @@ from fastapi import (
 )
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
-from pydantic import ValidationError
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from .cclc import CCLCOpenPort, CCLCOpenRequestClient
-from .cell_recover import (
-    CELL_RECOVER_ABORT_REFERENCE_NOTE,
-    CELL_RECOVER_REFERENCE_NOTE,
-    CellRecoverLedger,
-    CellRecoverPorts,
-    recover_cell_once,
-)
-from .component_rearm import REENABLE_SOURCE_LABEL, ComponentRearmPorts, reenable_components
+from .component_model import RUN_REFUSAL_CODES
 from .execution import ExecutionCommandClient, ExecutionEventPump
 from .control_dispatch import (
     HeadlessExecutionControlDispatch,
@@ -65,22 +56,14 @@ from .history_query import (
     HistorianDiscoveryRequest,
     HistorianDebugRequest,
 )
-from .close_wire import (
-    SCENARIO_CLOSE_REFERENCE_NOTE,
-    SCENARIO_FORCE_CLOSE_REFERENCE_NOTE,
-    LifecycleOwnerSettlementRequest,
-    LifecycleTargetRetirementIntent,
-    ScenarioForceCloseRequest,
-)
 from .models import (
     AcknowledgeAlarmRequest,
+    ApplyOutcomeRequest,
+    ComponentActionRequest,
+    ComponentGroupActionRequest,
+    SetOutputRequest,
     AcknowledgeAllAlarmsRequest,
-    CellRecoverAbortRequest,
-    CellRecoverRequest,
-    ComponentLifecycleRequest,
-    ComponentProcessStopBody,
     ActivationPreparationRequest,
-    CanonicalEmptyActivationPreparationRequest,
     FullStopIntentRequest,
     HistorianReconcileRequest,
     IoSignalReadRequest,
@@ -121,12 +104,8 @@ from .models import (
     RuntimeScaleControlSelectorRequest,
     MAX_RUNTIME_SCALE_SELECTOR_JSON_BYTES,
     decode_runtime_scale_selector_query,
-    RouteSelectionRequest,
-    RouteSelectionRequestResultQuery,
     SceneResourcePoseQuery,
     SceneTransactionRequest,
-    StopFaultRecoveryIntentRequest,
-    StopFaultRecoveryRequest,
     StopIntentRequest,
 )
 from .native import (
@@ -138,7 +117,7 @@ from .native import (
     ViewerModelAsset,
     strict_json_object,
 )
-from .service import HeadlessService, TrustedAttribution
+from .service import HeadlessService, TrustedAttribution, warm_builtin_node_environment
 from .program_runner_client import ProgramRunnerHttpClient
 from .cell_admission import CellAdmissionClient
 from .alarm_attention import (
@@ -153,9 +132,6 @@ _MAXIMUM_SAFE_INTEGER = 9_007_199_254_740_991
 _MAXIMUM_SIGNED_64 = 9_223_372_036_854_775_807
 _MAXIMUM_ALARM_PAGE = 128
 _MAXIMUM_HISTORY_PAGE = 32
-# Item 37: how long Force close waits for the Kernel to confirm its Full Stop.
-FORCE_CLOSE_STOP_WAIT_SECONDS = 10.0
-FORCE_CLOSE_STOP_POLL_SECONDS = 0.2
 _OBSERVATION_CREDIT_SCHEMA = "manyforge.execution_observation_credit.v1"
 SOURCE_MODEL_REFERENCE_NOTE = (
     "The applied cell's source-local model facts, schema "
@@ -352,7 +328,6 @@ def _error_status(code: str) -> int:
         "headless_projection_response_oversized",
         "manager_command_response_invalid",
         "execution_command_response_invalid",
-        "cclc_open_response_invalid",
         "node_environment_projection_invalid",
         "assistant_mode_context_invalid",
         "source_model_context_invalid",
@@ -395,40 +370,26 @@ def _error_status(code: str) -> int:
             "program_run_stopped_before_start",
             "program_run_draft_applied_mismatch",
             "deployment_candidate_compiler_busy",
+            "activation_preparer_busy",
             "program_node_preview_busy",
             "deployment_candidate_cell_mismatch",
-            "cclc_request_namespace_refreshed",
-            "cclc_request_admission_deferred",
             "persistent_key_request_replayed",
-            "unacknowledged_operator_alarms",
-            "component_lifecycle_close_incident_mismatch",
+            # An operator-alarm condition interlock refuses motion before any effect.
+            "operator_alarm_interlock_active",
             "request_result_expired",
-            # Typed refusals before any effect: Close needs settled work, and
-            # Close keeps the cell Stop fault while it runs (D6).
+            # Typed refusals before any effect: Close needs settled work.
             "cell_close_operation_nonterminal",
             "cell_close_containment_uncertain",
-            "stop_fault_recovery_closing",
-            # Another CCLC transaction holds the control domain; nothing started.
-            "cclc_domain_busy",
-            # M6: a lifecycle request that may not acknowledge an open incident.
-            "cclc_incident_open",
-            # M6 (item 36): a Recover whose expected incident is not the open one.
-            "cclc_incident_changed",
-            # m5.5: motion while a robot needs re-arming; a re-arm refused.
-            "component_rearm_refused",
-            "component_rearm_failed",
-            "component_rearm_timeout",
-            "component_rearm_required",
-            # Close refuses while a part is attached; detach first.
-            "scenario_close_attachment_present",
-            # Item 37 Force close: refused before its own effect.
-            "scenario_force_close_stop_unconfirmed",
-            "scenario_force_close_not_closing",
-            "scenario_force_close_operation_busy",
-            # SX-679: Close waits for Recover cell; abort needs a running press.
-            "recover_cell_in_progress",
-            "cell_recover_not_running",
+            # Component model v2: refusals before dispatch (CONTRACTS §2, §5, §7, §8, §16).
+            "component_action_in_progress",
+            "component_action_unsupported",
+            "owner_not_prepared",
+            "io_output_controller_owned",
+            # SIM-1 (RP-1b): a position reset while the simulation isn't playing.
+            "simulation_not_playing",
         }
+        # RunReadiness reasons and run refusals (CONTRACTS §10).
+        or code in RUN_REFUSAL_CODES
     ):
         return 409
     if "unavailable" in code or code in {
@@ -446,7 +407,6 @@ def _error_status(code: str) -> int:
         "scene_projection_commit_uncertain",
         "persistent_key_storage_uncertain",
         "execution_control_ingress_busy",
-        "component_lifecycle_owner_settlement_unknown",
     }:
         return 503
     if (
@@ -456,7 +416,6 @@ def _error_status(code: str) -> int:
     ):
         return 400
     if code in {
-        "cclc_confirmation_required",
         "confirmation_required",
         "operator_alarm_acknowledgement_confirmation_required",
         "operator_alarm_acknowledgement_reason_required",
@@ -492,7 +451,6 @@ def create_app(
     config: HeadlessApiConfig | None = None,
     *,
     service: HeadlessService | None = None,
-    cclc: CCLCOpenPort | None = None,
     trusted_principal_adapter: TrustedPrincipalAdapter | None = None,
 ) -> FastAPI:
     """Create the headless API without importing or starting Composer."""
@@ -505,6 +463,8 @@ def create_app(
     program_runner_client: ProgramRunnerHttpClient | None = None
     if service is None:
         assert config is not None
+        # Before serving: never on request threads while machines prepare.
+        warm_builtin_node_environment()
         core = NativeHeadlessCore(config)
         manager = ManagerCommandClient(
             config.manager_run_root,
@@ -514,11 +474,6 @@ def create_app(
             config.execution_run_root,
             timeout_seconds=config.execution_timeout_seconds,
         )
-        if cclc is None:
-            cclc = CCLCOpenRequestClient(
-                config.execution_run_root,
-                timeout_seconds=config.cclc_timeout_seconds,
-            )
         if config.program_runner_url is not None:
             program_runner_client = ProgramRunnerHttpClient(
                 config.program_runner_url,
@@ -534,8 +489,6 @@ def create_app(
                 activation_root=config.activation_preparer_activation_root,
                 runtime_cell_id=config.cell_id,
                 timeout_seconds=config.activation_preparer_timeout_seconds,
-                canonical_empty_package_root=config.install_root,
-                canonical_empty_admission_filename=config.canonical_empty_admission_filename,
             )
         service = HeadlessService(
             core,
@@ -546,7 +499,6 @@ def create_app(
                 config.execution_run_root,
                 timeout_seconds=config.execution_timeout_seconds,
             ),
-            cclc=cclc,
             activation_preparer=activation_preparer,
         )
         event_execution = ExecutionCommandClient(
@@ -557,12 +509,6 @@ def create_app(
             core,
             event_execution,
             poll_seconds=config.execution_event_poll_milliseconds / 1_000.0,
-            # Its own short-bounded client: an unreachable CCLC owner must not
-            # hold up operation-event ingestion beyond one short exchange.
-            cclc=CCLCOpenRequestClient(
-                config.execution_run_root,
-                timeout_seconds=min(config.cclc_timeout_seconds, 1.0),
-            ),
         )
         # Its own thread, reading the owner's published projection without the
         # core lock: neither event-pump work nor any core call can delay the
@@ -632,22 +578,6 @@ def create_app(
         event_pump.set_settled_observer(control_state_source.notify_motion_settled)
         event_pump.set_progress_observer(control_state_source.notify_operation_progress)
         event_pump.set_global_rules_observer(control_state_source.notify_global_rules)
-    service_cclc = getattr(service, "cclc", None)
-    if cclc is None:
-        cclc = service_cclc
-    elif isinstance(service, HeadlessService) and service_cclc is None:
-        # Keep the service-owned lifecycle admission path and the thin route/
-        # projection paths on the same explicitly injected CCLC adapter.
-        service.cclc = cclc
-
-    def cclc_port() -> CCLCOpenPort:
-        if cclc is None:
-            raise HeadlessApiError(
-                "cclc_owner_unavailable",
-                "CCLC owner is not configured",
-            )
-        return cclc
-
     async def control_call(callback, *, stop: bool = False):
         try:
             lane = execution_controls.stop if stop else execution_controls.ordinary
@@ -781,7 +711,7 @@ def create_app(
 
     app = FastAPI(
         title="ManyForge Headless Runtime API",
-        version="0.1.0",
+        version="0.2.0",
         lifespan=lifespan,
     )
     maximum_body = (
@@ -927,22 +857,47 @@ def create_app(
     def runtime() -> dict[str, Any]:
         return service.runtime()
 
-    @app.get("/api/component-overview")
-    async def component_overview() -> dict[str, Any]:
-        try:
-            current = control_state_source.current_component_overview()
-        except ControlStateUnavailableError as error:
-            raise HeadlessApiError(
-                "control_projection_unavailable",
-                str(error),
-            ) from error
-        if current is not None:
-            return current
-        # With no control client there is deliberately no retained source work.
-        # A standalone REST reader owns exactly one on-demand fact capture and
-        # reduction in a read worker instead of starting a polling/subscription
-        # lifetime.
-        return await asyncio.to_thread(service.component_overview)
+    # Component model v2 (CONTRACTS §1, §2, §5, §7, §10). ------------------
+
+    @app.get("/api/components")
+    def components() -> list[Any]:
+        """Every ComponentState, in cell order."""
+        return service.components()
+
+    @app.post("/api/components/actions", status_code=202)
+    def component_group_action(body: ComponentGroupActionRequest) -> dict[str, Any]:
+        """One action on several components, one at a time in cell order."""
+        return service.component_actions(body.action, body.component_ids)
+
+    @app.post("/api/components/{component_id}/actions", status_code=202)
+    def component_action(
+        component_id: Annotated[str, Path(min_length=1, max_length=256)],
+        body: ComponentActionRequest,
+    ) -> dict[str, Any]:
+        """Accepted action; its result arrives in `last_action`."""
+        return service.component_action(component_id, body.action)
+
+    @app.get("/api/cell/latch")
+    def cell_latch() -> dict[str, Any]:
+        return service.cell_latch()
+
+    @app.get("/api/io")
+    def io_signals() -> list[Any]:
+        """Every SignalSample."""
+        return service.io_signals()
+
+    @app.post("/api/io/{signal_id:path}/set")
+    def set_io_output(
+        signal_id: Annotated[str, Path(min_length=1, max_length=256)],
+        body: SetOutputRequest,
+    ) -> dict[str, Any]:
+        """One output write; returns SetOutputResult."""
+        return service.set_io_output(signal_id, body.value)
+
+    @app.get("/api/program/readiness")
+    def program_readiness() -> dict[str, Any]:
+        """RunReadiness: can_execute, can_resume, blocked_reasons."""
+        return service.run_readiness()
 
     @app.get("/api/cell/authoring-admission")
     def authoring_admission() -> dict[str, Any]:
@@ -980,33 +935,6 @@ def create_app(
         control_state_source.notify_cold()
         return {"admission": admission}
 
-    @app.get("/api/manager/canonical-empty-selection")
-    def canonical_empty_selection() -> dict[str, Any]:
-        return service.canonical_empty_selection()
-
-    @app.get("/api/cclc/targets/retirement-offer")
-    def lifecycle_target_retirement_offer() -> dict[str, Any]:
-        return cclc_port().lifecycle_target_retirement_offer()
-
-    @app.post("/api/cclc/targets/retire")
-    def retire_lifecycle_targets(body: LifecycleTargetRetirementIntent) -> dict[str, Any]:
-        # SX-679 (maintainer): Close's retirement is refused while Recover cell
-        # runs; the operator waits for it or aborts it.
-        if cell_recover_ledger.running():
-            raise HeadlessApiError(
-                "recover_cell_in_progress",
-                "Recover cell is in progress; wait for it to finish or abort it",
-            )
-        return cclc_port().retire_lifecycle_targets(body)
-
-    @app.post("/api/cclc/targets/retire/result")
-    def lifecycle_target_retirement_result(body: LifecycleTargetRetirementIntent) -> dict[str, Any]:
-        return {"result": cclc_port().lifecycle_target_retirement_result(body)}
-
-    @app.post("/api/cclc/targets/settlement")
-    def lifecycle_owner_settlement(body: LifecycleOwnerSettlementRequest) -> dict[str, Any]:
-        return cclc_port().lifecycle_owner_settlement(body.scope)
-
     @app.get("/api/manager/status")
     def manager_status() -> dict[str, Any]:
         return service.manager_status()
@@ -1018,106 +946,6 @@ def create_app(
     @app.get("/api/manager/diff")
     def manager_diff() -> dict[str, Any]:
         return service.manager_diff()
-
-    @app.get("/api/cclc/components/{component_id}")
-    def cclc_component_snapshot(
-        component_id: Annotated[str, Path(min_length=1, max_length=256)],
-    ) -> dict[str, Any]:
-        return cclc_port().component_snapshot(component_id)
-
-    @app.get("/api/cclc/components/{component_id}/lifecycle-snapshot")
-    def cclc_component_lifecycle_snapshot(
-        component_id: Annotated[str, Path(min_length=1, max_length=256)],
-    ) -> dict[str, Any]:
-        return cclc_port().component_lifecycle_snapshot(component_id)
-
-    @app.get("/api/cclc/owner")
-    def cclc_owner_identity() -> dict[str, Any]:
-        return cclc_port().owner_identity()
-
-    @app.get("/api/cclc/components/{component_id}/route-templates")
-    def cclc_route_templates(
-        component_id: Annotated[str, Path(min_length=1, max_length=256)],
-    ) -> dict[str, Any]:
-        return cclc_port().route_templates(component_id)
-
-    @app.get("/api/cclc/components/{component_id}/process/stop-offer")
-    def component_process_stop_offer(component_id: Annotated[str, Path(min_length=1, max_length=128)]) -> dict[str, Any]:
-        return service.component_process_stop_offer(component_id)
-
-    @app.post("/api/cclc/components/{component_id}/process/stop")
-    def stop_component_process(
-        component_id: Annotated[str, Path(min_length=1, max_length=128)],
-        body: ComponentProcessStopBody,
-    ) -> dict[str, Any]:
-        if component_id != body.request.controllable_component_id:
-            raise HeadlessApiError("invalid_request", "Process Stop component path does not match its request")
-        return service.stop_component_process(body.request)
-
-    @app.post("/api/cclc/components/{component_id}/process/stop/result")
-    def component_process_stop_result(
-        component_id: Annotated[str, Path(min_length=1, max_length=128)],
-        body: ComponentProcessStopBody,
-    ) -> dict[str, Any]:
-        if component_id != body.request.controllable_component_id:
-            raise HeadlessApiError("invalid_request", "Process Stop component path does not match its request")
-        return service.component_process_stop_result(body.request)
-
-    @app.post("/api/cclc/lifecycle/requests")
-    def cclc_lifecycle_submit(
-        body: ComponentLifecycleRequest,
-    ) -> dict[str, Any]:
-        # SX-659: a public label is not trusted. Only Headless's own Recover
-        # cell re-enable names its requests with the reserved label that
-        # keeps CCLC's incident re-enable mark.
-        if body.request_context.source_label == REENABLE_SOURCE_LABEL:
-            raise HeadlessApiError(
-                "invalid_request",
-                "source_label is reserved for Recover cell's own re-enable",
-                details={
-                    "field": "request_context.source_label",
-                    "reason": "reserved_source_label",
-                },
-            )
-        if not body.confirmed:
-            raise HeadlessApiError(
-                "cclc_confirmation_required",
-                "component lifecycle request requires explicit confirmation",
-            )
-        return service.component_lifecycle_submit(body)
-
-    @app.post("/api/cclc/lifecycle/requests/result")
-    def cclc_lifecycle_request_result(
-        body: ComponentLifecycleRequest,
-    ) -> dict[str, Any]:
-        return {"result": service.component_lifecycle_request_result(body)}
-
-    @app.get("/api/cclc/lifecycle/transactions/{transaction_id}")
-    def cclc_lifecycle_status(
-        transaction_id: Annotated[str, Path(min_length=1, max_length=256)],
-    ) -> dict[str, Any]:
-        return {"status": service.component_lifecycle_status(transaction_id)}
-
-    @app.post("/api/cclc/routes/requests")
-    def cclc_route_submit(body: RouteSelectionRequest) -> dict[str, Any]:
-        if not body.confirmed:
-            raise HeadlessApiError(
-                "cclc_confirmation_required",
-                "route-selection request requires explicit confirmation",
-            )
-        return service.route_selection_submit(body)
-
-    @app.post("/api/cclc/routes/requests/result")
-    def cclc_route_request_result(
-        body: RouteSelectionRequestResultQuery,
-    ) -> dict[str, Any]:
-        return {"result": service.route_selection_request_result(body)}
-
-    @app.get("/api/cclc/routes/transactions/{transaction_id}")
-    def cclc_route_status(
-        transaction_id: Annotated[str, Path(min_length=1, max_length=256)],
-    ) -> dict[str, Any]:
-        return {"status": cclc_port().route_status(transaction_id)}
 
     @app.get("/api/node-environment")
     def node_environment() -> dict[str, Any]:
@@ -1579,13 +1407,8 @@ def create_app(
             )
         return JSONResponse(status_code=_error_status(code), content=response)
 
-    @app.post(
-        "/api/activation-preparations",
-        openapi_extra={"x-manyforge-reference-note": SCENARIO_CLOSE_REFERENCE_NOTE},
-    )
-    def prepare_activation(
-        request: ActivationPreparationRequest | CanonicalEmptyActivationPreparationRequest,
-    ) -> dict[str, Any]:
+    @app.post("/api/activation-preparations")
+    def prepare_activation(request: ActivationPreparationRequest) -> dict[str, Any]:
         return service.prepare_activation(request)
 
     @app.post("/api/manager/apply")
@@ -1646,6 +1469,25 @@ def create_app(
             raise HeadlessApiError(
                 "manager_command_response_invalid",
                 "Manager Apply acknowledgement rejection has no stable error code",
+            )
+        return JSONResponse(status_code=_error_status(code), content=response)
+
+    @app.post("/api/manager/apply/release-for-new")
+    def manager_apply_release_for_new(
+        request: ManagerApplyAcknowledgementRequest,
+    ) -> JSONResponse:
+        """New (R3): release the fence and claim a failed Apply still holds,
+        whatever it changed; New's Apply then empties the cell."""
+
+        response = service.manager_apply_release_for_new(request.request_context)
+        if response.get("ok") is True:
+            return JSONResponse(status_code=200, content=response)
+        error = response.get("error")
+        code = error.get("code") if isinstance(error, dict) else None
+        if not isinstance(code, str) or not code:
+            raise HeadlessApiError(
+                "manager_command_response_invalid",
+                "Manager Apply release for New rejection has no stable error code",
             )
         return JSONResponse(status_code=_error_status(code), content=response)
 
@@ -1932,196 +1774,6 @@ def create_app(
             )
         )
 
-    @app.post(
-        "/api/execution/force-close",
-        openapi_extra={"x-manyforge-reference-note": SCENARIO_FORCE_CLOSE_REFERENCE_NOTE},
-    )
-    async def execution_force_close(
-        body: ScenarioForceCloseRequest,
-        request: Request,
-    ) -> JSONResponse:
-        """Item 37: one step of an operator Force close (Composer runs the order)."""
-
-        context = body.request_context
-        if body.step == "end":
-            return execution_response(service.scenario_force_close_end())
-        if body.step == "close_operations":
-            return execution_response(
-                await asyncio.to_thread(service.scenario_force_close_operations, context)
-            )
-        stop = FullStopIntentRequest(
-            request_context=context,
-            expected_stop_generation=body.expected_stop_generation,
-        )
-        stopped = await rest_execution_command(
-            command_kind="cell_full_stop",
-            payload=stop.model_dump(mode="json"),
-            request_context=context,
-            transport_request=request,
-        )
-        if stopped.get("ok") is not True:
-            return execution_response(stopped)
-        generation = stopped["accepted"]["stop_generation"]
-        # Wait briefly for the Kernel to confirm this Full Stop; anything but
-        # a pending Stop is final, and so is the end of the wait.
-        deadline = time.monotonic() + FORCE_CLOSE_STOP_WAIT_SECONDS
-        while True:
-            armed = await asyncio.to_thread(service.scenario_force_close_arm, generation)
-            error = armed.get("error")
-            pending = (
-                isinstance(error, dict)
-                and isinstance(error.get("details"), dict)
-                and error["details"].get("reason") == "stop_pending"
-            )
-            if not pending or time.monotonic() >= deadline:
-                return execution_response(armed)
-            await asyncio.sleep(FORCE_CLOSE_STOP_POLL_SECONDS)
-
-    @app.get("/api/execution/stop-fault")
-    def execution_stop_fault() -> JSONResponse:
-        return execution_response(service.execution_stop_fault())
-
-    @app.post("/api/execution/stop-fault/recover")
-    async def execution_recover_stop_fault(
-        body: StopFaultRecoveryRequest,
-        request: Request,
-    ) -> JSONResponse:
-        return execution_response(
-            await rest_execution_command(
-                command_kind="stop_recovery",
-                payload=body.model_dump(mode="json"),
-                request_context=body.request_context,
-                transport_request=request,
-            )
-        )
-
-    cell_recover_ledger = CellRecoverLedger()
-
-    def _authoring_admission_generation() -> int:
-        generation = service.authoring_admission().get("admission_generation")
-        if type(generation) is not int:
-            raise HeadlessApiError(
-                "authoring_admission_unavailable",
-                "current authoring admission generation is unavailable",
-            )
-        return generation
-
-    def _submit_component_lifecycle(payload: dict[str, Any]) -> dict[str, Any]:
-        try:
-            intent = ComponentLifecycleRequest.model_validate(payload)
-        except ValidationError as error:
-            raise HeadlessApiError(
-                "cclc_open_response_invalid",
-                "CCLC snapshot does not form a valid lifecycle request",
-            ) from error
-        return service.component_lifecycle_submit(intent)
-
-    def _thread(callback):
-        return lambda *args: asyncio.to_thread(callback, *args)
-
-    def _component_rearm_ports() -> ComponentRearmPorts:
-        return ComponentRearmPorts(
-            component_ids=_thread(lambda: []),  # unused by the re-enable
-            component_snapshot=_thread(lambda cid: cclc_port().component_snapshot(cid)),
-            admission_generation=_thread(_authoring_admission_generation),
-            submit_lifecycle=_thread(_submit_component_lifecycle),
-            lifecycle_status=_thread(lambda tid: cclc_port().lifecycle_status(tid)),
-            monotonic=time.monotonic,
-            sleep=asyncio.sleep,
-        )
-
-
-    @app.post(
-        "/api/execution/cell-recover",
-        openapi_extra={"x-manyforge-reference-note": CELL_RECOVER_REFERENCE_NOTE},
-    )
-    async def execution_cell_recover(
-        body: CellRecoverRequest,
-        request: Request,
-    ) -> JSONResponse:
-        """Recover cell (design 0.3): every fence is read here, not echoed."""
-
-        admission_generation = _authoring_admission_generation
-        submit_lifecycle = _submit_component_lifecycle
-
-        async def submit_stop_recovery(payload: dict[str, Any]) -> dict[str, Any]:
-            try:
-                intent = StopFaultRecoveryIntentRequest.model_validate(payload)
-            except ValidationError as error:
-                raise HeadlessApiError(
-                    "execution_command_response_invalid",
-                    "Stop-fault offer does not form a valid recovery request",
-                ) from error
-            return await rest_execution_command(
-                command_kind="stop_recovery",
-                payload=intent.model_dump(mode="json"),
-                request_context=intent.request_context,
-                transport_request=request,
-                rejection_as_result=True,
-            )
-
-        def thread(callback):
-            return lambda *args: asyncio.to_thread(callback, *args)
-
-        context = body.request_context
-        ports = CellRecoverPorts(
-            execution_identity=thread(service.execution_identity),
-            execution_targets=thread(service.execution_targets),
-            cclc_owner_epoch=thread(
-                lambda: cclc_port().owner_identity()["request_owner_epoch"]
-            ),
-            component_snapshot=thread(lambda cid: cclc_port().component_snapshot(cid)),
-            admission_generation=thread(admission_generation),
-            submit_lifecycle=thread(submit_lifecycle),
-            stop_fault=thread(service.execution_stop_fault),
-            submit_stop_recovery=submit_stop_recovery,
-            monotonic=time.monotonic,
-            sleep=asyncio.sleep,
-            reenable=lambda component_ids, moved, owner_epoch, acknowledge: reenable_components(
-                _component_rearm_ports(),
-                component_ids,
-                request_id=context.request_id,
-                owner_epoch=owner_epoch,
-                moved=moved,
-                acknowledge_incident=acknowledge,
-                aborted=lambda: cell_recover_ledger.aborted(context.request_id),
-            ),
-        )
-        result, replayed = await recover_cell_once(
-            cell_recover_ledger,
-            ports,
-            request_id=context.request_id,
-            source_label=context.source_label,
-            correlation_id=context.correlation_id,
-            expected_incident_ids=(
-                None
-                if body.expected_incident_ids is None
-                else frozenset(body.expected_incident_ids)
-            ),
-            replay_only=body.replay_only,
-        )
-        if not replayed:
-            control_state_source.notify_cold()
-        return JSONResponse(content=result)
-
-    @app.post(
-        "/api/execution/cell-recover/abort",
-        openapi_extra={"x-manyforge-reference-note": CELL_RECOVER_ABORT_REFERENCE_NOTE},
-    )
-    async def execution_cell_recover_abort(body: CellRecoverAbortRequest) -> dict[str, Any]:
-        """SX-679: the operator's abort of the running Recover cell press.
-
-        No later step of that press starts; the step in flight settles within
-        its own limit, and the press ends `cell_recover_aborted`.
-        """
-
-        aborted = cell_recover_ledger.abort_running()
-        if not aborted:
-            raise HeadlessApiError(
-                "cell_recover_not_running", "no Recover cell press is running"
-            )
-        return {"abort_requested": True, "request_ids": aborted}
-
     @app.post("/api/execution/runtime-scale-control")
     async def execution_set_runtime_scale_control(
         body: RuntimeScaleControlRequest,
@@ -2331,6 +1983,12 @@ def create_app(
         sequence: Annotated[int, Path(ge=1, le=_MAXIMUM_SAFE_INTEGER)],
     ) -> dict[str, Any]:
         return service.history_detail(sequence)
+
+    @app.post("/api/execution/history/apply-outcomes")
+    def history_apply_outcome(body: ApplyOutcomeRequest) -> dict[str, Any]:
+        """One Scenario Load/New, Deployment or Program Apply/Revert terminal
+        (outcome, typed error, component rows), recorded as `apply_finished`."""
+        return service.record_apply_outcome(body)
 
     @app.post("/api/execution/history/reconcile")
     def historian_reconcile(

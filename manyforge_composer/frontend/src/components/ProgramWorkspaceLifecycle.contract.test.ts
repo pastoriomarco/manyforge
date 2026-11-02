@@ -92,7 +92,8 @@ describe('Program workspace lifecycle controls', () => {
     );
 
     expect(scenarioSource).toContain('New Scenario');
-    expect(scenarioSource).toContain('controller.newScenarioDocument(afterClose.confirmDiscard, afterClose.confirmed.authoring)');
+    // New is the server's Apply of the empty cell (CONTRACTS §11): one call.
+    expect(scenarioSource).toContain("kind === 'new' ? await newScenarioDocument(onRefusal)");
     expect(source).toContain('Revert to saved');
     expect(source).toContain('Discard changes');
     expect(source).toContain('returns to Applied');
@@ -112,7 +113,7 @@ describe('Program workspace lifecycle controls', () => {
     );
 
     expect(source).toContain("'discard'");
-    expect(source).toContain("'new_scenario_document'");
+    expect(source).toContain('run(`${kind}_scenario_document`');
     expect(source).toContain("'revert'");
     expect(source).toContain('api.programWorkspace.discard(requestFence)');
     expect(source).toContain('api.programWorkspace.revert(requestFence)');
@@ -207,9 +208,9 @@ describe('Program workspace lifecycle controls', () => {
     expect(source).not.toContain('applyDraft(selectedScenario');
     expect(source).not.toContain('Load and Apply Program');
     expect(scenarioSource).toContain('Load replaces the current Scenario and applies its Deployment, Scene and Program.');
-    // Every Load closes first; its dirty-work confirmation is the Close popup.
+    // Load is the server's New then Apply; only discarding Draft changes asks.
     expect(scenarioSource).not.toContain('Replace current unsaved or unapplied Draft changes');
-    expect(scenarioSource).toContain('Discard the current Draft and continue?');
+    expect(scenarioSource).toContain('Current unsaved and unapplied Draft changes will be discarded.');
     expect(scenarioSource).not.toContain('Open as Draft only');
     expect(scenarioSource).not.toContain('confirmScenarioDeployment');
     expect(scenarioSource).toContain('The list shows saved metadata, not current readiness.');
@@ -247,7 +248,7 @@ describe('Program workspace lifecycle controls', () => {
     // Edits and Discard follow the Draft-edit gate; Apply with a run Resets
     // it first; every other document action requires Idle.
     expect(controlsSource).toContain("programBusyReason ?? program.mutationUnavailableReason");
-    expect(controlsSource).toContain("resetApply.unavailableReason('program') : program.documentUnavailableReason");
+    expect(controlsSource).toContain('resetApply.unavailableReason() : program.documentUnavailableReason');
     expect(workspaceSource).not.toContain('affect only later runs');
   });
 });

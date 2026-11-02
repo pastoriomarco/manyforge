@@ -234,7 +234,7 @@ void InsertMaintenanceResult(
 
 bool CandidateBindingsMatch(
     const RetainedBundleDTO &bundle,
-    const std::vector<core::ProjectionNativeRuntimeBindingDTO> &bindings) {
+    const std::vector<core::ProjectionExecutionHostBindingDTO> &bindings) {
   const auto requirements = NativeSceneProviderBindings(bundle);
   if (requirements.size() != bindings.size()) {
     return false;
@@ -377,17 +377,17 @@ void ValidateAdoptionRequest(const Request &request,
                       AdoptionTarget(request, request.expected_snapshot_identity.revision),
                       request.expected_active_projection_revision),
               "legacy_projection_unchanged") ||
-      invalid(request.native_runtime_bindings.size() > kMaximumNativeProjectionBindings,
+      invalid(request.execution_host_bindings.size() > kMaximumNativeProjectionBindings,
               "native_bindings_limit")) {
     throw std::invalid_argument(
         std::string("qualified Scene product adoption is invalid: ") + failed_guard);
   }
   for (std::size_t index = 0U;
-       index < request.native_runtime_bindings.size(); ++index) {
-    if (!request.native_runtime_bindings[index].valid() ||
+       index < request.execution_host_bindings.size(); ++index) {
+    if (!request.execution_host_bindings[index].valid() ||
         (index != 0U && !core::CanonicalProjectionNativeBindingLess(
-                           request.native_runtime_bindings[index - 1U],
-                           request.native_runtime_bindings[index]))) {
+                           request.execution_host_bindings[index - 1U],
+                           request.execution_host_bindings[index]))) {
       throw std::invalid_argument("qualified Scene adoption bindings are invalid");
     }
   }
@@ -475,7 +475,7 @@ void RequireVerifiedAdoptionCandidate(
       request.candidate_retained_bundle.retained_bundle_id);
   std::set<std::pair<core::CapabilityProviderBindingId,
                      core::CapabilityProviderBindingRevision>> supplied;
-  for (const auto &binding : request.native_runtime_bindings) {
+  for (const auto &binding : request.execution_host_bindings) {
     if (!supplied.emplace(binding.provider_binding_id,
                           binding.provider_binding_revision).second) {
       throw LogicalSceneOwnerConflictError(
@@ -485,7 +485,7 @@ void RequireVerifiedAdoptionCandidate(
   if (candidate == nullptr ||
       !deployment::verify_retained_bundle_identity(*candidate) ||
       candidate->value() != request.candidate_retained_bundle ||
-      !CandidateBindingsMatch(candidate->value(), request.native_runtime_bindings)) {
+      !CandidateBindingsMatch(candidate->value(), request.execution_host_bindings)) {
     throw LogicalSceneOwnerConflictError(
         "qualified Scene adoption candidate or binding set is not exact");
   }
@@ -520,7 +520,7 @@ void RequireAdoptionRow(
       !core::SameProjectionIdentity(
           row.target, AdoptionTarget(request, request.expected_snapshot_identity.revision)) ||
       !SameSnapshotScene(row.authoritative_snapshot.identity(), request.expected_snapshot_identity) ||
-      row.bindings != request.native_runtime_bindings ||
+      row.bindings != request.execution_host_bindings ||
       row.initial_baseline_request_digest.has_value() ||
       row.repaired_transaction_sequence.has_value()) {
     throw LogicalSceneOwnerConflictError(
@@ -536,6 +536,154 @@ void RequireCurrentPublication(
     throw LogicalSceneOwnerConflictError(
         "qualified Scene adoption publication is not the exact current head");
   }
+}
+
+// Returns the oldest initialization no reader still needs, given how many
+// completions (in order) are already folded into the Scene history
+// checkpoint. See MakeRoomForMaintenanceInitialization.
+[[nodiscard]] std::optional<std::size_t> OldestEvictableMaintenanceInitialization(
+    const DurableState &state, const std::size_t folded_completions) {
+  const auto &rows = state.maintenance_initializations;
+  std::optional<std::size_t> latest_completed;
+  for (std::size_t index = 0U; index < rows.size(); ++index) {
+    if (rows[index].publication_receipt.has_value()) {
+      latest_completed = index;
+    }
+  }
+  std::size_t completion_ordinal = 0U;
+  for (std::size_t index = 0U; index + 1U < rows.size(); ++index) {
+    const auto &row = rows[index];
+    if (row.publication_receipt.has_value()) {
+      if (completion_ordinal++ < folded_completions &&
+          latest_completed != index) {
+        return index;
+      }
+      continue;
+    }
+    const bool terminal =
+        row.result_state == ProjectionMaintenanceInitializationState::kFailed ||
+        row.result_state ==
+            ProjectionMaintenanceInitializationState::kInterrupted;
+    const bool superseded =
+        latest_completed.has_value() && index < *latest_completed;
+    if (terminal && (!row.effects_unknown || superseded)) {
+      return index;
+    }
+  }
+  return std::nullopt;
+}
+
+// Deletes one initialization and its rows in every child table inside the
+// caller's write transaction (the delete guards open only while
+// compaction_in_progress is set). A folded completion leaves the checkpoint's
+// folded-completion count, which indexes the retained completions.
+void DeleteMaintenanceInitialization(sqlite3 *database,
+                                     const MaintenanceInitializationState &row) {
+  Exec(database, "UPDATE logical_scene_history_state SET "
+                 "compaction_in_progress=1 WHERE singleton=1 AND "
+                 "compaction_in_progress=0");
+  if (sqlite3_changes(database) != 1) {
+    throw LogicalSceneOwnerIntegrityError(
+        "maintenance eviction cannot open the bounded-history window");
+  }
+  for (const std::string_view table :
+       {"logical_scene_initial_baseline_results",
+        "logical_scene_initial_baseline_intents",
+        "logical_scene_initial_baseline_requests",
+        "logical_scene_maintenance_initialization_completions",
+        "logical_scene_maintenance_initialization_results",
+        "logical_scene_maintenance_initialization_bindings",
+        "logical_scene_maintenance_initialization_intents"}) {
+    Statement remove(database, "DELETE FROM " + std::string(table) +
+                                   " WHERE initialization_sequence=?");
+    remove.Bind(1, CheckedSafeCounter(row.initialization_sequence,
+                                      "initialization sequence"));
+    if (remove.Step()) {
+      throw LogicalSceneOwnerIntegrityError(
+          "maintenance eviction delete returned a row");
+    }
+  }
+  Exec(database,
+       row.publication_receipt.has_value()
+           ? "UPDATE logical_scene_history_state SET "
+             "compacted_maintenance_completion_count="
+             "compacted_maintenance_completion_count-1,"
+             "compaction_in_progress=0 WHERE singleton=1"
+           : "UPDATE logical_scene_history_state SET "
+             "compaction_in_progress=0 WHERE singleton=1");
+}
+
+// Bound the maintenance-initialization history by eviction instead of
+// refusal. When it is full, delete, inside the caller's write transaction and
+// before its insert, the oldest initialization no reader can still need:
+//  - not the latest: AccessStatus, health, the Begin/Install/Complete
+//    continuation and the Manager's in-flight Apply read it;
+//  - not the latest completed one: ActiveExecutionHostBindings, the durable
+//    head's Deployment identity and legacy-uncertainty repair read it;
+//  - not one that may still progress: no result yet, or initialized without
+//    completion (InstallInitialScene and CompleteMaintenanceInitialization
+//    find any row by Apply identity);
+//  - not an interrupted (effects-unknown) one that no later completion has
+//    superseded with a fresh initialization (the workbench classifier reports
+//    it as unresolved);
+//  - not a completion the Scene replay still consumes: replay applies the
+//    completions in order after the history checkpoint, skipping the first
+//    `compacted_maintenance_completion_count`, so only those folded ones are
+//    evictable and evicting one decrements that count.
+// A failed row and a superseded interrupted one are terminal and never read
+// again; exact status replay of an evicted Apply returns nothing, like an
+// evicted Manager Apply. When rows are needed only because completions are not
+// yet folded, fold them first with the transparent history compaction at the
+// settled head, settling held authored-Scene claims first as the commit path
+// does. Returns false when every retained initialization is still needed.
+[[nodiscard]] bool MakeRoomForMaintenanceInitialization(
+    sqlite3 *database, core::IKernelCellAdmissionPort *cell_admission,
+    const DurableState &state) {
+  if (state.maintenance_initializations.size() <
+      kMaximumMaintenanceInitializations) {
+    return true;
+  }
+  auto evictable = OldestEvictableMaintenanceInitialization(
+      state, ReadBoundedHistoryState(database)
+                 .compacted_maintenance_completion_count);
+  if (!evictable.has_value()) {
+    if (!OldestEvictableMaintenanceInitialization(
+             state, kMaximumMaintenanceInitializations)
+             .has_value()) {
+      return false;
+    }
+    const auto transactions = ReadSceneTransactionStoreState(database, state);
+    if (state.projection_desynchronized ||
+        state.unresolved_scene_transaction ||
+        transactions.projection_desynchronized ||
+        transactions.unresolved_native_attempt) {
+      return false;
+    }
+    if (cell_admission != nullptr &&
+        transactions.resident_transaction_count != 0U) {
+      try {
+        SettleRecoveredAuthoredSceneClaims(database, *cell_admission);
+      } catch (const CellAdmissionTemporarilyUnavailable &) {
+        return false;
+      }
+    }
+    CompactSceneTransactionHistory(database, state, transactions, true);
+    evictable = OldestEvictableMaintenanceInitialization(
+        state, ReadBoundedHistoryState(database)
+                   .compacted_maintenance_completion_count);
+    if (!evictable.has_value()) {
+      return false;
+    }
+  }
+  DeleteMaintenanceInitialization(
+      database, state.maintenance_initializations[*evictable]);
+  return true;
+}
+
+[[nodiscard]] std::uint64_t
+NextMaintenanceInitializationSequence(const DurableState &state) {
+  const auto *latest = state.LatestMaintenanceInitialization();
+  return latest == nullptr ? 1U : latest->initialization_sequence + 1U;
 }
 
 } // namespace
@@ -631,12 +779,12 @@ LogicalSceneOwner::OriginalManagerProductAdoptionProjectionHealthImpl(
   // its exact predecessor. Rebuild uses that same owner/job; it does not select
   // a public planner, change the logical Scene or retire a surviving projection.
   std::vector<core::ProjectionHealthDTO> health;
-  health.reserve(request.native_runtime_bindings.size());
-  for (const auto &binding : request.native_runtime_bindings) {
+  health.reserve(request.execution_host_bindings.size());
+  for (const auto &binding : request.execution_host_bindings) {
     auto projection = ResolveRequiredProjection(
             binding, impl_->projection_resolver_, target);
     auto observed = projection.preflight_health;
-    if (observed.native_runtime_binding != binding ||
+    if (observed.execution_host_binding != binding ||
         (observed.state == ProjectionHealthState::kHealthy &&
          !observed.healthy_for_identity(target))) {
       throw LogicalSceneOwnerConflictError(
@@ -656,7 +804,7 @@ LogicalSceneOwner::OriginalManagerProductAdoptionProjectionHealthImpl(
                              rebuilt.resulting_health.healthy_for_target(target);
       if (!rebuilt.presence_valid() || rebuilt.transaction_sequence.has_value() ||
           rebuilt.proposed_projection_revision != target ||
-          rebuilt.resulting_health.native_runtime_binding != binding ||
+          rebuilt.resulting_health.execution_host_binding != binding ||
           (!accepted && !committed)) {
         const auto detail = rebuilt.error.has_value() ? ": " + rebuilt.error->message : std::string{};
         throw LogicalSceneOwnerConflictError(
@@ -742,14 +890,13 @@ LogicalSceneOwner::BeginQualifiedProductAdoptionImpl(
           "qualified Scene adoption has no exact original live continuation");
     }
   } else if (impl_->live_product_adoption_.has_value() ||
-             !AccessStatus(state).scene_writes_open ||
-             state.maintenance_initializations.size() >= kMaximumMaintenanceInitializations) {
+             !AccessStatus(state).scene_writes_open) {
     throw LogicalSceneOwnerConflictError(
         "qualified Scene adoption cannot enter this maintenance window");
   }
   const auto staged_target = AdoptionTarget(request, state.active_scene_snapshot->revision);
   lock.unlock();
-  for (const auto &binding : request.native_runtime_bindings) {
+  for (const auto &binding : request.execution_host_bindings) {
     const auto projection = ResolveRequiredProjection(
             binding, impl_->projection_resolver_, staged_target);
     if (!projection.preflight_health.healthy_for_identity(staged_target)) {
@@ -789,7 +936,12 @@ LogicalSceneOwner::BeginQualifiedProductAdoptionImpl(
   bool commit_reached = false;
   try {
     Transaction transaction(database, "BEGIN IMMEDIATE");
-    const auto sequence = state.maintenance_initializations.size() + 1U;
+    if (!MakeRoomForMaintenanceInitialization(
+            database, impl_->cell_admission_, state)) {
+      throw LogicalSceneOwnerConflictError(
+          "qualified Scene adoption cannot enter this maintenance window");
+    }
+    const auto sequence = NextMaintenanceInitializationSequence(state);
     Statement insert(
         database,
         "INSERT INTO logical_scene_maintenance_initialization_intents("
@@ -807,13 +959,13 @@ LogicalSceneOwner::BeginQualifiedProductAdoptionImpl(
     BindProjection(insert, 4, predecessor);
     BindProjection(insert, 9, target);
     insert.Bind(14, logical_scene_codec_internal::EncodeSnapshot(snapshot));
-    insert.Bind(15, static_cast<std::int64_t>(request.native_runtime_bindings.size()));
+    insert.Bind(15, static_cast<std::int64_t>(request.execution_host_bindings.size()));
     insert.BindNull(16);
     if (insert.Step()) {
       throw LogicalSceneOwnerIntegrityError("Scene adoption intent insert returned a row");
     }
-    for (std::size_t index = 0U; index < request.native_runtime_bindings.size(); ++index) {
-      const auto &binding = request.native_runtime_bindings[index];
+    for (std::size_t index = 0U; index < request.execution_host_bindings.size(); ++index) {
+      const auto &binding = request.execution_host_bindings[index];
       Statement row(
           database,
           "INSERT INTO logical_scene_maintenance_initialization_bindings("
@@ -847,7 +999,7 @@ LogicalSceneOwner::BeginQualifiedProductAdoptionImpl(
   // Candidate projections staged at an earlier revision of this Scene move to
   // the captured one in place. A failure here is uncertainty, not rollback.
   const auto latest = std::make_shared<const LogicalSceneSnapshotDTO>(snapshot);
-  for (const auto &binding : request.native_runtime_bindings) {
+  for (const auto &binding : request.execution_host_bindings) {
     const auto projection = ResolveRequiredProjection(
         binding, impl_->projection_resolver_, target);
     const auto &health = projection.preflight_health;
@@ -885,7 +1037,7 @@ ProjectionMaintenanceInitializationStatusDTO
 LogicalSceneOwner::BeginMaintenanceInitialization(
     const ProjectionMaintenanceInitializationRequestDTO &request) {
   if (!request.valid() ||
-      request.native_runtime_bindings.size() >
+      request.execution_host_bindings.size() >
           kMaximumNativeProjectionBindings) {
     throw std::invalid_argument(
         "maintenance initialization request is invalid");
@@ -904,7 +1056,7 @@ LogicalSceneOwner::BeginMaintenanceInitialization(
       candidate->value() != request.candidate_retained_bundle ||
       candidate->value().cell_graph.cell_id != impl_->fixed_query_.cell_id ||
       !CandidateBindingsMatch(candidate->value(),
-                              request.native_runtime_bindings)) {
+                              request.execution_host_bindings)) {
     throw LogicalSceneOwnerConflictError(
         "maintenance initialization candidate or binding set is not exact");
   }
@@ -935,9 +1087,7 @@ LogicalSceneOwner::BeginMaintenanceInitialization(
             request.expected_active_projection_revision ||
         (!access.scene_writes_open && latest == nullptr &&
          !explicitly_repairable) ||
-        !prior_settled ||
-        state.maintenance_initializations.size() >=
-            kMaximumMaintenanceInitializations) {
+        !prior_settled) {
       throw LogicalSceneOwnerConflictError(
           "maintenance initialization does not match the exact active Scene");
     }
@@ -964,7 +1114,12 @@ LogicalSceneOwner::BeginMaintenanceInitialization(
         provisional_snapshot.revision,
     };
     Transaction intent(database, "BEGIN IMMEDIATE");
-    const auto sequence = state.maintenance_initializations.size() + 1U;
+    if (!MakeRoomForMaintenanceInitialization(
+            database, impl_->cell_admission_, state)) {
+      throw LogicalSceneOwnerConflictError(
+          "maintenance initialization does not match the exact active Scene");
+    }
+    const auto sequence = NextMaintenanceInitializationSequence(state);
     Statement insert(
         database,
         "INSERT INTO logical_scene_maintenance_initialization_intents("
@@ -985,7 +1140,7 @@ LogicalSceneOwner::BeginMaintenanceInitialization(
     insert.Bind(14, logical_scene_codec_internal::EncodeSnapshot(
                         provisional_snapshot));
     insert.Bind(15, static_cast<std::int64_t>(
-                        request.native_runtime_bindings.size()));
+                        request.execution_host_bindings.size()));
     if (state.projection_desynchronized &&
         state.latest_uncertain_transaction_sequence.has_value()) {
       insert.Bind(16, CheckedSafeCounter(
@@ -999,8 +1154,8 @@ LogicalSceneOwner::BeginMaintenanceInitialization(
           "maintenance intent insert returned a row");
     }
     for (std::size_t index = 0U;
-         index < request.native_runtime_bindings.size(); ++index) {
-      const auto &binding = request.native_runtime_bindings[index];
+         index < request.execution_host_bindings.size(); ++index) {
+      const auto &binding = request.execution_host_bindings[index];
       Statement row(
           database,
           "INSERT INTO logical_scene_maintenance_initialization_bindings("
@@ -1039,7 +1194,7 @@ LogicalSceneOwner::BeginMaintenanceInitialization(
           request.candidate_retained_bundle.retained_bundle_id ||
       found->target.graph_revision !=
           request.candidate_retained_bundle.cell_graph.graph_revision ||
-      found->bindings != request.native_runtime_bindings ||
+      found->bindings != request.execution_host_bindings ||
       found->initial_baseline_request_digest != initial_scene_digest) {
     throw LogicalSceneOwnerConflictError(
         "maintenance initialization identity is already bound differently");
@@ -1133,7 +1288,7 @@ LogicalSceneOwner::BeginMaintenanceInitialization(
       if (rebuilt.result == core::ProjectionCommitResultStateDTO::kAccepted &&
           rebuilt.presence_valid() && !rebuilt.transaction_sequence.has_value() &&
           rebuilt.proposed_projection_revision == initialization.target &&
-          rebuilt.resulting_health.native_runtime_binding == binding) {
+          rebuilt.resulting_health.execution_host_binding == binding) {
         progressing = true;
         projection_effect_pending_or_committed = true;
         continue;
@@ -1222,7 +1377,7 @@ LogicalSceneOwner::InstallInitialScene(
           request.candidate_retained_bundle.retained_bundle_id ||
       found->target.graph_revision !=
           request.candidate_retained_bundle.cell_graph.graph_revision ||
-      found->bindings != request.native_runtime_bindings ||
+      found->bindings != request.execution_host_bindings ||
       found->initial_baseline_request_digest != request_digest) {
     throw LogicalSceneOwnerConflictError(
         "initial Scene request differs from its durable Apply intent");

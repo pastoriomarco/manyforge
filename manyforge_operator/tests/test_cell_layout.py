@@ -39,7 +39,7 @@ def test_clean_bootstrap_creates_missing_private_namespace_chain(
 ) -> None:
     install = tmp_path / "install"
     install.mkdir()
-    namespace = tmp_path / "operator-state" / "native"
+    namespace = tmp_path / "operator-state" / "workbench"
     cell = namespace / "cell.a"
 
     layout = CellInstanceLayout.open_or_create(
@@ -60,7 +60,7 @@ def test_missing_namespace_rejects_unsafe_existing_component_without_mutation(
     install.mkdir()
     namespace = tmp_path / "operator-state"
     namespace.mkdir()
-    unsafe = namespace / "native"
+    unsafe = namespace / "workbench"
     outside = tmp_path / "outside"
     outside.mkdir()
     if unsafe_kind == "symlink":

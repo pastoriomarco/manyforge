@@ -3,7 +3,7 @@
 Run through the CLI shim from the repository root, in the workbench container:
 
     scripts/manyforge component check <folder> [--scenario <scenario folder>]
-    scripts/manyforge component new <robot|tool|io_device> <vendor>.<name> [--into <folder>]
+    scripts/manyforge component new <robot|tool|io_device|machine> <vendor>.<name> [--into <folder>]
     scripts/manyforge component register <folder>
     scripts/manyforge component list [--json]
 
@@ -100,8 +100,7 @@ def _parser() -> argparse.ArgumentParser:
     new.set_defaults(handler=_new)
     register = commands.add_parser(
         "register",
-        help="write a robot's or tool's model family, component profile and Mock "
-        "controller rows",
+        help="write a robot's or tool's model family row",
     )
     register.add_argument("folder")
     register.set_defaults(handler=_register)

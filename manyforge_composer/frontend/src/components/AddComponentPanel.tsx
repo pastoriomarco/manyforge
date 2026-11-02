@@ -6,12 +6,15 @@ import type {
   ComponentCatalog,
   ComponentCatalogEntry,
   ComponentCatalogKind,
+  MachineCatalogEntry,
 } from '../types/componentCatalog';
 import {
   COMPONENT_KIND_LABELS,
   addComponentProblem,
+  defaultMemberId,
   draftComponents,
   framePrefixFor,
+  machineCatalogEntry,
   mountCandidates,
   nextFreeComponentId,
   renameComponentRows,
@@ -21,16 +24,39 @@ import {
   type RoleFeedback,
 } from '../utils/componentManager';
 
-const KINDS: readonly ComponentCatalogKind[] = ['robot', 'tool', 'io_device', 'pose_source', 'ai_model'];
+const KINDS: readonly ComponentCatalogKind[] = ['machine', 'robot', 'tool', 'io_device', 'pose_source', 'ai_model', 'sensor'];
+
+/** An absolute ROS topic name (the compiler checks it fully). */
+const ROS_TOPIC = /^\/[A-Za-z0-9_/~{}]*$/;
 
 interface AddDraft {
   entry: ComponentCatalogEntry;
+  /** A machine model: `entry` is its owner and member rows (CONTRACTS §16). */
+  machine: MachineCatalogEntry | null;
+  /** A machine's lane (its owner's; the members take it). */
+  lane: string;
+  /** A sensor's source topic (`runtime_configuration.topic`); empty for other kinds. */
+  topic: string;
+  /** A sensor's source frame (`runtime_configuration.source_frame_id`); empty for other kinds. */
+  sourceFrame: string;
   /** Catalog component id -> id in this Deployment. */
   ids: Record<string, string>;
   framePrefix: string;
   position: [string, string, string];
   /** A tool's robot (its `flange`); empty for other kinds. */
   mountOn: string;
+}
+
+/** The row the role, prefix and base position apply to: a machine's arm (the member with a model), else the entry's own. */
+function mainRowId(entry: ComponentCatalogEntry): string {
+  if (entry.kind !== 'machine') return entry.componentId;
+  const arm = entry.components.find((row) => row.owner !== undefined && row.model_source !== undefined);
+  return typeof arm?.component_id === 'string' ? arm.component_id : entry.componentId;
+}
+
+/** Whether the entry places a model in the cell (base position and frame prefix). */
+function placed(entry: ComponentCatalogEntry): boolean {
+  return entry.kind === 'robot' || (entry.kind === 'machine' && mainRowId(entry) !== entry.componentId);
 }
 
 function object(value: JsonValue | undefined): Record<string, JsonValue> | null {
@@ -48,6 +74,7 @@ function rowPosition(row: Record<string, JsonValue> | undefined): [string, strin
 /** A first choice for the ids: a fitting unbound role's assigned id, else the catalog id (made free). */
 function initialDraft(
   entry: ComponentCatalogEntry,
+  machine: MachineCatalogEntry | null,
   document: Record<string, JsonValue> | null,
   feedback: readonly RoleFeedback[],
   mounts: readonly string[],
@@ -55,16 +82,20 @@ function initialDraft(
   const existing = draftComponents(document);
   const taken = new Set(existing.map((row) => row.component_id as string));
   const ids: Record<string, string> = {};
+  const mainId = mainRowId(entry);
   const roleId = rolesFittingEntry(entry, feedback)
     .map((role) => role.componentId)
     .find((id): id is string => id !== null && !taken.has(id));
   for (const row of entry.components) {
     const original = row.component_id as string;
-    ids[original] = original === entry.componentId && roleId !== undefined
-      ? roleId : nextFreeComponentId(original, taken);
+    // A machine's members follow a free owner id: `<owner_id>_<role>`.
+    const memberDefault = machine !== null && typeof row.role === 'string' && ids[entry.componentId] !== undefined
+      ? defaultMemberId(ids[entry.componentId], row.role) : original;
+    ids[original] = original === mainId && roleId !== undefined
+      ? roleId : nextFreeComponentId(memberDefault, taken);
     taken.add(ids[original]);
   }
-  const main = entry.components.find((row) => row.component_id === entry.componentId);
+  const main = entry.components.find((row) => row.component_id === mainId);
   // The same model twice needs a frame prefix to keep its frame names apart.
   const urdf = JSON.stringify(object(main?.model_source)?.urdf ?? null);
   const sameModel = main?.model_source !== undefined && existing.some((row) => (
@@ -72,22 +103,47 @@ function initialDraft(
   ));
   return {
     entry,
+    machine,
+    lane: entry.lane ?? '',
+    topic: '',
+    sourceFrame: '',
     ids,
-    framePrefix: sameModel ? framePrefixFor(ids[entry.componentId]) : String(main?.frame_prefix ?? ''),
+    framePrefix: sameModel ? framePrefixFor(ids[mainId]) : String(main?.frame_prefix ?? ''),
     position: rowPosition(main),
     mountOn: entry.kind === 'tool' ? mounts[0] ?? '' : '',
   };
 }
 
+/** Rename one catalog id; renaming a machine's owner moves the member ids still at their default. */
+function withId(draft: AddDraft, original: string, id: string): AddDraft {
+  const ids = { ...draft.ids, [original]: id };
+  if (draft.machine !== null && original === draft.entry.componentId) {
+    for (const row of draft.entry.components) {
+      if (typeof row.role !== 'string') continue;
+      const member = row.component_id as string;
+      if (draft.ids[member] === defaultMemberId(draft.ids[original], row.role)) {
+        ids[member] = defaultMemberId(id, row.role);
+      }
+    }
+  }
+  return { ...draft, ids };
+}
+
 /**
  * The Draft rows the add sends: renamed, with the main robot's prefix and
  * position. A tool gets its prefix and no `root_pose_in_cell`: its mount row
- * places it on the robot flange.
+ * places it on the robot flange. A machine's rows are built for its lane;
+ * the members' `owner` follows the owner's id.
  */
-function addedComponentRows(draft: AddDraft): Array<Record<string, JsonValue>> | string {
-  const mainId = draft.ids[draft.entry.componentId];
+function addedComponentRows(
+  draft: AddDraft,
+  catalog: ComponentCatalog | null,
+): Array<Record<string, JsonValue>> | string {
+  const entry = draft.machine === null ? draft.entry
+    : machineCatalogEntry(draft.machine, draft.lane, catalog?.componentProfiles ?? {});
+  const mainId = draft.ids[mainRowId(entry)];
   const position = draft.position.map((value) => Number(value));
-  if (draft.entry.kind === 'robot' && draft.position.some((value, index) => (
+  if (placed(entry) && draft.position.some((value, index) => (
     value.trim() === '' || !Number.isFinite(position[index])
   ))) {
     return 'Position must be three finite numbers in meters.';
@@ -95,15 +151,36 @@ function addedComponentRows(draft: AddDraft): Array<Record<string, JsonValue>> |
   if (draft.framePrefix !== '' && !/^[A-Za-z0-9_][A-Za-z0-9_/]*\/$/.test(draft.framePrefix)) {
     return "Frame prefix must be empty or use only ASCII letters, digits, '_' and '/', ending in '/'.";
   }
-  const renamed = renameComponentRows(draft.entry.components, draft.ids);
-  const rows = draft.entry.kind === 'tool' ? withMountRobot(renamed, draft.mountOn) : renamed;
+  if (entry.kind === 'sensor' && !ROS_TOPIC.test(draft.topic.trim())) {
+    return 'Topic must be an absolute ROS topic, e.g. /camera/points.';
+  }
+  if (entry.kind === 'sensor' && draft.sourceFrame.trim() === '') {
+    return 'Enter the frame the cloud is published in.';
+  }
+  const renamed = renameComponentRows(entry.components, draft.ids);
+  const rows = entry.kind === 'tool' ? withMountRobot(renamed, draft.mountOn) : renamed;
   return rows.map((row) => {
     if (row.component_id !== mainId) return row;
-    if (draft.entry.kind === 'tool') {
+    if (entry.kind === 'sensor') {
+      // A sensor has no lane; its source topic and frame are the settings without a default.
+      const configuration = object(row.configuration) ?? {};
+      return {
+        ...row,
+        configuration: {
+          ...configuration,
+          runtime_configuration: {
+            ...(object(configuration.runtime_configuration) ?? {}),
+            topic: draft.topic.trim(),
+            source_frame_id: draft.sourceFrame.trim(),
+          },
+        },
+      };
+    }
+    if (entry.kind === 'tool') {
       const mounted = Object.fromEntries(Object.entries(row).filter(([key]) => key !== 'root_pose_in_cell'));
       return { ...mounted, frame_prefix: draft.framePrefix };
     }
-    if (draft.entry.kind !== 'robot') return row;
+    if (!placed(entry)) return row;
     const pose = object(row.root_pose_in_cell) ?? {};
     return {
       ...row,
@@ -115,8 +192,9 @@ function addedComponentRows(draft: AddDraft): Array<Record<string, JsonValue>> |
 
 /**
  * Add component: compose components that already exist (the curated catalog)
- * into the Deployment Draft. Nothing runs until the one confirmed Apply under
- * Deployment, Changes; the Program role feedback shows what each choice binds.
+ * into the Deployment Draft, like every other Draft edit (remove, mount, base
+ * pose, lane). Nothing runs until Apply; the Program role feedback shows what
+ * each choice binds.
  */
 export function AddComponentPanel({ controller, catalog, catalogError, feedback, onAdded }: {
   controller: DeploymentWorkspaceController;
@@ -132,10 +210,15 @@ export function AddComponentPanel({ controller, catalog, catalogError, feedback,
   // Local validation (red, blocks Add until an edit) or a pointer to the owner's refusal (neutral).
   const [error, setError] = useState<{ message: string; refused: boolean } | null>(null);
   const document = controller.workspace?.draft.document ?? null;
-  const entries = useMemo(
-    () => (catalog?.entries ?? []).filter((entry) => entry.kind === kind),
-    [catalog, kind],
-  );
+  // A machine model is offered as one entry: its owner and member rows.
+  const entries = useMemo((): Array<{ entry: ComponentCatalogEntry; machine: MachineCatalogEntry | null }> => (
+    kind === 'machine'
+      ? (catalog?.machines ?? []).map((machine) => ({
+        machine,
+        entry: machineCatalogEntry(machine, machine.lanes[0] ?? '', catalog?.componentProfiles ?? {}),
+      }))
+      : (catalog?.entries ?? []).filter((entry) => entry.kind === kind).map((entry) => ({ entry, machine: null }))
+  ), [catalog, kind]);
   const mounts = useMemo(
     () => mountCandidates(document, catalog?.componentProfiles ?? {}),
     [catalog, document],
@@ -151,7 +234,7 @@ export function AddComponentPanel({ controller, catalog, catalogError, feedback,
 
   const add = async () => {
     if (draft === null) return;
-    const rows = addedComponentRows(draft);
+    const rows = addedComponentRows(draft, catalog);
     if (typeof rows === 'string') {
       setError({ message: rows, refused: false });
       return;
@@ -180,7 +263,7 @@ export function AddComponentPanel({ controller, catalog, catalogError, feedback,
     return (
       <div className="dactions">
         <button type="button" className="primary-action" disabled={disabled}
-          title={unavailable ?? 'Add a robot, tool, I/O device, pose source or AI model to the Deployment Draft.'}
+          title={unavailable ?? 'Add a machine, robot, tool, I/O device, pose source, AI model or sensor to the Deployment Draft.'}
           onClick={() => { setOpen(true); setError(null); }}>Add component</button>
       </div>
     );
@@ -193,8 +276,9 @@ export function AddComponentPanel({ controller, catalog, catalogError, feedback,
           onClick={() => { setOpen(false); setDraft(null); setError(null); }}>Cancel</button>
       </header>
       <p className="field-help">
-        Pick a component that already exists in a ManyForge example Scenario. It is added to the
-        Deployment Draft only; review it under Deployment, Changes, then Apply once to bring it up.
+        Pick a component that already exists in a ManyForge example Scenario, a machine model (its
+        owner and every member) or a sensor model. It is added to the Deployment Draft only; Preview and Apply bring it
+        up prepared, then Enable it.
       </p>
       {/* Yellow: a failed read blocks nothing else (M55 notice rule). */}
       {catalogError !== null && <p className="inline-message severity-warning" role="alert">{catalogError}</p>}
@@ -210,7 +294,7 @@ export function AddComponentPanel({ controller, catalog, catalogError, feedback,
       </div>
       <div className="drows" role="listbox" aria-label="Available components">
         {catalog !== null && entries.length === 0 && <p className="muted">No component of this kind is available.</p>}
-        {entries.map((entry) => {
+        {entries.map(({ entry, machine }) => {
           const fits = rolesFittingEntry(entry, feedback);
           const selected = draft?.entry.entryId === entry.entryId;
           const others = entry.components.map((row) => row.component_id as string)
@@ -219,20 +303,26 @@ export function AddComponentPanel({ controller, catalog, catalogError, feedback,
             <button key={entry.entryId} type="button" role="option" aria-selected={selected}
               className={`dpick${selected ? ' selected' : ''}`}
               title={entry.description ?? undefined}
-              onClick={() => { setDraft(initialDraft(entry, document, feedback, mounts)); setError(null); }}>
+              onClick={() => {
+                setDraft(initialDraft(entry, machine, document, feedback, mounts));
+                setError(null);
+              }}>
               <span>
-                <strong>{entry.componentProfileId}</strong>
+                <strong>{machine?.title ?? entry.componentProfileId}</strong>
                 <small>
                   {entry.componentId}
                   {others.length > 0 ? ` + ${others.join(', ')}` : ''}
-                  {entry.lane !== null ? ` · ${entry.lane}` : ''}
+                  {machine !== null ? ` · ${machine.modelId}` : entry.lane !== null ? ` · ${entry.lane}` : ''}
+                  {entry.kind === 'sensor' ? ` · ${entry.description ?? ''}` : ''}
                   {entry.tags.length > 0 ? ` · ${entry.tags.join(', ')}` : ''}
                 </small>
               </span>
               <small>
                 {fits.length > 0
                   ? `Fits role ${fits.map((role) => role.roleId).join(', ')}`
-                  : `from ${entry.sources[0]}${entry.sources.length > 1 ? ` +${entry.sources.length - 1}` : ''}`}
+                  : machine !== null ? `${machine.members.length} members`
+                    : entry.kind === 'sensor' ? 'sensor model'
+                    : `from ${entry.sources[0]}${entry.sources.length > 1 ? ` +${entry.sources.length - 1}` : ''}`}
               </small>
             </button>
           );
@@ -246,16 +336,47 @@ export function AddComponentPanel({ controller, catalog, catalogError, feedback,
       )}
       {draft !== null && (
         <fieldset className="dgrid" aria-label="New component settings">
+          {draft.machine !== null && (
+            <label>
+              <span>Lane</span>
+              <select aria-label="New machine lane" value={draft.lane} disabled={controller.busy}
+                onChange={(event) => { setDraft({ ...draft, lane: event.target.value }); setError(null); }}>
+                {draft.machine.lanes.map((lane) => <option key={lane} value={lane}>{lane}</option>)}
+              </select>
+              <small>The machine's lane; every member runs on it.</small>
+            </label>
+          )}
+          {draft.entry.kind === 'sensor' && (
+            <>
+              <label>
+                <span>Topic</span>
+                <input aria-label="New sensor topic" value={draft.topic} disabled={controller.busy}
+                  placeholder="/camera/points"
+                  onChange={(event) => { setDraft({ ...draft, topic: event.target.value }); setError(null); }} />
+                <small>The source topic it reads (absolute); it shows no data until something publishes it.</small>
+              </label>
+              <label>
+                <span>Source frame</span>
+                <input aria-label="New sensor source frame" value={draft.sourceFrame} disabled={controller.busy}
+                  placeholder="camera_link"
+                  onChange={(event) => { setDraft({ ...draft, sourceFrame: event.target.value }); setError(null); }} />
+                <small>The frame the cloud is published in; its other settings start at their defaults.</small>
+              </label>
+            </>
+          )}
           {draft.entry.components.map((row) => {
             const original = row.component_id as string;
             const id = draft.ids[original];
             const role = feedback.find((candidate) => candidate.componentId === id);
+            const slot = draft.machine?.members.find((member) => member.role === row.role);
+            const name = draft.machine === null ? original
+              : slot === undefined ? 'machine (owner)' : `${slot.title}, ${slot.role}`;
             return (
               <label key={original}>
-                <span>Component id{draft.entry.components.length > 1 ? ` (${original})` : ''}</span>
+                <span>Component id{draft.entry.components.length > 1 ? ` (${name})` : ''}</span>
                 <input aria-label={`Component id for ${original}`} value={id} disabled={controller.busy}
                   onChange={(event) => {
-                    setDraft({ ...draft, ids: { ...draft.ids, [original]: event.target.value } });
+                    setDraft(withId(draft, original, event.target.value));
                     setError(null);
                   }} />
                 <small>{role !== undefined
@@ -277,7 +398,7 @@ export function AddComponentPanel({ controller, catalog, catalogError, feedback,
                 : 'The tool is mounted on this robot\'s flange; its default TCP becomes the robot\'s tcp.'}</small>
             </label>
           )}
-          {(draft.entry.kind === 'robot' || draft.entry.kind === 'tool') && (
+          {(placed(draft.entry) || draft.entry.kind === 'tool') && (
             <label>
               <span>TF frame prefix</span>
               <input aria-label="New component frame prefix" value={draft.framePrefix} disabled={controller.busy}
@@ -285,7 +406,7 @@ export function AddComponentPanel({ controller, catalog, catalogError, feedback,
               <small>Needed when the same model is already in the cell; empty keeps unprefixed frames.</small>
             </label>
           )}
-          {draft.entry.kind === 'robot' && (
+          {placed(draft.entry) && (
             <>
               {(['x', 'y', 'z'] as const).map((axis, index) => (
                 <label key={axis}>

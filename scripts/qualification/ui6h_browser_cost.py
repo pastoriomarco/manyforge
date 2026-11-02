@@ -13,9 +13,8 @@ from pathlib import Path
 import shutil
 from tempfile import TemporaryDirectory
 import time
-from types import SimpleNamespace
 
-from current_workbench_browser_collector import CollectorError, RawWebDriver, _execute
+from current_workbench_browser_collector import RawWebDriver, _execute
 from manyforge_headless_api.client import HeadlessHttpClient
 
 
@@ -25,17 +24,6 @@ def main():
     parser.add_argument("--build-root", type=Path, required=True)
     parser.add_argument("--webdriver", required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument(
-        "--stop-diagnostic-samples",
-        type=int,
-        default=0,
-        help="Bounded Stop diagnosis only (1..10); never a latency qualification",
-    )
-    parser.add_argument(
-        "--stop-latency",
-        metavar="PRESSURE_WEBDRIVER",
-        help="Run the existing 100+100 Stop gate instead of the cycle-cost check",
-    )
     parser.add_argument(
         "--manual",
         action="store_true",
@@ -47,59 +35,12 @@ def main():
         help="Deliberately hide/freeze the viewer during this isolated cycle",
     )
     args = parser.parse_args()
-    if args.stop_latency and (args.manual or args.recovery):
-        parser.error("--stop-latency is separate from --manual/--recovery")
-    if args.stop_diagnostic_samples and not args.stop_latency:
-        parser.error("--stop-diagnostic-samples requires --stop-latency")
     workspace = Path(__file__).resolve().parents[2]
     spec = importlib.util.spec_from_file_location(
         "cost_workbench", workspace / "scripts/dev-workbench.py"
     )
     workbench = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(workbench)
-    if args.stop_diagnostic_samples:
-        original_popen = workbench.subprocess.Popen
-
-        def diagnostic_popen(command, *positional, **keywords):
-            if (
-                len(command) > 2
-                and command[1] == "-m"
-                and command[2] in {"manyforge_composer", "manyforge_headless_api"}
-            ):
-                module = command[2]
-                prelude = f"""
-import json, runpy, time
-from starlette.websockets import WebSocket
-original_send = WebSocket.send_text
-async def timed_send(self, payload):
-    received = time.monotonic_ns()
-    await original_send(self, payload)
-    sent = time.monotonic_ns()
-    if '"command_receipt"' in payload:
-        value = json.loads(payload)
-        receipt = value.get('receipt', {{}})
-        if receipt.get('code') == 'program_motion_stop_received':
-            print(json.dumps({{'stop_relay': {module!r}, 'correlation_id': receipt['correlation_id'],
-                'emitted_ns': value['emitted_monotonic_ns'], 'send_begin_ns': received,
-                'send_end_ns': sent, 'bytes': len(payload)}}), flush=True)
-    elif '"program_cycle"' in payload:
-        value = json.loads(payload)
-        cycle = value.get('shell', {{}}).get('program_cycle')
-        if isinstance(cycle, dict):
-            print(json.dumps({{'state_relay': {module!r},
-                'server_sequence': value.get('server_sequence'),
-                'execution_control_revision': cycle.get('execution_control_revision'),
-                'send_begin_ns': received, 'send_end_ns': sent,
-                'bytes': len(payload)}}), flush=True)
-WebSocket.send_text = timed_send
-runpy.run_module({module!r}, run_name='__main__')
-"""
-                command = [command[0], "-c", prelude, *command[3:]]
-            return original_popen(command, *positional, **keywords)
-
-        workbench.subprocess = SimpleNamespace(
-            **{**vars(workbench.subprocess), "Popen": diagnostic_popen}
-        )
     result = {
         "scope": "isolated Lite6 ROS mock cycle, Firefox software WebGL, 1440x900; no Stop or hardware"
     }
@@ -137,7 +78,7 @@ runpy.run_module({module!r}, run_name='__main__')
         # NOT_RUN: this historical package/Scenario handoff is not the current
         # authored-project startup. N4 owns its complete workflow migration.
         stack = workbench.Workbench(
-            scenario_id="lite6_pick_and_place",
+            scenario_id="mock_lite6_pick_and_place",
             headless_port=9101,
             runner_port=9102,
             composer_port=9001,
@@ -315,21 +256,6 @@ runpy.run_module({module!r}, run_name='__main__')
 
         try:
             stack.start()
-            if args.stop_latency:
-                from ui6_stop_latency import collect_ui6_stop_latency
-
-                result = collect_ui6_stop_latency(
-                    args.webdriver,
-                    args.stop_latency,
-                    "http://127.0.0.1:3001",
-                    "http://127.0.0.1:9001",
-                    require_software_renderer=True,
-                    diagnostic_samples=args.stop_diagnostic_samples,
-                )
-                print(json.dumps(result, sort_keys=True))
-                if result.get("success") is False:
-                    raise CollectorError("; ".join(result["failures"]))
-                return
             driver.create_session(firefox_args=("-no-remote",))
             driver.set_window_rect(1440, 900)
             driver.command(

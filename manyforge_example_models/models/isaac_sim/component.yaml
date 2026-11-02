@@ -1,0 +1,25 @@
+# Component descriptor of the Isaac Sim simulator (CONTRACTS §14). The
+# simulator is a component like any other: `playing` = enabled, paused or
+# stopped = prepared with the reason, unreachable = offline; Enable plays,
+# Disable pauses, capability sim_reset. It runs on the generic simulator adapter
+# (`simulation_interfaces`); this row holds the Isaac-specific values.
+api_version: manyforge.component_package.v1
+kind: simulator
+id: nvidia.isaac_sim
+version: 1.0.0
+title: NVIDIA Isaac Sim
+license: Apache-2.0
+lanes:
+  isaac:
+    adapter: simulation_interfaces
+    # Isaac Sim 5's ROS 2 simulation control extension serves the standard
+    # services at the root (observed live, 2026-07).
+    get_state_service: /get_simulation_state
+    set_state_service: /set_simulation_state
+    reset_service: /reset_simulation
+    # A loaded scene answers within a few seconds; the program simulation
+    # site uses the same bound.
+    response_timeout_s: 10.0
+    # The standard has no state topic, so the adapter reads the state at this
+    # period; play/pause by hand in Isaac shows within it.
+    state_poll_period_s: 1.0

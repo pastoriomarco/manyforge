@@ -15,7 +15,9 @@ from typing import Any, Final
 
 
 STATE_EVENT_KIND: Final = "interrupt_rule_state_changed"
-RULE_STATES: Final = frozenset({"clear", "tripped", "latched", "unknown"})
+# CONTRACTS §8: `inactive | clear | tripped`; `unknown` is an active rule
+# that can't watch its signals (its state key is withdrawn; it gates its scope).
+RULE_STATES: Final = frozenset({"inactive", "clear", "tripped", "unknown"})
 
 _MAX_SAFE: Final = 9_007_199_254_740_991
 _MAX_UINT64: Final = 2**64 - 1
@@ -353,7 +355,7 @@ class GlobalRuleStatusModel:
     at or before its ``through_sequence``; later same-context sparse rows
     overlay it (only the latest row per rule is kept). ``rows()`` is None
     while the catalog is unknown (never empty), otherwise one row per catalog
-    rule: clear/tripped/latched, ``waiting_for_program`` with the keys no
+    rule: inactive/clear/tripped/unknown, ``waiting_for_program`` with the keys no
     Program declares (decision 110), or ``pending`` while no state is known.
     """
 

@@ -6,8 +6,6 @@ from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 import json
-import hashlib
-import os
 import shutil
 import sys
 from tempfile import TemporaryDirectory
@@ -18,6 +16,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
+from manyforge_headless_api.component_model import enable_all_targets, owner_ids
 from manyforge_headless_api.execution import ExecutionCommandClient
 from manyforge_headless_api.models import OperationIntentRequest, TargetObservationQuery
 from manyforge_headless_api.process_tests.test_process_stack import (
@@ -32,14 +31,9 @@ from manyforge_headless_api.process_tests.test_process_stack import (
 
 
 CELL_ID = "ui6i_ur5e_lite6_wall_cell"
-# One budget per activation operation; nested reads share it, never reset it.
-# PROVISIONAL (maintainer 2026-10-18, contract 122): 20 s is not measured. Refine from live
-# command->Prepared/Active timings and component_read_changed re-read counts per component kind
-# (r5-live-trial-checklist.md "Provisional values").
-ACTIVATION_READ_TIMEOUT_SECONDS = 20.0
 ADMISSION_FILENAME = f"canonical-empty-admission.{CELL_ID}.json"
-GROUPED_SCENARIO = "ur5e_lite6_wall_grouped"
-ISOLATION_SCENARIO = "ur5e_lite6_wall_isolation"
+GROUPED_SCENARIO = "mock_dual_arm_shared_group"
+ISOLATION_SCENARIO = "mock_dual_arm_separate_groups"
 # Near the wall the UR5e start keeps about 9 cm of clearance, while its
 # Program goal reaches about 6 cm through the wall.
 MOVED_UR5E_ROOT_POSITION_M = [-0.2, 0.68, 0.0]
@@ -93,476 +87,73 @@ def _dual_robot_stack() -> Iterator[ProcessStack]:
 
 
 def _applied_activation_order(stack: ProcessStack) -> list[str]:
-    """Use the captured applied Deployment order, never the mutable Draft."""
-    deadline = time.monotonic() + ACTIVATION_READ_TIMEOUT_SECONDS
-    with (
-        HeadlessHttpClient(stack.composer_url, timeout_seconds=10.0) as composer,
-        HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless,
-    ):
-        selected = composer.request("GET", "/api/deployment/workspace")["managerApplied"]
-        order = selected["activationOrder"]
-        assert order is not None, selected
+    """The Applied components in cell order, as `GET /api/components` lists them."""
+    with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
         applied = headless.program_applied_status()
-        origin = applied["origin"]
-        assert origin["kind"] == "scenario", applied
-        assert selected["scenarioId"] == origin["scenario_id"], (selected, applied)
-        assert selected["deploymentRevision"] == applied["deployment_revision"], (selected, applied)
-        assert order["retainedBundleId"] == applied["retained_bundle_id"], (order, applied)
-        assert order["graphRevision"] == applied["graph_revision"], (order, applied)
-        component_ids = order["componentIds"]
-        assert isinstance(component_ids, list) and component_ids, order
-        assert len(component_ids) == len(set(component_ids)), order
-        for component_id in component_ids:
-            current = read_activation_component(headless, component_id, deadline=deadline)
-            assert current["retained_bundle_id"] == order["retainedBundleId"], current
-            assert current["graph_revision"] == order["graphRevision"], current
+        assert applied["origin"]["kind"] == "scenario", applied
+        component_ids = [row["component_id"] for row in headless.components()]
+        assert component_ids, applied
         return component_ids
 
 
-# Evidence only (contract 122): per-component activation timings to refine the
-# provisional deadline. Never alters deadlines, retries, commands or assertions.
-ACTIVATION_TIMING_SCHEMA = "manyforge.process_test.activation_timing.v1"
-ACTIVATION_TIMING_MAX_ROWS = 32
-ACTIVATION_TIMING_MAX_FILES = 32
+def _component_states(headless: HeadlessHttpClient) -> dict[str, dict[str, Any]]:
+    return {row["component_id"]: row for row in headless.components()}
 
 
-def _timing_row(
-    component_id: str, current: dict[str, Any] | None, intent: str | None
-) -> dict[str, Any]:
-    # Exact domain kind values only; anything else (incl. the superseded
-    # "provider") is labelled "unknown", never guessed.
-    kinds = {row.get("kind") if row.get("kind") in ("controller", "io_provider") else "unknown"
-             for row in (current or {}).get("domains", [])}
-    return {
-        "component_id": str(component_id)[:128],
-        "kind": kinds.pop() if len(kinds) == 1 else ("mixed" if kinds else "unknown"),
-        "intent": intent,
-        "deadline_seconds": ACTIVATION_READ_TIMEOUT_SECONDS,
-        "readiness_wait_ms": None, "readiness_wait_iterations": 0,
-        "admission_wait_ms": None,
-        "submit_to_terminal_ms": None, "submit_to_ready_ms": None,
-        "component_read_changed_count": 0,
-        "terminal_result": None, "terminal_state": None,
-        "target_state": {"prepare": "prepared", "enable": "active", "disable": "disabled"}.get(intent),
-        "final_state": None,
-        "outcome": None,  # "ok" once the target state is read back; "error" if the span failed first.
-    }
-
-
-def _elapsed_ms(started: float) -> float:
-    return round((time.monotonic() - started) * 1000.0, 3)
-
-
-def _write_activation_timing(
-    stack: Any, span: str, started: float, rows: list[dict[str, Any]], error: BaseException | None
+def _wait_lifecycle(
+    stack: ProcessStack, component_ids: list[str], lifecycle: str,
+    timeout_seconds: float = 60.0,
 ) -> None:
-    """Write one bounded JSON file for one activation span; never raises."""
-    try:
-        raw = os.environ.get("MANYFORGE_PROCESS_TEST_EVIDENCE_ROOT")
-        if raw:  # Same per-test directory naming as keep_failure_evidence.
-            test = os.environ.get("PYTEST_CURRENT_TEST", "unknown").split(" ", 1)[0]
-            directory = Path(raw) / test.replace("/", "_").replace("::", "__")
-        else:
-            directory = Path(stack.root)
-        sequence = getattr(stack, "_activation_timing_sequence", 0)
-        stack._activation_timing_sequence = sequence + 1
-        if sequence >= ACTIVATION_TIMING_MAX_FILES:
-            return
-        document = {
-            "schema": ACTIVATION_TIMING_SCHEMA, "span": span, "sequence": sequence,
-            "clock": "time.monotonic", "deadline_seconds": ACTIVATION_READ_TIMEOUT_SECONDS,
-            "span_ms": _elapsed_ms(started),
-            "outcome": "ok" if error is None else "error",
-            "error": None if error is None else f"{type(error).__name__}: {error}"[:512],
-            "rows": [{**row, "outcome": row["outcome"] or ("error" if error is not None else None)}
-                     for row in rows[:ACTIVATION_TIMING_MAX_ROWS]],
-            "rows_dropped": max(0, len(rows) - ACTIVATION_TIMING_MAX_ROWS),
-        }
-        directory.mkdir(parents=True, exist_ok=True)
-        (directory / f"activation-timing.{sequence:02d}.json").write_text(
-            json.dumps(document, sort_keys=True) + "\n", encoding="utf-8")
-    except Exception as failure:  # Evidence must never change the test outcome.
-        try:
-            print(f"activation timing evidence not written: {failure!r}", file=sys.stderr)
-        except Exception:
-            pass  # Best-effort diagnostic; never replaces the original exception.
-
-
-def _is_component_read_changed(error: HeadlessClientError) -> bool:
-    # Exactly useCCLC.ts readCurrent(observeComponentReadChanges=true).
-    return (
-        error.status_code == 409
-        and error.code == "component_lifecycle_facts_stale"
-        and error.details.get("reason") == "component_read_changed"
-    )
-
-
-def read_activation_component(
-    headless: Any, component_id: str, *, deadline: float, timing: dict[str, Any] | None = None
-) -> dict[str, Any]:
-    """Activation-path CCLC read; re-reads only the torn-read transient.
-
-    Mirrors the Composer activation observer: the read alone is repeated at
-    POLL_INTERVAL_MS=250 ms, no command is re-sent, and any other error fails
-    at once. Composer is bounded by operator cancel; this fixture by the
-    caller's absolute ``deadline`` (time.monotonic), which is shared and never
-    extended: no read starts at or after it.
-    """
-    last_error: HeadlessClientError | None = None
-    while True:
-        if time.monotonic() >= deadline:
-            raise AssertionError(
-                f"CCLC read of {component_id!r} reached the shared activation deadline"
-                + ("" if last_error is None
-                   else f" while reporting component_read_changed: {last_error.details!r}")
-            ) from last_error
-        try:
-            return headless.cclc_component(component_id)
-        except HeadlessClientError as error:
-            if not _is_component_read_changed(error):
-                raise
-            last_error = error
-            if timing is not None:
-                timing["component_read_changed_count"] += 1
-        time.sleep(0.25)
-
-
-def expected_control_domains(current: dict[str, Any]) -> list[dict[str, Any]]:
-    """Exactly useCCLC.ts lifecycleRequestFromSnapshot's expected domains."""
-    expected_domains = []
-    for domain in current["domains"]:
-        active = domain["active_control_configuration"]
-        expected_active = {"presence": "absent"} if active is None else {
-            "presence": "present",
-            "active_control_configuration_id": active["active_control_configuration_id"],
-            "active_control_configuration_generation": active["active_control_configuration_generation"],
-        }
-        assert domain["kind"] in ("controller", "io_provider"), domain
-        if domain["kind"] == "io_provider":
-            # CCLCExpectedProviderDomainRequest: no topology, bindings or routes.
-            expected_domains.append({
-                "kind": "io_provider",
-                "control_domain_id": domain["control_domain_id"],
-                "control_domain_revision": domain["control_domain_revision"],
-                "provider": domain["provider"],
-                "expected_active_control_configuration": expected_active,
-            })
-            continue
-        expected_domains.append({
-            "kind": "controller",
-            **{key: domain[key] for key in (
-                "control_domain_id", "control_domain_revision",
-                "controller_topology_id", "topology_revision",
-            )},
-            "expected_active_control_configuration": expected_active,
-            "expected_control_bindings": domain["current_control_bindings"],
-        })
-    return expected_domains
-
-
-def _component_lifecycle(
-    stack: ProcessStack, component_id: str, intent: str, owner_epoch: str,
-    timing: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    """Submit one ordinary confirmed command with actual current CAS facts."""
-    achieved = {"prepare": "prepared", "enable": "active", "disable": "disabled"}[intent]
-    deadline = time.monotonic() + ACTIVATION_READ_TIMEOUT_SECONDS
     with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
-        assert headless.cclc_owner_identity()["request_owner_epoch"] == owner_epoch
-        current = read_activation_component(headless, component_id, deadline=deadline, timing=timing)
-        if timing is not None and timing["kind"] == "unknown":
-            timing["kind"] = _timing_row(component_id, current, intent)["kind"]
-        expected_domains = expected_control_domains(current)
-
-        def require_budget(step: str) -> float:
-            # Shared budget: no new work (admission, command, poll) starts at or after it.
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise AssertionError(
-                    f"{intent} of {component_id!r} reached the shared activation deadline before "
-                    f"{step} ({-remaining:.3f} s late); "
-                    + ("the accepted command's terminal status is unobserved"
-                       if step == "terminal status poll" else "no command was sent")
-                )
-            return remaining
-
-        admission_started = time.monotonic()
-        admission = stack.wait_authoring_admission(
-            require_budget("authoring admission"), expected_allowed=True)
-        if timing is not None:
-            timing["admission_wait_ms"] = _elapsed_ms(admission_started)
-        request = {
-            "request_context": {
-                "request_id": f"ui6i.{component_id}.{intent}.{uuid.uuid4().hex}",
-                "request_owner_epoch": owner_epoch,
-                "source_label": "ui6i_process_fixture",
-            },
-            "controllable_component_id": component_id,
-            "intent": intent,
-            "expected_graph_revision": current["graph_revision"],
-            "expected_component_lifecycle_generation": current["component_lifecycle_generation"],
-            "expected_control_domains": expected_domains,
-            "expected_admission_generation": admission["admission_generation"],
-            "confirmed": True,
-        }
-        # A refusal or unknown response stops the sequence. Never repeat effects.
-        require_budget("command dispatch")
-        submitted_at = time.monotonic()
-        submitted = headless.submit_component_lifecycle(request)
-        acceptance = submitted["acceptance"]
-        assert acceptance is not None, submitted
-        status = None
+        deadline = time.monotonic() + timeout_seconds
         while True:
-            try:
-                require_budget("terminal status poll")
-            except AssertionError as error:
-                raise AssertionError(f"{error}; acceptance={acceptance!r}; last status={status!r}") from None
-            status = headless.component_lifecycle_status(acceptance["lifecycle_transaction_id"])["status"]
-            assert status is not None, acceptance
-            assert status["status_owner_epoch"] == owner_epoch, status
-            assert status["acceptance"] == acceptance, status
-            if status["terminal_result"] is not None:
-                if timing is not None:
-                    timing["submit_to_terminal_ms"] = _elapsed_ms(submitted_at)
-                    timing["terminal_result"] = str(status["terminal_result"])[:64]
-                    timing["terminal_state"] = str(status.get("current_state"))[:64]
-                assert status["terminal_result"] == "succeeded", status
-                break
-            time.sleep(0.01)
-        assert status["current_state"] == achieved, status
-        assert {row["control_domain_id"] for row in status["domains"]} == {
-            row["control_domain_id"] for row in expected_domains
-        }, status
-        assert len(status["domains"]) == len(expected_domains), status
-        assert all(row["current_state"] == achieved for row in status["domains"]), status
-        installed = read_activation_component(headless, component_id, deadline=deadline, timing=timing)
-        if timing is not None:
-            # Honest: the state actually read back, not the one requested.
-            if installed.get("component_lifecycle_state") == achieved:
-                timing["submit_to_ready_ms"] = _elapsed_ms(submitted_at)
-                timing["outcome"] = "ok"
-            timing["final_state"] = str(installed.get("component_lifecycle_state"))[:64]
-        assert installed["component_lifecycle_state"] == achieved, installed
-        assert headless.cclc_owner_identity()["request_owner_epoch"] == owner_epoch
-        return status
+            states = _component_states(headless)
+            if all(states.get(cid, {}).get("lifecycle") == lifecycle
+                   and "action" not in states[cid] for cid in component_ids):
+                return
+            if time.monotonic() >= deadline:
+                raise AssertionError(
+                    f"components did not become {lifecycle} within "
+                    f"{timeout_seconds:.0f} s: {states!r}"
+                )
+            time.sleep(0.1)
 
 
 def _activate_loaded_components(stack: ProcessStack) -> list[str]:
-    span_started = time.monotonic()
-    timing_rows: list[dict[str, Any]] = []
-    try:
-        component_ids = _activate_loaded_components_timed(stack, timing_rows)
-    except BaseException as error:
-        _write_activation_timing(stack, "activate_loaded_components", span_started, timing_rows, error)
-        raise
-    _write_activation_timing(stack, "activate_loaded_components", span_started, timing_rows, None)
-    return component_ids
-
-
-def _activate_loaded_components_timed(
-    stack: ProcessStack, timing_rows: list[dict[str, Any]]
-) -> list[str]:
+    """Prepare (where needed) and Enable every Applied component (V2-6)."""
     component_ids = _applied_activation_order(stack)
     with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
-        owner_epoch = headless.cclc_owner_identity()["request_owner_epoch"]
-
-        def wait_ready(
-            initial: dict[str, Any], intent: str, requested: str, timing: dict[str, Any]
-        ) -> None:
-            identity_fields = (
-                "controllable_component_id", "retained_bundle_id", "graph_revision",
-                "publication_generation", "active_public_pointer_digest",
-                "component_lifecycle_generation", "component_lifecycle_state",
-                "provider_occurrences", "domains",
-            )
-            identity = {key: initial[key] for key in identity_fields}
-            start_wallclock = time.time()
-            started = time.monotonic()
-            deadline = started + ACTIVATION_READ_TIMEOUT_SECONDS
-            trace: list[dict[str, Any]] = []
-            trace_dropped = 0
-            previous_facts = None
-            while True:
-                timing["readiness_wait_iterations"] += 1
-                assert headless.cclc_owner_identity()["request_owner_epoch"] == owner_epoch
-                current = read_activation_component(
-                    headless, initial["controllable_component_id"], deadline=deadline, timing=timing)
-                assert {key: current[key] for key in identity_fields} == identity, current
-                readiness = current["readiness"]
-                assert readiness["request_owner_epoch"] == owner_epoch, current
-                assert readiness["next_intent"] == intent, current
-                assert readiness["requested_state"] == requested, current
-                assert type(readiness["ready"]) is bool, current
-                error = readiness.get("error") or {}
-                observed_codes = {
-                    "ready": readiness["ready"],
-                    "error_code": str(error.get("code", "")),
-                    "error_reason": str((error.get("details") or {}).get("reason", "")),
-                    "domain_codes": [str((row.get("error") or {}).get("code", ""))
-                                     for row in readiness.get("domains", [])],
-                    "measured_code": str(((readiness.get("measured_state") or {}).get("error") or {}).get("code", "")),
-                }
-                facts = json.dumps(observed_codes, sort_keys=True, separators=(",", ":"))
-                if facts != previous_facts:
-                    error = readiness.get("error") or {}
-                    trace.append({
-                        "elapsed_seconds": time.monotonic() - started,
-                        "facts_sha256": hashlib.sha256(facts.encode()).hexdigest(),
-                        "ready": readiness["ready"],
-                        "error_code": str(error.get("code", ""))[:256],
-                        "error_reason": str((error.get("details") or {}).get("reason", ""))[:256],
-                        "domain_codes": [code[:256] for code in observed_codes["domain_codes"][:64]],
-                        "measured_code": observed_codes["measured_code"][:256],
-                    })
-                    if len(trace) > 64:
-                        trace.pop(0)
-                        trace_dropped += 1
-                    previous_facts = facts
-                if readiness["ready"]:
-                    timing["readiness_wait_ms"] = _elapsed_ms(started)
-                    return
-                assert readiness["error"] is not None, current
-                # Match useCCLC.ts POLL_INTERVAL_MS=250. Check the shared
-                # deadline after the wait so no read starts past it.
-                time.sleep(0.25)
-                if time.monotonic() >= deadline:
-                    encoded = json.dumps(current, sort_keys=True, separators=(",", ":")).encode()
-                    evidence: dict[str, Any] = {
-                        "start_wallclock_seconds": start_wallclock,
-                        "join_identity": identity,
-                        "request_owner_epoch": owner_epoch,
-                        "provider_runtime_epochs": [row.get("provider_runtime_epoch")
-                                                    for row in current["provider_occurrences"]],
-                        "intent": intent, "requested_state": requested,
-                        "snapshot_sha256": hashlib.sha256(encoded).hexdigest(),
-                        "snapshot_bytes": len(encoded), "truncated": False,
-                        "change_trace": trace, "trace_dropped_count": trace_dropped,
-                        "snapshot": current,
-                    }
-                    cap = 256 * 1024
-                    payload = json.dumps(evidence, sort_keys=True).encode()
-                    if len(payload) > cap:
-                        del evidence["snapshot"]
-                        evidence["truncated"] = True
-                        # Bound identity too; its complete hash remains in the
-                        # receipt when the last exact body exceeds the cap.
-                        identity_bytes = json.dumps(identity, sort_keys=True).encode()
-                        evidence["join_identity_sha256"] = hashlib.sha256(identity_bytes).hexdigest()
-                        evidence["join_identity"] = str(identity)[:4096]
-                        epochs_bytes = json.dumps(evidence["provider_runtime_epochs"], sort_keys=True).encode()
-                        evidence["provider_runtime_epochs_sha256"] = hashlib.sha256(epochs_bytes).hexdigest()
-                        evidence["provider_runtime_epochs"] = str(evidence["provider_runtime_epochs"])[:4096]
-                        evidence["snapshot_utf8_prefix"] = encoded[: cap // 4].decode("utf-8", errors="replace")
-                        payload = json.dumps(evidence, sort_keys=True).encode()
-                        while len(payload) > cap and evidence["snapshot_utf8_prefix"]:
-                            evidence["snapshot_utf8_prefix"] = evidence["snapshot_utf8_prefix"][:len(evidence["snapshot_utf8_prefix"]) // 2]
-                            payload = json.dumps(evidence, sort_keys=True).encode()
-                        while len(payload) > cap and evidence["change_trace"]:
-                            evidence["change_trace"].pop(0)
-                            evidence["trace_dropped_count"] += 1
-                            payload = json.dumps(evidence, sort_keys=True).encode()
-                    assert len(payload) <= cap, "readiness evidence exceeded its byte cap"
-                    evidence_path = stack.root / "readiness-last-snapshot.json"
-                    evidence_path.write_bytes(payload)
-                    summary = str({
-                        "component_id": initial["controllable_component_id"],
-                        "state": current["component_lifecycle_state"],
-                        "intent": intent, "requested_state": requested,
-                        "ready": observed_codes["ready"],
-                        "error_code": observed_codes["error_code"][:128],
-                        "reason": observed_codes["error_reason"][:256],
-                        "domain_codes": str(observed_codes["domain_codes"])[:512],
-                        "measured_code": observed_codes["measured_code"][:128],
-                        "evidence": str(evidence_path),
-                        "snapshot_sha256": evidence["snapshot_sha256"],
-                        "truncated": evidence["truncated"],
-                    })[:2048]
-                    raise AssertionError(summary)
-
-        for component_id in component_ids:
-            first_read: dict[str, Any] = {"component_read_changed_count": 0}
-            try:
-                before = read_activation_component(
-                    headless, component_id,
-                    deadline=time.monotonic() + ACTIVATION_READ_TIMEOUT_SECONDS, timing=first_read)
-            except BaseException:
-                # Failed initial observation: real id and count; no intent or state invented.
-                failed = _timing_row(component_id, None, None)
-                failed["component_read_changed_count"] = first_read["component_read_changed_count"]
-                timing_rows.append(failed)
-                raise
-            assert before["controllable_component_id"] == component_id, before
-            state = before["component_lifecycle_state"]
-            if state == "active":
-                continue  # Unchanged Active owners never cycle on config-only Apply.
-            assert state in {"declared", "disabled", "prepared"}, before
-            if state != "prepared":
-                timing = _timing_row(component_id, before, "prepare")
-                timing["component_read_changed_count"] += first_read["component_read_changed_count"]
-                timing_rows.append(timing)
-                wait_ready(before, "prepare", "prepared", timing)
-                _component_lifecycle(stack, component_id, "prepare", owner_epoch, timing)
-                before = read_activation_component(
-                    headless, component_id,
-                    deadline=time.monotonic() + ACTIVATION_READ_TIMEOUT_SECONDS, timing=timing)
-                assert before["component_lifecycle_state"] == "prepared", before
-                first_read["component_read_changed_count"] = 0
-            timing = _timing_row(component_id, before, "enable")
-            timing["component_read_changed_count"] += first_read["component_read_changed_count"]
-            timing_rows.append(timing)
-            wait_ready(before, "enable", "active", timing)
-            _component_lifecycle(stack, component_id, "enable", owner_epoch, timing)
-        assert headless.cclc_owner_identity()["request_owner_epoch"] == owner_epoch
-    assert _applied_activation_order(stack) == component_ids
+        states = _component_states(headless)
+        unprepared = [cid for cid in component_ids
+                      if states[cid]["lifecycle"] == "not_prepared"]
+        if unprepared:
+            headless.component_actions("prepare", unprepared)
+    _wait_lifecycle(stack, [cid for cid in component_ids if cid in unprepared], "prepared")
+    with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
+        headless.component_actions(
+            "enable", enable_all_targets(headless.components()))
+    _wait_components_reached_requested_target(stack, component_ids)
     return component_ids
 
 
 def _disable_for_reload(stack: ProcessStack, component_id: str) -> None:
     with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
-        current = headless.cclc_component(component_id)
-        assert current["component_lifecycle_state"] == "active", current
-        owner_epoch = headless.cclc_owner_identity()["request_owner_epoch"]
-    span_started = time.monotonic()
-    timing = _timing_row(component_id, current, "disable")
-    try:
-        _component_lifecycle(stack, component_id, "disable", owner_epoch, timing)
-    except BaseException as error:
-        _write_activation_timing(stack, "disable_for_reload", span_started, [timing], error)
-        raise
-    _write_activation_timing(stack, "disable_for_reload", span_started, [timing], None)
+        assert _component_states(headless)[component_id]["lifecycle"] == "enabled"
+        headless.component_action(component_id, "disable")
+    _wait_lifecycle(stack, [component_id], "prepared")
 
 
 def _wait_components_reached_requested_target(
     stack: ProcessStack, component_ids: list[str], timeout_seconds: float = 60.0
 ) -> None:
-    """Observe achieved targets after explicit ordinary component activation."""
+    """Every activated component is enabled; a machine owner has no Enable
+    and is ready when prepared (CONTRACTS §2, §16)."""
     with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
-        deadline = time.monotonic() + timeout_seconds
-        while True:
-            states: dict[str, Any] = {}
-            for component_id in component_ids:
-                snapshot = read_activation_component(headless, component_id, deadline=deadline)
-                target = snapshot.get("lifecycle_target")
-                progress = snapshot.get("lifecycle_progress")
-                states[component_id] = {
-                    "state": snapshot.get("component_lifecycle_state"),
-                    "generation": snapshot.get("component_lifecycle_generation"),
-                    "target": target,
-                    "progress": progress,
-                }
-            if all(
-                row["target"] is not None
-                and row["state"] == row["target"]["requested_state"]
-                and (row["progress"] is None or row["progress"]["phase"] == "satisfied")
-                for row in states.values()
-            ):
-                return
-            if time.monotonic() >= deadline:
-                raise AssertionError(
-                    "deployed components did not reach their requested lifecycle "
-                    f"target within {timeout_seconds:.0f} s: {states!r}"
-                )
-            time.sleep(0.1)
+        owners = owner_ids(headless.components())
+    _wait_lifecycle(stack, [cid for cid in component_ids if cid in owners],
+                    "prepared", timeout_seconds)
+    _wait_lifecycle(stack, [cid for cid in component_ids if cid not in owners],
+                    "enabled", timeout_seconds)
 
 
 def observe_applied_activation_projection(
@@ -609,24 +200,7 @@ def observe_applied_activation_projection(
             assert prior_program is not None, predecessor
             for field in ("deployment_artifact_id", "deployment_revision", "program_binding_id"):
                 assert prior_apply["prepared_activation"][field] == prior_program[field], predecessor
-        prior_is_sealed = (prior_program is not None
-                           and prior_program["origin"]["kind"] == "sealed_canonical_empty")
-        if prior_is_sealed:
-            assert prior_publication is not None, predecessor
-            assert prior_publication["transaction"]["kind"] == "named_apply", predecessor
-            assert prior_selected == {"scenarioId": None, "deploymentRevision": None,
-                                      "activationOrder": None}, predecessor
-            assert prior_program["executable"] is False, predecessor
-            assert all(prior_program[field] is None for field in (
-                "program", "program_id", "program_revision", "program_binding_id", "non_executable"
-            )), predecessor
-            for field in ("deployment_artifact_id", "deployment_revision",
-                          "retained_bundle_id", "graph_revision"):
-                assert prior_program["origin"][field] == prior_program[field], predecessor
-            prior_revision = prior_publication["projection_revision"]
-            assert prior_program["retained_bundle_id"] == prior_revision["retained_bundle_id"], predecessor
-            assert prior_program["graph_revision"] == prior_revision["graph_revision"], predecessor
-        elif prior_publication is not None and prior_publication["transaction"]["kind"] == "named_apply":
+        if prior_publication is not None and prior_publication["transaction"]["kind"] == "named_apply":
             assert prior_order is not None and prior_program is not None, predecessor
             prior_revision = prior_publication["projection_revision"]
             assert prior_order["retainedBundleId"] == prior_revision["retained_bundle_id"], predecessor
@@ -635,7 +209,7 @@ def observe_applied_activation_projection(
             assert prior_program is None, predecessor
             assert prior_selected == {"scenarioId": None, "deploymentRevision": None,
                                       "activationOrder": None}, predecessor
-        if prior_program is not None and not prior_is_sealed:
+        if prior_program is not None:
             assert prior_program["origin"]["kind"] == "scenario", predecessor
             assert prior_selected["scenarioId"] == prior_program["origin"]["scenario_id"], predecessor
             assert prior_selected["deploymentRevision"] == prior_program["deployment_revision"], predecessor
@@ -733,150 +307,52 @@ def _load_scenario(
     *,
     scenario_path: Path | None = None,
     executable: bool = True,
-    on_apply_succeeded: Callable[[], None] | None = None,
     on_configuration_applied: Callable[[dict[str, Any]], None] | None = None,
 ) -> tuple[dict[str, Any], str]:
-    # Each deliberate Load is a new Manager request, even when it loads the
-    # same Scenario again. Retries within this one Load keep their own distinct
-    # attempt identities because a stale admission snapshot changes the
-    # request's expected generation.
-    load_identity = uuid.uuid4().hex
-    with (
-        _composer_snapshot_stream(stack, client_id=f"ui6i-{scenario_id}") as snapshots,
-        HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as composer,
-    ):
+    with HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as composer:
         scenarios = composer.request("GET", "/api/scenario-documents")
         rows = {row["scenario_id"]: row for row in scenarios["entries"]}
         ids = set(rows)
         assert {GROUPED_SCENARIO, ISOLATION_SCENARIO} <= ids
         path = str(scenario_path) if scenario_path is not None else rows[scenario_id]["path"]
-        draft = composer.request("GET", "/api/program/draft")
-        for attempt in range(8):
-            snapshot = _matching_composer_snapshot(snapshots, draft)
-            deployment = composer.request("GET", "/api/deployment/workspace")
-            with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as previous:
-                previous_manager = previous.manager_status()
-                previous_publication = previous_manager["status"]["active"].get("publication")
-                previous_apply = None
-                if (previous_publication is not None
-                        and previous_publication["transaction"]["kind"] == "named_apply"):
-                    transaction = previous_publication["transaction"]
-                    previous_apply = previous.manager_apply_status(
-                        transaction["apply_id"], transaction["apply_generation"]
-                    )
-                try:
-                    previous_program = previous.program_applied_status()
-                except HeadlessClientError as error:
-                    if error.code not in {"program_applied_selection_not_active", "program_applied_selection_not_found"}:
-                        raise
-                    previous_program = None
-            predecessor = deepcopy({
-                "source": previous_manager["source"],
-                "publication": previous_publication,
-                "apply_status": previous_apply,
-                "managerApplied": deployment["managerApplied"],
-                "applied_status": previous_program,
-            })
+        with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as previous:
+            previous_manager = previous.manager_status()
+            previous_publication = previous_manager["status"]["active"].get("publication")
+            previous_apply = None
+            if (previous_publication is not None
+                    and previous_publication["transaction"]["kind"] == "named_apply"):
+                transaction = previous_publication["transaction"]
+                previous_apply = previous.manager_apply_status(
+                    transaction["apply_id"], transaction["apply_generation"]
+                )
             try:
-                loaded = composer.request(
-                    "POST",
-                    "/api/scenario-documents/load",
-                    body={
-                        **_composer_fence(
-                            snapshot,
-                            request_id=(
-                                f"ui6i.{scenario_id}.load.{load_identity}.{attempt}"
-                            ),
-                        ),
-                        "deploymentDraftId": deployment["draft"]["id"],
-                        "expectedDeploymentDraftRevision": deployment["draft"][
-                            "revision"
-                        ],
-                        "path": path,
-                        "confirmDiscard": False,
-                    },
-                )
-                break
+                previous_program = previous.program_applied_status()
             except HeadlessClientError as error:
-                if (
-                    error.code
-                    not in {"authoring_not_ready", "stale_generation"}
-                    or attempt == 7
-                ):
-                    try:
-                        manager_status = composer.manager_status()["status"]
-                        active = manager_status.get("active")
-                        publication = (
-                            active.get("publication")
-                            if isinstance(active, dict)
-                            else None
-                        )
-                        records = manager_status.get("apply", {}).get(
-                            "records", []
-                        )
-                        manager_summary = {
-                            "manager_ready": manager_status.get(
-                                "manager_ready"
-                            ),
-                            "active_publication": publication,
-                            "recent_applies": [
-                                {
-                                    "apply_id": row.get("apply_id"),
-                                    "phase": row.get("phase"),
-                                    "terminal_state": row.get(
-                                        "terminal_state"
-                                    ),
-                                    "error": row.get("error"),
-                                    "failure": row.get("failure"),
-                                    "scenario_id": row.get(
-                                        "prepared_activation", {}
-                                    ).get("scenario_id"),
-                                    "request": row.get("request"),
-                                }
-                                for row in records[-4:]
-                                if isinstance(row, dict)
-                            ],
-                        }
-                    except Exception as status_error:  # noqa: BLE001
-                        manager_summary = {"read_error": str(status_error)}
-                    raise AssertionError(
-                        f"{scenario_id}: Load failed: code={error.code!r}, "
-                        f"response={error.response!r}, "
-                        f"Manager={manager_summary!r}"
-                    ) from error
-                draft = composer.request("GET", "/api/program/draft")
-        assert loaded["status"] == "accepted"
-        assert loaded["path"] == path
-        activation = loaded["activation"]
-        deadline = time.monotonic() + 30.0
-        with HeadlessHttpClient(
-            stack.base_url, timeout_seconds=10.0
-        ) as headless:
-            while True:
-                status = headless.manager_apply_status(
-                    activation["apply_id"], activation["apply_generation"]
-                )
-                if status["state"] != "pending":
-                    assert status["state"] == "succeeded", (
-                        f"{scenario_id}: terminal Apply status {status!r}"
-                    )
-                    assert (status["apply_id"], status["apply_generation"]) == (
-                        activation["apply_id"], activation["apply_generation"]
-                    ), status
-                    observe_applied_activation_projection(
-                        headless, composer, status, scenario_id, predecessor=predecessor,
-                        timeout_seconds=max(0.0, deadline - time.monotonic()),
-                    )
-                    if on_apply_succeeded is not None:
-                        on_apply_succeeded()
-                    if on_configuration_applied is not None:
-                        on_configuration_applied(status)
-                    break
-                if time.monotonic() >= deadline:
-                    raise AssertionError(
-                        f"Scenario activation did not settle: {status!r}"
-                    )
-                time.sleep(0.02)
+                if error.code not in {"program_applied_selection_not_active", "program_applied_selection_not_found"}:
+                    raise
+                previous_program = None
+        predecessor = deepcopy({
+            "source": previous_manager["source"],
+            "publication": previous_publication,
+            "apply_status": previous_apply,
+            "managerApplied": composer.request("GET", "/api/deployment/workspace")["managerApplied"],
+            "applied_status": previous_program,
+        })
+        # Load waits for the whole Apply (CONTRACTS §11); components end prepared.
+        loaded = composer.request("POST", "/api/scenario/load", body={"path": path})
+        assert loaded["outcome"] == "succeeded", f"{scenario_id}: Load failed: {loaded!r}"
+        assert loaded["path"] == str(Path(path).resolve()), loaded
+        with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
+            transaction = headless.manager_status()["status"]["active"]["publication"]["transaction"]
+            assert transaction["kind"] == "named_apply", transaction
+            status = headless.manager_apply_status(
+                transaction["apply_id"], transaction["apply_generation"]
+            )
+            observe_applied_activation_projection(
+                headless, composer, status, scenario_id, predecessor=predecessor,
+            )
+            if on_configuration_applied is not None:
+                on_configuration_applied(status)
         component_ids = _activate_loaded_components(stack)
         _wait_components_reached_requested_target(stack, component_ids)
         stack.wait_authoring_admission(expected_allowed=True)
@@ -916,7 +392,7 @@ def _save_and_reopen_current_scenario(
         manager_before = composer.manager_status()["status"]["active"]
         applied_before = composer.program_applied()
         components_before = {
-            component_id: headless.cclc_component(component_id)
+            component_id: _component_states(headless)[component_id]
             for component_id in ("lite6_robot", "ur5e_robot")
         }
         save_identity = uuid.uuid4().hex
@@ -974,68 +450,19 @@ def _save_and_reopen_current_scenario(
         assert len(saved_rows) == 1
         assert saved_rows[0]["path"] == str(target.resolve())
 
-        draft = composer.request("GET", "/api/program/draft")
-        for attempt in range(8):
-            snapshot = _matching_composer_snapshot(snapshots, draft)
-            deployment = composer.request("GET", "/api/deployment/workspace")
-            try:
-                reopened = composer.request(
-                    "POST",
-                    "/api/scenario-documents/load",
-                    body={
-                        **_composer_fence(
-                            snapshot,
-                            request_id=f"ui6i.{scenario_id}.reopen.{attempt}",
-                        ),
-                        "deploymentDraftId": deployment["draft"]["id"],
-                        "expectedDeploymentDraftRevision": deployment["draft"][
-                            "revision"
-                        ],
-                        "path": str(target),
-                        "confirmDiscard": False,
-                    },
-                )
-                break
-            except HeadlessClientError as error:
-                if (
-                    error.code not in {"authoring_not_ready", "stale_generation"}
-                    or attempt == 7
-                ):
-                    raise
-                draft = composer.request("GET", "/api/program/draft")
-        assert reopened["status"] in {"accepted", "applied"}
+        reopened = composer.request("POST", "/api/scenario/load", body={"path": str(target)})
+        assert reopened["outcome"] == "succeeded", reopened
         assert reopened["path"] == str(target.resolve())
-        activation = reopened["activation"]
-        if reopened["status"] == "accepted":
-            deadline = time.monotonic() + 30.0
-            while True:
-                status = headless.manager_apply_status(
-                    activation["apply_id"], activation["apply_generation"]
-                )
-                if status["state"] != "pending":
-                    assert status["state"] == "succeeded", (
-                        f"reopened Scenario Apply did not succeed: {status!r}"
-                    )
-                    break
-                if time.monotonic() >= deadline:
-                    raise AssertionError(
-                        "reopened Scenario Apply did not settle: " f"{status!r}"
-                    )
-                time.sleep(0.02)
-        _wait_components_reached_requested_target(stack, _applied_activation_order(stack))
-        stack.wait_authoring_admission(expected_allowed=True)
+        # Load closes first (CONTRACTS §11): the unchanged cell is retained and
+        # its components end prepared; Enable stays the operator's action.
         manager_after = composer.manager_status()["status"]["active"]
         for key in ("retained_bundle_id", "graph_revision", "cell_graph"):
             assert manager_after[key] == manager_before[key]
-        for component_id, before in components_before.items():
-            after = headless.cclc_component(component_id)
-            for key in (
-                "component_lifecycle_generation",
-                "component_lifecycle_state",
-                "domains",
-                "provider_occurrences",
-            ):
-                assert after[key] == before[key], (component_id, key, before, after)
+        for component_id in components_before:
+            after = _component_states(headless)[component_id]
+            assert after["lifecycle"] == "prepared", (component_id, after)
+        _activate_loaded_components(stack)
+        stack.wait_authoring_admission(expected_allowed=True)
         applied = composer.program_applied()
         assert applied["scenario_id"] == scenario_id
         for key in ("program_revision", "program_binding_id"):
@@ -1127,7 +554,6 @@ def _start_motion(
             "correlation_id": request_id,
             "program_run_id": program_run_id,
             "expected_owner_epoch": cycle["program_runner_owner_epoch"],
-            "expected_run_revision": cycle["run"]["run_revision"],
             "expected_selection_revision": selections["selection_revision"],
             "reason": "initial operator motion Run",
             "group_ids": ["all"],
@@ -1347,11 +773,14 @@ def _write_mixed_variants(
         # These variants qualify retention during a same-Scenario reload.
         # Their distinct paths/digests remain real independent source facts.
         candidate["scenario_id"] = GROUPED_SCENARIO
-        candidate["name"] = f"Mixed Apply {kind}"
+        # A Scenario project's folder, scenario_id and name are one name.
+        candidate["name"] = GROUPED_SCENARIO
         components = candidate["deployment_draft"]["components"]
         if kind in ("single", "solo", "solo_cartesian"):
+            # The Lite 6 machine: its owner, arm and (deactivated) I/O members.
             candidate["deployment_draft"]["components"] = [
-                row for row in components if row["component_id"] == "lite6_robot"
+                row for row in components
+                if row["component_id"] == "lite6" or row.get("owner") == "lite6"
             ]
         if kind in ("solo", "solo_cartesian"):
             program = candidate["program_draft"]
@@ -1393,7 +822,7 @@ def _write_mixed_variants(
                 # Authoring rule: value_sources is omitted when empty; unset motion defaults must reference the Program parameter.
                 motion["value_sources"] = {
                     key: {"kind": "program_parameter", "reference": key}
-                    for key in ("max_blend_deviation_rad", "translation_tol_m")
+                    for key in ("blend_radius_m", "translation_tol_m")
                 }
                 motion["parameters"] = {
                     "target_role": "lite6_arm", "base_frame_role": "base",
@@ -1415,7 +844,8 @@ def _write_mixed_variants(
             ur5e["configuration"]["runtime_configuration"]["initial_joint_positions_rad"][0] = 0.1
         elif kind != "isolation":
             assert kind == "single", kind
-        target = variants / f"mixed_{kind}.scenario"
+        target = variants / kind / f"{GROUPED_SCENARIO}.scenario"
+        target.parent.mkdir()
         candidate = build_scenario_document(
             scenario_id=candidate["scenario_id"],
             name=candidate["name"],
@@ -1443,15 +873,15 @@ def test_retained_robot_plans_after_apply_retires_its_first_composition() -> Non
     with _dual_robot_stack() as stack:
         _load_scenario(stack, GROUPED_SCENARIO)
         with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
-            survivor = headless.cclc_component("lite6_robot")
+            survivor = _component_states(headless)["lite6_robot"]
         paths = _write_mixed_variants(stack, ("replace",))
         _disable_for_reload(stack, "ur5e_robot")
         applied, source_document_digest = _load_scenario(
             stack, GROUPED_SCENARIO, scenario_path=paths["replace"]
         )
         with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
-            retained = headless.cclc_component("lite6_robot")
-        assert retained["provider_occurrences"] == survivor["provider_occurrences"]
+            retained = _component_states(headless)["lite6_robot"]
+        assert retained.get("last_action") == survivor.get("last_action")
         with HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as client:
             started = _start_run(
                 stack,
@@ -1489,7 +919,7 @@ def test_retained_robot_plans_in_the_candidate_cell_planning_model() -> None:
         _load_scenario(stack, GROUPED_SCENARIO)
         robots = ("lite6_robot", "ur5e_robot")
         with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
-            survivors = {robot: headless.cclc_component(robot) for robot in robots}
+            survivors = {robot: _component_states(headless)[robot] for robot in robots}
         paths = _write_mixed_variants(stack, ("move",))
         _disable_for_reload(stack, "ur5e_robot")
         applied, source_document_digest = _load_scenario(
@@ -1497,10 +927,10 @@ def test_retained_robot_plans_in_the_candidate_cell_planning_model() -> None:
         )
         with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
             for robot in robots:
-                retained = headless.cclc_component(robot)
+                retained = _component_states(headless)[robot]
                 assert (
-                    retained["provider_occurrences"]
-                    == survivors[robot]["provider_occurrences"]
+                    retained.get("last_action")
+                    == survivors[robot].get("last_action")
                 ), robot
         with HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as client:
             started = _start_run(
@@ -1591,15 +1021,15 @@ def test_survivor_moves_after_its_peer_is_removed_from_the_cell() -> None:
     with _dual_robot_stack() as stack:
         _load_scenario(stack, GROUPED_SCENARIO)
         with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
-            survivor = headless.cclc_component("lite6_robot")
+            survivor = _component_states(headless)["lite6_robot"]
         paths = _write_mixed_variants(stack, ("solo", "solo_cartesian"))
         _disable_for_reload(stack, "ur5e_robot")
         applied, source_document_digest = _load_scenario(
             stack, GROUPED_SCENARIO, scenario_path=paths["solo"]
         )
         with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
-            retained = headless.cclc_component("lite6_robot")
-        assert retained["provider_occurrences"] == survivor["provider_occurrences"]
+            retained = _component_states(headless)["lite6_robot"]
+        assert retained.get("last_action") == survivor.get("last_action")
         native = ExecutionCommandClient(stack.execution_run_root, timeout_seconds=5.0)
         owner_epoch = native.identity()["identity"]["owner_epoch"]
         for frame_role in ("base", "tcp"):
@@ -1645,7 +1075,7 @@ def test_survivor_moves_after_its_peer_is_removed_from_the_cell() -> None:
             stack, GROUPED_SCENARIO, scenario_path=paths["solo_cartesian"]
         )
         with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
-            assert headless.cclc_component("lite6_robot")["provider_occurrences"] == survivor["provider_occurrences"]
+            assert _component_states(headless)["lite6_robot"]["last_action"] == survivor["last_action"]
         with HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as client:
             started = _start_run(stack, scenario_id=cartesian["scenario_id"],
                                  source_document_digest=digest, applied=cartesian)
@@ -1690,21 +1120,9 @@ def test_mixed_apply_preserves_survivor_and_observations_during_publication() ->
             return result
 
         def survivor_facts(snapshot: dict[str, Any]) -> dict[str, Any]:
-            # Product evidence may be re-sealed to the new bundle. Assert the
-            # controller, lifecycle and route facts that must remain stable.
-            return {
-                "generation": snapshot["component_lifecycle_generation"],
-                "state": snapshot["component_lifecycle_state"],
-                "domains": snapshot["domains"],
-                "owners": [
-                    {key: row[key] for key in (
-                        "control_domain_id",
-                        "provider_instance_id", "provider_runtime_unit_id",
-                        "provider_runtime_epoch",
-                    )}
-                    for row in snapshot["provider_occurrences"]
-                ],
-            }
+            # A retained component is untouched by the Apply: no new action.
+            return {"lifecycle": snapshot["lifecycle"],
+                    "last_action": snapshot.get("last_action")}
 
         stop_reader = threading.Event()
         reader_started = threading.Event()
@@ -1722,7 +1140,7 @@ def test_mixed_apply_preserves_survivor_and_observations_during_publication() ->
             return count
 
         with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
-            survivor = survivor_facts(headless.cclc_component("lite6_robot"))
+            survivor = survivor_facts(_component_states(headless)["lite6_robot"])
             native = ExecutionCommandClient(stack.execution_run_root, timeout_seconds=5.0)
             initial_diagnostics = native.diagnostics()
             assert initial_diagnostics.get("ok") is True, initial_diagnostics
@@ -1842,7 +1260,7 @@ def test_mixed_apply_preserves_survivor_and_observations_during_publication() ->
                             scenario_path=None if kind == "restore" else paths[kind],
                             executable=kind != "single",
                         )
-                        current = survivor_facts(headless.cclc_component("lite6_robot"))
+                        current = survivor_facts(_component_states(headless)["lite6_robot"])
                         assert current == survivor, (kind, survivor, current)
                         expected_inventory = single_inventory if kind == "single" else dual_inventory
                         expected_supported = single_supported if kind == "single" else dual_supported
@@ -1936,7 +1354,6 @@ def test_grouped_dual_robot_run_scales_stops_and_resumes() -> None:
                     "correlation_id": "ui6i.group.resume",
                     "program_run_id": program_run_id,
                     "expected_owner_epoch": cycle["program_runner_owner_epoch"],
-                    "expected_run_revision": held_run["run_revision"],
                     "expected_selection_revision": selections["selection_revision"],
                     "reason": "resume both robots from current observations",
                     "group_ids": ["robot_group"],
@@ -2194,7 +1611,6 @@ def test_separate_group_stop_does_not_stop_the_other_robot() -> None:
                     "correlation_id": "ui6i.isolation.resume-lite6",
                     "program_run_id": program_run_id,
                     "expected_owner_epoch": cycle["program_runner_owner_epoch"],
-                    "expected_run_revision": cycle["run"]["run_revision"],
                     "expected_selection_revision": selections["selection_revision"],
                     "reason": "resume only the selected robot",
                     "group_ids": ["lite6_arm"],
@@ -2312,110 +1728,11 @@ def _strict_authoring_mock_apply(stack: ProcessStack, *, single: bool) -> None:
     def configured_inactive(status: dict[str, Any], *, initial: bool, preserved: dict[str, Any]) -> None:
         _assert_stored_authoring_apply_without_linked_children(stack, status)
         with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
-            snapshots = []
+            # V2-6: after any Apply the affected components are prepared,
+            # never enabled; Enable stays the operator's action.
+            states = _component_states(headless)
             for component in component_ids:
-                read_started_wallclock = time.time()
-                try:
-                    snapshots.append(headless.cclc_component(component))
-                except HeadlessClientError as error:
-                    # Preserve the already-read error body and original failure;
-                    # no new GET, retry or change to configured-state assertions.
-                    encoded = json.dumps(error.response, sort_keys=True, separators=(",", ":")).encode()
-                    digest = hashlib.sha256(encoded).hexdigest()
-                    evidence_path = stack.root / "readiness-last-snapshot.json"
-                    evidence = {
-                        "component_id": component,
-                        "start_wallclock_seconds": read_started_wallclock,
-                        "error_response_sha256": digest,
-                        "error_response_bytes": len(encoded),
-                        "truncated": False,
-                        "error_response": error.response,
-                    }
-                    cap = 256 * 1024
-                    payload = json.dumps(evidence, sort_keys=True).encode()
-                    if len(payload) > cap:
-                        del evidence["error_response"]
-                        evidence["truncated"] = True
-                        evidence["error_response_utf8_prefix"] = encoded[:cap // 4].decode("utf-8", errors="replace")
-                        payload = json.dumps(evidence, sort_keys=True).encode()
-                        while len(payload) > cap:
-                            evidence["error_response_utf8_prefix"] = evidence["error_response_utf8_prefix"][:len(evidence["error_response_utf8_prefix"]) // 2]
-                            payload = json.dumps(evidence, sort_keys=True).encode()
-                    try:
-                        evidence_path.write_bytes(payload)
-                    except OSError as evidence_error:
-                        error.add_note(f"CCLC error evidence write failed: {str(evidence_error)[:256]}")
-                    error.add_note(str({
-                        "component_id": component,
-                        "already_read_response": encoded[:1024].decode("utf-8", errors="replace"),
-                        "error_response_sha256": digest,
-                        "truncated": evidence["truncated"],
-                        "evidence": str(evidence_path),
-                    })[:2048])
-                    raise
-            for current in snapshots:
-                assert current["component_lifecycle_state"] == ("declared" if initial else "disabled"), current
-                if initial:
-                    assert current["lifecycle_target"] is None, current
-                    revision = status["candidate_projection_revision"]
-                    assert (current["retained_bundle_id"], current["graph_revision"]) == (
-                        revision["retained_bundle_id"], revision["graph_revision"]
-                    ), current
-                    for domain in current["domains"]:
-                        active = domain["active_control_configuration"]
-                        # Reconciled configuration currency does not enable the component.
-                        assert active is not None and set(active) == {
-                            "activation_set_id", "active_control_configuration_generation",
-                            "active_control_configuration_id", "binding_routes", "control_domain_id",
-                            "control_domain_revision", "controller_topology_id", "source_runtime_epoch",
-                            "source_runtime_unit_id", "source_sequence", "state", "topology_revision",
-                        }, active
-                        assert active["state"] == "reconciled", active
-                        assert active["active_control_configuration_generation"] > 0, active
-                        assert active["activation_set_id"] and active["active_control_configuration_id"] and active["source_runtime_epoch"] and active["source_runtime_unit_id"], active
-                        assert active["source_sequence"] >= 0, active
-                        assert all(active[key] == domain[key] for key in (
-                            "control_domain_id", "control_domain_revision", "controller_topology_id", "topology_revision"
-                        )), domain
-                        assert active["binding_routes"] and active["binding_routes"] == domain["current_control_bindings"], domain
-                        assert all(set(route) == {"control_binding_id", "control_binding_revision", "control_route_id"}
-                                   and all(route.values()) for route in active["binding_routes"]), active
-                else:
-                    assert current["lifecycle_target"]["requested_state"] == "disabled", current
-            if initial:
-                from contextlib import closing
-                import sqlite3
-
-                # Observe this fresh stack's actual plan/adoption, without decoding or using it as authority.
-                journal = stack.execution_state_root / "cclc-journal.sqlite3"
-                assert journal.is_file(), journal
-                with closing(sqlite3.connect(journal.resolve().as_uri() + "?mode=ro", uri=True)) as connection:
-                    connection.execute("BEGIN")
-                    revision = status["candidate_projection_revision"]
-                    key = (status["apply_id"], status["apply_generation"])
-                    assert connection.execute(
-                        "SELECT apply_id,apply_generation,candidate_bundle_id,candidate_graph_revision,component_bring_up "
-                        "FROM cclc_native_apply_plans WHERE singleton=1"
-                    ).fetchall() == [(*key, revision["retained_bundle_id"], revision["graph_revision"], None)]
-                    routes = {domain["control_domain_id"]:
-                              domain["active_control_configuration"]["active_control_configuration_generation"]
-                              for current in snapshots for domain in current["domains"]}
-                    assert len(routes) == sum(len(current["domains"]) for current in snapshots), snapshots
-                    assert dict(connection.execute(
-                        "SELECT control_domain_id,active_control_configuration_generation FROM cclc_native_apply_plan_routes"
-                    )) == routes
-                    assert sorted(connection.execute(
-                        "SELECT control_domain_id,active_control_configuration_generation,"
-                        "origin_route_selection_transaction_id,origin_route_selection_transaction_generation "
-                        "FROM control_domain_active_configurations"
-                    )) == sorted((domain, generation, None, None) for domain, generation in routes.items())
-                    assert connection.execute(
-                        "SELECT publication_generation,public_pointer_digest,candidate_bundle_id,candidate_graph_revision "
-                        "FROM cclc_native_apply_adoptions WHERE apply_id=? AND apply_generation=?", key
-                    ).fetchall() == [(snapshots[0]["publication_generation"], snapshots[0]["active_public_pointer_digest"],
-                                      revision["retained_bundle_id"], revision["graph_revision"])]
-                    for table in ("lifecycle_transactions", "route_selection_transactions"):
-                        assert connection.execute(f"SELECT count(*) FROM {table}").fetchone() == (0,), table
+                assert states[component]["lifecycle"] == "prepared", states[component]
             targets = headless.execution_targets()["targets"]["components"]
             assert {row["controllable_component_id"] for row in targets} == set(component_ids), targets
             assert len(targets) == len(component_ids), targets

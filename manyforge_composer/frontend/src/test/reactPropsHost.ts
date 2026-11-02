@@ -23,7 +23,9 @@ export function reactPropsHost() {
   const node = (tag: string): FakeNode => {
     const element = {
       nodeType: 1, nodeName: tag.toUpperCase(), tagName: tag.toUpperCase(),
-      namespaceURI: 'http://www.w3.org/1999/xhtml', ownerDocument: document, style: {}, options: [],
+      namespaceURI: 'http://www.w3.org/1999/xhtml', ownerDocument: document, options: [],
+      // React writes CSS custom properties (`--name`) through setProperty.
+      style: { setProperty: () => undefined },
       addEventListener: () => undefined, removeEventListener: () => undefined,
       appendChild: () => undefined, insertBefore: () => undefined, removeChild: () => undefined,
       setAttribute: () => undefined, removeAttribute: () => undefined,

@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <exception>
 #include <filesystem>
-#include <manyforge_core/io_provider_lifecycle_catalog.hpp>
 #include <manyforge_deployment/io_provider_domain.hpp>
 #include <manyforge_deployment/io_signal_catalog.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
@@ -110,13 +109,6 @@ Value DetectionLink(std::string object_id, std::string policy) {
 
 Value Intent(Array components, Array links = {}, Array streams = {}) {
   Object policies;
-  if (!links.empty() || !streams.empty())
-    policies.emplace_back(
-        "interrupt_config",
-        Value(Object{{"cancel_validation_timeout_ns", Value(1000.0)},
-                     {"motion_scope_arm_timeout_ns", Value(1000.0)},
-                     {"queue_depth", Value(8.0)},
-                     {"supervisory_poll_rate_hz", Value(10.0)}}));
   if (!links.empty())
     policies.emplace_back("scene_pose_sources", Value(std::move(links)));
   if (!streams.empty())
@@ -191,7 +183,7 @@ TEST(ActivationPoseSource, ModelFreeComponentCompilesToOneProviderDomain) {
   const auto *provider = graph.control_domains.front().provider();
   ASSERT_NE(provider, nullptr);
   EXPECT_EQ(provider->provider_manifest_id.value(),
-            c::kPoseSourceLifecycleManifestId);
+            d::kPoseSourceProviderManifestId);
   EXPECT_EQ(provider->controllable_component_id.value(), "scene_objects");
   EXPECT_EQ(provider->lifecycle_command_timeout_ns, 10'000'000'000LL);
   EXPECT_EQ(provider->signal_names,
@@ -212,7 +204,7 @@ TEST(ActivationPoseSource, ModelFreeComponentCompilesToOneProviderDomain) {
   EXPECT_EQ(std::count_if(providers.begin(), providers.end(),
                           [](const auto &row) {
                             return row.provider_manifest_id.value() ==
-                                   c::kPoseSourceLifecycleManifestId;
+                                   d::kPoseSourceProviderManifestId;
                           }),
             6);
   // The link itself is retained as the object's policy row.

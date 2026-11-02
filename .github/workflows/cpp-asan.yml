@@ -1,77 +1,49 @@
 name: cpp-asan
 
+# Heavy tier: nightly (on dev), on demand, and on release tags. Not on PRs.
 on:
-  pull_request:
-    paths:
-      - "Dockerfile"
-      - "docker-entrypoint.sh"
-      - "manyforge_core/**"
-      - "manyforge_content_identity/**"
-      - "manyforge_persistence/**"
-      - "manyforge_deployment/**"
-      - "manyforge_component_manager/**"
-      - "manyforge_scene/**"
-      - "scripts/ci/run-core-asan.sh"
-      - "scripts/ci/run-deployment-asan.sh"
-      - "scripts/ci/run-component-manager-asan.sh"
-      - "scripts/ci/run-relocation-packages-asan.sh"
-      - "scripts/ci/run-ctest-gtest-binaries-grouped.py"
-      - "scripts/setup-docker.sh"
-      - ".github/workflows/cpp-asan.yml"
-  push:
-    branches: [main, dev]
-    paths:
-      - "Dockerfile"
-      - "docker-entrypoint.sh"
-      - "manyforge_core/**"
-      - "manyforge_content_identity/**"
-      - "manyforge_persistence/**"
-      - "manyforge_deployment/**"
-      - "manyforge_component_manager/**"
-      - "manyforge_scene/**"
-      - "scripts/ci/run-core-asan.sh"
-      - "scripts/ci/run-deployment-asan.sh"
-      - "scripts/ci/run-component-manager-asan.sh"
-      - "scripts/ci/run-relocation-packages-asan.sh"
-      - "scripts/ci/run-ctest-gtest-binaries-grouped.py"
-      - "scripts/setup-docker.sh"
-      - ".github/workflows/cpp-asan.yml"
+  schedule:
+    - cron: "0 2 * * *"
   workflow_dispatch:
+  push:
+    tags: ["v*"]
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   image-cache:
-    name: Build development image cache (asan)
+    name: Build development image cache
     runs-on: ubuntu-24.04
-    timeout-minutes: 360
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'schedule' && 'dev' || '' }}
 
       - name: Prepare pinned RoboPlan Docker context
         run: ./scripts/setup-docker.sh --prepare-only
 
-      - name: Report free disk before image build
-        run: df -h
-
       - uses: docker/setup-buildx-action@v3
 
+      # One cache scope shared by every heavy workflow and run: an unchanged
+      # Dockerfile reuses its layers instead of rebuilding RoboPlan.
       - name: Build and export image layers
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64
-          cache-to: type=gha,scope=manyforge-asan-${{ github.run_id }}-${{ github.run_attempt }},mode=max,ignore-error=true
-
-      - name: Report free disk after image build
-        if: always()
-        run: df -h
+          cache-from: type=gha,scope=manyforge-dev
+          cache-to: type=gha,scope=manyforge-dev,mode=max,ignore-error=true
 
   manyforge-cpp-asan:
     name: ROS-free C++ ASan/UBSan (${{ matrix.suite }}, AMD64 Docker)
     runs-on: ubuntu-24.04
-    timeout-minutes: 360
+    timeout-minutes: 240
     needs: image-cache
     strategy:
       fail-fast: false
@@ -79,37 +51,40 @@ jobs:
         suite: [core, deployment, component-manager, relocation-packages]
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'schedule' && 'dev' || '' }}
 
       - name: Prepare pinned RoboPlan Docker context
         run: ./scripts/setup-docker.sh --prepare-only
 
-      - name: Report free disk before image build
-        run: df -h
-
       - name: Free runner disk before image load
         run: |
-          df -h
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           docker image prune -af
           df -h
           free -h
 
+      # One ASan+UBSan test TU outgrew a 7.7 GiB runner even at -j1 (cc1plus
+      # killed), so this stays at -j2 with extra swap on the 16 GB runners.
+      - name: Add swap for sanitizer compiles
+        run: |
+          sudo fallocate -l 8G /mnt/manyforge.swap
+          sudo chmod 600 /mnt/manyforge.swap
+          sudo mkswap /mnt/manyforge.swap
+          sudo swapon /mnt/manyforge.swap
+          free -h
+
       - uses: docker/setup-buildx-action@v3
         id: sanitizer_builder
 
-      - name: Load development image from cache or rebuild
+      - name: Load development image from cache
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64
           load: true
           tags: manyforge-asan-ci:${{ github.sha }}
-          cache-from: type=gha,scope=manyforge-asan-${{ github.run_id }}-${{ github.run_attempt }}
-
-      - name: Report image size and free disk after build
-        run: |
-          docker image inspect "manyforge-asan-ci:${GITHUB_SHA}" --format 'Image size (bytes): {{.Size}}'
-          df -h
+          cache-from: type=gha,scope=manyforge-dev
 
       - name: Prune local builder cache after image load
         shell: bash
@@ -119,8 +94,6 @@ jobs:
           set -euo pipefail
           image="manyforge-asan-ci:${GITHUB_SHA}"
           image_id="$(docker image inspect "$image" --format '{{.Id}}')"
-          docker buildx du --builder "$BUILDER_NAME"
-          df -h
           docker buildx prune --builder "$BUILDER_NAME" --all --force
           test "$(docker image inspect "$image" --format '{{.Id}}')" = "$image_id"
           df -h
@@ -142,8 +115,8 @@ jobs:
             --security-opt seccomp=unconfined \
             -e ASAN_OPTIONS=halt_on_error=1:detect_leaks=1:exitcode=66 \
             -e UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1:exitcode=66 \
-            -e CMAKE_BUILD_PARALLEL_LEVEL=1 \
-            -e MAKEFLAGS=-j1 \
+            -e CMAKE_BUILD_PARALLEL_LEVEL=2 \
+            -e MAKEFLAGS=-j2 \
             -e SANITIZER_SUITE \
             -e BUILD_DIR=/tmp/manyforge-asan/core \
             -e DEPLOYMENT_BUILD_DIR=/tmp/manyforge-asan/deployment \

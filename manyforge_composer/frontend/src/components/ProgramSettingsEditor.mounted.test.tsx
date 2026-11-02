@@ -3,7 +3,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { afterEach, expect, it, vi } from 'vitest';
 
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
-import type { ProgramAuthoringDocument } from '../types/api';
+import type { CatalogEntry, ProgramAuthoringDocument } from '../types/api';
 import { ProgramSettingsEditor } from './ProgramSettingsEditor';
 
 afterEach(() => vi.unstubAllGlobals());
@@ -68,7 +68,7 @@ const program: ProgramAuthoringDocument = {
   positions: {},
 };
 
-async function mountSettings(draft: ProgramAuthoringDocument) {
+async function mountSettings(draft: ProgramAuthoringDocument, catalogEntries: CatalogEntry[] = []) {
   const { host, find } = mountedHost();
   const onMutate = vi.fn(() => null);
   const { createRoot } = await import('react-dom/client');
@@ -76,7 +76,7 @@ async function mountSettings(draft: ProgramAuthoringDocument) {
   await act(() => root.render(
     <ProgramSettingsEditor
       program={draft}
-      catalogEntries={[]}
+      catalogEntries={catalogEntries}
       candidateRevision={null}
       busy={false}
       runtime={runtime}
@@ -141,4 +141,39 @@ it('starts a logic-only Program with no component role and still offers role cre
   expect(markup).toContain('Create component role');
   expect(markup).not.toContain('Remove component role');
   expect(markup).toContain('Select component role');
+});
+
+it('validates the Program corner blend radius as a non-negative distance', async () => {
+  // Declared defaults stand in when no node of this Program carries the field.
+  const motionEntry = {
+    id: 'move', name: 'Move', category: 'motion', description: '', stability: 'stable',
+    kind: 'leaf', childrenMin: 0, childrenMax: 0, parameters: [], requiredCapabilities: [],
+    execution: { blocking: true, cancellable: true, ownerApi: 'kernel.operation' },
+    runners: { py_trees: 'move_v1' }, tags: [], minProgramProfile: 'composable-cell-v1',
+    blackboard: { reads: [], writes: [] }, ownerContext: null, outcomes: {},
+    eventFamily: 'manyforge.program.node',
+  } as CatalogEntry;
+  const defaults = { velocity_scale: 0.5, acceleration_scale: 0.5, translation_tol_m: 0.005, blend_radius_m: 0 };
+  const mounted = await mountSettings({
+    ...program,
+    parameters: Object.entries(defaults).map(([parameter_id, value]) => ({
+      parameter_id, type: 'float64', default: value,
+    })),
+  }, [motionEntry]);
+  try {
+    const radius = () => mounted.find((p) => p['aria-label'] === 'Program Cartesian corner blend radius');
+    const submit = () => mounted.find((p) => p.children === 'Update motion defaults');
+    expect(radius().value).toBe(0);
+    const edit = (value: number) => act(() => (radius().onChange as (event: unknown) => void)(
+      { currentTarget: { valueAsNumber: value } }));
+    await edit(-0.001);
+    await act(() => submit().onClick?.());
+    expect(mounted.onMutate).not.toHaveBeenCalled();
+    expect(mounted.find((p) => p.role === 'alert').children)
+      .toContain('corner blend radius must be non-negative');
+    await edit(0.02);
+    await act(() => submit().onClick?.());
+    expect(mounted.onMutate).toHaveBeenCalledWith('program_draft_update_motion_defaults',
+      expect.objectContaining({ blend_radius_m: 0.02, translation_tol_m: 0.005 }));
+  } finally { await mounted.unmount(); }
 });

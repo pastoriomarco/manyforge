@@ -2,7 +2,6 @@
 #include <cmath>
 #include <manyforge_core/program_frame_identity.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
-#include <manyforge_core/io_signal_descriptor.hpp>
 #include <manyforge_core/types/projection_common.hpp>
 #include <manyforge_core/types/collision_world_snapshot.hpp>
 #include <map>
@@ -148,7 +147,6 @@ bool runtime_participant_binding_physically_contains(
              }) &&
          available.control_path == value.control_path &&
          available.capability_provider_path == value.capability_provider_path &&
-         available.io_output_binding == value.io_output_binding &&
          is_unambiguous_subset(
              available.supporting_capability_provider_paths,
              value.supporting_capability_provider_paths,
@@ -164,12 +162,7 @@ Result<ParticipantBindingIdentityDTO> runtime_participant_binding_identity(
         binding.capability_provider_path->capability_provider_binding_id,
         binding.capability_provider_path->capability_provider_binding_revision};
   }
-  if (binding.io_output_binding && provider && !binding.control_path) {
-    const auto& occurrence = binding.io_output_binding->provider;
-    ParticipantBindingIdentityDTO result{occurrence.control_domain_id,
-        occurrence.control_domain_revision, *provider};
-    if (result.locally_valid()) return Result<ParticipantBindingIdentityDTO>::Ok(std::move(result));
-  } else if (binding.control_path && !binding.io_output_binding) {
+  if (binding.control_path) {
     const auto& path = *binding.control_path;
     ParticipantBindingIdentityDTO result{path.control_domain_id, path.control_domain_revision,
         ControllerParticipantBindingIdentityDTO{path.control_binding_id, path.control_binding_revision,
@@ -192,47 +185,6 @@ Result<RuntimeParticipantBinding> verify_runtime_participant_binding(
       value.capability_definition_revision.empty()) {
     return invalid("runtime participant has an empty required identity",
                    "runtime_participant_identity_empty");
-  }
-  if (value.io_output_binding) {
-    const auto& output = *value.io_output_binding;
-    const auto descriptor = ComputeIoSignalDescriptorDigest(output.signal);
-    if (value.control_path || !value.resources.empty() || !value.model_bindings.empty() ||
-        !value.model_groups.empty() || !value.frame_bindings.empty() ||
-        !value.collision_body_bindings.empty() || !value.contact_grasp_bindings.empty() ||
-        value.motion_endpoint || !value.supporting_capability_provider_paths.empty() ||
-        !value.command_schema || value.command_schema->command_schema_id.empty() ||
-        value.command_schema->command_schema_revision.empty() || !value.capability_provider_path ||
-        !valid_provider_path(*value.capability_provider_path) ||
-        value.capability_provider_path->capability_id != value.capability_id ||
-        value.capability_provider_path->capability_definition_revision !=
-            value.capability_definition_revision ||
-        output.resource_role_id.empty() || !output.component_lifecycle_generation.nonzero() ||
-        !output.provider.locally_valid() || !output.completion_policy.locally_valid() ||
-        !IsExactLowercaseSha256Digest(output.signal_configuration_digest.value()) ||
-        output.signal.signal_id.controllable_component_id != value.controllable_component_id ||
-        output.signal.direction != IoSignalDirection::kOutput || !output.signal.output_resource ||
-        !descriptor.ok() || descriptor.value() != output.signal_descriptor_digest) {
-      return invalid("runtime output lacks an exact non-coordinate provider channel",
-                     "runtime_io_output_binding_invalid");
-    }
-    if (value.runtime_unit_epochs.empty() ||
-        !sorted_unique(value.runtime_unit_epochs, [](const auto& item) { return item.runtime_unit_id; }) ||
-        std::any_of(value.runtime_unit_epochs.begin(), value.runtime_unit_epochs.end(), [](const auto& item) {
-          return item.runtime_unit_id.empty() || item.runtime_epoch.empty();
-        })) {
-      return invalid("runtime output epochs are incomplete or duplicate", "runtime_epoch_binding_invalid");
-    }
-    const auto exact_epoch = [&](const auto& provider) {
-      return std::count_if(value.runtime_unit_epochs.begin(), value.runtime_unit_epochs.end(),
-          [&](const auto& epoch) {
-            return epoch.runtime_unit_id == provider.provider_runtime_unit_id &&
-                   epoch.runtime_epoch == provider.provider_runtime_epoch;
-          }) == 1;
-    };
-    if (!exact_epoch(output.provider) || !exact_epoch(*value.capability_provider_path))
-      return invalid("runtime output provider epoch differs from its installed occurrence",
-                     "runtime_provider_epoch_join_invalid");
-    return Result<RuntimeParticipantBinding>::Ok(RuntimeParticipantBinding(std::move(value)));
   }
   if (!unique_nonempty(value.model_bindings, [](const auto& item) { return item.model_role_id; }) ||
       std::any_of(value.model_bindings.begin(), value.model_bindings.end(), [](const auto& item) {

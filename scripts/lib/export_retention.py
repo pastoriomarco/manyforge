@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 
 import argparse
 from collections import deque
-from contextlib import ExitStack, closing
+from contextlib import ExitStack
 from dataclasses import dataclass
 import fcntl
 import json
@@ -15,7 +15,6 @@ import os
 from pathlib import Path
 import re
 import shutil
-import sqlite3
 import stat
 import sys
 import time
@@ -99,64 +98,6 @@ def _safe_path(path: Path, root: Path | None = None) -> Path:
 
 def _identity(row: os.stat_result) -> tuple[int, ...]:
     return row.st_dev, row.st_ino, row.st_size, row.st_mtime_ns, row.st_ctime_ns
-
-
-class _IncidentGuard:
-    """Pin protection inputs before inventory, for this quiescent pass only."""
-    def __init__(self, root_fd: int, resources: ExitStack):
-        self.root_fd = root_fd
-        self.ready = False
-        self.reason: str | None = None
-        try:
-            try:
-                os.stat("current", dir_fd=root_fd, follow_symlinks=False)
-                self.state_relative = Path("current/execution-state")
-            except FileNotFoundError:
-                self.state_relative = Path("execution-state")
-            self.state_fd = _open_relative_directory(root_fd, self.state_relative)
-            resources.callback(os.close, self.state_fd)
-            self.journal_fd = os.open("cclc-journal.sqlite3", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=self.state_fd)
-            resources.callback(os.close, self.journal_fd)
-            row = os.fstat(self.journal_fd)
-            if not stat.S_ISREG(row.st_mode):
-                raise ValueError("not a regular journal")
-            self.journal_identity = _identity(row)
-            self.sidecars = self._sidecars()
-            self.ready = True
-            self.check()
-            uri = f"file:/proc/self/fd/{self.journal_fd}?mode=ro&immutable=1"
-            with closing(sqlite3.connect(uri, uri=True)) as database:
-                row = database.execute("SELECT 1 FROM cclc_component_incidents WHERE acknowledged IS NULL OR acknowledged != 1 LIMIT 1").fetchone()
-            self.check()
-            self.reason = "open CCLC incident" if row else None
-        except (OSError, ValueError, sqlite3.Error) as error:
-            self.reason = f"CCLC incident state unknown: {str(error)[:200]}"
-            self.ready = False
-
-    def _sidecars(self) -> tuple:
-        observations = []
-        for suffix in ("-wal", "-journal"):
-            try:
-                row = os.stat("cclc-journal.sqlite3" + suffix, dir_fd=self.state_fd, follow_symlinks=False)
-            except FileNotFoundError:
-                observations.append(None)
-                continue
-            if not stat.S_ISREG(row.st_mode) or row.st_size:
-                raise ValueError("uncheckpointed or unknown journal sidecar " + suffix)
-            observations.append(_identity(row))
-        return tuple(observations)
-
-    def check(self) -> None:
-        if not self.ready:
-            return
-        state = os.stat(self.state_relative, dir_fd=self.root_fd, follow_symlinks=False)
-        held_state = os.fstat(self.state_fd)
-        journal = os.stat("cclc-journal.sqlite3", dir_fd=self.state_fd, follow_symlinks=False)
-        if ((state.st_dev, state.st_ino) != (held_state.st_dev, held_state.st_ino) or
-                _identity(journal) != self.journal_identity or
-                _identity(os.fstat(self.journal_fd)) != self.journal_identity or
-                self._sidecars() != self.sidecars):
-            raise ValueError("CCLC protection journal changed during retention")
 
 
 def _disk_facts(root_fd: int) -> DiskFacts:
@@ -652,8 +593,7 @@ def _remove_old_session(root: Path, root_fd: int, folder: Path,
         os.close(parent_fd)
 
 
-def _prune_previous_sessions(root: Path, root_fd: int,
-                             incident: _IncidentGuard) -> RetentionResult:
+def _prune_previous_sessions(root: Path, root_fd: int) -> RetentionResult:
     """One bounded count pass over completed previous sessions and reports."""
     for name in (".session-selection.json", ".legacy-session-transition.json"):
         if (root / name).exists() or (root / name).is_symlink():
@@ -690,8 +630,6 @@ def _prune_previous_sessions(root: Path, root_fd: int,
     excess_reports = max(0, len(finalized) - target)
     if not excess_archives and not excess_reports:
         return RetentionResult()
-    if incident.reason:
-        return RetentionResult(warning="previous-session retention deferred: " + incident.reason)
 
     protected: set[str] = set()
     if archives:
@@ -735,7 +673,6 @@ def _prune_previous_sessions(root: Path, root_fd: int,
             if folder.name in protected:
                 continue
             _check_root_identity(root, root_fd)
-            incident.check()
             _remove_old_session(root, root_fd, folder, row)
             retained_archives.remove(folder.name)
             deleted.append(str(folder.relative_to(root)))
@@ -753,7 +690,6 @@ def _prune_previous_sessions(root: Path, root_fd: int,
             if report.stem in protected or report.stem in retained_archives:
                 continue
             _check_root_identity(root, root_fd)
-            incident.check()
             remove_report(report, row)
             deleted_units += 1
             excess_reports -= 1
@@ -781,13 +717,11 @@ def rotate_retained_logs(root: Path, policy: SiteRetentionPolicy, *,
             raise ValueError("filesystem root is not a ManyForge state root")
         root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         fcntl.flock(root_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        incident = _IncidentGuard(root_fd, resources)
-        sessions = _prune_previous_sessions(root, root_fd, incident)
+        sessions = _prune_previous_sessions(root, root_fd)
         deleted.extend(sessions.deleted)
         session_warning = sessions.warning
         for _ in range(_MAX_DELETIONS + 1):
             _check_root_identity(root, root_fd)
-            incident.check()
             units, owned_bytes, seen = [], 0, set()
             mounts = _mounted_children(root)
             root_device = os.fstat(root_fd).st_dev
@@ -818,7 +752,7 @@ def rotate_retained_logs(root: Path, policy: SiteRetentionPolicy, *,
                             owner_resources.callback(os.close, owner_fd)
                             mounts.update(_mounted_children(owner))
                         alias = Path(f"/proc/self/fd/{owner_fd}")
-                        for aliased, reason, order in _units(alias, sibling=owner != root, ownership_root=owner, protection=incident.reason, warnings=observations):
+                        for aliased, reason, order in _units(alias, sibling=owner != root, ownership_root=owner, warnings=observations):
                             relative = aliased.relative_to(alias)
                             folder = owner / relative
                             try:
@@ -844,7 +778,6 @@ def rotate_retained_logs(root: Path, policy: SiteRetentionPolicy, *,
                             units.append((folder, row, reason, order))
             facts = disk_facts(root_fd)
             _check_root_identity(root, root_fd)
-            incident.check()
             if facts.total_bytes <= 0 or facts.free_bytes < 0:
                 raise ValueError("invalid filesystem capacity facts")
             if owned_bytes * 100 <= facts.total_bytes * policy.max_disk_percent and facts.free_bytes >= policy.min_free_bytes:
@@ -860,7 +793,6 @@ def rotate_retained_logs(root: Path, policy: SiteRetentionPolicy, *,
                     f"{'bounded deletion pass complete' if eligible else 'only protected material remains'}; protected: {detail[:4096]}")
             victim = eligible[0]
             before = next(row for folder, row, _, _ in units if folder == victim)
-            incident.check()
             try:
                 parent_fd = _open_relative_directory(root_fd, victim.relative_to(root).parent)
             except (OSError, ValueError) as error:

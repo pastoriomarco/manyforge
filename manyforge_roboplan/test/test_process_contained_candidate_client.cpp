@@ -9,6 +9,7 @@
 #include <cmath>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <future>
 #include <functional>
 #include <manyforge_collision/scene_asset_root.hpp>
@@ -19,6 +20,7 @@
 #include <memory>
 #include <optional>
 #include <roboplan/core/scene.hpp>
+#include <set>
 #include <roboplan_example_models/resources.hpp>
 #include <sstream>
 #include <string>
@@ -266,7 +268,7 @@ request(const ProcessFixture &fixture) {
                                      values(fixture.goal)},
       .tolerances = TolerancesDTO{1.0e-4, 5.0e-3, 1.0e-2},
       .speed_profile = SpeedProfileDTO{0.5, 0.5, std::nullopt},
-      .planning_profile = PlanningProfileDTO::kFirstFeasible,
+      .planner = {},
       .dynamics_limits = {},
       .planning_timeout_s = 3.0,
       .planning_attempt_index = 0U,
@@ -393,7 +395,8 @@ frame_relative_collision_projection(const ProcessFixture &fixture) {
 
 [[nodiscard]] CollisionWorldBody far_scene_body(
     const bool carried_by_component = false,
-    const std::optional<std::string> &mesh_resource_uri = std::nullopt) {
+    const std::optional<std::string> &mesh_resource_uri = std::nullopt,
+    const double x_m = 100.0) {
   CollisionWorldBody body;
   body.body_id = CollisionBodyId(std::string(kSceneBodyId));
   body.owner_kind = CollisionOwnerKind::kSceneResource;
@@ -401,7 +404,7 @@ frame_relative_collision_projection(const ProcessFixture &fixture) {
   if (carried_by_component) {
     body.parent_body_id = CollisionBodyId(std::string(kComponentBodyId));
   }
-  body.pose = identity_pose(100.0);
+  body.pose = identity_pose(x_m);
   if (mesh_resource_uri.has_value()) {
     CollisionGeometryDescriptor geometry;
     geometry.body_id = body.body_id;
@@ -427,7 +430,8 @@ projection(std::uint64_t world_revision = 1U,
            std::uint64_t scene_revision = 1U,
            const bool carried_by_component = false,
            const std::optional<std::string> &mesh_resource_uri =
-               std::nullopt) {
+               std::nullopt,
+           const double scene_body_x_m = 100.0) {
   auto policy = std::make_shared<CollisionPolicySnapshot>();
   policy->policy_id = "process-client-projection";
   policy->revision = CollisionPolicyRevision{1U, std::string(kDigestZero)};
@@ -439,7 +443,8 @@ projection(std::uint64_t world_revision = 1U,
           .set_policy_overlay_content_hash(policy->revision.content_hash)
           .add_body(component_body())
           .add_body(
-              far_scene_body(carried_by_component, mesh_resource_uri))
+              far_scene_body(carried_by_component, mesh_resource_uri,
+                             scene_body_x_m))
           .build_shared();
   if (!world.ok()) {
     throw std::runtime_error(world.error().message);
@@ -484,6 +489,52 @@ TEST(ProcessContainedCandidateClientTest,
   EXPECT_EQ(ik.value().size(), fixture.binding.resources.size());
 }
 
+// Planner settings are cell context: a retained planner takes new ones at
+// Apply, and the next request plans in a worker started with them.
+TEST(ProcessContainedCandidateClientTest,
+     RetainedSettingsReplacementStartsTheNextWorkerWithThem) {
+  auto fixture = make_fixture();
+  const auto generation_counter =
+      std::filesystem::temp_directory_path() /
+      ("manyforge-worker-settings-generations-" + std::to_string(::getpid()));
+  std::error_code ignored;
+  std::filesystem::remove(generation_counter, ignored);
+  fixture.model.native_scene_name =
+      "count-generations:" + generation_counter.string();
+  auto process_config = config(MANYFORGE_ROBOPLAN_FAKE_WORKER_PATH);
+  process_config.require_retained_projection = true;
+  const RoboPlanCandidateComputerConfig first_settings{0x1234U, 65'536U, 0.01};
+  ProcessContainedRoboPlanCandidateClient client(
+      fixture.model, fixture.binding, first_settings, std::move(process_config));
+  ASSERT_TRUE(client.select_retained_projection(projection()).ok());
+  const auto generations = [&] {
+    std::ifstream input(generation_counter);
+    return std::string(std::istreambuf_iterator<char>(input), {});
+  };
+  ASSERT_TRUE(client.compute(request(fixture)).ok());
+  EXPECT_EQ(generations(), "g");
+
+  // The same settings keep the running worker.
+  ASSERT_TRUE(client.replace_retained_settings(first_settings).ok());
+  ASSERT_TRUE(client.compute(request(fixture)).ok());
+  EXPECT_EQ(generations(), "g");
+
+  // A new seed: the next request plans in a worker started with it.
+  auto seeded = first_settings;
+  seeded.rng_seed = 0x1235U;
+  ASSERT_TRUE(client.replace_retained_settings(seeded).ok());
+  ASSERT_TRUE(client.compute(request(fixture)).ok());
+  EXPECT_EQ(generations(), "gh");
+
+  // A new collision-check step restarts it too, with the same seed.
+  auto stepped = seeded;
+  stepped.collision_check_step_rad = 0.02;
+  ASSERT_TRUE(client.replace_retained_settings(stepped).ok());
+  ASSERT_TRUE(client.compute(request(fixture)).ok());
+  EXPECT_EQ(generations(), "ghh");
+  std::filesystem::remove(generation_counter, ignored);
+}
+
 TEST(ProcessContainedCandidateClientTest,
      RetainedProjectionPinsAndReplacesOnlyItsExactWorkerGeneration) {
   auto fixture = make_fixture();
@@ -523,7 +574,24 @@ TEST(ProcessContainedCandidateClientTest,
   ASSERT_TRUE(repeated.ok()) << repeated.error().message;
   EXPECT_EQ(std::filesystem::file_size(generation_counter), 1U);
 
-  const auto next_projection = projection(1U, 2U);
+  // New scene/world revisions and a contact selector that relaxes no pair
+  // project byte-identical worker content: the worker is kept.
+  for (auto same_content : {projection(1U, 2U), projection(2U, 3U)}) {
+    for (const auto &contact : {std::optional<std::string>{},
+                                std::optional<std::string>("absent-policy")}) {
+      same_content.contact_policy_id = contact;
+      const auto kept = client.select_retained_projection(same_content);
+      ASSERT_TRUE(kept.ok()) << kept.error().message;
+      const auto planned = client.compute(request(fixture));
+      ASSERT_TRUE(planned.ok()) << planned.error().message;
+      EXPECT_EQ(planned.value().waypoints.back().positions_rad,
+                first.value().waypoints.back().positions_rad);
+      EXPECT_EQ(std::filesystem::file_size(generation_counter), 1U);
+    }
+  }
+
+  // Different worker content: the scene body moved.
+  const auto next_projection = projection(1U, 2U, false, std::nullopt, 101.0);
   const auto next_selection =
       client.select_retained_projection(next_projection);
   ASSERT_TRUE(next_selection.ok()) << next_selection.error().message;
@@ -1446,6 +1514,68 @@ TEST(ProcessContainedCandidateClientTest,
   ASSERT_TRUE(client.select_retained_projection(selected).ok());
   result = client.compute(request(fixture));
   ASSERT_TRUE(result.ok()) << result.error().message;
+}
+
+/// This process's live child PIDs (the spawned workers).
+[[nodiscard]] std::set<pid_t> child_pids() {
+  std::set<pid_t> pids;
+  for (const auto &task :
+       std::filesystem::directory_iterator("/proc/self/task")) {
+    std::ifstream children(task.path() / "children");
+    pid_t pid = 0;
+    while (children >> pid) {
+      pids.insert(pid);
+    }
+  }
+  return pids;
+}
+
+TEST(ProcessContainedCandidateClientTest,
+     RealWorkerContactPolicyChangesKeepTheWorkerAndMatchAFreshWorker) {
+  SeparatedSceneRoots roots("contact-reuse");
+  auto fixture = make_contact_fixture(roots.package_root);
+  auto process_config = config(MANYFORGE_ROBOPLAN_CANDIDATE_WORKER_PATH);
+  process_config.require_retained_projection = true;
+  const RoboPlanCandidateComputerConfig candidate_config{0x1234U, 65'536U,
+                                                         0.01};
+  ProcessContainedRoboPlanCandidateClient reused(
+      fixture.model, fixture.binding, candidate_config, process_config);
+  std::optional<std::set<pid_t>> workers;
+  for (const auto &id : {std::optional<std::string>("finger-contact"),
+                         std::optional<std::string>("palm-contact"),
+                         std::optional<std::string>{},
+                         std::optional<std::string>("finger-contact"),
+                         std::optional<std::string>("absent-policy"),
+                         std::optional<std::string>("palm-contact")}) {
+    SCOPED_TRACE("selector=" + id.value_or("<none>"));
+    const auto selected = contact_projection(id);
+    ASSERT_TRUE(reused.select_retained_projection(selected).ok());
+    const auto result = reused.compute(request(fixture));
+    // Every policy change after the first plan keeps the same worker.
+    if (!workers) {
+      workers = child_pids();
+    }
+    EXPECT_EQ(child_pids(), *workers);
+
+    ProcessContainedRoboPlanCandidateClient fresh(
+        fixture.model, fixture.binding, candidate_config, process_config);
+    ASSERT_TRUE(fresh.select_retained_projection(selected).ok());
+    const auto expected = fresh.compute(request(fixture));
+    ASSERT_EQ(result.ok(), expected.ok());
+    EXPECT_EQ(result.ok(), id == std::optional<std::string>("finger-contact"));
+    if (result.ok()) {
+      EXPECT_EQ(result.value().waypoints.size(),
+                expected.value().waypoints.size());
+      EXPECT_EQ(result.value().waypoints.back().positions_rad,
+                expected.value().waypoints.back().positions_rad);
+    } else {
+      // Same failure, naming the same colliding pair.
+      EXPECT_EQ(result.error().code, expected.error().code);
+      EXPECT_EQ(result.error().message, expected.error().message);
+      EXPECT_EQ(result.error().details, expected.error().details);
+      EXPECT_TRUE(result.error().details.contains("collision_body_a"));
+    }
+  }
 }
 
 TEST(ProcessContainedCandidateClientTest,

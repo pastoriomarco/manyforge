@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: semantic_shape_pick
-program_revision: sha256:008abe7952122d46242344707735c60efb61ea7206704d7eb0665f28da990435
+program_revision: sha256:a30663dc2c2581b498055dc743406f06b54f68018a8b4a83e03c2070027851b2
 program_profile: composable-cell-v1
 name: semantic_shape_pick
 description: Semantic object-selection demo. Deterministic nodes build and validate a retained scene-selection
@@ -45,12 +45,6 @@ target_roles:
       parameters: {}
       disposition: required
     - capability_id: planning.motion.pose_goal
-      parameters: {}
-      disposition: required
-    - capability_id: planning.profile.balanced
-      parameters: {}
-      disposition: required
-    - capability_id: planning.profile.first_feasible
       parameters: {}
       disposition: required
     - capability_id: planning.trajectory.time_parameterized

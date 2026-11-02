@@ -8,7 +8,6 @@ bool recovery_request_names_assessment(const KernelRecoveryActionRequestDTO& req
   return request.expected_assessment_revision == assessment.assessment_revision &&
          request.expected_control_command_epoch == assessment.control_command_epoch &&
          request.expected_execution_id == assessment.execution_id &&
-         request.expected_latch_id == assessment.latch_id &&
          request.expected_stop_certificate_id == assessment.stop_certificate_id &&
          request.expected_stop_owner_generation == assessment.stop_owner_generation;
 }
@@ -19,7 +18,6 @@ bool recovery_requests_match(const KernelRecoveryActionRequestDTO& left,
          left.expected_assessment_revision == right.expected_assessment_revision &&
          left.expected_control_command_epoch == right.expected_control_command_epoch &&
          left.expected_execution_id == right.expected_execution_id &&
-         left.expected_latch_id == right.expected_latch_id &&
          left.expected_stop_certificate_id == right.expected_stop_certificate_id &&
          left.expected_stop_owner_generation == right.expected_stop_owner_generation &&
          left.reason == right.reason && left.fresh_motion_attempt == right.fresh_motion_attempt;
@@ -165,8 +163,7 @@ MotionRetryEligibilityDTO ResourceAddressedExecutionKernel::operation_retry_elig
   };
   if (operation.retry_run_ended)
     return refuse(MotionRetryIneligibilityReason::kProgramScopeRequired);
-  if (is_active_stop_fault_latch(active_stop_fault_latch_))
-    return refuse(MotionRetryIneligibilityReason::kLatchPresent);
+  if (cell_latched_locked()) return refuse(MotionRetryIneligibilityReason::kLatchPresent);
   if ((!recovery_owner && operation.recovery_effect_in_flight) || operation.stop_effect_in_flight ||
       operation.ordinary_commit_in_flight || operation.ordinary_acceptance_pending ||
       operation.pending_control || operation.runtime_scale_effect_in_flight ||
@@ -221,9 +218,6 @@ MotionRetryEligibilityDTO ResourceAddressedExecutionKernel::operation_retry_elig
     if (row.stop_owner_active) return refuse(MotionRetryIneligibilityReason::kStopOwnerActive);
     if (row.stronger_authority_active)
       return refuse(MotionRetryIneligibilityReason::kStrongerAuthorityActive);
-    if (row.queued_latch_present)
-      return refuse(MotionRetryIneligibilityReason::kQueuedLatchPresent);
-    if (!row.latch_id.empty()) return refuse(MotionRetryIneligibilityReason::kLatchPresent);
     if (row.execution_state != ExecutionState::kStopped ||
         row.recovery_class != RecoveryClass::kOrdinaryOperatorStop || !row.retry_admissible ||
         !row.backend_stop_confirmed || !row.observed_state_available || !row.observed_state_fresh ||
@@ -241,7 +235,7 @@ MotionRetryEligibilityDTO ResourceAddressedExecutionKernel::operation_retry_elig
 bool ResourceAddressedExecutionKernel::operation_close_eligible_locked(
     const ActiveOperation& operation, const std::vector<KernelRecoveryAssessmentDTO>& assessments,
     const bool closure_owner) const {
-  if (is_active_stop_fault_latch(active_stop_fault_latch_) || operation.participants.empty() ||
+  if (operation.participants.empty() ||
       operation.participants.size() != operation.state.participants.size() ||
       operation.participants.size() != assessments.size() ||
       (!closure_owner &&
@@ -285,8 +279,7 @@ bool ResourceAddressedExecutionKernel::operation_close_eligible_locked(
     const auto* associated_fact = selected_cause_terminal_fact(state);
     if (!terminal(state.state) || row.preparation_borrow_in_flight() ||
         row.deferred_stop_settlement || assessment.stop_owner_active ||
-        assessment.stronger_authority_active || assessment.queued_latch_present ||
-        !assessment.latch_id.empty() ||
+        assessment.stronger_authority_active ||
         (associated_fact &&
          associated_fact->effect == ParticipantEffectKnowledge::kEffectUncertain))
       return false;
@@ -367,15 +360,11 @@ ResourceAddressedExecutionKernel::get_operation_recovery_assessment(
           participant.slot_owner.participant_id, binding.controllable_component_id,
           binding.command_target_id, binding.capability_id,
           participant.slot_owner.binding_identity.control_domain_id,
-          participant.slot_owner.binding_identity.controller()
-              ? std::optional(participant.slot_owner.binding_identity.controller()->control_binding_id) : std::nullopt,
+          participant.slot_owner.binding_identity.controller.control_binding_id,
           std::move(provider),
-          participant.slot_owner.controller_authority
-              ? std::optional(participant.slot_owner.controller().control_route_id) : std::nullopt,
-          participant.slot_owner.controller_authority
-              ? std::optional(participant.slot_owner.controller().active_control_configuration_id) : std::nullopt,
-          participant.slot_owner.controller_authority
-              ? std::optional(participant.slot_owner.controller().active_control_configuration_generation) : std::nullopt,
+          participant.slot_owner.controller_authority.control_route_id,
+          participant.slot_owner.controller_authority.active_control_configuration_id,
+          participant.slot_owner.controller_authority.active_control_configuration_generation,
           participant.resources});
     }
   }
@@ -457,9 +446,6 @@ ResourceAddressedExecutionKernel::get_operation_recovery_assessment(
       assessment.stronger_authority_active =
           std::any_of(assessments.begin(), assessments.end(),
                       [](const auto& row) { return row.stronger_authority_active; });
-      assessment.queued_latch_present =
-          std::any_of(assessments.begin(), assessments.end(),
-                      [](const auto& row) { return row.queued_latch_present; });
       assessment.allowed_actions = assessments.front().allowed_actions;
       std::erase_if(assessment.allowed_actions, [&](const auto action) {
         return std::any_of(assessments.begin() + 1, assessments.end(), [&](const auto& row) {
@@ -496,26 +482,6 @@ ResourceAddressedExecutionKernel::get_operation_recovery_assessment(
     if (std::any_of(operation->participants.begin(), operation->participants.end(),
                     [](const auto& row) { return row.runtime_collision_error.has_value(); }))
       assessment.recovery_class = RecoveryClass::kRuntimeCollision;
-    if (is_active_stop_fault_latch(active_stop_fault_latch_)) {
-      const auto& latch = *active_stop_fault_latch_;
-      // A participant may be physically stopped and locally retry-ready while
-      // the addressed cell owner has retained a stronger Stop-fault latch.
-      // Publish the composed truth: motion is settled, but only Program Reset
-      // may clear the exact outer latch.  Never offer Resume that the same
-      // owner would subsequently reject at motion admission.
-      assessment.recovery_class = RecoveryClass::kStopFaultIntervention;
-      assessment.status = RecoveryAssessmentStatus::kResetRequired;
-      assessment.latch_id = latch.latch_id.value();
-      assessment.stop_owner_generation = latch.stop_generation.value();
-      assessment.retry_admissible = false;
-      assessment.allowed_actions = {RecoveryAction::kResetCycle};
-      assessment.reason_code = "active_stop_fault_requires_reset";
-      if (latch.stop_certificate.has_value()) {
-        assessment.stop_certificate_id = latch.stop_certificate->stop_certificate_id.value();
-        assessment.stop_certificate_revision =
-            latch.stop_certificate->stop_certificate_revision.value();
-      }
-    }
     const auto& retained = operation->recovery_assessment_inputs;
     bool semantic_change =
         !operation->published_recovery_assessment || retained.size() != assessments.size();
@@ -674,12 +640,9 @@ ResourceAddressedExecutionKernel::apply_operation_recovery_action(
       return reject<KernelRecoveryActionResultDTO>("operation work is still in flight",
                                                    "operation_recovery_busy",
                                                    ErrorCode::kInvalidStateTransition);
-    if (is_active_stop_fault_latch(active_stop_fault_latch_)) {
-      return Result<KernelRecoveryActionResultDTO>::Err(
-          ErrorDTO{"operation_recovery_blocked_by_stop_fault",
-                   "Program Reset is required before motion can resume",
-                   {{"reason", "active_stop_fault_requires_reset"},
-                    {"latch_id", active_stop_fault_latch_->latch_id.value()}}});
+    if (motion_producing_recovery(request.action)) {
+      if (auto refusal = cell_latch_refusal_locked())
+        return Result<KernelRecoveryActionResultDTO>::Err(std::move(*refusal));
     }
     if (motion_producing_recovery(request.action) && !operation->manual) {
       if (auto refusal = operator_alarm_attention_refusal_locked(
@@ -876,7 +839,6 @@ ResourceAddressedExecutionKernel::apply_operation_recovery_action(
     std::lock_guard state_lock(state_mutex_);
     if (auto* operation = find_active_operation_locked(operation_id))
       operation->recovery_effect_in_flight = false;
-    motion_admission_closed_ = true;
     retain_current_recovery(OperationRecoveryReplayEntry{
         operation_id, expected_operation_revision, request,
         KernelRecoveryActionResultDTO{
@@ -909,7 +871,6 @@ ResourceAddressedExecutionKernel::apply_operation_recovery_action(
         operation->participants.size() != 1U || operation->participants.front().engine != engine ||
         !operation->stop_allows_retirement() || result.request_id != request.request_id ||
         result.action != request.action) {
-      motion_admission_closed_ = true;
       retain_current_recovery(OperationRecoveryReplayEntry{
           operation_id, expected_operation_revision, request, result, true});
       return reject<KernelRecoveryActionResultDTO>(
@@ -926,10 +887,8 @@ ResourceAddressedExecutionKernel::apply_operation_recovery_action(
          program_cycle_claim_run_->capture->table != continuation_capture->table ||
          program_cycle_claim_run_->claim_generation != continuation_capture->claim_generation ||
          program_cycle_claim_run_->program_run_id != continuation_capture->program_run_id ||
-         (request.fresh_motion_attempt &&
-          (is_active_stop_fault_latch(active_stop_fault_latch_) || operation->retry_run_ended)) ||
+         (request.fresh_motion_attempt && (cell_latched_locked() || operation->retry_run_ended)) ||
          continuation_index >= program_cycle_claim_run_->motion_continuations.size())) {
-      motion_admission_closed_ = true;
       retain_current_recovery(OperationRecoveryReplayEntry{
           operation_id, expected_operation_revision, request, result, true});
       return reject<KernelRecoveryActionResultDTO>(
@@ -939,7 +898,6 @@ ResourceAddressedExecutionKernel::apply_operation_recovery_action(
     auto owner_rows =
         retained_owner_rows(operation->participants, resource_slots_->coherent_snapshot());
     if (!owner_rows.ok()) {
-      motion_admission_closed_ = true;
       retain_current_recovery(OperationRecoveryReplayEntry{
           operation_id, expected_operation_revision, request, result, true});
       return Result<KernelRecoveryActionResultDTO>::Err(owner_rows.error());
@@ -947,7 +905,6 @@ ResourceAddressedExecutionKernel::apply_operation_recovery_action(
     if (!owner_rows.value().empty()) {
       auto released = resource_slots_->release_batch(owner_rows.value());
       if (!released.ok()) {
-        motion_admission_closed_ = true;
         retain_current_recovery(OperationRecoveryReplayEntry{
             operation_id, expected_operation_revision, request, result, true});
         return Result<KernelRecoveryActionResultDTO>::Err(released.error());
@@ -1094,7 +1051,6 @@ Result<KernelRecoveryActionResultDTO> ResourceAddressedExecutionKernel::close_op
   KernelRecoveryActionResultDTO result{request.request_id, request.action, true, {}, std::nullopt};
   const auto unresolved = [&](std::string message) {
     std::lock_guard state_lock(state_mutex_);
-    motion_admission_closed_ = true;
     retain({operation_id, expected_operation_revision, request, result, true});
     return reject<KernelRecoveryActionResultDTO>(std::move(message),
                                                  "operation_recovery_outcome_unresolved",
@@ -1132,7 +1088,6 @@ Result<KernelRecoveryActionResultDTO> ResourceAddressedExecutionKernel::close_op
         operation->state.active_stop_id != projection.value().stop_id ||
         operation->state.active_stop_generation != projection.value().stop_generation ||
         !operation_close_eligible_locked(*operation, closure_assessments, true)) {
-      motion_admission_closed_ = true;
       retain({operation_id, expected_operation_revision, request, result, true});
       return reject<KernelRecoveryActionResultDTO>("operation changed during closure cleanup",
                                                    "operation_recovery_outcome_unresolved",
@@ -1142,7 +1097,6 @@ Result<KernelRecoveryActionResultDTO> ResourceAddressedExecutionKernel::close_op
     result.resulting_assessment.reason_code = "operation_closed";
     const auto retired = retire_operation_ownership_locked(operation_id, true, true);
     if (!retired.ok()) {
-      motion_admission_closed_ = true;
       retain({operation_id, expected_operation_revision, request, result, true});
       return Result<KernelRecoveryActionResultDTO>::Err(retired.error());
     }
@@ -1150,166 +1104,6 @@ Result<KernelRecoveryActionResultDTO> ResourceAddressedExecutionKernel::close_op
     retain({operation_id, expected_operation_revision, request, result});
   }
   return Result<KernelRecoveryActionResultDTO>::Ok(std::move(result));
-}
-
-Result<StopGeneration> ResourceAddressedExecutionKernel::arm_force_close(
-    const StopGeneration stop_generation) {
-  const auto unconfirmed = [&](const char* reason) {
-    return Result<StopGeneration>::Err(
-        ErrorDTO{"scenario_force_close_stop_unconfirmed",
-                 "Force close requires the operator's confirmed Full Stop",
-                 {{"reason", reason}, {"stop_generation", std::to_string(stop_generation.value())}}});
-  };
-  std::lock_guard state_lock(state_mutex_);
-  // A newer Stop supersedes the operator's Full Stop: its outcome decides.
-  if (stop_generation.value() == 0U || cell_stop_generation_ != stop_generation)
-    return unconfirmed("stop_superseded");
-  const auto* terminal_record =
-      stop_terminal_history_.empty() ? nullptr : stop_terminal_history_.back().get();
-  if (terminal_record == nullptr || terminal_record->certificate.stop_generation != stop_generation)
-    return unconfirmed("stop_pending");
-  const auto result = terminal_record->certificate.result;
-  if (result != StopCertificateResultDTO::kSucceededNominal &&
-      result != StopCertificateResultDTO::kSucceededEscalated)
-    return unconfirmed("stop_not_contained");
-  force_close_stop_generation_ = stop_generation;
-  return Result<StopGeneration>::Ok(stop_generation);
-}
-
-Result<ForceCloseResultDTO> ResourceAddressedExecutionKernel::force_close_operations() {
-  // The same lock order as close_operation: recovery, submission, state.
-  std::lock_guard recovery_lock(operation_recovery_mutex_);
-  std::lock_guard submission_lock(submission_mutex_);
-  ForceCloseResultDTO result;
-  // Journaled after the state lock is released (below).
-  std::vector<OperationStateDTO> settled;
-  {
-    std::lock_guard state_lock(state_mutex_);
-    if (!force_close_stop_generation_.has_value())
-      return Result<ForceCloseResultDTO>::Err(
-          ErrorDTO{"scenario_force_close_stop_unconfirmed",
-                   "Force close requires the operator's confirmed Full Stop first",
-                   {{"reason", "not_armed"}}});
-    if (!close_retired_product_)
-      return Result<ForceCloseResultDTO>::Err(
-          ErrorDTO{"scenario_force_close_not_closing",
-                   "Force close moves operations only after Close retired the lifecycle targets",
-                   {}});
-    // Another thread is writing this operation right now; it re-finds the
-    // operation by id afterwards, so only this short window is refused.
-    // Item 39: a pending I/O-rule Stop response is not waited for; it may
-    // never arrive, and its late certificate skips an operation in history.
-    for (const auto& [id, operation] : active_operations_) {
-      if (operation->ordinary_commit_in_flight || operation->recovery_effect_in_flight ||
-          operation->coordinated_cancellation_in_flight || operation->takeover_advance_in_flight)
-        return Result<ForceCloseResultDTO>::Err(
-            ErrorDTO{"scenario_force_close_operation_busy",
-                     "An operation is being updated right now; retry Force close",
-                     {{"operation_id", id.value()}}});
-    }
-    result.stop_generation = *force_close_stop_generation_;
-    std::vector<OperationId> closed;
-    closed.reserve(active_operations_.size());
-    for (const auto& [id, operation] : active_operations_) {
-      closed.push_back(id);
-      ForceClosedOperationDTO row{id, operation->state.operation_revision, operation->state.state,
-                                  operation->containment_effect_uncertain(), {}};
-      for (const auto& participant : operation->state.participants)
-        row.targets.push_back({participant.controllable_component_id,
-                               participant.command_target_id,
-                               participant.output_evidence == IoOutputEvidence::kAcceptanceUnknown});
-      result.operations.push_back(std::move(row));
-    }
-    for (const auto& id : closed) {
-      // The history copy is this state: marked here, then the ordinary
-      // retirement (I/O rules, continuations, the Program node's slot).
-      auto* operation = find_active_operation_locked(id);
-      auto& state = operation->state;
-      // Item 25: settled as a replaced host settles it. Interrupted is not
-      // settled for the journal's clean owner close, so it is relabelled too.
-      if (!terminal(state.state) || state.state == OperationStateKind::kInterrupted)
-        state.state = OperationStateKind::kInterventionRequired;
-      for (auto& participant : state.participants) {
-        if (participant.terminal_error.has_value())
-          participant.terminal_error->details["force_closed"] = "cell_force_closed_by_operator";
-        else
-          participant.terminal_error = ErrorDTO{
-              "cell_force_closed_by_operator",
-              "Force close moved this operation into history; its effect is unknown", {}};
-      }
-      state.updated_at_ns = clock_.now();
-      stamp_operation_capture_locked(*operation, state);
-      settled.push_back(state);
-      static_cast<void>(retire_operation_ownership_locked(id, true, true, true));
-    }
-    // An unresolved closure (U6) belongs to an operation that no longer exists.
-    const auto is_closed = [&](const auto& row) {
-      return std::find(closed.begin(), closed.end(), row.operation_id) != closed.end();
-    };
-    const bool unresolved_closure =
-        std::any_of(operation_recovery_replay_ledger_.begin(), operation_recovery_replay_ledger_.end(),
-                    [&](const auto& row) { return row.outcome_unresolved && is_closed(row); });
-    std::erase_if(operation_recovery_replay_ledger_, is_closed);
-    result.released_orphan_resources = resource_slots_->force_release(closed);
-    // An operation an earlier restart left orphaned on a freed slot is settled
-    // too (journaled below), so a later start does not fence that slot again.
-    auto freed = result.released_orphan_resources;
-    std::sort(freed.begin(), freed.end());
-    for (auto& history : historical_operations_) {
-      const bool orphaned = std::any_of(
-          history.participants.begin(), history.participants.end(), [&](const auto& participant) {
-            return participant.terminal_error.has_value() &&
-                   participant.terminal_error->code == "execution_host_replaced" &&
-                   std::any_of(participant.resources.begin(), participant.resources.end(),
-                               [&](const auto& resource) {
-                                 return std::binary_search(freed.begin(), freed.end(), resource);
-                               });
-          });
-      if (!orphaned) continue;
-      for (auto& participant : history.participants)
-        if (participant.terminal_error.has_value())
-          participant.terminal_error->details["force_closed"] = "cell_force_closed_by_operator";
-      history.updated_at_ns = clock_.now();
-      if (history.journal_capture_order != 0U) ++history.journal_capture_order;
-      settled.push_back(history);
-    }
-    // Every orphan slot is free now: the reconcile_orphaned_resources rule.
-    if (motion_admission_unreconciled_) {
-      motion_admission_unreconciled_ = false;
-      result.motion_block_cleared = !motion_admission_closed_;
-    }
-    // FIX1 (maintainer): the cell-wide motion block that unresolved closure
-    // left ends with its operation, by the same rule as a Stop-fault clear.
-    if (unresolved_closure && motion_admission_closed_) {
-      motion_admission_closed_ =
-          restart_required_fault_locked() || manager_liveness_motion_inhibited_ ||
-          is_active_stop_fault_latch(active_stop_fault_latch_) ||
-          std::any_of(incident_containments_.begin(), incident_containments_.end(),
-                      [](const auto& row) { return !row.receipt.has_value(); });
-      result.motion_block_cleared = !motion_admission_closed_;
-    }
-  }
-  // Item 25: the settled states are journaled, so a restart finds these
-  // operations in history and fences none of their resources. A failed write
-  // is the ordinary journal write fault; the operations stay history here.
-  for (const auto& state : settled) {
-    const auto written = attempt_journal_write([&] {
-      return journal_.RecordOperationState(config_.request_owner_epoch, state, nullptr,
-                                           "cell_force_closed_by_operator");
-    });
-    if (!written.ok()) {
-      std::lock_guard state_lock(state_mutex_);
-      retain_operation_journal_write_fault_locked("cell_force_closed_by_operator",
-                                                  written.error(), &state, std::nullopt);
-      result.motion_block_cleared = false;
-    }
-  }
-  if (result.motion_block_cleared)
-    static_cast<void>(cell_admission_owner_->RefreshStopFaultAdmission());
-  // A manual claim whose operation is now history and whose slots are free
-  // settles through the existing exact path.
-  static_cast<void>(reconcile_manual_operation_admission_locked());
-  return Result<ForceCloseResultDTO>::Ok(std::move(result));
 }
 
 Result<KernelRecoveryActionResultDTO>
@@ -1365,7 +1159,6 @@ ResourceAddressedExecutionKernel::apply_coordinated_operation_recovery_action(
       request.expected_assessment_revision == assessment.assessment_revision &&
       request.expected_control_command_epoch == assessment.control_command_epoch &&
       request.expected_execution_id == assessment.execution_id &&
-      request.expected_latch_id == assessment.latch_id &&
       request.expected_stop_certificate_id == assessment.stop_certificate_id &&
       request.expected_stop_owner_generation == assessment.stop_owner_generation;
   // Q8a admits no multi-motion operation; supported coordinated command
@@ -1426,12 +1219,9 @@ ResourceAddressedExecutionKernel::apply_coordinated_operation_recovery_action(
           "coordinated operation recovery fence is stale or busy", "operation_recovery_stale",
           ErrorCode::kStaleGeneration);
     }
-    if (is_active_stop_fault_latch(active_stop_fault_latch_)) {
-      return Result<KernelRecoveryActionResultDTO>::Err(
-          ErrorDTO{"operation_recovery_blocked_by_stop_fault",
-                   "Program Reset is required before motion can resume",
-                   {{"reason", "active_stop_fault_requires_reset"},
-                    {"latch_id", active_stop_fault_latch_->latch_id.value()}}});
+    if (motion_producing_recovery(request.action)) {
+      if (auto refusal = cell_latch_refusal_locked())
+        return Result<KernelRecoveryActionResultDTO>::Err(std::move(*refusal));
     }
     if (motion_producing_recovery(request.action) && !operation->manual) {
       if (auto refusal = operator_alarm_attention_refusal_locked(
@@ -1506,7 +1296,6 @@ ResourceAddressedExecutionKernel::apply_coordinated_operation_recovery_action(
       operation->recovery_effect_in_flight = false;
   });
   const auto unresolved_locked = [&](std::string message) {
-    motion_admission_closed_ = true;
     KernelRecoveryActionResultDTO result{
         request.request_id, request.action, false, assessment,
         ErrorDTO{"operation_recovery_outcome_unresolved",
@@ -1603,7 +1392,6 @@ ResourceAddressedExecutionKernel::apply_coordinated_operation_recovery_action(
     participant_request.expected_assessment_revision = target.assessment.assessment_revision;
     participant_request.expected_control_command_epoch = target.assessment.control_command_epoch;
     participant_request.expected_execution_id = target.assessment.execution_id;
-    participant_request.expected_latch_id = target.assessment.latch_id;
     participant_request.expected_stop_certificate_id = target.assessment.stop_certificate_id;
     participant_request.expected_stop_owner_generation = target.assessment.stop_owner_generation;
     try {

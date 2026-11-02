@@ -416,9 +416,9 @@ TEST(RoboPlanPlannerBackendTest,
       std::invalid_argument);
 }
 
-// lite6_pick_and_place (merge 6 tool split): the planner inventory also holds
+// mock_lite6_pick_and_place (merge 6 tool split): the planner inventory also holds
 // the frames of the tool mounted on the robot, with the tool's own component
-// and model identity. Construction failed here and the native runtime exited.
+// and model identity. Construction failed here and the execution host exited.
 // B7: each frame has one, owner-stamped spelling; the moving arm's spelling of
 // the tool's frame is outside the inventory and refused before transport.
 TEST(RoboPlanPlannerBackendTest, AcceptsTheFramesOfAToolMountedOnTheMotionComponent) {

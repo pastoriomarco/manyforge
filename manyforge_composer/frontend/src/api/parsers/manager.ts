@@ -683,13 +683,6 @@ export function parseAppliedProgramStatus(value: unknown): AppliedProgramStatus 
     || executable !== (record.program_binding_id !== null)) {
     return fail(path, 'a binding exactly when executable, named references otherwise');
   }
-  if (origin.kind === 'sealed_canonical_empty' && (!noProgram
-    || origin.deploymentArtifactId !== record.deployment_artifact_id
-    || origin.deploymentRevision !== record.deployment_revision
-    || origin.retainedBundleId !== record.retained_bundle_id
-    || origin.graphRevision !== record.graph_revision)) {
-    return fail(path, 'sealed empty origin matching its exact no-Program status');
-  }
   const references = record.non_executable === null
     ? { unresolvedReferences: [], affectedNodes: [], affectedExecutionGroups: [] }
     : programUnresolvedReferencesAt(
@@ -1194,28 +1187,11 @@ export function parseManagerApplyStatus(value: unknown): ManagerApplyStatus {
 
 export function parsePreparedActivationOrigin(value: unknown, path: string): PreparedActivationOrigin {
   const row = objectAt(value, path);
-  if (row.kind === 'scenario') {
-    exactKeysAt(row, ['kind', 'scenario_id', 'source_document_digest', 'project_path'], path);
-    return { kind: 'scenario', scenarioId: stringAt(row.scenario_id, `${path}.scenario_id`),
-      sourceDocumentDigest: digestAt(row.source_document_digest, `${path}.source_document_digest`),
-      projectPath: projectPathAt(row.project_path, `${path}.project_path`) };
-  }
-  if (row.kind !== 'sealed_canonical_empty') return fail(`${path}.kind`, 'scenario or sealed_canonical_empty');
-  exactKeysAt(row, ['kind', 'cell_id', 'deployment_artifact_id', 'deployment_revision',
-    'retained_bundle_id', 'graph_revision', 'admission_digest'], path);
-  const identity = (value: unknown, name: string): string => {
-    const text = stringAt(value, `${path}.${name}`);
-    if (!text || text.normalize('NFC') !== text || new TextEncoder().encode(text).length > 128) {
-      return fail(`${path}.${name}`, 'nonempty NFC identity of at most 128 UTF-8 bytes');
-    }
-    return text;
-  };
-  return { kind: 'sealed_canonical_empty', cellId: identity(row.cell_id, 'cell_id'),
-    deploymentArtifactId: identity(row.deployment_artifact_id, 'deployment_artifact_id'),
-    deploymentRevision: digestAt(row.deployment_revision, `${path}.deployment_revision`),
-    retainedBundleId: digestAt(row.retained_bundle_id, `${path}.retained_bundle_id`),
-    graphRevision: digestAt(row.graph_revision, `${path}.graph_revision`),
-    admissionDigest: digestAt(row.admission_digest, `${path}.admission_digest`) };
+  if (row.kind !== 'scenario') return fail(`${path}.kind`, 'scenario');
+  exactKeysAt(row, ['kind', 'scenario_id', 'source_document_digest', 'project_path'], path);
+  return { kind: 'scenario', scenarioId: stringAt(row.scenario_id, `${path}.scenario_id`),
+    sourceDocumentDigest: digestAt(row.source_document_digest, `${path}.source_document_digest`),
+    projectPath: projectPathAt(row.project_path, `${path}.project_path`) };
 }
 
 export function parsePreparedActivationInput(
@@ -1260,13 +1236,6 @@ export function parsePreparedActivationInput(
     programBindingId = null;
   } else {
     return fail(`${path}.program_outcome.kind`, 'bound, non_executable, or no_program');
-  }
-  if (origin.kind === 'sealed_canonical_empty' && (outcomeKind !== 'no_program'
-    || origin.deploymentArtifactId !== record.deployment_artifact_id
-    || origin.deploymentRevision !== record.deployment_revision
-    || origin.retainedBundleId !== record.retained_bundle_id
-    || origin.graphRevision !== record.graph_revision)) {
-    return fail(path, 'sealed empty origin matching its exact no-Program candidate');
   }
   return {
     schemaVersion,

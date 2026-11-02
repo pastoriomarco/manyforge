@@ -1,5 +1,4 @@
 #include "host_io_output_channels.hpp"
-#include "xarm_digital_address.hpp"
 
 #include <algorithm>
 #include <manyforge_core/io_signal_descriptor.hpp>
@@ -26,6 +25,7 @@ struct Channel final {
   std::optional<RosBooleanOutputAddress> ros_address;
   std::vector<HostIoOutputAliasInstallation> aliases;
   core::ActiveBundlePublicationGeneration publication{0U};
+  core::Duration ack_timeout_ns{};
 };
 
 struct Occurrence final {
@@ -42,7 +42,7 @@ Reply CreateHostIoOutputChannels(
     std::span<const HostIoGpioTopicPin> captured_topics) {
   try {
     // Ephemeral selection of actual provider pins, not a second topic model.
-    // Reject conflicting captures before constructing any leaf or engine.
+    // Reject conflicting captures before constructing any leaf.
     std::map<std::string, std::shared_ptr<RosBooleanOutputProvider::GpioTopic>>
         gpio_topics;
     for (const auto &captured : captured_topics) {
@@ -98,47 +98,19 @@ Reply CreateHostIoOutputChannels(
       if (configuration.input_bit || configuration.initial_value ||
           configuration.ingress_depth != 0U)
         return invalid("host_io_output_profile_unqualified");
-      if (profile == "mock_output" && configuration.channel &&
+      const bool generic_only = configuration.adapter_fields.empty();
+      if (profile == "mock_output" && configuration.channel && generic_only &&
           !configuration.service && !configuration.topic &&
-          !configuration.pin && !configuration.group &&
-          !configuration.interface_name) {
+          !configuration.group && !configuration.interface_name) {
         address = {*configuration.channel};
       } else if (profile == "ros_set_bool" && configuration.service && node &&
-                 !configuration.channel && !configuration.topic &&
-                 !configuration.pin && !configuration.group &&
-                 !configuration.interface_name) {
+                 generic_only && !configuration.channel && !configuration.topic &&
+                 !configuration.group && !configuration.interface_name) {
         address = {*configuration.service};
         ros_address = RosSetBoolOutputAddress{*configuration.service};
-      } else if (profile == "ur_set_io" && configuration.service &&
-                 configuration.pin && *configuration.pin <= 17U && node &&
-                 !configuration.channel && !configuration.topic &&
-                 !configuration.group && !configuration.interface_name) {
-        // The typed leaf fixes FUN_SET_DIGITAL_OUT; no caller-selected
-        // function.
-        address = {*configuration.service, "set_digital_out",
-                   std::to_string(*configuration.pin)};
-        ros_address =
-            UrSetIoOutputAddress{*configuration.service,
-                                 static_cast<std::uint8_t>(*configuration.pin)};
-      } else if (profile == "xarm_digital" && configuration.robot_component_id &&
-                 configuration.bank && configuration.pin && node &&
-                 !configuration.channel && !configuration.service &&
-                 !configuration.topic && !configuration.group &&
-                 !configuration.interface_name &&
-                 ((*configuration.bank == "tool" && *configuration.pin <= 4U) ||
-                  (*configuration.bank == "controller" && *configuration.pin <= 15U))) {
-        const auto bank = *configuration.bank == "tool"
-                              ? XArmDigitalBank::kTool
-                              : XArmDigitalBank::kController;
-        const auto service = XArmDigitalServiceName(
-            configuration.robot_component_id->value(), bank, true);
-        address = {service, std::to_string(*configuration.pin)};
-        ros_address = XArmSetDigitalOutputAddress{
-            service, static_cast<std::uint8_t>(*configuration.pin), bank};
       } else if (profile == "ros2_control_gpio" && configuration.topic &&
                  configuration.group && configuration.interface_name && node &&
-                 !configuration.channel && !configuration.service &&
-                 !configuration.pin) {
+                 generic_only && !configuration.channel && !configuration.service) {
         address = {*configuration.topic, *configuration.group,
                    *configuration.interface_name};
         ros_address =
@@ -161,7 +133,8 @@ Reply CreateHostIoOutputChannels(
                             address,
                             std::move(ros_address),
                             {},
-                            alias.active_publication_generation});
+                            alias.active_publication_generation,
+                            alias.ack_timeout_ns});
       if (!first_channel && (channel->second.profile != profile ||
                              channel->second.address != address))
         return invalid("host_io_output_address_conflict");
@@ -187,9 +160,7 @@ Reply CreateHostIoOutputChannels(
           return Reply::Err(made.error());
         auto provider =
             std::shared_ptr<MockBooleanOutputProvider>(std::move(made.value()));
-        auto engine =
-            std::make_unique<core::IoOutputParticipantEngine>(*provider, clock);
-        result.emplace_back(resource, std::move(provider), std::move(engine));
+        result.emplace_back(resource, std::move(provider));
       } else {
         std::vector<RosBooleanOutputAlias> installed;
         installed.reserve(channel.aliases.size());
@@ -206,9 +177,9 @@ Reply CreateHostIoOutputChannels(
             topic = actual->second;
         }
         auto made = RosBooleanOutputProvider::Create(
-            node, clock,
+            node,
             {resource, *channel.ros_address, std::move(installed),
-             channel.publication},
+             channel.publication, channel.ack_timeout_ns},
             std::move(topic));
         if (!made.ok())
           return Reply::Err(made.error());
@@ -220,9 +191,7 @@ Reply CreateHostIoOutputChannels(
             return invalid("host_io_output_gpio_topic_unavailable");
           gpio_topics.emplace(gpio->topic, actual);
         }
-        auto engine =
-            std::make_unique<core::IoOutputParticipantEngine>(*provider, clock);
-        result.emplace_back(resource, std::move(provider), std::move(engine));
+        result.emplace_back(resource, std::move(provider));
       }
     }
     return Reply::Ok(std::move(result));

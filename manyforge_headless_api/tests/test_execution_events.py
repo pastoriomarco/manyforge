@@ -22,7 +22,6 @@ from manyforge_headless_api.models import (
     OperationIntentRequest,
     OperationRecoveryActionRequest,
     ProgramRunStopIntentRequest,
-    StopFaultRecoveryIntentRequest,
     StopIntentRequest,
 )
 from manyforge_headless_api.native import HeadlessApiError
@@ -199,60 +198,6 @@ def _stop_terminal_event(owner_epoch: str, sequence: int) -> dict[str, Any]:
     }
 
 
-def _stop_fault_clear_event(owner_epoch: str, sequence: int) -> dict[str, Any]:
-    payload = {
-        "api_version": "manyforge.stop_fault_clear_projection.v1",
-        "fault_latch": {
-            "captured_operation_count": 1,
-            "captured_resource_count": 1,
-            "cell_id": "cell.test",
-            "latch_generation": 1,
-            "latch_id": "stop-fault.1",
-            "persistence_degraded": False,
-            "reason_code": "stop_fault_recovery_cleared",
-            "recovery_assessment_revision": 2,
-            "recovery_status": "cleared",
-            "state": "cleared",
-            "stop_certificate": {
-                "stop_certificate_id": "stop-certificate.1",
-                "stop_certificate_revision": 1,
-                "stop_generation": 1,
-                "stop_id": "stop.1",
-            },
-            "stop_generation": 1,
-            "stop_id": "stop.1",
-            "trigger": "escalated",
-        },
-        "owner_epoch": owner_epoch,
-        "record_kind": "stop_fault_cleared",
-        "request_id": "stop-fault-reset.1",
-        "result": {
-            "accepted": True,
-            "error": None,
-            "replay_status": "accepted_new",
-            "request_id": "stop-fault-reset.1",
-        },
-        "stop_certificate_id": "stop-certificate.1",
-        "stop_certificate_revision": 1,
-        "stop_generation": 1,
-        "stop_id": "stop.1",
-    }
-    canonical = rfc8785.dumps(payload)
-    return {
-        "effect_pending": False,
-        "occurred_at_ns": 100 + sequence,
-        "occurred_at_wall": f"2026-08-07T10:00:01.00000000{sequence}Z",
-        "operation_id": None,
-        "operation_revision": None,
-        "owner_epoch": owner_epoch,
-        "payload": payload,
-        "payload_digest": f"sha256:{hashlib.sha256(canonical).hexdigest()}",
-        "record_kind": "stop_fault_cleared",
-        "request_id": "stop-fault-reset.1",
-        "sequence": sequence,
-    }
-
-
 def _page(owner_epoch: str, events: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "operation_progress": [],
@@ -413,26 +358,6 @@ def test_execution_client_accepts_stop_terminal_as_stop_scoped_fact(
     assert page["events"][0]["operation_id"] is None
 
     terminal["request_id"] = "stop-request.1"
-    with pytest.raises(HeadlessApiError) as invalid_request_identity:
-        client.events(owner_epoch, 0)
-    assert invalid_request_identity.value.code == ("execution_command_response_invalid")
-
-
-def test_execution_client_accepts_stop_fault_clear_as_request_scoped_fact(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    client = ExecutionCommandClient(tmp_path)
-    owner_epoch = "execution-host.epoch.stop"
-    cleared = _stop_fault_clear_event(owner_epoch, 1)
-    monkeypatch.setattr(
-        client, "_exchange", lambda _command: _page(owner_epoch, [cleared])
-    )
-    page = client.events(owner_epoch, 0)
-    assert page["events"][0]["record_kind"] == "stop_fault_cleared"
-    assert page["events"][0]["request_id"] == "stop-fault-reset.1"
-    assert page["events"][0]["operation_id"] is None
-
-    cleared["request_id"] = None
     with pytest.raises(HeadlessApiError) as invalid_request_identity:
         client.events(owner_epoch, 0)
     assert invalid_request_identity.value.code == ("execution_command_response_invalid")
@@ -626,7 +551,7 @@ def test_execution_client_releases_one_exact_internal_program_run_fence(
     assert unavailable_publicly.value.code == ("execution_request_attribution_invalid")
 
 
-def test_execution_client_projects_scoped_full_and_fault_recovery_commands(
+def test_execution_client_projects_scoped_and_full_stop_commands(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     client = ExecutionCommandClient(tmp_path)
@@ -699,159 +624,6 @@ def test_execution_client_projects_scoped_full_and_fault_recovery_commands(
     assert control_commands[0]["request"]["request_context"] == context
     assert control_commands[2]["command"] == "malformed_stop"
 
-    latch = {
-        "captured_operation_ids": ["operation.1"],
-        "captured_resources": ["joint.1"],
-        "cell_id": "cell.1",
-        "clear_projection": {
-            "error": None,
-            "retry_generation": None,
-            "state": "not_applicable",
-        },
-        "evidence_refs": [],
-        "graph_revision": "sha256:" + "2" * 64,
-        "latch_generation": 1,
-        "latch_id": "stop-fault.1",
-        "observed_triggers": ["scope_promotion"],
-        "persistence_degraded": False,
-        "reason_code": "stop_fault_recovery_ready",
-        "recovery_assessment_revision": 2,
-        "recovery_status": "ready",
-        "retained_bundle_id": "sha256:" + "3" * 64,
-        "state": "latched",
-        "stop_certificate": {
-            "stop_certificate_id": "stop-certificate.1",
-            "stop_certificate_revision": 1,
-            "stop_generation": 1,
-            "stop_id": "stop.1",
-        },
-        "stop_generation": 1,
-        "stop_id": "stop.1",
-        "terminal_projection": {
-            "error": None,
-            "retry_generation": None,
-            "state": "recorded",
-        },
-        "trigger": "scope_promotion",
-    }
-    expectation = {
-        "active_control_configuration_generation": 4,
-        "active_control_configuration_id": "configuration.1",
-        "control_domain_id": "domain.1",
-    }
-    normal_commands: list[dict[str, Any]] = []
-
-    def exchange(command: dict[str, Any]) -> dict[str, Any]:
-        normal_commands.append(command)
-        if command["command"] == "get_stop_fault":
-            return {
-                "api_version": "manyforge.execution_command_response.v1",
-                "command": "get_stop_fault",
-                "ok": True,
-                "stop_fault": {
-                    "configuration_expectations": [expectation],
-                    "latch": latch,
-                    "recovery_unavailable_reason": None,
-                },
-            }
-        return {
-            "api_version": "manyforge.execution_command_response.v1",
-            "command": "recover_stop_fault",
-            "ok": True,
-            "result": {
-                "accepted": True,
-                "error": None,
-                "latch": {**latch, "state": "cleared"},
-                "replay_status": "accepted_new",
-                "request_id": "request.recover.1",
-            },
-        }
-
-    def ordinary_exchange(command: dict[str, Any]) -> dict[str, Any]:
-        assert command["command"] != "get_stop_fault"
-        return exchange(command)
-
-    def control_exchange(command: dict[str, Any]) -> dict[str, Any]:
-        assert command["command"] == "get_stop_fault"
-        return exchange(command)
-
-    # The Stop-fault read is served on the control socket; recovery is not.
-    monkeypatch.setattr(client, "_exchange", ordinary_exchange)
-    monkeypatch.setattr(client, "_exchange_control", control_exchange)
-    offer = client.stop_fault()["stop_fault"]
-    recovery = StopFaultRecoveryIntentRequest.model_validate(
-        {
-            "request_context": {
-                **context,
-                "request_id": "request.recover.1",
-            },
-            "expected_latch_id": latch["latch_id"],
-            "expected_latch_generation": latch["latch_generation"],
-            "expected_recovery_assessment_revision": latch[
-                "recovery_assessment_revision"
-            ],
-            "expected_stop_certificate_id": latch["stop_certificate"][
-                "stop_certificate_id"
-            ],
-            "expected_stop_certificate_revision": latch["stop_certificate"][
-                "stop_certificate_revision"
-            ],
-            "expected_cell_id": latch["cell_id"],
-            "expected_retained_bundle_id": latch["retained_bundle_id"],
-            "expected_graph_revision": latch["graph_revision"],
-            "configuration_expectations": offer["configuration_expectations"],
-            "reason": "operator confirmed non-moving clear",
-        }
-    )
-    assert client.recover_stop_fault(recovery)["result"]["accepted"] is True
-    assert [command["command"] for command in normal_commands] == [
-        "get_stop_fault",
-        "recover_stop_fault",
-    ]
-    assert normal_commands[1]["request"]["request_context"]["correlation_id"] is None
-
-    # The same response can publish a fault before containment is settled,
-    # but cannot advertise recovery readiness or fabricated configuration.
-    pending = copy.deepcopy(offer)
-    pending["configuration_expectations"] = []
-    pending["latch"].update(
-        stop_certificate=None,
-        recovery_status="waiting_for_observation",
-        terminal_projection={
-            "error": None,
-            "retry_generation": None,
-            "state": "pending",
-        },
-    )
-    assert client._valid_stop_fault_offer(pending)
-    for key, value in (("recovery_status", "ready"), ("state", "recovery_pending")):
-        invalid = copy.deepcopy(pending)
-        invalid["latch"][key] = value
-        assert not client._valid_stop_fault_offer(invalid)
-    invalid = copy.deepcopy(pending)
-    invalid["configuration_expectations"] = [expectation]
-    assert not client._valid_stop_fault_offer(invalid)
-    invalid = copy.deepcopy(offer)
-    invalid["latch"]["stop_certificate"]["stop_id"] = "wrong-stop"
-    assert not client._valid_stop_fault_offer(invalid)
-
-    # A certified latch names why recovery is unavailable instead of carrying
-    # an empty proof; a proof and a reason never appear together.
-    unavailable = copy.deepcopy(offer)
-    unavailable["configuration_expectations"] = []
-    unavailable["recovery_unavailable_reason"] = (
-        "stop_fault_recovery_installed_configuration_unavailable"
-    )
-    assert client._valid_stop_fault_offer(unavailable)
-    invalid = copy.deepcopy(unavailable)
-    invalid["recovery_unavailable_reason"] = None
-    assert not client._valid_stop_fault_offer(invalid)
-    invalid = copy.deepcopy(offer)
-    invalid["recovery_unavailable_reason"] = "stop_fault_recovery_installed_configuration_unavailable"
-    assert not client._valid_stop_fault_offer(invalid)
-    invalid = copy.deepcopy(offer)
-    del invalid["recovery_unavailable_reason"]
-    assert not client._valid_stop_fault_offer(invalid)
 
 
 def _direct_motion_request() -> OperationIntentRequest:
@@ -896,7 +668,6 @@ def _direct_motion_request() -> OperationIntentRequest:
                             "execution_timeout_s": 10.0,
                         },
                         "cache_mode": "default",
-                        "planning_profile": "balanced",
                         "target_mode": "absolute",
                         "target_reference": None,
                         "offset_reference": None,
@@ -1344,8 +1115,6 @@ class _PagedExecution:
         self.admission_generation = 1
         self.fail = False
         self.event = _event(self.owner_epoch, 1)
-        self.stop_fault_offer: dict[str, Any] | None = None
-        self.stop_fault_calls = 0
         self.progress: list[dict[str, Any]] = []
 
     def identity(self) -> dict[str, Any]:
@@ -1378,15 +1147,6 @@ class _PagedExecution:
             "next_after_sequence": after_sequence or 1,
             "owner_epoch": owner_epoch,
             "schema_version": "manyforge.execution_event_page.v1",
-        }
-
-    def stop_fault(self) -> dict[str, Any]:
-        self.stop_fault_calls += 1
-        return {
-            "api_version": "manyforge.execution_command_response.v1",
-            "command": "get_stop_fault",
-            "ok": True,
-            "stop_fault": self.stop_fault_offer,
         }
 
 
@@ -1427,52 +1187,6 @@ class _StreamingExecution(_PagedExecution):
         }
 
 
-def _stop_fault_response(stop_fault: Any) -> dict[str, Any]:
-    return {
-        "api_version": "manyforge.execution_command_response.v1",
-        "command": "get_stop_fault",
-        "ok": True,
-        "stop_fault": stop_fault,
-    }
-
-
-def _active_stop_fault_offer() -> dict[str, Any]:
-    return {
-        "recovery_unavailable_reason": None,
-        "configuration_expectations": [],
-        "latch": {
-            "captured_operation_ids": [],
-            "captured_resources": [],
-            "cell_id": "cell.test",
-            "clear_projection": {
-                "error": None,
-                "retry_generation": None,
-                "state": "not_applicable",
-            },
-            "evidence_refs": [],
-            "graph_revision": "sha256:" + "2" * 64,
-            "latch_generation": 1,
-            "latch_id": "stop-fault.test.idle",
-            "observed_triggers": ["physical_rest_unproven"],
-            "persistence_degraded": False,
-            "reason_code": "stop_fault_latched",
-            "recovery_assessment_revision": 1,
-            "recovery_status": "waiting_for_observation",
-            "retained_bundle_id": "sha256:" + "3" * 64,
-            "state": "latched",
-            "stop_certificate": None,
-            "stop_generation": 1,
-            "stop_id": "stop.test.idle",
-            "terminal_projection": {
-                "error": None,
-                "retry_generation": None,
-                "state": "pending",
-            },
-            "trigger": "physical_rest_unproven",
-        },
-    }
-
-
 class _IdleExecution:
     def subscribe_events(self, after_cursor: int, owner_epoch: str | None):
         # The pump reads the subscription only (contract §8.1).
@@ -1482,15 +1196,12 @@ class _IdleExecution:
         self,
         *,
         include_epoch: bool = True,
-        stop_fault_response: dict[str, Any] | None = None,
     ) -> None:
         self.owner_epoch = "kernel-owner.runtime-epoch"
         self.admission_generation = 1
         self.include_epoch = include_epoch
         self.status_calls = 0
         self.events_calls = 0
-        self.stop_fault_calls = 0
-        self.stop_fault_response = stop_fault_response
 
     def identity(self) -> dict[str, Any]:
         self.status_calls += 1
@@ -1522,12 +1233,6 @@ class _IdleExecution:
             "events": [], "has_more": False, "next_after_sequence": _after_sequence,
             "operation_progress": [], "admission_generation": self.admission_generation,
         }
-
-    def stop_fault(self) -> dict[str, Any]:
-        self.stop_fault_calls += 1
-        if self.stop_fault_response is not None:
-            return self.stop_fault_response
-        return _stop_fault_response(None)
 
 
 class _RetiringExecution(_PagedExecution):
@@ -1609,6 +1314,90 @@ def test_event_pump_wakes_cold_state_when_kernel_admission_advances() -> None:
     assert core.ingested == []
     assert len(wakes) == baseline + 1
 
+
+
+def test_event_pump_wakes_cold_state_when_component_states_change() -> None:
+    # CONTRACTS §1: the host publishes a component state change as a stream
+    # `state` message without any journal row; it must reach `/ws/control`.
+    class _ComponentExecution(_StreamingExecution):
+        component_states: list[dict[str, Any]] = [
+            {"component_id": "gripper", "lifecycle": "enabled"}
+        ]
+
+        def events(self, owner_epoch: str, after_sequence: int, *, limit: int = 16):
+            return {
+                **super().events(owner_epoch, after_sequence, limit=limit),
+                "component_states": self.component_states,
+            }
+
+    core = _RecordingCore()
+    execution = _ComponentExecution()
+    changed = threading.Event()
+    wakes: list[None] = []
+    pump = ExecutionEventPump(  # type: ignore[arg-type]
+        core, execution, poll_seconds=0.01, page_limit=1
+    )
+
+    def observe() -> None:
+        wakes.append(None)
+        changed.set()
+
+    pump.set_change_observer(observe)
+    pump.start()
+    assert changed.wait(timeout=1.0)
+    changed.clear()
+    baseline = len(wakes)
+
+    execution.component_states = [{"component_id": "gripper", "lifecycle": "prepared"}]
+    assert changed.wait(timeout=1.0)
+    pump.shutdown()
+
+    assert core.ingested == []
+    assert len(wakes) == baseline + 1
+
+
+def test_event_pump_wakes_cold_state_on_a_signal_value_not_its_age() -> None:
+    # CONTRACTS §7: I/O changes are pushed on `/ws/control`; the age that
+    # changes on every read wakes nothing.
+    class _SignalExecution(_StreamingExecution):
+        samples: list[dict[str, Any]] = [{"signal_id": "io/di0", "value": False,
+                                          "source": "device", "age_ns": 1, "fresh": True}]
+
+        def events(self, owner_epoch: str, after_sequence: int, *, limit: int = 16):
+            return {
+                **super().events(owner_epoch, after_sequence, limit=limit),
+                "signal_samples": [dict(sample) for sample in self.samples],
+            }
+
+    core = _RecordingCore()
+    execution = _SignalExecution()
+    changed = threading.Event()
+    wakes: list[None] = []
+    pump = ExecutionEventPump(  # type: ignore[arg-type]
+        core, execution, poll_seconds=0.01, page_limit=1
+    )
+
+    def observe() -> None:
+        wakes.append(None)
+        changed.set()
+
+    pump.set_change_observer(observe)
+    pump.start()
+    assert changed.wait(timeout=1.0)
+    changed.clear()
+    baseline = len(wakes)
+
+    execution.samples = [{**execution.samples[0], "age_ns": 5}]
+    assert not changed.wait(timeout=0.1)
+    execution.samples = [{**execution.samples[0], "value": True}]
+    assert changed.wait(timeout=1.0)
+    changed.clear()
+    execution.samples = [{**execution.samples[0], "fresh": False}]
+    assert changed.wait(timeout=1.0)
+    pump.shutdown()
+
+    assert core.ingested == []
+    assert len(wakes) == baseline + 2
 
 
 def test_event_pump_wakes_cold_state_for_active_tcp_change() -> None:
@@ -1746,46 +1535,40 @@ def test_progress_is_latest_only_bounded_and_quiet_when_unchanged() -> None:
     assert samples[-1] == []
 
 
-def test_event_pump_operation_semantic_cache_has_the_native_resident_bound(
+def test_event_pump_operation_semantic_cache_evicts_at_the_native_resident_bound(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # R3: the change-detection memo is bounded by eviction, never refusal.
     monkeypatch.setattr(
         "manyforge_headless_api.execution.MAXIMUM_RESIDENT_OPERATION_CONTROL_KEYS",
         1,
     )
     core = _RecordingCore()
     execution = _StreamingExecution()
-    execution.append(
-        _progress_event(
-            execution.owner_epoch,
-            1,
-            state="executing",
-            progress=0.1,
-            operation_id="operation.1",
+    for sequence in (1, 2, 3):
+        execution.append(
+            _progress_event(
+                execution.owner_epoch,
+                sequence,
+                state="executing",
+                progress=0.1,
+                operation_id=f"operation.{sequence}",
+            )
         )
-    )
-    execution.append(
-        _progress_event(
-            execution.owner_epoch,
-            2,
-            state="executing",
-            progress=0.1,
-            operation_id="operation.2",
-        )
-    )
     pump = ExecutionEventPump(  # type: ignore[arg-type]
         core, execution, poll_seconds=0.01, page_limit=1
     )
     pump.start()
-    for _ in range(100):
-        if pump.last_error is not None:
+    for _ in range(200):
+        if pump.last_error is not None or any(
+            call.get("through_source_sequence") == 3 for call in core.completed_calls
+        ):
             break
         threading.Event().wait(0.01)
     pump.shutdown()
 
-    assert pump.last_error is not None
-    assert "execution_control_projection_capacity_invalid" in pump.last_error
-
+    assert pump.last_error is None
+    assert any(call.get("through_source_sequence") == 3 for call in core.completed_calls)
 
 def test_event_pump_reconciles_typed_idle_owner_through_stable_events() -> None:
     core = _RecordingCore()
@@ -1811,85 +1594,9 @@ def test_event_pump_reconciles_typed_idle_owner_through_stable_events() -> None:
     assert len(core.completed_calls) >= 4
     assert wakes == [None]
     assert core.completed_calls[0] == {
-        "current_stop_fault_json": "null",
         "source_owner_epoch": execution.owner_epoch,
         "through_source_sequence": 0,
     }
-
-
-def test_event_pump_completes_idle_snapshot_with_active_stop_fault_offer() -> None:
-    core = _RecordingCore()
-    offer = _active_stop_fault_offer()
-    assert ExecutionCommandClient._valid_stop_fault_offer(offer)
-    execution = _IdleExecution(
-        stop_fault_response=_stop_fault_response(offer)
-    )
-    pump = ExecutionEventPump(  # type: ignore[arg-type]
-        core, execution, poll_seconds=0.01, page_limit=1
-    )
-    pump.start()
-    assert core.completed.wait(timeout=1.0)
-    pump.shutdown()
-
-    assert pump.last_error is None
-    assert execution.events_calls >= 1
-    assert execution.stop_fault_calls >= 1
-    assert core.completed_calls[0] == {
-        "current_stop_fault_json": rfc8785.dumps(offer["latch"]).decode("utf-8"),
-        "source_owner_epoch": execution.owner_epoch,
-        "through_source_sequence": 0,
-    }
-
-
-@pytest.mark.parametrize(
-    ("stop_fault_response", "expected_error"),
-    [
-        (
-            {
-                "api_version": "manyforge.execution_command_response.v1",
-                "error": {
-                    "code": "execution_command_unavailable",
-                    "details": {},
-                    "message": "the stop-fault snapshot is temporarily unavailable",
-                },
-                "ok": False,
-            },
-            "execution_command_unavailable",
-        ),
-        (
-            {
-                "api_version": "manyforge.execution_command_response.v1",
-                "command": "get_stop_fault",
-                "ok": False,
-            },
-            "execution_command_response_invalid",
-        ),
-    ],
-    ids=["unavailable", "malformed_error_envelope"],
-)
-def test_event_pump_keeps_idle_source_open_when_stop_fault_read_fails(
-    stop_fault_response: dict[str, Any],
-    expected_error: str,
-) -> None:
-    core = _RecordingCore()
-    execution = _IdleExecution(stop_fault_response=stop_fault_response)
-    pump = ExecutionEventPump(  # type: ignore[arg-type]
-        core, execution, poll_seconds=0.01, page_limit=1
-    )
-    pump.start()
-    deadline = threading.Event()
-    for _ in range(100):
-        if pump.last_error is not None:
-            break
-        deadline.wait(0.01)
-    pump.shutdown()
-
-    assert pump.last_error is not None
-    assert expected_error in pump.last_error
-    assert execution.events_calls >= 1
-    assert execution.stop_fault_calls >= 1
-    assert core.completed_calls == []
-    assert not core.completed.is_set()
 
 
 def test_event_pump_wakes_cold_state_when_idle_kernel_admission_advances() -> None:
@@ -1941,33 +1648,6 @@ def test_event_pump_reconciles_idle_after_owner_retirement_at_event_high_water()
         "source_owner_epoch": execution.owner_epoch,
         "through_source_sequence": 1,
     }
-
-
-def test_event_pump_supplies_fresh_current_stop_fault_condition() -> None:
-    core = _RecordingCore()
-    execution = _PagedExecution()
-    latch = {"cell_id": "cell.test", "latch_id": "stop-fault.test.1"}
-    execution.stop_fault_offer = {
-        "configuration_expectations": [],
-        "latch": latch,
-        "recovery_unavailable_reason": None,
-    }
-    pump = ExecutionEventPump(  # type: ignore[arg-type]
-        core,
-        execution,
-        poll_seconds=0.01,
-        condition_poll_seconds=0.05,
-        page_limit=1,
-    )
-    pump.start()
-    assert core.completed.wait(timeout=1.0)
-    pump.shutdown()
-
-    assert pump.last_error is None
-    assert execution.stop_fault_calls >= 1
-    assert core.completed_calls[0]["current_stop_fault_json"] == (
-        rfc8785.dumps(latch).decode("utf-8")
-    )
 
 
 def test_event_pump_rejects_untyped_idle_owner_response() -> None:
@@ -2090,623 +1770,6 @@ def test_event_pump_keeps_alarm_sources_current_on_every_iteration() -> None:
         threading.Event().wait(0.01)
     pump.shutdown()
     assert core.alarm_refreshes >= refreshes + 3
-
-
-class _ComponentConditionCore(_RecordingCore):
-    def __init__(self, component_ids: list[str]) -> None:
-        super().__init__()
-        self.component_ids = component_ids
-        self.source_registered = False
-        self.configuration: tuple[str, str] | None = ("bundle.1", "graph.1")
-        self.observed: list[dict[str, Any]] = []
-        self.observed_empty: list[dict[str, Any]] = []
-        self.empty_status = "observed"
-        self.observe_status: str | None = None
-        self.marked_unknown = 0
-        self.observation_pending = False
-
-    def component_lifecycle_condition_scope(self) -> dict[str, Any]:
-        bundle, graph = self.configuration or (None, None)
-        return {
-            "component_ids": list(self.component_ids),
-            "graph_revision": graph,
-            "retained_bundle_id": bundle,
-            "source_registered": self.source_registered,
-        }
-
-    def refresh_alarm_sources(self) -> dict[str, Any]:
-        self.alarm_refreshes += 1
-        return {
-            "component_lifecycle_observation_pending": self.observation_pending,
-            "refreshed": True,
-        }
-
-    def observe_component_lifecycle_conditions(self, **kwargs: Any) -> dict[str, Any]:
-        self.observed.append(kwargs)
-        if self.observe_status is not None:
-            return {"status": self.observe_status}
-        # Like the core: an unread component leaves quality unknown.
-        if kwargs.get("unavailable_component_ids"):
-            return {"status": "incomplete"}
-        self.observation_pending = False
-        return {"status": "observed"}
-
-    def observe_empty_component_lifecycle_configuration(
-        self, **kwargs: Any
-    ) -> dict[str, Any]:
-        self.observed_empty.append(kwargs)
-        return {"status": self.empty_status}
-
-    def mark_component_lifecycle_source_unknown(self) -> dict[str, Any]:
-        self.marked_unknown += 1
-        return {"status": "marked_unknown"}
-
-
-def _component_snapshot(component_id: str, cause: str) -> dict[str, Any]:
-    return {
-        "active_public_pointer_digest": "sha256:" + "a" * 64,
-        "component_lifecycle_generation": 3,
-        "component_lifecycle_state": "active",
-        "controllable_component_id": component_id,
-        "domains": [
-            {
-                "control_domain_id": "domain.arm",
-                "kind": "controller",
-                "resources": ["resource.arm"],
-                "topology_revision": "topology.rev",
-            }
-        ],
-        "graph_revision": "graph.1",
-        "lifecycle_progress": {
-            "blocking_cause_class": cause,
-            "blocking_reason": None,
-            "delayed": True,
-            "incident": None,
-            "next_intent": None,
-            "phase": "satisfied",
-            "waiting_since_ns": 1_759_900_000_000,
-        },
-        "lifecycle_target": {
-            "origin": "startup",
-            "requested_state": "active",
-            "target_generation": 1,
-        },
-        "provider_occurrences": [],
-        "retained_bundle_id": "bundle.1",
-        "snapshot_digest": "sha256:" + "b" * 64,
-    }
-
-
-class _FakeCCLC:
-    def __init__(self) -> None:
-        self.epochs = ["cclc.epoch.1"]
-        self.snapshots: dict[str, Any] = {}
-        self.calls: list[str] = []
-
-    def owner_identity(self) -> dict[str, Any]:
-        self.calls.append("owner_identity")
-        epoch = self.epochs[0] if len(self.epochs) == 1 else self.epochs.pop(0)
-        if isinstance(epoch, Exception):
-            raise epoch
-        return {"request_owner_epoch": epoch}
-
-    def component_snapshot(self, component_id: str) -> dict[str, Any]:
-        self.calls.append(component_id)
-        value = self.snapshots[component_id]
-        if isinstance(value, Exception):
-            raise value
-        return value
-
-
-def _condition_pump(
-    core: _ComponentConditionCore, cclc: _FakeCCLC | None
-) -> ExecutionEventPump:
-    return ExecutionEventPump(  # type: ignore[arg-type]
-        core, _PagedExecution(), cclc=cclc, component_condition_poll_seconds=5.0
-    )
-
-
-def test_component_conditions_forward_only_condition_facts_at_a_bounded_cadence() -> None:
-    core = _ComponentConditionCore(["arm", "gripper"])
-    cclc = _FakeCCLC()
-    cclc.snapshots = {
-        "arm": _component_snapshot("arm", "emergency_stop"),
-        "gripper": HeadlessApiError("component_lifecycle_snapshot_unavailable", "no row"),
-    }
-    pump = _condition_pump(core, cclc)
-    pump._observe_component_lifecycle_conditions()  # noqa: SLF001
-    assert len(core.observed) == 1
-    observed = core.observed[0]
-    assert observed["cclc_owner_epoch"] == "cclc.epoch.1"
-    assert observed["unavailable_component_ids"] == ["gripper"]
-    snapshots = rfc8785.dumps(
-        [
-            {
-                "component_lifecycle_state": "active",
-                "controllable_component_id": "arm",
-                "domains": [
-                    {
-                        "control_domain_id": "domain.arm",
-                        "resources": ["resource.arm"],
-                    }
-                ],
-                "graph_revision": "graph.1",
-                "lifecycle_progress": {
-                    "blocking_cause_class": "emergency_stop",
-                    "blocking_reason": None,
-                    "incident": None,
-                    "phase": "satisfied",
-                },
-                "lifecycle_target": {
-                    "origin": "startup",
-                    "requested_state": "active",
-                    "target_generation": 1,
-                },
-                "retained_bundle_id": "bundle.1",
-            }
-        ]
-    ).decode("utf-8")
-    # Wait timing is presentation only and never crosses the boundary.
-    assert observed["snapshots_json"] == snapshots
-    # Within the period nothing is read again.
-    pump._observe_component_lifecycle_conditions()  # noqa: SLF001
-    assert len(core.observed) == 1
-    assert cclc.calls == ["owner_identity", "arm", "gripper", "owner_identity"]
-
-
-def test_a_provider_domain_component_completes_the_lifecycle_observation() -> None:
-    # A model-free I/O provider domain carries the same common `resources`
-    # (its sealed logical outputs). Its component is read like a controller
-    # one, so the observation is complete rather than permanently
-    # `incomplete` (which left the runtime_health alarm domain unreconciled
-    # and closed admission).
-    core = _ComponentConditionCore(["arm", "station_io"])
-    cclc = _FakeCCLC()
-    provider = _component_snapshot("station_io", "none")
-    provider["domains"] = [
-        {
-            "active_control_configuration": None,
-            "control_domain_id": "domain.io",
-            "control_domain_revision": "rev.io",
-            "kind": "io_provider",
-            "provider": {},
-            "provider_runtime_epoch": "epoch.io",
-            "resources": ["resource.do0"],
-        }
-    ]
-    cclc.snapshots = {
-        "arm": _component_snapshot("arm", "none"),
-        "station_io": provider,
-    }
-    _condition_pump(core, cclc)._observe_component_lifecycle_conditions()  # noqa: SLF001
-    assert len(core.observed) == 1
-    observed = core.observed[0]
-    assert observed["unavailable_component_ids"] == []
-    rows = json.loads(observed["snapshots_json"])
-    assert [row["domains"] for row in rows] == [
-        [{"control_domain_id": "domain.arm", "resources": ["resource.arm"]}],
-        [{"control_domain_id": "domain.io", "resources": ["resource.do0"]}],
-    ]
-    assert core.observation_pending is False
-
-
-def test_component_conditions_need_no_cclc_without_components() -> None:
-    core = _ComponentConditionCore([])
-    cclc = _FakeCCLC()
-    _condition_pump(core, cclc)._observe_component_lifecycle_conditions()  # noqa: SLF001
-    _condition_pump(core, None)._observe_component_lifecycle_conditions()  # noqa: SLF001
-    assert cclc.calls == []
-    assert core.observed == []
-    assert core.observed_empty == []
-    assert core.marked_unknown == 0
-
-
-def test_component_conditions_reconcile_a_scope_that_became_empty(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Regression: an Apply to a configuration without controlled components
-    # removes the CCLC service. Observing the empty scope through CCLC found
-    # the owner unavailable and marked the source unknown, so the removed
-    # components' conditions stayed active. The empty configuration is now
-    # observed by the core alone, fenced to its identity, without CCLC.
-    clock = [100.0]
-    monkeypatch.setattr(
-        "manyforge_headless_api.execution.time.monotonic", lambda: clock[0]
-    )
-    core = _ComponentConditionCore(["arm"])
-    cclc = _FakeCCLC()
-    cclc.snapshots = {"arm": _component_snapshot("arm", "emergency_stop")}
-    pump = _condition_pump(core, cclc)
-    pump._observe_component_lifecycle_conditions()  # noqa: SLF001
-    assert len(core.observed) == 1
-    core.source_registered = True
-
-    # Apply to the empty configuration: the CCLC owner is gone.
-    core.component_ids = []
-    core.configuration = ("bundle.empty", "graph.empty")
-    cclc.epochs = [HeadlessApiError("cclc_owner_unavailable", "socket absent")]
-    calls = list(cclc.calls)
-    clock[0] += 5.0
-    pump._observe_component_lifecycle_conditions()  # noqa: SLF001
-    assert core.observed_empty == [
-        {"graph_revision": "graph.empty", "retained_bundle_id": "bundle.empty"}
-    ]
-    assert len(core.observed) == 1
-    assert core.marked_unknown == 0
-    assert cclc.calls == calls
-    assert not pump._component_conditions_failing  # noqa: SLF001
-    # An accepted observation waits the full period.
-    clock[0] += 0.2
-    pump._observe_component_lifecycle_conditions()  # noqa: SLF001
-    assert len(core.observed_empty) == 1
-
-    # A configuration changed under the read (or no fresh publication)
-    # completed nothing: the read repeats at the pump cadence.
-    core.empty_status = "scope_changed"
-    clock[0] += 5.0
-    pump._observe_component_lifecycle_conditions()  # noqa: SLF001
-    core.empty_status = "configuration_unavailable"
-    clock[0] += 0.11
-    pump._observe_component_lifecycle_conditions()  # noqa: SLF001
-    assert len(core.observed_empty) == 3
-    assert core.marked_unknown == 0
-    assert cclc.calls == calls
-
-
-def test_registered_source_with_components_and_unreachable_cclc_stays_unknown() -> None:
-    # Only an empty configuration is observed without CCLC: with components in
-    # scope an unreachable owner keeps the conditions at unknown quality.
-    core = _ComponentConditionCore(["arm"])
-    core.source_registered = True
-    cclc = _FakeCCLC()
-    cclc.epochs = [HeadlessApiError("cclc_owner_unavailable", "socket absent")]
-    _condition_pump(core, cclc)._observe_component_lifecycle_conditions()  # noqa: SLF001
-    assert core.marked_unknown == 1
-    assert core.observed == []
-    assert core.observed_empty == []
-
-
-def test_component_condition_scope_without_registration_flag_is_refused() -> None:
-    core = _ComponentConditionCore([])
-    core.component_lifecycle_condition_scope = (  # type: ignore[method-assign]
-        lambda: {"component_ids": []}
-    )
-    cclc = _FakeCCLC()
-    pump = _condition_pump(core, cclc)
-    pump._observe_component_lifecycle_conditions()  # noqa: SLF001
-    assert pump._component_conditions_failing  # noqa: SLF001
-    assert cclc.calls == []
-    assert core.observed == []
-    assert core.marked_unknown == 0
-
-
-def test_unreachable_cclc_keeps_component_conditions_at_unknown_quality() -> None:
-    core = _ComponentConditionCore(["arm"])
-    cclc = _FakeCCLC()
-    cclc.epochs = [HeadlessApiError("cclc_owner_unavailable", "socket absent")]
-    _condition_pump(core, cclc)._observe_component_lifecycle_conditions()  # noqa: SLF001
-    assert core.marked_unknown == 1
-    assert core.observed == []
-
-    # Losing the owner in the middle of the read is the same communication loss.
-    cclc = _FakeCCLC()
-    cclc.snapshots = {"arm": HeadlessApiError("cclc_owner_unavailable", "lost")}
-    _condition_pump(core, cclc)._observe_component_lifecycle_conditions()  # noqa: SLF001
-    assert core.marked_unknown == 2
-    assert core.observed == []
-
-
-def test_component_conditions_reconcile_promptly_after_an_apply_replaced_cclc(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Regression: an Apply that replaces the CCLC owner makes it briefly
-    # unreachable, and unknown quality holds the Alarm Lifecycle Owner
-    # unreconciled (motion admission refused). The next read must follow at
-    # the pump cadence, not one whole condition period after the owner is
-    # back; only an accepted observation waits the full period.
-    clock = [100.0]
-    monkeypatch.setattr(
-        "manyforge_headless_api.execution.time.monotonic", lambda: clock[0]
-    )
-    core = _ComponentConditionCore(["arm"])
-    cclc = _FakeCCLC()
-    cclc.epochs = [HeadlessApiError("cclc_owner_unavailable", "socket absent")]
-    cclc.snapshots = {"arm": _component_snapshot("arm", "none")}
-    pump = _condition_pump(core, cclc)
-    pump._observe_component_lifecycle_conditions()  # noqa: SLF001
-    assert core.marked_unknown == 1
-
-    cclc.epochs = ["cclc.epoch.2"]
-    clock[0] += 0.05
-    pump._observe_component_lifecycle_conditions()  # noqa: SLF001
-    assert core.observed == []
-    clock[0] += 0.06
-    pump._observe_component_lifecycle_conditions()  # noqa: SLF001
-    assert [value["cclc_owner_epoch"] for value in core.observed] == ["cclc.epoch.2"]
-
-    clock[0] += 0.1
-    pump._observe_component_lifecycle_conditions()  # noqa: SLF001
-    assert len(core.observed) == 1
-
-    # A scope that changed under the read completed nothing either.
-    core.observe_component_lifecycle_conditions = (  # type: ignore[method-assign]
-        lambda **kwargs: core.observed.append(kwargs) or {"status": "scope_changed"}
-    )
-    clock[0] += 5.0
-    pump._observe_component_lifecycle_conditions()  # noqa: SLF001
-    clock[0] += 0.11
-    pump._observe_component_lifecycle_conditions()  # noqa: SLF001
-    assert len(core.observed) == 3
-
-
-def _clocked_condition_pump(
-    monkeypatch: pytest.MonkeyPatch, core: _ComponentConditionCore, cclc: _FakeCCLC
-) -> tuple[ExecutionEventPump, list[float]]:
-    clock = [100.0]
-    monkeypatch.setattr(
-        "manyforge_headless_api.execution.time.monotonic", lambda: clock[0]
-    )
-    return (
-        ExecutionEventPump(  # type: ignore[arg-type]
-            core, _PagedExecution(), cclc=cclc, component_condition_poll_seconds=1.0
-        ),
-        clock,
-    )
-
-
-def _pump_iteration(pump: ExecutionEventPump) -> None:
-    # The order of one pump iteration: refresh, then the lifecycle read.
-    pump._refresh_alarm_sources()  # noqa: SLF001
-    pump._observe_component_lifecycle_conditions()  # noqa: SLF001
-
-
-def test_a_pending_lifecycle_observation_is_read_on_the_next_iteration(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Spec 530 §7.1: an Apply is respected without polling. The registry swap
-    # marks the lifecycle source unknown and the core reports the pending
-    # observation through the refresh the pump offers each iteration; the
-    # next read does not wait out the period started under the old
-    # configuration.
-    core = _ComponentConditionCore(["arm"])
-    cclc = _FakeCCLC()
-    cclc.snapshots = {"arm": _component_snapshot("arm", "none")}
-    pump, clock = _clocked_condition_pump(monkeypatch, core, cclc)
-    _pump_iteration(pump)
-    assert len(core.observed) == 1
-
-    # A complete observation was accepted: the ordinary period applies.
-    clock[0] += 0.3
-    _pump_iteration(pump)
-    assert len(core.observed) == 1
-
-    # The registry swap (by any reader's refresh) sets the flag.
-    core.observation_pending = True
-    clock[0] += 0.05
-    _pump_iteration(pump)
-    assert len(core.observed) == 2
-    # Accepted (the fake clears the flag like the core): the period applies
-    # again from this read.
-    clock[0] += 0.5
-    _pump_iteration(pump)
-    assert len(core.observed) == 2
-    clock[0] += 0.51
-    _pump_iteration(pump)
-    assert len(core.observed) == 3
-
-
-def test_a_pending_lifecycle_observation_still_respects_the_retry_floor(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    core = _ComponentConditionCore(["arm"])
-    cclc = _FakeCCLC()
-    cclc.snapshots = {"arm": _component_snapshot("arm", "none")}
-    pump, clock = _clocked_condition_pump(monkeypatch, core, cclc)
-    core.observation_pending = True
-    core.observe_status = "scope_changed"
-    _pump_iteration(pump)
-    assert len(core.observed) == 1
-    clock[0] += 0.05
-    _pump_iteration(pump)
-    assert len(core.observed) == 1
-    clock[0] += 0.06
-    _pump_iteration(pump)
-    assert len(core.observed) == 2
-
-
-def test_an_incomplete_lifecycle_observation_is_retried_at_the_floor(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # An observation with an unread component leaves quality unknown, so it
-    # is not the period's accepted observation: retried at 0.1 s until a
-    # complete one is accepted, which then waits the full period.
-    core = _ComponentConditionCore(["arm", "gripper"])
-    cclc = _FakeCCLC()
-    cclc.snapshots = {
-        "arm": _component_snapshot("arm", "none"),
-        "gripper": HeadlessApiError("component_lifecycle_snapshot_unavailable", "no row"),
-    }
-    pump, clock = _clocked_condition_pump(monkeypatch, core, cclc)
-    _pump_iteration(pump)
-    assert [value["unavailable_component_ids"] for value in core.observed] == [
-        ["gripper"]
-    ]
-    clock[0] += 0.05
-    _pump_iteration(pump)
-    assert len(core.observed) == 1
-    clock[0] += 0.06
-    _pump_iteration(pump)
-    assert len(core.observed) == 2
-
-    cclc.snapshots["gripper"] = _component_snapshot("gripper", "none")
-    clock[0] += 0.11
-    _pump_iteration(pump)
-    assert len(core.observed) == 3
-    assert core.observed[-1]["unavailable_component_ids"] == []
-    clock[0] += 0.11
-    _pump_iteration(pump)
-    clock[0] += 0.5
-    _pump_iteration(pump)
-    assert len(core.observed) == 3
-    clock[0] += 0.4
-    _pump_iteration(pump)
-    assert len(core.observed) == 4
-
-
-def test_component_conditions_skip_a_read_that_spans_two_cclc_owners() -> None:
-    core = _ComponentConditionCore(["arm"])
-    cclc = _FakeCCLC()
-    cclc.epochs = ["cclc.epoch.1", "cclc.epoch.2"]
-    cclc.snapshots = {"arm": _component_snapshot("arm", "none")}
-    _condition_pump(core, cclc)._observe_component_lifecycle_conditions()  # noqa: SLF001
-    assert core.observed == []
-    assert core.marked_unknown == 0
-
-
-def test_component_conditions_forward_an_open_incident_without_its_timing() -> None:
-    core = _ComponentConditionCore(["arm"])
-    cclc = _FakeCCLC()
-    snapshot = _component_snapshot("arm", "provider_lost")
-    snapshot["lifecycle_progress"]["phase"] = "blocked"
-    snapshot["lifecycle_progress"]["incident"] = {
-        "acknowledged": False,
-        "cause_class": "provider_lost",
-        "detected_at_ns": 1_759_900_000_000,
-        "incident_id": "incident.arm.1",
-        "summary": "Controller lost",
-        "vendor_codes": ["exit=137"],
-    }
-    cclc.snapshots = {"arm": snapshot}
-    _condition_pump(core, cclc)._observe_component_lifecycle_conditions()  # noqa: SLF001
-    forwarded = json.loads(core.observed[0]["snapshots_json"])
-    assert forwarded[0]["lifecycle_progress"]["incident"] == {
-        "cause_class": "provider_lost",
-        "incident_id": "incident.arm.1",
-        "summary": "Controller lost",
-        "vendor_codes": ["exit=137"],
-    }
-
-
-def _cclc_incident_event(sequence: int, incident_id: str = "incident.arm.1") -> dict[str, Any]:
-    kind = "component_incident" if sequence % 2 else "component_incident_acknowledged"
-    return {
-        "event_kind": kind,
-        "event_sequence": sequence,
-        "incident_id": incident_id,
-        "occurred_at_ns": 1_000 + sequence,
-        "payload": {"event_kind": kind, "incident_id": incident_id},
-    }
-
-
-class _IncidentCore(_RecordingCore):
-    def __init__(self) -> None:
-        super().__init__()
-        self.recorded: list[tuple[str, dict[str, Any]]] = []
-        self.keys: set[tuple[str, str]] = set()
-        self.reject_next = False
-
-    def record_cclc_incident_event(
-        self, *, cclc_owner_epoch: str, event_json: str
-    ) -> dict[str, Any]:
-        event = json.loads(event_json)
-        if self.reject_next:
-            self.reject_next = False
-            return {"event_id": None, "status": "rejected"}
-        key = (event["incident_id"], event["event_kind"])
-        if key in self.keys:
-            return {"event_id": None, "status": "duplicate"}
-        self.keys.add(key)
-        self.recorded.append((cclc_owner_epoch, event))
-        return {"event_id": f"event-{len(self.recorded)}", "status": "recorded"}
-
-
-class _IncidentCCLC(_FakeCCLC):
-    def __init__(self, events: list[dict[str, Any]]) -> None:
-        super().__init__()
-        self.events = events
-        self.reads: list[tuple[int, int]] = []
-
-    def incident_events(self, after_sequence: int, limit: int) -> dict[str, Any]:
-        self.reads.append((after_sequence, limit))
-        page = [row for row in self.events if row["event_sequence"] > after_sequence][:limit]
-        return {
-            "events": page,
-            "through_sequence": page[-1]["event_sequence"] if page else after_sequence,
-        }
-
-
-def test_cclc_incident_events_are_recorded_once_in_order_at_a_bounded_cadence() -> None:
-    core = _IncidentCore()
-    cclc = _IncidentCCLC([_cclc_incident_event(1), _cclc_incident_event(2)])
-    pump = _condition_pump(core, cclc)
-    pump._record_cclc_incident_events()  # noqa: SLF001
-    assert [event["event_sequence"] for _epoch, event in core.recorded] == [1, 2]
-    assert {epoch for epoch, _event in core.recorded} == {"cclc.epoch.1"}
-    assert core.recorded[0][1] == _cclc_incident_event(1)
-    # Within the period nothing is read again; afterwards only newer events.
-    pump._record_cclc_incident_events()  # noqa: SLF001
-    assert cclc.reads == [(0, 64)]
-    pump._next_incident_event_poll_at = float("-inf")  # noqa: SLF001
-    cclc.events.append(_cclc_incident_event(3, "incident.arm.2"))
-    pump._record_cclc_incident_events()  # noqa: SLF001
-    assert cclc.reads[-1] == (2, 64)
-    assert [event["event_sequence"] for _epoch, event in core.recorded] == [1, 2, 3]
-
-
-def test_cclc_incident_events_survive_a_lost_cursor_without_duplicates() -> None:
-    core = _IncidentCore()
-    events = [_cclc_incident_event(1), _cclc_incident_event(2)]
-    _condition_pump(core, _IncidentCCLC(events))._record_cclc_incident_events()  # noqa: SLF001
-    # A restarted reader (fresh pump, cursor zero) replays: the core answers
-    # duplicates and nothing is recorded twice.
-    restarted = _IncidentCCLC(events)
-    _condition_pump(core, restarted)._record_cclc_incident_events()  # noqa: SLF001
-    assert restarted.reads == [(0, 64)]
-    assert len(core.recorded) == 2
-
-
-def test_cclc_incident_events_retry_a_rejected_event_and_follow_the_owner_epoch() -> None:
-    core = _IncidentCore()
-    cclc = _IncidentCCLC([_cclc_incident_event(1), _cclc_incident_event(2)])
-    pump = _condition_pump(core, cclc)
-    core.reject_next = True
-    pump._record_cclc_incident_events()  # noqa: SLF001
-    assert core.recorded == []
-    pump._next_incident_event_poll_at = float("-inf")  # noqa: SLF001
-    pump._record_cclc_incident_events()  # noqa: SLF001
-    assert cclc.reads == [(0, 64), (0, 64)]
-    assert len(core.recorded) == 2
-    # A new CCLC owner restarts the cursor; recorded events stay deduplicated.
-    cclc.epochs = ["cclc.epoch.2"]
-    cclc.events = [_cclc_incident_event(1, "incident.arm.9")]
-    pump._next_incident_event_poll_at = float("-inf")  # noqa: SLF001
-    pump._record_cclc_incident_events()  # noqa: SLF001
-    assert cclc.reads[-1] == (0, 64)
-    assert core.recorded[-1] == ("cclc.epoch.2", _cclc_incident_event(1, "incident.arm.9"))
-
-
-def test_cclc_incident_events_continue_immediately_after_a_full_page() -> None:
-    core = _IncidentCore()
-    cclc = _IncidentCCLC(
-        [_cclc_incident_event(index, f"incident.{index}") for index in range(1, 66)]
-    )
-    pump = _condition_pump(core, cclc)
-    pump._record_cclc_incident_events()  # noqa: SLF001
-    assert len(core.recorded) == 64
-    pump._record_cclc_incident_events()  # noqa: SLF001
-    assert cclc.reads == [(0, 64), (64, 64)]
-    assert len(core.recorded) == 65
-
-
-def test_cclc_incident_events_wait_quietly_for_an_unreachable_owner() -> None:
-    core = _IncidentCore()
-    cclc = _IncidentCCLC([_cclc_incident_event(1)])
-    cclc.epochs = [HeadlessApiError("cclc_owner_unavailable", "socket absent")]
-    pump = _condition_pump(core, cclc)
-    pump._record_cclc_incident_events()  # noqa: SLF001
-    assert cclc.reads == []
-    assert core.recorded == []
-    assert not pump._incident_events_failing  # noqa: SLF001
 
 
 def _recovery_response(retry_eligibility: object = "absent") -> dict[str, Any]:
@@ -2867,15 +1930,14 @@ def test_recovery_action_request_is_serialized_with_the_native_ten_fields(
         "expected_assessment_revision",
         "expected_control_command_epoch",
         "expected_execution_id",
-        "expected_latch_id",
         "expected_stop_certificate_id",
         "expected_stop_owner_generation",
         "reason",
     }
 
 
-def test_recovery_assessment_reason_union_is_the_frozen_eighteen() -> None:
-    assert len(RETRY_ELIGIBILITY_REASONS) == 18
+def test_recovery_assessment_reason_union_is_the_frozen_seventeen() -> None:
+    assert len(RETRY_ELIGIBILITY_REASONS) == 17
     assert "none" in RETRY_ELIGIBILITY_REASONS
 
 
@@ -2995,117 +2057,6 @@ def test_page_parse_errors_keep_runtime_fault_context_for_pump(
     assert pump.last_error is not None  # Fault delivery does not turn page failure into Good.
 
 
-def test_execution_client_projects_global_rule_recovery_offers_and_variant(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    from manyforge_headless_api.models import GlobalIoRuleRecoveryIntentRequest
-
-    client = ExecutionCommandClient(tmp_path)
-    selector = {
-        "context": {
-            "owner_epoch": "kernel.epoch.1",
-            "catalog_generation": "4",
-            "active_publication_generation": 2,
-            "bundle": "bundle.1",
-            "graph": "graph.1",
-        },
-        "rule_id": "door_open",
-        "expected_rule_registration_id": "9",
-    }
-    offer = {
-        "selector": selector,
-        "current_condition": None,
-        "post_latch_disposition": "await_operator_ack",
-        "latch_cause": "source_loss",
-    }
-    offers: list[Any] = [offer]
-    commands: list[dict[str, Any]] = []
-    result: dict[str, Any] = {}
-
-    def exchange(command: dict[str, Any]) -> dict[str, Any]:
-        commands.append(command)
-        if command["command"] == "get_stop_fault":
-            return {
-                "api_version": "manyforge.execution_command_response.v1",
-                "command": "get_stop_fault",
-                "ok": True,
-                "stop_fault": None,
-                "global_rule_recovery_offers": offers,
-            }
-        return {
-            "api_version": "manyforge.execution_command_response.v1",
-            "command": "recover_stop_fault",
-            "ok": True,
-            "result": result,
-        }
-
-    monkeypatch.setattr(client, "_exchange", exchange)
-    monkeypatch.setattr(client, "_exchange_control", exchange)
-    assert client.stop_fault()["global_rule_recovery_offers"] == [offer]
-    for patch in (
-        {"current_condition": 0},
-        {"latch_cause": "unknown"},
-        {"post_latch_disposition": "auto_clear"},
-        {"selector": {**selector, "expected_rule_registration_id": 9}},
-        # SX-2216: Core emits only a positive registration nonce.
-        {"selector": {**selector, "expected_rule_registration_id": "0"}},
-        {"selector": {**selector, "context": {**selector["context"], "catalog_generation": "04"}}},
-        {"extra": True},
-    ):
-        offers[:] = [{**offer, **patch}]
-        with pytest.raises(HeadlessApiError):
-            client.stop_fault()
-
-    request = GlobalIoRuleRecoveryIntentRequest.model_validate(
-        {
-            "kind": "global_io_rule",
-            "request_context": {
-                "request_id": "request.rule-recovery.1",
-                "request_owner_epoch": "execution.epoch.1",
-                "source_label": "operator_ui",
-                "correlation_id": None,
-            },
-            "selector": selector,
-            "reason": None,
-        }
-    )
-    result.update(
-        request_id="request.rule-recovery.1",
-        replay_status="accepted_new",
-        accepted=True,
-        context=selector["context"],
-        rule={"rule_id": "door_open", "state": "clear", "triggering_acquisition": None},
-        error=None,
-    )
-    assert client.recover_stop_fault(request)["result"]["accepted"] is True
-    # The variant keeps its explicit null reason; Stop bytes are untouched.
-    assert commands[-1]["request"] == request.model_dump(mode="json")
-    assert commands[-1]["request"]["reason"] is None
-    result["rule"] = {**result["rule"], "state": "unknown"}
-    with pytest.raises(HeadlessApiError) as invalid:
-        client.recover_stop_fault(request)
-    assert invalid.value.code == "execution_command_response_invalid"
-    result.update(accepted=False, rule=None, error="global_rule_condition_true")
-    assert client.recover_stop_fault(request)["result"]["accepted"] is False
-    result.update(
-        accepted=True,
-        rule={"rule_id": "door_open", "state": "clear", "triggering_acquisition": None},
-        error=None,
-    )
-    # A replay of a historical request keeps its original context even after
-    # the current Applied context (the offers) moved on.
-    offers[:] = [{**offer, "selector": {
-        **selector, "context": {**selector["context"], "active_publication_generation": 3}}}]
-    assert client.stop_fault()["global_rule_recovery_offers"] == offers
-    result.update(context=selector["context"], replay_status="replayed_exact")
-    assert client.recover_stop_fault(request)["result"]["replay_status"] == "replayed_exact"
-    with pytest.raises(ValueError):
-        GlobalIoRuleRecoveryIntentRequest.model_validate({
-            **request.model_dump(mode="json"),
-            "selector": {**selector, "expected_rule_registration_id": "0"},
-        })
-
-
 def _rule_state_event(owner_epoch: str, sequence: int, state: str) -> dict[str, Any]:
     payload = {
         "owner_epoch": owner_epoch,
@@ -3202,9 +2153,9 @@ def test_event_pump_projects_global_rules_and_forwards_rule_rows_to_the_historia
         if core.completed_calls and published:
             break
         threading.Event().wait(0.01)
-    execution.append(_rule_state_event(epoch, 3, "latched"))
+    execution.append(_rule_state_event(epoch, 3, "inactive"))
     for _ in range(200):
-        if published and published[-1] == [{"rule_id": "door", "state": "latched", "keys": []}]:
+        if published and published[-1] == [{"rule_id": "door", "state": "inactive", "keys": []}]:
             break
         threading.Event().wait(0.01)
     pump.shutdown()
@@ -3233,7 +2184,7 @@ def test_event_pump_projects_global_rules_and_forwards_rule_rows_to_the_historia
     assert core.completed_calls[0]["through_source_sequence"] == 2
     assert core.completed_calls[-1]["through_source_sequence"] == 3
     assert published[0] == [{"rule_id": "door", "state": "tripped", "keys": []}]
-    assert published[-1] == [{"rule_id": "door", "state": "latched", "keys": []}]
+    assert published[-1] == [{"rule_id": "door", "state": "inactive", "keys": []}]
     assert len(published) == 2
 
 

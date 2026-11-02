@@ -26,7 +26,7 @@ def previous_session_notice(path: str | None) -> dict | None:
             or report.get("shutdown") not in {"clean", "unknown"}
             or report.get("effects") not in {"closed", "unknown", "unresolved"}
             or report.get("history_coverage") != "not_imported"
-            or report.get("journal_families") != ["program_cycle", "scene", "manager", "cclc", "kernel_operation"]
+            or report.get("journal_families") != ["program_cycle", "scene", "manager", "kernel_operation"]
             or not isinstance(report.get("message"), str)
             or not 0 < len(report["message"].encode()) <= 1024):
         raise ValueError("previous workbench session report is invalid")

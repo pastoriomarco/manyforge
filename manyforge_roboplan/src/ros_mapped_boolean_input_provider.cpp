@@ -22,8 +22,6 @@
 #include <rclcpp/subscription.hpp>
 #include <set>
 #include <stdexcept>
-#include <type_traits>
-#include <ur_msgs/msg/io_states.hpp>
 #include <utility>
 
 namespace manyforge::roboplan_backend {
@@ -41,48 +39,31 @@ struct RosMappedBooleanInputProvider::State final {
         sender(std::move(sink), time, binding.source_id, binding.incarnation,
                generation) {}
 
-  template <class Message>
-  void Receive(const Message &message,
+  void Receive(const control_msgs::msg::DynamicInterfaceGroupValues &message,
                core::IoSourceIngressAcquisitionReceipt receipt) {
     std::vector<core::IoSignalUpdateDTO> updates;
     updates.reserve(binding.signals.size());
-    bool malformed = false;
-    if constexpr (std::is_same_v<
-                      Message,
-                      control_msgs::msg::DynamicInterfaceGroupValues>) {
+    bool malformed =
+        message.interface_groups.size() != message.interface_values.size();
+    for (const auto &values : message.interface_values)
       malformed =
-          message.interface_groups.size() != message.interface_values.size();
-      for (const auto &values : message.interface_values)
-        malformed =
-            malformed || values.interface_names.size() != values.values.size();
-    }
+          malformed || values.interface_names.size() != values.values.size();
     for (const auto &configured : binding.signals) {
       std::optional<bool> value;
       std::size_t matches = 0;
-      if constexpr (std::is_same_v<Message, ur_msgs::msg::IOStates>) {
-        const auto pin =
-            std::get<UrDigitalInputSelector>(configured.selector).pin;
-        for (const auto &digital : message.digital_in_states)
-          if (digital.pin == pin) {
-            ++matches;
-            value = digital.state;
-          }
-      } else {
-        const auto &selected =
-            std::get<RosGpioBooleanInputSelector>(configured.selector);
-        if (!malformed)
-          for (std::size_t i = 0; i < message.interface_groups.size(); ++i)
-            if (message.interface_groups[i] == selected.group)
-              for (std::size_t j = 0;
-                   j < message.interface_values[i].interface_names.size(); ++j)
-                if (message.interface_values[i].interface_names[j] ==
-                    selected.interface_name) {
-                  ++matches;
-                  const auto raw = message.interface_values[i].values[j];
-                  if (std::isfinite(raw) && (raw == 0.0 || raw == 1.0))
-                    value = raw == 1.0;
-                }
-      }
+      const auto &selected = configured.selector;
+      if (!malformed)
+        for (std::size_t i = 0; i < message.interface_groups.size(); ++i)
+          if (message.interface_groups[i] == selected.group)
+            for (std::size_t j = 0;
+                 j < message.interface_values[i].interface_names.size(); ++j)
+              if (message.interface_values[i].interface_names[j] ==
+                  selected.interface_name) {
+                ++matches;
+                const auto raw = message.interface_values[i].values[j];
+                if (std::isfinite(raw) && (raw == 0.0 || raw == 1.0))
+                  value = raw == 1.0;
+              }
       const bool valid = !malformed && matches == 1U && value.has_value();
       updates.push_back({configured.descriptor.signal_id,
                          valid ? core::IoSampleValidity::kValid
@@ -126,19 +107,6 @@ struct RosMappedBooleanInputProvider::Entities final {
                 core::IoIngressLossReason::kMiddlewareMessageLost, receipt,
                 static_cast<std::uint64_t>(event.total_count_change));
         };
-    if (std::holds_alternative<UrDigitalInputSelector>(
-            state->binding.signals.front().selector))
-      return node->create_subscription<ur_msgs::msg::IOStates>(
-          state->binding.topic,
-          detail::InputConnectQos<ur_msgs::msg::IOStates>(
-              *node, state->binding.topic, qos),
-          [state, callback_incarnation,
-           callback_generation](const ur_msgs::msg::IOStates &message) {
-            const auto receipt = state->sender.CaptureAcquisition(
-                callback_incarnation, callback_generation);
-            state->Receive(message, receipt);
-          },
-          options);
     return node->create_subscription<
         control_msgs::msg::DynamicInterfaceGroupValues>(
         state->binding.topic,
@@ -181,7 +149,6 @@ RosMappedBooleanInputProvider::Create(
     return Reply::Err(invalid(
         "Mapped ROS boolean input requires explicit bounded volatile QoS"));
   std::set<core::IoSignalId> identities;
-  const auto selected_kind = binding.signals.front().selector.index();
   for (const auto &signal : binding.signals) {
     const auto &descriptor = signal.descriptor;
     if (!core::ComputeIoSignalDescriptorDigest(descriptor).ok() ||
@@ -191,25 +158,17 @@ RosMappedBooleanInputProvider::Create(
         descriptor.update_mode != core::IoSignalUpdateMode::kSampled ||
         descriptor.transition_capability !=
             core::IoTransitionCapability::kSampledOnly ||
-        !identities.insert(descriptor.signal_id).second ||
-        signal.selector.index() != selected_kind)
+        !identities.insert(descriptor.signal_id).second)
       return Reply::Err(invalid("Mapped ROS input requires one periodic "
                                 "sampled source and unique signals"));
-    if (const auto *pin =
-            std::get_if<UrDigitalInputSelector>(&signal.selector)) {
-      if (pin->pin > 17U)
-        return Reply::Err(invalid("UR digital input pin is outside 0..17"));
-    } else {
-      const auto &selected =
-          std::get<RosGpioBooleanInputSelector>(signal.selector);
-      const auto valid_text = [](const std::string &value) {
-        return !value.empty() && value.size() <= 4096U &&
-               value.find('\0') == std::string::npos;
-      };
-      if (!valid_text(selected.group) || !valid_text(selected.interface_name))
-        return Reply::Err(
-            invalid("GPIO selector requires exact group and interface names"));
-    }
+    const auto valid_text = [](const std::string &value) {
+      return !value.empty() && value.size() <= 4096U &&
+             value.find('\0') == std::string::npos;
+    };
+    if (!valid_text(signal.selector.group) ||
+        !valid_text(signal.selector.interface_name))
+      return Reply::Err(
+          invalid("GPIO selector requires exact group and interface names"));
   }
 
   auto state =
@@ -299,6 +258,11 @@ bool RosMappedBooleanInputProvider::Resume(std::uint64_t generation) {
   } catch (const std::exception &) {
     return false;
   }
+}
+
+void RosMappedBooleanInputProvider::SetArrivalRecorder(
+    std::shared_ptr<core::StreamRecorder> arrivals) {
+  state_->sender.SetArrivalRecorder(std::move(arrivals));
 }
 
 void RosMappedBooleanInputProvider::Shutdown() { state_->sender.Shutdown(); }

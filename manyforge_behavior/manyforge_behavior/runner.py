@@ -175,7 +175,6 @@ class OrchestratorRunner:
                             "execution_timeout_s": 10.0,
                         },
                         "cache_mode": "default",
-                        "planning_profile": "first_feasible",
                         "target_mode": "absolute",
                         "target_reference": None,
                         "offset_reference": None,
@@ -207,6 +206,7 @@ class OrchestratorRunner:
         position: float,
         max_effort: float | None = None,
         command_duration_s: float = 0.0,
+        wait_for_duration: bool = False,
         completion_timeout_s: float = 5.0,
         correlation_id: str | None = None,
     ) -> dict[str, Any]:
@@ -312,7 +312,12 @@ class OrchestratorRunner:
                             {
                                 "option_id": "command_duration_s",
                                 "value_s": command_duration_s,
-                            }
+                            },
+                            *(
+                                [{"option_id": "wait_for_duration", "value_bool": True}]
+                                if wait_for_duration
+                                else []
+                            ),
                         ],
                     },
                 }

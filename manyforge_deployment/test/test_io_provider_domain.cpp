@@ -5,7 +5,6 @@
 #include <filesystem>
 #include <unistd.h>
 
-#include <manyforge_core/io_provider_lifecycle_catalog.hpp>
 #include <manyforge_deployment/io_provider_domain.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 
@@ -64,7 +63,7 @@ protected:
 };
 
 TEST_F(IoProviderDomainTest,
-       GenuineZeroArmReadbackHasActualDomainAndCatalogProof) {
+       GenuineZeroArmReadbackHasActualDomainProof) {
   const auto &graph = bundle->value().cell_graph;
   EXPECT_TRUE(graph.model_instances.empty());
   EXPECT_TRUE(graph.control_bindings.empty());
@@ -84,13 +83,8 @@ TEST_F(IoProviderDomainTest,
   EXPECT_EQ(provider->lifecycle_command_timeout_ns, 10'000'000'000LL);
   EXPECT_EQ(domain.control_coordinator_endpoint_role,
             c::EndpointRoleId("ros2_control_execution_status"));
-  const auto catalog =
-      c::MakeIoProviderLifecycleCatalog(manifests.front().value());
-  ASSERT_TRUE(catalog.ok());
-  EXPECT_EQ(provider->lifecycle_plan_catalog_digest,
-            catalog.value().catalog_digest);
-  EXPECT_NE(provider->lifecycle_plan_catalog_digest,
-            manifests.front().value().lifecycle_plan_catalog->semantic_digest);
+  EXPECT_EQ(provider->lifecycle_plan_catalog_digest.value(),
+            provider->provider_manifest_revision.value());
   EXPECT_TRUE(d::ValidateIoProviderDomains(
                   graph, bundle->value().capability_provider_bindings, profiles,
                   manifests)
@@ -101,7 +95,7 @@ TEST_F(IoProviderDomainTest,
 }
 
 TEST_F(IoProviderDomainTest,
-       EditedDeviceLimitChangesExactDomainProofButNotOwnerOrCatalog) {
+       EditedDeviceLimitChangesExactDomainProofButNotOwner) {
   auto graph = bundle->value().cell_graph;
   const auto original = graph.control_domains.front();
   SetBudget(graph, 31.0);
@@ -136,7 +130,7 @@ TEST_F(IoProviderDomainTest,
 }
 
 TEST_F(IoProviderDomainTest,
-       AmbiguousOccurrenceAndForgedCatalogProjectionRefuse) {
+       AmbiguousOccurrenceAndForgedProjectionRefuse) {
   auto bindings = bundle->value().capability_provider_bindings;
   const auto input =
       std::find_if(bindings.begin(), bindings.end(), [](const auto &binding) {
@@ -170,8 +164,10 @@ TEST_F(IoProviderDomainTest,
                    .ok());
 }
 
+// An adapter profile is a device connection: on a component that also has a
+// controller binding it is refused when its provider domain is derived.
 TEST_F(IoProviderDomainTest,
-       DeferredXArmProfileRefusesBeforeAnyProviderDomainIsInferred) {
+       AdapterSignalOnAControlledComponentRefusesItsProviderDomain) {
   const auto arm =
       d::test::make_lite6_ros2_control_shared_consumer_retention_fixture();
   auto graph = arm.qualified.deployment().graph().graph();
@@ -210,21 +206,17 @@ TEST_F(IoProviderDomainTest,
                         {"maximum_age_ns", c::JsonValueDTO{1000.0}}}}},
       {"provider",
        c::JsonValueDTO{Object{
-           {"profile", c::JsonValueDTO{std::string("xarm_controller_input")}},
-           {"topic", c::JsonValueDTO{std::string("/arm/cgpio")}},
-           {"input_bit", c::JsonValueDTO{0.0}},
+           {"profile", c::JsonValueDTO{std::string("vendor_digital")}},
+           {"pin", c::JsonValueDTO{0.0}},
            {"ingress_depth", c::JsonValueDTO{4.0}}}}}};
   unit->configuration["io_signals"] =
       c::JsonValueDTO{Array{c::JsonValueDTO{gpio}}};
-  const auto refused = d::ResolveRetainedIoSignalCatalog(graph);
-  ASSERT_FALSE(refused.ok());
-  EXPECT_EQ(refused.error().details.at("reason"),
-            "io_signal_provider_unsupported");
+  ASSERT_TRUE(d::ResolveRetainedIoSignalCatalog(graph).ok());
   const auto derived = d::DeriveIoProviderDomains(
       graph, bundle->value().capability_provider_bindings, profiles, manifests);
   ASSERT_FALSE(derived.ok());
   EXPECT_EQ(derived.error().details.at("reason"),
-            "io_signal_provider_unsupported");
+            "io_ros_connection_component_has_controller_binding");
 }
 
 TEST_F(IoProviderDomainTest,

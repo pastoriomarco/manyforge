@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: isaac_lite6_lite_gripper_pick_and_place
-program_revision: sha256:c90197058c3bc25233e3e7c99ec7c8829a2149a9088e6ac0177b9ae9872a2472
+program_revision: sha256:949627e589146e217114bc56db7378b83277924278d47f20b241436d13feb619
 program_profile: composable-cell-v1
 name: isaac_lite6_lite_gripper_pick_and_place
 description: Retained Isaac-compatible Lite6 pick-and-place Program. It preserves the scan poses, exact
@@ -43,9 +43,6 @@ target_roles:
       parameters: {}
       disposition: required
     - capability_id: planning.motion.pose_goal
-      parameters: {}
-      disposition: required
-    - capability_id: planning.profile.balanced
       parameters: {}
       disposition: required
     - capability_id: planning.trajectory.time_parameterized

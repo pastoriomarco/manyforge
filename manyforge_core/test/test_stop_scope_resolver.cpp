@@ -360,64 +360,6 @@ TEST(StopScopeResolverTest, RejectsInvalidOrAmbiguousOwnerSnapshotsWithoutResolu
   EXPECT_EQ(stop_scope_snapshot_field_error(unsorted), "stop_scope_operations_not_canonical");
 }
 
-TEST(StopScopeResolverTest, SharedLogicalOutputMembershipKeepsActualOperationAndAllOrphanAliases) {
-  auto snapshot = independent_snapshot();
-  const ResourceId channel("output.actual.channel");
-  for (auto& component : snapshot.components) {
-    component.resources = {channel};
-    component.logical_output_resources = {channel};
-  }
-  for (auto& operation : snapshot.operations) operation.resources = {channel};
-  snapshot.operations.pop_back();  // Only component A has a live transaction.
-  snapshot.resources = {{channel, StopGeneration(4U), false}};
-  ASSERT_EQ(stop_scope_snapshot_field_error(snapshot), std::nullopt);
-  const auto live = resolve_full_stop_scope({request_context(), StopGeneration(7U), {}}, snapshot);
-  ASSERT_TRUE(live.ok());
-  EXPECT_EQ(live.value().operations, std::vector<OperationId>{OperationId("operation.a")});
-  EXPECT_EQ(live.value().controllable_components,
-            std::vector<ControllableComponentId>{ControllableComponentId("robot.a")});
-  EXPECT_EQ(live.value().resources, std::vector<ResourceId>{channel});
-  snapshot.operations.clear();
-  snapshot.resources.front().effect_uncertain = true;
-  const auto orphan =
-      resolve_full_stop_scope({request_context(), StopGeneration(7U), {}}, snapshot);
-  ASSERT_TRUE(orphan.ok());
-  EXPECT_TRUE(orphan.value().operations.empty());
-  EXPECT_EQ(orphan.value().controllable_components,
-            (std::vector<ControllableComponentId>{ControllableComponentId("robot.a"),
-                                                  ControllableComponentId("robot.b")}));
-  EXPECT_EQ(orphan.value().resources, std::vector<ResourceId>{channel});
-}
-
-TEST(StopScopeResolverTest,
-     SharedLogicalOutputRequiresExactTypedMembershipWithoutPhysicalAmbiguity) {
-  auto snapshot = independent_snapshot();
-  const ResourceId channel("output.actual.channel");
-  for (auto& component : snapshot.components) {
-    component.resources = {channel};
-    component.logical_output_resources = {channel};
-  }
-  for (auto& operation : snapshot.operations) operation.resources = {channel};
-  snapshot.resources = {{channel, StopGeneration(4U), false}};
-  EXPECT_EQ(stop_scope_snapshot_field_error(snapshot), std::nullopt);
-  snapshot.components.back().logical_output_resources.clear();
-  EXPECT_EQ(stop_scope_snapshot_field_error(snapshot), "stop_scope_resource_owner_ambiguous");
-  snapshot.components.front().logical_output_resources.clear();
-  EXPECT_EQ(stop_scope_snapshot_field_error(snapshot), "stop_scope_resource_owner_ambiguous");
-  snapshot.components.front().logical_output_resources = {ResourceId("unowned.channel")};
-  EXPECT_EQ(stop_scope_snapshot_field_error(snapshot),
-            "stop_scope_component_resources_not_canonical");
-  snapshot.components.front().logical_output_resources = {channel};
-  snapshot.components.back().logical_output_resources = {channel};
-  snapshot.components.push_back({ControllableComponentId("robot.c"),
-                                 ComponentLifecycleGeneration(12U),
-                                 {ResourceId("unrelated.resource")}});
-  snapshot.resources.push_back({ResourceId("unrelated.resource"), StopGeneration(0U), false});
-  snapshot.operations.front().controllable_components = {ControllableComponentId("robot.c")};
-  EXPECT_EQ(stop_scope_snapshot_field_error(snapshot),
-            "stop_scope_operation_resource_owner_outside_scope");
-}
-
 TEST(StopScopeResolverTest, MixedLiveAndTerminalSelectionCapturesOnlyCurrentEffectfulWork) {
   auto snapshot = independent_snapshot();
   snapshot.operations[1].state = OperationStateKind::kStopped;

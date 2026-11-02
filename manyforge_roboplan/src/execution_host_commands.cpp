@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <charconv>
+#include <limits>
 
 namespace manyforge::roboplan_backend::host_detail {
 
@@ -241,11 +242,12 @@ DecodeMotionSpec(const CanonicalValue &value) {
     return core::PoseGoalDTO{DecodePose(Member(value, "goal"))};
   }
   if (kind == "cartesian_path") {
-    const auto *blend = value.find_object_member("max_blend_deviation_rad");
-    // A Cartesian path has nine required fields; the blend-deviation field is
-    // the one optional tenth field.  Keep the decoder aligned with the
-    // frontend/headless CartesianPath contract.
-    RequireExactObjectSize(value, blend == nullptr ? 9U : 10U,
+    const auto *speed_mode = value.find_object_member("speed_mode");
+    // A Cartesian path has nine required fields; `speed_mode` is the one
+    // optional tenth field (absent: the Deployment's `cartesian_timing`).
+    // Keep the decoder aligned with the frontend/headless CartesianPath
+    // contract.
+    RequireExactObjectSize(value, speed_mode == nullptr ? 9U : 10U,
                            "Cartesian path");
     const auto &encoded_waypoints = Array(value, "waypoints");
     Require(!encoded_waypoints.empty() &&
@@ -256,8 +258,11 @@ DecodeMotionSpec(const CanonicalValue &value) {
     for (const auto &waypoint : encoded_waypoints) {
       waypoints.push_back(DecodePose(waypoint));
     }
-    Require(Text(value, "speed_mode") == "bounded",
-            "Cartesian speed mode is unsupported");
+    std::optional<core::CartesianSpeedModeDTO> mode;
+    if (speed_mode != nullptr) {
+      mode = core::parse_cartesian_speed_mode(Text(value, "speed_mode"));
+      Require(mode.has_value(), "Cartesian speed mode is unsupported");
+    }
     core::CartesianFallbackPolicyDTO fallback;
     const auto fallback_name = Text(value, "fallback_policy");
     if (fallback_name == "fail_closed") {
@@ -271,14 +276,14 @@ DecodeMotionSpec(const CanonicalValue &value) {
         std::move(waypoints),
         Number(value, "max_translation_step_m"),
         Number(value, "max_rotation_step_rad"),
-        core::CartesianSpeedModeDTO::kBounded,
+        mode,
         Number(value, "max_angular_speed_rad_s"),
         Number(value, "max_linear_acceleration_mps2"),
         Number(value, "max_angular_acceleration_rad_s2"),
-        fallback};
-    if (blend != nullptr) {
-      result.max_blend_deviation_rad = Number(value, "max_blend_deviation_rad");
-    }
+        fallback,
+        NumberArray(value, "blend_radii_m", core::kMaxOperationParticipants)};
+    Require(result.blend_radii_m.size() == result.waypoints.size(),
+            "Cartesian blend radii must give one radius per waypoint");
     return result;
   }
   Fail("motion specification kind is unsupported");
@@ -360,6 +365,47 @@ DecodeDynamicsLimit(const CanonicalValue &value) {
           OptionalNumber(value, "max_jerk_rad_s3")};
 }
 
+/// The motion's `planner` block: any subset of its members; absent or null
+/// members take the Deployment planner default.
+[[nodiscard]] core::PlannerOverrideDTO
+DecodePlannerOverride(const CanonicalValue &value) {
+  Require(value.is_object(), "motion planner must be an object");
+  for (const auto &[name, member] : value.as_object()) {
+    static_cast<void>(member);
+    Require(name == "search" || name == "optimize" || name == "n" ||
+                name == "collision_check_step_rad" || name == "max_nodes",
+            "motion planner has an unknown field");
+  }
+  const auto set = [&](std::string_view name) {
+    const auto *member = value.find_object_member(name);
+    return member != nullptr && !member->is_null();
+  };
+  const auto u32 = [&](std::string_view name) {
+    const auto counter = Counter(value, name, 0U);
+    Require(counter <= std::numeric_limits<std::uint32_t>::max(),
+            "motion planner " + std::string(name) + " is out of range");
+    return static_cast<std::uint32_t>(counter);
+  };
+  core::PlannerOverrideDTO planner;
+  if (set("search")) {
+    planner.search = core::planner_search_from_string(Text(value, "search"));
+    Require(planner.search.has_value(), "motion planner search is unsupported");
+  }
+  if (set("optimize")) {
+    planner.optimize =
+        core::planner_optimize_from_string(Text(value, "optimize"));
+    Require(planner.optimize.has_value(),
+            "motion planner optimize is unsupported");
+  }
+  if (set("n")) planner.n = u32("n");
+  if (set("collision_check_step_rad"))
+    planner.collision_check_step_rad = Number(value, "collision_check_step_rad");
+  if (set("max_nodes")) planner.max_nodes = u32("max_nodes");
+  Require(core::valid_planner_override(planner),
+          "motion planner value is out of range");
+  return planner;
+}
+
 [[nodiscard]] core::MotionParticipantIntentDTO
 DecodeMotionPayload(const CanonicalValue &value) {
   const bool has_runtime_object_bindings =
@@ -372,11 +418,15 @@ DecodeMotionPayload(const CanonicalValue &value) {
   // Optional nullable member; absent or null means the Deployment clearance.
   const bool has_clearance_member =
       value.is_object() && value.find_object_member("clearance_m") != nullptr;
+  // Optional nullable member; absent or null means the Deployment planner.
+  const bool has_planner_member =
+      value.is_object() && value.find_object_member("planner") != nullptr;
   Require(value.is_object() &&
               value.as_object().size() ==
-                  16U + (has_runtime_object_bindings ? 1U : 0U) +
+                  15U + (has_runtime_object_bindings ? 1U : 0U) +
                       (has_goal_frame_member ? 1U : 0U) +
-                      (has_clearance_member ? 1U : 0U),
+                      (has_clearance_member ? 1U : 0U) +
+                      (has_planner_member ? 1U : 0U),
           "motion payload has an unknown or missing field");
   Require(Text(value, "kind") == "motion",
           "operation payload kind is unsupported");
@@ -402,17 +452,10 @@ DecodeMotionPayload(const CanonicalValue &value) {
   } else {
     Fail("motion cache mode is unsupported");
   }
-  core::PlanningProfileDTO planning_profile;
-  const auto profile = Text(value, "planning_profile");
-  if (profile == "first_feasible") {
-    planning_profile = core::PlanningProfileDTO::kFirstFeasible;
-  } else if (profile == "balanced") {
-    planning_profile = core::PlanningProfileDTO::kBalanced;
-  } else if (profile == "quality_bounded") {
-    planning_profile = core::PlanningProfileDTO::kQualityBounded;
-  } else {
-    Fail("motion planning profile is unsupported");
-  }
+  const auto planner =
+      has_planner_member && !Member(value, "planner").is_null()
+          ? DecodePlannerOverride(Member(value, "planner"))
+          : core::PlannerOverrideDTO{};
   core::MotionTargetModeDTO target_mode;
   const auto target_mode_name = Text(value, "target_mode");
   if (target_mode_name == "absolute") {
@@ -510,7 +553,7 @@ DecodeMotionPayload(const CanonicalValue &value) {
       core::TimeoutsDTO{Number(timeouts, "planning_timeout_s"),
                         Number(timeouts, "execution_timeout_s")},
       cache_mode,
-      planning_profile,
+      planner,
       target_mode,
       std::move(target_reference),
       std::move(offset_reference),
@@ -555,52 +598,42 @@ DecodeCapabilityCommandPayload(const CanonicalValue &value) {
           "operation payload kind is unsupported");
   const auto &command_value = Member(value, "command_value");
   RequireExactObjectSize(command_value, 3U, "capability-command value");
-  const auto decoded_value = [&]() -> core::CapabilityCommandValueDTO {
-    const auto kind = Text(command_value, "kind");
-    if (kind == "io_signal_write") {
-      return core::IoSignalWriteCommandValueDTO{
-          core::ResourceRoleId(Text(command_value, "resource_role_id")),
-          Boolean(command_value, "value")};
-    }
-    Require(kind == "gripper_position",
-            "capability-command value kind is unsupported");
-    std::optional<core::CoordinateEffortDTO> max_effort;
-    const auto &effort = Member(command_value, "max_effort");
-    if (!std::holds_alternative<std::nullptr_t>(effort.storage())) {
-      max_effort = DecodeCoordinateEffort(effort);
-    }
-    return core::GripperPositionCommandValueDTO{
-        DecodeCoordinatePosition(Member(command_value, "position")),
-        std::move(max_effort)};
-  }();
-
-  const bool output =
-      std::holds_alternative<core::IoSignalWriteCommandValueDTO>(decoded_value);
-  RequireExactObjectSize(value, output ? 5U : 6U, "capability-command payload");
-  std::optional<double> completion_timeout_s;
-  if (output) {
-    Require(value.find_object_member("completion_timeout_s") == nullptr,
-            "I/O output completion policy is sealed, not caller supplied");
-  } else {
-    completion_timeout_s = Number(value, "completion_timeout_s");
+  Require(Text(command_value, "kind") == "gripper_position",
+          "capability-command value kind is unsupported");
+  std::optional<core::CoordinateEffortDTO> max_effort;
+  const auto &effort = Member(command_value, "max_effort");
+  if (!std::holds_alternative<std::nullptr_t>(effort.storage())) {
+    max_effort = DecodeCoordinateEffort(effort);
   }
+  core::GripperPositionCommandValueDTO decoded_value{
+      DecodeCoordinatePosition(Member(command_value, "position")),
+      std::move(max_effort)};
+
+  RequireExactObjectSize(value, 6U, "capability-command payload");
+  const std::optional<double> completion_timeout_s =
+      Number(value, "completion_timeout_s");
 
   const auto &option_values = Array(value, "caller_options");
   Require(option_values.size() <= core::kMaxOperationCommandOptions,
           "capability-command options exceed their fixed bound");
-  std::vector<core::CommandDurationOptionDTO> caller_options;
+  std::vector<core::CommandOptionDTO> caller_options;
   caller_options.reserve(option_values.size());
   for (const auto &option : option_values) {
     RequireExactObjectSize(option, 2U, "capability-command option");
-    caller_options.push_back(core::CommandDurationOptionDTO{
-        core::CommandOptionId(Text(option, "option_id")),
-        Number(option, "value_s")});
+    core::CommandOptionId option_id(Text(option, "option_id"));
+    if (option.find_object_member("value_bool") != nullptr) {
+      caller_options.push_back(
+          core::CommandOptionDTO{std::move(option_id), Boolean(option, "value_bool")});
+    } else {
+      caller_options.push_back(
+          core::CommandOptionDTO{std::move(option_id), Number(option, "value_s")});
+    }
   }
 
   return core::CapabilityCommandIntentDTO{
       core::CommandSchemaId(Text(value, "command_schema_id")),
       core::CommandSchemaRevision(Text(value, "command_schema_revision")),
-      decoded_value, completion_timeout_s, std::move(caller_options)};
+      std::move(decoded_value), completion_timeout_s, std::move(caller_options)};
 }
 
 [[nodiscard]] core::OperationParticipantPayloadDTO
@@ -809,34 +842,10 @@ DecodePlacePlanningIntent(const CanonicalValue &value,
 
 [[nodiscard]] core::OperationControlRequestDTO
 DecodeOperationControlRequest(const CanonicalValue &value,
-                              const core::RequestAttributionDTO &attribution,
-                              bool permits_uncertain_output_acknowledgement) {
+                              const core::RequestAttributionDTO &attribution) {
   auto execution_scope = DecodeProgramExecutionScope(value, attribution);
-  const auto *encoded_ack =
-      value.find_object_member("acknowledged_uncertain_outputs");
-  Require(!encoded_ack || permits_uncertain_output_acknowledgement,
-          "Uncertain output acknowledgement is only legal on explicit Reset");
-  RequireExactObjectSize(
-      value, 4U + (execution_scope ? 1U : 0U) + (encoded_ack ? 1U : 0U),
-      "operation control request");
-  std::optional<std::vector<core::UncertainOutputAcknowledgementDTO>>
-      acknowledged;
-  if (encoded_ack) {
-    Require(encoded_ack->is_array(),
-            "Uncertain output acknowledgement must be an array");
-    acknowledged.emplace();
-    for (const auto &row : encoded_ack->as_array()) {
-      RequireExactObjectSize(row, 2U, "uncertain output acknowledgement");
-      core::UncertainOutputAcknowledgementDTO decoded{
-          core::OperationId(Text(row, "operation_id")),
-          core::OperationRevision(Counter(row, "operation_revision", 1U))};
-      Require(acknowledged->empty() ||
-                  acknowledged->back().operation_id < decoded.operation_id,
-              "Uncertain output acknowledgements must have unique sorted "
-              "operation IDs");
-      acknowledged->push_back(std::move(decoded));
-    }
-  }
+  RequireExactObjectSize(value, 4U + (execution_scope ? 1U : 0U),
+                         "operation control request");
   return core::OperationControlRequestDTO{
       DecodeRequestContext(Member(value, "request_context")),
       core::OperationId(Text(value, "operation_id")),
@@ -844,8 +853,7 @@ DecodeOperationControlRequest(const CanonicalValue &value,
           Counter(value, "expected_operation_revision", 1U)),
       OptionalBoundedText(value, "reason", kMaximumReasonBytes),
       attribution,
-      std::move(execution_scope),
-      std::move(acknowledged)};
+      std::move(execution_scope)};
 }
 
 [[nodiscard]] core::StopIntentDTO
@@ -949,47 +957,6 @@ DecodeFullStopIntent(const CanonicalValue &value,
       attribution};
 }
 
-[[nodiscard]] core::StopFaultRecoveryIntentDTO
-DecodeStopFaultRecoveryIntent(const CanonicalValue &value) {
-  Require(value.is_object() && (value.as_object().size() == 10U ||
-                                value.as_object().size() == 11U),
-          "Stop fault-recovery intent has an unknown or missing field");
-  std::vector<core::StopFaultRecoveryConfigurationExpectationDTO> expectations;
-  const auto &rows = Array(value, "configuration_expectations");
-  Require(!rows.empty() &&
-              rows.size() <= core::kMaximumStopFaultRecoveryEvidenceRefs,
-          "Stop fault-recovery configuration table exceeds its row bound");
-  expectations.reserve(rows.size());
-  for (const auto &row : rows) {
-    RequireExactObjectSize(row, 3U,
-                           "Stop fault-recovery configuration expectation");
-    expectations.push_back(core::StopFaultRecoveryConfigurationExpectationDTO{
-        core::ControlDomainId(Text(row, "control_domain_id")),
-        core::ActiveControlConfigurationId(
-            Text(row, "active_control_configuration_id")),
-        core::ActiveControlConfigurationGeneration(
-            Counter(row, "active_control_configuration_generation", 1U))});
-  }
-  std::optional<std::string> reason;
-  if (value.find_object_member("reason") != nullptr) {
-    reason = OptionalBoundedText(value, "reason", kMaximumReasonBytes);
-  }
-  return core::StopFaultRecoveryIntentDTO{
-      DecodeRequestContext(Member(value, "request_context")),
-      core::StopFaultLatchId(Text(value, "expected_latch_id")),
-      core::StopFaultLatchGeneration(
-          Counter(value, "expected_latch_generation", 1U)),
-      Counter(value, "expected_recovery_assessment_revision", 1U),
-      core::StopCertificateId(Text(value, "expected_stop_certificate_id")),
-      core::StopCertificateRevision(
-          Counter(value, "expected_stop_certificate_revision", 1U)),
-      core::CellId(Text(value, "expected_cell_id")),
-      core::RetainedBundleId(Text(value, "expected_retained_bundle_id")),
-      core::GraphRevision(Text(value, "expected_graph_revision")),
-      std::move(expectations),
-      std::move(reason)};
-}
-
 [[nodiscard]] core::RuntimeScaleControlSelectorDTO
 DecodeRuntimeScaleControlSelector(const CanonicalValue &value) {
   if (value.find_object_member("group_targets") == nullptr) {
@@ -1064,7 +1031,7 @@ DecodeRecoveryAction(const std::string_view value) {
 DecodeOperationRecoveryRequest(const CanonicalValue &value) {
   const bool has_fresh_motion_attempt =
       value.find_object_member("fresh_motion_attempt") != nullptr;
-  RequireExactObjectSize(value, has_fresh_motion_attempt ? 11U : 10U,
+  RequireExactObjectSize(value, has_fresh_motion_attempt ? 10U : 9U,
                          "operation recovery request");
   return core::KernelRecoveryActionRequestDTO{
       Text(value, "request_id"),
@@ -1073,7 +1040,6 @@ DecodeOperationRecoveryRequest(const CanonicalValue &value) {
       Counter(value, "expected_assessment_revision", 1U),
       Counter(value, "expected_control_command_epoch", 0U),
       Counter(value, "expected_execution_id", 1U),
-      Text(value, "expected_latch_id", true),
       Text(value, "expected_stop_certificate_id", true),
       Counter(value, "expected_stop_owner_generation", 0U),
       Text(value, "reason", true),
@@ -1117,7 +1083,8 @@ DecodeOperationRecoveryRequest(const CanonicalValue &value) {
 /// In-memory Stop-progression reads of the stable Kernel. They are served
 /// beside Stop on the independent control socket, never on the ordinary one.
 [[nodiscard]] bool IsStopLaneRead(const CommandKind kind) noexcept {
-  return kind == CommandKind::kReadStop || kind == CommandKind::kGetStopFault;
+  return kind == CommandKind::kReadStop || kind == CommandKind::kReadComponentModel ||
+         kind == CommandKind::kComponentAction;
 }
 
 /// Every Stop form preempts advisory planning before it is dispatched: a
@@ -1138,19 +1105,17 @@ DecodeOperationRecoveryRequest(const CanonicalValue &value) {
   }
 }
 
-/// A component-lifecycle claim is a whole-cell configuration mutation: the
-/// Kernel serializes it with the submission lock a preview session retains
-/// for its whole planning time. Like Stop, it preempts advisory planning
-/// before it is dispatched instead of waiting behind it. Other claim kinds
-/// never take that lock.
+/// A Program reset claim is a whole-cell mutation: the Kernel serializes it
+/// with the submission lock a preview session retains for its whole planning
+/// time. Like Stop, it preempts advisory planning before it is dispatched
+/// instead of waiting behind it. Other claim kinds never take that lock.
 [[nodiscard]] bool PreemptsPlanning(
     const component_manager::detail::KernelCellAdmissionRpcPacket
         &packet) noexcept {
   const auto *intent =
       std::get_if<core::CellAdmissionClaimIntentDTO>(&packet.request);
   return intent != nullptr &&
-         (intent->claim_kind == core::CellAdmissionClaimKindDTO::kComponentLifecycle ||
-          intent->claim_kind == core::CellAdmissionClaimKindDTO::kProgramReset);
+         intent->claim_kind == core::CellAdmissionClaimKindDTO::kProgramReset;
 }
 
 namespace {
@@ -1169,33 +1134,6 @@ std::uint64_t IoCounter(const CanonicalValue& object, std::string_view name,
               result >= minimum,
           "I/O counter exceeds its unsigned range");
   return result;
-}
-
-core::IoGlobalRuleRecoveryIntentDTO
-DecodeGlobalIoRuleRecoveryIntent(const CanonicalValue &value) {
-  RequireExactObjectSize(value, 4U, "global rule recovery intent");
-  Require(Text(value, "kind") == "global_io_rule",
-          "cell recovery request kind is invalid");
-  const auto &selector = Member(value, "selector");
-  RequireExactObjectSize(selector, 3U, "global rule recovery selector");
-  const auto &context = Member(selector, "context");
-  RequireExactObjectSize(context, 5U, "global rule recovery context");
-  core::IoRuleStateContextDTO actual_context{
-      core::RequestOwnerEpoch(Text(context, "owner_epoch")),
-      IoCounter(context, "catalog_generation", 1U),
-      core::ActiveBundlePublicationGeneration(
-          Counter(context, "active_publication_generation", 1U)),
-      core::RetainedBundleId(Text(context, "bundle")),
-      core::GraphRevision(Text(context, "graph"))};
-  Require(!core::io_rule_state_context_field_error(actual_context),
-          "global rule recovery context is invalid");
-  auto rule = Text(selector, "rule_id");
-  Require(rule.find('\0') == std::string::npos,
-          "global rule recovery ID contains a null byte");
-  return {DecodeRequestContext(Member(value, "request_context")),
-          {std::move(actual_context), core::InterruptPolicyId(std::move(rule)),
-           IoCounter(selector, "expected_rule_registration_id", 1U)},
-          OptionalBoundedText(value, "reason", kMaximumReasonBytes)};
 }
 
 core::IoWatchRegistrationDTO DecodeIoWatchRegistration(const CanonicalValue& value) {
@@ -1995,31 +1933,62 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
         Text(root, "reason")};
     return decoded;
   }
-  if (command == "force_close") {
-    // Item 37: `arm` names the operator's Full Stop; `close_operations` none.
-    const auto step = Text(root, "step");
-    Require(step == "arm" || step == "close_operations",
-            "Force close step is unsupported");
-    RequireExactObjectSize(root, step == "arm" ? 4U : 3U, "Force close command");
-    Command decoded{CommandKind::kForceClose};
-    decoded.force_close_step = step;
-    if (step == "arm")
-      decoded.stop_generation =
-          core::StopGeneration(Counter(root, "stop_generation", 1U));
+  if (command == "read_component_model") {
+    RequireExactObjectSize(root, 2U, "component model query command");
+    return Command{CommandKind::kReadComponentModel};
+  }
+  if (command == "component_action") {
+    RequireExactObjectSize(root, 3U, "component action command");
+    const auto &request = Member(root, "request");
+    RequireExactObjectSize(request, 2U, "component action request");
+    Command decoded{CommandKind::kComponentAction};
+    decoded.component_id = Text(request, "component_id");
+    const auto action = core::parse_component_action(Text(request, "action"));
+    Require(action.has_value(), "component action is not a known action");
+    decoded.component_action = *action;
     return decoded;
   }
-  if (command == "get_stop_fault") {
-    RequireExactObjectSize(root, 2U, "Stop-fault query command");
-    return Command{CommandKind::kGetStopFault};
+  if (command == "set_rule_active") {
+    RequireExactObjectSize(root, 4U, "set rule active command");
+    Command decoded{CommandKind::kSetRuleActive};
+    decoded.rule_id = core::InterruptPolicyId(Text(root, "rule_id"));
+    decoded.rule_active = Boolean(root, "active");
+    return decoded;
   }
-  if (command == "recover_stop_fault") {
-    RequireExactObjectSize(root, 3U, "Stop-fault recovery command");
-    Command decoded{CommandKind::kRecoverStopFault};
+  if (command == "reset_rule_activation") {
+    RequireExactObjectSize(root, 2U, "reset rule activation command");
+    return Command{CommandKind::kResetRuleActivation};
+  }
+  if (command == "clear_outside_change") {
+    RequireExactObjectSize(root, 4U, "clear outside change command");
+    Command decoded{CommandKind::kClearOutsideChange};
+    decoded.outside_change_output = core::IoSignalId{
+        core::ControllableComponentId(Text(root, "controllable_component_id")),
+        Text(root, "signal_name")};
+    return decoded;
+  }
+  if (command == "set_io_output") {
+    // CONTRACTS §7: `signal_id` is `<component_id>/<signal_name>`.
+    RequireExactObjectSize(root, 3U, "set I/O output command");
     const auto &request = Member(root, "request");
-    if (request.find_object_member("kind"))
-      decoded.global_io_rule_recovery = DecodeGlobalIoRuleRecoveryIntent(request);
-    else
-      decoded.stop_fault_recovery = DecodeStopFaultRecoveryIntent(request);
+    RequireExactObjectSize(request, 3U, "set I/O output request");
+    const auto signal_id = Text(request, "signal_id");
+    const auto origin = Text(request, "origin");
+    Require(origin == "manual" || origin == "program",
+            "set I/O output origin is not manual or program");
+    const auto slash = signal_id.find('/');
+    Require(slash != std::string::npos && slash != 0U && slash + 1U < signal_id.size(),
+            "set I/O output signal_id is not <component_id>/<signal_name>");
+    const auto &value = Member(request, "value");
+    Require(value.is_bool() || value.is_number(),
+            "set I/O output value is not a boolean or a number");
+    Command decoded{CommandKind::kSetIoOutput};
+    decoded.io_output_signal = core::IoSignalId{
+        core::ControllableComponentId(signal_id.substr(0U, slash)),
+        signal_id.substr(slash + 1U)};
+    decoded.io_output_value = value.is_bool() ? std::variant<bool, double>(value.as_bool())
+                                              : std::variant<bool, double>(value.as_number());
+    decoded.io_output_manual = origin == "manual";
     return decoded;
   }
   if (command == "set_operation_runtime_scale") {
@@ -2063,8 +2032,7 @@ DecodeProgramMockSimulationSignals(const CanonicalValue& rows) {
       DecodeRequestAttribution(Member(root, "attribution"));
   Command decoded{kind};
   decoded.control =
-      DecodeOperationControlRequest(Member(root, "request"), attribution,
-                                    kind == CommandKind::kReset);
+      DecodeOperationControlRequest(Member(root, "request"), attribution);
   return decoded;
 }
 

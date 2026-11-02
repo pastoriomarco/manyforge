@@ -126,8 +126,8 @@ struct PreparedCapabilityCommandChannelBindingDTO final {
 struct PreparedCapabilityCommandDTO final {
   CommandSchemaId command_schema_id;
   CommandSchemaRevision command_schema_revision;
-  CapabilityCommandValueDTO command_value;
-  std::vector<CommandDurationOptionDTO> validated_options;
+  GripperPositionCommandValueDTO command_value;
+  std::vector<CommandOptionDTO> validated_options;
   std::vector<PreparedCapabilityCommandResourceBindingDTO> resource_bindings;
   std::vector<PreparedCapabilityCommandChannelBindingDTO> channel_bindings;
   double completion_timeout_s{};
@@ -135,18 +135,8 @@ struct PreparedCapabilityCommandDTO final {
   CommandConfirmationRule confirmation_rule{CommandConfirmationRule::kBindingFeedbackRequired};
   std::vector<CommandStopEvidenceRequirement> stop_evidence_requirements;
 };
-struct PreparedIoOutputCommandDTO final {
-  CommandSchemaId command_schema_id;
-  CommandSchemaRevision command_schema_revision;
-  IoSignalWriteCommandValueDTO command_value;
-  IoSignalId signal_id;
-  ResourceId output_resource;
-  ContentDigest signal_descriptor_digest;
-  IoOutputCompletionPolicyDTO completion_policy;
-};
 using PreparedParticipantPayloadDTO =
-    std::variant<PreparedMotionExecutionDTO, PreparedCapabilityCommandDTO,
-                 PreparedIoOutputCommandDTO>;
+    std::variant<PreparedMotionExecutionDTO, PreparedCapabilityCommandDTO>;
 
 struct PreparedControllerExecutionAuthorityDTO final {
   ControlInterfaceContractId control_interface_contract_id;
@@ -168,11 +158,6 @@ struct PreparedControllerExecutionAuthorityDTO final {
   std::optional<PreparedParticipantStopPlanDTO> fault_stop_plan;
 };
 
-struct PreparedProviderExecutionAuthorityDTO final {
-  ResolvedLifecycleProviderOccurrenceDTO lifecycle_provider;
-  ContentDigest signal_configuration_digest;
-  PreparedCapabilityProviderRuntimeOccurrenceDTO capability_provider;
-};
 
 struct PreparedOperationParticipantDTO final {
   ContentDigest prepared_contract_digest;
@@ -198,51 +183,8 @@ struct PreparedOperationParticipantDTO final {
   std::vector<ResourceId> resources;
   std::vector<RuntimeUnitEpochBindingDTO> runtime_unit_epochs;
   PreparedParticipantPayloadDTO payload;
-  std::variant<PreparedControllerExecutionAuthorityDTO, PreparedProviderExecutionAuthorityDTO>
-      execution_authority;
+  PreparedControllerExecutionAuthorityDTO execution_authority;
   std::optional<RuntimeMotionEndpointBindingDTO> motion_endpoint{};
-
-  PreparedOperationParticipantDTO(
-      ContentDigest prepared_contract_digest, OperationId operation_id,
-      OperationRevision operation_revision, OperationParticipantId participant_id,
-      ProgramId program_id, ProgramRevision program_revision, ProgramBindingId program_binding_id,
-      ProgramRunId program_run_id, RetainedBundleId retained_bundle_id,
-      GraphRevision graph_revision, ControllableComponentId controllable_component_id,
-      ComponentLifecycleGeneration component_lifecycle_generation,
-      ComponentTypeId component_type_id, ComponentTypeRevision component_type_revision,
-      CommandTargetId command_target_id, CapabilityId capability_id,
-      CapabilityDefinitionRevision capability_definition_revision,
-      std::vector<ProgramModelRoleBindingDTO> model_bindings,
-      std::vector<ProgramFrameRoleBindingDTO> frame_bindings,
-      ParticipantBindingIdentityDTO binding_identity, std::vector<ResourceId> resources,
-      std::vector<RuntimeUnitEpochBindingDTO> runtime_unit_epochs,
-      PreparedParticipantPayloadDTO payload,
-      std::variant<PreparedControllerExecutionAuthorityDTO, PreparedProviderExecutionAuthorityDTO>
-          execution_authority)
-      : prepared_contract_digest(std::move(prepared_contract_digest)),
-        operation_id(std::move(operation_id)),
-        operation_revision(std::move(operation_revision)),
-        participant_id(std::move(participant_id)),
-        program_id(std::move(program_id)),
-        program_revision(std::move(program_revision)),
-        program_binding_id(std::move(program_binding_id)),
-        program_run_id(std::move(program_run_id)),
-        retained_bundle_id(std::move(retained_bundle_id)),
-        graph_revision(std::move(graph_revision)),
-        controllable_component_id(std::move(controllable_component_id)),
-        component_lifecycle_generation(std::move(component_lifecycle_generation)),
-        component_type_id(std::move(component_type_id)),
-        component_type_revision(std::move(component_type_revision)),
-        command_target_id(std::move(command_target_id)),
-        capability_id(std::move(capability_id)),
-        capability_definition_revision(std::move(capability_definition_revision)),
-        model_bindings(std::move(model_bindings)),
-        frame_bindings(std::move(frame_bindings)),
-        binding_identity(std::move(binding_identity)),
-        resources(std::move(resources)),
-        runtime_unit_epochs(std::move(runtime_unit_epochs)),
-        payload(std::move(payload)),
-        execution_authority(std::move(execution_authority)) {}
 
   PreparedOperationParticipantDTO(
       ContentDigest prepared_contract_digest, OperationId operation_id,
@@ -315,14 +257,9 @@ struct PreparedOperationParticipantDTO final {
             std::move(stop_evidence_policy_revision), std::move(ordinary_stop_plan),
             std::move(fault_stop_plan)}) {}
 
-  [[nodiscard]] PreparedControllerExecutionAuthorityDTO& controller() {
-    return std::get<PreparedControllerExecutionAuthorityDTO>(execution_authority);
-  }
+  [[nodiscard]] PreparedControllerExecutionAuthorityDTO& controller() { return execution_authority; }
   [[nodiscard]] const PreparedControllerExecutionAuthorityDTO& controller() const {
-    return std::get<PreparedControllerExecutionAuthorityDTO>(execution_authority);
-  }
-  [[nodiscard]] const PreparedProviderExecutionAuthorityDTO* provider() const noexcept {
-    return std::get_if<PreparedProviderExecutionAuthorityDTO>(&execution_authority);
+    return execution_authority;
   }
 };
 

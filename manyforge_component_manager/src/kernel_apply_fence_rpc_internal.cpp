@@ -1,6 +1,5 @@
 #include "kernel_apply_fence_rpc_internal.hpp"
 #include <manyforge_component_manager/kernel_cell_admission_rpc_internal.hpp>
-#include <manyforge_core/component_lifecycle_value_codec.hpp>
 
 #include <array>
 #include <bit>
@@ -22,7 +21,7 @@ constexpr std::array<std::uint8_t, 8U> kMagic{'M', 'F', 'N', 'K',
                                               'A', 'F', 'R', '2'};
 constexpr auto kProviderMagic = [] {
   auto value = kMagic;
-  value.back() = '4';
+  value.back() = '5';
   return value;
 }();
 constexpr std::size_t kMaximumCollectionEntries = 4096U;
@@ -326,20 +325,42 @@ UsesProviderDomains(const core::ConfigurationFenceScopeDTO &scope) {
       });
 }
 
+void WriteProviderOccurrence(
+    Writer &writer, const core::ProviderConfigurationFenceOccurrenceDTO &value) {
+  WriteStrong(writer, value.controllable_component_id);
+  WriteStrong(writer, value.provider_instance_id);
+  WriteStrong(writer, value.signal_configuration_digest);
+  WriteVector(writer, value.output_resources,
+              [](Writer &output, const auto &id) { WriteStrong(output, id); });
+}
+
+[[nodiscard]] core::ProviderConfigurationFenceOccurrenceDTO
+ReadProviderOccurrence(Reader &reader) {
+  return {ReadStrong<core::ControllableComponentId>(reader),
+          ReadStrong<core::ProviderInstanceId>(reader),
+          ReadStrong<core::ContentDigest>(reader),
+          ReadVector<core::ResourceId>(reader, [](Reader &input) {
+            return ReadStrong<core::ResourceId>(input);
+          })};
+}
+
+/// Controller-only scopes keep the base packet version. A provider scope uses
+/// the provider version, whose domains carry one kind byte and the provider
+/// occurrences.
 void WriteScope(Writer &writer, const core::ConfigurationFenceScopeDTO &scope) {
   if (!scope.valid()) {
     Fail("cannot encode an invalid configuration-fence scope");
   }
-  if (writer.ProviderFormat()) {
-    writer.String(core::detail::EncodeConfigurationFenceScopeRecord(scope));
-    return;
-  }
-  if (UsesProviderDomains(scope))
+  if (!writer.ProviderFormat() && UsesProviderDomains(scope))
     Fail("provider scope requires the provider packet version");
   WriteVector(
       writer, scope.controllable_component_ids,
       [](Writer &output, const auto &value) { WriteStrong(output, value); });
   WriteVector(writer, scope.domains, [](Writer &output, const auto &value) {
+    const auto *provider =
+        std::get_if<core::ProviderConfigurationFenceDomainDTO>(&value.payload);
+    if (output.ProviderFormat())
+      output.Boolean(provider != nullptr);
     WriteStrong(output, value.control_domain_id);
     WriteOptional<core::ControlDomainRevision>(
         output, value.predecessor_control_domain_revision,
@@ -351,6 +372,12 @@ void WriteScope(Writer &writer, const core::ConfigurationFenceScopeDTO &scope) {
         [](Writer &nested, const auto &revision) {
           WriteStrong(nested, revision);
         });
+    if (provider != nullptr) {
+      WriteOptional<core::ProviderConfigurationFenceOccurrenceDTO>(
+          output, provider->predecessor_provider, WriteProviderOccurrence);
+      WriteOptional<core::ProviderConfigurationFenceOccurrenceDTO>(
+          output, provider->candidate_provider, WriteProviderOccurrence);
+    }
   });
   WriteVector(writer, scope.bindings, [](Writer &output, const auto &value) {
     WriteStrong(output, value.control_binding_id);
@@ -371,8 +398,6 @@ void WriteScope(Writer &writer, const core::ConfigurationFenceScopeDTO &scope) {
 }
 
 [[nodiscard]] core::ConfigurationFenceScopeDTO ReadScope(Reader &reader) {
-  if (reader.ProviderFormat())
-    return core::detail::DecodeConfigurationFenceScopeRecord(reader.String());
   core::ConfigurationFenceScopeDTO result{
       ReadVector<core::ControllableComponentId>(
           reader,
@@ -382,7 +407,8 @@ void WriteScope(Writer &writer, const core::ConfigurationFenceScopeDTO &scope) {
       ReadVector<core::ConfigurationFenceDomainScopeDTO>(
           reader,
           [](Reader &input) {
-            return core::ConfigurationFenceDomainScopeDTO{
+            const bool provider = input.ProviderFormat() && input.Boolean();
+            core::ConfigurationFenceDomainScopeDTO domain{
                 ReadStrong<core::ControlDomainId>(input),
                 ReadOptional<core::ControlDomainRevision>(
                     input,
@@ -393,6 +419,15 @@ void WriteScope(Writer &writer, const core::ConfigurationFenceScopeDTO &scope) {
                     input, [](Reader &nested) {
                       return ReadStrong<core::ControlDomainRevision>(nested);
                     })};
+            if (provider) {
+              auto before = ReadOptional<core::ProviderConfigurationFenceOccurrenceDTO>(
+                  input, ReadProviderOccurrence);
+              auto after = ReadOptional<core::ProviderConfigurationFenceOccurrenceDTO>(
+                  input, ReadProviderOccurrence);
+              domain.payload = core::ProviderConfigurationFenceDomainDTO{
+                  std::move(before), std::move(after)};
+            }
+            return domain;
           }),
       ReadVector<core::ConfigurationFenceBindingScopeDTO>(
           reader,
@@ -474,24 +509,6 @@ void WriteReplayStatus(Writer &writer,
   return result;
 }
 
-void WriteProviderLineage(
-    Writer &writer, const core::ProviderConfigurationFenceLineageDTO &value) {
-  if (!value.valid())
-    Fail("invalid provider lineage receipt");
-  WriteStrong(writer, value.control_domain_id);
-  WriteStrong(writer, value.provider_runtime_epoch);
-  WriteGeneration(writer, value.component_lifecycle_generation);
-}
-core::ProviderConfigurationFenceLineageDTO ReadProviderLineage(Reader &reader) {
-  core::ProviderConfigurationFenceLineageDTO value{
-      ReadStrong<core::ControlDomainId>(reader),
-      ReadStrong<core::RuntimeEpoch>(reader),
-      ReadGeneration<core::ComponentLifecycleGeneration>(reader)};
-  if (!value.valid())
-    Fail("invalid provider lineage receipt");
-  return value;
-}
-
 void WriteIntent(Writer &writer,
                  const core::ApplyConfigurationFenceIntentDTO &intent) {
   if (!intent.valid()) {
@@ -508,9 +525,6 @@ void WriteIntent(Writer &writer,
   WriteVector(writer, intent.expected_active_control_configurations,
               WriteActiveConfiguration);
   writer.String(intent.reason);
-  if (writer.ProviderFormat())
-    WriteVector(writer, intent.expected_provider_lineages,
-                WriteProviderLineage);
 }
 
 [[nodiscard]] core::ApplyConfigurationFenceIntentDTO
@@ -527,10 +541,6 @@ ReadIntent(Reader &reader) {
       ReadVector<core::DomainActiveControlConfigurationDTO>(
           reader, ReadActiveConfiguration),
       reader.String()};
-  if (reader.ProviderFormat())
-    result.expected_provider_lineages =
-        ReadVector<core::ProviderConfigurationFenceLineageDTO>(
-            reader, ReadProviderLineage);
   if (!result.valid()) {
     Fail("decoded Apply-fence intent is invalid");
   }
@@ -631,8 +641,6 @@ void WriteAdmissionSnapshot(
   writer.U64(snapshot.affected_queued_operation_count);
   writer.U64(snapshot.affected_active_operation_count);
   WriteStrong(writer, snapshot.result_digest);
-  if (writer.ProviderFormat())
-    WriteVector(writer, snapshot.provider_lineages, WriteProviderLineage);
 }
 
 [[nodiscard]] core::ConfigurationFenceAdmissionSnapshotDTO
@@ -649,10 +657,6 @@ ReadAdmissionSnapshot(Reader &reader) {
       reader.U64(),
       reader.U64(),
       ReadStrong<core::ContentDigest>(reader)};
-  if (reader.ProviderFormat())
-    result.provider_lineages =
-        ReadVector<core::ProviderConfigurationFenceLineageDTO>(
-            reader, ReadProviderLineage);
   if (!result.presence_valid()) {
     Fail("decoded fence-admission snapshot is invalid");
   }
@@ -1030,379 +1034,6 @@ ReadReconcileResult(Reader &reader) {
   return result;
 }
 
-void WriteSelectedFenceOwner(Writer &writer,
-                             const core::SelectedBringUpFenceOwnerDTO &owner) {
-  if (!owner.valid())
-    Fail("invalid selected fence owner");
-  WriteStrong(writer, owner.lifecycle_transaction_id);
-  WriteGeneration(writer, owner.lifecycle_transaction_generation);
-  WriteGeneration(writer, owner.selected_claim_generation);
-}
-core::SelectedBringUpFenceOwnerDTO ReadSelectedFenceOwner(Reader &reader) {
-  core::SelectedBringUpFenceOwnerDTO owner{
-      ReadStrong<core::LifecycleTransactionId>(reader),
-      ReadGeneration<core::LifecycleTransactionGeneration>(reader),
-      ReadGeneration<core::CellAdmissionClaimGeneration>(reader)};
-  if (!owner.valid())
-    Fail("invalid selected fence owner");
-  return owner;
-}
-void WriteSelectedIntent(
-    Writer &writer,
-    const core::SelectedBringUpConfigurationFenceIntentDTO &intent) {
-  if (!intent.valid())
-    Fail("invalid selected fence intent");
-  WritePublicRequestContext(writer, intent.owner_request_context);
-  WriteStrong(writer, intent.lifecycle_transaction_id);
-  WriteGeneration(writer, intent.lifecycle_transaction_generation);
-  writer.String(EncodeKernelCellAdmissionRpcResponse("cell_admission_acquire",
-                                                     intent.selected_claim));
-  WriteAdmissionSnapshot(writer, intent.expected_admission);
-  WriteGeneration(writer, intent.expected_publication_generation);
-  WriteScope(writer, intent.selected_scope);
-  WriteProjectionRevision(writer, intent.candidate_projection_revision);
-}
-core::SelectedBringUpConfigurationFenceIntentDTO
-ReadSelectedIntent(Reader &reader) {
-  auto request = ReadPublicRequestContext(reader);
-  auto transaction = ReadStrong<core::LifecycleTransactionId>(reader);
-  auto generation =
-      ReadGeneration<core::LifecycleTransactionGeneration>(reader);
-  auto claim_packet = DecodeKernelCellAdmissionRpcResponse(reader.String());
-  if (claim_packet.command != "cell_admission_acquire" ||
-      !std::holds_alternative<core::CellAdmissionClaimDTO>(
-          claim_packet.response))
-    Fail("invalid selected claim record");
-  core::SelectedBringUpConfigurationFenceIntentDTO intent{
-      request,
-      transaction,
-      generation,
-      std::get<core::CellAdmissionClaimDTO>(std::move(claim_packet.response)),
-      ReadAdmissionSnapshot(reader),
-      ReadGeneration<core::ActiveBundlePublicationGeneration>(reader),
-      ReadScope(reader),
-      ReadProjectionRevision(reader)};
-  if (!intent.valid())
-    Fail("invalid selected fence intent");
-  return intent;
-}
-void WriteSelectedReconciliationEvidence(
-    Writer &writer,
-    const core::SelectedBringUpConfigurationFenceReconciliationEvidenceDTO
-        &evidence,
-    const core::ConfigurationFenceScopeDTO *const shared_scope = nullptr) {
-  if (!evidence.valid()) {
-    Fail("cannot encode invalid fence reconciliation evidence");
-  }
-  if (shared_scope != nullptr && evidence.reconciled_scope != *shared_scope) {
-    Fail("fence reconciliation evidence differs from its shared scope");
-  }
-  WriteExecutionHostEpoch(writer, evidence.execution_host_epoch);
-  WriteSelectedFenceOwner(writer, evidence.owner_transaction);
-  WriteStrong(writer, evidence.configuration_fence_id);
-  WriteGeneration(writer, evidence.configuration_fence_generation);
-  if (shared_scope == nullptr) {
-    WriteScope(writer, evidence.reconciled_scope);
-  }
-  writer.U64(evidence.operation_resource_generation);
-  WriteStrong(writer, evidence.active_graph_revision);
-  WriteProjectionRevision(writer, evidence.active_projection_revision);
-  WriteGeneration(writer, evidence.active_publication_generation);
-  WriteStrong(writer, evidence.active_public_pointer_digest);
-  WriteVector(writer, evidence.active_control_configurations,
-              WriteActiveConfiguration);
-  writer.U64(evidence.affected_queued_operation_count);
-  writer.U64(evidence.affected_active_operation_count);
-  WriteStrong(writer, evidence.evidence_digest);
-}
-
-[[nodiscard]] core::SelectedBringUpConfigurationFenceReconciliationEvidenceDTO
-ReadSelectedReconciliationEvidence(
-    Reader &reader,
-    const core::ConfigurationFenceScopeDTO *const shared_scope = nullptr) {
-  core::SelectedBringUpConfigurationFenceReconciliationEvidenceDTO result{
-      ReadExecutionHostEpoch(reader),
-      ReadSelectedFenceOwner(reader),
-      ReadStrong<core::ConfigurationFenceId>(reader),
-      ReadGeneration<core::ConfigurationFenceGeneration>(reader),
-      shared_scope == nullptr ? ReadScope(reader) : *shared_scope,
-      reader.U64(),
-      ReadStrong<core::GraphRevision>(reader),
-      ReadProjectionRevision(reader),
-      ReadGeneration<core::ActiveBundlePublicationGeneration>(reader),
-      ReadStrong<core::ContentDigest>(reader),
-      ReadVector<core::DomainActiveControlConfigurationDTO>(
-          reader, ReadActiveConfiguration),
-      reader.U64(),
-      reader.U64(),
-      ReadStrong<core::ContentDigest>(reader)};
-  if (!result.valid()) {
-    Fail("decoded fence reconciliation evidence is invalid");
-  }
-  return result;
-}
-
-void WriteSelectedRelease(
-    Writer &writer,
-    const core::SelectedBringUpConfigurationFenceReleaseDTO &request) {
-  if (!request.valid()) {
-    Fail("cannot encode an invalid fence release request");
-  }
-  WriteSelectedReconciliationEvidence(writer, request.reconciliation_evidence);
-  WriteStrong(writer, request.manager_runtime_epoch);
-}
-
-[[nodiscard]] core::SelectedBringUpConfigurationFenceReleaseDTO
-ReadSelectedRelease(Reader &reader) {
-  core::SelectedBringUpConfigurationFenceReleaseDTO result{
-      ReadSelectedReconciliationEvidence(reader),
-      ReadStrong<core::RuntimeEpoch>(reader)};
-  if (!result.valid()) {
-    Fail("decoded fence release request is invalid");
-  }
-  return result;
-}
-
-void WriteSelectedReleased(
-    Writer &writer,
-    const core::SelectedBringUpConfigurationFenceReleasedDTO &released) {
-  if (!released.valid()) {
-    Fail("cannot encode an invalid fence release receipt");
-  }
-  WriteSelectedRelease(writer, released.request);
-  WriteExecutionHostEpoch(writer, released.execution_host_epoch);
-  writer.I64(released.released_at_ns);
-  WriteReplayStatus(writer, released.replay_status);
-  WriteStrong(writer, released.release_receipt_digest);
-}
-
-[[nodiscard]] core::SelectedBringUpConfigurationFenceReleasedDTO
-ReadSelectedReleased(Reader &reader) {
-  core::SelectedBringUpConfigurationFenceReleasedDTO result{
-      ReadSelectedRelease(reader), ReadExecutionHostEpoch(reader), reader.I64(),
-      ReadReplayStatus(reader), ReadStrong<core::ContentDigest>(reader)};
-  if (!result.valid()) {
-    Fail("decoded fence release receipt is invalid");
-  }
-  return result;
-}
-
-void WriteSelectedReleasedWithSharedEvidence(
-    Writer &writer,
-    const core::SelectedBringUpConfigurationFenceReleasedDTO &released,
-    const core::SelectedBringUpConfigurationFenceReconciliationEvidenceDTO
-        &shared_evidence) {
-  if (!released.valid() ||
-      released.request.reconciliation_evidence != shared_evidence ||
-      released.execution_host_epoch != shared_evidence.execution_host_epoch) {
-    Fail("fence release receipt differs from its shared status evidence");
-  }
-  WriteStrong(writer, released.request.manager_runtime_epoch);
-  writer.I64(released.released_at_ns);
-  WriteReplayStatus(writer, released.replay_status);
-  WriteStrong(writer, released.release_receipt_digest);
-}
-
-[[nodiscard]] core::SelectedBringUpConfigurationFenceReleasedDTO
-ReadSelectedReleasedWithSharedEvidence(
-    Reader &reader,
-    const core::SelectedBringUpConfigurationFenceReconciliationEvidenceDTO
-        &shared_evidence) {
-  core::SelectedBringUpConfigurationFenceReleasedDTO result{
-      core::SelectedBringUpConfigurationFenceReleaseDTO{
-          shared_evidence, ReadStrong<core::RuntimeEpoch>(reader)},
-      shared_evidence.execution_host_epoch, reader.I64(),
-      ReadReplayStatus(reader), ReadStrong<core::ContentDigest>(reader)};
-  if (!result.valid()) {
-    Fail("decoded shared-evidence fence release receipt is invalid");
-  }
-  return result;
-}
-
-void WriteSelectedStatusQuery(
-    Writer &writer,
-    const core::SelectedBringUpConfigurationFenceStatusQueryDTO &query) {
-  if (!query.valid()) {
-    Fail("cannot encode an invalid fence status query");
-  }
-  WriteSelectedFenceOwner(writer, query.owner_transaction);
-  WriteStrong(writer, query.configuration_fence_id);
-  WriteGeneration(writer, query.configuration_fence_generation);
-  WriteScope(writer, query.expected_scope);
-  WriteStrong(writer, query.manager_runtime_epoch);
-}
-
-[[nodiscard]] core::SelectedBringUpConfigurationFenceStatusQueryDTO
-ReadSelectedStatusQuery(Reader &reader) {
-  core::SelectedBringUpConfigurationFenceStatusQueryDTO result{
-      ReadSelectedFenceOwner(reader),
-      ReadStrong<core::ConfigurationFenceId>(reader),
-      ReadGeneration<core::ConfigurationFenceGeneration>(reader),
-      ReadScope(reader), ReadStrong<core::RuntimeEpoch>(reader)};
-  if (!result.valid()) {
-    Fail("decoded fence status query is invalid");
-  }
-  return result;
-}
-
-void WriteSelectedStatus(
-    Writer &writer,
-    const core::SelectedBringUpConfigurationFenceStatusDTO &status) {
-  if (!status.presence_valid()) {
-    Fail("cannot encode an invalid fence status");
-  }
-  WriteSelectedStatusQuery(writer, status.echoed_query);
-  // The DTO validity relation proves this scope equals expected_scope. Keep
-  // one copy on this private bounded wire and reconstruct the second value.
-  WriteSelectedReconciliationEvidence(writer, status.reconciliation_evidence,
-                                      &status.echoed_query.expected_scope);
-  writer.Byte(static_cast<std::uint8_t>(status.state));
-  writer.Boolean(status.admission_fenced);
-  WriteOptional<core::SelectedBringUpConfigurationFenceReleasedDTO>(
-      writer, status.release_receipt,
-      [&status](Writer &output, const auto &released) {
-        WriteSelectedReleasedWithSharedEvidence(output, released,
-                                                status.reconciliation_evidence);
-      });
-  writer.String(status.required_compensation_or_operator_direction);
-  WriteStrong(writer, status.result_digest);
-  WriteOptional<core::ErrorDTO>(writer, status.error, WriteError);
-}
-
-[[nodiscard]] core::SelectedBringUpConfigurationFenceStatusDTO
-ReadSelectedStatus(Reader &reader) {
-  auto query = ReadSelectedStatusQuery(reader);
-  auto evidence =
-      ReadSelectedReconciliationEvidence(reader, &query.expected_scope);
-  const auto state = static_cast<core::ConfigurationFenceState>(reader.Byte());
-  const bool admission_fenced = reader.Boolean();
-  auto release_receipt =
-      ReadOptional<core::SelectedBringUpConfigurationFenceReleasedDTO>(
-          reader, [&evidence](Reader &input) {
-            return ReadSelectedReleasedWithSharedEvidence(input, evidence);
-          });
-  core::SelectedBringUpConfigurationFenceStatusDTO result{
-      std::move(query),
-      std::move(evidence),
-      state,
-      admission_fenced,
-      std::move(release_receipt),
-      reader.String(),
-      ReadStrong<core::ContentDigest>(reader),
-      ReadOptional<core::ErrorDTO>(reader, ReadError)};
-  if (!result.presence_valid()) {
-    Fail("decoded fence status is invalid");
-  }
-  return result;
-}
-
-void WriteSelectedAttemptQuery(
-    Writer &writer,
-    const core::SelectedBringUpFenceAcquireAttemptQueryDTO &query) {
-  if (!query.valid()) {
-    Fail("cannot encode an invalid fence-attempt query");
-  }
-  WriteSelectedIntent(writer, query.persisted_intent);
-  WriteStrong(writer, query.persisted_attempt_digest);
-  WriteStrong(writer, query.manager_runtime_epoch);
-}
-
-[[nodiscard]] core::SelectedBringUpFenceAcquireAttemptQueryDTO
-ReadSelectedAttemptQuery(Reader &reader) {
-  core::SelectedBringUpFenceAcquireAttemptQueryDTO result{
-      ReadSelectedIntent(reader), ReadStrong<core::ContentDigest>(reader),
-      ReadStrong<core::RuntimeEpoch>(reader)};
-  if (!result.valid()) {
-    Fail("decoded fence-attempt query is invalid");
-  }
-  return result;
-}
-
-void WriteSelectedAttemptResult(
-    Writer &writer,
-    const core::SelectedBringUpFenceAcquireAttemptReconcileResultDTO &result) {
-  if (!result.presence_valid()) {
-    Fail("cannot encode invalid fence-attempt reconciliation");
-  }
-  WriteExecutionHostEpoch(writer, result.execution_host_epoch);
-  WriteSelectedAttemptQuery(writer, result.echoed_query);
-  writer.Byte(static_cast<std::uint8_t>(result.state));
-  WriteOptional<core::ConfigurationFenceAcceptedDTO>(
-      writer, result.accepted_fence,
-      [&result](Writer &output, const auto &accepted) {
-        WriteAccepted(output, accepted,
-                      &result.echoed_query.persisted_intent.selected_scope);
-      });
-  writer.Boolean(result.admission_fenced);
-  writer.String(result.required_compensation_or_operator_direction);
-  WriteStrong(writer, result.result_digest);
-  WriteOptional<core::ErrorDTO>(writer, result.error, WriteError);
-}
-
-[[nodiscard]] core::SelectedBringUpFenceAcquireAttemptReconcileResultDTO
-ReadSelectedAttemptResult(Reader &reader) {
-  auto execution_host_epoch = ReadExecutionHostEpoch(reader);
-  auto query = ReadSelectedAttemptQuery(reader);
-  const auto state =
-      static_cast<core::ApplyFenceAcquireAttemptReconcileState>(reader.Byte());
-  auto accepted = ReadOptional<core::ConfigurationFenceAcceptedDTO>(
-      reader, [&query](Reader &input) {
-        return ReadAccepted(input, &query.persisted_intent.selected_scope);
-      });
-  core::SelectedBringUpFenceAcquireAttemptReconcileResultDTO result{
-      std::move(execution_host_epoch),
-      std::move(query),
-      state,
-      std::move(accepted),
-      reader.Boolean(),
-      reader.String(),
-      ReadStrong<core::ContentDigest>(reader),
-      ReadOptional<core::ErrorDTO>(reader, ReadError)};
-  if (!result.presence_valid()) {
-    Fail("decoded fence-attempt reconciliation is invalid");
-  }
-  return result;
-}
-
-void WriteSelectedReleaseAttemptQuery(
-    Writer &writer,
-    const core::SelectedBringUpFenceReleaseAttemptQueryDTO &query) {
-  if (!query.valid())
-    Fail("invalid selected release attempt");
-  WriteSelectedRelease(writer, query.persisted_request);
-}
-core::SelectedBringUpFenceReleaseAttemptQueryDTO
-ReadSelectedReleaseAttemptQuery(Reader &reader) {
-  return {ReadSelectedRelease(reader)};
-}
-void WriteSelectedReleaseAttemptResult(
-    Writer &writer,
-    const core::SelectedBringUpFenceReleaseAttemptReconcileResultDTO &result) {
-  if (!result.presence_valid())
-    Fail("invalid selected release reconciliation");
-  WriteSelectedReleaseAttemptQuery(writer, result.echoed_query);
-  writer.Byte(static_cast<std::uint8_t>(result.state));
-  WriteOptional<core::SelectedBringUpConfigurationFenceReleasedDTO>(
-      writer, result.release_receipt, WriteSelectedReleased);
-  WriteOptional<core::SelectedBringUpConfigurationFenceStatusDTO>(
-      writer, result.observed_status, WriteSelectedStatus);
-  WriteOptional<core::ErrorDTO>(writer, result.error, WriteError);
-}
-core::SelectedBringUpFenceReleaseAttemptReconcileResultDTO
-ReadSelectedReleaseAttemptResult(Reader &reader) {
-  core::SelectedBringUpFenceReleaseAttemptReconcileResultDTO result{
-      ReadSelectedReleaseAttemptQuery(reader),
-      static_cast<core::SelectedBringUpFenceReleaseAttemptState>(reader.Byte()),
-      ReadOptional<core::SelectedBringUpConfigurationFenceReleasedDTO>(
-          reader, ReadSelectedReleased),
-      ReadOptional<core::SelectedBringUpConfigurationFenceStatusDTO>(
-          reader, ReadSelectedStatus),
-      ReadOptional<core::ErrorDTO>(reader, ReadError)};
-  if (!result.presence_valid())
-    Fail("invalid selected release reconciliation");
-  return result;
-}
-
 enum class RequestKind : std::uint8_t {
   kObserveAdmission = 1U,
   kAcquire = 2U,
@@ -1410,12 +1041,6 @@ enum class RequestKind : std::uint8_t {
   kRehydrate = 4U,
   kQueryStatus = 5U,
   kRelease = 6U,
-  kSelectedAcquire = 7U,
-  kSelectedReconcileAttempt = 8U,
-  kSelectedQueryStatus = 9U,
-  kSelectedRelease = 10U,
-  kSelectedReconcileRelease = 11U,
-
 };
 
 enum class ResponseKind : std::uint8_t {
@@ -1426,11 +1051,6 @@ enum class ResponseKind : std::uint8_t {
   kStatus = 5U,
   kReleased = 6U,
   kFailure = 7U,
-  kSelectedAttemptReconciled = 8U,
-  kSelectedStatus = 9U,
-  kSelectedReleased = 10U,
-  kSelectedReleaseReconciled = 11U,
-
 };
 
 [[nodiscard]] bool UsesProviderScope(const KernelApplyFenceRpcRequest &packet) {
@@ -1455,25 +1075,6 @@ enum class ResponseKind : std::uint8_t {
                                           core::ConfigurationFenceReleaseDTO>)
           return UsesProviderDomains(
               value.reconciliation_evidence.reconciled_scope);
-        else if constexpr (
-            std::is_same_v<T, core::SelectedBringUpConfigurationFenceIntentDTO>)
-          return UsesProviderDomains(value.selected_scope);
-        else if constexpr (
-            std::is_same_v<T, core::SelectedBringUpFenceAcquireAttemptQueryDTO>)
-          return UsesProviderDomains(value.persisted_intent.selected_scope);
-        else if constexpr (
-            std::is_same_v<
-                T, core::SelectedBringUpConfigurationFenceStatusQueryDTO>)
-          return UsesProviderDomains(value.expected_scope);
-        else if constexpr (
-            std::is_same_v<T,
-                           core::SelectedBringUpConfigurationFenceReleaseDTO>)
-          return UsesProviderDomains(
-              value.reconciliation_evidence.reconciled_scope);
-        else if constexpr (
-            std::is_same_v<T, core::SelectedBringUpFenceReleaseAttemptQueryDTO>)
-          return UsesProviderDomains(
-              value.persisted_request.reconciliation_evidence.reconciled_scope);
         else
           return false;
       },
@@ -1500,25 +1101,6 @@ UsesProviderScope(const KernelApplyFenceRpcResponse &packet) {
                                           core::ConfigurationFenceReleasedDTO>)
           return UsesProviderDomains(
               value.request.reconciliation_evidence.reconciled_scope);
-        else if constexpr (
-            std::is_same_v<
-                T, core::SelectedBringUpFenceAcquireAttemptReconcileResultDTO>)
-          return UsesProviderDomains(
-              value.echoed_query.persisted_intent.selected_scope);
-        else if constexpr (
-            std::is_same_v<T, core::SelectedBringUpConfigurationFenceStatusDTO>)
-          return UsesProviderDomains(value.echoed_query.expected_scope);
-        else if constexpr (
-            std::is_same_v<T,
-                           core::SelectedBringUpConfigurationFenceReleasedDTO>)
-          return UsesProviderDomains(
-              value.request.reconciliation_evidence.reconciled_scope);
-        else if constexpr (
-            std::is_same_v<
-                T, core::SelectedBringUpFenceReleaseAttemptReconcileResultDTO>)
-          return UsesProviderDomains(
-              value.echoed_query.persisted_request.reconciliation_evidence
-                  .reconciled_scope);
         else
           return false;
       },
@@ -1526,6 +1108,23 @@ UsesProviderScope(const KernelApplyFenceRpcResponse &packet) {
 }
 
 } // namespace
+
+std::string EncodeConfigurationFenceScopeRecord(
+    const core::ConfigurationFenceScopeDTO &scope) {
+  Writer writer(true);
+  WriteScope(writer, scope);
+  return std::move(writer).Finish();
+}
+
+core::ConfigurationFenceScopeDTO
+DecodeConfigurationFenceScopeRecord(const std::string_view bytes) {
+  Reader reader(bytes);
+  if (!reader.ProviderFormat())
+    Fail("configuration-fence scope record version differs");
+  auto scope = ReadScope(reader);
+  reader.Finish(true);
+  return scope;
+}
 
 bool IsKernelApplyFenceRpcPacket(const std::string_view bytes) noexcept {
   if (bytes.size() < kMagic.size())
@@ -1566,34 +1165,6 @@ EncodeKernelApplyFenceRpcRequest(const KernelApplyFenceRpcRequest &request) {
                                  T, core::ConfigurationFenceStatusQueryDTO>) {
           writer.Byte(static_cast<std::uint8_t>(RequestKind::kQueryStatus));
           WriteStatusQuery(writer, value);
-        } else if constexpr (
-            std::is_same_v<T,
-                           core::SelectedBringUpConfigurationFenceIntentDTO>) {
-          writer.Byte(static_cast<std::uint8_t>(RequestKind::kSelectedAcquire));
-          WriteSelectedIntent(writer, value);
-        } else if constexpr (
-            std::is_same_v<T,
-                           core::SelectedBringUpFenceAcquireAttemptQueryDTO>) {
-          writer.Byte(static_cast<std::uint8_t>(
-              RequestKind::kSelectedReconcileAttempt));
-          WriteSelectedAttemptQuery(writer, value);
-        } else if constexpr (
-            std::is_same_v<
-                T, core::SelectedBringUpConfigurationFenceStatusQueryDTO>) {
-          writer.Byte(
-              static_cast<std::uint8_t>(RequestKind::kSelectedQueryStatus));
-          WriteSelectedStatusQuery(writer, value);
-        } else if constexpr (
-            std::is_same_v<T,
-                           core::SelectedBringUpConfigurationFenceReleaseDTO>) {
-          writer.Byte(static_cast<std::uint8_t>(RequestKind::kSelectedRelease));
-          WriteSelectedRelease(writer, value);
-        } else if constexpr (
-            std::is_same_v<T,
-                           core::SelectedBringUpFenceReleaseAttemptQueryDTO>) {
-          writer.Byte(static_cast<std::uint8_t>(
-              RequestKind::kSelectedReconcileRelease));
-          WriteSelectedReleaseAttemptQuery(writer, value);
         } else {
           writer.Byte(static_cast<std::uint8_t>(RequestKind::kRelease));
           WriteRelease(writer, value);
@@ -1620,16 +1191,6 @@ DecodeKernelApplyFenceRpcRequest(const std::string_view bytes) {
       return ReadStatusQuery(reader);
     case RequestKind::kRelease:
       return ReadRelease(reader);
-    case RequestKind::kSelectedAcquire:
-      return ReadSelectedIntent(reader);
-    case RequestKind::kSelectedReconcileAttempt:
-      return ReadSelectedAttemptQuery(reader);
-    case RequestKind::kSelectedQueryStatus:
-      return ReadSelectedStatusQuery(reader);
-    case RequestKind::kSelectedRelease:
-      return ReadSelectedRelease(reader);
-    case RequestKind::kSelectedReconcileRelease:
-      return ReadSelectedReleaseAttemptQuery(reader);
     }
     Fail("request kind is unknown");
   }();
@@ -1669,31 +1230,6 @@ EncodeKernelApplyFenceRpcResponse(const KernelApplyFenceRpcResponse &response) {
                                  T, core::ConfigurationFenceReleasedDTO>) {
           writer.Byte(static_cast<std::uint8_t>(ResponseKind::kReleased));
           WriteReleased(writer, value);
-        } else if constexpr (
-            std::is_same_v<
-                T,
-                core::SelectedBringUpFenceAcquireAttemptReconcileResultDTO>) {
-          writer.Byte(static_cast<std::uint8_t>(
-              ResponseKind::kSelectedAttemptReconciled));
-          WriteSelectedAttemptResult(writer, value);
-        } else if constexpr (
-            std::is_same_v<T,
-                           core::SelectedBringUpConfigurationFenceStatusDTO>) {
-          writer.Byte(static_cast<std::uint8_t>(ResponseKind::kSelectedStatus));
-          WriteSelectedStatus(writer, value);
-        } else if constexpr (
-            std::is_same_v<
-                T, core::SelectedBringUpConfigurationFenceReleasedDTO>) {
-          writer.Byte(
-              static_cast<std::uint8_t>(ResponseKind::kSelectedReleased));
-          WriteSelectedReleased(writer, value);
-        } else if constexpr (
-            std::is_same_v<
-                T,
-                core::SelectedBringUpFenceReleaseAttemptReconcileResultDTO>) {
-          writer.Byte(static_cast<std::uint8_t>(
-              ResponseKind::kSelectedReleaseReconciled));
-          WriteSelectedReleaseAttemptResult(writer, value);
         } else {
           writer.Byte(static_cast<std::uint8_t>(ResponseKind::kFailure));
           WriteError(writer, value.error);
@@ -1722,14 +1258,6 @@ DecodeKernelApplyFenceRpcResponse(const std::string_view bytes) {
       return ReadReleased(reader);
     case ResponseKind::kFailure:
       return KernelApplyFenceRpcFailure{ReadError(reader)};
-    case ResponseKind::kSelectedAttemptReconciled:
-      return ReadSelectedAttemptResult(reader);
-    case ResponseKind::kSelectedStatus:
-      return ReadSelectedStatus(reader);
-    case ResponseKind::kSelectedReleased:
-      return ReadSelectedReleased(reader);
-    case ResponseKind::kSelectedReleaseReconciled:
-      return ReadSelectedReleaseAttemptResult(reader);
     }
     Fail("response kind is unknown");
   }();

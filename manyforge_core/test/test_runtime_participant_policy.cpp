@@ -2,7 +2,7 @@
 
 #include <limits>
 #include <manyforge_core/runtime_participant_policy.hpp>
-#include <manyforge_core/types/tcp_speed_check.hpp>
+#include <manyforge_core/types/resolved_frame.hpp>
 #include <optional>
 #include <string>
 
@@ -107,46 +107,11 @@ TEST(RuntimeParticipantPolicy, DeploymentMaximumCapsOperationRequest) {
   EXPECT_FALSE(apply_deployment_motion_speed_limit(1000.1, {}).ok());
 }
 
-TEST(RuntimeParticipantPolicy, TcpSpeedCheckNamesExactlyTwoModes) {
-  EXPECT_EQ(parse_tcp_speed_check("active_tcp"), TcpSpeedCheck::kActiveTcp);
-  EXPECT_EQ(parse_tcp_speed_check("active_tcp_and_flange"),
-            TcpSpeedCheck::kActiveTcpAndFlange);
-  for (const auto invalid : {"", "flange", "Active_TCP", "active_tcp_and_tool"})
-    EXPECT_FALSE(parse_tcp_speed_check(invalid)) << invalid;
-  for (const auto mode : {TcpSpeedCheck::kActiveTcp, TcpSpeedCheck::kActiveTcpAndFlange})
-    EXPECT_EQ(parse_tcp_speed_check(to_string(mode)), mode);
-}
-
-TEST(RuntimeParticipantPolicy, SpeedCheckFramesAddTheRobotFlangeOnce) {
-  const ResolvedFrameDTO robot_tcp = ResolvedComponentModelFrameDTO{
-      ControllableComponentId("lite6"), ModelInstanceId("lite6.model"), FrameRoleId("tcp"),
-      "mf2_link_tcp", ModelRevision("lite6.revision")};
-  const ResolvedFrameDTO flange = ResolvedComponentModelFrameDTO{
-      ControllableComponentId("lite6"), ModelInstanceId("lite6.model"), FrameRoleId("flange"),
-      "mf2_link_eef", ModelRevision("lite6.revision")};
-  // `active_tcp`: the active TCP alone.
-  EXPECT_EQ(speed_check_frames(robot_tcp, std::nullopt), std::vector{robot_tcp});
-  // `active_tcp_and_flange`: the TCP first, then the robot flange.
-  EXPECT_EQ(speed_check_frames(robot_tcp, flange), (std::vector{robot_tcp, flange}));
-  // A TCP on a mounted tool keeps the robot's flange as the second point.
+TEST(RuntimeParticipantPolicy, FrameRoleIdNamesTheModelRole) {
   const ResolvedFrameDTO tool_tcp = ResolvedComponentModelFrameDTO{
       ControllableComponentId("vacuum_gripper"), ModelInstanceId("vacuum_gripper.model"),
       FrameRoleId("cup_center"), "mf2_cup_center", ModelRevision("vacuum.revision")};
-  const auto mounted = speed_check_frames(tool_tcp, flange);
-  ASSERT_EQ(mounted.size(), 2U);
-  EXPECT_EQ(frame_role_id(mounted[0]), "cup_center");
-  EXPECT_EQ(std::get<ResolvedComponentModelFrameDTO>(mounted[1]).controllable_component_id,
-            ControllableComponentId("lite6"));
-  EXPECT_EQ(frame_role_id(mounted[1]), "flange");
-  // The flange itself as TCP, or UR's `tcp` and `flange` on one link: one point.
-  EXPECT_EQ(speed_check_frames(flange, flange), std::vector{flange});
-  const ResolvedFrameDTO ur_tcp = ResolvedComponentModelFrameDTO{
-      ControllableComponentId("ur10e"), ModelInstanceId("ur10e.model"), FrameRoleId("tcp"),
-      "mf2_tool0", ModelRevision("ur10e.revision")};
-  const ResolvedFrameDTO ur_flange = ResolvedComponentModelFrameDTO{
-      ControllableComponentId("ur10e"), ModelInstanceId("ur10e.model"), FrameRoleId("flange"),
-      "mf2_tool0", ModelRevision("ur10e.revision")};
-  EXPECT_EQ(speed_check_frames(ur_tcp, ur_flange), std::vector{ur_tcp});
+  EXPECT_EQ(frame_role_id(tool_tcp), "cup_center");
   EXPECT_EQ(frame_role_id(ResolvedCellFrameDTO{CellId("cell"), "world"}), "");
 }
 
@@ -164,7 +129,7 @@ TEST(RuntimeParticipantPolicy, RefusesEveryMotionInterruptScope) {
 TEST(RuntimeParticipantPolicy, OrdinaryJerkPolicyFillsOmissionsAndRejectsWeakerRequests) {
   const auto participant = binding();
   const auto base = select_runtime_participant_policy(participant);
-  OrdinaryMotionJerkPolicy profile{true, false, {{"joint_1", AngularJerkDTO{10.0}}}};
+  OrdinaryMotionJerkPolicy profile{true, {{"joint_1", AngularJerkDTO{10.0}}}};
   const auto selected = apply_deployment_motion_jerk_policy(base, participant, profile);
   ASSERT_TRUE(selected.ok());
   profile.limits.at("joint_1") = AngularJerkDTO{100.0};
@@ -182,10 +147,10 @@ TEST(RuntimeParticipantPolicy, OrdinaryJerkPolicyFillsOmissionsAndRejectsWeakerR
   EXPECT_FALSE(base.value().ordinary_motion_jerk);
 }
 
-TEST(RuntimeParticipantPolicy, OrdinaryJerkOffDoesNotActivateRetainedValuesOrWaiveRequiredLimits) {
+TEST(RuntimeParticipantPolicy, OrdinaryJerkOffDoesNotActivateRetainedValues) {
   const auto participant = binding();
   const auto base = select_runtime_participant_policy(participant);
-  OrdinaryMotionJerkPolicy profile{false, false, {{"joint_1", AngularJerkDTO{10.0}}}};
+  OrdinaryMotionJerkPolicy profile{false, {{"joint_1", AngularJerkDTO{10.0}}}};
   const auto selected = apply_deployment_motion_jerk_policy(base, participant, profile);
   ASSERT_TRUE(selected.ok());
   EXPECT_TRUE(apply_runtime_participant_motion_jerk_policy(selected.value(), {}).value().empty());
@@ -193,33 +158,21 @@ TEST(RuntimeParticipantPolicy, OrdinaryJerkOffDoesNotActivateRetainedValuesOrWai
       apply_runtime_participant_motion_jerk_policy(selected.value(), {{"joint_1", {{}, {}, 5.0}}});
   ASSERT_FALSE(rejected.ok());
   EXPECT_EQ(rejected.error().details.at("reason"), "ordinary_motion_jerk_disabled");
-  profile.machine_required = true;
-  EXPECT_FALSE(apply_deployment_motion_jerk_policy(base, participant, profile).ok());
-  profile.enabled = true;
-  const auto required = apply_deployment_motion_jerk_policy(base, participant, profile);
-  ASSERT_TRUE(required.ok());
-  profile.machine_required = false;
-  EXPECT_FALSE(apply_deployment_motion_jerk_policy(required.value(), participant, profile).ok());
-  profile.machine_required = true;
-  profile.limits.at("joint_1") = AngularJerkDTO{11.0};
-  EXPECT_FALSE(apply_deployment_motion_jerk_policy(required.value(), participant, profile).ok());
-  profile.limits.at("joint_1") = AngularJerkDTO{5.0};
-  EXPECT_TRUE(apply_deployment_motion_jerk_policy(required.value(), participant, profile).ok());
 }
 
 TEST(RuntimeParticipantPolicy, OrdinaryJerkPolicyRejectsIncompleteCrossedAndWrongUnitLimits) {
   const auto participant = binding();
   const auto base = select_runtime_participant_policy(participant);
   EXPECT_FALSE(
-      apply_deployment_motion_jerk_policy(base, participant, {true, false, {}}).ok());
+      apply_deployment_motion_jerk_policy(base, participant, {true, {}}).ok());
   EXPECT_FALSE(apply_deployment_motion_jerk_policy(base, participant,
-                                                   {true, false, {{"other", AngularJerkDTO{10.0}}}})
+                                                   {true, {{"other", AngularJerkDTO{10.0}}}})
                    .ok());
   EXPECT_FALSE(apply_deployment_motion_jerk_policy(
-                   base, participant, {true, false, {{"joint_1", LinearJerkDTO{10.0}}}})
+                   base, participant, {true, {{"joint_1", LinearJerkDTO{10.0}}}})
                    .ok());
   EXPECT_FALSE(apply_deployment_motion_jerk_policy(
-                   base, participant, {true, false, {{"joint_1", AngularJerkDTO{0.0}}}})
+                   base, participant, {true, {{"joint_1", AngularJerkDTO{0.0}}}})
                    .ok());
 }
 

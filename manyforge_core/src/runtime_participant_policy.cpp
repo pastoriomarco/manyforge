@@ -24,11 +24,10 @@ Result<RuntimeParticipantPolicySelection> apply_deployment_motion_jerk_policy(
   const auto& target = binding.value();
   if (selection.value().controllable_component_id != target.controllable_component_id ||
       selection.value().command_target_id != target.command_target_id ||
-      (profile.machine_required && !profile.enabled) ||
       profile.limits.size() > target.resources.size() ||
       (profile.enabled && profile.limits.size() != target.resources.size()))
     return invalid<RuntimeParticipantPolicySelection>(
-        "ordinary jerk policy is incomplete, crosses its target or disables required limits",
+        "ordinary jerk policy is incomplete or crosses its target",
         "ordinary_motion_jerk_policy_invalid");
   for (const auto& [joint, limit] : profile.limits) {
     const auto resource =
@@ -43,19 +42,6 @@ Result<RuntimeParticipantPolicySelection> apply_deployment_motion_jerk_policy(
       return invalid<RuntimeParticipantPolicySelection>(
           "ordinary jerk limit has an invalid joint, coordinate kind or value",
           "ordinary_motion_jerk_limit_invalid");
-  }
-  if (const auto& required = selection.value().ordinary_motion_jerk;
-      required && required->machine_required) {
-    if (!profile.enabled || !profile.machine_required ||
-        std::any_of(required->limits.begin(), required->limits.end(), [&](const auto& row) {
-          const auto found = profile.limits.find(row.first);
-          return found == profile.limits.end() ||
-                 std::get<AngularJerkDTO>(found->second).value_rad_s3 >
-                     std::get<AngularJerkDTO>(row.second).value_rad_s3;
-        }))
-      return invalid<RuntimeParticipantPolicySelection>(
-          "ordinary jerk policy cannot weaken an existing required limit",
-          "ordinary_motion_jerk_policy_weakens_required");
   }
   auto value = selection.value();
   value.ordinary_motion_jerk = std::move(profile);

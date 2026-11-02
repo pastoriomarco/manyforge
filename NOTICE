@@ -71,17 +71,27 @@ scripts/setup-docker.sh and Dockerfile.ros-lyrical-full download the
 following exact, pinned sources and packages when you build the workbench
 image. They are not part of this repository.
 
-### RoboPlan 0.7.0, including roboplan_example_models
+### RoboPlan 0.8.0, including roboplan_example_models
 Copyright (c) 2025-2026 Open Planning
 License: MIT
 Source: https://github.com/open-planning/roboplan
 Note: the example robot models in roboplan_example_models (used by the UR5
 example Scenarios) carry their upstream provenance; see that package.
 
-### ProxSuite 0.7.3
+### ProxSuite 0.8.2
 Copyright (c) 2022-2026, Inria
 License: BSD-2-Clause
 Source: https://github.com/Simple-Robotics/proxsuite
+
+### jrl-cmakemodules 2.3.0 (build-time CMake modules for ProxSuite; not installed)
+Copyright 2025-2026 Inria and contributors
+License: LGPL-3.0-only
+Source: https://github.com/jrl-umi3218/jrl-cmakemodules
+
+### nanoflann 2.0.1 (header-only, compiled into RoboPlan RRT)
+Copyright 2008-2009 Marius Muja, David G. Lowe; Copyright 2011-2026 Jose L. Blanco
+License: BSD-2-Clause
+Source: https://github.com/jlblancoc/nanoflann
 
 ### TOPPRA 0.6.10
 Copyright (c) 2017 Hung Pham
@@ -126,10 +136,6 @@ Source: https://github.com/ros-controls/ros2_control_cmake
 ### control_msgs
 License: BSD-3-Clause
 Source: https://github.com/ros-controls/control_msgs
-
-### ur_msgs 2.6.0
-License: BSD-3-Clause
-Source: https://github.com/ros-industrial/ur_msgs
 
 ### topic_based_ros2_control
 License: BSD-3-Clause

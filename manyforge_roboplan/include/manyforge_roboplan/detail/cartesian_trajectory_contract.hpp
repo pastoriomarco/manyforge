@@ -4,6 +4,7 @@
 // the deleted Cartesian planner request body is intentionally absent.
 
 #include <cstddef>
+#include <functional>
 #include <manyforge_core/detail/runtime_scale_governor.hpp>
 #include <manyforge_core/types/joint_dynamics_limits.hpp>
 #include <manyforge_core/types/motion_spec.hpp>
@@ -27,10 +28,6 @@ struct CartesianTrajectoryContractInput final {
   std::string compiled_tcp_frame;
   core::SpeedProfileDTO speed_profile;
   core::PerJointDynamicsLimitsDTO per_joint_dynamics_limits;
-  /// Every point the linear-speed retime holds under the TCP limit (the
-  /// robot flange under `active_tcp_and_flange`); `compiled_tcp_frame` is
-  /// always one. Angular and acceleration caps stay TCP path constraints.
-  std::vector<std::string> compiled_speed_frames{};
 };
 
 struct CartesianJointDynamicsEnvelope {
@@ -127,17 +124,48 @@ measure_cartesian_joint_dynamics_envelope(
     std::span<const double> model_acceleration_limits,
     const CartesianPlanningControl& control);
 
-/// Certifies TCP dynamics for the exact quintic trajectory used at execution.
-/// Pinocchio provides the endpoint values for each adaptive interval; analytic
-/// joint-derivative and model-radius bounds conservatively cover all unsampled
-/// time. Exhausting the declared work bound is a fail-closed planning error.
+/// Certifies a Cartesian path's TCP dynamics for the exact quintic trajectory
+/// used at execution. Pinocchio provides the endpoint values for each adaptive
+/// interval; analytic joint-derivative and model-radius bounds conservatively
+/// cover all unsampled time. Exhausting the declared work bound is a
+/// fail-closed planning error.
 core::Result<CartesianFrameDynamicsEnvelope>
 measure_cartesian_frame_dynamics_envelope(
     const CartesianTrajectoryContractInput& request,
-    const core::CartesianPathDTO* path,
+    const core::CartesianPathDTO& path,
     const std::shared_ptr<roboplan::Scene>& scene,
     const roboplan::JointTrajectory& trajectory,
     const CartesianPlanningControl& control);
+
+/// RP-3: TOPP-RA times every joint move with the active TCP at this fraction
+/// of its speed limit.
+inline constexpr double kTcpSpeedTargetFraction = 0.98;
+
+/// roboplan::TOPPRAOptions::max_path_velocity: largest ds/dt at a grid point
+/// given the group positions q and the path tangent dq/ds.
+using TcpPathVelocityBound =
+    std::function<double(const Eigen::VectorXd&, const Eigen::VectorXd&)>;
+
+/// RP-3 TOPP-RA bound ds/dt <= 0.98 * limit / ||d(TCP)/ds|| at each grid
+/// point, for the active TCP relative to the base frame: linear against the
+/// TCP linear speed limit and, with a Cartesian path (time_optimal timing),
+/// angular against its angular speed limit, both times the velocity scale.
+/// nullopt when the group, frames or limits cannot be resolved.
+std::optional<TcpPathVelocityBound> make_tcp_speed_path_velocity_bound(
+    const CartesianTrajectoryContractInput& request,
+    const core::CartesianPathDTO* path,
+    const std::shared_ptr<roboplan::Scene>& scene);
+
+/// RP-3 sample check: peak active-TCP speed over the trajectory samples
+/// divided by its limit (velocity scale included): linear against the TCP
+/// linear speed limit and, with a Cartesian path, angular against its angular
+/// speed limit; the larger ratio. Speed between samples is not measured.
+/// nullopt when it cannot be evaluated.
+std::optional<double> measure_tcp_sample_speed_ratio(
+    const CartesianTrajectoryContractInput& request,
+    const core::CartesianPathDTO* path,
+    const std::shared_ptr<roboplan::Scene>& scene,
+    const roboplan::JointTrajectory& trajectory);
 
 core::Result<CartesianKinematicMotionBounds>
 resolve_cartesian_kinematic_motion_bounds(

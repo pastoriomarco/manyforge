@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { reactPropsHost } from '../test/reactPropsHost';
 import {
   TRIAL_E_CONDITION, trialEAssignment, trialEDeployment, trialEProgram,
-} from '../testFixtures/trialESignal';
+} from '../testFixtures/mockLite6SignalMoves';
 import type {
   CatalogEntry, DeploymentWorkspaceResponse, JsonValue, ProgramTreeNode,
 } from '../types/api';
@@ -71,7 +71,7 @@ async function mountSearchTrip(assignment: Record<string, JsonValue> | null) {
 }
 
 describe('interrupt conditions with binding null', () => {
-  it('resolves the Trial E signal from the Draft facts: no invalid edit, operand listed', async () => {
+  it('resolves the signal from the Draft facts: no invalid edit, operand listed', async () => {
     const mounted = await mountSearchTrip(trialEAssignment);
     try {
       expect(mounted.onInvalidEditChange).not.toHaveBeenCalledWith(true);

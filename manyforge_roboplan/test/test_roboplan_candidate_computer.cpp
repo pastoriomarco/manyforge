@@ -3,11 +3,15 @@
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <manyforge_core/motion_interrupt/soft_on_path_stop_planner.hpp>
 #include <manyforge_core/trajectory/trajectory_sampler.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
+#include <manyforge_roboplan/detail/cartesian_path_densification.hpp>
 #include <manyforge_roboplan/detail/cartesian_trajectory_contract.hpp>
 #include <manyforge_roboplan/roboplan_candidate_computer.hpp>
 #include <manyforge_roboplan/roboplan_planner_options.hpp>
@@ -16,6 +20,7 @@
 #include <roboplan/core/geometry_wrappers.hpp>
 #include <roboplan/core/scene.hpp>
 #include <roboplan_example_models/resources.hpp>
+#include <roboplan_toppra/toppra.hpp>
 #include <sstream>
 #include <string>
 #include <utility>
@@ -140,7 +145,7 @@ struct CandidateFixture final {
       .motion = std::move(motion),
       .tolerances = TolerancesDTO{1.0e-4, 5.0e-3, 1.0e-2},
       .speed_profile = SpeedProfileDTO{0.5, 0.5, 0.1},
-      .planning_profile = PlanningProfileDTO::kFirstFeasible,
+      .planner = {},
       .dynamics_limits = {},
       .planning_timeout_s = 3.0,
       .planning_attempt_index = 0U,
@@ -797,8 +802,11 @@ TEST(RoboPlanCandidateComputerTest,
   ASSERT_TRUE(result.value().runtime_scale_bounds);
   const double rate = result.value().runtime_scale_bounds->max_stop_path_rate;
   ASSERT_GE(rate, 1.0);
-  // Re-measure the final curve traversed at the maximum certified Stop rate.
-  // This exercises the complete producer, not just a hand-written DTO.
+  detail::CartesianTrajectoryContractInput contract{
+      "arm", "base", "tool0", input.speed_profile, {}};
+  // Re-measure the delivered samples, at nominal speed and traversed at the
+  // maximum Stop rate. This exercises the complete producer, not just a
+  // hand-written DTO.
   roboplan::JointTrajectory native;
   native.joint_names = result.value().joint_names;
   for (const auto &waypoint : result.value().waypoints) {
@@ -815,15 +823,244 @@ TEST(RoboPlanCandidateComputerTest,
             waypoint.accelerations_rad_s2.data(),
             waypoint.accelerations_rad_s2.size()));
   }
+  const auto at_stop_rate =
+      detail::measure_tcp_sample_speed_ratio(contract, nullptr, fixture.scene,
+                                             native);
+  ASSERT_TRUE(at_stop_rate.has_value());
+  EXPECT_LE(*at_stop_rate, 1.0 + 1e-9);
+  for (auto &velocity : native.velocities)
+    velocity /= rate;
+  const auto nominal =
+      detail::measure_tcp_sample_speed_ratio(contract, nullptr, fixture.scene,
+                                             native);
+  ASSERT_TRUE(nominal.has_value());
+  EXPECT_LE(*nominal, 1.0 + 1e-9);
+}
+
+// RP-3: the TCP bound inside TOPP-RA holds the 0.98 target at the samples and
+// slows only where the cap binds, so without jerk it is never slower than
+// timing within the joint limits and stretching uniformly to the same target.
+TEST(RoboPlanCandidateComputerTest,
+     TcpSpeedBoundInsideToppraHoldsTargetAndBeatsUniformStretch) {
+  auto fixture = make_fixture();
+  detail::CartesianTrajectoryContractInput contract{
+      "arm", "base", "tool0", SpeedProfileDTO{1.0, 1.0, 0.25}, {}};
+  roboplan::PathParameterizerTOPPRA toppra(fixture.scene, "arm");
+  const roboplan::JointPath path{fixture.binding.compiled_joint_names,
+                                 {fixture.start, fixture.goal}};
+  roboplan::TOPPRAOptions options;
+  const auto unbounded = toppra.generate(path, options);
+  ASSERT_TRUE(unbounded.has_value()) << unbounded.error();
+  const auto unbounded_ratio = detail::measure_tcp_sample_speed_ratio(
+      contract, nullptr, fixture.scene, *unbounded);
+  ASSERT_TRUE(unbounded_ratio.has_value());
+  ASSERT_GT(*unbounded_ratio, 1.0);  // the cap binds
+
+  auto bound = detail::make_tcp_speed_path_velocity_bound(contract, nullptr,
+                                                          fixture.scene);
+  ASSERT_TRUE(bound.has_value());
+  options.max_path_velocity = std::move(*bound);
+  const auto bounded = toppra.generate(path, options);
+  ASSERT_TRUE(bounded.has_value()) << bounded.error();
+  const auto bounded_ratio = detail::measure_tcp_sample_speed_ratio(
+      contract, nullptr, fixture.scene, *bounded);
+  ASSERT_TRUE(bounded_ratio.has_value());
+  EXPECT_LE(*bounded_ratio, 1.0);
+  EXPECT_GE(*bounded_ratio, 0.9 * detail::kTcpSpeedTargetFraction);
+  const double uniform_stretch =
+      unbounded->times.back() * *unbounded_ratio /
+      detail::kTcpSpeedTargetFraction;
+  // Up to grid error.
+  EXPECT_LE(bounded->times.back(), uniform_stretch * (1.0 + 1e-2));
+}
+
+// Motion timing fast: TOPP-RA times joint moves within the nominal
+// acceleration share (0.8 of the limit), so the live-scaling headroom costs
+// no extra uniform stretch: the nominal multiplier stays near one (it was >=
+// sqrt(1/0.8) whenever the acceleration limit bound) and the delivered
+// samples keep the headroom.
+TEST(RoboPlanCandidateComputerTest,
+     FastJointMoveKeepsAccelerationHeadroomWithoutAUniformStretch) {
+  auto fixture = make_fixture();
+  RoboPlanCandidateComputerConfig config{0x1234U, 65'536U, 0.01};
+  config.motion_timing = MotionTimingDTO::kFast;
+  RoboPlanCandidateComputer computer(fixture.scene, fixture.binding, config);
+  auto input = request(fixture, ResolvedMotionSpecDTO{joint_goal(fixture)});
+  input.speed_profile.max_tcp_linear_speed_mps = 100.0;  // never binds
+  const auto result = computer.compute(input);
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  ASSERT_TRUE(result.value().runtime_scale_bounds);
+  const auto &bounds = *result.value().runtime_scale_bounds;
+  ASSERT_TRUE(bounds.nominal_time_multiplier);
+  EXPECT_LT(*bounds.nominal_time_multiplier, 1.1);
+  const Eigen::VectorXd model_acceleration =
+      fixture.scene->getAccelerationLimitVectors("arm")->second.cwiseAbs();
+  double ratio = 0.0;
+  for (const auto &waypoint : result.value().waypoints)
+    for (std::size_t joint = 0; joint < waypoint.accelerations_rad_s2.size();
+         ++joint)
+      ratio = std::max(
+          ratio, std::abs(waypoint.accelerations_rad_s2[joint]) /
+                     (input.speed_profile.acceleration_scale *
+                      model_acceleration[static_cast<Eigen::Index>(joint)]));
+  EXPECT_LE(ratio, 0.8 * 1.02);
+  EXPECT_GE(ratio, 0.7);  // the acceleration limit binds
+}
+
+[[nodiscard]] roboplan::JointTrajectory native_trajectory(
+    const TrajectoryDTO &trajectory) {
+  roboplan::JointTrajectory native;
+  native.joint_names = trajectory.joint_names;
+  for (const auto &waypoint : trajectory.waypoints) {
+    native.times.push_back(waypoint.time_from_start_s);
+    native.positions.emplace_back(Eigen::Map<const Eigen::VectorXd>(
+        waypoint.positions_rad.data(), waypoint.positions_rad.size()));
+    native.velocities.emplace_back(Eigen::Map<const Eigen::VectorXd>(
+        waypoint.velocities_rad_s.data(), waypoint.velocities_rad_s.size()));
+    native.accelerations.emplace_back(Eigen::Map<const Eigen::VectorXd>(
+        waypoint.accelerations_rad_s2.data(),
+        waypoint.accelerations_rad_s2.size()));
+  }
+  return native;
+}
+
+// Peak joint jerk between consecutive samples (finite difference).
+[[nodiscard]] double peak_sample_jerk(const TrajectoryDTO &trajectory) {
+  double peak = 0.0;
+  for (std::size_t k = 1U; k < trajectory.waypoints.size(); ++k) {
+    const auto &a = trajectory.waypoints[k - 1U];
+    const auto &b = trajectory.waypoints[k];
+    const double dt = b.time_from_start_s - a.time_from_start_s;
+    for (std::size_t j = 0U; j < a.accelerations_rad_s2.size(); ++j)
+      peak = std::max(peak, std::abs(b.accelerations_rad_s2[j] -
+                                     a.accelerations_rad_s2[j]) / dt);
+  }
+  return peak;
+}
+
+// N12 / RP-3b: the Deployment default is smooth (robot_defaults.tsv).
+TEST(RoboPlanCandidateComputerTest, MotionTimingDefaultsToSmooth) {
+  EXPECT_EQ(kDefaultMotionTimingName, "smooth");
+  EXPECT_EQ(kDefaultMotionTiming, MotionTimingDTO::kSmooth);
+  EXPECT_EQ(RoboPlanCandidateComputerConfig{}.motion_timing,
+            MotionTimingDTO::kSmooth);
+  EXPECT_EQ(parse_motion_timing("fast"), MotionTimingDTO::kFast);
+  EXPECT_FALSE(parse_motion_timing("rp3"));
+}
+
+// Smooth (M8): TOPP-RA within the full joint limits, then one uniform
+// stretch until the TCP is at its 0.98 target at the samples. Undoing the
+// stretch gives back a trajectory at the full acceleration limit. Fast
+// (RP-3) on the same path is quicker with far larger jerk; the TCP holds in
+// both.
+TEST(RoboPlanCandidateComputerTest,
+     SmoothStretchesUniformlyToTheTcpTargetAndFastHoldsItInsideToppra) {
+  auto fixture = make_fixture();
+  auto input = request(fixture, ResolvedMotionSpecDTO{joint_goal(fixture)});
+  input.speed_profile.max_tcp_linear_speed_mps = 0.25;
   detail::CartesianTrajectoryContractInput contract{
       "arm", "base", "tool0", input.speed_profile, {}};
-  const auto envelope = detail::measure_cartesian_frame_dynamics_envelope(
-      contract, nullptr, fixture.scene, native, {});
-  ASSERT_TRUE(envelope.ok()) << envelope.error().message;
-  ASSERT_TRUE(envelope.value().complete);
-  // Independently subdividing the dilated curve has a different conservative
-  // residual, bounded by the primitive's declared adaptive resolution.
-  EXPECT_LE(envelope.value().linear_speed_ratio, 1.02 + 1e-10);
+  const Eigen::VectorXd model_acceleration =
+      fixture.scene->getAccelerationLimitVectors("arm")->second.cwiseAbs();
+  std::map<MotionTimingDTO, TrajectoryDTO> timed;
+  for (const auto timing : {MotionTimingDTO::kSmooth, MotionTimingDTO::kFast}) {
+    SCOPED_TRACE(static_cast<int>(timing));
+    RoboPlanCandidateComputerConfig config{0x1234U, 65'536U, 0.01};
+    config.motion_timing = timing;
+    RoboPlanCandidateComputer computer(fixture.scene, fixture.binding, config);
+    const auto result = computer.compute(input);
+    ASSERT_TRUE(result.ok()) << result.error().message;
+    ASSERT_TRUE(result.value().runtime_scale_bounds);
+    const auto tcp = detail::measure_tcp_sample_speed_ratio(
+        contract, nullptr, fixture.scene, native_trajectory(result.value()));
+    ASSERT_TRUE(tcp.has_value());
+    EXPECT_LE(*tcp, 1.0 + 1e-9);
+    const double multiplier =
+        *result.value().runtime_scale_bounds->nominal_time_multiplier;
+    if (timing == MotionTimingDTO::kSmooth) {
+      EXPECT_NEAR(*tcp, detail::kTcpSpeedTargetFraction, 1e-6);
+      EXPECT_GT(multiplier, 1.5);  // the TCP target binds the stretch
+      double acceleration = 0.0;
+      for (const auto &waypoint : result.value().waypoints)
+        for (std::size_t j = 0; j < waypoint.accelerations_rad_s2.size(); ++j)
+          acceleration = std::max(
+              acceleration,
+              std::abs(waypoint.accelerations_rad_s2[j]) * multiplier *
+                  multiplier /
+                  (input.speed_profile.acceleration_scale *
+                   model_acceleration[static_cast<Eigen::Index>(j)]));
+      EXPECT_GE(acceleration, 0.85);  // the acceleration limit binds
+      EXPECT_LE(acceleration, 1.02);
+    } else {
+      EXPECT_LT(multiplier, 1.1);
+    }
+    timed.emplace(timing, result.value());
+  }
+  const auto &smooth = timed.at(MotionTimingDTO::kSmooth);
+  const auto &fast = timed.at(MotionTimingDTO::kFast);
+  EXPECT_GT(smooth.waypoints.back().time_from_start_s,
+            fast.waypoints.back().time_from_start_s);
+  EXPECT_LT(peak_sample_jerk(smooth), peak_sample_jerk(fast));
+  RecordProperty("smooth_duration_s",
+                 std::to_string(smooth.waypoints.back().time_from_start_s));
+  RecordProperty("fast_duration_s",
+                 std::to_string(fast.waypoints.back().time_from_start_s));
+  RecordProperty("smooth_peak_jerk", std::to_string(peak_sample_jerk(smooth)));
+  RecordProperty("fast_peak_jerk", std::to_string(peak_sample_jerk(fast)));
+}
+
+// V2-9 jerk limits stay one more condition of the final stretch in both
+// motion timings, on top of the TCP limit.
+TEST(RoboPlanCandidateComputerTest, JerkLimitsStackOnBothMotionTimings) {
+  auto fixture = make_fixture();
+  auto input = request(fixture, ResolvedMotionSpecDTO{joint_goal(fixture)});
+  input.speed_profile.max_tcp_linear_speed_mps = 0.25;
+  for (std::size_t index = 0; index < fixture.binding.resources.size();
+       ++index) {
+    JointDynamicsLimitDTO limit;
+    limit.max_jerk_rad_s3 = 10.0;
+    input.dynamics_limits.push_back(
+        {fixture.binding.resources[index],
+         fixture.binding.compiled_joint_names[index], limit});
+  }
+  const auto model_v = fixture.scene->getVelocityLimitVectors("arm");
+  const auto model_a = fixture.scene->getAccelerationLimitVectors("arm");
+  ASSERT_TRUE(model_v && model_a);
+  detail::CartesianTrajectoryContractInput contract{
+      "arm", "base", "tool0", input.speed_profile, {}};
+  for (const auto timing : {MotionTimingDTO::kSmooth, MotionTimingDTO::kFast}) {
+    SCOPED_TRACE(static_cast<int>(timing));
+    RoboPlanCandidateComputerConfig config{0x1234U, 65'536U, 0.01};
+    config.motion_timing = timing;
+    RoboPlanCandidateComputer computer(fixture.scene, fixture.binding, config);
+    const auto result = computer.compute(input);
+    ASSERT_TRUE(result.ok()) << result.error().message;
+    const auto native = native_trajectory(result.value());
+    const auto measured = detail::measure_cartesian_joint_dynamics_envelope(
+        contract, native, values(model_v->second), values(model_a->second),
+        {});
+    ASSERT_TRUE(measured.ok());
+    ASSERT_TRUE(measured.value().complete);
+    for (const auto &derivative : measured.value().joint_derivatives)
+      EXPECT_LE(derivative.jerk, 8.0 + 1e-6);
+    const auto tcp = detail::measure_tcp_sample_speed_ratio(
+        contract, nullptr, fixture.scene, native);
+    ASSERT_TRUE(tcp.has_value());
+    EXPECT_LE(*tcp, 1.0 + 1e-9);
+  }
+}
+
+TEST(RoboPlanCandidateComputerTest,
+     TcpSpeedBoundIsUnavailableWithoutAResolvableTcpOrLimit) {
+  auto fixture = make_fixture();
+  detail::CartesianTrajectoryContractInput contract{
+      "arm", "base", "missing_frame", SpeedProfileDTO{1.0, 1.0, 0.25}, {}};
+  EXPECT_FALSE(detail::make_tcp_speed_path_velocity_bound(contract, nullptr,
+                                                          fixture.scene));
+  contract.compiled_tcp_frame = "tool0";
+  contract.speed_profile.max_tcp_linear_speed_mps.reset();
+  EXPECT_FALSE(detail::make_tcp_speed_path_velocity_bound(contract, nullptr,
+                                                          fixture.scene));
 }
 
 TEST(RoboPlanCandidateComputerTest,
@@ -995,10 +1232,6 @@ TEST(RoboPlanCandidateComputerTest,
             candidate_request.tolerances.translation_tol_m);
   EXPECT_LE(fidelity.certified_max_rotation_error_rad,
             candidate_request.tolerances.rotation_tol_rad);
-  EXPECT_LE(fidelity.accepted_max_blend_deviation_rad,
-            fidelity.requested_max_blend_deviation_rad);
-  EXPECT_GE(fidelity.planning_attempt_count, 1U);
-  EXPECT_LE(fidelity.planning_attempt_count, 5U);
   ASSERT_EQ(result.value().cartesian_waypoint_times_s.size(), 3U);
   EXPECT_GT(result.value().cartesian_waypoint_times_s[1], 0.0);
   EXPECT_LT(result.value().cartesian_waypoint_times_s[1],
@@ -1021,36 +1254,32 @@ TEST(RoboPlanCandidateComputerTest,
   auto fixture = make_fixture();
   // This configuration has free +X travel (see the Cartesian return test).
   fixture.start = fixture.goal;
-  for (const auto profile : {PlanningProfileDTO::kFirstFeasible,
-                             PlanningProfileDTO::kQualityBounded}) {
-    for (const double delta_m : {0.01, 0.0005}) {
-      RoboPlanCandidateComputer computer(
-          fixture.scene, fixture.binding,
-          RoboPlanCandidateComputerConfig{0x4321U, 65'536U, 0.01});
-      Eigen::Matrix4d target =
-          fixture.scene->forwardKinematics(fixture.start, "tool0", "base");
-      target(0, 3) += delta_m;
-      auto input =
-          request(fixture, ResolvedMotionSpecDTO{PoseGoalDTO{pose(target)}});
-      input.tolerances = TolerancesDTO{1.0e-4, 5.0e-3, 5.0e-2};
-      input.planning_profile = profile;
-      const auto result = computer.compute(input);
-      ASSERT_TRUE(result.ok()) << result.error().message << " delta " << delta_m;
-      const auto &final = result.value().waypoints.back().positions_rad;
-      const Eigen::VectorXd positions =
-          Eigen::Map<const Eigen::VectorXd>(final.data(), final.size());
-      const auto reached = fixture.scene->forwardKinematics(
-          fixture.scene->toFullJointPositions("arm", positions), "tool0",
-          "base");
-      EXPECT_LE((reached.block<3, 1>(0, 3) - target.block<3, 1>(0, 3)).norm(),
-                1.0e-4)
-          << "delta " << delta_m;
-      EXPECT_LE(Eigen::AngleAxisd(reached.block<3, 3>(0, 0).transpose() *
-                                  target.block<3, 3>(0, 0))
-                    .angle(),
-                1.0e-3)
-          << "delta " << delta_m;
-    }
+  for (const double delta_m : {0.01, 0.0005}) {
+    RoboPlanCandidateComputer computer(
+        fixture.scene, fixture.binding,
+        RoboPlanCandidateComputerConfig{0x4321U, 65'536U, 0.01});
+    Eigen::Matrix4d target =
+        fixture.scene->forwardKinematics(fixture.start, "tool0", "base");
+    target(0, 3) += delta_m;
+    auto input =
+        request(fixture, ResolvedMotionSpecDTO{PoseGoalDTO{pose(target)}});
+    input.tolerances = TolerancesDTO{1.0e-4, 5.0e-3, 5.0e-2};
+    const auto result = computer.compute(input);
+    ASSERT_TRUE(result.ok()) << result.error().message << " delta " << delta_m;
+    const auto &final = result.value().waypoints.back().positions_rad;
+    const Eigen::VectorXd positions =
+        Eigen::Map<const Eigen::VectorXd>(final.data(), final.size());
+    const auto reached = fixture.scene->forwardKinematics(
+        fixture.scene->toFullJointPositions("arm", positions), "tool0",
+        "base");
+    EXPECT_LE((reached.block<3, 1>(0, 3) - target.block<3, 1>(0, 3)).norm(),
+              1.0e-4)
+        << "delta " << delta_m;
+    EXPECT_LE(Eigen::AngleAxisd(reached.block<3, 3>(0, 0).transpose() *
+                                target.block<3, 3>(0, 0))
+                  .angle(),
+              1.0e-3)
+        << "delta " << delta_m;
   }
 }
 
@@ -1103,25 +1332,20 @@ TEST(RoboPlanCandidateComputerTest,
   // solution (the seed) is the result.
   auto fixture = make_fixture();
   fixture.start = fixture.goal;
-  for (const auto profile : {PlanningProfileDTO::kFirstFeasible,
-                             PlanningProfileDTO::kQualityBounded}) {
-    SCOPED_TRACE(static_cast<int>(profile));
-    RoboPlanCandidateComputer computer(
-        fixture.scene, fixture.binding,
-        RoboPlanCandidateComputerConfig{0x4321U, 65'536U, 0.01});
-    Eigen::Matrix4d target =
-        fixture.scene->forwardKinematics(fixture.start, "tool0", "base");
-    target(0, 3) += 0.0005;
-    auto input =
-        request(fixture, ResolvedMotionSpecDTO{PoseGoalDTO{pose(target)}});
-    input.tolerances = TolerancesDTO{1.0e-4, 5.0e-3, 5.0e-2};
-    input.planning_profile = profile;
-    input.planning_timeout_s = 1.0e-9;
-    const auto result = computer.compute(input);
-    ASSERT_TRUE(result.ok()) << result.error().message;
-    EXPECT_EQ(result.value().waypoints.back().positions_rad,
-              values(fixture.start));
-  }
+  RoboPlanCandidateComputer computer(
+      fixture.scene, fixture.binding,
+      RoboPlanCandidateComputerConfig{0x4321U, 65'536U, 0.01});
+  Eigen::Matrix4d target =
+      fixture.scene->forwardKinematics(fixture.start, "tool0", "base");
+  target(0, 3) += 0.0005;
+  auto input =
+      request(fixture, ResolvedMotionSpecDTO{PoseGoalDTO{pose(target)}});
+  input.tolerances = TolerancesDTO{1.0e-4, 5.0e-3, 5.0e-2};
+  input.planning_timeout_s = 1.0e-9;
+  const auto result = computer.compute(input);
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  EXPECT_EQ(result.value().waypoints.back().positions_rad,
+            values(fixture.start));
 }
 
 TEST(RoboPlanCandidateComputerTest,
@@ -1153,22 +1377,10 @@ TEST(RoboPlanCandidateComputerTest,
   path.max_angular_speed_rad_s = 0.25;
   path.max_linear_acceleration_mps2 = 0.25;
   path.max_angular_acceleration_rad_s2 = 1.0;
-  path.max_blend_deviation_rad = 0.0;
   const auto cartesian_result = computer.compute(request(
       fixture, ResolvedMotionSpecDTO{std::move(path)}, &cartesian_start));
   ASSERT_TRUE(cartesian_result.ok()) << cartesian_result.error().message;
   ASSERT_TRUE(cartesian_result.value().cartesian_fidelity_metrics.has_value());
-  EXPECT_DOUBLE_EQ(
-      cartesian_result.value().cartesian_fidelity_metrics
-          ->requested_max_blend_deviation_rad,
-      0.0);
-  EXPECT_DOUBLE_EQ(
-      cartesian_result.value().cartesian_fidelity_metrics
-          ->accepted_max_blend_deviation_rad,
-      0.0);
-  EXPECT_EQ(cartesian_result.value().cartesian_fidelity_metrics
-                ->planning_attempt_count,
-            1U);
   EXPECT_EQ(cartesian_result.value().resources, fixture.binding.resources);
   EXPECT_EQ(cartesian_result.value().joint_names,
             fixture.binding.compiled_joint_names);
@@ -1267,14 +1479,62 @@ TEST(RoboPlanCandidateComputerTest,
      ProductionSolverOptionsPreserveTheBoundedTakeoverPlanningTimeout) {
   for (const double capped_timeout : {0.1, 0.2, 0.5}) {
     SCOPED_TRACE(capped_timeout);
-    for (const auto profile :
-         {PlanningProfileDTO::kFirstFeasible, PlanningProfileDTO::kBalanced,
-          PlanningProfileDTO::kQualityBounded}) {
-      SCOPED_TRACE(static_cast<int>(profile));
-      const auto options = planning_profile_rrt_options(
-          production_rrt_options("arm", capped_timeout), profile);
+    for (const auto optimize :
+         {PlannerOptimizeDTO::kFirst, PlannerOptimizeDTO::kRrtStar,
+          PlannerOptimizeDTO::kBestOfN}) {
+      SCOPED_TRACE(static_cast<int>(optimize));
+      PlannerSettingsDTO planner;
+      planner.optimize = optimize;
+      const auto options =
+          production_rrt_options("arm", capped_timeout, 0U, planner);
       EXPECT_DOUBLE_EQ(options.max_planning_time, capped_timeout);
     }
+  }
+}
+
+TEST(RoboPlanCandidateComputerTest, EveryPlannerBlockPlansTheJointGoal) {
+  // Deployment default (RRT-Connect, first path) and each override mode.
+  auto fixture = make_fixture();
+  RoboPlanCandidateComputer computer(
+      fixture.scene, fixture.binding,
+      RoboPlanCandidateComputerConfig{0x4321U, 65'536U, 0.01});
+  std::vector<PlannerOverrideDTO> overrides{PlannerOverrideDTO{}};
+  overrides.resize(4U);
+  overrides[1].search = PlannerSearchDTO::kRrt;
+  overrides[1].optimize = PlannerOptimizeDTO::kFirst;
+  overrides[2].optimize = PlannerOptimizeDTO::kRrtStar;
+  overrides[2].max_nodes = 500U;
+  overrides[3].optimize = PlannerOptimizeDTO::kBestOfN;
+  overrides[3].n = 3U;
+  overrides[3].collision_check_step_rad = 0.02;
+  for (const auto &planner : overrides) {
+    SCOPED_TRACE(planner.optimize ? static_cast<int>(*planner.optimize) : -1);
+    auto input = request(fixture, ResolvedMotionSpecDTO{joint_goal(fixture)});
+    input.planner = planner;
+    const auto result = computer.compute(input);
+    ASSERT_TRUE(result.ok()) << result.error().message;
+    EXPECT_EQ(result.value().waypoints.back().positions_rad,
+              values(fixture.goal));
+  }
+}
+
+TEST(RoboPlanCandidateComputerTest, OutOfRangePlannerOverrideIsRefused) {
+  auto fixture = make_fixture();
+  RoboPlanCandidateComputer computer(
+      fixture.scene, fixture.binding,
+      RoboPlanCandidateComputerConfig{0x4321U, 65'536U, 0.01});
+  std::vector<PlannerOverrideDTO> invalid(4U);
+  invalid[0].n = 1U;
+  invalid[1].n = kMaxPlannerBestOfN + 1U;
+  invalid[2].max_nodes = 10U;
+  invalid[3].collision_check_step_rad = 0.0;
+  for (const auto &planner : invalid) {
+    auto input = request(fixture, ResolvedMotionSpecDTO{joint_goal(fixture)});
+    input.planner = planner;
+    const auto result = computer.compute(input);
+    ASSERT_FALSE(result.ok());
+    EXPECT_EQ(result.error().details.at("reason"),
+              "native_candidate_request_numeric_invalid");
   }
 }
 
@@ -1354,6 +1614,310 @@ TEST(RoboPlanCandidateComputerTest, MovingPlanningBudgetRejectsInvalidOrAlreadyC
   const auto expired = computer.compute(input);
   ASSERT_FALSE(expired.ok());
   EXPECT_EQ(expired.error().details.at("reason"), "planning_timeout");
+}
+
+
+// -- RP-2 corner blend radius (densification geometry) ----------------------
+
+[[nodiscard]] Pose3DTO planar_pose(double x, double y, double yaw = 0.0) {
+  const Eigen::Quaterniond orientation(
+      Eigen::AngleAxisd(yaw, Eigen::Vector3d::UnitZ()));
+  return Pose3DTO{{x, y, 0.0},
+                  {orientation.x(), orientation.y(), orientation.z(),
+                   orientation.w()}};
+}
+
+[[nodiscard]] CartesianPathDTO corner_path(std::vector<Pose3DTO> waypoints,
+                                           std::vector<double> radii) {
+  CartesianPathDTO path;
+  path.waypoints = std::move(waypoints);
+  path.blend_radii_m = std::move(radii);
+  path.max_translation_step_m = 0.005;
+  path.max_rotation_step_rad = 0.05;
+  return path;
+}
+
+[[nodiscard]] bool contains_position(
+    const std::vector<Eigen::Matrix4d> &poses, const Eigen::Vector3d &point) {
+  return std::any_of(poses.begin(), poses.end(), [&](const auto &pose) {
+    return (pose.template block<3, 1>(0, 3) - point).norm() < 1e-9;
+  });
+}
+
+TEST(CartesianCornerBlendTest, RoundsCornerWithArcTangentToBothSegments) {
+  const auto dense = detail::densify_cartesian_path(
+      corner_path({planar_pose(0.0, 0.0), planar_pose(0.1, 0.0),
+                   planar_pose(0.1, 0.1)},
+                  {0.0, 0.02, 0.0}),
+      RoboPlanCandidateControl{});
+  ASSERT_TRUE(dense.ok()) << dense.error().message;
+  const auto &poses = dense.value().poses;
+  // Tangent points 0.02 m before and after the corner; the corner itself is cut.
+  EXPECT_TRUE(contains_position(poses, {0.08, 0.0, 0.0}));
+  EXPECT_TRUE(contains_position(poses, {0.1, 0.02, 0.0}));
+  EXPECT_FALSE(contains_position(poses, {0.1, 0.0, 0.0}));
+  // A 90 degree turn at tangent distance 0.02 m has radius 0.02 m about
+  // (0.08, 0.02); every sample between the tangent points lies on it.
+  const Eigen::Vector3d center(0.08, 0.02, 0.0);
+  std::size_t on_arc = 0U;
+  for (const auto &pose : poses) {
+    const Eigen::Vector3d position = pose.block<3, 1>(0, 3);
+    if (position.x() > 0.08 + 1e-9 && position.y() < 0.02 - 1e-9) {
+      EXPECT_NEAR((position - center).norm(), 0.02, 1e-12);
+      ++on_arc;
+    }
+  }
+  EXPECT_GE(on_arc, 30U);
+  // The waypoint stands for the arc middle.
+  const auto &indices = dense.value().source_waypoint_dense_indices;
+  ASSERT_EQ(indices.size(), 3U);
+  EXPECT_EQ(indices.front(), 0U);
+  EXPECT_EQ(indices.back(), poses.size() - 1U);
+  const Eigen::Vector3d middle = poses[indices[1]].block<3, 1>(0, 3);
+  const double half = 0.02 * std::sqrt(0.5);
+  EXPECT_NEAR((middle - Eigen::Vector3d(0.08 + half, 0.02 - half, 0.0)).norm(),
+              0.0, 1e-12);
+  // No sample-to-sample direction change reaches RoboPlan's corner tolerance.
+  for (std::size_t index = 2U; index < poses.size(); ++index) {
+    const Eigen::Vector3d before = (poses[index - 1U].block<3, 1>(0, 3) -
+                                    poses[index - 2U].block<3, 1>(0, 3))
+                                       .normalized();
+    const Eigen::Vector3d after = (poses[index].block<3, 1>(0, 3) -
+                                   poses[index - 1U].block<3, 1>(0, 3))
+                                      .normalized();
+    EXPECT_LE(std::acos(std::clamp(before.dot(after), -1.0, 1.0)),
+              detail::kCornerArcMaxTurnRad + 1e-9)
+        << index;
+  }
+}
+
+TEST(CartesianCornerBlendTest, ClampsRadiusToHalfOfEachAdjacentSegment) {
+  const auto dense = detail::densify_cartesian_path(
+      corner_path({planar_pose(0.0, 0.0), planar_pose(0.1, 0.0),
+                   planar_pose(0.1, 0.04)},
+                  {0.0, 1.0, 0.0}),
+      RoboPlanCandidateControl{});
+  ASSERT_TRUE(dense.ok()) << dense.error().message;
+  // Half of the 0.04 m segment: the arc ends where the last segment ends its
+  // first half and starts 0.02 m before the corner.
+  EXPECT_TRUE(contains_position(dense.value().poses, {0.08, 0.0, 0.0}));
+  EXPECT_TRUE(contains_position(dense.value().poses, {0.1, 0.02, 0.0}));
+  EXPECT_TRUE(contains_position(dense.value().poses, {0.1, 0.04, 0.0}));
+}
+
+// N18: a 10 mm corner is resolved at least every 1 mm (r/20 = 0.5 mm), on the
+// arc and in the tolerances RoboPlan's Bounded resolution steps by (half of
+// each).
+TEST(CartesianCornerBlendTest, TenMillimetreCornerIsResolvedWithinAMillimetre) {
+  const auto dense = detail::densify_cartesian_path(
+      corner_path({planar_pose(0.0, 0.0), planar_pose(0.1, 0.0),
+                   planar_pose(0.1, 0.1)},
+                  {0.0, 0.01, 0.0}),
+      RoboPlanCandidateControl{});
+  ASSERT_TRUE(dense.ok()) << dense.error().message;
+  EXPECT_NEAR(dense.value().smallest_corner_radius_m, 0.01, 1e-12);
+  const auto &poses = dense.value().poses;
+  for (std::size_t index = 1U; index < poses.size(); ++index) {
+    const Eigen::Vector3d position = poses[index].block<3, 1>(0, 3);
+    if (position.x() > 0.09 + 1e-9 && position.y() < 0.01 - 1e-9) {
+      EXPECT_LE((position - poses[index - 1U].block<3, 1>(0, 3)).norm(),
+                0.001)
+          << index;
+    }
+  }
+  const auto resolution =
+      detail::cartesian_resolution_tolerances(dense.value(), 0.005, 0.01);
+  EXPECT_NEAR(0.5 * resolution.translation_m, 0.0005, 1e-12);
+  EXPECT_NEAR(resolution.rotation_rad / 0.01, resolution.translation_m / 0.005,
+              1e-12);
+
+  // Without a rounded corner, or with a step already fine enough, the node's
+  // own tolerances apply.
+  for (const auto &path :
+       {corner_path({planar_pose(0.0, 0.0), planar_pose(0.1, 0.0),
+                     planar_pose(0.1, 0.1)},
+                    {0.0, 0.0, 0.0}),
+        corner_path({planar_pose(0.0, 0.0), planar_pose(0.2, 0.0),
+                     planar_pose(0.2, 0.2)},
+                    {0.0, 0.08, 0.0})}) {
+    const auto coarse =
+        detail::densify_cartesian_path(path, RoboPlanCandidateControl{});
+    ASSERT_TRUE(coarse.ok()) << coarse.error().message;
+    const auto unchanged =
+        detail::cartesian_resolution_tolerances(coarse.value(), 0.005, 0.01);
+    EXPECT_DOUBLE_EQ(unchanged.translation_m, 0.005);
+    EXPECT_DOUBLE_EQ(unchanged.rotation_rad, 0.01);
+  }
+}
+
+TEST(CartesianCornerBlendTest, ZeroRadiusAndReversalKeepTheExactCorner) {
+  for (const auto &path :
+       {corner_path({planar_pose(0.0, 0.0), planar_pose(0.1, 0.0),
+                     planar_pose(0.1, 0.1)},
+                    {0.0, 0.0, 0.0}),
+        corner_path({planar_pose(0.0, 0.0), planar_pose(0.1, 0.0),
+                     planar_pose(0.1, 0.1)},
+                    {}),
+        corner_path({planar_pose(0.0, 0.0), planar_pose(0.1, 0.0),
+                     planar_pose(0.0, 0.0)},
+                    {0.0, 0.02, 0.0})}) {
+    const auto dense =
+        detail::densify_cartesian_path(path, RoboPlanCandidateControl{});
+    ASSERT_TRUE(dense.ok()) << dense.error().message;
+    const auto &corner =
+        dense.value().poses[dense.value().source_waypoint_dense_indices[1]];
+    EXPECT_NEAR((corner.block<3, 1>(0, 3) - Eigen::Vector3d(0.1, 0.0, 0.0))
+                    .norm(),
+                0.0, 1e-12);
+    // Straight segments only: 0.1 m / 0.005 m steps each.
+    EXPECT_EQ(dense.value().poses.size(), 41U);
+  }
+}
+
+TEST(CartesianCornerBlendTest, RoundedCornerKeepsOrientationAndItsRateContinuous) {
+  const auto dense = detail::densify_cartesian_path(
+      corner_path({planar_pose(0.0, 0.0, 0.0), planar_pose(0.1, 0.0, 0.2),
+                   planar_pose(0.1, 0.1, 0.4)},
+                  {0.0, 0.02, 0.0}),
+      RoboPlanCandidateControl{});
+  ASSERT_TRUE(dense.ok()) << dense.error().message;
+  const auto &poses = dense.value().poses;
+  const auto yaw = [](const Eigen::Matrix4d &pose) {
+    return std::atan2(pose(1, 0), pose(0, 0));
+  };
+  EXPECT_NEAR(yaw(poses.front()), 0.0, 1e-12);
+  EXPECT_NEAR(yaw(poses.back()), 0.4, 1e-12);
+  // Rotation per metre is 2 rad/m on both segments; it may rise inside the
+  // arc but changes by well under RoboPlan's 17.5 % between samples.
+  double rate_before = 0.0;
+  for (std::size_t index = 1U; index < poses.size(); ++index) {
+    const double length = (poses[index].block<3, 1>(0, 3) -
+                           poses[index - 1U].block<3, 1>(0, 3))
+                              .norm();
+    const double turn = yaw(poses[index]) - yaw(poses[index - 1U]);
+    ASSERT_GT(length, 0.0);
+    EXPECT_GT(turn, 0.0) << index;
+    const double rate = turn / length;
+    if (index > 1U) {
+      EXPECT_LT(std::abs(rate - rate_before), 0.10 * rate_before) << index;
+    }
+    rate_before = rate;
+  }
+}
+
+TEST(CartesianCornerBlendTest, RejectsBlendRadiiThatDoNotMatchTheWaypoints) {
+  for (const auto &radii : {std::vector<double>{0.0, 0.01},
+                            std::vector<double>{0.0, -0.01, 0.0},
+                            std::vector<double>{
+                                0.0, std::numeric_limits<double>::infinity(),
+                                0.0}}) {
+    const auto dense = detail::densify_cartesian_path(
+        corner_path({planar_pose(0.0, 0.0), planar_pose(0.1, 0.0),
+                     planar_pose(0.1, 0.1)},
+                    radii),
+        RoboPlanCandidateControl{});
+    ASSERT_FALSE(dense.ok());
+    EXPECT_EQ(dense.error().details.at("reason"), "cartesian_request_invalid");
+  }
+}
+
+// -- CT-1 Cartesian timing ---------------------------------------------------
+
+TEST(RoboPlanCandidateComputerTest,
+     TimeOptimalCartesianTimingFromMoveOrDeploymentDefault) {
+  auto fixture = make_fixture();
+  // Away from the fixture start's singular configuration.
+  fixture.start = fixture.goal;
+  const Eigen::Matrix4d start =
+      fixture.scene->forwardKinematics(fixture.start, "tool0", "base");
+  Eigen::Matrix4d middle = start;
+  middle(0, 3) += 0.005;
+  Eigen::Matrix4d end = start;
+  end(0, 3) += 0.01;
+  CartesianPathDTO path;
+  path.waypoints = {pose(start), pose(middle), pose(end)};
+  path.blend_radii_m = {0.0, 0.0, 0.0};
+  path.max_translation_step_m = 0.005;
+  path.max_rotation_step_rad = 0.05;
+
+  RoboPlanCandidateComputer constant_speed(
+      fixture.scene, fixture.binding,
+      RoboPlanCandidateComputerConfig{0x4321U, 65'536U, 0.01});
+  const auto bounded = constant_speed.compute(request(fixture, path));
+  ASSERT_TRUE(bounded.ok()) << bounded.error().message;
+
+  auto time_optimal_path = path;
+  time_optimal_path.speed_mode = CartesianSpeedModeDTO::kTimeOptimal;
+  const auto from_move =
+      constant_speed.compute(request(fixture, time_optimal_path));
+  ASSERT_TRUE(from_move.ok()) << from_move.error().message;
+  ASSERT_TRUE(from_move.value().cartesian_fidelity_metrics.has_value());
+  EXPECT_LE(from_move.value().cartesian_fidelity_metrics
+                ->certified_max_translation_error_m,
+            request(fixture, path).tolerances.translation_tol_m);
+  ASSERT_EQ(from_move.value().cartesian_waypoint_times_s.size(), 3U);
+
+  RoboPlanCandidateComputerConfig deployment_time_optimal{0x4321U, 65'536U,
+                                                          0.01};
+  deployment_time_optimal.cartesian_timing = CartesianSpeedModeDTO::kTimeOptimal;
+  RoboPlanCandidateComputer time_optimal(fixture.scene, fixture.binding,
+                                         deployment_time_optimal);
+  const auto from_deployment = time_optimal.compute(request(fixture, path));
+  ASSERT_TRUE(from_deployment.ok()) << from_deployment.error().message;
+  EXPECT_EQ(from_deployment.value().waypoints.size(),
+            from_move.value().waypoints.size());
+  EXPECT_DOUBLE_EQ(from_deployment.value().waypoints.back().time_from_start_s,
+                   from_move.value().waypoints.back().time_from_start_s);
+}
+
+// Bounded applies the scales to the joint limits only; the computer passes
+// the scaled 0.98 TCP target and the nominal acceleration share, so the
+// constant-speed trapezoid needs no uniform stretch for velocity_scale 0.5 or
+// the live-scaling headroom (it was >= 2 here: full TCP speed at scale 0.5).
+TEST(RoboPlanCandidateComputerTest,
+     ConstantSpeedCartesianTimingHoldsScaledTargetWithoutUniformStretch) {
+  auto fixture = make_fixture();
+  fixture.start = fixture.goal;  // away from the start's singularity
+  const Eigen::Matrix4d start =
+      fixture.scene->forwardKinematics(fixture.start, "tool0", "base");
+  Eigen::Matrix4d end = start;
+  end(0, 3) += 0.02;
+  CartesianPathDTO path;
+  path.waypoints = {pose(start), pose(end)};
+  path.blend_radii_m = {0.0, 0.0};
+  path.max_translation_step_m = 0.005;
+  path.max_rotation_step_rad = 0.05;
+  RoboPlanCandidateComputer computer(
+      fixture.scene, fixture.binding,
+      RoboPlanCandidateComputerConfig{0x4321U, 65'536U, 0.01});
+  const auto input = request(fixture, path);  // velocity_scale 0.5, 0.1 m/s
+  const auto result = computer.compute(input);
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  ASSERT_TRUE(result.value().runtime_scale_bounds);
+  ASSERT_TRUE(result.value().runtime_scale_bounds->nominal_time_multiplier);
+  // Only the quintic's acceleration overshoot between samples remains.
+  EXPECT_LT(*result.value().runtime_scale_bounds->nominal_time_multiplier,
+            1.5);
+  const double limit = *input.speed_profile.max_tcp_linear_speed_mps *
+                       input.speed_profile.velocity_scale;
+  double peak = 0.0;
+  for (const auto &waypoint : result.value().waypoints) {
+    const Eigen::VectorXd q = Eigen::Map<const Eigen::VectorXd>(
+        waypoint.positions_rad.data(), waypoint.positions_rad.size());
+    const Eigen::VectorXd v = Eigen::Map<const Eigen::VectorXd>(
+        waypoint.velocities_rad_s.data(), waypoint.velocities_rad_s.size());
+    const double h = 1e-7;
+    const auto at = [&](const Eigen::VectorXd &positions) {
+      return fixture.scene
+          ->forwardKinematics(
+              fixture.scene->toFullJointPositions("arm", positions), "tool0",
+              "base")
+          .block<3, 1>(0, 3)
+          .eval();
+    };
+    peak = std::max(peak, (at(q + h * v) - at(q)).norm() / h);
+  }
+  EXPECT_LE(peak, limit * (1.0 + 1e-3));
 }
 
 } // namespace

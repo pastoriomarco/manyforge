@@ -298,22 +298,22 @@ ReadProjectionRevision(Reader &reader) {
 }
 
 void WriteBinding(Writer &writer,
-                  const core::ProjectionNativeRuntimeBindingDTO &binding) {
+                  const core::ProjectionExecutionHostBindingDTO &binding) {
   WriteStrong(writer, binding.provider_binding_id);
   WriteStrong(writer, binding.provider_binding_revision);
   WriteStrong(writer, binding.runtime_unit_id);
   WriteStrong(writer, binding.runtime_epoch);
 }
 
-[[nodiscard]] core::ProjectionNativeRuntimeBindingDTO
+[[nodiscard]] core::ProjectionExecutionHostBindingDTO
 ReadBinding(Reader &reader) {
-  core::ProjectionNativeRuntimeBindingDTO binding{
+  core::ProjectionExecutionHostBindingDTO binding{
       ReadStrong<core::CapabilityProviderBindingId>(reader),
       ReadStrong<core::CapabilityProviderBindingRevision>(reader),
       ReadStrong<core::RuntimeUnitId>(reader),
       ReadStrong<core::RuntimeEpoch>(reader)};
   if (!binding.valid()) {
-    Fail("native runtime binding is invalid");
+    Fail("execution host binding is invalid");
   }
   return binding;
 }
@@ -737,7 +737,7 @@ void WriteHealth(Writer &writer, const core::ProjectionHealthDTO &health) {
   if (!health.valid()) {
     Fail("cannot encode invalid projection health");
   }
-  WriteBinding(writer, health.native_runtime_binding);
+  WriteBinding(writer, health.execution_host_binding);
   writer.U64(health.source_sequence);
   WriteHealthState(writer, health.state);
   WriteOptional(writer, health.active_projection_revision,
@@ -775,7 +775,7 @@ void WritePrepare(Writer &writer,
   if (!request.valid()) {
     Fail("cannot encode invalid candidate preparation request");
   }
-  WriteBinding(writer, request.native_runtime_binding);
+  WriteBinding(writer, request.execution_host_binding);
   WriteStrong(writer, request.candidate_retained_bundle_id);
   WriteStrong(writer, request.candidate_graph_revision);
   WriteProduct(writer, request.planning_collision_model);
@@ -796,7 +796,7 @@ void WriteRebuild(Writer &writer,
   if (!request.valid()) {
     Fail("cannot encode invalid projection rebuild request");
   }
-  WriteBinding(writer, request.expected_native_runtime_binding);
+  WriteBinding(writer, request.expected_execution_host_binding);
   WriteProjectionRevision(writer, request.target_projection_revision);
   WriteProduct(writer, request.planning_collision_model);
   writer.String(scene::EncodeLogicalSceneSnapshot(*request.logical_scene));
@@ -832,7 +832,7 @@ void WriteBootstrapRebuild(
   }
   WriteStrong(writer, request.bootstrap_id);
   WriteGeneration(writer, request.bootstrap_generation);
-  WriteBinding(writer, request.native_runtime_binding);
+  WriteBinding(writer, request.execution_host_binding);
   WriteProjectionRevision(writer, request.canonical_empty_target);
   WriteProduct(writer, request.planning_collision_model);
   writer.String(scene::EncodeLogicalSceneSnapshot(
@@ -864,7 +864,7 @@ void WriteBootstrapQuery(
   }
   WriteStrong(writer, query.bootstrap_id);
   WriteGeneration(writer, query.bootstrap_generation);
-  WriteBinding(writer, query.native_runtime_binding);
+  WriteBinding(writer, query.execution_host_binding);
   WriteProjectionRevision(writer, query.canonical_empty_target);
 }
 
@@ -943,7 +943,7 @@ void WriteBootstrapRebuildResult(
   }
   WriteStrong(writer, result.bootstrap_id);
   WriteGeneration(writer, result.bootstrap_generation);
-  WriteBinding(writer, result.native_runtime_binding);
+  WriteBinding(writer, result.execution_host_binding);
   WriteProjectionRevision(writer, result.canonical_empty_target);
   WriteProduct(writer, result.planning_collision_model);
   writer.String(scene::EncodeLogicalSceneSnapshot(
@@ -1009,7 +1009,7 @@ void WriteBootstrapStatus(
   }
   WriteStrong(writer, status.bootstrap_id);
   WriteGeneration(writer, status.bootstrap_generation);
-  WriteBinding(writer, status.native_runtime_binding);
+  WriteBinding(writer, status.execution_host_binding);
   WriteProjectionRevision(writer, status.canonical_empty_target);
   writer.Byte(static_cast<std::uint8_t>(status.state));
   WriteOptional(writer, status.acknowledged_target, WriteProjectionRevision);
@@ -1103,11 +1103,11 @@ EncodeNativeProjectionRpcRequest(const NativeProjectionRpcRequest &request) {
           writer.Byte(static_cast<std::uint8_t>(RequestKind::kPrepare));
           WritePrepare(writer, value);
         } else if constexpr (std::is_same_v<T, NativeProjectionHealthQuery>) {
-          if (!value.native_runtime_binding.valid()) {
+          if (!value.execution_host_binding.valid()) {
             Fail("cannot encode invalid projection health query");
           }
           writer.Byte(static_cast<std::uint8_t>(RequestKind::kHealth));
-          WriteBinding(writer, value.native_runtime_binding);
+          WriteBinding(writer, value.execution_host_binding);
           // Absence retains the original tag-2 body byte for byte. An explicit
           // zero marker is not an alternative encoding of absence.
           if (value.selected_projection_revision.has_value()) {
@@ -1124,7 +1124,7 @@ EncodeNativeProjectionRpcRequest(const NativeProjectionRpcRequest &request) {
             Fail("cannot encode invalid projection transaction request");
           }
           writer.Byte(static_cast<std::uint8_t>(RequestKind::kTransaction));
-          WriteBinding(writer, value.native_runtime_binding);
+          WriteBinding(writer, value.execution_host_binding);
           writer.String(scene::EncodeSceneTransaction(value.transaction));
         } else if constexpr (std::is_same_v<T,
                                             core::NativeProjectionRebuildDTO>) {
@@ -1146,7 +1146,7 @@ EncodeNativeProjectionRpcRequest(const NativeProjectionRpcRequest &request) {
             Fail("cannot encode invalid projection retain request");
           }
           writer.Byte(static_cast<std::uint8_t>(RequestKind::kRetain));
-          WriteBinding(writer, value.native_runtime_binding);
+          WriteBinding(writer, value.execution_host_binding);
           WriteProjectionRevision(writer, value.projection_revision);
           WriteStrong(writer, value.projection_lease_id);
         } else if constexpr (std::is_same_v<
@@ -1155,7 +1155,7 @@ EncodeNativeProjectionRpcRequest(const NativeProjectionRpcRequest &request) {
             Fail("cannot encode invalid projection release request");
           }
           writer.Byte(static_cast<std::uint8_t>(RequestKind::kRelease));
-          WriteBinding(writer, value.native_runtime_binding);
+          WriteBinding(writer, value.execution_host_binding);
           WriteStrong(writer, value.projection_lease_id);
         } else if constexpr (std::is_same_v<
                                  T, NativeProjectionSceneFrameRequest>) {
@@ -1163,7 +1163,7 @@ EncodeNativeProjectionRpcRequest(const NativeProjectionRpcRequest &request) {
             Fail("cannot encode invalid projection scene-frame request");
           }
           writer.Byte(static_cast<std::uint8_t>(RequestKind::kSceneFrame));
-          WriteBinding(writer, value.native_runtime_binding);
+          WriteBinding(writer, value.execution_host_binding);
           WriteSceneFrameQuery(writer, value.query);
         } else {
           static_assert(
@@ -1173,7 +1173,7 @@ EncodeNativeProjectionRpcRequest(const NativeProjectionRpcRequest &request) {
           }
           writer.Byte(
               static_cast<std::uint8_t>(RequestKind::kEffectivePolicy));
-          WriteBinding(writer, value.native_runtime_binding);
+          WriteBinding(writer, value.execution_host_binding);
           writer.String(scene::EncodeLogicalSceneSnapshot(
               value.logical_scene));
           writer.U64(value.effective_policy_revision_id);

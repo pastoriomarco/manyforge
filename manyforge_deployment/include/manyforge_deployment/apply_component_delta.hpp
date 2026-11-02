@@ -10,6 +10,7 @@
 #include <manyforge_core/types/cell_graph.hpp>
 #include <manyforge_core/types/configuration_fence.hpp>
 #include <manyforge_core/types/strong_id.hpp>
+#include <manyforge_deployment/component_spec.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 
 namespace manyforge::deployment {
@@ -22,8 +23,9 @@ public:
 /// What one Apply does to one controllable component's runtime.
 ///
 /// Retain keeps the exact controller, engines, observed-state source, owner
-/// epoch, eligibility and lifecycle/route generations. Replace is chosen only
-/// when a fact the component's runtime depends on changed, and names why.
+/// epoch, eligibility and lifecycle/route generations; the component takes the
+/// new CellContext. Replace is chosen exactly when its ComponentSpec changed,
+/// and names the spec sections that differ.
 enum class ApplyComponentDisposition : std::uint8_t {
   kRetain = 0,
   kAdd,
@@ -37,20 +39,6 @@ to_string(ApplyComponentDisposition disposition) noexcept;
 inline constexpr std::size_t kMaximumApplyComponentDeltaRows = 128U;
 inline constexpr std::size_t kMaximumApplyComponentDeltaDomains = 64U;
 
-/// Fact families that make up a component's runtime identity. A replacement
-/// reason is exactly one of these tokens.
-inline constexpr std::string_view kApplyComponentReasonComponent = "component";
-inline constexpr std::string_view kApplyComponentReasonModelInstances =
-    "model_instances";
-inline constexpr std::string_view kApplyComponentReasonBindings = "bindings";
-inline constexpr std::string_view kApplyComponentReasonDomains = "domains";
-inline constexpr std::string_view kApplyComponentReasonRuntimeUnits =
-    "runtime_units";
-inline constexpr std::string_view kApplyComponentReasonCapabilityProviders =
-    "capability_providers";
-inline constexpr std::string_view kApplyComponentReasonRetainedPolicies =
-    "retained_policies";
-
 struct ApplyComponentChangeDTO final {
   core::ControllableComponentId controllable_component_id;
   ApplyComponentDisposition disposition{ApplyComponentDisposition::kRetain};
@@ -61,7 +49,8 @@ struct ApplyComponentChangeDTO final {
   /// Canonical sorted domains the component owns in each bundle.
   std::vector<core::ControlDomainId> predecessor_domains;
   std::vector<core::ControlDomainId> candidate_domains;
-  /// Sorted fact-family tokens; non-empty exactly for kReplace.
+  /// Sorted spec section names (kComponentSpecSections); non-empty exactly
+  /// for kReplace.
   std::vector<std::string> replacement_reasons;
 
   [[nodiscard]] bool valid() const noexcept;
@@ -98,12 +87,13 @@ EncodeApplyComponentDelta(const ApplyComponentDeltaDTO &delta);
 [[nodiscard]] ApplyComponentDeltaDTO
 DecodeApplyComponentDelta(std::string_view encoded);
 
-/// The runtime identity of one component in one sealed bundle, or nullopt
-/// when the bundle does not contain the component. B's host uses this to
-/// report the identity it actually installed.
+/// The runtime identity of one component in one sealed bundle (its
+/// ComponentSpec fingerprint under this site's facts), or nullopt when the
+/// bundle does not contain the component. The host uses this to report the
+/// identity it actually installed.
 [[nodiscard]] std::optional<core::ContentDigest>
 derive_component_runtime_identity(
-    const RetainedBundle &bundle,
+    const RetainedBundle &bundle, const SiteFacts &site_facts,
     const core::ControllableComponentId &controllable_component_id);
 
 /// Every added, removed or replaced component that owns a control domain is
@@ -126,11 +116,13 @@ derive_component_runtime_identity(
 detached_attachment_children(const core::CellGraphDTO &predecessor,
                              const core::CellGraphDTO &candidate);
 
-/// Purely classifies every component of one named Apply. Both inputs are
-/// sealed, independently verified retained bundles of the same cell; the
+/// Purely classifies every component of one named Apply by comparing each
+/// component's spec in both bundles under the same site facts. Both inputs
+/// are sealed, independently verified retained bundles of the same cell; the
 /// function performs no I/O.
 [[nodiscard]] ApplyComponentDeltaDTO
 derive_apply_component_delta(const RetainedBundle &predecessor,
-                             const RetainedBundle &candidate);
+                             const RetainedBundle &candidate,
+                             const SiteFacts &site_facts);
 
 } // namespace manyforge::deployment

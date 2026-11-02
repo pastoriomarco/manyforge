@@ -1590,11 +1590,7 @@ class ProgramCycleJournal:
                     # implicit Scene restoration is never reinterpreted.
                     retained_intent = self._load(current[1])
                     compared_intent = dict(intent)
-                    for key in (
-                        "reload_initial_scene",
-                        "reset_robot_position",
-                        "keep_stop_fault",
-                    ):
+                    for key in ("reload_initial_scene", "reset_robot_position"):
                         retained_intent.setdefault(key, False)
                         compared_intent.setdefault(key, False)
                     same_intent = self._dump(retained_intent) == self._dump(compared_intent)

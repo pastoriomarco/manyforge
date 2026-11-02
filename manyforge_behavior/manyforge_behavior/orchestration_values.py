@@ -419,10 +419,6 @@ class ProgramValueStore:
         self._declarations = program.blackboard_keys
         self._parameters = MappingProxyType(_program_parameter_values(program))
         self._values: dict[str, ProgramValueRecord] = {}
-        # Mirror writes per interrupt_state key, unchanged values included:
-        # each is one reading of the Kernel rule state (Rule 2 gate wait).
-        self._interrupt_state_readings: dict[str, int] = {}
-        self._interrupt_notify_rule_reader: Callable[[], tuple[str, ...] | None] | None = None
         self._lock = RLock()
         self._published: frozenset[str] | None = None
         self._on_published: Callable[[PublishedKeyChange], None] | None = None
@@ -617,7 +613,9 @@ class ProgramValueStore:
         section, so no commit falls between them. A computed key is recomputed
         by the existing evaluator whenever a stored key it reads commits, and
         is reported only when its value actually changes. Both callbacks run
-        under the store lock: they may only capture and enqueue bounded data.
+        under the store lock and forward synchronously (BBK-1): every writer
+        commits through this store, so the forwards keep commit order and a
+        write returns only after its forward.
         """
 
         if not keys or keys != tuple(sorted(set(keys))):
@@ -660,28 +658,43 @@ class ProgramValueStore:
                     "the Run's published blackboard keys are already fixed"
                 )
             self._published_computed = computed_inputs
-            computed = self._published_computed_locked(set(computed_inputs))
-            self._published_computed_last = computed
-            changes = []
-            for key in keys:
-                if key in computed:
-                    present, value = computed[key]
-                else:
-                    present = key in self._values
-                    value = (
-                        _copy_runtime_value(self._values[key].value) if present else None
-                    )
-                changes.append(
-                    PublishedKeyChange(
-                        key=key,
-                        value_type=self._declarations[key].type,
-                        value=value,
-                        present=present,
-                    )
-                )
-            baseline(tuple(changes))
+            baseline(self._published_baseline_locked(keys))
             self._published = frozenset(keys)
             self._on_published = on_change
+
+    def read_published_baseline(
+        self, baseline: Callable[[tuple[PublishedKeyChange, ...]], None]
+    ) -> None:
+        """Hand ``baseline`` every subscribed key's current value, under the
+        store lock: a source the Kernel installs later starts from the values
+        committed meanwhile (BBK-1 (a))."""
+
+        with self._lock:
+            if self._published is None:
+                raise ProgramValueError("the Run's published blackboard keys are not fixed")
+            baseline(self._published_baseline_locked(tuple(sorted(self._published))))
+
+    def _published_baseline_locked(
+        self, keys: tuple[str, ...]
+    ) -> tuple[PublishedKeyChange, ...]:
+        computed = self._published_computed_locked(set(self._published_computed))
+        self._published_computed_last = computed
+        changes = []
+        for key in keys:
+            if key in computed:
+                present, value = computed[key]
+            else:
+                present = key in self._values
+                value = _copy_runtime_value(self._values[key].value) if present else None
+            changes.append(
+                PublishedKeyChange(
+                    key=key,
+                    value_type=self._declarations[key].type,
+                    value=value,
+                    present=present,
+                )
+            )
+        return tuple(changes)
 
     def _published_computed_locked(
         self, keys: set[str]
@@ -865,7 +878,6 @@ class ProgramValueStore:
         if state is not None and state not in INTERRUPT_STATE_VALUES:
             raise ProgramValueError(f"{state!r} is not an interrupt rule state")
         with self._lock:
-            self._interrupt_state_readings[key] = self._interrupt_state_readings.get(key, 0) + 1
             current = self._values.get(key)
             if state is None:
                 if current is None:
@@ -910,39 +922,6 @@ class ProgramValueStore:
                 )
             self._publish_locked(key, current)
         return True
-
-    def set_interrupt_notify_rule_reader(
-        self, reader: Callable[[], tuple[str, ...] | None] | None
-    ) -> None:
-        """Install the Run's context-qualified catalog view for gate retries."""
-
-        with self._lock:
-            self._interrupt_notify_rule_reader = reader
-
-    def interrupt_rule_is_notify(self, rule_id: str) -> bool:
-        """Whether the current catalog proves this rule uses notify mode."""
-
-        with self._lock:
-            reader = self._interrupt_notify_rule_reader
-        if reader is None:
-            return False
-        notify_rule_ids = reader()
-        return notify_rule_ids is not None and rule_id in notify_rule_ids
-
-    def interrupt_state_reading(self, rule_id: str) -> tuple[int, str | None]:
-        """(readings, state) of one global rule: how many mirror readings this
-        store received for it, and the current state (None: unavailable or
-        not declared). A motion node gated by the rule re-evaluates its
-        admission only on a newer clear reading, or a newer tripped reading
-        when the context-qualified catalog marks the rule notify."""
-
-        key = interrupt_state_key(rule_id)
-        with self._lock:
-            current = self._values.get(key)
-            return (
-                self._interrupt_state_readings.get(key, 0),
-                None if current is None else current.value,
-            )
 
     def reset_to_initial(
         self, key: str, *, metadata: Mapping[str, Any] | None = None

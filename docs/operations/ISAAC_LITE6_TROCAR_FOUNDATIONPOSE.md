@@ -1,7 +1,7 @@
 # Isaac Lite6 Trocar FoundationPose Bring-Up
 
 This runbook covers the Lite6 trocar pick Scenario
-(`examples/isaac-lite6-trocar-foundationpose.scenario`):
+(`examples/sim_lite6_foundationpose_trocar_pick.scenario`):
 
 - Isaac Sim runs the Lite6/trocar USD on the simulator host.
 - Isaac ROS 4.4 runs YOLOv8 + FoundationPose and publishes
@@ -197,7 +197,7 @@ export MANYFORGE_ROOT="${MANYFORGE_ROOT:-${HOME}/workspaces/dev_ws/src/manyforge
 cd "${MANYFORGE_ROOT}"
 source config/ros/isaac_lite6_trocar_foundationpose.env.sh
 
-./scripts/compose-dev.sh start --project examples/isaac-lite6-trocar-foundationpose.scenario
+./scripts/compose-dev.sh start --project examples/sim_lite6_foundationpose_trocar_pick.scenario
 ./scripts/compose-dev.sh status
 ```
 
@@ -256,8 +256,8 @@ nodes remain fully visible and editable; the template itself is never saved or
 run.
 
 Each generated motion has independent selectors for motion type (`joint`,
-`pose`, `cartesian`), target mode (`absolute`, `relative`), and
-planner-neutral planning profile. Cartesian paths require the Deployment to
+`pose`, `cartesian`), target mode (`absolute`, `relative`), and an optional
+planner block (otherwise the Deployment's). Cartesian paths require the Deployment to
 advertise `planning.motion.cartesian_path`. Unsupported choices are rejected
 instead of silently falling back to another planner behavior.
 
@@ -377,4 +377,4 @@ arriving but the `link_base <- camera_color_optical_frame` transform is missing
 or not visible to the ManyForge ROS sidecar. Fix TF before running motion.
 
 If the arm or gripper actions are missing, confirm the workbench was started
-with `--project examples/isaac-lite6-trocar-foundationpose.scenario`.
+with `--project examples/sim_lite6_foundationpose_trocar_pick.scenario`.

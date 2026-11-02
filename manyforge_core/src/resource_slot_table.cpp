@@ -76,8 +76,7 @@ template <typename Value>
 bool ResourceSlotOwnerDTO::valid() const noexcept {
   if (operation_id.empty() || !operation_revision.nonzero() || participant_id.empty() ||
       !binding_identity.locally_valid()) return false;
-  if (binding_identity.provider()) return !controller_authority;
-  return controller_authority && !controller().controller_topology_id.empty() &&
+  return !controller().controller_topology_id.empty() &&
       !controller().topology_revision.empty() && !controller().control_route_id.empty() &&
       !controller().active_control_configuration_id.empty() &&
       controller().active_control_configuration_generation.nonzero();
@@ -912,27 +911,6 @@ Result<void> ResourceSlotTable::release_batch(
   return Result<void>::Ok();
 }
 
-std::vector<ResourceId> ResourceSlotTable::force_release(
-    const std::vector<OperationId>& operations) {
-  std::lock_guard lock(data_mutex_);
-  std::vector<ResourceId> orphans;
-  bool changed = false;
-  for (auto& slot : slots_) {
-    const bool owned =
-        slot.owner.has_value() &&
-        std::find(operations.begin(), operations.end(), slot.owner->operation_id) != operations.end();
-    const bool orphan = !slot.owner.has_value() &&
-                        slot.state == ResourceSlotState::kUnreconciledExternalOrOrphanGoal;
-    if (!owned && !orphan) continue;
-    if (orphan) orphans.push_back(slot.resource_id);
-    slot.state = ResourceSlotState::kFree;
-    slot.owner.reset();
-    changed = true;
-  }
-  if (changed && require_generation_available_locked().ok()) advance_generation_locked();
-  return orphans;
-}
-
 Result<void> ResourceSlotTable::mark_unreconciled_external_or_orphan_goal(
     const std::vector<ResourceId>& resources) {
   std::lock_guard lock(data_mutex_);
@@ -1028,10 +1006,6 @@ Result<void> ResourceSlotTable::reconfigure_runtime_inventory(
     if (!slot.owner.has_value()) {
       continue;
     }
-    // Provider slots have no controller configuration. Kernel validates their
-    // exact sealed occurrence before publication; occupied resource removal
-    // remains refused above, independent of domain kind.
-    if (slot.owner->binding_identity.provider()) continue;
     const auto configuration = std::lower_bound(
         active_control_configurations.begin(), active_control_configurations.end(),
         slot.owner->binding_identity.control_domain_id,

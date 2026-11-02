@@ -14,9 +14,7 @@ enum class ExecutionState {
   kPlanning,
   kValidating,  // pre-execution validation phase
   kExecuting,
-  /// Kernel-native interrupt latch is active. The prior execution phase is
-  /// recorded on the InterruptLatch; the state itself is the observable
-  /// interrupted annotation from spec/260.
+  /// Interrupted annotation from spec/260.
   kInterrupted,
   kStopping,
   kStopped,

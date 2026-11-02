@@ -52,7 +52,7 @@ _PROGRAM_MOTION_DEFAULTS = frozenset(
         "velocity_scale",
         "acceleration_scale",
         "translation_tol_m",
-        "max_blend_deviation_rad",
+        "blend_radius_m",
     }
 )
 

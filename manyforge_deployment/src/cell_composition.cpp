@@ -18,9 +18,12 @@
 #include <variant>
 #include <vector>
 
+#include <manyforge_core/types/typed_error.hpp>
+
 #include "mf1_name_internal.hpp"
 #include "mf2_joint_name_internal.hpp"
 #include "planning_resource_map_internal.hpp"
+#include <manyforge_core/types/typed_error.hpp>
 
 namespace manyforge::deployment {
 namespace {
@@ -30,6 +33,7 @@ using ResourceUriMap =
     std::map<std::string, std::string, std::less<>>;
 using SymbolTuple =
     std::tuple<std::string, std::uint8_t, std::string, std::string>;
+using detail::StructuralAttachmentEndpointResolution;
 using detail::StructuralAttachmentResolution;
 using detail::StructuralCommandTargetResolution;
 using detail::StructuralComponentLocalResourceResolution;
@@ -230,6 +234,15 @@ class SymbolRegistry final {
       fail("internal occurrence rewrite is missing a source symbol");
     }
     return found->second;
+  }
+
+  [[nodiscard]] const std::string* find(
+      const core::ModelInstanceId& model_instance_id,
+      OccurrenceSymbolKind kind, std::string_view source) const {
+    const auto found = forward_.find(SymbolTuple{
+        model_instance_id.value(), static_cast<std::uint8_t>(kind),
+        std::string(), std::string(source)});
+    return found == forward_.end() ? nullptr : &found->second;
   }
 
   [[nodiscard]] std::vector<OccurrenceSymbolRewrite> take_forward() {
@@ -2093,6 +2106,37 @@ CompositionQualifiedCellIr compose_cell_occurrences(
         flattened_srdf.disabled_collisions.push_back(
             {key.first, key.second, std::string("Adjacent")});
       }
+    }
+  }
+  // Authored arm-tool pairs that never touch (user-owned data; only link
+  // existence is checked), disabled like the mount pairs with reason Never.
+  for (const auto& edge : graph.component_attachments) {
+    if (edge.collision_exclusions.empty()) continue;
+    const auto& attachment = *attachments_by_child_component.at(
+        edge.child.controllable_component_id.value());
+    const auto link = [&](const StructuralAttachmentEndpointResolution& end,
+                          std::string_view side, const std::string& source)
+        -> const std::string& {
+      const auto* compiled = symbols.find(end.frame.model.model_instance_id,
+                                          OccurrenceSymbolKind::kLink, source);
+      if (compiled == nullptr) {
+        throw core::TypedError(
+            "component_attachments",
+            "attachment " + edge.component_attachment_id.value() +
+                " collision exclusion names " + std::string(side) +
+                " link '" + source + "', which is not on " +
+                end.controllable_component_id.value() + "'s model");
+      }
+      return *compiled;
+    };
+    for (const auto& pair : edge.collision_exclusions) {
+      auto key = std::minmax(link(attachment.child, "child", pair.child_link),
+                             link(attachment.parent, "parent", pair.parent_link));
+      if (!disabled_pairs.emplace(key.first, key.second).second) continue;
+      require_room(flattened_srdf.disabled_collisions.size(), 1U,
+                   kMaxCompositionSymbols, "flattened SRDF disabled collision");
+      flattened_srdf.disabled_collisions.push_back(
+          {key.first, key.second, std::string("Never")});
     }
   }
   for (const auto& connection : connections) {

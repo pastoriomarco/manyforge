@@ -175,15 +175,15 @@ def test_service_selection_is_deterministic_and_prefix_bounded() -> None:
         service_type=simulation_control.RESET_SERVICE_TYPE,
     ) == "/reset_simulation"
     assert simulation_control.select_simulation_service_name(
-        ["/other/reset", "/isaacsim/reset_simulation"],
+        ["/other/reset", "/sim_a/reset_simulation"],
         service_type=simulation_control.RESET_SERVICE_TYPE,
-        service_prefix="/isaacsim/",
-    ) == "/isaacsim/reset_simulation"
+        service_prefix="/sim_a/",
+    ) == "/sim_a/reset_simulation"
     assert (
         simulation_control.select_simulation_service_name(
             ["/other/reset"],
             service_type=simulation_control.RESET_SERVICE_TYPE,
-            service_prefix="isaacsim",
+            service_prefix="sim_a",
         )
         is None
     )

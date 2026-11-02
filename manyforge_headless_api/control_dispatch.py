@@ -12,9 +12,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from pydantic import TypeAdapter, ValidationError
+from pydantic import ValidationError
 
-from manyforge_behavior.failure_details import output_may_have_acted
 
 from .control_protocol import (
     ExecutionCommandRequestDTO,
@@ -40,28 +39,23 @@ from .models import (
     ProgramManualHandoverRequest,
     RuntimeScaleControlRequest,
     RuntimeBlackboardWriteRequest,
-    StopFaultRecoveryRequest,
     StopIntentRequest,
 )
 from .native import HeadlessApiError
 from .service import HeadlessService, TrustedAttribution
 
 
-_STOP_FAULT_RECOVERY_ADAPTER: TypeAdapter = TypeAdapter(StopFaultRecoveryRequest)
-_NATIVE_EXECUTION_COMMANDS = frozenset(
+_EXECUTION_HOST_COMMANDS = frozenset(
     {
         "operation_start",
         "operation_stop",
         "operation_reset",
         "operation_acknowledge_completed",
         "cell_full_stop",
-        "stop_recovery",
         "runtime_scale",
     }
 )
 _EXPECTED_EXECUTION_OWNER_FIELD = "expected_execution_owner_epoch"
-_STANDALONE_EXECUTION_CONTROL_REVISION = 1
-_MISSING = object()
 _MANUAL_OPERATION_CONTROLS = frozenset(
     {
         "operation_reset",
@@ -71,9 +65,9 @@ _MANUAL_OPERATION_CONTROLS = frozenset(
 
 
 def requires_execution_owner_fence(command_kind: str) -> bool:
-    """Return whether a command targets the independently owned native runtime."""
+    """Return whether a command targets the independently owned execution host."""
 
-    return command_kind in _NATIVE_EXECUTION_COMMANDS
+    return command_kind in _EXECUTION_HOST_COMMANDS
 
 
 class HeadlessExecutionControlDispatch:
@@ -81,11 +75,6 @@ class HeadlessExecutionControlDispatch:
 
     def __init__(self, service: HeadlessService) -> None:
         self._service = service
-
-    def _uses_standalone_execution_owner(self) -> bool:
-        """Return whether this Headless instance intentionally has no runner."""
-
-        return getattr(self._service, "program_runner", _MISSING) is None
 
     def _manual_scope_conflict(
         self, request: ExecutionCommandRequestDTO, cycle: Mapping[str, Any]
@@ -134,80 +123,9 @@ class HeadlessExecutionControlDispatch:
         # rejects in the command's Kernel check.
         if len(matches) == 1:
             return None
-        if not matches and self._held_program_uncertain_output(request, cycle):
-            return None
         return "manual_operation_scope_stale"
 
-    def _held_program_uncertain_output(
-        self, request: ExecutionCommandRequestDTO, cycle: Mapping[str, Any]
-    ) -> bool:
-        """Contract 66 (SX-2169): the operator's targeted Reset of a retained
-        Program-owned output whose write ended acceptance-unknown, which it
-        acknowledges explicitly. Proven only from the exact current operation
-        projection: same id and revision, resident, owned by the current
-        cycle's Program run, and its participant's output_evidence. No other
-        held Program operation passes this gate."""
-
-        payload = request.payload
-        operation_id = payload.get("operation_id")
-        revision = payload.get("expected_operation_revision")
-        run_id = cycle.get("program_run_id")
-        acknowledged = payload.get("acknowledged_uncertain_outputs")
-        if (
-            request.command_envelope.command_kind != "operation_reset"
-            or not isinstance(operation_id, str)
-            or not operation_id
-            or type(revision) is not int
-            or not isinstance(run_id, str)
-            or not run_id
-            or not isinstance(acknowledged, list)
-            or {"operation_id": operation_id, "operation_revision": revision}
-            not in acknowledged
-        ):
-            return False
-        try:
-            response = self._service.execution_read(operation_id)
-        except Exception:
-            return False
-        operation = response.get("operation") if isinstance(response, Mapping) else None
-        participants = operation.get("participants") if isinstance(operation, Mapping) else None
-        return (
-            response.get("ok") is True
-            and response.get("resident") is True
-            and operation.get("operation_id") == operation_id
-            and operation.get("operation_revision") == revision
-            and operation.get("program_run_id") == run_id
-            and isinstance(participants, list)
-            and len(participants) == 1
-            and isinstance(participants[0], Mapping)
-            and output_may_have_acted(participants[0].get("output_evidence"))
-        )
-
-    def _standalone_execution_projection(self) -> tuple[str, int, dict[str, Any]]:
-        response = self._service.execution_identity()
-        identity = response.get("identity") if isinstance(response, Mapping) else None
-        owner = identity.get("owner_epoch") if isinstance(identity, Mapping) else None
-        if not isinstance(owner, str) or not owner:
-            raise HeadlessApiError(
-                "execution_control_projection_invalid",
-                "native execution owner omitted its current identity",
-            )
-        # The native owner epoch changes on replacement. Operation, Stop, and
-        # scale payloads carry their own finer-grained revisions, so a second
-        # synthetic state machine or aggregate revision is neither needed nor
-        # useful for standalone Headless operation control.
-        return (
-            owner,
-            _STANDALONE_EXECUTION_CONTROL_REVISION,
-            {
-                "execution_owner_epoch": owner,
-            },
-        )
-
     def owner_projection(self) -> tuple[str, int]:
-        if self._uses_standalone_execution_owner():
-            owner, revision, _identity = self._standalone_execution_projection()
-            return owner, revision
         cycle = self._service.program_cycle_status()
         owner = cycle.get("program_runner_owner_epoch")
         revision = cycle.get("execution_control_revision")
@@ -289,7 +207,6 @@ class HeadlessExecutionControlDispatch:
         *,
         disposition: str,
         code: str,
-        current_identity: Mapping[str, Any] | None = None,
     ) -> ExecutionIngressResult:
         """Describe owner disposition without resampling owner state.
 
@@ -306,7 +223,7 @@ class HeadlessExecutionControlDispatch:
             code=code,
             semantic_owner_epoch=envelope.expected_semantic_owner_epoch,
             execution_control_revision=(envelope.expected_execution_control_revision),
-            current_identity=current_identity,
+            current_identity=None,
         )
 
     @staticmethod
@@ -355,12 +272,9 @@ class HeadlessExecutionControlDispatch:
             selected = {
                 "reload_initial_scene": model.reload_initial_scene,
                 "reset_robot_position": model.reset_robot_position,
-                "keep_stop_fault": model.keep_stop_fault,
             }
             accepted = cycle.get("reset_options")
-            if not isinstance(accepted, dict) or {
-                "keep_stop_fault": False, **accepted
-            } != selected:
+            if not isinstance(accepted, dict) or accepted != selected:
                 disposition, code = "rejected", "program_run_request_conflict"
             else:
                 disposition, code = "joined", "program_reset_already_current"
@@ -386,23 +300,10 @@ class HeadlessExecutionControlDispatch:
         stamp: ExecutionIngressStamp,
     ) -> tuple[ExecutionIngressResult, Mapping[str, Any] | None]:
         envelope = request.command_envelope
-        standalone_execution = self._uses_standalone_execution_owner()
-        if standalone_execution:
-            if envelope.command_kind not in _NATIVE_EXECUTION_COMMANDS:
-                # Preserve the stable unavailable result for Program-owned
-                # commands; only independently owned native controls can run
-                # in an intentionally runner-less Headless process.
-                raise HeadlessApiError(
-                    "program_runner_unavailable",
-                    "independent Program runner is not configured",
-                )
-            cycle_before = None
-        elif is_stop_command(envelope.command_kind):
-            # Recognized Stop must not wait for a Program projection read.  Its
-            # semantic owner validates the exact target and current state, then
-            # the state stream publishes the authoritative outcome.
-            cycle_before = None
-        else:
+        # Recognized Stop must not wait for a Program projection read.  Its
+        # semantic owner validates the exact target and current state, then
+        # the state stream publishes the authoritative outcome.
+        if not is_stop_command(envelope.command_kind):
             cycle_before = self._service.program_cycle_status()
             allowed, reason = self._availability(cycle_before, envelope.command_kind)
             if not allowed:
@@ -555,12 +456,6 @@ class HeadlessExecutionControlDispatch:
                 result = self._service.cycle_recovery_action(
                     CycleRecoveryActionRequest.model_validate({**payload, **context})
                 )
-            elif kind == "stop_recovery":
-                result = self._service.execution_recover_stop_fault(
-                    _STOP_FAULT_RECOVERY_ADAPTER.validate_python(
-                        {**payload, "request_context": context}
-                    )
-                )
             elif kind == "runtime_scale":
                 result = self._service.execution_set_runtime_scale_control(
                     RuntimeScaleControlRequest.model_validate(
@@ -580,32 +475,12 @@ class HeadlessExecutionControlDispatch:
                 details={"validation": str(error)},
             ) from error
 
-        if standalone_execution:
-            # Ordinary native commands were fenced against this projection by
-            # the ingress immediately before dispatch. Recognized Stop skips
-            # that read deliberately and the native owner resolves stale
-            # targets conservatively. Do not add a post-command identity read:
-            # it could place a Stop response behind unrelated native work.
-            owner = envelope.expected_semantic_owner_epoch
-            revision = envelope.expected_execution_control_revision
-            current_identity = {"execution_owner_epoch": owner}
-
-            def owner_result(disposition: str, code: str) -> ExecutionIngressResult:
-                return self._addressed_result(
-                    request,
-                    disposition=disposition,
-                    code=code,
-                    current_identity=current_identity,
-                )
-
-        else:
-
-            def owner_result(disposition: str, code: str) -> ExecutionIngressResult:
-                return self._addressed_result(
-                    request,
-                    disposition=disposition,
-                    code=code,
-                )
+        def owner_result(disposition: str, code: str) -> ExecutionIngressResult:
+            return self._addressed_result(
+                request,
+                disposition=disposition,
+                code=code,
+            )
 
         if isinstance(result, Mapping) and result.get("ok") is False:
             error = result.get("error")

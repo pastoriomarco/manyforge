@@ -16,8 +16,9 @@
 #include <vector>
 
 #include "closed_schema_internal.hpp"
+#include "gripper_only_retention_fixture.hpp"
 #include "lite6_controllable_retention_fixture.hpp"
-#include "native_execution_runtime_unit_internal.hpp"
+#include "execution_host_unit_internal.hpp"
 #include "ros2_control_execution_runtime_unit_internal.hpp"
 #include "manyforge_deployment/deployment_authoring.hpp"
 #include "manyforge_deployment/artifact_codec.hpp"
@@ -580,88 +581,6 @@ value: true
                ClosedSchemaError);
 }
 
-TEST(ClosedSchema, ApiDiscriminatedFamilyKeepsBothCommandBranchesClosed) {
-  const auto schema =
-      compile_resource("catalog/manyforge.command_schema.v1.yaml");
-  EXPECT_EQ(schema.schema_id().value(), "manyforge.command_schema.v1");
-  EXPECT_EQ(schema.root_shape(), ClosedSchemaRootShape::kTaggedUnion);
-  for (const auto source : {"../catalog/gripper.command_position.v1.yaml",
-                            "../catalog/io.signal_write_boolean.v1.yaml"}) {
-    const auto candidate = parse_strict_json_model_yaml(read_resource(source));
-    const auto normalized =
-        validate_and_normalize_unqualified_artifact_candidate(schema,
-                                                              candidate);
-    EXPECT_EQ(canonical_json(normalized.normalized_root()),
-              canonical_json(candidate.root()));
-    auto missing = candidate.root().as_object();
-    std::erase_if(missing, [](const auto &field) {
-      return field.first == "command_value";
-    });
-    EXPECT_THROW(validate_and_normalize_unqualified_artifact_candidate(
-                     schema, parse_strict_json_model_yaml(
-                                 canonical_json(CanonicalValue(missing)))),
-                 ClosedSchemaError);
-  }
-  auto io = parse_strict_json_model_yaml(
-                read_resource("../catalog/io.signal_write_boolean.v1.yaml"))
-                .root()
-                .as_object();
-  io.emplace_back("completion_rule",
-                  CanonicalValue("goal_fenced_target_reached"));
-  EXPECT_THROW(validate_and_normalize_unqualified_artifact_candidate(
-                   schema, parse_strict_json_model_yaml(
-                               canonical_json(CanonicalValue(io)))),
-               ClosedSchemaError);
-  EXPECT_THROW(
-      validate_and_normalize_unqualified_artifact_candidate(
-          schema, parse_strict_json_model_yaml(
-                      R"({"api_version":"manyforge.unknown_command.v1"})")),
-      ClosedSchemaError);
-}
-
-TEST(ClosedSchema, ApiDiscriminatedFamilyRequiresAnchorAndExactValidTags) {
-  const auto source = read_resource("catalog/manyforge.command_schema.v1.yaml");
-  const auto replace = [](std::string value, std::string_view before,
-                          std::string_view after, bool all = false) {
-    auto offset = value.find(before);
-    if (offset == std::string::npos)
-      throw std::logic_error("test schema replacement absent");
-    do {
-      value.replace(offset, before.size(), after);
-      offset =
-          all ? value.find(before, offset + after.size()) : std::string::npos;
-    } while (offset != std::string::npos);
-    return value;
-  };
-  expect_compile_error(replace(source, "schema_id: manyforge.command_schema.v1",
-                               "schema_id: manyforge.other_command_family.v1"),
-                       "must include its schema_id family");
-  auto invalid_tag =
-      replace(source, "manyforge.io_signal_write_command_schema.v1",
-              "invalid_api_tag", true);
-  // The root API envelope must hold even without a redundant string-format
-  // constraint on each branch's singleton enum.
-  invalid_tag = replace(invalid_tag,
-                        "              - kind: string_format\n"
-                        "                value: api_version\n",
-                        "", true);
-  expect_compile_error(std::move(invalid_tag),
-                       "tags must be versioned ManyForge APIs");
-  expect_compile_error(
-      replace(source, "tag_value: manyforge.io_signal_write_command_schema.v1",
-              "tag_value: manyforge.command_schema.v1"),
-      "duplicate tag_value");
-  expect_compile_error(
-      replace(source, "values: [manyforge.io_signal_write_command_schema.v1]",
-              "values: [manyforge.command_schema.v1]"),
-      "branch tag field must be a single-value string enum matching tag_value");
-  expect_compile_error(
-      replace(source, "values: [manyforge.io_signal_write_command_schema.v1]",
-              "values: [manyforge.io_signal_write_command_schema.v1, "
-              "manyforge.other.v1]"),
-      "branch tag field must be a single-value string enum matching tag_value");
-}
-
 TEST(ClosedSchema, OrdinaryArtifactRootsStillRequireTheirExactSchemaApi) {
   for (const auto name : {"inventory", "command"}) {
     const auto family =
@@ -770,7 +689,7 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
   const auto &registry = build_qualified_closed_schema_registry();
   ASSERT_EQ(registry.catalog_schemas().size(),
             core::kCatalogRecordTypeRegistry.size());
-  ASSERT_EQ(registry.value_schemas().size(), 7U);
+  ASSERT_EQ(registry.value_schemas().size(), 6U);
   for (const auto &value_schema : registry.value_schemas()) {
     const auto expected_shape = value_schema.schema_id().value() ==
                                         "manyforge.value_schema.provider_"
@@ -805,7 +724,7 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
       EXPECT_EQ(
           entry.compiled_schema()->schema_revision().value(),
           "sha256:"
-          "fdce9bb1facd259bde85f502197fd534dc05346a030605a55aa951d9e88c73dd");
+          "4f23fe66c0dd587d998a52a7b166bddd22d7ab8e5b28caacc48373ff373dcd84");
       EXPECT_EQ(registry.find_qualified_catalog_schema(
                     entry.record_kind(), entry.schema_id(),
                     entry.compiled_schema()->schema_revision()),
@@ -946,11 +865,6 @@ TEST(ClosedSchema, BuildRegistryQualifiesOnlyTheCompleteAdmittedFamilies) {
                                      "03457d535d31818fedaa7e44f48432a08feb705e4"
                                      "d22c9a8f5e50977c8dbf785")),
             nullptr);
-  EXPECT_NE(
-      registry.find_qualified_value_schema(
-          core::SchemaId("manyforge.value_schema.runtime.native_execution.v1"),
-          core::SchemaRevision("sha256:19db78f3505f27815b6a90556de58caa0541c91193ead9b6a643f475383d5190")),
-      nullptr);
   EXPECT_EQ(registry.find_qualified_value_schema(
                 core::SchemaId("manyforge.none.v1"),
                 core::SchemaRevision("sha256:"
@@ -1014,7 +928,7 @@ TEST(ClosedSchema, IoComponentWrapperUsesSharedRowsAndMaterializesDeviceLimit) {
       core::SchemaId("manyforge.value_schema.runtime.io_provider_execution.v1"),
       core::SchemaRevision(
           "sha256:"
-          "253091b4459b65d16bf23acc539e5d3c9ee65938008a147fd438ec6b6d8d53d7"));
+          "500cfe739120003e06057cdf78a94f006eb4fc4ef157a7f55f70ab4d1aa45b1d"));
   ASSERT_NE(schema, nullptr);
   const auto source = parse_strict_json_model_yaml(R"({
     "io_signals":[
@@ -1069,7 +983,7 @@ TEST(ClosedSchema, IoComponentWrapperRefusesEmptySignalsMultipleDevicesAndMotion
       core::SchemaId("manyforge.value_schema.runtime.io_provider_execution.v1"),
       core::SchemaRevision(
           "sha256:"
-          "253091b4459b65d16bf23acc539e5d3c9ee65938008a147fd438ec6b6d8d53d7"));
+          "500cfe739120003e06057cdf78a94f006eb4fc4ef157a7f55f70ab4d1aa45b1d"));
   ASSERT_NE(schema, nullptr);
   const std::string signal = R"({"controllable_component_id":"device.io",
     "command_target_id":"gpio","resource_role_id":"lamp","signal_name":"lamp",
@@ -1139,143 +1053,6 @@ TEST(ClosedSchema, PoseSourceComponentSchemaIsClosedAndBuildQualified) {
   auto header = simulation;
   header.replace(header.find(header_field), header_field.size(), "");
   EXPECT_THROW((void)normalize(budget + "," + header), ClosedSchemaError);
-}
-
-TEST(ClosedSchema,
-     NativeExecutionRuntimeConfigurationIsClosedBoundedAndBuildQualified) {
-  const auto &registry = build_qualified_closed_schema_registry();
-  const auto *schema = registry.find_qualified_value_schema(
-      core::SchemaId("manyforge.value_schema.runtime.native_execution.v1"),
-      core::SchemaRevision(
-          "sha256:"
-          "19db78f3505f27815b6a90556de58caa0541c91193ead9b6a643f475383d5190"));
-  ASSERT_NE(schema, nullptr);
-
-  const CanonicalValue valid = value_object({
-      {"mode", CanonicalValue("simulated")},
-      {"planner_rng_seed", CanonicalValue(12345.0)},
-      {"initial_joint_positions_rad", CanonicalValue(CanonicalValue::Array{
-                                          CanonicalValue(0.0),
-                                          CanonicalValue(-1.57),
-                                          CanonicalValue(1.57),
-                                          CanonicalValue(-1.57),
-                                          CanonicalValue(-1.57),
-                                          CanonicalValue(0.0),
-                                      })},
-      {"execution_tick_hz", CanonicalValue(100.0)},
-      {"collision_monitor_period_ms", CanonicalValue(50.0)},
-      {"motion_target_limits",
-       CanonicalValue(
-           CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
-               {"controllable_component_id", CanonicalValue("robot")},
-               {"command_target_id", CanonicalValue("arm")},
-               {"maximum_tcp_linear_speed_mps", CanonicalValue(0.15)},
-               {"ordinary_motion_jerk", value_object({
-                   {"enabled", CanonicalValue(false)},
-                   {"preset_reference_time_s", CanonicalValue(1.0)},
-                   {"joint_limits", CanonicalValue(CanonicalValue::Array{})}})},
-               {"tcp_speed_check", CanonicalValue("active_tcp_and_flange")},
-           })})},
-      {"direct_control_joint_limits",
-       CanonicalValue(
-           CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
-               {"controllable_component_id", CanonicalValue("robot")},
-               {"command_target_id", CanonicalValue("arm")},
-               {"source_joint_name", CanonicalValue("joint1")},
-               {"max_velocity_rad_s", CanonicalValue(1.5)},
-               {"max_acceleration_rad_s2", CanonicalValue(2.5)},
-               {"max_jerk_rad_s3", CanonicalValue(10.0)},
-           })})},
-      {"gripper_target_configurations",
-       CanonicalValue(
-           CanonicalValue::Array{CanonicalValue(CanonicalValue::Object{
-               {"actuation_kind", CanonicalValue("position_commanded")},
-               {"attach_frame", CanonicalValue("tool_tcp")},
-               {"auxiliary_frames", CanonicalValue(CanonicalValue::Array{
-                                        CanonicalValue("tool_base")})},
-               {"closed_state_ref", CanonicalValue("closed")},
-               {"command_duration_s", CanonicalValue(0.8)},
-               {"command_target_id", CanonicalValue("gripper")},
-               {"controllable_component_id", CanonicalValue("robot")},
-               {"description", CanonicalValue("Test gripper")},
-               {"mount_frame", CanonicalValue("tool_mount")},
-               {"open_state_ref", CanonicalValue("open")},
-               {"tcp_frame", CanonicalValue("tool_tcp")},
-               {"touch_links", CanonicalValue(CanonicalValue::Array{
-                                   CanonicalValue("left_finger"),
-                                   CanonicalValue("right_finger")})},
-           })})},
-  });
-  const auto normalized =
-      validate_and_normalize_build_qualified_value(*schema, valid);
-  EXPECT_EQ(normalized.normalized_value(), valid);
-
-  auto retired_operator_field = valid.as_object();
-  for (auto &[name, value] : retired_operator_field) {
-    if (name != "gripper_target_configurations")
-      continue;
-    auto targets = value.as_array();
-    auto target = targets.front().as_object();
-    target.emplace_back("operator_confirmation_validity_ns",
-                        CanonicalValue(30'000'000'000.0));
-    targets.front() = CanonicalValue(std::move(target));
-    value = CanonicalValue(std::move(targets));
-  }
-  EXPECT_THROW(
-      validate_and_normalize_build_qualified_value(
-          *schema, CanonicalValue(std::move(retired_operator_field))),
-      ClosedSchemaError);
-
-  // tcp_speed_check: omission materializes `active_tcp_and_flange`; only the
-  // two modes are accepted.
-  const auto with_speed_check = [&](std::optional<CanonicalValue> mode) {
-    auto fields = valid.as_object();
-    for (auto &[name, value] : fields) {
-      if (name != "motion_target_limits") continue;
-      auto rows = value.as_array();
-      CanonicalValue::Object row;
-      for (const auto &[field, item] : rows.front().as_object())
-        if (field != "tcp_speed_check") row.emplace_back(field, item);
-      if (mode) row.emplace_back("tcp_speed_check", *mode);
-      rows.front() = CanonicalValue(std::move(row));
-      value = CanonicalValue(std::move(rows));
-    }
-    return CanonicalValue(std::move(fields));
-  };
-  EXPECT_EQ(validate_and_normalize_build_qualified_value(
-                *schema, with_speed_check(std::nullopt))
-                .normalized_value(),
-            valid);
-  EXPECT_NO_THROW(static_cast<void>(validate_and_normalize_build_qualified_value(
-      *schema, with_speed_check(CanonicalValue("active_tcp")))));
-  for (const auto &invalid : {CanonicalValue("flange"), CanonicalValue(1.0)})
-    EXPECT_THROW(static_cast<void>(validate_and_normalize_build_qualified_value(
-                     *schema, with_speed_check(invalid))),
-                 ClosedSchemaError);
-
-  EXPECT_THROW(
-      validate_and_normalize_build_qualified_value(
-          *schema,
-          value_object({
-              {"mode", CanonicalValue("real")},
-              {"planner_rng_seed", CanonicalValue(12345.0)},
-              {"initial_joint_positions_rad",
-               CanonicalValue(CanonicalValue::Array{CanonicalValue(0.0)})},
-              {"execution_tick_hz", CanonicalValue(100.0)},
-              {"collision_monitor_period_ms", CanonicalValue(50.0)},
-          })),
-      ClosedSchemaError);
-  EXPECT_THROW(
-      validate_and_normalize_build_qualified_value(
-          *schema, value_object({
-                       {"mode", CanonicalValue("simulated")},
-                       {"planner_rng_seed", CanonicalValue(12345.0)},
-                       {"initial_joint_positions_rad",
-                        CanonicalValue(CanonicalValue::Array{})},
-                       {"execution_tick_hz", CanonicalValue(0.0)},
-                       {"collision_monitor_period_ms", CanonicalValue(0.0)},
-                   })),
-      ClosedSchemaError);
 }
 
 TEST(ClosedSchema, QualifiesEveryAndOnlyTheExactBuiltinCapabilityDefinition) {
@@ -1472,7 +1249,7 @@ TEST(ClosedSchema, EveryPackagedYamlResourcePassesStrictUniqueKeyIngress) {
         << relative_path;
     ++parsed_count;
   }
-  EXPECT_EQ(parsed_count, 21U);
+  EXPECT_EQ(parsed_count, 20U);
 }
 
 TEST(ClosedSchema,
@@ -1649,7 +1426,7 @@ TEST(ClosedSchema,
                  core::CatalogRecordKind::kCommandSchema) {
         expected_revision =
             "sha256:"
-            "fdce9bb1facd259bde85f502197fd534dc05346a030605a55aa951d9e88c73dd";
+            "4f23fe66c0dd587d998a52a7b166bddd22d7ab8e5b28caacc48373ff373dcd84";
         expected_path = "catalog/manyforge.command_schema.v1.yaml";
       } else if (built.record_kind() ==
                  core::CatalogRecordKind::kComponentType) {
@@ -1745,7 +1522,6 @@ TEST(ClosedSchema,
       "value/"
       "manyforge.value_schema.provider_contract.motion_controlled_stop.v1.yaml",
       "value/manyforge.value_schema.runtime.empty.v1.yaml",
-      "value/manyforge.value_schema.runtime.native_execution.v1.yaml",
       "value/manyforge.value_schema.runtime.ros2_control_execution.v1.yaml",
       "value/manyforge.value_schema.runtime.io_provider_execution.v1.yaml",
       "value/manyforge.value_schema.runtime.pose_source.v2.yaml",
@@ -2010,8 +1786,7 @@ CanonicalValue with_ros_delivery_timeout(
 TEST(ClosedSchema, RosDeliveryTimeoutPreservesAbsenceAndColdDecodedSource) {
   for (const std::string_view kind : {"pneumatic", "position_commanded"}) {
     const auto fixture =
-        test::make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture(
-            {}, kind);
+        test::make_lite_gripper_only_retention_fixture({}, kind);
     const auto &source = fixture.qualified.deployment().normalized_authored_root();
     const auto absent = with_ros_delivery_timeout(source, std::nullopt);
     const auto compiled_absent = compile_deployment_draft(canonical_json(absent));
@@ -2040,14 +1815,14 @@ TEST(ClosedSchema, RosDeliveryTimeoutPreservesAbsenceAndColdDecodedSource) {
     auto common = std::get<core::JsonObjectDTO>(rows.front().value);
     common.erase("output_mode");
     ASSERT_EQ(common.size(), 12U);
-    const auto archival = detail::decode_execution_gripper_target_configurations(
-        {core::JsonValueDTO{common}}, "archival Native configuration");
-    ASSERT_EQ(archival.size(), 1U);
-    EXPECT_DOUBLE_EQ(archival.front().command_duration_s, 0.8);
-    EXPECT_EQ(archival.front().actuation_kind, kind);
+    const auto common_rows = detail::decode_execution_gripper_target_configurations(
+        {core::JsonValueDTO{common}}, "common configuration");
+    ASSERT_EQ(common_rows.size(), 1U);
+    EXPECT_DOUBLE_EQ(common_rows.front().command_duration_s, 0.8);
+    EXPECT_EQ(common_rows.front().actuation_kind, kind);
     common.emplace("delivery_result_timeout_s", core::JsonValueDTO{2.5});
     EXPECT_THROW((void)detail::decode_execution_gripper_target_configurations(
-                     {core::JsonValueDTO{common}}, "archival Native configuration"),
+                     {core::JsonValueDTO{common}}, "common configuration"),
                  RetainedBundleError);
 
     if (kind != "pneumatic") continue;
@@ -2081,8 +1856,7 @@ TEST(ClosedSchema, RosDeliveryTimeoutPreservesAbsenceAndColdDecodedSource) {
 TEST(ClosedSchema, RosDeliveryTimeoutRejectsMalformedAndForeignPositionAtBothBoundaries) {
   for (const std::string_view kind : {"pneumatic", "position_commanded"}) {
     const auto fixture =
-        test::make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture(
-            {}, kind);
+        test::make_lite_gripper_only_retention_fixture({}, kind);
     const auto &source = fixture.qualified.deployment().normalized_authored_root();
     const auto &graph = fixture.qualified.deployment().graph().graph();
     const std::array invalid{CanonicalValue(0.0), CanonicalValue(-1.0),
@@ -2148,7 +1922,7 @@ TEST(ClosedSchema, RosDeliveryTimeoutRejectsMalformedAndForeignPositionAtBothBou
 }
 
 TEST(ClosedSchema, RosNoneRetainsPositiveTimeoutMetadataWithoutMaterializingDefault) {
-  const auto fixture = test::make_lite6_ros2_control_no_output_gripper_retention_fixture({}, 0.25);
+  const auto fixture = test::make_lite_gripper_only_retention_fixture({}, "pneumatic", 0.25, "none");
   const auto &source = fixture.qualified.deployment().normalized_authored_root();
   const std::array profiles{*fixture.ros2_control_execution_runtime_profile};
   for (const auto &timeout : {std::optional<CanonicalValue>{},
@@ -2168,93 +1942,6 @@ TEST(ClosedSchema, RosNoneRetainsPositiveTimeoutMetadataWithoutMaterializingDefa
   }
 }
 
-TEST(ClosedSchema, MaintainedPneumaticSourcesExplicitlyAuthorDeliveryTimeoutOnlyForPneumatic) {
-  const auto source = parse_strict_json_model_yaml(
-      read_resource("../maintained/maintained_deployment_sources.v1.json"));
-  std::size_t pneumatic = 0U;
-  std::size_t position = 0U;
-  for (const auto &profile : member(source.root(), "runtime_restoration_profiles").as_array()) {
-    const auto *runtime = profile.find_object_member("ros2_control_runtime");
-    if (runtime == nullptr) continue;
-    const auto *rows = runtime->find_object_member("gripper_target_configurations");
-    if (rows == nullptr) continue;
-    // M6 tool split: grippers have their own profiles. A lane-simulated one
-    // (Mock or Isaac selector) commands its output; the lane-free pneumatic
-    // profile has no output (its valve and sensor are I/O components).
-    const bool simulated = runtime->find_object_member("mock_profile") != nullptr ||
-                           runtime->find_object_member("isaac_profile") != nullptr;
-    for (const auto &row : rows->as_array()) {
-      const auto *timeout = row.find_object_member("delivery_result_timeout_s");
-      if (member(row, "actuation_kind").as_string() == "pneumatic") {
-        ++pneumatic;
-        ASSERT_NE(timeout, nullptr);
-        EXPECT_DOUBLE_EQ(std::get<double>(timeout->storage()), 1.0);
-        EXPECT_EQ(row.as_object().size(), 14U);
-      } else {
-        ++position;
-        EXPECT_EQ(timeout, nullptr);
-        EXPECT_EQ(row.as_object().size(), 13U);
-      }
-      EXPECT_EQ(member(row, "output_mode").as_string(), simulated ? "commanded" : "none");
-    }
-  }
-  EXPECT_EQ(pneumatic, 3U);
-  EXPECT_EQ(position, 3U);
-}
-
-// CP9: every maintained ROS profile declares its streams with their defaults:
-// Isaac arm measured joints and gripper feedback warning/auto, Mock arm and
-// gripper fault/ack, gripper feedback 1 s. M6 tool split: the Real arm profile
-// carries no gripper, and the lane-free no-output pneumatic gripper profile
-// declares no stream. One data source; no code default.
-TEST(ClosedSchema, MaintainedRosProfilesDeclareComponentStreamDefaults) {
-  const auto source = parse_strict_json_model_yaml(
-      read_resource("../maintained/maintained_deployment_sources.v1.json"));
-  std::size_t profiles = 0U;
-  for (const auto &profile : member(source.root(), "runtime_restoration_profiles").as_array()) {
-    const auto *runtime = profile.find_object_member("ros2_control_runtime");
-    if (runtime == nullptr) continue;
-    // E1: a profile added as data carries only its lane selector; its
-    // Deployment authors the streams, which the compiler checks.
-    if (runtime->as_object().size() == 1U) continue;
-    ++profiles;
-    const bool isaac = runtime->find_object_member("isaac_profile") != nullptr;
-    const bool real = runtime->find_object_member("real_profile") != nullptr;
-    const bool gripper = runtime->find_object_member("gripper_target_configurations") != nullptr;
-    if (real) {
-      EXPECT_FALSE(gripper);
-    }
-    bool no_output = false;
-    if (gripper) {
-      const auto &grippers = member(*runtime, "gripper_target_configurations").as_array();
-      ASSERT_EQ(grippers.size(), 1U);
-      no_output = member(grippers.front(), "output_mode").as_string() == "none";
-      if (no_output) {
-        EXPECT_EQ(member(grippers.front(), "actuation_kind").as_string(), "pneumatic");
-        EXPECT_FALSE(isaac || runtime->find_object_member("mock_profile") != nullptr);
-      }
-    }
-    const auto &rows = member(*runtime, "component_streams").as_array();
-    if (no_output) {
-      EXPECT_TRUE(rows.empty());
-      continue;
-    }
-    const bool feedback_stream = gripper;
-    ASSERT_EQ(rows.size(), feedback_stream ? 2U : 1U);
-    const auto &measured = rows.back();
-    EXPECT_EQ(member(measured, "stream_id").as_string(), "measured_joints");
-    EXPECT_DOUBLE_EQ(member(measured, "budget_ns").as_number(), 250000000.0);
-    EXPECT_EQ(member(measured, "severity").as_string(), isaac ? "warning" : "fault");
-    EXPECT_EQ(member(measured, "recovery").as_string(), isaac ? "auto" : "ack");
-    if (!feedback_stream) continue;
-    const auto &feedback = rows.front();
-    EXPECT_EQ(member(feedback, "stream_id").as_string(), "gripper_feedback");
-    EXPECT_DOUBLE_EQ(member(feedback, "budget_ns").as_number(), 1000000000.0);
-    EXPECT_EQ(member(feedback, "severity").as_string(), isaac ? "warning" : "fault");
-    EXPECT_EQ(member(feedback, "recovery").as_string(), isaac ? "auto" : "ack");
-  }
-  EXPECT_EQ(profiles, 15U);
-}
 
 } // namespace
 } // namespace manyforge::deployment

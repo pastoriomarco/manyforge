@@ -1,6 +1,7 @@
 #include "host_io_provider_installation.hpp"
 #include "host_io_signal_runtime.hpp"
 #include "io_provider_lifecycle_product.hpp"
+#include <manyforge_roboplan/passive_component_adapter.hpp>
 
 #include "../../manyforge_deployment/test/io_retained_fixture.hpp"
 #include <algorithm>
@@ -13,14 +14,7 @@
 #include <limits>
 #include <manyforge_component_manager/active_bundle_publication_store.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
-#include <manyforge_core/build_owned_lifecycle_plan_catalog_source.hpp>
-#include <manyforge_core/component_lifecycle_coordinator.hpp>
-#include <manyforge_core/io_provider_lifecycle_catalog.hpp>
 #include <manyforge_core/manager_liveness_receiver.hpp>
-#include <manyforge_core/prepared_operation_participant_codec.hpp>
-#include <manyforge_core/sqlite_cclc_journal.hpp>
-#include <manyforge_core/types/command_schema.hpp>
-#include <manyforge_deployment/component_lifecycle_current_snapshot_source.hpp>
 #include <manyforge_deployment/program_binding_compiler.hpp>
 #include <manyforge_deployment/runtime_program_binding.hpp>
 #include <memory>
@@ -66,18 +60,18 @@ private:
 };
 
 // This uses the real Composition implementation, actual qualified product,
-// driver, channel/engine, stable cell and CCLC journal/current-source owner.
-// It exercises the trusted helper boundary, not Manager Apply authority.
+// driver (the I/O provider component's adapter), channel and stable
+// cell. It exercises the trusted helper boundary, not Manager Apply authority.
 class HostIoProviderInstallationTest : public ::testing::Test {
 protected:
   void Build(bool input = false, bool output = true, bool second = false,
              bool shared_channel = false,
-             std::string_view output_profile = {}) {
+             std::string_view output_profile = {}, bool controller_owned = false) {
     package = temporary.path / "package";
     checked(std::filesystem::create_directory(package), "package root missing");
     bundle = deployment::test::materialize_boolean_io_retained_fixture(
                  package, input, output, false, second, shared_channel,
-                 nullptr, output_profile)
+                 nullptr, output_profile, controller_owned)
                  .bundle;
     checked(bundle != nullptr, "actual retained fixture product missing");
     checked(bundle->value().cell_graph.model_instances.empty() &&
@@ -114,34 +108,13 @@ protected:
         core::RuntimeEpoch("helper.manager.epoch"),
         core::RequestOwnerEpoch("helper.manager.owner"),
         {}};
-    // Use the same durable CCLC owner readers as the production host. The
-    // coordinator writes its actual journal owner before requesting rotation;
-    // neither startup nor later claim settlement accepts an unproved owner.
-    const auto lifecycle_path =
-        temporary.path / std::string(core::kCCLCJournalFilename);
-    config.cell_admission_reconcile_validator =
-        [lifecycle_path, cell_id](
-            const std::vector<core::CellAdmissionClaimDTO> &held,
-            const std::vector<core::CellAdmissionCurrentOwnerEpochDTO> &owners,
-            const core::CellAdmissionReconcileDTO &request) {
-          return core::ValidateCCLCCellAdmissionReconciliationReadOnly(
-              lifecycle_path, cell_id, held, owners, request);
-        };
-    config.cell_admission_settlement_validator =
-        [lifecycle_path,
-         cell_id](const core::CellAdmissionClaimDTO &claim,
-                  const core::CellAdmissionClaimReleaseDTO &release) {
-          return core::ValidateCCLCCellAdmissionSettlementReadOnly(
-              lifecycle_path, cell_id, claim, release);
-        };
-    cell = std::make_unique<RetainedNativeCellRuntime>(
-        RetainedNativeCellRuntimeInput{.clock = clock,
+    cell = std::make_unique<RetainedCellRuntime>(
+        RetainedCellRuntimeInput{.clock = clock,
                                        .scheduler = scheduler,
                                        .operation_journal_path =
                                            temporary.path / "operations.sqlite",
                                        .participant_registrations = {},
-                                       .kernel_config = std::move(config),
-                                       .stop_sources = {}});
+                                       .kernel_config = std::move(config)});
     const core::CellAdmissionReadinessSnapshotDTO idle{
         true,
         core::ProgramCycleStatusDTO{core::RequestOwnerEpoch("helper.runner"),
@@ -184,13 +157,7 @@ protected:
     current = View(publication->publication_generation, drivers);
   }
   void TearDown() override {
-    // The actual coordinator drains before its borrowed source/driver/cell.
-    coordinator.reset();
-    context.reset();
-    snapshot_source.reset();
-    port_registry.reset();
-    // The stable Kernel borrows registered channel engines. Keep their actual
-    // owners alive through Kernel unsubscribe while preserving source shutdown.
+    // Keep the output channels alive until the cell is gone.
     auto installed_channels = current ? current->io_output_channels
                                      : std::vector<std::shared_ptr<HostIoOutputChannelEntry>>{};
     current.reset();
@@ -203,7 +170,6 @@ protected:
 
   std::shared_ptr<const IoProviderDriverGroup> MakeDrivers() {
     IoProviderDriverGroup result;
-    std::vector<core::BuildOwnedLifecyclePlanCatalogEntryDTO> entries;
     deployment::FilesystemVerifiedRetainedProviderManifestSource manifests(
         package);
     const auto catalog = take(
@@ -216,11 +182,6 @@ protected:
           {bundle->retained_bundle_id(), provider->provider_manifest_id,
            provider->provider_manifest_revision});
       checked(manifest.has_value(), "actual qualified manifest missing");
-      auto plans =
-          take(core::MakeIoProviderLifecycleCatalog(manifest->value()));
-      checked(plans.catalog_digest == provider->lifecycle_plan_catalog_digest,
-              "actual lifecycle catalog anchor mismatch");
-      entries.push_back({manifest->value(), plans});
       std::vector<core::ResourceId> resources;
       for (const auto &row : catalog)
         if (row.descriptor.signal_id.controllable_component_id ==
@@ -244,16 +205,10 @@ protected:
           provider->provider_manifest_revision,
           provider->provider_runtime_unit_id,
           epoch,
-          plans.catalog_digest};
+          provider->lifecycle_plan_catalog_digest};
       result.push_back(take(IoProviderDriverRecord::Create(
-          std::move(scope), std::move(occurrence), manifest->value(), clock,
-          1'000'000'000LL, 10'000'000LL)));
+          std::move(scope), std::move(occurrence), manifest->value(), clock)));
     }
-    if (!catalog_source)
-      catalog_source =
-          std::make_unique<core::BuildOwnedLifecyclePlanCatalogSource>(
-              take(core::BuildOwnedLifecyclePlanCatalogSource::Make(
-                  std::move(entries))));
     return std::make_shared<const IoProviderDriverGroup>(std::move(result));
   }
 
@@ -306,104 +261,15 @@ protected:
     return publication->publication_generation;
   }
 
-  void StartOwner() {
-    if (coordinator)
-      return;
-    journal = std::make_unique<core::SqliteCCLCJournal>(
-        temporary.path / std::string(core::kCCLCJournalFilename),
-        bundle->value().cell_graph.cell_id, 8U);
-    std::vector<core::BrandLifecyclePortRegistrationDTO> ports;
-    std::vector<core::ResolvedLifecycleProviderOccurrenceDTO> occurrences;
-    for (const auto &driver : *drivers) {
-      ports.push_back(driver->brand_registration());
-      occurrences.push_back(driver->occurrence());
-    }
-    port_registry = std::make_unique<core::FixedCCLCPortRegistry>(
-        std::move(ports),
-        std::vector<core::ControllerLifecyclePortRegistrationDTO>{});
-    snapshot_source = std::make_unique<
-        deployment::VerifiedComponentLifecycleCurrentSnapshotSource>(
-        *bundle, *publication_store, *publication, *journal, *catalog_source,
-        std::move(occurrences));
-    std::vector<core::ControllableComponentId> components;
-    for (const auto &component :
-         bundle->value().cell_graph.controllable_components)
-      components.push_back(component.controllable_component_id);
-    // Exercise the actual lifecycle journal/driver protocol without a readiness
-    // publication adapter. Kernel command eligibility stays closed below; this
-    // fixture does not qualify the host's readiness/publication join.
-    context = std::make_shared<const core::ComponentLifecycleProductContext>(
-        core::ComponentLifecycleProductContext{
-            *snapshot_source,
-            *catalog_source,
-            *port_registry,
-            {},
-            nullptr,
-            core::ComponentLifecycleProductIdentity{*publication,
-                                                    std::move(components)}});
-    coordinator = std::make_unique<core::ComponentLifecycleCoordinator>(
-        core::ComponentLifecycleCoordinatorConfig{
-            core::RequestOwnerEpoch("helper.cclc"), 32U, 1U, 1'000'000},
-        *journal, reservations, context, cell->addressed_kernel(), *clock,
-        *scheduler);
-    const auto started = coordinator->Start();
-    checked(started.ok(), started.ok() ? "" : started.error().message);
+  // Runs one lifecycle action on the I/O provider component's adapter, as
+  // the host's component runtime does.
+  void Step(core::ComponentAction action) {
+    const auto result = drivers->front()->Run(action, {});
+    checked(result.outcome == core::ActionOutcome::kSucceeded,
+            result.error ? result.error->message : "lifecycle action failed");
   }
-  core::ComponentLifecycleCurrentSnapshotDTO Snapshot() {
-    checked(coordinator != nullptr, "actual CCLC owner missing");
-    auto pin = take(coordinator->AcquireProductPin());
-    return take(
-        pin.context().current_snapshot_source.ReadCurrentComponentSnapshot(
-            current->controllable_component_id));
-  }
-  core::ComponentLifecycleCurrentSnapshotDTO
-  Step(core::ComponentLifecycleIntentKindDTO kind) {
-    StartOwner();
-    const auto before = Snapshot();
-    std::vector<core::ExpectedControlDomainRevisionDTO> domains;
-    for (const auto &domain : before.domains)
-      domains.push_back(
-          {domain.control_domain_id, domain.control_domain_revision,
-           core::ExpectedProviderDomainScopeDTO{
-               domain.provider()->provider,
-               {core::ExpectedActiveControlConfigurationPresenceDTO::kAbsent,
-                {},
-                {}}}});
-    core::ComponentLifecycleIntentDTO intent{
-        {core::RequestId("helper.lifecycle." +
-                         std::string(core::to_string(kind))),
-         coordinator->request_owner_epoch(),
-         "fixture",
-         {}},
-        before.controllable_component_id,
-        kind,
-        bundle->value().cell_graph.graph_revision,
-        before.component_lifecycle_generation,
-        std::move(domains),
-        {}};
-    intent.expected_admission_generation =
-        cell->addressed_kernel().GetAuthoringAdmission().admission_generation;
-    const auto submitted = take(coordinator->SubmitLifecycle(intent));
-    checked(submitted.acceptance.has_value(), "actual CCLC acceptance missing");
-    checked(coordinator->DrainFor(std::chrono::seconds(2)),
-            "actual CCLC did not drain");
-    const auto status = take(coordinator->LoadLifecycleStatus(
-        submitted.acceptance->lifecycle_transaction_id));
-    checked(status && status->terminal_result ==
-                          core::ComponentLifecycleTerminalResultDTO::kSucceeded,
-            status && status->error ? status->error->message
-                                    : "actual lifecycle failed");
-    const auto after = Snapshot();
-    checked(after.component_lifecycle_generation ==
-                status->acceptance.component_lifecycle_generation,
-            "production current source disagrees with actual accepted journal "
-            "generation");
-    return after;
-  }
-  IoProviderConstructionGenerations ActualGenerations() {
-    const auto snapshot = Snapshot();
-    return {{snapshot.controllable_component_id,
-             snapshot.component_lifecycle_generation}};
+  core::ComponentLifecycle Lifecycle(const IoProviderDriverRecord &driver) {
+    return driver.State(clock->now()).lifecycle;
   }
   std::shared_ptr<MockBooleanOutputProvider> Mock(const Composition &view) {
     checked(view.io_output_channels.size() == 1U,
@@ -411,59 +277,10 @@ protected:
     return std::get<std::shared_ptr<MockBooleanOutputProvider>>(
         view.io_output_channels.front()->provider);
   }
-  struct Execution final {
-    core::IoOutputParticipantEngine *engine;
-    std::uint64_t preparation;
-    core::IoOutputObservationDTO observation;
-  };
-  Execution Write(Composition &view, std::string role, bool value) {
-    const auto row = std::find_if(
-        view.io_output_registrations.begin(),
-        view.io_output_registrations.end(), [&](const auto &registration) {
-          return registration.binding.value()
-                     .io_output_binding->resource_role_id.value() == role;
-        });
-    checked(row != view.io_output_registrations.end(),
-            "actual output registration missing");
-    auto *engine = dynamic_cast<core::IoOutputParticipantEngine *>(row->engine);
-    checked(engine != nullptr, "actual subordinate output engine missing");
-    const auto schema = core::builtin_io_signal_write_command_schema();
-    const core::CapabilityCommandIntentDTO command{
-        schema.command_schema_id,
-        schema.command_schema_revision,
-        core::IoSignalWriteCommandValueDTO{
-            core::ResourceRoleId(std::move(role)), value},
-        {},
-        {}};
-    auto prepared = take(core::MakePreparedIoOutputParticipant(
-        core::OperationId("helper.output." + std::to_string(++write_sequence)),
-        core::OperationRevision(1U),
-        core::OperationParticipantId("helper.participant"),
-        core::ProgramRunId("helper.private.session"), command, row->binding));
-    auto sealed = std::make_shared<const core::PreparedOperationParticipantDTO>(
-        std::move(prepared));
-    const auto &output =
-        std::get<core::PreparedIoOutputCommandDTO>(sealed->payload);
-    const auto id = take(engine->PrepareCapabilityCommand(
-        {sealed, row->binding,
-         core::ResolvedPreparedIoOutputCommandAuthorityDTO{
-             output.signal_id, output.output_resource,
-             output.command_value.value, sealed->provider()->lifecycle_provider,
-             output.completion_policy}}));
-    const auto sent = engine->DispatchPreparedCapabilityCommand(
-        id, sealed->prepared_contract_digest,
-        core::ControllerGoalId("helper.goal." + std::to_string(write_sequence)),
-        core::ControllerGoalGeneration(1U));
-    checked(sent.ok(), sent.ok() ? "" : sent.error().message);
-    checked(sent.value().accepted, sent.value().error
-                                       ? sent.value().error->message
-                                       : "actual output dispatch refused");
-    const auto observed = take(engine->ObservePreparedCapabilityCommand(id));
-    checked(observed.output_observation.has_value(),
-            "actual output evidence missing");
-    return {engine, id, *observed.output_observation};
+  // The one write path: the I/O component's output writer (`set_io_output`).
+  core::ActionOutcome Write(const std::string &signal, bool value) {
+    return drivers->front()->SetOutput(signal, value, {}).outcome;
   }
-
   TemporaryRoot temporary;
   std::filesystem::path package;
   std::shared_ptr<const deployment::RetainedBundle> bundle;
@@ -472,7 +289,7 @@ protected:
       direct_bindings;
   std::shared_ptr<WallClock> clock;
   std::shared_ptr<SimpleScheduler> scheduler;
-  std::unique_ptr<RetainedNativeCellRuntime> cell;
+  std::unique_ptr<RetainedCellRuntime> cell;
   std::unique_ptr<component_manager::SqliteActiveBundlePublicationStore>
       publication_store;
   core::ProjectionRevisionDTO projection;
@@ -480,15 +297,6 @@ protected:
   std::optional<core::ActiveBundlePublicationReceiptDTO> publication;
   std::shared_ptr<const IoProviderDriverGroup> drivers;
   std::unique_ptr<Composition> current;
-  std::unique_ptr<core::BuildOwnedLifecyclePlanCatalogSource> catalog_source;
-  std::unique_ptr<core::SqliteCCLCJournal> journal;
-  core::CCLCDomainReservationTable reservations;
-  std::unique_ptr<core::FixedCCLCPortRegistry> port_registry;
-  std::unique_ptr<deployment::VerifiedComponentLifecycleCurrentSnapshotSource>
-      snapshot_source;
-  std::shared_ptr<const core::ComponentLifecycleProductContext> context;
-  std::unique_ptr<core::ComponentLifecycleCoordinator> coordinator;
-  std::uint64_t write_sequence{};
 };
 
 TEST_F(HostIoProviderInstallationTest, CommonProductViewBorrowsTheActualCompositionStorage) {
@@ -496,7 +304,7 @@ TEST_F(HostIoProviderInstallationTest, CommonProductViewBorrowsTheActualComposit
   ExecutionCompositionAccess access;
   {
     std::unique_lock lock(access.mutex);
-    access.replace_current(current.get());
+    static_cast<void>(access.replace_current(current.get()));
     EXPECT_EQ(access.product(), static_cast<ExecutionProduct *>(current.get()));
     EXPECT_EQ(&access.product()->bundle, &current->bundle);
     EXPECT_EQ(&access.product()->program_binding, &current->program_binding);
@@ -508,9 +316,41 @@ TEST_F(HostIoProviderInstallationTest, CommonProductViewBorrowsTheActualComposit
         nullptr, nullptr, projection, publication->publication_generation);
     EXPECT_THROW((void)access.product(), std::exception);
     access.logical_product.reset();
-    access.replace_current(nullptr);
+    static_cast<void>(access.replace_current(nullptr));
     EXPECT_EQ(access.product(), nullptr);
   }
+}
+
+// CONTRACTS §16: the owner of a machine with its arm deactivated is a view of
+// its own (its adapter and its `owner_component` are the same): it is
+// coordinated once, as an owner, and its I/O members carry it.
+TEST_F(HostIoProviderInstallationTest, AnOwnerViewIsCoordinatedOnceAsTheOwner) {
+  Build();
+  const auto make_view = [&](const std::string &id) {
+    return std::make_unique<Composition>(
+        core::ControllableComponentId(id), bundle, nullptr, nullptr, nullptr, nullptr,
+        std::nullopt, std::nullopt, std::nullopt, CanonicalValue(nullptr),
+        CanonicalValue(nullptr), nullptr, nullptr, projection,
+        publication->publication_generation, std::nullopt, std::nullopt);
+  };
+  auto owner = make_view("lite6");
+  owner->component_adapter = std::make_shared<PassiveComponentAdapter>();
+  owner->owner_component = core::CoordinatedComponent{"lite6", owner->component_adapter};
+  auto member = make_view("lite6_controller_io");
+  member->component_adapter = std::make_shared<PassiveComponentAdapter>();
+  member->owner_id = "lite6";
+  member->member_role = "controller_io";
+  owner->participant_compositions.push_back(std::move(member));
+
+  const auto components = CoordinatedComponentsOf(owner.get());
+  ASSERT_EQ(components.size(), 2U);
+  EXPECT_EQ(components[0].component_id, "lite6");
+  EXPECT_TRUE(components[0].owner);
+  EXPECT_EQ(components[0].adapter, owner->component_adapter);
+  EXPECT_EQ(components[1].component_id, "lite6_controller_io");
+  EXPECT_FALSE(components[1].owner);
+  EXPECT_EQ(components[1].owner_id, std::optional<std::string>("lite6"));
+  EXPECT_EQ(components[1].role, std::optional<std::string>("controller_io"));
 }
 
 TEST_F(HostIoProviderInstallationTest, TcpRegistryFollowsSelectedComposition) {
@@ -556,12 +396,12 @@ TEST_F(HostIoProviderInstallationTest, TcpRegistryFollowsSelectedComposition) {
     ExecutionCompositionAccess &access;
     ~ClearSelection() {
       std::unique_lock lock(access.mutex);
-      access.replace_current(nullptr);
+      static_cast<void>(access.replace_current(nullptr));
     }
   } cleanup{access};
   const auto select = [&](Composition *selected) {
     std::unique_lock lock(access.mutex);
-    access.replace_current(selected);
+    static_cast<void>(access.replace_current(selected));
   };
 
   // Startup selection publishes every robot; merely building a candidate
@@ -661,22 +501,18 @@ TEST_F(
   mixed.control_bindings.push_back(std::move(actual_physical_binding));
   EXPECT_FALSE(IsProviderOnlyNativeComponent(mixed, component_id));
 
-  // Existing actual installation still makes no motion/gripper registration or
-  // Active/readiness fact for this genuine input-only component.
+  // Existing actual installation still makes no motion/gripper registration
+  // for this genuine input-only component.
   ASSERT_TRUE(Prepare(*current).ok());
   EXPECT_TRUE(current->component_registrations().empty());
-  EXPECT_FALSE(
-      take(cell->addressed_kernel().component_command_readiness(component_id))
-          .command_eligible);
 }
 
 TEST_F(HostIoProviderInstallationTest,
-       GenuineInputOnlyCompositionHasNoExecutionOrFakeReadiness) {
+       GenuineInputOnlyCompositionHasNoExecutionAndStaysNotPrepared) {
   Build(true, false);
   ASSERT_TRUE(Prepare(*current).ok());
   ASSERT_NE(current->io_signal_runtime, nullptr);
   EXPECT_TRUE(current->io_output_channels.empty());
-  EXPECT_TRUE(BindCompositionIoOutputParticipants(*current, {}).ok());
   EXPECT_TRUE(current->component_registrations().empty());
   const auto installed = cell->reconfigure_runtime_product({}, {}, {});
   ASSERT_TRUE(installed.ok()) << installed.error().message;
@@ -687,110 +523,89 @@ TEST_F(HostIoProviderInstallationTest,
   EXPECT_EQ(current->host_runtime_unit_epochs().front(),
             drivers->front()->runtime_unit_epoch());
   EXPECT_TRUE(drivers->front()->resources_installed());
-  EXPECT_EQ(
-      take(drivers->front()->ReadLifecycleSnapshot(
-               drivers->front()->domain().control_domain_id, clock->now()))
-          .component_state,
-      core::ComponentLifecycleStateDTO::kDeclared);
-  EXPECT_FALSE(take(cell->addressed_kernel().component_command_readiness(
-                        current->controllable_component_id))
-                   .command_eligible);
+  EXPECT_EQ(Lifecycle(*drivers->front()), core::ComponentLifecycle::kNotPrepared);
 }
 
 TEST_F(HostIoProviderInstallationTest,
-       ActualSharedAliasesUseOneEngineAndJournalConstructionGeneration) {
+       ActualSharedAliasesUseOneChannelAndWriteOnlyWhileEnabled) {
   Build(false, true, true, true);
   ASSERT_TRUE(Prepare(*current).ok());
   ASSERT_EQ(current->io_output_channels.size(), 1U);
   EXPECT_FALSE(Mock(*current)->model_value());
-  EXPECT_FALSE(BindCompositionIoOutputParticipants(*current, {}).ok());
-  const auto prepared = Step(core::ComponentLifecycleIntentKindDTO::kPrepare);
-  EXPECT_EQ(prepared.component_lifecycle_state,
-            core::ComponentLifecycleStateDTO::kPrepared);
-  ASSERT_TRUE(
-      BindCompositionIoOutputParticipants(*current, ActualGenerations()).ok());
-  const auto paused = Write(*current, "lamp", true);
-  EXPECT_EQ(paused.observation.evidence, core::IoOutputEvidence::kNotSubmitted);
+  Step(core::ComponentAction::kPrepare);
+  EXPECT_EQ(Lifecycle(*drivers->front()), core::ComponentLifecycle::kPrepared);
+  EXPECT_EQ(Write("lamp", true), core::ActionOutcome::kFailed);
   EXPECT_FALSE(Mock(*current)->model_value());
-  ASSERT_TRUE(paused.engine->get_status().fact);
-  EXPECT_EQ(paused.engine->get_status().fact->effect,
-            core::ParticipantEffectKnowledge::kNoEffect);
-  ASSERT_TRUE(
-      paused.engine
-          ->reset_capability_command(current->io_output_registrations.front()
-                                         .binding.value()
-                                         .command_target_id.value(),
-                                     paused.preparation,
-                                     paused.observation.identity.command
-                                         .command_generation.value())
-          .ok());
-  const auto enabled = Step(core::ComponentLifecycleIntentKindDTO::kEnable);
-  const auto generations = ActualGenerations();
-  EXPECT_FALSE(
-      BindCompositionIoOutputParticipants(
-          *current, {{core::ControllableComponentId("foreign.component"),
-                      enabled.component_lifecycle_generation}})
-          .ok());
-  ASSERT_TRUE(BindCompositionIoOutputParticipants(*current, generations).ok());
-  const auto rows = current->component_registrations();
-  ASSERT_EQ(rows.size(), 2U);
-  EXPECT_EQ(rows[0].engine, rows[1].engine);
-  EXPECT_EQ(rows[0].engine, current->io_output_channels.front()->engine.get());
-  for (const auto &row : rows) {
-    ASSERT_TRUE(row.binding.value().io_output_binding);
-    EXPECT_EQ(
-        row.binding.value().io_output_binding->component_lifecycle_generation,
-        enabled.component_lifecycle_generation);
-    EXPECT_FALSE(row.binding.value().control_path);
-    EXPECT_TRUE(row.binding.value().resources.empty());
-    EXPECT_FALSE(row.stop_readiness);
-  }
-  const auto write = Write(*current, "lamp_other", true);
-  EXPECT_EQ(write.observation.evidence,
-            core::IoOutputEvidence::kSourceAccepted);
+  Step(core::ComponentAction::kEnable);
+  EXPECT_EQ(Lifecycle(*drivers->front()), core::ComponentLifecycle::kEnabled);
+  EXPECT_TRUE(current->component_registrations().empty());
+  EXPECT_EQ(Write("lamp_other", true), core::ActionOutcome::kSucceeded);
   EXPECT_EQ(Mock(*current)->model_value(), std::optional<bool>(true));
-  EXPECT_TRUE(write.engine->acknowledge_completed(write.preparation).accepted);
-  // No helper or lifecycle-only test adapter published Kernel eligibility.
-  EXPECT_FALSE(take(cell->addressed_kernel().component_command_readiness(
-                        current->controllable_component_id))
-                   .command_eligible);
 }
 
 TEST_F(HostIoProviderInstallationTest,
-       RetainedActualChannelResetsOnceAndKeepsItsOriginalCommandEvidence) {
+       MockOutputWriteIsPublishedBackAsItsSampleWithItsOutsideChangeSignal) {
+  // CONTRACTS §7 (D2): a Mock output reports its written value back, source
+  // `manyforge_write`, and has the core-held `changed_outside` signal.
   Build();
   ASSERT_TRUE(Prepare(*current).ok());
-  Step(core::ComponentLifecycleIntentKindDTO::kPrepare);
-  Step(core::ComponentLifecycleIntentKindDTO::kEnable);
-  const auto generations = ActualGenerations();
-  ASSERT_TRUE(BindCompositionIoOutputParticipants(*current, generations).ok());
-  const auto old = Write(*current, "lamp", true);
-  ASSERT_EQ(old.observation.evidence, core::IoOutputEvidence::kSourceAccepted);
+  const auto runtime = current->io_signal_runtime;
+  ASSERT_NE(runtime, nullptr);
+  runtime->Start();
+  Step(core::ComponentAction::kPrepare);
+  Step(core::ComponentAction::kEnable);
+  const auto capabilities = drivers->front()->capabilities();
+  EXPECT_NE(std::find(capabilities.begin(), capabilities.end(),
+                      core::Capability::kIoOutputReadback),
+            capabilities.end());
+  ASSERT_EQ(Write("lamp", true), core::ActionOutcome::kSucceeded);
+  ASSERT_TRUE(runtime->DrainPending().ok());
+  const core::IoSignalId lamp{
+      drivers->front()->domain().provider()->provider.controllable_component_id, "lamp"};
+  const auto observed = runtime->service()->ReadSignal(lamp);
+  ASSERT_TRUE(observed.ok()) << observed.error().message;
+  const auto sample = core::ToSignalSample(observed.value());
+  EXPECT_EQ(sample.value, (std::optional<std::variant<bool, double>>(true)));
+  EXPECT_EQ(sample.source, core::IoSignalSampleSource::kManyforgeWrite);
+  EXPECT_TRUE(sample.fresh);
+  const auto outside = runtime->service()->ReadSignal(core::ChangedOutsideSignalId(lamp));
+  ASSERT_TRUE(outside.ok()) << outside.error().message;
+  EXPECT_EQ(core::ToSignalSample(outside.value()).value,
+            (std::optional<std::variant<bool, double>>(false)));
+  runtime->Shutdown();
+}
+
+TEST_F(HostIoProviderInstallationTest, ControllerOwnedOutputIsRefusedBeforeSending) {
+  Build(false, true, false, false, {}, true);
+  ASSERT_TRUE(Prepare(*current).ok());
+  Step(core::ComponentAction::kPrepare);
+  Step(core::ComponentAction::kEnable);
+  const auto refused = drivers->front()->SetOutput("lamp", true, {});
+  EXPECT_EQ(refused.outcome, core::ActionOutcome::kFailed);
+  ASSERT_TRUE(refused.error.has_value());
+  EXPECT_EQ(refused.error->code, "io_output_controller_owned");
+  EXPECT_FALSE(Mock(*current)->model_value());
+}
+
+TEST_F(HostIoProviderInstallationTest,
+       RetainedActualChannelResetsOnceAndKeepsItsEnabledGate) {
+  Build();
+  ASSERT_TRUE(Prepare(*current).ok());
+  Step(core::ComponentAction::kPrepare);
+  Step(core::ComponentAction::kEnable);
+  ASSERT_EQ(Write("lamp", true), core::ActionOutcome::kSucceeded);
   const auto predecessor = Capture(*current); // before any publication mutation
   const auto entry = current->io_output_channels.front();
   auto candidate = View(NewPublication(), drivers);
   ASSERT_TRUE(Prepare(*candidate, predecessor).ok());
   EXPECT_EQ(candidate->io_output_channels.front(), entry);
   EXPECT_FALSE(Mock(*candidate)->model_value());
-  const auto retained =
-      take(old.engine->ObservePreparedCapabilityCommand(old.preparation));
-  ASSERT_TRUE(retained.output_observation);
-  EXPECT_EQ(*retained.output_observation, old.observation);
-  ASSERT_TRUE(old.engine->acknowledge_completed(old.preparation).accepted);
-  ASSERT_TRUE(
-      BindCompositionIoOutputParticipants(*candidate, generations).ok());
-  const auto next = Write(*candidate, "lamp", false);
-  ASSERT_EQ(next.observation.evidence, core::IoOutputEvidence::kSourceAccepted);
+  ASSERT_EQ(Write("lamp", false), core::ActionOutcome::kSucceeded);
   EXPECT_EQ(Mock(*candidate)->model_value(), std::optional<bool>(false));
   const auto replay = Capture(*candidate);
   ASSERT_TRUE(Prepare(*candidate, replay).ok());
   EXPECT_EQ(candidate->io_output_channels.front(), entry);
   EXPECT_EQ(Mock(*candidate)->model_value(), std::optional<bool>(false));
-  EXPECT_EQ(
-      take(next.engine->ObservePreparedCapabilityCommand(next.preparation))
-          .output_observation,
-      std::optional(next.observation));
-  EXPECT_TRUE(next.engine->acknowledge_completed(next.preparation).accepted);
 }
 
 TEST_F(HostIoProviderInstallationTest,
@@ -849,11 +664,7 @@ TEST_F(HostIoProviderInstallationTest,
   proof.clear();
   EXPECT_FALSE(
       lifetime.expired()); // candidate is now the sole surviving Entry owner
-  EXPECT_NE(candidate->io_output_channels.front()->engine, nullptr);
   EXPECT_FALSE(runtime_lifetime.expired());
-  EXPECT_FALSE(take(cell->addressed_kernel().component_command_readiness(
-                        candidate->controllable_component_id))
-                   .command_eligible);
   candidate.reset();
   EXPECT_TRUE(lifetime.expired());
   EXPECT_TRUE(runtime_lifetime.expired());
@@ -862,12 +673,9 @@ TEST_F(HostIoProviderInstallationTest,
        GenuineOutputRemovalPermanentlyFencesOnlyItsOldOccurrence) {
   Build();
   ASSERT_TRUE(Prepare(*current).ok());
-  Step(core::ComponentLifecycleIntentKindDTO::kPrepare);
-  Step(core::ComponentLifecycleIntentKindDTO::kEnable);
-  ASSERT_TRUE(
-      BindCompositionIoOutputParticipants(*current, ActualGenerations()).ok());
-  const auto old = Write(*current, "lamp", true);
-  ASSERT_EQ(old.observation.evidence, core::IoOutputEvidence::kSourceAccepted);
+  Step(core::ComponentAction::kPrepare);
+  Step(core::ComponentAction::kEnable);
+  ASSERT_EQ(Write("lamp", true), core::ActionOutcome::kSucceeded);
   const auto old_provider = Mock(*current);
   const auto old_occurrence = drivers->front()->occurrence();
   const auto old_driver = drivers->front();
@@ -907,11 +715,6 @@ TEST_F(HostIoProviderInstallationTest,
                             std::numeric_limits<std::uint64_t>::max(),
                             old_driver)
                    .ok());
-  const auto retained =
-      take(old.engine->ObservePreparedCapabilityCommand(old.preparation));
-  EXPECT_EQ(retained.output_observation, std::optional(old.observation));
-  EXPECT_TRUE(old.engine->acknowledge_completed(old.preparation).accepted);
-  EXPECT_TRUE(BindCompositionIoOutputParticipants(*candidate, {}).ok());
   EXPECT_TRUE(candidate->component_registrations().empty());
 }
 
@@ -942,14 +745,11 @@ TEST_F(HostIoProviderInstallationTest,
   ASSERT_TRUE(Prepare(*current, {}, node).ok());
   ASSERT_EQ(current->io_output_channels.size(), 2U);
   ASSERT_TRUE(spin_until([&] { return subscriber->get_publisher_count() == 1U; }));
-  Step(core::ComponentLifecycleIntentKindDTO::kPrepare);
-  Step(core::ComponentLifecycleIntentKindDTO::kEnable);
-  ASSERT_TRUE(BindCompositionIoOutputParticipants(*current, ActualGenerations()).ok());
-  const auto first = Write(*current, "lamp", true);
-  ASSERT_EQ(first.observation.evidence, core::IoOutputEvidence::kSubmitted);
+  Step(core::ComponentAction::kPrepare);
+  Step(core::ComponentAction::kEnable);
+  ASSERT_EQ(Write("lamp", true), core::ActionOutcome::kSucceeded);
   ASSERT_TRUE(spin_until([&] { return messages.size() == 1U; }));
-  const auto removed_write = Write(*current, "lamp_other", false);
-  ASSERT_EQ(removed_write.observation.evidence, core::IoOutputEvidence::kSubmitted);
+  ASSERT_EQ(Write("lamp_other", false), core::ActionOutcome::kSucceeded);
   ASSERT_TRUE(spin_until([&] { return messages.size() == 2U; }));
   ASSERT_EQ(messages.back().interface_groups.size(), 1U);
   ASSERT_EQ(messages.back().interface_values.size(), 1U);
@@ -1021,8 +821,6 @@ TEST_F(HostIoProviderInstallationTest,
   EXPECT_TRUE(candidate->io_output_channels.empty());
   same_table(retained_provider->ReadAliasState(), retained_before);
   same_table(removed_provider->ReadAliasState(), removed_before);
-  EXPECT_EQ(removed_provider->ObserveOutputResult(removed_write.observation.identity).value(),
-            removed_write.observation);
   EXPECT_EQ(messages.size(), 2U);
 
   ASSERT_TRUE(Prepare(*candidate, predecessor, node).ok());
@@ -1032,19 +830,14 @@ TEST_F(HostIoProviderInstallationTest,
   EXPECT_EQ(retained_provider->ReadAliasState().active_publication_generation,
             candidate->publication_generation);
   same_table(removed_provider->ReadAliasState(), removed_before);
-  EXPECT_EQ(removed_provider->ObserveOutputResult(removed_write.observation.identity).value(),
-            removed_write.observation);
   EXPECT_FALSE(removed_provider
                    ->Resume(original_driver->occurrence(),
                             std::numeric_limits<std::uint64_t>::max(), original_driver)
                    .ok());
   EXPECT_EQ(messages.size(), 2U);  // preparation/retirement never resends
-  // Candidate stays paused. No old CCLC generation is passed off as its
-  // readiness, and no post-Apply dispatch/physical-effect claim is made.
-  EXPECT_EQ(take(replacement_drivers->front()->ReadLifecycleSnapshot(
-                     replacement_drivers->front()->domain().control_domain_id, clock->now()))
-                .component_state,
-            core::ComponentLifecycleStateDTO::kDeclared);
+  // Candidate stays paused: its new driver is not prepared, and no
+  // post-Apply dispatch/physical-effect claim is made.
+  EXPECT_EQ(Lifecycle(*replacement_drivers->front()), core::ComponentLifecycle::kNotPrepared);
   candidate.reset();
   for (const auto& driver : *replacement_drivers) driver->Shutdown();
   for (const auto& driver : *drivers) driver->Shutdown();
@@ -1053,89 +846,5 @@ TEST_F(HostIoProviderInstallationTest,
 }
 
 } // namespace
-
-TEST_F(
-    HostIoProviderInstallationTest,
-    GenuineLogicalOutputRegistrationsReachStableCellWithoutPhysicalResources) {
-  Build(true, true);
-  ASSERT_TRUE(Prepare(*current).ok());
-  const auto prepared = Step(core::ComponentLifecycleIntentKindDTO::kPrepare);
-  ASSERT_EQ(prepared.component_lifecycle_state,
-            core::ComponentLifecycleStateDTO::kPrepared);
-  ASSERT_TRUE(
-      BindCompositionIoOutputParticipants(*current, ActualGenerations()).ok());
-  const auto rows = current->component_registrations();
-  ASSERT_EQ(rows.size(), 1U);
-  ASSERT_TRUE(rows.front().binding.value().io_output_binding);
-  EXPECT_TRUE(rows.front().binding.value().resources.empty());
-  EXPECT_FALSE(rows.front().binding.value().control_path);
-  EXPECT_FALSE(rows.front().stop_readiness);
-  ASSERT_EQ(rows.front().engine,
-            current->io_output_channels.front()->engine.get());
-  const auto product_resolver = current->target_resolver;
-  ASSERT_NE(product_resolver, nullptr);
-  const auto resolver = make_retained_cell_kernel_participant_resolver(
-      [product_resolver](const core::OperationIntentDTO &intent,
-                         std::size_t index) {
-        return product_resolver->ResolveExecutionParticipant(intent, index);
-      },
-      rows);
-  const auto installed = cell->reconfigure_runtime_product(rows, resolver, {});
-  ASSERT_TRUE(installed.ok()) << installed.error().message;
-  ASSERT_EQ(cell->participant_registrations().size(), 1U);
-  EXPECT_EQ(cell->participant_registrations().front().binding.value(),
-            rows.front().binding.value());
-  const auto slots = cell->addressed_kernel().resource_snapshot();
-  ASSERT_EQ(slots.size(), 1U);
-  EXPECT_EQ(
-      slots.front().resource_id,
-      *rows.front().binding.value().io_output_binding->signal.output_resource);
-  EXPECT_TRUE(cell->stop_surveillance_owner()->SnapshotSources().empty());
-  EXPECT_FALSE(take(cell->addressed_kernel().component_command_readiness(
-                        current->controllable_component_id))
-                   .command_eligible);
-  EXPECT_FALSE(Mock(*current)->model_value());
-}
-
-TEST_F(HostIoProviderInstallationTest,
-       RetiredOutputOwnerCanDieBeforeStableKernelAfterExactUnsubscribe) {
-  Build(true, true);
-  ASSERT_TRUE(Prepare(*current).ok());
-  ASSERT_EQ(Step(core::ComponentLifecycleIntentKindDTO::kPrepare).component_lifecycle_state,
-            core::ComponentLifecycleStateDTO::kPrepared);
-  ASSERT_TRUE(BindCompositionIoOutputParticipants(*current, ActualGenerations()).ok());
-  ASSERT_EQ(current->io_output_channels.size(), 1U);
-  const std::weak_ptr<HostIoOutputChannelEntry> channel = current->io_output_channels.front();
-  auto *const engine = current->io_output_channels.front()->engine.get();
-  ASSERT_NE(engine, nullptr);
-  {
-    const auto registrations = current->component_registrations();
-    ASSERT_EQ(registrations.size(), 1U);
-    ASSERT_EQ(registrations.front().engine, engine);
-    const auto product_resolver = current->target_resolver;
-    ASSERT_NE(product_resolver, nullptr);
-    const auto resolver = make_retained_cell_kernel_participant_resolver(
-        [product_resolver](const core::OperationIntentDTO &intent, std::size_t index) {
-          return product_resolver->ResolveExecutionParticipant(intent, index);
-        }, registrations);
-    ASSERT_TRUE(cell->reconfigure_runtime_product(registrations, resolver, {}).ok());
-  }
-  // A current registered engine cannot be detached early. After the actual
-  // empty inventory commit, it remains subscribed until explicit retirement.
-  EXPECT_FALSE(cell->addressed_kernel().release_retired_engine(engine).ok());
-  ASSERT_TRUE(cell->reconfigure_runtime_product({}, {}, {}).ok());
-  ASSERT_TRUE(cell->participant_registrations().empty());
-  ASSERT_TRUE(cell->addressed_kernel().release_retired_engine(engine).ok());
-  EXPECT_FALSE(cell->addressed_kernel().release_retired_engine(engine).ok());
-  coordinator.reset();
-  context.reset();
-  snapshot_source.reset();
-  port_registry.reset();
-  current.reset();
-  EXPECT_TRUE(channel.expired());
-  // Unlike the fixture's general teardown guard, no channel owner is kept
-  // alive here to hide a stale borrowed subscription in Kernel destruction.
-  cell.reset();
-}
 
 } // namespace manyforge::roboplan_backend::host_detail

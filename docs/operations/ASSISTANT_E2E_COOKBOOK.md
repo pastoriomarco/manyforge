@@ -109,7 +109,7 @@ The launcher always starts the bridge on `127.0.0.1:8100` and passes
 `--assistant-bridge-url` to Composer. Nothing else needs configuring.
 
 Program model requests that attach an image require a connected Composer
-native 3D viewer. Both Program runner launch paths provide the Composer
+3D viewer. Both Program runner launch paths provide the Composer
 `/api/scene/snapshot/render` URL automatically. Open the viewer before running
 a vision Scenario and keep it connected so the request can obtain a
 generation-matched frame. If Composer has no generation-matched viewer frame,
@@ -117,21 +117,19 @@ capture fails with `model_snapshot_observer_unavailable`; if the Composer
 snapshot endpoint is unreachable, it fails with
 `model_snapshot_image_source_unavailable`.
 
-With the default `endpoint` stream setting (warning, auto), Prepare and Enable never refuse because of the model server. While the
+Prepare and Enable never refuse because of the model server. While the
 Deployment runs, each endpoint is supervised as the component stream
 `endpoint` of the `ai_model` component: it is probed every 2 s, and its
-default budget is 10 s, severity `warning` and recovery `auto`. An unreachable
-server, or one that does not list the model, raises a warning that clears by
-itself when the server returns. Override severity, recovery or budget with a
+default budget is 10 s. An unreachable server, or one that does not list the
+model, makes the stream stale; it never faults the component and turns fresh
+again when the server returns. Override the budget with a
 `policies.component_streams` row:
 
 ```json
 {
   "controllable_component_id": "assistant_model",
   "stream_id": "endpoint",
-  "budget_ns": 30000000000,
-  "severity": "warning",
-  "recovery": "auto"
+  "budget_ns": 30000000000
 }
 ```
 
@@ -164,7 +162,7 @@ curl -fsS http://127.0.0.1:3000/api/assistant/modes # ai_model_component_id set
 ## 5. Run the Mock smoke scripts
 
 Use a Mock Scenario with an applied assistant Deployment and a loaded Program
-Draft, such as `examples/ur10e_assistant_scene_authoring.scenario`. Keep the
+Draft, such as `examples/mock_ur10e_assistant_scene_authoring.scenario`. Keep the
 Composer and ManyForge services on the same host where the smoke command runs.
 For the local setup above, configure the chat component's `base_url` as
 `http://127.0.0.1:8000/v1` and set its `model` to the exact served name.
@@ -217,7 +215,7 @@ the scripts submit each request once and do not retry an uncertain outcome.
 ## Recipes
 
 Run each on a Mock Scenario with an assistant profile, for example
-`examples/ur10e_assistant_scene_authoring.scenario`.
+`examples/mock_ur10e_assistant_scene_authoring.scenario`.
 
 | Recipe | Prompt | Pass signal |
 |---|---|---|
@@ -226,7 +224,7 @@ Run each on a Mock Scenario with an assistant profile, for example
 | Tree edit + Apply | "Insert a move to joint target `home` at the start of the tree." | Node appears in the Draft; Apply makes it the active Program |
 | Refused node | "Insert a plan_pick_sequence node." | The model reports it cannot; Draft unchanged |
 | Cancel | Send a long request, press Cancel | Status `cancelled`; no further Draft change |
-| Model down | Stop the model server | `endpoint` warning in the component streams; a chat request fails with `upstream_unavailable`; warning clears after restart |
+| Model down | Stop the model server | the `endpoint` stream shows stale on the component; a chat request fails with `upstream_unavailable`; the stream turns fresh after restart |
 
 ## Failure codes
 
@@ -241,7 +239,9 @@ Run each on a Mock Scenario with an assistant profile, for example
 | `upstream_response_invalid` / `response_rejected` | The model returned malformed output or called a tool outside the mode; try a model with reliable tool calling |
 | `assistant_projection_stale` / `assistant_catalog_mismatch` | The active Deployment changed during the request; retry |
 
-The bridge writes a bounded audit log (`MANYFORGE_ASSISTANT_AUDIT_LOG`, default
-`$XDG_STATE_HOME/manyforge/assistant-bridge-audit.jsonl`, 10 MB x 3 files). It
+The bridge writes a bounded audit log (`MANYFORGE_ASSISTANT_AUDIT_LOG`, 10 MB x
+3 files; in the workbench under the runtime root's
+`current/assistant-bridge/audit.jsonl`, see
+[Observability](OBSERVABILITY.md#assistant-bridge-audit)). It
 holds identities, hashes and outcomes, never prompt text, responses or
 argument values.

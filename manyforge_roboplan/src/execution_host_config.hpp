@@ -9,10 +9,8 @@
 #include <manyforge_component_manager/selected_runtime_composition.hpp>
 #include <manyforge_component_manager/site_settings.hpp>
 #include <manyforge_content_identity/content_identity.hpp>
-#include <manyforge_core/sqlite_cclc_journal.hpp>
 #include <manyforge_core/types/cell_admission.hpp>
 #include <manyforge_core/time/iclock.hpp>
-#include <manyforge_deployment/native_execution_runtime_contract.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 
 namespace manyforge::roboplan_backend::host_detail {
@@ -57,10 +55,8 @@ inline constexpr int kManagedProgramArtifactRootFd = 8;
 // Optional Manager-opened scene-asset root; never a retained package root.
 inline constexpr int kManagedSceneAssetRootFd = 9;
 inline constexpr int kSocketBacklog = 16;
+// The host tick: subordinate reconciliation and the component-state refresh.
 inline constexpr int kReconcilePeriodMilliseconds = 5;
-// Recovery evidence is not a control deadline. Refresh it at 20 Hz on the
-// existing noncritical lane, independently of browser requests.
-inline constexpr core::Duration kRecoveryObservationPeriodNs = 50'000'000;
 inline constexpr int kClientPacketDeadlineMilliseconds = 100;
 inline constexpr int kOrdinaryFirstPacketDeadlineMilliseconds = 1'000;
 // Requests the ordinary socket handed to one deferred lane and that are not
@@ -76,20 +72,6 @@ inline constexpr auto kPlanningSceneSynchronizationRetryDelay =
 [[nodiscard]] inline constexpr std::string_view SelectedExecutionRuntimeRole() {
   return deployment::ros2_control_execution_runtime_contract::kRuntimeRoleId;
 }
-
-struct HostConfig final {
-  std::filesystem::path package_root;
-  std::filesystem::path manager_state_root;
-  std::filesystem::path manager_run_root;
-  std::filesystem::path execution_state_root;
-  std::filesystem::path execution_run_root;
-  std::filesystem::path candidate_worker;
-  std::string cell_id;
-  std::string program_binding_id;
-  std::string motion_target_role_id;
-  std::string gripper_target_role_id;
-  core::NativeApplyParentPreparationFailureSource preparation_failure_source{};
-};
 
 struct ManagedRuntimeChildConfig final {
   int manager_channel_fd{-1};

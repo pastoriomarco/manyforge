@@ -684,6 +684,73 @@ TEST(CellGraphCodec, CarriesDefaultTcpAndPrimaryOnlyWhenPresent) {
                CellGraphCodecError);
 }
 
+// MOUNT_COLLISION_EXCLUSIONS_PLAN: a mount's authored arm-tool pairs
+// round-trip sorted, are written only when present and move the attachment
+// revision; empty, unknown-field, empty-name and repeated pairs are refused.
+TEST(CellGraphCodec, CarriesSortedCollisionExclusionsOnlyWhenPresent) {
+  const std::string edge_anchor = "      attachment_interface_id: mount\n";
+  const auto with = [&](const std::string& rows) {
+    return replace_once(full_graph(), edge_anchor,
+                        edge_anchor + "    collision_exclusions:\n" + rows);
+  };
+  const std::string pairs = with(
+      "      - {child_link: right_finger, parent_link: link5}\n"
+      "      - {child_link: left_finger, parent_link: link5}\n"
+      "      - {child_link: left_finger, parent_link: link4}\n");
+  const auto& edge = validate(pairs).graph().component_attachments.front();
+  using Pair = core::ComponentAttachmentCollisionExclusionDTO;
+  EXPECT_EQ(edge.collision_exclusions,
+            (std::vector<Pair>{{"left_finger", "link4"},
+                               {"left_finger", "link5"},
+                               {"right_finger", "link5"}}));
+  EXPECT_NE(canonical_json(decode(pairs).structurally_normalized_root())
+                .find("\"collision_exclusions\":[{\"child_link\":\"left_finger\","
+                      "\"parent_link\":\"link4\"},{\"child_link\":\"left_finger\","
+                      "\"parent_link\":\"link5\"},{\"child_link\":\"right_finger\","
+                      "\"parent_link\":\"link5\"}]"),
+            std::string::npos);
+  EXPECT_TRUE(validate(full_graph()).graph().component_attachments.front()
+                  .collision_exclusions.empty());
+  EXPECT_EQ(canonical_json(decode(full_graph()).structurally_normalized_root())
+                .find("collision_exclusions"),
+            std::string::npos);
+
+  EXPECT_THROW((void)decode(replace_once(full_graph(), edge_anchor,
+                                         edge_anchor + "    collision_exclusions: []\n")),
+               CellGraphCodecError);
+  for (const char* bad : {
+           "      - {child_link: left_finger, parent_link: link4, reason: Never}\n",
+           "      - {child_link: left_finger}\n",
+           "      - {child_link: \"\", parent_link: link4}\n",
+           "      - {child_link: left_finger, parent_link: link4}\n"
+           "      - {child_link: left_finger, parent_link: link4}\n"}) {
+    EXPECT_THROW((void)decode(with(bad)), CellGraphCodecError) << bad;
+  }
+
+  // The attachment revision covers the pairs.
+  const auto observer = qualify_runtime_profile("observer_profile");
+  const auto driver = qualify_runtime_profile("driver_profile");
+  const auto attachment_revision = [&](std::string graph) {
+    for (const auto* profile : {&observer, &driver}) {
+      const std::string id = profile == &observer ? "observer_profile" : "driver_profile";
+      graph = replace_once(
+          std::move(graph),
+          "runtime_profile_id: " + id + "\n    runtime_profile_revision: " +
+              std::string(kZeroDigest),
+          "runtime_profile_id: " + id + "\n    runtime_profile_revision: " +
+              profile->value().runtime_profile_revision.value());
+    }
+    graph = replace_once(std::move(graph), "configuration: {robot_ip_ref: site.robot.ip}",
+                         "configuration: {}");
+    const std::vector<QualifiedRuntimeProfile> profiles{observer, driver};
+    return compute_graph_revision(prepare_cell_graph_identity(validate(graph), profiles))
+        .graph()
+        .component_attachments.front()
+        .component_attachment_revision;
+  };
+  EXPECT_NE(attachment_revision(pairs), attachment_revision(full_graph()));
+}
+
 TEST(CellGraphCodec, RejectsOneModelBoundToMultipleRolesInOneComponent) {
   std::string graph = two_instance_graph(false);
   graph = replace_once(std::move(graph),

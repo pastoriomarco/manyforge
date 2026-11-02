@@ -17,7 +17,7 @@ describe('refused startup project notice', () => {
   });
 
   it('says not opened for a refusal before the workspace commit', () => {
-    expect(startupScenarioNotices({ ...unconfirmed, code: 'scenario_close_required', message: 'm' })[0]?.title)
+    expect(startupScenarioNotices({ ...unconfirmed, code: 'scenario_new_required', message: 'm' })[0]?.title)
       .toBe('Startup project was not opened.');
     expect(startupScenarioNotices(null)).toEqual([]);
   });

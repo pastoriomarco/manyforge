@@ -6,14 +6,13 @@
 #include <future>
 #include <gtest/gtest.h>
 #include <limits>
-#include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
+#include <manyforge_core/execution_event_change_signal.hpp>
 #include <manyforge_core/io_condition_evaluator.hpp>
 #include <manyforge_core/io_signal_descriptor.hpp>
 #include <manyforge_core/runtime_participant_binding.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_core/time/manual_scheduler.hpp>
-#include <manyforge_core/types/capability_definition.hpp>
-#include <manyforge_roboplan/native_runtime_support.hpp>
+#include <manyforge_roboplan/execution_host_support.hpp>
 #include <rclcpp/executors/single_threaded_executor.hpp>
 #include <set>
 #include <std_msgs/msg/bool.hpp>
@@ -133,13 +132,13 @@ protected:
     }
     runtime->Start();
     // Creation/Start are not lifecycle activation. These tests exercise the
-    // actual retained catalog/driver and acquire the first value at Enable.
+    // actual driver and acquire the first value at Enable.
     const auto before_enable = Observe();
     if (before_enable.availability != core::IoSignalAvailability::kMissing ||
         before_enable.latest_sample)
       throw std::runtime_error("unenabled fixture must have no reported sample");
-    Step("prepare");
-    Step("enable");
+    Step(core::ComponentAction::kPrepare);
+    Step(core::ComponentAction::kEnable);
     if (echo_output && !echo_output->Resume(driver->occurrence(), 2U, driver).ok())
       throw std::runtime_error("echo output did not enable");
     const auto drained = runtime->DrainPending();
@@ -159,55 +158,16 @@ protected:
     if (driver)
       driver->Shutdown();
   }
-  core::IoOutputWriteRequestDTO EchoRequest(std::uint64_t number, bool value) {
-    return {{{core::OperationId("echo.operation." + std::to_string(number)),
-              core::OperationRevision(1U), core::OperationParticipantId("echo"),
-              core::ControllerGoalId("echo.goal." + std::to_string(number)),
-              core::ControllerGoalGeneration(1U)},
-             core::ContentDigest("sha256:" + std::string(64U, 'a')),
-             core::ComponentLifecycleGeneration(1U), driver->occurrence()},
-            {core::ControllableComponentId("io"), "valve"}, value, std::nullopt};
+  SetOutputResult Write(bool value) {
+    return echo_output->WriteOutput({core::ControllableComponentId("io"), "valve"}, value);
   }
   std::shared_ptr<IoProviderDriverRecord>
   MakeDriver(const deployment::RetainedIoSignalConfiguration &row,
              std::string epoch) {
     const core::ContentDigest digest("sha256:" + std::string(64U, 'a'));
-    const core::ProviderManifestId id(
-        std::string(core::kIoProviderLifecycleManifestId));
-    const auto plans = core::MakeIoProviderLifecyclePlans();
-    if (!plans.ok())
-      throw std::runtime_error(plans.error().message);
-    const auto semantic =
-        core::ComputeBrandLifecyclePlanCatalogSemanticDigest(id, plans.value());
-    if (!semantic.ok())
-      throw std::runtime_error(semantic.error().message);
-    std::vector<core::ProviderCapabilityOfferDTO> offers;
-    for (const auto *name :
-         {"component.lifecycle.observe", "component.lifecycle.prepare",
-          "component.lifecycle.enable", "component.lifecycle.disable",
-          "component.lifecycle.recover"}) {
-      const auto *definition = core::find_builtin_capability_definition(name);
-      if (!definition)
-        throw std::runtime_error("missing lifecycle definition");
-      offers.push_back({core::CapabilityId(name),
-                        core::CapabilityDefinitionRevision(std::string(
-                            definition->capability_definition_revision)),
-                        {}});
-    }
-    // Plain unit product: the real Core factory validates this exact semantic
-    // anchor; it is not a fabricated verified Deployment or admission proof.
+    const core::ProviderManifestId id{std::string(kIoProviderManifestId)};
     const core::ProviderManifestDTO manifest{
-        id,
-        core::ProviderManifestRevision(digest.value()),
-        std::move(offers),
-        {},
-        core::ProviderLifecyclePlanCatalogDeclarationDTO{
-            core::SchemaId(
-                std::string(core::kBrandLifecyclePlanCatalogApiVersion)),
-            semantic.value()}};
-    const auto catalog = core::MakeIoProviderLifecycleCatalog(manifest);
-    if (!catalog.ok())
-      throw std::runtime_error(catalog.error().message);
+        id, core::ProviderManifestRevision(digest.value()), {}, {}, std::nullopt};
     const core::ControlDomainId domain("io.domain");
     const core::ControlDomainRevision revision(digest.value());
     const core::ProviderInstanceId instance("io.provider");
@@ -220,7 +180,7 @@ protected:
              instance,
              id,
              manifest.provider_manifest_revision,
-             catalog.value().catalog_digest,
+             digest,
              digest,
              {row.descriptor.signal_id.name},
              30'000'000'000LL},
@@ -235,39 +195,19 @@ protected:
         manifest.provider_manifest_revision,
         row.runtime_unit_id,
         runtime_epoch,
-        catalog.value().catalog_digest};
-    auto made =
-        IoProviderDriverRecord::Create(scope, actual, manifest, clock, 1000, 1'000'000);
+        digest};
+    auto made = IoProviderDriverRecord::Create(scope, actual, manifest, clock);
     if (!made.ok())
       throw std::runtime_error(made.error().message);
     return std::move(made.value());
   }
-  void Step(const char *action) {
-    const auto snapshot = driver->ReadLifecycleSnapshot(
-        driver->domain().control_domain_id, clock->now());
-    if (!snapshot.ok())
-      throw std::runtime_error(snapshot.error().message);
-    const auto &actual = driver->occurrence();
-    const core::BrandLifecyclePrimitiveIntentDTO intent{
-        core::LifecycleTransactionId(std::string("fixture.") + action),
-        core::LifecycleTransactionGeneration(1U),
-        signal().controllable_component_id,
-        actual.control_domain_id,
-        actual.control_domain_revision,
-        actual.provider_instance_id,
-        actual.provider_manifest_id,
-        actual.provider_manifest_revision,
-        actual.provider_runtime_unit_id,
-        actual.provider_runtime_epoch,
-        core::LifecyclePrimitiveId(std::string("io.provider.") + action),
-        core::LifecyclePrimitiveAttemptId(std::string("attempt.") + action),
-        snapshot.value().source_generation,
-        1'000'000,
-        core::ComponentLifecycleStateDTO::kUndeclared};
-    const auto outcome = driver->Dispatch(intent, {});
-    if (outcome.outcome != RetainedRos2ControlSwitchOutcome::kSucceeded)
-      throw std::runtime_error(outcome.error ? outcome.error->message
-                                             : "fixture lifecycle failed");
+  // Runs one lifecycle action on the I/O provider component's adapter, as
+  // the host's component runtime does.
+  void Step(core::ComponentAction action) {
+    const auto result = driver->Run(action, {});
+    if (result.outcome != core::ActionOutcome::kSucceeded)
+      throw std::runtime_error(result.error ? result.error->message
+                                            : "fixture lifecycle failed");
   }
   void Advance(core::TimePoint now) {
     clock->set(now);
@@ -395,14 +335,9 @@ protected:
 
 TEST_F(HostIoSignalRuntimeTest, MockOutputEchoIsDelayedAndNewerWriteReplacesIt) {
   Build(false, "installation.1", {}, true);
-  const auto first = EchoRequest(1U, true);
-  ASSERT_EQ(echo_output->SubmitOutput(first).value().evidence,
-            core::IoOutputEvidence::kSourceAccepted);
-  ASSERT_TRUE(echo_output->RetireOutput(first.identity).ok());
+  ASSERT_EQ(Write(true).outcome, core::ActionOutcome::kSucceeded);
   clock->set(100'000'000);
-  const auto second = EchoRequest(2U, false);
-  ASSERT_EQ(echo_output->SubmitOutput(second).value().evidence,
-            core::IoOutputEvidence::kSourceAccepted);
+  ASSERT_EQ(Write(false).outcome, core::ActionOutcome::kSucceeded);
   clock->set(kDelay);
   scheduler->advance_to(clock->now(), core::SchedulerPriority::Monitoring);
   EXPECT_EQ(Observe().latest_sample->publication.value, false);
@@ -415,7 +350,7 @@ TEST_F(HostIoSignalRuntimeTest, MockOutputEchoIsDelayedAndNewerWriteReplacesIt) 
 
 TEST_F(HostIoSignalRuntimeTest, MockOutputEchoStopsWithItsRuntime) {
   Build(false, "installation.1", {}, true);
-  ASSERT_TRUE(echo_output->SubmitOutput(EchoRequest(1U, true)).ok());
+  ASSERT_EQ(Write(true).outcome, core::ActionOutcome::kSucceeded);
   runtime->Shutdown();
   clock->set(kDelay);
   scheduler->advance_to(clock->now(), core::SchedulerPriority::Monitoring);
@@ -426,10 +361,7 @@ TEST_F(HostIoSignalRuntimeTest,
        MockOutputEchoCannotPublishAfterANewerWriteIsAccepted) {
   using namespace std::chrono_literals;
   Build(false, "installation.1", {}, true);
-  const auto first = EchoRequest(1U, true);
-  ASSERT_EQ(echo_output->SubmitOutput(first).value().evidence,
-            core::IoOutputEvidence::kSourceAccepted);
-  ASSERT_TRUE(echo_output->RetireOutput(first.identity).ok());
+  ASSERT_EQ(Write(true).outcome, core::ActionOutcome::kSucceeded);
   clock->set(kDelay);
   auto first_delivery = std::async(std::launch::async, [&] {
     clock->GateNextReadOnThisThread();
@@ -442,12 +374,11 @@ TEST_F(HostIoSignalRuntimeTest,
     FAIL() << "echo did not reach the gated publication";
   }
 
-  const auto second = EchoRequest(2U, false);
   std::promise<void> writer_started;
   auto started = writer_started.get_future();
   auto newer_write = std::async(std::launch::async, [&] {
     writer_started.set_value();
-    return echo_output->SubmitOutput(second);
+    return Write(false);
   });
   started.wait();
   const auto during_echo = newer_write.wait_for(100ms);
@@ -457,8 +388,7 @@ TEST_F(HostIoSignalRuntimeTest,
   ASSERT_EQ(newer_write.wait_for(2s), std::future_status::ready);
   const auto accepted = newer_write.get();
   EXPECT_EQ(during_echo, std::future_status::timeout);
-  ASSERT_TRUE(accepted.ok());
-  EXPECT_EQ(accepted.value().evidence, core::IoOutputEvidence::kSourceAccepted);
+  EXPECT_EQ(accepted.outcome, core::ActionOutcome::kSucceeded);
   EXPECT_EQ(Observe().latest_sample->publication.value, true);
 
   // A manual input write after that actual echo remains the latest change.
@@ -493,7 +423,7 @@ TEST_F(HostIoSignalRuntimeTest,
   ASSERT_EQ(availability.size(), 1U);
   EXPECT_EQ(availability.back(), core::IoSignalAvailability::kFresh);
   EXPECT_EQ(values.back(), std::optional<bool>(true));
-  Step("disable");
+  Step(core::ComponentAction::kDisable);
   ASSERT_TRUE(runtime->DrainPending().ok());
   Advance(clock->now());
   ASSERT_EQ(availability.size(), 2U);
@@ -547,8 +477,8 @@ TEST_F(HostIoSignalRuntimeTest,
   EXPECT_EQ(inactive.value().signals.front().disposition,
             core::ProgramMockSimulationSignalDisposition::kInactive);
   EXPECT_FALSE(Observe().latest_sample); // real ROS input is never fabricated
-  Step("prepare");
-  Step("enable");
+  Step(core::ComponentAction::kPrepare);
+  Step(core::ComponentAction::kEnable);
   EXPECT_FALSE(
       Observe().latest_sample); // Enable does not fabricate a ROS value
   rclcpp::ExecutorOptions executor_options;
@@ -613,6 +543,14 @@ TEST_F(HostIoSignalRuntimeTest,
   ASSERT_EQ(calls, 2U);
   EXPECT_EQ(observed.back(), core::IoSignalAvailability::kStale);
   EXPECT_EQ(Observe().latest_sample, baseline.latest_sample);
+  // The same expiry turns the published sample stale: one refresh at that
+  // moment (no periodic re-read) raises the event-stream change signal, so
+  // the stream sends the new `state` (CONTRACTS §7).
+  EXPECT_EQ(scheduler->pending_count(core::SchedulerPriority::Monitoring), 1U);
+  const auto generation = core::execution_event_change_signal().Generation();
+  scheduler->advance_to(*expiry.value(), core::SchedulerPriority::Monitoring);
+  EXPECT_NE(core::execution_event_change_signal().Generation(), generation);
+  EXPECT_EQ(scheduler->pending_count(core::SchedulerPriority::Monitoring), 0U);
   const auto evidence = runtime->ReadRuleEvidence(armed.value());
   ASSERT_TRUE(evidence.ok());
   EXPECT_FALSE(evidence.value().trip);
@@ -1232,7 +1170,7 @@ TEST_F(HostIoSignalRuntimeTest,
   const auto request = Simulation();
   const auto first = StartSimulation(request);
   ASSERT_TRUE(first.ok());
-  Step("disable");
+  Step(core::ComponentAction::kDisable);
   ASSERT_TRUE(runtime->DrainPending().ok());
   EXPECT_EQ(Observe().availability, core::IoSignalAvailability::kUnavailable);
   const auto before = Observe();
@@ -1422,7 +1360,7 @@ TEST_F(HostIoSignalRuntimeTest,
   ASSERT_TRUE(StartSimulation(disabled).ok());
   Advance(2'100'000'000);
   ASSERT_TRUE(SetRunPaused(disabled.scope, 4U, true).ok());
-  Step("disable");
+  Step(core::ComponentAction::kDisable);
   ASSERT_TRUE(runtime->DrainPending().ok());
   const auto closed = Observe();
   EXPECT_EQ(closed.availability, core::IoSignalAvailability::kUnavailable);

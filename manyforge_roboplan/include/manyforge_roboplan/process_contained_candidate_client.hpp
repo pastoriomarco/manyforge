@@ -102,6 +102,8 @@ class ProcessContainedRoboPlanCandidateClient final : public IRoboPlanCandidateC
       const RoboPlanCandidateProjectionDTO& projection) override;
   [[nodiscard]] core::Result<void> replace_retained_model(
       const RoboPlanWorkerModelDTO& model) override;
+  [[nodiscard]] core::Result<void> replace_retained_settings(
+      const RoboPlanCandidateComputerConfig& settings) override;
   void request_cancel() noexcept override;
 
  private:

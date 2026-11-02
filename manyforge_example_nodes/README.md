@@ -27,9 +27,3 @@ artifact regeneration, not a permissive runtime fallback. A source-only change
 requires manifest regeneration. The retained project snapshot must match
 `pyproject.toml`. Build/install both this wheel and the Behavior wheel when
 qualifying an installed environment without the source checkout.
-
-The actual native exercise is part of
-[`ui6h_target_queries.py`](../scripts/qualification/ui6h_target_queries.py): it
-compiles a normal Program/Binding, runs the node through Program Runner and
-the native model query, and verifies the terminal node result. Its default
-workflow is read-only; the script's motion/control options are separate.

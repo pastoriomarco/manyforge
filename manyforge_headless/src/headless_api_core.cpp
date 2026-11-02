@@ -23,7 +23,6 @@
 #include <manyforge_core/io_rule_outcome_codec.hpp>
 #include <manyforge_core/types/carried_object_lost.hpp>
 #include <manyforge_core/types/io_rule_state.hpp>
-#include <manyforge_core/types/component_incident.hpp>
 #include <manyforge_core/types/error_catalog.generated.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/io_signal_catalog.hpp>
@@ -161,10 +160,10 @@ HistorianEvent PreviousSessionReportEvent(const CanonicalValue &report) {
           "previous-session report classification is invalid");
   static_cast<void>(text("message"));
   const auto &families = RequiredMember(report, "journal_families");
-  const std::array<std::string_view, 5U> expected{
-      "program_cycle", "scene", "manager", "cclc", "kernel_operation"};
+  const std::array<std::string_view, 4U> expected{
+      "program_cycle", "scene", "manager", "kernel_operation"};
   Require(families.is_array() && families.as_array().size() == expected.size(),
-          code, "previous-session report must name all five journal families");
+          code, "previous-session report must name all four journal families");
   for (std::size_t i = 0U; i < expected.size(); ++i) {
     const auto *family = std::get_if<std::string>(&families.as_array()[i].storage());
     Require(family != nullptr && *family == expected[i], code,
@@ -372,32 +371,6 @@ ManagerApplyTransitionId(const CanonicalValue &runtime) {
   return transition;
 }
 
-const CanonicalValue &
-ValidateStopFaultProjection(const CanonicalValue &payload,
-                            const std::string_view record_kind) {
-  const auto &latch = RequiredMember(payload, "fault_latch");
-  if (latch.is_null())
-    return latch;
-  Require(latch.is_object(), "headless_operation_event_invalid",
-          "Stop fault projection latch must be an object or null");
-  RequiredString(latch, "latch_id");
-  RequiredString(latch, "cell_id");
-  const auto state = RequiredString(latch, "state");
-  const bool active = record_kind == "stop_terminal_projected";
-  Require((active && (state == "latched" || state == "recovery_pending")) ||
-              (!active && record_kind == "stop_fault_cleared" &&
-               state == "cleared"),
-          "headless_operation_event_invalid",
-          "Stop fault projection state does not match its event kind");
-  const auto &certificate = RequiredMember(latch, "stop_certificate");
-  Require(certificate.is_object(), "headless_operation_event_invalid",
-          "Stop fault projection must name its exact certificate");
-  RequiredMember(certificate, "stop_certificate_id");
-  RequiredMember(certificate, "stop_certificate_revision");
-  RequiredMember(latch, "stop_generation");
-  RequiredMember(latch, "stop_id");
-  return latch;
-}
 
 bool IsOperationFaultState(const std::string_view state) noexcept {
   return state == "failed" || state == "interrupted" ||
@@ -450,11 +423,12 @@ void ValidateInterruptRuleStateProjection(const CanonicalValue &payload,
       core::RetainedBundleId(RequiredString(payload, "retained_bundle_id")),
       core::GraphRevision(RequiredString(payload, "graph_revision"))};
   Require(context.owner_epoch.value() == source_owner_epoch &&
-              (state == "clear" || state == "tripped" || state == "latched" || state == "unknown"),
+              (state == "inactive" || state == "clear" || state == "tripped" ||
+               state == "unknown"),
           code, "rule-state projection differs from its actual owner or state");
-  const auto kind = state == "clear" ? core::IoGlobalRuleState::kClear
+  const auto kind = state == "inactive" ? core::IoGlobalRuleState::kInactive
+                  : state == "clear" ? core::IoGlobalRuleState::kClear
                   : state == "tripped" ? core::IoGlobalRuleState::kTripped
-                  : state == "latched" ? core::IoGlobalRuleState::kLatched
                                        : core::IoGlobalRuleState::kUnknown;
   core::IoRuleStateDTO rule{
       core::InterruptPolicyId(RequiredString(payload, "rule_id")), kind,
@@ -510,9 +484,6 @@ OperationHistoryEventType(const std::string_view record_kind,
   }
   if (record_kind == "stop_terminal_projected") {
     return "stop_terminal_projected";
-  }
-  if (record_kind == "stop_fault_cleared") {
-    return "stop_fault_cleared";
   }
   if (record_kind == "runtime_scale_accepted") {
     return "runtime_scale_requested";
@@ -570,10 +541,10 @@ std::string ProductionWallText() {
 // Registered bounded failure-detail keys. manyforge_headless_api tests check
 // this set against the Python runtime's FAILURE_DETAIL_KEYS.
 const std::set<std::string> kFailureDetailKeys{
-    "input_problem",    "latch_id",      "path",
-    "reason",           "reference_id",  "reference_type",
-    "required_action",  "retryable",     "source_kind",
-    "source_reference", "target_role_id"};
+    "component_id",     "input_problem",  "path",
+    "reason",           "reference_id",   "reference_type",
+    "required_action",  "retryable",      "rule_id",
+    "source_kind",      "source_reference", "target_role_id"};
 
 // Closed failure `details`/`origin` of a run record. Values pass through
 // unchanged; this only rejects shapes outside their bounds.
@@ -845,16 +816,6 @@ HeadlessApiCore::HeadlessApiCore(HeadlessApiCoreConfig config,
           config_.owner_id + ".alarm-scope-adapter",
           "runtime_health",
           "manyforge.alarm_adapter.runtime_health_condition",
-          {},
-          0U,
-          0U,
-          {},
-          std::nullopt,
-      },
-      component_lifecycle_adapter_{
-          config_.owner_id + ".cclc-lifecycle-condition-adapter",
-          "runtime_health",
-          "manyforge.alarm_adapter.cclc_condition",
           {},
           0U,
           0U,
@@ -1454,28 +1415,12 @@ ReadAppliedProgramOutcome(const CanonicalValue &prepared) {
   return std::move(outcome.value());
 }
 
-/// The exact prepared origin is retained on every committed Apply, including
-/// a sealed empty Apply which carries no Scenario or Program.
+/// The exact prepared origin is retained on every committed Apply, the empty
+/// cell (Close, New) included.
 const CanonicalValue &ReadPreparedOrigin(const CanonicalValue &prepared) {
   const auto &origin = RequiredMember(prepared, "origin");
   try {
-    const auto typed = deployment::parse_prepared_activation_origin(origin);
-    if (const auto *sealed =
-            std::get_if<deployment::PreparedSealedCanonicalEmptyOrigin>(&typed)) {
-      Require(sealed->deployment_artifact_id.value() ==
-                      RequiredString(prepared, "deployment_artifact_id") &&
-                  sealed->deployment_revision.value() ==
-                      RequiredString(prepared, "deployment_revision") &&
-                  sealed->retained_bundle_id.value() ==
-                      RequiredString(prepared, "retained_bundle_id") &&
-                  sealed->graph_revision.value() ==
-                      RequiredString(prepared, "graph_revision") &&
-                  RequiredString(RequiredMember(prepared, "program_outcome"), "kind") ==
-                      "no_program" &&
-                  RequiredMember(prepared, "program_id").is_null() &&
-                  RequiredMember(prepared, "program_revision").is_null(),
-              "program_applied_selection_invalid", "invalid sealed empty origin");
-    }
+    static_cast<void>(deployment::parse_prepared_activation_origin(origin));
   } catch (const deployment::PreparedActivationInputError &error) {
     CoreFail("program_applied_selection_invalid",
              std::string("invalid prepared origin: ") + error.what());
@@ -1787,8 +1732,10 @@ CanonicalValue HeadlessApiCore::CommittedScenarioActivation() {
   const auto publication_generation = RequiredCounter(
       RequiredMember(RequiredMember(manager_payload, "active"), "publication"),
       "publication_generation", 2U);
-  // Every committed Apply, including sealed empty origins, remains in the
-  // complete publication inventory. Canonical origin bytes keep ordering exact.
+  // Every committed Apply Manager's journal retains, the empty cell included.
+  // The journal is bounded by eviction, so older committed Applies may be
+  // gone; the retained ones and the current one are what consumers follow.
+  // Canonical origin bytes keep ordering exact.
   using CommittedApply = std::tuple<std::string, std::string, std::string,
                                     std::uint64_t, std::string>;
   const auto committed_apply = [](const CanonicalValue &apply_record) {
@@ -1814,16 +1761,17 @@ CanonicalValue HeadlessApiCore::CommittedScenarioActivation() {
   }
   std::sort(committed.begin(), committed.end());
   // Publication 1 is the canonical-empty bootstrap and every later one is
-  // exactly one committed named Apply, so the inventory must account for
-  // every publication; otherwise no consumer can prove it saw them all.
-  Require(committed.size() + 1U == publication_generation &&
+  // exactly one committed named Apply. Eviction only removes older committed
+  // Applies, so the retained ones can never outnumber the Apply publications:
+  // more would pair this publication with a newer journal (a split read).
+  Require(committed.size() < publication_generation &&
               std::adjacent_find(committed.begin(), committed.end(),
                                  [](const auto &left, const auto &right) {
                                    return std::get<0>(left) ==
                                           std::get<0>(right);
                                  }) == committed.end(),
           "program_activation_history_incomplete",
-          "Manager's committed Applies do not account for every publication");
+          "Manager's committed Applies do not match its publications");
   CanonicalValue::Array committed_applies;
   committed_applies.reserve(committed.size());
   for (const auto &[record_digest, origin_json, apply_id, apply_generation,
@@ -1969,9 +1917,6 @@ CanonicalValue HeadlessApiCore::RefreshAlarmSources() {
   }
   Require(!shutdown_, "headless_api_closed", "headless API core is closed");
   return CanonicalValue(CanonicalValue::Object{
-      {"component_lifecycle_observation_pending",
-       CanonicalValue(component_lifecycle_observation_pending_.load(
-           std::memory_order_acquire))},
       {"refreshed", CanonicalValue(refreshed)},
       {"refreshed_at_ns",
        Number(static_cast<std::uint64_t>(alarm_sources_refreshed_at_ns_.load(
@@ -2218,36 +2163,6 @@ CanonicalValue HeadlessApiCore::HistorianHealth() {
   return AsyncHistorianHealthValue(historian_.Health());
 }
 
-CanonicalValue HeadlessApiCore::RecordScenarioForceClose(CanonicalValue record) {
-  // Headless builds this record from the Kernel's own Force close result;
-  // only its envelope is checked here.
-  Require(record.is_object() &&
-              RequiredString(record, "schema_version") ==
-                  "manyforge.scenario_force_close.v1" &&
-              RequiredString(record, "reason_code") == "cell_force_closed_by_operator",
-          "scenario_force_close_record_invalid", "Force close History record is invalid");
-  auto payload = record.as_object();
-  payload.emplace_back("clock_owner", CanonicalValue("headless:" + config_.owner_epoch));
-  std::lock_guard lock(mutex_);
-  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
-  auto event = MakeHistorianEvent("manyforge.headless", "scenario_force_closed", "WARN",
-                                  clocks_.monotonic_time_ns(), clocks_.wall_time_text(),
-                                  CanonicalValue(std::move(payload)));
-  const auto event_id = event.event_id;
-  const bool recorded = historian_.TryEnqueue(std::move(event));
-  if (!recorded) {
-    alarm_owner_.MarkHealthUnavailable(
-        std::string(kHistorianOwnerHealthCode),
-        "historian queue rejected a Force close record");
-  }
-  SynchronizeHistorianHealthLocked();
-  return CanonicalValue(CanonicalValue::Object{
-      {"event_id", CanonicalValue(event_id)},
-      {"recorded", CanonicalValue(recorded)},
-      {"schema_version", CanonicalValue("manyforge.scenario_force_close_record.v1")},
-  });
-}
-
 CanonicalValue HeadlessApiCore::RecordProgramDiagnostic(CanonicalValue record) {
   const std::string code = "program_diagnostic_invalid";
   const std::set<std::string> fields{"schema_version",
@@ -2384,6 +2299,131 @@ CanonicalValue HeadlessApiCore::RecordProgramDiagnostic(CanonicalValue record) {
        CanonicalValue("manyforge.program_diagnostic_record.v1")},
       {"event_id", CanonicalValue(event_id)},
       {"recorded", CanonicalValue(recorded)}});
+}
+
+CanonicalValue HeadlessApiCore::RecordActivity(CanonicalValue record) {
+  const std::string code = "activity_record_invalid";
+  const std::set<std::string> fields{"schema_version", "kind",   "subject",
+                                     "action",         "outcome", "error",
+                                     "components",     "message"};
+  Require(record.is_object() && record.as_object().size() == fields.size(),
+          code, "activity record fields are invalid");
+  for (const auto &[name, value] : record.as_object()) {
+    Require(fields.contains(name), code, "activity record field is unknown");
+  }
+  const auto bounded = [&](const std::string &value, std::size_t limit) {
+    Require(!value.empty() && value.size() <= limit &&
+                content_identity::is_utf8_nfc(value),
+            code, "activity record text is invalid");
+  };
+  const auto text = [&](const std::string_view name, std::size_t limit = 256U) {
+    const auto *value =
+        std::get_if<std::string>(&RequiredMember(record, name).storage());
+    Require(value != nullptr, code, "activity record text is missing");
+    bounded(*value, limit);
+    return *value;
+  };
+  // A typed error: code and message, optionally the vendor's code and text.
+  const auto error_value = [&](const CanonicalValue &error) {
+    if (std::holds_alternative<std::nullptr_t>(error.storage())) return false;
+    Require(error.is_object() && error.as_object().size() <= 4U, code,
+            "activity record error is invalid");
+    bool has_code = false;
+    for (const auto &[name, value] : error.as_object()) {
+      const auto *member = std::get_if<std::string>(&value.storage());
+      Require(member != nullptr &&
+                  (name == "code" || name == "message" ||
+                   name == "vendor_code" || name == "vendor_text"),
+              code, "activity record error field is invalid");
+      bounded(*member, name == "code" ? 256U : 2048U);
+      has_code = has_code || name == "code";
+    }
+    Require(has_code, code, "activity record error has no code");
+    return true;
+  };
+  Require(text("schema_version") == "manyforge.activity_event.v1", code,
+          "activity record version is unsupported");
+  const auto kind = text("kind");
+  const auto subject = text("subject");
+  const auto outcome = text("outcome");
+  text("message", 4096U);
+  const bool component_action = kind == "component_action";
+  Require(component_action || kind == "apply", code,
+          "activity record kind is unsupported");
+  const std::set<std::string> outcomes =
+      component_action
+          ? std::set<std::string>{"succeeded", "failed", "unknown", "refused",
+                                  "interrupted"}
+          : std::set<std::string>{"succeeded", "accepted", "failed", "refused"};
+  Require(outcomes.contains(outcome), code,
+          "activity record outcome is unsupported");
+  const auto &action = RequiredMember(record, "action");
+  const auto &components = RequiredMember(record, "components");
+  Require(components.is_array() && components.as_array().size() <= 256U, code,
+          "activity record components are invalid");
+  if (component_action) {
+    text("action", 64U);
+    Require(components.as_array().empty(), code,
+            "a component action record carries no component rows");
+  } else {
+    Require(std::holds_alternative<std::nullptr_t>(action.storage()), code,
+            "an Apply record carries no action");
+    const std::set<std::string> apply_kinds{
+        "scenario_load",     "scenario_new",  "deployment_apply",
+        "deployment_revert", "program_apply", "program_revert"};
+    Require(apply_kinds.contains(subject), code,
+            "activity record Apply kind is unsupported");
+    for (const auto &row : components.as_array()) {
+      Require(row.is_object() && row.as_object().size() <= 4U, code,
+              "activity record component row is invalid");
+      for (const auto &[name, value] : row.as_object()) {
+        if (name == "error") {
+          error_value(value);
+          continue;
+        }
+        const auto *member = std::get_if<std::string>(&value.storage());
+        Require(member != nullptr &&
+                    (name == "component_id" || name == "disposition" ||
+                     name == "lifecycle_after"),
+                code, "activity record component row field is invalid");
+        bounded(*member, 256U);
+      }
+      Require(row.find_object_member("component_id") != nullptr, code,
+              "activity record component row has no component id");
+    }
+  }
+  const bool has_error = error_value(RequiredMember(record, "error"));
+  Require(has_error == (outcome != "succeeded" && outcome != "accepted"),
+          code, "activity record error does not match its outcome");
+  Require(content_identity::canonical_json(record).size() <= 64U * 1024U, code,
+          "activity record exceeds its byte bound");
+  const auto severity = outcome == "succeeded" || outcome == "accepted" ? "INFO"
+                        : outcome == "refused" || outcome == "interrupted"
+                            ? "WARN"
+                            : "ERROR";
+  auto payload = record.as_object();
+  payload.emplace_back("clock_owner",
+                       CanonicalValue("headless:" + config_.owner_epoch));
+
+  std::lock_guard lock(mutex_);
+  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
+  auto event = MakeHistorianEvent(
+      component_action ? subject : std::string("manyforge.composer"),
+      component_action ? "component_action_finished" : "apply_finished",
+      severity, clocks_.monotonic_time_ns(), clocks_.wall_time_text(),
+      CanonicalValue(std::move(payload)));
+  const auto event_id = event.event_id;
+  const bool recorded = historian_.TryEnqueue(std::move(event));
+  if (!recorded) {
+    alarm_owner_.MarkHealthUnavailable(
+        std::string(kHistorianOwnerHealthCode),
+        "historian delivery queue rejected an activity record");
+  }
+  SynchronizeHistorianHealthLocked();
+  return CanonicalValue(CanonicalValue::Object{
+      {"event_id", CanonicalValue(event_id)},
+      {"recorded", CanonicalValue(recorded)},
+      {"schema_version", CanonicalValue("manyforge.activity_record.v1")}});
 }
 
 CanonicalValue HeadlessApiCore::ReconcileHistorianHealth(
@@ -2605,7 +2645,7 @@ HeadlessApiCore::CommitProgramModelAttempt(CanonicalValue record) {
 namespace {
 
 // The current v8 common row carries one neutral addressed command identity.
-// Optional provider/output/rule evidence retains its existing typed validation.
+// Optional rule evidence retains its existing typed validation.
 void ValidateParticipantExtensions(const CanonicalValue& state) {
   for (const auto& participant : RequiredArray(state, "participants")) {
     Require(participant.is_object() &&
@@ -2614,12 +2654,8 @@ void ValidateParticipantExtensions(const CanonicalValue& state) {
             "headless_operation_event_invalid", "common participant uses obsolete command identity");
     static_cast<void>(RequiredString(participant, "command_id"));
     static_cast<void>(RequiredCounter(participant, "command_generation", 1U));
-    const auto* binding = participant.find_object_member("control_binding_id");
-    const bool provider = binding && binding->is_null();
-    const auto* output = participant.find_object_member("output_evidence");
     const auto* rules = participant.find_object_member("io_rule_outcomes");
-    if (!provider && !output && !rules) continue;
-    const auto& revision = RequiredMember(participant, "control_binding_revision");
+    if (!rules) continue;
     const auto& capability = RequiredMember(participant, "capability_provider_binding_id");
     const auto& capability_revision =
         RequiredMember(participant, "capability_provider_binding_revision");
@@ -2629,44 +2665,31 @@ void ValidateParticipantExtensions(const CanonicalValue& state) {
           core::CapabilityProviderBindingId(RequiredString(participant, "capability_provider_binding_id")),
           core::CapabilityProviderBindingRevision(RequiredString(participant, "capability_provider_binding_revision"))};
     }
-    Require(!provider || (revision.is_null() && capability_binding.has_value()),
-            "headless_operation_event_invalid", "provider binding identity is incomplete");
     const core::ParticipantBindingIdentityDTO identity{
         core::ControlDomainId(RequiredString(participant, "control_domain_id")),
         core::ControlDomainRevision(RequiredString(participant, "control_domain_revision")),
-        provider ? decltype(core::ParticipantBindingIdentityDTO::binding)(*capability_binding)
-                 : decltype(core::ParticipantBindingIdentityDTO::binding)(
-                       core::ControllerParticipantBindingIdentityDTO{
-                           core::ControlBindingId(RequiredString(participant, "control_binding_id")),
-                           core::ControlBindingRevision(RequiredString(participant, "control_binding_revision")),
-                           capability_binding})};
+        core::ControllerParticipantBindingIdentityDTO{
+            core::ControlBindingId(RequiredString(participant, "control_binding_id")),
+            core::ControlBindingRevision(RequiredString(participant, "control_binding_revision")),
+            capability_binding}};
     Require(identity.locally_valid(), "headless_operation_event_invalid",
             "participant binding identity is invalid");
-    if (output) {
-      Require(output->is_string() &&
-                  (output->as_string() == "not_submitted" || output->as_string() == "submitted" ||
-                   output->as_string() == "source_accepted" || output->as_string() == "source_rejected" ||
-                   output->as_string() == "acceptance_unknown"),
-              "headless_operation_event_invalid", "output evidence is invalid");
-    }
-    if (rules) {
-      const auto decoded = core::DecodeIoRuleOutcomes(content_identity::canonical_json(*rules));
-      Require(decoded.ok() && !decoded.value().empty(), "headless_operation_event_invalid",
-              "I/O rule evidence is invalid or empty");
-      // Share the journal's historical chronology and exact containing tuple
-      // checks. This observation never grants live execution authority.
-      const auto qualified = core::ValidateIoRuleOutcomeParticipant(
-          core::OperationId(RequiredString(state, "operation_id")),
-          core::OperationRevision(RequiredCounter(state, "operation_revision", 1U)),
-          core::OperationParticipantId(RequiredString(participant, "participant_id")),
-          core::ControllableComponentId(RequiredString(participant, "controllable_component_id")),
-          core::CommandTargetId(RequiredString(participant, "command_target_id")),
-          core::ControllerGoalId(RequiredString(participant, "command_id")),
-          core::ControllerGoalGeneration(RequiredCounter(participant, "command_generation", 1U)),
-          decoded.value());
-      Require(qualified.ok(), "headless_operation_event_invalid",
-              "I/O rule evidence relabels its containing participant");
-    }
+    const auto decoded = core::DecodeIoRuleOutcomes(content_identity::canonical_json(*rules));
+    Require(decoded.ok() && !decoded.value().empty(), "headless_operation_event_invalid",
+            "I/O rule evidence is invalid or empty");
+    // Share the journal's historical chronology and exact containing tuple
+    // checks. This observation never grants live execution authority.
+    const auto qualified = core::ValidateIoRuleOutcomeParticipant(
+        core::OperationId(RequiredString(state, "operation_id")),
+        core::OperationRevision(RequiredCounter(state, "operation_revision", 1U)),
+        core::OperationParticipantId(RequiredString(participant, "participant_id")),
+        core::ControllableComponentId(RequiredString(participant, "controllable_component_id")),
+        core::CommandTargetId(RequiredString(participant, "command_target_id")),
+        core::ControllerGoalId(RequiredString(participant, "command_id")),
+        core::ControllerGoalGeneration(RequiredCounter(participant, "command_generation", 1U)),
+        decoded.value());
+    Require(qualified.ok(), "headless_operation_event_invalid",
+            "I/O rule evidence relabels its containing participant");
   }
 }
 
@@ -2838,15 +2861,13 @@ CanonicalValue HeadlessApiCore::IngestOperationEvent(
       record_kind == "stop_acceptance_projected";
   const bool stop_terminal_projection =
       record_kind == "stop_terminal_projected";
-  const bool stop_fault_clear_projection = record_kind == "stop_fault_cleared";
   // Active TCP (M7, A2a-2): one History event per confirmed change (robot,
   // old -> new entry, source, offset sent), carried in the journal payload.
   const bool active_tcp_projection = record_kind == "active_tcp_changed";
   const bool rule_state_projection =
       record_kind == "interrupt_rule_state_changed" || active_tcp_projection;
   const bool stop_scoped_projection = stop_acceptance_projection ||
-                                      stop_terminal_projection ||
-                                      stop_fault_clear_projection;
+                                      stop_terminal_projection;
   Require(!source_owner_epoch.empty() && source_sequence != 0U &&
               source_sequence <= kMaximumSafeInteger && !record_kind.empty() &&
               has_operation_id == has_operation_revision &&
@@ -2867,7 +2888,6 @@ CanonicalValue HeadlessApiCore::IngestOperationEvent(
                                                    "control_accepted",
                                                    "stop_acceptance_projected",
                                                    "stop_terminal_projected",
-                                                   "stop_fault_cleared",
                                                    "runtime_scale_accepted",
                                                    "interrupt_rule_state_changed",
                                                    "active_tcp_changed",
@@ -2998,40 +3018,6 @@ CanonicalValue HeadlessApiCore::IngestOperationEvent(
         "Stop terminal projection does not match its durable envelope");
     stop_terminal_duration_ns = duration_ns;
     stop_terminal_result = result;
-  } else if (stop_fault_clear_projection) {
-    const auto &fault_latch = RequiredMember(journal_payload, "fault_latch");
-    const auto &result = RequiredMember(journal_payload, "result");
-    const auto &certificate = RequiredMember(fault_latch, "stop_certificate");
-    const auto request = RequiredString(journal_payload, "request_id");
-    const auto stop_id = RequiredString(journal_payload, "stop_id");
-    const auto stop_generation =
-        RequiredCounter(journal_payload, "stop_generation", 1U);
-    Require(RequiredString(journal_payload, "api_version") ==
-                    "manyforge.stop_fault_clear_projection.v1" &&
-                RequiredString(journal_payload, "owner_epoch") ==
-                    source_owner_epoch &&
-                request_id.has_value() && *request_id == request &&
-                result.is_object() && RequiredBool(result, "accepted") &&
-                RequiredString(result, "request_id") == request &&
-                std::holds_alternative<std::nullptr_t>(
-                    RequiredMember(result, "error").storage()) &&
-                fault_latch.is_object() &&
-                RequiredString(fault_latch, "state") == "cleared" &&
-                RequiredString(fault_latch, "recovery_status") == "cleared" &&
-                RequiredString(fault_latch, "reason_code") ==
-                    "stop_fault_recovery_cleared" &&
-                RequiredString(fault_latch, "stop_id") == stop_id &&
-                RequiredCounter(fault_latch, "stop_generation", 1U) ==
-                    stop_generation &&
-                certificate.is_object() &&
-                RequiredString(certificate, "stop_certificate_id") ==
-                    RequiredString(journal_payload, "stop_certificate_id") &&
-                RequiredCounter(certificate, "stop_certificate_revision", 1U) ==
-                    RequiredCounter(journal_payload,
-                                    "stop_certificate_revision", 1U) &&
-                !effect_pending,
-            "headless_operation_event_invalid",
-            "Stop fault-clear projection does not match its durable envelope");
   } else {
     const auto record_api = RequiredString(journal_payload, "api_version");
     Require(record_api == "manyforge.operation_journal_record.v8" &&
@@ -3060,9 +3046,6 @@ CanonicalValue HeadlessApiCore::IngestOperationEvent(
     operation_facts = ParseOperationFacts(
         *operation_state, journal_payload.find_object_member("intent"), true, true, true);
   }
-  if (stop_terminal_projection || stop_fault_clear_projection)
-    static_cast<void>(
-        ValidateStopFaultProjection(journal_payload, record_kind));
   const auto event_type = OperationHistoryEventType(record_kind, journal_payload);
   // Handling a failure changes its alarm disposition, not its history class.
   const bool stopped_with_error =
@@ -3179,10 +3162,6 @@ CanonicalValue HeadlessApiCore::IngestOperationEvent(
     ReconcileRuntimeCollisionStopLocked(
         journal_payload, source_sequence, payload_digest, occurred_at_ns,
         occurred_at_wall, event_id.value_or(""));
-  } else if (stop_terminal_projection || stop_fault_clear_projection) {
-    ReconcileStopFaultLocked(journal_payload, record_kind, source_sequence,
-                             payload_digest, occurred_at_ns, occurred_at_wall,
-                             event_id.value_or(""));
   } else if (operation_state != nullptr) {
     ReconcileOperationFaultLocked(journal_payload, operation_facts, record_kind,
                                   request_id.value_or(""), source_sequence,
@@ -3201,8 +3180,7 @@ CanonicalValue HeadlessApiCore::IngestOperationEvent(
 }
 
 CanonicalValue HeadlessApiCore::CompleteOperationEventSnapshot(
-    std::string source_owner_epoch, const std::uint64_t through_source_sequence,
-    std::optional<CanonicalValue> current_stop_fault) {
+    std::string source_owner_epoch, const std::uint64_t through_source_sequence) {
   Require(!source_owner_epoch.empty() &&
               through_source_sequence <= kMaximumSafeInteger,
           "headless_operation_event_invalid",
@@ -3214,18 +3192,6 @@ CanonicalValue HeadlessApiCore::CompleteOperationEventSnapshot(
       through_source_sequence == operation_native_sequence_,
       "headless_operation_event_snapshot_incomplete",
       "operation event snapshot completion is ahead of or behind ingestion");
-
-  const bool current_fault_active =
-      current_stop_fault.has_value() &&
-      !std::holds_alternative<std::nullptr_t>(current_stop_fault->storage());
-  if (current_stop_fault.has_value()) {
-    if (current_fault_active) {
-      ObserveCurrentStopFaultLocked(*current_stop_fault,
-                                    through_source_sequence);
-    } else {
-      current_stop_fault_fingerprint_.clear();
-    }
-  }
 
   std::vector<std::string> retired;
   for (const auto &[operation, subject] : active_operation_faults_) {
@@ -3304,52 +3270,6 @@ CanonicalValue HeadlessApiCore::CompleteOperationEventSnapshot(
     active_runtime_collisions_.erase(operation);
   }
   retired.clear();
-  for (const auto &[latch, subject] : active_stop_faults_) {
-    // A selected current latch is not a complete set of unresolved faults.
-    // Keep older identities until exact clear or an authoritative null
-    // snapshot.
-    if (!current_stop_fault.has_value() || current_fault_active) {
-      continue;
-    }
-    retired.push_back(latch);
-    Require(operation_adapter_.source_sequence < kMaximumSafeInteger,
-            "headless_adapter_sequence_exhausted",
-            "operation alarm adapter sequence is exhausted");
-    ++operation_adapter_.source_sequence;
-    AlarmConditionUpdate update{
-        "manyforge.motion.stop_fault",
-        subject,
-        false,
-        operation_adapter_.source_id,
-        operation_adapter_.source_epoch,
-        operation_adapter_.source_sequence,
-        clocks_.monotonic_time_ns(),
-        clocks_.wall_time_text(),
-        AlarmConditionQuality::kGood,
-        CanonicalValue(CanonicalValue::Object{}),
-        CanonicalValue(CanonicalValue::Object{
-            {"reason", CanonicalValue("stop_fault_context_retired")},
-        }),
-        {},
-        CanonicalValue(CanonicalValue::Object{
-            {"latch_id", CanonicalValue(latch)},
-        }),
-    };
-    if (const auto mutation = SubmitOperationConditionLocked(
-            std::move(update), OperationConditionKind::kStopFault, latch)) {
-      static_cast<void>(DeliverFactsLocked(mutation->lifecycle_facts));
-    }
-  }
-  for (const auto &latch : retired) {
-    active_stop_faults_.erase(latch);
-  }
-  if (current_stop_fault.has_value() && !current_fault_active) {
-    // An authoritative null snapshot also ends refused, never-admitted ones.
-    std::erase_if(refused_operation_conditions_, [](const auto &entry) {
-      return entry.second.kind == OperationConditionKind::kStopFault;
-    });
-    SynchronizeAlarmScopeConditionLocked();
-  }
   alarm_owner_.CompleteSourceSnapshot(operation_adapter_.source_id,
                                       operation_adapter_.source_epoch,
                                       AlarmConditionQuality::kGood);
@@ -3381,586 +3301,6 @@ CanonicalValue HeadlessApiCore::MarkOperationEventSourceUnknown(
       {"source_owner_epoch", CanonicalValue(source_owner_epoch)},
       {"status", CanonicalValue(current ? "marked_unknown" : "stale_ignored")},
   });
-}
-
-namespace {
-
-constexpr std::string_view kComponentLifecycleConditionSchemaVersion =
-    "manyforge.component_lifecycle_condition.v1";
-constexpr std::string_view kComponentLifecycleFaultDefinition =
-    "manyforge.runtime.component_lifecycle_fault";
-constexpr std::size_t kMaximumComponentLifecycleConditionScope = 256U;
-
-/// Blocking cause classes held as a lifecycle fault (spec 530 §3.3,
-/// 2026-10-08; incident classes of the 2026-10-08 addendum 2).
-/// `configuration` stays in CCLC/control-domain reconciliation status and
-/// `availability` is not a lifecycle fault.
-bool ComponentLifecycleFaultCause(const std::string_view cause) {
-  return cause == "emergency_stop" || cause == "protective_stop" ||
-         cause == "safeguard_stop" || cause == "fault" || cause == "unknown" ||
-         cause == "collision" || cause == "external_control" ||
-         cause == "provider_lost";
-}
-
-bool KnownBlockingCauseClass(const std::string_view cause) {
-  return ComponentLifecycleFaultCause(cause) || cause == "none" ||
-         cause == "availability" || cause == "configuration";
-}
-
-/// A nullable object member; absent and null are both no value.
-const CanonicalValue *NullableObjectMember(const CanonicalValue &root,
-                                           const std::string_view name) {
-  const auto *member = root.find_object_member(name);
-  if (member == nullptr ||
-      std::holds_alternative<std::nullptr_t>(member->storage())) {
-    return nullptr;
-  }
-  Require(member->is_object(), "headless_component_lifecycle_invalid",
-          "CCLC component snapshot " + std::string(name) +
-              " must be an object or null");
-  return member;
-}
-
-CanonicalValue NullableText(const CanonicalValue *root,
-                            const std::string_view name) {
-  if (root == nullptr) {
-    return CanonicalValue(nullptr);
-  }
-  const auto &member = RequiredMember(*root, name);
-  if (std::holds_alternative<std::nullptr_t>(member.storage())) {
-    return member;
-  }
-  Require(std::holds_alternative<std::string>(member.storage()),
-          "headless_component_lifecycle_invalid",
-          "CCLC component snapshot " + std::string(name) +
-              " must be text or null");
-  return member;
-}
-
-} // namespace
-
-CanonicalValue HeadlessApiCore::ComponentLifecycleConditionScope() {
-  std::lock_guard lock(mutex_);
-  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
-  const auto identity = [this](const bool bundle) {
-    return alarm_registry_identity_.has_value()
-               ? CanonicalValue(bundle ? alarm_registry_identity_->first
-                                       : alarm_registry_identity_->second)
-               : CanonicalValue(nullptr);
-  };
-  return CanonicalValue(CanonicalValue::Object{
-      {"component_ids", StringArrayValue(alarm_component_ids_)},
-      {"graph_revision", identity(false)},
-      {"retained_bundle_id", identity(true)},
-      {"schema_version",
-       CanonicalValue(std::string(kComponentLifecycleConditionSchemaVersion))},
-      {"source_registered",
-       CanonicalValue(!component_lifecycle_adapter_.source_epoch.empty())},
-  });
-}
-
-bool HeadlessApiCore::RefreshCurrentAlarmRegistryLocked() {
-  // Spec 530 §7.1: judged against the configuration Manager publishes now.
-  // The refresh replaces the registry (and marks lifecycle quality unknown)
-  // when the publication names a new configuration. A stale or absent
-  // publication still names its last configuration, which an Apply may
-  // already have superseded, and an unverifiable one leaves the registry on
-  // the previous configuration: neither can judge an observation.
-  const auto runtime = RefreshLocked();
-  const auto bundle_id =
-      OptionalStringMember(runtime.root, "active_retained_bundle_id");
-  const auto graph_revision =
-      OptionalStringMember(runtime.root, "active_graph_revision");
-  return SectionFresh(RequiredSection(runtime.root, "manager")) &&
-         bundle_id.has_value() && graph_revision.has_value() &&
-         alarm_registry_identity_ ==
-             std::make_pair(*bundle_id, *graph_revision);
-}
-
-void HeadlessApiCore::ReturnRemovedComponentConditionsLocked(
-    const std::set<std::string> &in_scope,
-    const std::function<CanonicalValue(const std::string &component_id)>
-        &correlations) {
-  std::vector<std::pair<std::string, std::string>> removed;
-  for (const auto &[key, state] : component_conditions_) {
-    static_cast<void>(state);
-    if (!in_scope.contains(key.second)) {
-      removed.push_back(key);
-    }
-  }
-  for (const auto &key : removed) {
-    const auto state = component_conditions_.at(key);
-    SynchronizeComponentConditionLocked(
-        component_lifecycle_adapter_, key.first, key.second, state.subject,
-        false,
-        CanonicalValue(CanonicalValue::Object{
-            {"reason", CanonicalValue("component_removed")}}),
-        correlations(key.second));
-    component_conditions_.erase(key);
-  }
-}
-
-CanonicalValue HeadlessApiCore::ObserveComponentLifecycleConditions(
-    std::string cclc_owner_epoch, CanonicalValue snapshots,
-    std::vector<std::string> unavailable_component_ids) {
-  const auto *rows = std::get_if<CanonicalValue::Array>(&snapshots.storage());
-  Require(!cclc_owner_epoch.empty() && cclc_owner_epoch.size() <= 256U &&
-              content_identity::is_utf8_nfc(cclc_owner_epoch) &&
-              rows != nullptr &&
-              rows->size() + unavailable_component_ids.size() <=
-                  kMaximumComponentLifecycleConditionScope,
-          "headless_component_lifecycle_invalid",
-          "component lifecycle observation envelope is malformed");
-  std::lock_guard lock(mutex_);
-  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
-
-  struct Observed final {
-    AlarmSubject subject;
-    bool lifecycle_fault{};
-    CanonicalValue details;
-    CanonicalValue correlations;
-    /// (retained bundle, graph revision) CCLC captured the row under.
-    std::pair<std::string, std::string> configuration;
-  };
-  std::set<std::string> named;
-  for (const auto &component : unavailable_component_ids) {
-    Require(!component.empty() && named.insert(component).second,
-            "headless_component_lifecycle_invalid",
-            "unavailable component ids must be unique and non-empty");
-  }
-  std::map<std::string, Observed> observed;
-  for (const auto &row : *rows) {
-    Require(row.is_object(), "headless_component_lifecycle_invalid",
-            "CCLC component snapshot must be an object");
-    auto component = RequiredString(row, "controllable_component_id");
-    Require(!component.empty() && named.insert(component).second,
-            "headless_component_lifecycle_invalid",
-            "CCLC component snapshots must name unique components");
-    std::set<std::string> resources;
-    CanonicalValue::Array domain_ids;
-    for (const auto &domain : RequiredArray(row, "domains")) {
-      domain_ids.emplace_back(RequiredString(domain, "control_domain_id"));
-      for (const auto &resource : RequiredArray(domain, "resources")) {
-        const auto *resource_id = std::get_if<std::string>(&resource.storage());
-        Require(resource_id != nullptr && !resource_id->empty(),
-                "headless_component_lifecycle_invalid",
-                "component resources must be non-empty text");
-        resources.insert(*resource_id);
-      }
-    }
-    const auto *target = NullableObjectMember(row, "lifecycle_target");
-    const auto *progress = NullableObjectMember(row, "lifecycle_progress");
-    const auto cause = progress == nullptr
-                           ? std::string("none")
-                           : RequiredString(*progress, "blocking_cause_class");
-    Require(KnownBlockingCauseClass(cause),
-            "headless_component_lifecycle_invalid",
-            "CCLC component snapshot names an unknown blocking cause class");
-    // An open incident (addendum 2, 2026-10-08) holds the condition until
-    // the operator's acknowledgement is accepted and CCLC publishes
-    // `incident: null`; a current intervention cause holds it as well.
-    const auto *incident =
-        progress == nullptr ? nullptr
-                            : NullableObjectMember(*progress, "incident");
-    CanonicalValue::Object details{
-        {"blocking_cause_class", CanonicalValue(cause)},
-        {"blocking_reason", NullableText(progress, "blocking_reason")},
-        {"component_lifecycle_state",
-         CanonicalValue(RequiredString(row, "component_lifecycle_state"))},
-    };
-    if (incident != nullptr) {
-      const auto id = RequiredString(*incident, "incident_id");
-      const auto incident_class = RequiredString(*incident, "cause_class");
-      Require(!id.empty() && id.size() <= 128U &&
-                  KnownBlockingCauseClass(incident_class) &&
-                  incident_class != "none" && incident_class != "availability",
-              "headless_component_lifecycle_invalid",
-              "CCLC component snapshot incident is malformed");
-      for (const auto &code : RequiredArray(*incident, "vendor_codes")) {
-        const auto *text = std::get_if<std::string>(&code.storage());
-        Require(text != nullptr && !text->empty() && text->size() <= 64U,
-                "headless_component_lifecycle_invalid",
-                "CCLC component snapshot incident vendor codes are malformed");
-      }
-      Require(RequiredArray(*incident, "vendor_codes").size() <= 16U,
-              "headless_component_lifecycle_invalid",
-              "CCLC component snapshot incident names too many vendor codes");
-      // Present only while the incident is open: the returned record keeps
-      // the identity of the incident that raised it.
-      details.emplace_back("incident_cause_class",
-                           CanonicalValue(incident_class));
-      details.emplace_back("incident_id", CanonicalValue(id));
-      details.emplace_back("incident_summary",
-                           CanonicalValue(RequiredString(*incident, "summary")));
-      details.emplace_back("incident_vendor_codes",
-                           RequiredMember(*incident, "vendor_codes"));
-    }
-    details.emplace_back("lifecycle_phase", NullableText(progress, "phase"));
-    details.emplace_back(
-        "requested_state",
-        target == nullptr
-            ? CanonicalValue(nullptr)
-            : CanonicalValue(RequiredString(*target, "requested_state")));
-    details.emplace_back(
-        "target_generation",
-        target == nullptr
-            ? CanonicalValue(nullptr)
-            : Number(RequiredCounter(*target, "target_generation", 1U),
-                     "target_generation"));
-    auto configuration = std::make_pair(RequiredString(row, "retained_bundle_id"),
-                                        RequiredString(row, "graph_revision"));
-    Observed value{
-        AlarmSubject{"component", component,
-                     std::vector<std::string>(resources.begin(),
-                                              resources.end())},
-        incident != nullptr || ComponentLifecycleFaultCause(cause),
-        CanonicalValue(std::move(details)),
-        CanonicalValue(CanonicalValue::Object{
-            {"cclc_owner_epoch", CanonicalValue(cclc_owner_epoch)},
-            {"control_domain_ids", CanonicalValue(std::move(domain_ids))},
-            {"controllable_component_id", CanonicalValue(component)},
-            {"graph_revision", CanonicalValue(configuration.second)},
-            {"retained_bundle_id", CanonicalValue(configuration.first)},
-        }),
-        std::move(configuration),
-    };
-    observed.insert_or_assign(std::move(component), std::move(value));
-  }
-  const auto response = [&](const std::string_view status) {
-    return CanonicalValue(CanonicalValue::Object{
-        {"schema_version",
-         CanonicalValue(std::string(kComponentLifecycleConditionSchemaVersion))},
-        {"source_owner_epoch", CanonicalValue(cclc_owner_epoch)},
-        {"status", CanonicalValue(std::string(status))},
-    });
-  };
-  if (!RefreshCurrentAlarmRegistryLocked()) {
-    return response("configuration_unavailable");
-  }
-  const std::set<std::string> scope(alarm_component_ids_.begin(),
-                                    alarm_component_ids_.end());
-  if (named != scope) {
-    // The active configuration changed between the scope read and this
-    // observation; the next observation names the new scope.
-    return response("scope_changed");
-  }
-  for (const auto &[component, value] : observed) {
-    static_cast<void>(component);
-    if (value.configuration != alarm_registry_identity_) {
-      // Fenced to the active configuration: a row CCLC captured under a
-      // superseded retained bundle or graph revision is no observation of
-      // the active one, even when it names the same components. It raises,
-      // keeps and clears nothing; CCLC restates the row once it has adopted
-      // the active configuration.
-      return response("scope_changed");
-    }
-  }
-  if (scope.empty() && component_lifecycle_adapter_.source_epoch.empty()) {
-    // Nothing in scope and no source to reconcile.
-    component_lifecycle_observation_pending_.store(false,
-                                                   std::memory_order_release);
-    return response("empty");
-  }
-
-  if (component_lifecycle_adapter_.source_epoch != cclc_owner_epoch) {
-    // A replacement CCLC owner restarts source ordering: restate every
-    // tracked point under the new epoch.
-    for (auto &[key, state] : component_conditions_) {
-      static_cast<void>(key);
-      state.fingerprint.clear();
-    }
-  }
-  RegisterAdapterEpochLocked(component_lifecycle_adapter_, cclc_owner_epoch);
-  for (const auto &[component, value] : observed) {
-    SynchronizeComponentConditionLocked(
-        component_lifecycle_adapter_,
-        std::string(kComponentLifecycleFaultDefinition), component,
-        value.subject, value.lifecycle_fault, value.details,
-        value.correlations);
-  }
-  // A component that left the active configuration has no lifecycle row:
-  // its raised conditions return to normal and are forgotten.
-  ReturnRemovedComponentConditionsLocked(
-      named, [&cclc_owner_epoch](const std::string &component_id) {
-        return CanonicalValue(CanonicalValue::Object{
-            {"cclc_owner_epoch", CanonicalValue(cclc_owner_epoch)},
-            {"controllable_component_id", CanonicalValue(component_id)},
-        });
-      });
-  if (!unavailable_component_ids.empty()) {
-    // Only a complete observation of the active configuration establishes
-    // current quality. An unread component leaves it as it was, so a read
-    // after an Apply cannot confirm conditions of the superseded one. The
-    // read components were applied; the caller repeats the read soon rather
-    // than treating this as the period's accepted observation.
-    return response("incomplete");
-  }
-  alarm_owner_.CompleteSourceSnapshot(
-      component_lifecycle_adapter_.source_id,
-      component_lifecycle_adapter_.source_epoch, AlarmConditionQuality::kGood);
-  component_lifecycle_observation_pending_.store(false,
-                                                 std::memory_order_release);
-  return response("observed");
-}
-
-CanonicalValue HeadlessApiCore::ObserveEmptyComponentLifecycleConfiguration(
-    std::string retained_bundle_id, std::string graph_revision) {
-  Require(!retained_bundle_id.empty() && retained_bundle_id.size() <= 256U &&
-              content_identity::is_utf8_nfc(retained_bundle_id) &&
-              !graph_revision.empty() && graph_revision.size() <= 256U &&
-              content_identity::is_utf8_nfc(graph_revision),
-          "headless_component_lifecycle_invalid",
-          "empty-configuration lifecycle observation identity is malformed");
-  std::lock_guard lock(mutex_);
-  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
-  const auto response = [&](const std::string_view status) {
-    return CanonicalValue(CanonicalValue::Object{
-        {"graph_revision", CanonicalValue(graph_revision)},
-        {"retained_bundle_id", CanonicalValue(retained_bundle_id)},
-        {"schema_version",
-         CanonicalValue(std::string(kComponentLifecycleConditionSchemaVersion))},
-        {"status", CanonicalValue(std::string(status))},
-    });
-  };
-  if (!RefreshCurrentAlarmRegistryLocked()) {
-    return response("configuration_unavailable");
-  }
-  if (alarm_registry_identity_ !=
-          std::make_pair(retained_bundle_id, graph_revision) ||
-      !alarm_component_ids_.empty()) {
-    // An Apply since the scope read: the next read names the new scope.
-    return response("scope_changed");
-  }
-  if (component_lifecycle_adapter_.source_epoch.empty()) {
-    // Never registered: no condition was ever raised.
-    component_lifecycle_observation_pending_.store(false,
-                                                   std::memory_order_release);
-    return response("empty");
-  }
-  // A configuration without controlled components has no CCLC owner and no
-  // lifecycle conditions. This is Headless's own observation of the active
-  // configuration, not a CCLC statement, so it continues the source's
-  // current epoch and is correlated to the configuration, not to an owner.
-  ReturnRemovedComponentConditionsLocked(
-      {}, [&](const std::string &component_id) {
-        return CanonicalValue(CanonicalValue::Object{
-            {"controllable_component_id", CanonicalValue(component_id)},
-            {"graph_revision", CanonicalValue(graph_revision)},
-            {"retained_bundle_id", CanonicalValue(retained_bundle_id)},
-        });
-      });
-  alarm_owner_.CompleteSourceSnapshot(
-      component_lifecycle_adapter_.source_id,
-      component_lifecycle_adapter_.source_epoch, AlarmConditionQuality::kGood);
-  component_lifecycle_observation_pending_.store(false,
-                                                 std::memory_order_release);
-  return response("observed");
-}
-
-CanonicalValue HeadlessApiCore::MarkComponentLifecycleSourceUnknown() {
-  std::lock_guard lock(mutex_);
-  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
-  const bool registered = !component_lifecycle_adapter_.source_epoch.empty();
-  if (registered) {
-    // Unknown quality cannot clear: raised conditions stay active.
-    alarm_owner_.MarkSourceQualityUnknown(
-        component_lifecycle_adapter_.source_id,
-        component_lifecycle_adapter_.source_epoch);
-    component_lifecycle_observation_pending_.store(true,
-                                                   std::memory_order_release);
-  }
-  return CanonicalValue(CanonicalValue::Object{
-      {"schema_version",
-       CanonicalValue(std::string(kComponentLifecycleConditionSchemaVersion))},
-      {"status",
-       CanonicalValue(registered ? "marked_unknown" : "not_registered")},
-  });
-}
-
-namespace {
-
-constexpr std::string_view kCCLCIncidentHistorySchemaVersion =
-    "manyforge.cclc_incident_history_record.v2";
-constexpr std::size_t kMaximumRecordedCCLCIncidentEvents = 2048U;
-
-} // namespace
-
-CanonicalValue
-HeadlessApiCore::RecordCCLCIncidentEvent(std::string cclc_owner_epoch,
-                                         CanonicalValue event) {
-  const std::string code = "headless_cclc_incident_event_invalid";
-  Require(!cclc_owner_epoch.empty() && cclc_owner_epoch.size() <= 256U &&
-              content_identity::is_utf8_nfc(cclc_owner_epoch) &&
-              event.is_object() && event.as_object().size() == 5U,
-          code, "CCLC incident event envelope is malformed");
-  const auto event_kind = RequiredString(event, "event_kind");
-  const auto incident_id = RequiredString(event, "incident_id");
-  const auto &details = RequiredMember(event, "payload");
-  const auto *sequence =
-      std::get_if<double>(&RequiredMember(event, "event_sequence").storage());
-  Require((event_kind == "component_incident" ||
-           event_kind == "component_incident_acknowledged") &&
-              incident_id.size() <= 128U &&
-              content_identity::is_utf8_nfc(incident_id) &&
-              sequence != nullptr && std::isfinite(*sequence) &&
-              *sequence >= 1.0 && std::floor(*sequence) == *sequence &&
-              *sequence <= static_cast<double>(kMaximumSafeInteger) &&
-              details.is_object() &&
-              RequiredString(details, "incident_id") == incident_id &&
-              RequiredString(details, "event_kind") == event_kind,
-          code, "CCLC incident event does not match its record");
-  Require(RequiredString(details, "schema_version") == core::kComponentIncidentEventSchemaVersion,
-          code, "CCLC component incident version is unsupported");
-  const auto cclc_occurred_at_ns = content_identity::parse_nonnegative_int64(
-      RequiredMember(event, "occurred_at_ns"));
-  const auto key = std::make_pair(incident_id, event_kind);
-  const auto response = [&](const std::string_view status,
-                            const std::optional<std::string> &event_id) {
-    return CanonicalValue(CanonicalValue::Object{
-        {"event_id", OptionalStringValue(event_id)},
-        {"schema_version",
-         CanonicalValue(std::string(kCCLCIncidentHistorySchemaVersion))},
-        {"status", CanonicalValue(std::string(status))},
-    });
-  };
-
-  std::shared_ptr<SqliteEventHistoryStore> store;
-  {
-    std::lock_guard lock(mutex_);
-    Require(!shutdown_, "headless_api_closed", "headless API core is closed");
-    if (recorded_cclc_incident_events_.contains(key)) {
-      return response("duplicate", std::nullopt);
-    }
-    store = history_store_;
-  }
-  // A restarted reader replays from its cursor; the durable record of an
-  // earlier process answers it. The read stays outside the core lock.
-  HistorianQuery query;
-  query.components = {"manyforge.cclc"};
-  query.event_types = {event_kind};
-  query.correlations = {{"incident_id", incident_id}};
-  query.limit = 1U;
-  const bool durable = !store->Query(query).events.empty();
-
-  std::lock_guard lock(mutex_);
-  Require(!shutdown_, "headless_api_closed", "headless API core is closed");
-  if (recorded_cclc_incident_events_.size() >=
-      kMaximumRecordedCCLCIncidentEvents) {
-    recorded_cclc_incident_events_.clear();
-  }
-  if (durable || recorded_cclc_incident_events_.contains(key)) {
-    recorded_cclc_incident_events_.insert(key);
-    return response("duplicate", std::nullopt);
-  }
-  // Historian time is this owner's recording time: CCLC stamps its own
-  // monotonic clock, kept in the record as `cclc_occurred_at_ns`.
-  auto historian_event = MakeHistorianEvent(
-      "manyforge.cclc", event_kind,
-      event_kind == "component_incident" ? "ERROR" : "INFO",
-      clocks_.monotonic_time_ns(), clocks_.wall_time_text(),
-      CanonicalValue(CanonicalValue::Object{
-          {"cclc_occurred_at_ns",
-           content_identity::nonnegative_int64_value(cclc_occurred_at_ns)},
-          {"cclc_owner_epoch", CanonicalValue(cclc_owner_epoch)},
-          {"clock_owner", CanonicalValue("headless:" + config_.owner_epoch)},
-          {"details", details},
-          {"event_kind", CanonicalValue(event_kind)},
-          {"event_sequence", CanonicalValue(*sequence)},
-          {"incident_id", CanonicalValue(incident_id)},
-          {"schema_version",
-           CanonicalValue("manyforge.cclc_incident_history_event.v2")},
-      }));
-  const auto event_id = historian_event.event_id;
-  const bool recorded = historian_.TryEnqueue(std::move(historian_event));
-  if (recorded) {
-    recorded_cclc_incident_events_.insert(key);
-  } else {
-    alarm_owner_.MarkHealthUnavailable(
-        std::string(kHistorianOwnerHealthCode),
-        "historian delivery queue rejected a CCLC incident event");
-  }
-  SynchronizeHistorianHealthLocked();
-  return response(recorded ? "recorded" : "rejected",
-                  recorded ? std::optional(event_id) : std::nullopt);
-}
-
-void HeadlessApiCore::SynchronizeComponentConditionLocked(
-    AdapterCursor &cursor, const std::string &definition_id,
-    const std::string &component_id, const AlarmSubject &subject,
-    const bool active, const CanonicalValue &details,
-    const CanonicalValue &correlations) {
-  const auto key = std::make_pair(definition_id, component_id);
-  auto found = component_conditions_.find(key);
-  if (found == component_conditions_.end() && !active) {
-    return;
-  }
-  const auto submit = [&](const AlarmSubject &scope, const bool raise) {
-    Require(cursor.source_sequence < kMaximumSafeInteger,
-            "headless_adapter_sequence_exhausted",
-            "component lifecycle alarm adapter sequence is exhausted");
-    ++cursor.source_sequence;
-    AlarmConditionUpdate update{
-        definition_id,
-        scope,
-        raise,
-        cursor.source_id,
-        cursor.source_epoch,
-        cursor.source_sequence,
-        clocks_.monotonic_time_ns(),
-        clocks_.wall_time_text(),
-        AlarmConditionQuality::kGood,
-        CanonicalValue(CanonicalValue::Object{}),
-        details,
-        {},
-        correlations,
-    };
-    try {
-      const auto mutation = alarm_owner_.Submit(std::move(update));
-      static_cast<void>(DeliverFactsLocked(mutation.lifecycle_facts));
-      return true;
-    } catch (const OperatorAlarmError &error) {
-      // A component whose resources are outside the active configuration
-      // (or that has none) cannot be scoped. The refusal is counted by the
-      // owner; the same state is retried only after the configuration or
-      // the observation changes.
-      if (error.code() != "operator_alarm_scope_inactive" &&
-          error.code() != "operator_alarm_scope_invalid") {
-        throw;
-      }
-      return false;
-    }
-  };
-  if (found != component_conditions_.end() && found->second.active &&
-      found->second.subject != subject) {
-    // The resources changed while raised: the old point returns to normal.
-    static_cast<void>(submit(found->second.subject, false));
-    found->second = ComponentConditionState{subject, false, {}};
-  }
-  const CanonicalValue condition(CanonicalValue::Object{
-      {"active", CanonicalValue(active)},
-      {"details", details},
-      {"registry",
-       alarm_registry_identity_.has_value()
-           ? CanonicalValue(alarm_registry_identity_->first + "\n" +
-                            alarm_registry_identity_->second)
-           : CanonicalValue(nullptr)},
-      {"resource_ids", StringArrayValue(subject.resource_ids)},
-  });
-  const auto fingerprint = content_identity::framed_sha256(
-      "manyforge-headless-component-lifecycle-condition", "v1", condition);
-  if (found != component_conditions_.end()) {
-    if (found->second.fingerprint == fingerprint) {
-      return;
-    }
-    if (!found->second.active && !active) {
-      // Nothing raised to return to normal.
-      found->second = ComponentConditionState{subject, false, fingerprint};
-      return;
-    }
-  }
-  const bool admitted = submit(subject, active);
-  component_conditions_.insert_or_assign(
-      key, ComponentConditionState{subject, active && admitted, fingerprint});
 }
 
 void HeadlessApiCore::Shutdown() {
@@ -4597,7 +3937,6 @@ void HeadlessApiCore::RegisterOperationEpochLocked(
   operation_native_record_digest_.clear();
   observed_operation_faults_.clear();
   observed_runtime_collisions_.clear();
-  current_stop_fault_fingerprint_.clear();
 }
 
 void HeadlessApiCore::ReconcileRuntimeCollisionStopLocked(
@@ -4882,206 +4221,6 @@ void HeadlessApiCore::ReconcileOperationFaultLocked(
   }
 }
 
-void HeadlessApiCore::ReconcileStopFaultLocked(
-    const CanonicalValue &journal_payload, const std::string_view record_kind,
-    const std::uint64_t native_sequence, const std::string_view payload_digest,
-    const std::int64_t occurred_at_ns, const std::string_view occurred_at_wall,
-    const std::string_view raw_event_id) {
-  const auto &fault_latch =
-      ValidateStopFaultProjection(journal_payload, record_kind);
-  if (std::holds_alternative<std::nullptr_t>(fault_latch.storage())) {
-    return;
-  }
-  const auto latch_id = RequiredString(fault_latch, "latch_id");
-  const auto cell_id = RequiredString(fault_latch, "cell_id");
-  const bool active = record_kind == "stop_terminal_projected";
-  current_stop_fault_fingerprint_.clear();
-
-  AlarmSubject subject;
-  if (active) {
-    subject = AlarmSubject{"cell", cell_id, {}};
-  } else {
-    const auto found = active_stop_faults_.find(latch_id);
-    if (found == active_stop_faults_.end()) {
-      ForgetRefusedOperationConditionLocked("manyforge.motion.stop_fault",
-                                            latch_id);
-      return;
-    }
-    subject = found->second;
-    active_stop_faults_.erase(found);
-    if (std::any_of(
-            active_stop_faults_.begin(), active_stop_faults_.end(),
-            [&](const auto &entry) { return entry.second == subject; })) {
-      return;
-    }
-  }
-
-  Require(operation_adapter_.source_sequence < kMaximumSafeInteger,
-          "headless_adapter_sequence_exhausted",
-          "operation alarm adapter sequence is exhausted");
-  ++operation_adapter_.source_sequence;
-  std::vector<std::string> evidence_refs;
-  if (!raw_event_id.empty()) {
-    evidence_refs.emplace_back(raw_event_id);
-  }
-  const auto &certificate = RequiredMember(fault_latch, "stop_certificate");
-  AlarmConditionUpdate update{
-      "manyforge.motion.stop_fault",
-      subject,
-      active,
-      operation_adapter_.source_id,
-      operation_adapter_.source_epoch,
-      operation_adapter_.source_sequence,
-      occurred_at_ns,
-      std::string(occurred_at_wall),
-      AlarmConditionQuality::kGood,
-      CanonicalValue(CanonicalValue::Object{}),
-      CanonicalValue(CanonicalValue::Object{
-          {"fault_latch", fault_latch},
-          {"native_sequence", Number(native_sequence, "native_sequence")},
-          {"payload_digest", CanonicalValue(std::string(payload_digest))},
-          {"record_kind", CanonicalValue(std::string(record_kind))},
-      }),
-      std::move(evidence_refs),
-      CanonicalValue(CanonicalValue::Object{
-          {"cell_id", CanonicalValue(cell_id)},
-          {"latch_id", CanonicalValue(latch_id)},
-          {"stop_certificate_id",
-           RequiredMember(certificate, "stop_certificate_id")},
-          {"stop_certificate_revision",
-           RequiredMember(certificate, "stop_certificate_revision")},
-          {"stop_generation", RequiredMember(fault_latch, "stop_generation")},
-          {"stop_id", RequiredMember(fault_latch, "stop_id")},
-      }),
-  };
-  if (const auto mutation = SubmitOperationConditionLocked(
-          std::move(update), OperationConditionKind::kStopFault, latch_id)) {
-    static_cast<void>(DeliverFactsLocked(mutation->lifecycle_facts));
-  }
-}
-
-void HeadlessApiCore::ObserveCurrentStopFaultLocked(
-    const CanonicalValue &fault_latch, const std::uint64_t native_sequence) {
-  Require(fault_latch.is_object() && fault_latch.as_object().size() == 20U,
-          "headless_operation_event_invalid",
-          "current Stop-fault condition has an invalid envelope");
-  const auto latch_id = RequiredString(fault_latch, "latch_id");
-  const auto cell_id = RequiredString(fault_latch, "cell_id");
-  const auto state = RequiredString(fault_latch, "state");
-  const auto recovery_status = RequiredString(fault_latch, "recovery_status");
-  const auto trigger = RequiredString(fault_latch, "trigger");
-  const auto stop_id = RequiredString(fault_latch, "stop_id");
-  const auto stop_generation =
-      RequiredCounter(fault_latch, "stop_generation", 1U);
-  const auto &certificate = RequiredMember(fault_latch, "stop_certificate");
-  const bool certificate_pending =
-      std::holds_alternative<std::nullptr_t>(certificate.storage());
-  Require(
-      cell_id == config_.cell_id &&
-          (state == "latched" || state == "recovery_pending") &&
-          (recovery_status == "waiting_for_observation" ||
-           recovery_status == "waiting_for_quiescence" ||
-           recovery_status == "waiting_for_configuration" ||
-           recovery_status == "waiting_for_external_reconciliation" ||
-           recovery_status == "waiting_for_durable_record" ||
-           recovery_status == "ready" ||
-           recovery_status == "recovery_pending") &&
-          (trigger == "scope_promotion" || trigger == "escalated" ||
-           trigger == "partial" || trigger == "failed_uncontained" ||
-           trigger == "physical_rest_unproven" ||
-           trigger == "persistence_degraded" ||
-           trigger == "post_reserve_fence_failed") &&
-          RequiredCounter(fault_latch, "latch_generation", 1U) != 0U &&
-          RequiredCounter(fault_latch, "recovery_assessment_revision", 1U) !=
-              0U &&
-          RequiredMember(fault_latch, "captured_operation_ids").is_array() &&
-          RequiredMember(fault_latch, "captured_resources").is_array() &&
-          RequiredMember(fault_latch, "evidence_refs").is_array() &&
-          RequiredMember(fault_latch, "observed_triggers").is_array() &&
-          !RequiredMember(fault_latch, "observed_triggers").as_array().empty() &&
-          RequiredMember(fault_latch, "terminal_projection").is_object() &&
-          RequiredMember(fault_latch, "clear_projection").is_object() &&
-          std::holds_alternative<bool>(
-              RequiredMember(fault_latch, "persistence_degraded").storage()) &&
-          !RequiredString(fault_latch, "graph_revision").empty() &&
-          !RequiredString(fault_latch, "reason_code").empty() &&
-          !RequiredString(fault_latch, "retained_bundle_id").empty() &&
-          ((certificate_pending && state == "latched" &&
-            recovery_status == "waiting_for_observation" &&
-            RequiredString(RequiredMember(fault_latch, "terminal_projection"),
-                           "state") == "pending" &&
-            RequiredString(RequiredMember(fault_latch, "clear_projection"),
-                           "state") == "not_applicable") ||
-           (certificate.is_object() && certificate.as_object().size() == 4U &&
-            RequiredString(certificate, "stop_id") == stop_id &&
-            RequiredCounter(certificate, "stop_generation", 1U) ==
-                stop_generation &&
-            RequiredCounter(certificate, "stop_certificate_revision", 1U) !=
-                0U &&
-            !RequiredString(certificate, "stop_certificate_id").empty())),
-      "headless_operation_event_invalid",
-      "current Stop-fault condition is internally inconsistent");
-
-  const AlarmSubject subject{"cell", cell_id, {}};
-  const auto payload_digest = content_identity::sha256_digest(
-      content_identity::canonical_json(fault_latch));
-  const auto found = active_stop_faults_.find(latch_id);
-  if (found != active_stop_faults_.end()) {
-    Require(found->second == subject, "headless_operation_event_invalid",
-            "current Stop-fault condition changed subject identity");
-  }
-  if (current_stop_fault_fingerprint_ == payload_digest) {
-    return;
-  }
-
-  Require(operation_adapter_.source_sequence < kMaximumSafeInteger,
-          "headless_adapter_sequence_exhausted",
-          "operation alarm adapter sequence is exhausted");
-  ++operation_adapter_.source_sequence;
-  AlarmConditionUpdate update{
-      "manyforge.motion.stop_fault",
-      subject,
-      true,
-      operation_adapter_.source_id,
-      operation_adapter_.source_epoch,
-      operation_adapter_.source_sequence,
-      clocks_.monotonic_time_ns(),
-      clocks_.wall_time_text(),
-      AlarmConditionQuality::kGood,
-      CanonicalValue(CanonicalValue::Object{}),
-      CanonicalValue(CanonicalValue::Object{
-          {"fault_latch", fault_latch},
-          {"native_sequence", Number(native_sequence, "native_sequence")},
-          {"payload_digest", CanonicalValue(payload_digest)},
-          {"record_kind", CanonicalValue("current_stop_fault_snapshot")},
-      }),
-      {},
-      CanonicalValue(CanonicalValue::Object{
-          {"cell_id", CanonicalValue(cell_id)},
-          {"latch_id", CanonicalValue(latch_id)},
-          {"stop_certificate_id",
-           certificate_pending
-               ? CanonicalValue(nullptr)
-               : RequiredMember(certificate, "stop_certificate_id")},
-          {"stop_certificate_revision",
-           certificate_pending
-               ? CanonicalValue(nullptr)
-               : RequiredMember(certificate, "stop_certificate_revision")},
-          {"stop_generation", RequiredMember(fault_latch, "stop_generation")},
-          {"stop_id", RequiredMember(fault_latch, "stop_id")},
-      }),
-  };
-  const auto mutation = SubmitOperationConditionLocked(
-      std::move(update), OperationConditionKind::kStopFault, latch_id);
-  // An unchanged observation is not resubmitted on every snapshot. A refused
-  // one is retained by the submit path and reconsidered once when the active
-  // configuration changes, so it is neither flooded nor stranded.
-  current_stop_fault_fingerprint_ = payload_digest;
-  if (mutation.has_value()) {
-    static_cast<void>(DeliverFactsLocked(mutation->lifecycle_facts));
-  }
-}
-
 void HeadlessApiCore::SynchronizeAlarmResourceRegistryLocked(
     const HeadlessRuntimeSnapshot &runtime) {
   // The alarm resource inventory follows the exact configuration Manager
@@ -5099,7 +4238,6 @@ void HeadlessApiCore::SynchronizeAlarmResourceRegistryLocked(
   if (alarm_registry_identity_ == identity) {
     return;
   }
-  bool replaced = false;
   try {
     const auto bundle = VerifiedActiveBundleLocked(
         *bundle_id, *graph_revision,
@@ -5123,16 +4261,9 @@ void HeadlessApiCore::SynchronizeAlarmResourceRegistryLocked(
         resources.insert(signal.descriptor.output_resource->value());
       }
     }
-    std::set<std::string> components;
-    for (const auto &component :
-         bundle->value().cell_graph.controllable_components) {
-      components.insert(component.controllable_component_id.value());
-    }
     alarm_owner_.ReplaceResourceRegistry(
         AlarmResourceRegistry{*bundle_id, *graph_revision, std::move(resources)});
     alarm_registry_identity_ = std::move(identity);
-    alarm_component_ids_.assign(components.begin(), components.end());
-    replaced = true;
     alarm_owner_.ReconcileHealth(kAlarmResourceRegistryHealthCode);
     ReconsiderRefusedOperationConditionsLocked();
   } catch (const std::exception &error) {
@@ -5148,23 +4279,6 @@ void HeadlessApiCore::SynchronizeAlarmResourceRegistryLocked(
         std::string(kAlarmResourceRegistryHealthCode),
         "active configuration " + *bundle_id +
             " has no verified alarm resource inventory: " + detail);
-  }
-  const bool lifecycle_registered =
-      !component_lifecycle_adapter_.source_epoch.empty();
-  if (replaced && lifecycle_registered) {
-    // Lifecycle conditions observed under the superseded configuration are
-    // not observations of this one. They keep their state at unknown quality
-    // (which cannot clear them) until an observation fenced to this
-    // configuration, possibly of an empty scope, restates or returns them.
-    alarm_owner_.MarkSourceQualityUnknown(
-        component_lifecycle_adapter_.source_id,
-        component_lifecycle_adapter_.source_epoch);
-  }
-  if (replaced && (lifecycle_registered || !alarm_component_ids_.empty())) {
-    // The new configuration needs its own lifecycle observation: the event
-    // pump reads it at once instead of at its next ordinary period.
-    component_lifecycle_observation_pending_.store(true,
-                                                   std::memory_order_release);
   }
 }
 
@@ -5193,9 +4307,6 @@ void HeadlessApiCore::TrackAdmittedOperationConditionLocked(
     break;
   case OperationConditionKind::kProgramFailure:
     break; // AlarmLifecycleOwner is the sole Program condition registry.
-  case OperationConditionKind::kStopFault:
-    active_stop_faults_.insert_or_assign(tracking_id, subject);
-    break;
   }
 }
 

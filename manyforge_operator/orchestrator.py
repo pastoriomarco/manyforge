@@ -3,7 +3,7 @@
 This module is deliberately a mechanical boundary around the already
 qualified Manager, Headless API, Program runner, and Composer processes.  It
 does not own graph, Apply, execution, scene, alarm, or health truth.  The
-native profile is the only live profile in O1.3; Isaac is kept behind the
+standard profile is the only live profile in O1.3; Isaac is kept behind the
 explicit unavailable gate until its own dependency-ordered slice.
 """
 
@@ -126,10 +126,10 @@ class NativeLauncherConfig:
     composer_static_dir: Path | None = None
     simulation_control_config: Path | None = None
     canonical_empty_admission_filename: str = "canonical-empty-admission.json"
-    cell_id: str = "native"
+    cell_id: str = "cell"
     state_root: Path = DEFAULT_STATE_ROOT
     advertised_host: str = "localhost"
-    instance_id: str = "native"
+    instance_id: str = "workbench"
     package_aggregate_sha256: str = ""
     compiler_build_manifest_sha256: str = ""
     node_environment_sha256: str = ""
@@ -404,7 +404,12 @@ def native_commands(config: NativeLauncherConfig) -> tuple[ProcessSpec, ...]:
                 config.reconciliation_period_ms,
             )
         ),
-        package_env,
+        {
+            **package_env,
+            # The execution host and its component processes inherit it: a
+            # point-cloud source sends its clouds to the Composer.
+            "MANYFORGE_COMPOSER_URL": f"http://127.0.0.1:{SERVICE_PORTS['composer']}",
+        },
         config.source_root,
     )
     headless = ProcessSpec(
@@ -688,7 +693,7 @@ def _configuration(config: NativeLauncherConfig) -> LaunchConfiguration:
     ]
     payload = {
         "schema_version": CONFIGURATION_SCHEMA,
-        "profile": LaunchProfile.NATIVE.value,
+        "profile": LaunchProfile.STANDARD.value,
         "source": source.model_dump(mode="json"),
         "hosts": [host.model_dump(mode="json")],
         "artifacts": [artifact.model_dump(mode="json")],
@@ -697,7 +702,7 @@ def _configuration(config: NativeLauncherConfig) -> LaunchConfiguration:
     }
     return LaunchConfiguration(
         schema_version=CONFIGURATION_SCHEMA,
-        profile=LaunchProfile.NATIVE,
+        profile=LaunchProfile.STANDARD,
         source=source,
         hosts=[host],
         artifacts=[artifact],
@@ -1339,7 +1344,7 @@ class NativeLauncher:
 
     def _mechanical(self) -> dict[str, Any]:
         return {
-            "profile": "native",
+            "profile": "standard",
             "launch_input_digest": _launch_input_digest(self.config),
             "launch_inputs": {
                 "canonical_empty_admission_filename": self.config.canonical_empty_admission_filename,
@@ -1808,7 +1813,7 @@ class NativeLauncher:
             )
         failure = None if state is LaunchInstanceState.READY else FailureRecord(
             reason_code="component_unavailable",
-            component_id="native",
+            component_id="launcher",
             detail=(reason or "native launch is degraded")[:4096],
             occurred_at_unix_ns=_safe_unix_timestamp(),
         )
@@ -1857,7 +1862,7 @@ class NativeLauncher:
             )
         cleanup_failure = FailureRecord(
             reason_code="cleanup_deadline_exceeded",
-            component_id="native",
+            component_id="launcher",
             detail="one or more authenticated native processes remain after bounded cleanup",
             occurred_at_unix_ns=_safe_unix_timestamp(),
         )
@@ -1903,10 +1908,10 @@ class NativeLauncher:
                     **paths,
                     "program_workspace": str(self.config.program_workspace),
                 }
-                if old_status.configuration.profile is not LaunchProfile.NATIVE:
+                if old_status.configuration.profile is not LaunchProfile.STANDARD:
                     raise LauncherError(
                         "incompatible_owner",
-                        "stored launch has a different native configuration",
+                        "stored launch has a different standard configuration",
                         exit_code=70,
                         status=old_status,
                     )
@@ -1966,7 +1971,7 @@ class NativeLauncher:
                         ):
                             failure = FailureRecord(
                                 reason_code="cleanup_deadline_exceeded",
-                                component_id="native",
+                                component_id="launcher",
                                 detail=(
                                     "degraded recovery could not prove prior "
                                     "owned resources absent"
@@ -2035,7 +2040,7 @@ class NativeLauncher:
                     time.sleep(self.config.poll_interval_seconds)
                 failure = FailureRecord(
                     reason_code="readiness_timeout",
-                    component_id="native",
+                    component_id="launcher",
                     detail=(reason or "native owner readiness timed out")[:4096],
                     occurred_at_unix_ns=_safe_unix_timestamp(),
                 )
@@ -2069,7 +2074,7 @@ class NativeLauncher:
                     raise
                 failure = FailureRecord(
                     reason_code=error.code,
-                    component_id="native",
+                    component_id="launcher",
                     detail=str(error)[:4096],
                     occurred_at_unix_ns=_safe_unix_timestamp(),
                 )
@@ -2079,7 +2084,7 @@ class NativeLauncher:
             except Exception as error:
                 failure = FailureRecord(
                     reason_code="native_start_failed",
-                    component_id="native",
+                    component_id="launcher",
                     detail=str(error)[:4096],
                     occurred_at_unix_ns=_safe_unix_timestamp(),
                 )
@@ -2230,7 +2235,7 @@ class NativeLauncher:
             if not clean:
                 failure = FailureRecord(
                     reason_code="cleanup_deadline_exceeded",
-                    component_id="native",
+                    component_id="launcher",
                     detail="one or more authenticated native processes remain after bounded cleanup",
                     occurred_at_unix_ns=_safe_unix_timestamp(),
                 )

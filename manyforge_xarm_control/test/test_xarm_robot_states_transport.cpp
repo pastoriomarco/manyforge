@@ -33,7 +33,6 @@ namespace manyforge::xarm_control {
 namespace {
 
 using namespace std::chrono_literals;
-using Cause = core::LifecycleBlockingCauseClassDTO;
 
 class RosEnvironment final : public ::testing::Environment {
 public:
@@ -103,21 +102,10 @@ TEST(XArmRobotStatesTransport, SubscribesAndStampsTheLatestReportAtReceipt) {
   EXPECT_EQ(observed.warning_code, 0);
   EXPECT_EQ(observed.motion_enable_mask, 0);
 
-  // Classified through the adapter: emergency stop with its code once
-  // ManyForge armed the robot (m5.5: unarmed, an error is facts only).
-  XArmBrandLifecyclePort port(transport);
-  port.ObserveHardwareActive(false);
-  EXPECT_EQ(port.Observe(clock.now()).cause, Cause::kNone);
-  port.BeginOwnPrimitive(XArmLifecycleCommand::kArm);
-  const auto status = port.Observe(clock.now());
-  EXPECT_EQ(status.cause, Cause::kEmergencyStop);
-  // 0.5 s without a report is stale.
-  clock.set(clock.now() + kXArmStatusFreshnessNs + 1);
-  EXPECT_EQ(port.Observe(clock.now()).cause, Cause::kAvailability);
   executor.remove_node(node);
 }
 
-TEST(XArmRobotStatesTransport, ReceiveKeepsTheStatusAndAnglesOfTheLatestReport) {
+TEST(XArmRobotStatesTransport, ReceiveKeepsTheStatusAndOffsetOfTheLatestReport) {
   core::FakeClock clock;
   clock.set(1'000);
   auto node = std::make_shared<rclcpp::Node>("xarm_transport_receive_test");
@@ -130,6 +118,7 @@ TEST(XArmRobotStatesTransport, ReceiveKeepsTheStatusAndAnglesOfTheLatestReport) 
   armed.mode = 1;
   armed.mt_able = 0x3F;
   armed.warn = 7;
+  armed.offset = {1.0F, 2.0F, 3.0F, 0.0F, 0.0F, 0.5F};
   armed.angle = {0.1F, -0.2F, 0.3F, 0.0F, 0.5F, 0.6F};
   transport.Receive(armed);
   const auto observed = transport.observe();
@@ -139,10 +128,11 @@ TEST(XArmRobotStatesTransport, ReceiveKeepsTheStatusAndAnglesOfTheLatestReport) 
   EXPECT_EQ(observed.error_code, 0);
   EXPECT_EQ(observed.warning_code, 7);
   EXPECT_EQ(observed.motion_enable_mask, 0x3F);
-  // R7 package 4: the angles serve only the Enable gate's agreement check.
   ASSERT_EQ(observed.joint_angles_rad.size(), 6U);
   EXPECT_DOUBLE_EQ(observed.joint_angles_rad[1], static_cast<double>(-0.2F));
-  EXPECT_DOUBLE_EQ(observed.joint_angles_rad[5], static_cast<double>(0.6F));
+  ASSERT_EQ(observed.tcp_offset.size(), 6U);
+  EXPECT_DOUBLE_EQ(observed.tcp_offset[1], 2.0);
+  EXPECT_DOUBLE_EQ(observed.tcp_offset[5], static_cast<double>(0.5F));
 }
 
 } // namespace

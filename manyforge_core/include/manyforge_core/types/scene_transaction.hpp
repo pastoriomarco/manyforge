@@ -216,7 +216,7 @@ struct SceneTransactionDTO final {
 /// projection. The retained product is identity evidence; concrete verified
 /// artifact/model handles remain adapter-private.
 struct NativeProjectionRebuildDTO final {
-  ProjectionNativeRuntimeBindingDTO expected_native_runtime_binding;
+  ProjectionExecutionHostBindingDTO expected_execution_host_binding;
   ProjectionRevisionDTO target_projection_revision;
   RetainedProductDTO planning_collision_model;
   std::shared_ptr<const LogicalSceneSnapshotDTO> logical_scene;
@@ -227,7 +227,7 @@ struct NativeProjectionRebuildDTO final {
   std::optional<ProjectionRevisionDTO> maintenance_predecessor{};
 
   [[nodiscard]] bool valid() const noexcept {
-    return expected_native_runtime_binding.valid() &&
+    return expected_execution_host_binding.valid() &&
            target_projection_revision.valid() &&
            planning_collision_model.product_kind ==
                RetainedProductKind::kPlanningCollisionModel &&
@@ -253,8 +253,8 @@ struct NativeProjectionRebuildDTO final {
 
   friend bool operator==(const NativeProjectionRebuildDTO& lhs,
                          const NativeProjectionRebuildDTO& rhs) {
-    return lhs.expected_native_runtime_binding ==
-               rhs.expected_native_runtime_binding &&
+    return lhs.expected_execution_host_binding ==
+               rhs.expected_execution_host_binding &&
            lhs.target_projection_revision == rhs.target_projection_revision &&
            lhs.planning_collision_model == rhs.planning_collision_model &&
            lhs.logical_scene != nullptr && rhs.logical_scene != nullptr &&

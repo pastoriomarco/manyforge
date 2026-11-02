@@ -34,6 +34,7 @@ TEST(MotionResumeIntentTest, ReplacesOnlyConsumedCartesianPrefixAndKeepsConstrai
   CartesianPathDTO source;
   source.waypoints = {pose_at(0, 0, 0), pose_at(1, 0, 0), pose_at(2, 0, 0), pose_at(1, 0, 0)};
   source.max_angular_acceleration_rad_s2 = 0.123;
+  source.blend_radii_m = {0.0, 0.01, 0.02, 0.0};
   TrajectoryDTO trajectory;
   trajectory.waypoints = {{0.0, {0.0}, {}, {}}, {3.0, {1.0}, {}, {}}};
   trajectory.cartesian_waypoint_times_s = {0.0, 1.0, 2.0, 3.0};
@@ -44,6 +45,8 @@ TEST(MotionResumeIntentTest, ReplacesOnlyConsumedCartesianPrefixAndKeepsConstrai
   const auto resumed = detail::resume_motion_from_current_tcp(retained.value(), current);
   auto expected = source;
   expected.waypoints = {current, source.waypoints[2], source.waypoints[3]};
+  // The current TCP starts the resumed path; later corners keep their radii.
+  expected.blend_radii_m = {0.0, 0.02, 0.0};
   EXPECT_EQ(std::get<CartesianPathDTO>(resumed), expected);
   EXPECT_EQ(std::get<CartesianPathDTO>(retained.value().motion), source);
 }

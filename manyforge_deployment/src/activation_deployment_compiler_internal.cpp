@@ -1,9 +1,9 @@
 #include "activation_deployment_compiler_internal.hpp"
-#include "native_execution_runtime_unit_internal.hpp"
+#include "component_static_frames_internal.hpp"
+#include "execution_host_unit_internal.hpp"
 #include "ros2_control_execution_runtime_unit_internal.hpp"
 #include "stop_deceleration_coherence_internal.hpp"
 #include <manyforge_content_identity/content_identity.hpp>
-#include <manyforge_core/io_provider_lifecycle_catalog.hpp>
 #include <manyforge_deployment/io_provider_domain.hpp>
 
 #include <algorithm>
@@ -24,10 +24,11 @@
 
 #include <manyforge_core/types/cell_graph.hpp>
 #include <manyforge_core/types/command_schema.hpp>
-#include <manyforge_core/types/tcp_speed_check.hpp>
 #include <manyforge_core/types/typed_error.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
+#include <manyforge_deployment/cell_composition.hpp>
 #include <manyforge_deployment/cell_graph_codec.hpp>
+#include <manyforge_deployment/component_spec.hpp>
 #include <manyforge_deployment/deployment_artifact_codec.hpp>
 #include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 
@@ -40,7 +41,7 @@ using Object = CanonicalValue::Object;
 constexpr std::string_view kZeroDigest =
     "sha256:0000000000000000000000000000000000000000000000000000000000000000";
 
-constexpr std::array<std::string_view, 18U> kRosArmCapabilities{{
+constexpr std::array<std::string_view, 15U> kRosArmCapabilities{{
     "execution.contact.geometric",
     "execution.contact.geometric_signed_penetration",
     "execution.feedback.phase_events",
@@ -53,9 +54,6 @@ constexpr std::array<std::string_view, 18U> kRosArmCapabilities{{
     "planning.motion.cartesian_path",
     "planning.motion.joint_goal",
     "planning.motion.pose_goal",
-    "planning.profile.balanced",
-    "planning.profile.first_feasible",
-    "planning.profile.quality_bounded",
     "planning.trajectory.time_parameterized",
     "state.observed.current",
     "validation.trajectory.non_collision",
@@ -166,27 +164,6 @@ constexpr std::array<std::string_view, 4U> kLifecycleCapabilities{{
           {"controllable_component_id", CanonicalValue(component.component_id)},
           {"lifecycle_command_timeout_s", *budget},
       })}));
-}
-
-// Q68: the controller profile a ROS component profile selects from the
-// catalog: exactly one of `isaac_profile` (Isaac lane), `mock_profile`
-// (offline mock lane) or, temporarily until CP8 step 3, `real_profile` (a
-// real robot). Returns the selector field name, or none.
-[[nodiscard]] std::optional<std::string_view>
-controller_profile_selector(const CanonicalValue &ros2_control_runtime) {
-  std::optional<std::string_view> selected;
-  for (const std::string_view name : {std::string_view("isaac_profile"),
-                                      std::string_view("mock_profile"),
-                                      std::string_view("real_profile")}) {
-    const auto *value = ros2_control_runtime.find_object_member(name);
-    if (value == nullptr) continue;
-    if (!value->is_string() || value->as_string().empty() ||
-        selected.has_value()) {
-      return std::nullopt;
-    }
-    selected = name;
-  }
-  return selected;
 }
 
 [[nodiscard]] CanonicalValue catalog_value(
@@ -301,82 +278,37 @@ component_type_id(const ActivationComponentProfile &profile,
   // A Real combined arm+gripper model without an authored gripper remains
   // arm-only. An authored Real pneumatic gripper uses the same model-backed
   // target as the Mock component. Split arm models have no fingers.
-  const auto *ros = profile.runtime_restoration_profile.find_object_member(
-      "ros2_control_runtime");
-  if (ros != nullptr && ros->find_object_member("real_profile") != nullptr &&
-      !has_gripper && !source_joints(profile, "fingers").empty())
+  if (profile.lane == std::optional<std::string>("real") && !has_gripper &&
+      !source_joints(profile, "fingers").empty())
     return profile.model_asset_id + ".fixed_scale.arm_only.component";
   return profile.model_asset_id + ".fixed_scale.component";
 }
 
-// D4: a pneumatic tool profile selects no controller lane. Its lane lives in
-// the I/O components its `pneumatic_io` references (Mock I/O devices on
-// Mock, `xarm_digital` on Real), so one tool row serves every lane.
+// D4: a pneumatic tool profile runs on no lane (its row declares no
+// `lanes`). Its lane lives in the I/O components its `pneumatic_io`
+// references, so one tool row serves every lane.
 [[nodiscard]] bool lane_free_tool(const ActivationComponentProfile &profile) {
-  if (profile.runtime_kind != ActivationRuntimeKind::kRos2Control ||
-      !is_tool(profile))
-    return false;
-  const auto &runtime = member(profile.runtime_restoration_profile,
-                               "ros2_control_runtime", "component profile");
-  for (const std::string_view name : {std::string_view("isaac_profile"),
-                                      std::string_view("mock_profile"),
-                                      std::string_view("real_profile")})
-    if (runtime.find_object_member(name) != nullptr) return false;
-  return true;
+  return profile.runtime_kind == ActivationRuntimeKind::kRos2Control &&
+         is_tool(profile) && !profile.lane.has_value();
 }
 
 // CP8 step 1: a real robot reports measured state; Mock and Isaac stay
 // commanded (CP4 authority rule).
 [[nodiscard]] bool real_controller_profile(
     const ActivationComponentProfile &profile) {
-  if (profile.runtime_kind != ActivationRuntimeKind::kRos2Control) return false;
-  const auto *runtime =
-      profile.runtime_restoration_profile.find_object_member("ros2_control_runtime");
-  return runtime != nullptr &&
-         controller_profile_selector(*runtime) == std::string_view("real_profile");
+  return profile.runtime_kind == ActivationRuntimeKind::kRos2Control &&
+         profile.lane == std::optional<std::string>("real");
 }
 
-// V-B4: the vendor adapter family a Real row declares (`adapter_family`,
-// e.g. `xarm`); it selects the robot's vendor adapter and lifecycle
-// providers. A Real row without one is refused, typed.
-[[nodiscard]] std::string real_adapter_family(
-    const ActivationDeploymentComponent &component) {
-  const auto *configuration =
-      component.configuration.find_object_member("runtime_configuration");
-  const auto *family = configuration == nullptr
-                           ? nullptr
-                           : configuration->find_object_member("adapter_family");
-  if (family == nullptr || !family->is_string() || family->as_string().empty())
-    throw core::TypedError(
-        "real_adapter_family_unknown",
-        "Activation Deployment compiler: real_adapter_family_unknown: " +
-            component.component_id + " is a real robot without an adapter_family");
-  return family->as_string();
-}
+// Every lane uses the one shared ros2_control provider: the vendor adapter
+// the execution host reads from the model's `lanes.real.adapter` row
+// (CONTRACTS §12) does the vendor sequence, so no provider names a vendor.
+constexpr std::string_view kRos2ControlProviderId =
+    "manyforge.provider.ros2_control";
 
-// R7 package 4: a Real component's ros2_control provider carries the Real
-// lifecycle catalog (arming at Prepare, D4 Disable, D10 Recover); it offers
-// what the shared provider offers. Mock and Isaac keep the shared provider.
-// V-B4: it is its adapter family's provider,
-// `manyforge.provider.ros2_control.<adapter_family>`. A Real gripper domain
-// has its own provider (`.gripper`): the shared gripper plans, with Recover
-// aligned to the arm's `disabled` target (one common Recover target, spec
-// 210 section 3.17).
-[[nodiscard]] std::string ros2_control_provider_id(
-    const ActivationDeploymentComponent &component,
-    const ActivationComponentProfile &profile, std::string_view target) {
-  if (!real_controller_profile(profile)) return "manyforge.provider.ros2_control";
-  return "manyforge.provider.ros2_control." + real_adapter_family(component) +
-         (target == "gripper" ? ".gripper" : "");
-}
-
-// One provider instance selects one manifest pair (spec 240), so a Real
-// gripper's provider is its own instance; Mock and Isaac keep one instance.
 [[nodiscard]] std::string ros2_control_provider_instance_id(
-    const ActivationDeploymentComponent &component,
-    const ActivationComponentProfile &profile, std::string_view target) {
-  return component.component_id + ".ros2_control" +
-         (real_controller_profile(profile) && target == "gripper" ? ".gripper" : "");
+    const ActivationDeploymentComponent &component) {
+  return component.component_id + ".ros2_control";
 }
 
 // A Real robot and a lane-free tool run no gripper controller of their own.
@@ -462,31 +394,12 @@ component_type_id(const ActivationComponentProfile &profile,
 }
 
 [[nodiscard]] CanonicalValue
-motion_limits(const ActivationDeploymentComponent &component,
-              const bool include_ordinary_jerk = true) {
+motion_limits(const ActivationDeploymentComponent &component) {
   Array result;
   for (const auto &[target, settings] : object(component.target_settings,
                                                 "target_settings")) {
-    if (!include_ordinary_jerk &&
-        settings.find_object_member("ordinary_motion_jerk") != nullptr) {
-      fail("authored ROS ordinary motion jerk is not yet supported");
-    }
     const auto *speed = settings.find_object_member("maximum_tcp_linear_speed_mps");
-    const auto *speed_check = settings.find_object_member("tcp_speed_check");
-    if (speed == nullptr) {
-      if (speed_check != nullptr)
-        fail(component.component_id + "." + target +
-             ".tcp_speed_check requires maximum_tcp_linear_speed_mps");
-      continue;
-    }
-    // Spec 430 §1.2: the maximum holds at the active TCP, plus the robot
-    // flange by default. Materialized here so identity sees the default.
-    if (speed_check != nullptr &&
-        (!speed_check->is_string() ||
-         !core::parse_tcp_speed_check(speed_check->as_string()))) {
-      fail(component.component_id + "." + target +
-           ".tcp_speed_check must be active_tcp or active_tcp_and_flange");
-    }
+    if (speed == nullptr) continue;
     CanonicalValue jerk(Object{
         {"enabled", CanonicalValue(false)},
         {"joint_limits", CanonicalValue(Array{})},
@@ -500,13 +413,8 @@ motion_limits(const ActivationDeploymentComponent &component,
         {"command_target_id", CanonicalValue(target)},
         {"controllable_component_id", CanonicalValue(component.component_id)},
         {"maximum_tcp_linear_speed_mps", *speed},
-        {"tcp_speed_check", speed_check != nullptr
-                                ? *speed_check
-                                : CanonicalValue("active_tcp_and_flange")},
+        {"ordinary_motion_jerk", std::move(jerk)},
     };
-    if (include_ordinary_jerk) {
-      limit.emplace_back("ordinary_motion_jerk", std::move(jerk));
-    }
     result.emplace_back(std::move(limit));
   }
   return CanonicalValue(std::move(result));
@@ -555,6 +463,67 @@ motion_limits(const ActivationDeploymentComponent &component,
   return CanonicalValue(std::move(row));
 }
 
+/// Q48: an arm's authored `controlled_stop.per_joint_limits`, one row per
+/// arm source joint, keyed by that joint (never by row position), each Stop
+/// deceleration no lower than the acceleration ordinary planning may use for
+/// the joint. Its two outputs are the arm's Stop stage rows and its
+/// controller profile's `max_deceleration_on_cancel_rad_s2`, so the JTC's
+/// cancel bound and the Kernel's Stop plan are the same values.
+[[nodiscard]] std::map<std::string, const CanonicalValue *, std::less<>>
+controlled_stop_limits(const ActivationDeploymentComponent &component,
+                       const ActivationComponentProfile &profile,
+                       const ActivationPreparedModel &model) {
+  const auto &settings = member(component.target_settings, "arm", "target settings");
+  const auto &controlled = member(settings, "controlled_stop", "arm settings");
+  const auto joints = source_joints(profile, "arm_joints");
+  std::map<std::string, const CanonicalValue *, std::less<>> limit_by_joint;
+  for (const auto &row : array(member(controlled, "per_joint_limits", "controlled stop"),
+                               "per_joint_limits")) {
+    const auto *name = row.find_object_member("source_joint_name");
+    if (name == nullptr) fail("controlled Stop limit row lacks source_joint_name");
+    const auto &joint = text(*name, "source_joint_name");
+    if (joint.empty()) fail("controlled Stop limit row lacks source_joint_name");
+    if (std::find(joints.begin(), joints.end(), joint) == joints.end()) {
+      fail("controlled Stop limits name unknown arm joint " + joint);
+    }
+    if (!limit_by_joint.emplace(joint, &row).second) {
+      fail("controlled Stop limits repeat joint " + joint);
+    }
+  }
+  const auto &urdf = model.verified_asset.source_ir().urdf();
+  for (const auto &joint : joints) {
+    const auto found = limit_by_joint.find(joint);
+    if (found == limit_by_joint.end()) fail("controlled Stop limits miss joint " + joint);
+    // The one Stop deceleration limit per joint (the runtime derives both the
+    // operator and the fault Stop from it) must not be lower than the
+    // acceleration ordinary planning may use for that joint.
+    const auto *deceleration = std::get_if<double>(
+        &member(*found->second, "max_deceleration_rad_s2", "limit").storage());
+    if (deceleration == nullptr) fail("controlled Stop max_deceleration_rad_s2 for joint " +
+                                      joint + " must be a number");
+    if (const auto error = stop_deceleration_coherence_error(
+            component.component_id + ".arm.controlled_stop", joint, *deceleration,
+            planning_joint_acceleration_limit_rad_s2(urdf, joint));
+        error.has_value()) {
+      fail(*error);
+    }
+  }
+  return limit_by_joint;
+}
+
+/// The controller profile's `max_deceleration_on_cancel_rad_s2` rows, sorted
+/// by source joint.
+[[nodiscard]] CanonicalValue max_deceleration_on_cancel_rows(
+    const std::map<std::string, const CanonicalValue *, std::less<>> &limits) {
+  Array rows;
+  for (const auto &[joint, limit] : limits)
+    rows.emplace_back(Object{
+        {"max_deceleration_rad_s2", member(*limit, "max_deceleration_rad_s2", "limit")},
+        {"source_joint_name", CanonicalValue(joint)},
+    });
+  return CanonicalValue(std::move(rows));
+}
+
 struct ComponentProjection final {
   CanonicalValue runtime_configuration;
   CanonicalValue model_instance;
@@ -598,7 +567,9 @@ struct ComponentProjection final {
   if (fields.size() != 13U + static_cast<std::size_t>(timeout != nullptr) +
                            static_cast<std::size_t>(pneumatic_io != nullptr) +
                            static_cast<std::size_t>(
-                               selected->find_object_member("grasp_confirmation") != nullptr) ||
+                               selected->find_object_member("grasp_confirmation") != nullptr) +
+                           static_cast<std::size_t>(
+                               selected->find_object_member("stop_finish_tolerance") != nullptr) ||
       duration == nullptr ||
       !execution_gripper_command_duration_is_valid(actuation, *duration) ||
       !ros_gripper_output_mode_is_valid(actuation, output) ||
@@ -785,6 +756,17 @@ custom_tcp_rows(const ActivationDeploymentComponent &component,
   return CanonicalValue(std::move(rows));
 }
 
+// The model's source URDF (its URDF entrypoint's bytes): the launched
+// description starts from it.
+[[nodiscard]] const std::string &source_urdf(const ActivationPreparedModel &model) {
+  for (const auto &row : model.verified_asset.retrieval_plan().artifacts()) {
+    if (row.artifact_kind != ModelSourceArtifactKind::kUrdfXmlEntrypoint) continue;
+    for (const auto &artifact : model.source_artifacts)
+      if (artifact.logical_uri == row.logical_uri) return artifact.bytes;
+  }
+  fail(model.verified_asset.value().model_asset_id.value() + " has no source URDF");
+}
+
 [[nodiscard]] ComponentProjection project_component(
     const ActivationDeploymentComponent &component,
     const ActivationComponentProfile &profile,
@@ -800,10 +782,9 @@ custom_tcp_rows(const ActivationDeploymentComponent &component,
   const bool tool = is_tool(profile);
   const bool lane_free = lane_free_tool(profile);
   if (ros2_control) {
-    const auto *selected = profile.runtime_restoration_profile.find_object_member("ros2_control_runtime");
     const auto *configuration = component.configuration.find_object_member("runtime_configuration");
     const auto *grippers = configuration ? configuration->find_object_member("gripper_target_configurations") : nullptr;
-    if (selected && controller_profile_selector(*selected) == std::string_view("isaac_profile") && grippers) {
+    if (profile.lane == std::optional<std::string>("isaac") && grippers) {
       for (const auto &row : array(*grippers, "gripper_target_configurations"))
         if (text(member(row, "controllable_component_id", "gripper target"), "gripper component") ==
                 component.component_id && row.find_object_member("pneumatic_io"))
@@ -848,58 +829,47 @@ custom_tcp_rows(const ActivationDeploymentComponent &component,
   }
   std::optional<CanonicalValue> controller_profile_row;
   if (ros2_control && !lane_free) {
-    const auto &profile_configuration =
-        member(profile.runtime_restoration_profile, "ros2_control_runtime",
-               "component profile");
-    const auto selector = controller_profile_selector(profile_configuration);
-    if (!selector.has_value()) {
-      fail(component.component_id + " (profile " +
-           profile.component_profile_id +
-           ") has no ROS controller profile in the catalog");
+    if (!profile.lane.has_value() || !profile.lane_row.has_value()) {
+      fail(component.component_id + " (model " +
+           profile.component_profile_id + ") names no lane");
     }
-    if (controller_profile_selector(configuration) != selector ||
-        member(configuration, *selector, "runtime configuration") !=
-            member(profile_configuration, *selector, "component profile")) {
-      fail(component.component_id + " " + std::string(*selector) +
-           " does not match its ROS component profile");
-    }
+    // The model's `lanes.<lane>` row (CONTRACTS §12 ModelLaneRow) travels
+    // verbatim as canonical JSON, so the execution host builds the
+    // component's adapter without reading the model folder.
     Object row{
         {"controllable_component_id", CanonicalValue(component.component_id)},
         {"frame_prefix", CanonicalValue(component.frame_prefix)},
-        {std::string(*selector),
-         member(configuration, *selector, "runtime configuration")},
+        {"lane", CanonicalValue(*profile.lane)},
+        {"lane_row", CanonicalValue(canonical_json(*profile.lane_row))},
+        {"model_family_id", CanonicalValue(profile.model_family_id)},
     };
     // CP8 step 1: a Real row names its address through a site-settings
-    // reference (never an address); the other lanes carry none.
+    // reference (never an address); the other lanes carry none. A machine's
+    // arm member takes its owner's (CONTRACTS §16) and has none of its own.
+    if (profile.owner_component_id.has_value()) {
+      if (configuration.find_object_member("device_address_ref") != nullptr)
+        fail(component.component_id + " is a member of " +
+             *profile.owner_component_id +
+             ": its device_address_ref belongs to the owner");
+      row.emplace_back("owner_component_id",
+                       CanonicalValue(*profile.owner_component_id));
+      row.emplace_back("member_role", CanonicalValue(*profile.member_role));
+    }
     const auto *device_address_ref =
-        configuration.find_object_member("device_address_ref");
-    if ((*selector == "real_profile") != (device_address_ref != nullptr)) {
+        profile.owner_component_id.has_value()
+            ? (profile.owner_device_address_ref
+                   ? &*profile.owner_device_address_ref
+                   : nullptr)
+            : configuration.find_object_member("device_address_ref");
+    const bool real = *profile.lane == "real";
+    if (real != (device_address_ref != nullptr)) {
       fail(component.component_id +
            (device_address_ref == nullptr
-                ? " real_profile requires a device_address_ref"
-                : " device_address_ref belongs to a real_profile only"));
+                ? " lane real requires a device_address_ref"
+                : " device_address_ref belongs to lane real only"));
     }
     if (device_address_ref != nullptr) {
       row.emplace_back("device_address_ref", *device_address_ref);
-    }
-    // V-B4: a Real row's adapter family is known when the qualified catalog
-    // has its lifecycle provider; Mock and Isaac rows name none.
-    if (*selector == "real_profile") {
-      const auto family = real_adapter_family(component);
-      const auto provider_id = ros2_control_provider_id(component, profile, "arm");
-      if (std::none_of(provider_manifests.begin(), provider_manifests.end(),
-                       [&](const auto &manifest) {
-                         return manifest.value().provider_manifest_id.value() ==
-                                provider_id;
-                       }))
-        throw core::TypedError(
-            "real_adapter_family_unknown",
-            "Activation Deployment compiler: real_adapter_family_unknown: " +
-                component.component_id + " adapter_family '" + family +
-                "' has no lifecycle provider");
-      row.emplace_back("adapter_family", CanonicalValue(family));
-    } else if (configuration.find_object_member("adapter_family") != nullptr) {
-      fail(component.component_id + " adapter_family belongs to a real_profile only");
     }
     // The component's soft Stop lead-in anchor (absent: commanded).
     if (const auto *anchor = configuration.find_object_member("stop_lead_in_anchor")) {
@@ -909,6 +879,26 @@ custom_tcp_rows(const ActivationDeploymentComponent &component,
     if (const auto *sync = configuration.find_object_member("controller_tcp_offset_sync")) {
       row.emplace_back("controller_tcp_offset_sync", *sync);
     }
+    // N17: what the host launches the component with, so it reads no model
+    // or planning product for it: an arm's source joints in controller order
+    // (its `arm_joints`), a tool's gripper joint, and its description (the
+    // model URDF; compile_activation_deployment adds the cell's static
+    // frames once the cell is composed).
+    if (tool) {
+      row.emplace_back("gripper_joint_name",
+                       CanonicalValue(source_joints(profile, "fingers").front()));
+    } else {
+      Array joints;
+      for (auto &joint : source_joints(profile, "arm_joints"))
+        joints.emplace_back(std::move(joint));
+      row.emplace_back("joint_names", CanonicalValue(std::move(joints)));
+    }
+    row.emplace_back("description", CanonicalValue(source_urdf(model)));
+    // Q48: an arm launches its JTC with its operator Stop decelerations.
+    if (!tool)
+      row.emplace_back("max_deceleration_on_cancel_rad_s2",
+                       max_deceleration_on_cancel_rows(
+                           controlled_stop_limits(component, profile, model)));
     controller_profile_row = CanonicalValue(std::move(row));
   }
   if (!tool) {
@@ -926,7 +916,7 @@ custom_tcp_rows(const ActivationDeploymentComponent &component,
            "arm resource bindings");
     }
   }
-  const auto limits = motion_limits(component, !ros2_control);
+  const auto limits = motion_limits(component);
   if (ros2_control) {
     if (configuration.find_object_member("motion_target_limits") != nullptr) {
       fail("runtime_configuration.motion_target_limits must be authored "
@@ -952,20 +942,14 @@ custom_tcp_rows(const ActivationDeploymentComponent &component,
       fail("authored ROS requires exactly one TCP-speed maximum for arm and no "
            "unknown target");
     }
-    if (!tool)
-      require_speed_check_flange(
-          component.component_id,
-          text(member(rows.front(), "tcp_speed_check", "motion limit"),
-               "tcp_speed_check"),
-          model.verified_asset.value().frame_role_bindings);
   }
   CanonicalValue runtime_configuration =
       object_with(configuration, "motion_target_limits", limits);
   if (controller_profile_row.has_value()) {
     // Q68: the unit carries each component's own controller profile.
     for (const std::string_view field :
-         {"isaac_profile", "mock_profile", "real_profile", "device_address_ref",
-          "adapter_family", "stop_lead_in_anchor", "controller_tcp_offset_sync"})
+         {"device_address_ref", "stop_lead_in_anchor",
+          "controller_tcp_offset_sync"})
       runtime_configuration = object_without(runtime_configuration, field);
     runtime_configuration = object_with(
         runtime_configuration, "controller_profiles",
@@ -990,8 +974,7 @@ custom_tcp_rows(const ActivationDeploymentComponent &component,
   // expected-position display until a physical feedback source is configured.
   // A lane-free tool's gripper is the same commanded display.
   const bool real = real_controller_profile(profile);
-  const std::string arm_provider_id =
-      ros2_control_provider_id(component, profile, tool ? "gripper" : "arm");
+  const std::string arm_provider_id(kRos2ControlProviderId);
   const auto &arm_provider_ref = catalog.require(
       core::CatalogRecordKind::kProviderManifest, arm_provider_id);
   const auto arm_provider_manifest = std::find_if(
@@ -1040,7 +1023,7 @@ custom_tcp_rows(const ActivationDeploymentComponent &component,
         core::CatalogRecordKind::kStopEvidencePolicy,
         target == "arm" ? "manyforge.arm_motion_controlled_stop"
                         : gripper_stop_policy_id(component, runtime_configuration));
-    const std::string provider_id = ros2_control_provider_id(component, profile, target);
+    const std::string provider_id(kRos2ControlProviderId);
     const auto &provider = catalog.require(
         core::CatalogRecordKind::kProviderManifest, provider_id);
     domains.emplace_back(Object{
@@ -1106,10 +1089,9 @@ custom_tcp_rows(const ActivationDeploymentComponent &component,
                     CanonicalValue(Array{CanonicalValue("state")})},
                })})},
               // One selected execution provider serves this component's
-              // domains (a Real gripper's is its own, see above).
+              // domains.
               {"provider_instance_id",
-               CanonicalValue(ros2_control_provider_instance_id(
-                   component, profile, target))},
+               CanonicalValue(ros2_control_provider_instance_id(component))},
               {"provider_runtime_unit_id",
                CanonicalValue(std::string(runtime_unit_id))},
               {"provider_manifest_id", CanonicalValue(provider_id)},
@@ -1310,20 +1292,69 @@ custom_tcp_rows(const ActivationDeploymentComponent &component,
   });
 }
 
-} // namespace
-
-void require_speed_check_flange(
-    std::string_view component_id, std::string_view tcp_speed_check,
-    std::span<const core::ModelFrameRoleBindingDTO> frame_role_bindings) {
-  if (tcp_speed_check != "active_tcp_and_flange") return;
-  if (std::none_of(frame_role_bindings.begin(), frame_role_bindings.end(),
-                   [](const auto &binding) {
-                     return binding.frame_role_id.value() == "flange";
-                   }))
-    fail("robot_flange_frame_missing: " + std::string(component_id) +
-         " has no flange frame, which tcp_speed_check active_tcp_and_flange "
-         "requires");
+// N17: every controller profile's description (its model URDF so far) with
+// the static frames of the composed cell appended (CONTRACTS §12): its own
+// offset frames, the mounts on it and a process-less mounted child's fixed
+// links. `graph` is the compiled cell graph; composition reads none of its
+// runtime configuration, so the descriptions do not change it.
+[[nodiscard]] CanonicalValue with_static_frames(
+    const CanonicalValue &configuration, const GraphRevisionVerifiedCellGraph &graph,
+    const std::vector<ActivationPreparedModel> &prepared_models,
+    const std::vector<ActivationPreparedIoType> &io_types,
+    std::span<const QualifiedComponentType> component_types) {
+  std::vector<SourceVerifiedModelAsset> assets;
+  std::vector<VerifiedRetainedModelSourceUrdf> sources;
+  for (const auto &model : prepared_models) {
+    const auto &asset = model.verified_asset.value();
+    if (std::any_of(sources.begin(), sources.end(), [&](const auto &source) {
+          return source.model_asset_id == asset.model_asset_id &&
+                 source.model_revision == asset.model_revision;
+        }))
+      continue;
+    std::vector<core::ModelFrameRoleBindingDTO> offset_frame_roles;
+    for (const auto &binding : asset.frame_role_bindings)
+      if (binding.pose_in_source_link.has_value()) offset_frame_roles.push_back(binding);
+    assets.push_back(model.verified_asset);
+    sources.push_back({asset.model_asset_id, asset.model_revision, source_urdf(model),
+                       std::move(offset_frame_roles), asset.payload});
+  }
+  // The exact type closure of the graph's components (models and model-free).
+  std::vector<QualifiedComponentType> types;
+  for (const auto &component : graph.graph().controllable_components) {
+    const auto same = [&](const QualifiedComponentType &type) {
+      return type.value().component_type_id == component.component_type_id &&
+             type.value().component_type_revision == component.component_type_revision;
+    };
+    if (std::any_of(types.begin(), types.end(), same)) continue;
+    if (const auto found = std::find_if(component_types.begin(), component_types.end(), same);
+        found != component_types.end()) {
+      types.push_back(*found);
+      continue;
+    }
+    const auto derived = std::find_if(io_types.begin(), io_types.end(),
+                                      [&](const auto &row) { return same(row.type); });
+    if (derived == io_types.end())
+      fail(component.controllable_component_id.value() + " has no qualified component type");
+    types.push_back(derived->type);
+  }
+  const auto composition = compose_cell_occurrences(graph, assets, types);
+  Array profiles;
+  for (const auto &row : array(member(configuration, "controller_profiles", "configuration"),
+                               "controller_profiles")) {
+    const core::ControllableComponentId id(
+        text(member(row, "controllable_component_id", "controller profile"), "component"));
+    const auto facts = component_description_facts(graph.graph(), graph.normalized_root(), id);
+    profiles.push_back(object_with(
+        row, "description",
+        CanonicalValue(component_description(
+            text(member(row, "description", "controller profile"), "description"),
+            ComponentDescriptionInput{id, facts, composition.symbol_rewrites(),
+                                      composition.fixed_connections(), sources}))));
+  }
+  return object_with(configuration, "controller_profiles", CanonicalValue(std::move(profiles)));
 }
+
+} // namespace
 
 std::optional<core::ComponentDefaultTcpDTO> compiled_default_tcp(
     const ActivationDeploymentComponent &component,
@@ -1379,16 +1410,6 @@ CanonicalValue compile_activation_deployment(
       io_types.size() + physical_count != intent.components.size()) {
     fail("component/profile/model joins differ in size");
   }
-  // D8: authored declarations must reach an installed runtime policy owner.
-  // This producer still emits empty interrupt tables below; refuse required
-  // declarations here instead of silently dropping them from the activation.
-  for (const std::string_view field : {"interrupt_sources", "interrupt_policies"}) {
-    if (const auto *declarations = intent.policies.find_object_member(field);
-        declarations != nullptr && !array(*declarations, field).empty()) {
-      fail(std::string(field) +
-           ": authored interrupt declarations are not installed by this compiler");
-    }
-  }
   // Each authored mount becomes one graph attachment, identified by its child
   // (one parent per child). The cell graph and structural validation own
   // references, interfaces, accepted tags and capacity.
@@ -1426,6 +1447,21 @@ CanonicalValue compile_activation_deployment(
       edge.emplace_back("primary", CanonicalValue(true));
       attachments.back() = CanonicalValue(std::move(edge));
     }
+    // Authored arm-tool pairs that never touch; written only when present.
+    if (const auto *exclusions = row.find_object_member("collision_exclusions");
+        exclusions != nullptr && !exclusions->as_array().empty()) {
+      auto pairs = exclusions->as_array();
+      std::sort(pairs.begin(), pairs.end(),
+                [](const CanonicalValue &lhs, const CanonicalValue &rhs) {
+                  return std::pair(member(lhs, "child_link", "pair").as_string(),
+                                   member(lhs, "parent_link", "pair").as_string()) <
+                         std::pair(member(rhs, "child_link", "pair").as_string(),
+                                   member(rhs, "parent_link", "pair").as_string());
+                });
+      auto edge = attachments.back().as_object();
+      edge.emplace_back("collision_exclusions", CanonicalValue(std::move(pairs)));
+      attachments.back() = CanonicalValue(std::move(edge));
+    }
   }
   CatalogSelection catalog(catalog_records);
   const bool ros2_control = true;
@@ -1448,12 +1484,7 @@ CanonicalValue compile_activation_deployment(
     if (profile.runtime_kind != ActivationRuntimeKind::kRos2Control) {
       return false;
     }
-    const auto *runtime =
-        profile.runtime_restoration_profile.find_object_member(
-            "ros2_control_runtime");
-    return runtime != nullptr &&
-           (controller_profile_selector(*runtime).has_value() ||
-            lane_free_tool(profile));
+    return profile.lane.has_value() || lane_free_tool(profile);
   };
   const auto lacking_ros_controller_profile = [&] {
     return std::find_if_not(component_profiles.begin(),
@@ -1668,7 +1699,7 @@ CanonicalValue compile_activation_deployment(
         }
       }
     }
-    using MergedFields = std::array<std::string_view, 11U>;
+    using MergedFields = std::array<std::string_view, 13U>;
     // Q68: one ROS runtime unit hosts every component and each component
     // keeps its own controller profile, fault Stop profile, authored
     // gripper target rows and stream defaults; the ROS runtime schema has no
@@ -1679,7 +1710,8 @@ CanonicalValue compile_activation_deployment(
         "controller_profiles",         "io_signals",
         "io_provider_devices",         "pose_sources",
         "ai_models",                   "component_streams",
-        "lifecycle_command_timeouts"};
+        "lifecycle_command_timeouts",  "machines",
+        "sensors"};
     for (const std::string_view name : merged_fields) {
       if (name.empty()) continue;
       Array combined;
@@ -1737,29 +1769,39 @@ CanonicalValue compile_activation_deployment(
   std::sort(domains.begin(), domains.end(), by("control_domain_id"));
   std::sort(bindings.begin(), bindings.end(), by("control_binding_id"));
 
-  CanonicalValue graph(Object{
-      {"api_version", CanonicalValue(std::string(core::kCellGraphApiVersion))},
-      {"graph_revision", CanonicalValue(std::string(kZeroDigest))},
-      {"cell_id", CanonicalValue(runtime_cell_id.value())},
-      {"runtime_units",
-       CanonicalValue(Array{CanonicalValue(Object{
-           {"runtime_unit_id", CanonicalValue(runtime_id)},
-           {"runtime_profile_id", CanonicalValue(runtime_profile_id)},
-           {"runtime_profile_revision", CanonicalValue(revision(runtime_ref))},
-           {"dependency_runtime_unit_ids", CanonicalValue(Array{})},
-           {"configuration", std::move(runtime_configuration)},
-       })})},
-      {"model_instances", CanonicalValue(std::move(models))},
-      {"controllable_components", CanonicalValue(std::move(components))},
-      {"control_domains", CanonicalValue(std::move(domains))},
-      {"control_bindings", CanonicalValue(std::move(bindings))},
-      {"component_attachments", CanonicalValue(std::move(attachments))},
-  });
-  const auto graph_parsed = parse_strict_json_model_yaml(canonical_json(graph));
-  const auto typed = decode_cell_graph_candidate(graph_parsed);
-  const auto intrinsic = validate_intrinsic_cell_graph_candidate(typed);
-  const auto ready = prepare_cell_graph_identity(intrinsic, selected_profiles);
-  const auto computed = compute_graph_revision(ready);
+  const auto compile_graph = [&](const CanonicalValue &configuration) {
+    const CanonicalValue graph(Object{
+        {"api_version", CanonicalValue(std::string(core::kCellGraphApiVersion))},
+        {"graph_revision", CanonicalValue(std::string(kZeroDigest))},
+        {"cell_id", CanonicalValue(runtime_cell_id.value())},
+        {"runtime_units",
+         CanonicalValue(Array{CanonicalValue(Object{
+             {"runtime_unit_id", CanonicalValue(runtime_id)},
+             {"runtime_profile_id", CanonicalValue(runtime_profile_id)},
+             {"runtime_profile_revision", CanonicalValue(revision(runtime_ref))},
+             {"dependency_runtime_unit_ids", CanonicalValue(Array{})},
+             {"configuration", configuration},
+         })})},
+        {"model_instances", CanonicalValue(models)},
+        {"controllable_components", CanonicalValue(components)},
+        {"control_domains", CanonicalValue(domains)},
+        {"control_bindings", CanonicalValue(bindings)},
+        {"component_attachments", CanonicalValue(attachments)},
+    });
+    const auto graph_parsed = parse_strict_json_model_yaml(canonical_json(graph));
+    const auto typed = decode_cell_graph_candidate(graph_parsed);
+    const auto intrinsic = validate_intrinsic_cell_graph_candidate(typed);
+    const auto ready = prepare_cell_graph_identity(intrinsic, selected_profiles);
+    return compute_graph_revision(ready);
+  };
+  // N17: the launched descriptions need the composed cell, which needs the
+  // graph: compose the graph with the model URDFs, then compile it again with
+  // the full descriptions.
+  if (!controller_profiles.empty())
+    runtime_configuration =
+        with_static_frames(runtime_configuration, compile_graph(runtime_configuration),
+                           prepared_models, io_types, component_types);
+  const auto computed = compile_graph(runtime_configuration);
   const auto &computed_graph = computed.normalized_root();
 
   Array desired;
@@ -1770,8 +1812,6 @@ CanonicalValue compile_activation_deployment(
     const auto &profile = component_profiles[index];
     if (is_model_free_runtime_kind(profile.runtime_kind))
       continue;
-    const auto &model_urdf =
-        prepared_model(index).verified_asset.source_ir().urdf();
     for (const std::string_view target : {std::string_view("arm"),
                                           std::string_view("gripper")}) {
       if ((target == "gripper" && !has_gripper_target(component, profile)) ||
@@ -1829,8 +1869,7 @@ CanonicalValue compile_activation_deployment(
       const auto &component_ref = catalog.require(
           core::CatalogRecordKind::kComponentType,
           component_type_id(profile, has_gripper_target(component, profile)));
-      const std::string planning_provider_id =
-          ros2_control_provider_id(component, profile, target);
+      const std::string planning_provider_id(kRos2ControlProviderId);
       const auto &planning =
           catalog.require(core::CatalogRecordKind::kProviderManifest,
                           planning_provider_id);
@@ -1868,8 +1907,7 @@ CanonicalValue compile_activation_deployment(
                       CanonicalValue(anchor_revision)},
                  })},
                 {"provider_instance_id",
-                 CanonicalValue(ros2_control_provider_instance_id(
-                     component, profile, target))},
+                 CanonicalValue(ros2_control_provider_instance_id(component))},
                 {"provider_manifest_id", CanonicalValue(planning_provider_id)},
                 {"provider_manifest_revision",
                  CanonicalValue(revision(planning))},
@@ -1918,55 +1956,23 @@ CanonicalValue compile_activation_deployment(
         if (target == "arm") {
           const auto &settings = member(component.target_settings, "arm", "target settings");
           const auto &controlled = member(settings, "controlled_stop", "arm settings");
-          // Authored rows name their source joint; pair them with the arm
-          // resources by that name, never by row position.
           const auto joints = source_joints(profile, "arm_joints");
-          std::map<std::string, const CanonicalValue *, std::less<>> limit_by_joint;
-          for (const auto &row : array(member(controlled, "per_joint_limits", "controlled stop"),
-                                       "per_joint_limits")) {
-            const auto *name = row.find_object_member("source_joint_name");
-            if (name == nullptr) fail("controlled Stop limit row lacks source_joint_name");
-            const auto &joint = text(*name, "source_joint_name");
-            if (joint.empty()) fail("controlled Stop limit row lacks source_joint_name");
-            if (std::find(joints.begin(), joints.end(), joint) == joints.end()) {
-              fail("controlled Stop limits name unknown arm joint " + joint);
-            }
-            if (!limit_by_joint.emplace(joint, &row).second) {
-              fail("controlled Stop limits repeat joint " + joint);
-            }
-          }
+          const auto limits = controlled_stop_limits(component, profile, prepared_model(index));
           Array resource_limits;
           for (const auto &resource : array(member(binding, "resource_bindings", "binding"),
                                             "resource bindings")) {
             const auto &resource_id = text(member(resource, "resource_id", "resource"),
                                            "resource_id");
-            std::size_t index = 0;
-            while (index < joints.size() &&
-                   coordinate_resource_id(component.component_id, target, index) != resource_id) {
-              ++index;
+            std::size_t joint_index = 0;
+            while (joint_index < joints.size() &&
+                   coordinate_resource_id(component.component_id, target, joint_index) !=
+                       resource_id) {
+              ++joint_index;
             }
-            if (index == joints.size()) fail("arm resource " + resource_id + " has no source joint");
-            const auto found = limit_by_joint.find(joints[index]);
-            if (found == limit_by_joint.end()) {
-              fail("controlled Stop limits miss joint " + joints[index]);
-            }
-            const auto &limit = *found->second;
-            // The one Stop deceleration limit per joint (the runtime derives
-            // both the operator and the fault Stop from it) must not be lower
-            // than the acceleration ordinary planning may use for that joint.
-            if (const auto *deceleration = std::get_if<double>(
-                    &member(limit, "max_deceleration_rad_s2", "limit").storage());
-                deceleration != nullptr) {
-              if (const auto error = stop_deceleration_coherence_error(
-                      component.component_id + "." + std::string(target) +
-                          ".controlled_stop",
-                      joints[index], *deceleration,
-                      planning_joint_acceleration_limit_rad_s2(model_urdf,
-                                                               joints[index]));
-                  error.has_value()) {
-                fail(*error);
-              }
-            }
+            if (joint_index == joints.size())
+              fail("arm resource " + resource_id + " has no source joint");
+            const auto &joint = joints[joint_index];
+            const auto &limit = *limits.at(joint);
             Object resource_limit{
                 {"resource_id", CanonicalValue(resource_id)},
                 {"max_deceleration", CanonicalValue(Object{
@@ -1984,7 +1990,7 @@ CanonicalValue compile_activation_deployment(
                 jerk != nullptr) {
               const auto *value = std::get_if<double>(&jerk->storage());
               if (value == nullptr || !std::isfinite(*value) || *value <= 0.0) {
-                fail("controlled Stop max_jerk_rad_s3 for joint " + joints[index] +
+                fail("controlled Stop max_jerk_rad_s3 for joint " + joint +
                      " must be a finite positive number");
               }
               resource_limit.emplace_back(
@@ -2088,12 +2094,12 @@ CanonicalValue compile_activation_deployment(
     std::optional<core::CatalogRecordRefDTO> manifest;
     std::span<const core::ProviderCapabilityOfferDTO> offers;
   };
-  ModelFreeProvider io_provider{core::kIoProviderLifecycleManifestId,
+  ModelFreeProvider io_provider{kIoProviderManifestId,
                                 "provider.io.", "io.binding.", {}, {}};
-  ModelFreeProvider pose_provider{core::kPoseSourceLifecycleManifestId,
+  ModelFreeProvider pose_provider{kPoseSourceProviderManifestId,
                                   "provider.pose_source.",
                                   "pose_source.binding.", {}, {}};
-  ModelFreeProvider ai_model_provider{core::kAiModelLifecycleManifestId,
+  ModelFreeProvider ai_model_provider{kAiModelProviderManifestId,
                                       "provider.ai_model.",
                                       "ai_model.binding.", {}, {}};
   const auto provider_for =
@@ -2135,29 +2141,21 @@ CanonicalValue compile_activation_deployment(
              "definition");
     }
   };
+  // A machine owner (CONTRACTS §16) and a sensor have no targets and no
+  // provider binding.
+  const auto target_less = [&](std::string_view component_id) {
+    return std::any_of(component_profiles.begin(), component_profiles.end(),
+                       [&](const auto &row) {
+                         return row.component_id == component_id &&
+                                (row.runtime_kind == ActivationRuntimeKind::kMachine ||
+                                 row.runtime_kind == ActivationRuntimeKind::kSensor);
+                       });
+  };
   for (const auto &prepared : io_types) {
+    if (target_less(prepared.component_id)) continue;
     auto &provider = provider_for(prepared.component_id);
     if (!provider.manifest)
       select_manifest(provider);
-  }
-  if (io_provider.manifest) {
-    const bool output =
-        std::any_of(io_types.begin(), io_types.end(), [](const auto &prepared) {
-          return std::any_of(prepared.type.value().command_targets.begin(),
-                             prepared.type.value().command_targets.end(),
-                             [](const auto &target) {
-                               return std::any_of(
-                                   target.capabilities.begin(),
-                                   target.capabilities.end(),
-                                   [](const auto &capability) {
-                                     return capability.capability_id.value() ==
-                                            "io.gpio.set_output";
-                                   });
-                             });
-        });
-    if (output)
-      static_cast<void>(catalog.require(core::CatalogRecordKind::kCommandSchema,
-                                        core::kIoSignalWriteCommandSchemaId));
   }
   const auto io_provider_row = [&](const ModelFreeProvider &provider,
                                    std::string_view capability,
@@ -2211,6 +2209,7 @@ CanonicalValue compile_activation_deployment(
     return CanonicalValue(std::move(row));
   };
   for (const auto &prepared : io_types) {
+    if (target_less(prepared.component_id)) continue;
     const auto &provider = provider_for(prepared.component_id);
     const auto identity = content_identity::framed_sha256(
         "io-provider-instance", "manyforge.io_provider_instance.v1",
@@ -2291,10 +2290,6 @@ CanonicalValue compile_activation_deployment(
         {"retained_policy_records", CanonicalValue(Array{})},
         {"stop_stage_parameters", CanonicalValue(std::move(stop_stages))},
         {"commissioned_stop_interfaces", CanonicalValue(Array{})},
-        {"interrupt_sources", CanonicalValue(Array{})},
-        {"interrupt_policies", CanonicalValue(Array{})},
-        {"interrupt_config",
-         member(intent.policies, "interrupt_config", "policies")},
     };
     if (const auto *rules =
             intent.policies.find_object_member("interrupt_rules");

@@ -66,6 +66,21 @@ public:
   ReadGoal(const core::ExecutionGoalKey &key) const override;
   std::optional<core::ExecutionControllerSampleDTO> ReadSample() const override;
   core::ExecutionReadinessDTO ReadReadiness() const override;
+  /// The controller's own goal state, for the component's activity
+  /// (CONTRACTS §1): a goal it has not reported finished, and whether its
+  /// latest finished goal was cancelled (JTC reports a cancelled goal finished
+  /// before it brakes; the caller then reads the reference in `ReadSample`).
+  /// `expected_end`: the earliest expected end of a goal the controller has
+  /// not reported finished (every open goal, the Stop's included), on the
+  /// backend's clock: its last progress report (feedback cursor) plus its
+  /// remaining trajectory time, else its acceptance (or send) plus its whole
+  /// trajectory time; a cancelled goal is expected to end at its cancel.
+  struct GoalActivity final {
+    bool goal_running{false};
+    bool last_cancelled{false};
+    std::optional<core::TimePoint> expected_end;
+  };
+  [[nodiscard]] GoalActivity ReadGoalActivity() const;
   /// Read this epoch's own FJT client availability for the Enable
   /// postcondition. No graph wait or change to execution readiness.
   [[nodiscard]] bool ActionServerIsReady() const;

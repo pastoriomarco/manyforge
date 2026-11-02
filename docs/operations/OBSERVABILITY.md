@@ -27,12 +27,12 @@ also writes a JSONL audit file.
   duration_ms, client) plus service-level INFO/WARNING/ERROR, from
   `manyforge_composer/backend/logging_config.py`. `uvicorn.access` is quieted
   to WARNING. The level is INFO by default (Composer's `--log-level` option).
-- **Lifecycle results**: Prepare, Enable, Disable and Recover return
-  `succeeded`, `failed` with a typed reason, or `connection_lost`. The CCLC
-  result and feedback include the substeps reported by the adapter and their
-  outcomes, for example the clear and controller steps of a Real arm's
-  Prepare. After a dispatched failure, the next lifecycle action is based on
-  the component's current status.
+- **Component actions**: Prepare, Enable, Disable, Recover and the other
+  component actions end `succeeded`, `failed` with a typed error (and the
+  vendor's code and text when the controller gave one), or `unknown` when
+  their effect could not be confirmed; nothing resends an `unknown` action.
+  The latest result is the component's `last_action` in `GET /api/components`.
+  What comes next is decided from the component's current state.
 
 ### Assistant bridge audit
 
@@ -57,6 +57,31 @@ The public read surface is:
 The browser mounts only the current summary page and requests detail on
 selection.
 
+History also records what was asked of the components and the cell, once per
+terminal, with the typed error code and message:
+
+- `component_action_finished` — one per component action (Prepare, Enable,
+  Disable, Recover, Reset position, Power off, Reboot, Sim reset), whoever
+  asked for it (a button, Enable all, an Apply step). The event's component is
+  the component id; the payload has `action`, `outcome` (`succeeded`,
+  `failed`, `unknown`, `refused` when it was never started, `interrupted` by a
+  Stop) and `error` (`code`, `message`, and the vendor's code and text when the
+  controller gave them). Severity: INFO on success, WARN when refused or
+  interrupted, ERROR when failed or unknown.
+- `apply_finished` — one per Scenario Load and New, Deployment Apply and
+  Revert, and Program Apply and Revert (component `manyforge.composer`). The
+  payload has `subject` (`scenario_load`, `scenario_new`, `deployment_apply`,
+  `deployment_revert`, `program_apply`, `program_revert`), `outcome`
+  (`succeeded`, `failed`, `refused` before any effect, or `accepted` when a
+  Program Apply was handed to the Manager), the first `error`, and the Apply's
+  component rows, each with its own `error`. A Load records one event; its
+  emptying New is part of it.
+
+The list line reads like `Enable lite6_robot failed: <code>: <message>`; select
+the row for the full payload. Filter with `event_types=component_action_finished`
+or `components=<component id>`. These events share the History's existing
+retention limits.
+
 ### What is **not** a runtime log
 
 - `verification/` — qualification fixtures used by the
@@ -75,7 +100,9 @@ operator-facing subset.
 | --- | --- |
 | `GET /api/health` | First check after starting: is Composer alive? |
 | `GET /api/runtime` | Runtime owner availability as seen by Composer. |
-| `GET /api/component-overview` | Per-component readiness and status, as in Composer's component view. |
+| `GET /api/components` | Every component's state (lifecycle, fault, reason, streams, last action, controller details), as on Composer's Components page. |
+| `GET /api/cell/latch` | Whether the cell is latched, and the components that cause it. |
+| `GET /api/program/readiness` | Whether Execute and Resume are allowed, with the blocked reasons. |
 | `GET /api/scenarios/current` | The active Scenario and its identity. |
 
 `./scripts/compose-dev.sh status` combines the owner-issued current Scenario
@@ -91,7 +118,6 @@ with `ready` and `unavailable_reasons`; it is the default check after `start`.
 | `GET /api/execution/alarms` | Current four-state alarms. Raw event severity does not imply a current alarm. |
 | `POST /api/execution/alarms/{condition_id}/acknowledge` | Acknowledge one exact activation/revision. This records awareness only; it does not clear the condition or recover motion. |
 | `POST /api/execution/alarms/acknowledge-all` | Acknowledge the exact returned membership/generation; stale membership is rejected. |
-| `GET /api/execution/stop-fault` | Current Stop fault, if any. |
 
 The four alarm states are `active_unacknowledged`, `active_acknowledged`,
 `returned_unacknowledged`, and `returned_acknowledged`. An acknowledged active

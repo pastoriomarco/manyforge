@@ -2,8 +2,6 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
-#include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
-#include <manyforge_core/ports/icclc_journal.hpp>
 #include <manyforge_core/types/component_lifecycle.hpp>
 
 #include "binding_registrations.hpp"
@@ -33,12 +31,6 @@ void register_component_lifecycle_bindings(py::module_& module) {
       .value("kRequestLedgerFull", RequestReplayStatusDTO::kRequestLedgerFull)
       .value("kStaleRequestOwnerEpoch", RequestReplayStatusDTO::kStaleRequestOwnerEpoch);
 
-  py::enum_<ComponentLifecycleIntentKindDTO>(module, "ComponentLifecycleIntentKindDTO")
-      .value("kPrepare", ComponentLifecycleIntentKindDTO::kPrepare)
-      .value("kEnable", ComponentLifecycleIntentKindDTO::kEnable)
-      .value("kDisable", ComponentLifecycleIntentKindDTO::kDisable)
-      .value("kRecover", ComponentLifecycleIntentKindDTO::kRecover);
-
   py::enum_<ComponentLifecycleStateDTO>(module, "ComponentLifecycleStateDTO")
       .value("kUndeclared", ComponentLifecycleStateDTO::kUndeclared)
       .value("kDeclared", ComponentLifecycleStateDTO::kDeclared)
@@ -48,11 +40,6 @@ void register_component_lifecycle_bindings(py::module_& module) {
       .value("kFaulted", ComponentLifecycleStateDTO::kFaulted)
       .value("kDisabling", ComponentLifecycleStateDTO::kDisabling)
       .value("kDisabled", ComponentLifecycleStateDTO::kDisabled);
-
-  py::enum_<ComponentLifecycleRequestedStatePresenceDTO>(
-      module, "ComponentLifecycleRequestedStatePresenceDTO")
-      .value("kUnresolved", ComponentLifecycleRequestedStatePresenceDTO::kUnresolved)
-      .value("kResolved", ComponentLifecycleRequestedStatePresenceDTO::kResolved);
 
   py::enum_<ExpectedActiveControlConfigurationPresenceDTO>(
       module, "ExpectedActiveControlConfigurationPresenceDTO")
@@ -64,40 +51,6 @@ void register_component_lifecycle_bindings(py::module_& module) {
       .value("kBoolean", LifecycleFactValueKindDTO::kBoolean)
       .value("kInteger", LifecycleFactValueKindDTO::kInteger)
       .value("kToken", LifecycleFactValueKindDTO::kToken);
-
-  py::enum_<LifecycleTransitionOutcomeDTO>(module, "LifecycleTransitionOutcomeDTO")
-      .value("kSucceeded", LifecycleTransitionOutcomeDTO::kSucceeded)
-      .value("kFailed", LifecycleTransitionOutcomeDTO::kFailed)
-      .value("kConnectionLost", LifecycleTransitionOutcomeDTO::kConnectionLost);
-
-  py::enum_<LifecyclePostconditionResultDTO>(module, "LifecyclePostconditionResultDTO")
-      .value("kSatisfied", LifecyclePostconditionResultDTO::kSatisfied)
-      .value("kNotSatisfied", LifecyclePostconditionResultDTO::kNotSatisfied)
-      .value("kInconclusive", LifecyclePostconditionResultDTO::kInconclusive);
-
-  py::enum_<ComponentLifecycleDomainActionStateDTO>(module,
-                                                    "ComponentLifecycleDomainActionStateDTO")
-      .value("kReserved", ComponentLifecycleDomainActionStateDTO::kReserved)
-      .value("kNotStarted", ComponentLifecycleDomainActionStateDTO::kNotStarted)
-      .value("kExecuting", ComponentLifecycleDomainActionStateDTO::kExecuting)
-      .value("kVerifying", ComponentLifecycleDomainActionStateDTO::kVerifying)
-      .value("kSucceeded", ComponentLifecycleDomainActionStateDTO::kSucceeded)
-      .value("kFailed", ComponentLifecycleDomainActionStateDTO::kFailed);
-
-  py::enum_<ComponentLifecycleTransactionPhaseDTO>(module, "ComponentLifecycleTransactionPhaseDTO")
-      .value("kAccepted", ComponentLifecycleTransactionPhaseDTO::kAccepted)
-      .value("kAcquiringDomains", ComponentLifecycleTransactionPhaseDTO::kAcquiringDomains)
-      .value("kContaining", ComponentLifecycleTransactionPhaseDTO::kContaining)
-      .value("kExecuting", ComponentLifecycleTransactionPhaseDTO::kExecuting)
-      .value("kVerifying", ComponentLifecycleTransactionPhaseDTO::kVerifying)
-      .value("kOutcomeUnknown", ComponentLifecycleTransactionPhaseDTO::kOutcomeUnknown)
-      .value("kSucceeded", ComponentLifecycleTransactionPhaseDTO::kSucceeded)
-      .value("kFailed", ComponentLifecycleTransactionPhaseDTO::kFailed);
-
-  py::enum_<ComponentLifecycleTerminalResultDTO>(module, "ComponentLifecycleTerminalResultDTO")
-      .value("kSucceeded", ComponentLifecycleTerminalResultDTO::kSucceeded)
-      .value("kFailed", ComponentLifecycleTerminalResultDTO::kFailed)
-      .value("kConnectionLost", ComponentLifecycleTerminalResultDTO::kConnectionLost);
 
   py::enum_<ConfigurationFenceState>(module, "ConfigurationFenceState")
       .value("kHeld", ConfigurationFenceState::kHeld)
@@ -211,17 +164,6 @@ void register_component_lifecycle_bindings(py::module_& module) {
       .def(py::self == py::self)
       .def(py::self != py::self);
 
-  py::class_<ComponentLifecycleRequestedStateDTO>(module, "ComponentLifecycleRequestedStateDTO",
-                                                  py::is_final())
-      .def(py::init<ComponentLifecycleRequestedStatePresenceDTO,
-                    std::optional<ComponentLifecycleStateDTO>>(),
-           py::arg("presence"), py::arg("state") = std::nullopt)
-      .def_readonly("presence", &ComponentLifecycleRequestedStateDTO::presence)
-      .def_readonly("state", &ComponentLifecycleRequestedStateDTO::state)
-      .def("locally_valid", &ComponentLifecycleRequestedStateDTO::locally_valid)
-      .def(py::self == py::self)
-      .def(py::self != py::self);
-
   py::class_<ExpectedActiveControlConfigurationDTO>(module, "ExpectedActiveControlConfigurationDTO",
                                                     py::is_final())
       .def(py::init<ExpectedActiveControlConfigurationPresenceDTO,
@@ -251,60 +193,6 @@ void register_component_lifecycle_bindings(py::module_& module) {
       .def(py::self == py::self)
       .def(py::self != py::self);
 
-  py::class_<ExpectedProviderDomainScopeDTO>(module, "ExpectedProviderDomainScopeDTO",
-                                             py::is_final())
-      .def(py::init<ProviderControlDomainDTO, ExpectedActiveControlConfigurationDTO>(),
-           py::arg("provider"), py::arg("expected_active_control_configuration"))
-      .def_readonly("provider", &ExpectedProviderDomainScopeDTO::provider)
-      .def_readonly("expected_active_control_configuration",
-                    &ExpectedProviderDomainScopeDTO::expected_active_control_configuration)
-      .def(py::self == py::self);
-
-  py::class_<ExpectedControlDomainRevisionDTO>(module, "ExpectedControlDomainRevisionDTO",
-                                               py::is_final())
-      .def(py::init<ControlDomainId, ControlDomainRevision, ExpectedProviderDomainScopeDTO>(),
-           py::arg("control_domain_id"), py::arg("control_domain_revision"), py::arg("provider"))
-      .def_property_readonly(
-          "provider",
-          [](const ExpectedControlDomainRevisionDTO& value) { return value.provider(); },
-          py::return_value_policy::reference_internal)
-      .def(py::init<ControlDomainId, ControlDomainRevision, ControllerTopologyId, TopologyRevision,
-                    ExpectedActiveControlConfigurationDTO,
-                    std::vector<ExpectedControlBindingRevisionDTO>>(),
-           py::arg("control_domain_id"), py::arg("control_domain_revision"),
-           py::arg("controller_topology_id"), py::arg("topology_revision"),
-           py::arg("expected_active_control_configuration"), py::arg("expected_control_bindings"))
-      .def_readonly("control_domain_id", &ExpectedControlDomainRevisionDTO::control_domain_id)
-      .def_readonly("control_domain_revision",
-                    &ExpectedControlDomainRevisionDTO::control_domain_revision)
-      .def_property_readonly(
-          "controller_topology_id",
-          [](const ExpectedControlDomainRevisionDTO& value) -> const ControllerTopologyId& {
-            return value.controller().controller_topology_id;
-          },
-          py::return_value_policy::reference_internal)
-      .def_property_readonly(
-          "topology_revision",
-          [](const ExpectedControlDomainRevisionDTO& value) -> const TopologyRevision& {
-            return value.controller().topology_revision;
-          },
-          py::return_value_policy::reference_internal)
-      .def_property_readonly(
-          "expected_active_control_configuration",
-          [](const ExpectedControlDomainRevisionDTO& value)
-              -> const ExpectedActiveControlConfigurationDTO& {
-            return value.controller().expected_active_control_configuration;
-          },
-          py::return_value_policy::reference_internal)
-      .def_property_readonly(
-          "expected_control_bindings",
-          [](const ExpectedControlDomainRevisionDTO& value) {
-            return immutable_snapshot(value.controller().expected_control_bindings);
-          })
-      .def("locally_valid", &ExpectedControlDomainRevisionDTO::locally_valid)
-      .def(py::self == py::self)
-      .def(py::self != py::self);
-
   py::class_<ProgramNodeAdmissionEvidenceDTO>(module, "ProgramNodeAdmissionEvidenceDTO",
                                               py::is_final())
       .def(py::init<RequestOwnerEpoch, ProgramRunId, CellAdmissionClaimGeneration, std::string,
@@ -322,61 +210,6 @@ void register_component_lifecycle_bindings(py::module_& module) {
       .def_readonly("owner_api", &ProgramNodeAdmissionEvidenceDTO::owner_api)
       .def("locally_valid", &ProgramNodeAdmissionEvidenceDTO::locally_valid)
       .def(py::self == py::self);
-
-  py::class_<ComponentLifecycleIntentDTO>(module, "ComponentLifecycleIntentDTO", py::is_final())
-      .def(py::init<PublicRequestContextDTO, ControllableComponentId,
-                    ComponentLifecycleIntentKindDTO, GraphRevision, ComponentLifecycleGeneration,
-                    std::vector<ExpectedControlDomainRevisionDTO>, std::optional<std::string>,
-                    RequestAttributionDTO, AdmissionGeneration,
-                    std::optional<ProgramNodeAdmissionEvidenceDTO>>(),
-           py::arg("request_context"), py::arg("controllable_component_id"), py::arg("intent"),
-           py::arg("expected_graph_revision"), py::arg("expected_component_lifecycle_generation"),
-           py::arg("expected_control_domains"), py::arg("reason") = std::nullopt,
-           py::arg("attribution") = RequestAttributionDTO{},
-           py::arg("expected_admission_generation") = AdmissionGeneration(1U),
-           py::arg("program_node_evidence") = std::nullopt)
-      .def_readonly("request_context", &ComponentLifecycleIntentDTO::request_context)
-      .def_readonly("controllable_component_id",
-                    &ComponentLifecycleIntentDTO::controllable_component_id)
-      .def_readonly("intent", &ComponentLifecycleIntentDTO::intent)
-      .def_readonly("expected_graph_revision",
-                    &ComponentLifecycleIntentDTO::expected_graph_revision)
-      .def_readonly("expected_component_lifecycle_generation",
-                    &ComponentLifecycleIntentDTO::expected_component_lifecycle_generation)
-      .def_property_readonly("expected_control_domains",
-                             [](const ComponentLifecycleIntentDTO& value) {
-                               return immutable_snapshot(value.expected_control_domains);
-                             })
-      .def_readonly("reason", &ComponentLifecycleIntentDTO::reason)
-      .def_readonly("attribution", &ComponentLifecycleIntentDTO::attribution)
-      .def_readonly("expected_admission_generation",
-                    &ComponentLifecycleIntentDTO::expected_admission_generation)
-      .def_readonly("program_node_evidence", &ComponentLifecycleIntentDTO::program_node_evidence)
-      .def("locally_valid", &ComponentLifecycleIntentDTO::locally_valid)
-      .def("replay_equal", &ComponentLifecycleIntentDTO::replay_equal)
-      .def(py::self == py::self)
-      .def(py::self != py::self);
-
-  py::class_<ComponentLifecycleAcceptedDTO>(module, "ComponentLifecycleAcceptedDTO", py::is_final())
-      .def(py::init<RequestId, RequestReplayStatusDTO, LifecycleTransactionId,
-                    LifecycleTransactionGeneration, ComponentLifecycleGeneration, std::int64_t,
-                    std::int64_t>(),
-           py::arg("request_id"), py::arg("replay_status"), py::arg("lifecycle_transaction_id"),
-           py::arg("lifecycle_transaction_generation"), py::arg("component_lifecycle_generation"),
-           py::arg("accepted_at_ns"), py::arg("timeout_duration_ns"))
-      .def_readonly("request_id", &ComponentLifecycleAcceptedDTO::request_id)
-      .def_readonly("replay_status", &ComponentLifecycleAcceptedDTO::replay_status)
-      .def_readonly("lifecycle_transaction_id",
-                    &ComponentLifecycleAcceptedDTO::lifecycle_transaction_id)
-      .def_readonly("lifecycle_transaction_generation",
-                    &ComponentLifecycleAcceptedDTO::lifecycle_transaction_generation)
-      .def_readonly("component_lifecycle_generation",
-                    &ComponentLifecycleAcceptedDTO::component_lifecycle_generation)
-      .def_readonly("accepted_at_ns", &ComponentLifecycleAcceptedDTO::accepted_at_ns)
-      .def_readonly("timeout_duration_ns", &ComponentLifecycleAcceptedDTO::timeout_duration_ns)
-      .def("locally_valid", &ComponentLifecycleAcceptedDTO::locally_valid)
-      .def(py::self == py::self)
-      .def(py::self != py::self);
 
   py::class_<LifecycleFactValueDTO>(module, "LifecycleFactValueDTO", py::is_final())
       .def(py::init<LifecycleFactValueKindDTO, std::optional<bool>, std::optional<std::int64_t>,
@@ -397,155 +230,6 @@ void register_component_lifecycle_bindings(py::module_& module) {
       .def_readonly("lifecycle_fact_id", &LifecycleFactDTO::lifecycle_fact_id)
       .def_readonly("value", &LifecycleFactDTO::value)
       .def("locally_valid", &LifecycleFactDTO::locally_valid)
-      .def(py::self == py::self)
-      .def(py::self != py::self);
-
-  py::class_<LifecycleFactPredicateDTO>(module, "LifecycleFactPredicateDTO", py::is_final())
-      .def(py::init<LifecycleFactId, LifecycleFactValueDTO>(), py::arg("lifecycle_fact_id"),
-           py::arg("expected_value"))
-      .def_readonly("lifecycle_fact_id", &LifecycleFactPredicateDTO::lifecycle_fact_id)
-      .def_readonly("expected_value", &LifecycleFactPredicateDTO::expected_value)
-      .def("locally_valid", &LifecycleFactPredicateDTO::locally_valid)
-      .def(py::self == py::self)
-      .def(py::self != py::self);
-
-  py::class_<LifecyclePredicateDTO>(module, "LifecyclePredicateDTO", py::is_final())
-      .def(py::init<std::vector<ComponentLifecycleStateDTO>,
-                    std::vector<LifecycleFactPredicateDTO>>(),
-           py::arg("allowed_states"), py::arg("fact_predicates"))
-      .def_property_readonly("allowed_states",
-                             [](const LifecyclePredicateDTO& value) {
-                               return immutable_snapshot(value.allowed_states);
-                             })
-      .def_property_readonly("fact_predicates",
-                             [](const LifecyclePredicateDTO& value) {
-                               return immutable_snapshot(value.fact_predicates);
-                             })
-      .def("locally_valid", &LifecyclePredicateDTO::locally_valid)
-      .def(py::self == py::self)
-      .def(py::self != py::self);
-
-  py::class_<LifecyclePrimitiveTransitionDTO>(module, "LifecyclePrimitiveTransitionDTO",
-                                              py::is_final())
-      .def(py::init<LifecyclePrimitiveId, LifecyclePredicateDTO, LifecyclePredicateDTO>(),
-           py::arg("lifecycle_primitive_id"), py::arg("eligibility_predicate"),
-           py::arg("postcondition_predicate"))
-      .def_readonly("lifecycle_primitive_id",
-                    &LifecyclePrimitiveTransitionDTO::lifecycle_primitive_id)
-      .def_readonly("eligibility_predicate",
-                    &LifecyclePrimitiveTransitionDTO::eligibility_predicate)
-      .def_readonly("postcondition_predicate",
-                    &LifecyclePrimitiveTransitionDTO::postcondition_predicate)
-      .def("locally_valid", &LifecyclePrimitiveTransitionDTO::locally_valid)
-      .def(py::self == py::self)
-      .def(py::self != py::self);
-
-  py::class_<DeviceConfiguredLifecycleLimitDTO>(module, "DeviceConfiguredLifecycleLimitDTO",
-                                                py::is_final())
-      .def(py::init<>())
-      .def(py::self == py::self)
-      .def(py::self != py::self);
-
-  py::class_<LifecycleIntentPlanDTO>(module, "LifecycleIntentPlanDTO", py::is_final())
-      .def(py::init<ComponentLifecycleIntentKindDTO, ComponentLifecycleStateDTO,
-                    std::optional<LifecyclePredicateDTO>, LifecyclePredicateDTO, std::int64_t,
-                    std::vector<LifecyclePrimitiveTransitionDTO>>(),
-           py::arg("intent"), py::arg("requested_state"), py::arg("recover_target_eligibility"),
-           py::arg("requested_postcondition"), py::arg("timeout_duration_ns"),
-           py::arg("transitions"))
-      .def(py::init<ComponentLifecycleIntentKindDTO, ComponentLifecycleStateDTO,
-                    std::optional<LifecyclePredicateDTO>, LifecyclePredicateDTO,
-                    LifecyclePlanTimeoutPolicyDTO, std::vector<LifecyclePrimitiveTransitionDTO>>(),
-           py::arg("intent"), py::arg("requested_state"), py::arg("recover_target_eligibility"),
-           py::arg("requested_postcondition"), py::arg("timeout_policy"), py::arg("transitions"))
-      .def_readonly("intent", &LifecycleIntentPlanDTO::intent)
-      .def_readonly("requested_state", &LifecycleIntentPlanDTO::requested_state)
-      .def_readonly("recover_target_eligibility",
-                    &LifecycleIntentPlanDTO::recover_target_eligibility)
-      .def_readonly("requested_postcondition", &LifecycleIntentPlanDTO::requested_postcondition)
-      .def_property_readonly("timeout_duration_ns",
-                             [](const LifecycleIntentPlanDTO& value) {
-                               return std::get<std::int64_t>(value.timeout_policy);
-                             })
-      .def_readonly("timeout_policy", &LifecycleIntentPlanDTO::timeout_policy)
-      .def_property_readonly(
-          "transitions",
-          [](const LifecycleIntentPlanDTO& value) { return immutable_snapshot(value.transitions); })
-      .def("locally_valid", &LifecycleIntentPlanDTO::locally_valid)
-      .def(py::self == py::self)
-      .def(py::self != py::self);
-
-  py::class_<BrandLifecyclePlanCatalogDTO>(module, "BrandLifecyclePlanCatalogDTO", py::is_final())
-      .def(py::init<ProviderManifestId, ProviderManifestRevision, ContentDigest,
-                    std::vector<LifecycleIntentPlanDTO>>(),
-           py::arg("provider_manifest_id"), py::arg("provider_manifest_revision"),
-           py::arg("catalog_digest"), py::arg("plans"))
-      .def_readonly("provider_manifest_id", &BrandLifecyclePlanCatalogDTO::provider_manifest_id)
-      .def_readonly("provider_manifest_revision",
-                    &BrandLifecyclePlanCatalogDTO::provider_manifest_revision)
-      .def_readonly("catalog_digest", &BrandLifecyclePlanCatalogDTO::catalog_digest)
-      .def_property_readonly(
-          "plans",
-          [](const BrandLifecyclePlanCatalogDTO& value) { return immutable_snapshot(value.plans); })
-      .def("locally_valid", &BrandLifecyclePlanCatalogDTO::locally_valid)
-      .def(py::self == py::self)
-      .def(py::self != py::self);
-
-  module.def(
-      "make_brand_lifecycle_plan_catalog",
-      [](ProviderManifestId provider_manifest_id,
-         ProviderManifestRevision provider_manifest_revision,
-         std::vector<LifecycleIntentPlanDTO> plans) {
-        auto result =
-            MakeBrandLifecyclePlanCatalog(std::move(provider_manifest_id),
-                                          std::move(provider_manifest_revision), std::move(plans));
-        if (!result.ok()) {
-          throw py::value_error(result.error().message);
-        }
-        return std::move(result.value());
-      },
-      py::arg("provider_manifest_id"), py::arg("provider_manifest_revision"), py::arg("plans"));
-  module.def(
-      "encode_brand_lifecycle_plan_catalog",
-      [](const BrandLifecyclePlanCatalogDTO& catalog) {
-        auto result = EncodeBrandLifecyclePlanCatalog(catalog);
-        if (!result.ok()) {
-          throw py::value_error(result.error().message);
-        }
-        return std::move(result.value());
-      },
-      py::arg("catalog"));
-
-  py::class_<BrandLifecycleObservationQueryDTO>(module, "BrandLifecycleObservationQueryDTO",
-                                                py::is_final())
-      .def(py::init<LifecycleTransactionId, LifecycleTransactionGeneration, ControllableComponentId,
-                    ControlDomainId, ControlDomainRevision, ProviderInstanceId, ProviderManifestId,
-                    ProviderManifestRevision, RuntimeUnitId, RuntimeEpoch>(),
-           py::arg("lifecycle_transaction_id"), py::arg("lifecycle_transaction_generation"),
-           py::arg("controllable_component_id"), py::arg("control_domain_id"),
-           py::arg("control_domain_revision"), py::arg("provider_instance_id"),
-           py::arg("provider_manifest_id"), py::arg("provider_manifest_revision"),
-           py::arg("provider_runtime_unit_id"), py::arg("provider_runtime_epoch"))
-      .def_readonly("lifecycle_transaction_id",
-                    &BrandLifecycleObservationQueryDTO::lifecycle_transaction_id)
-      .def_readonly("lifecycle_transaction_generation",
-                    &BrandLifecycleObservationQueryDTO::lifecycle_transaction_generation)
-      .def_readonly("controllable_component_id",
-                    &BrandLifecycleObservationQueryDTO::controllable_component_id)
-      .def_readonly("control_domain_id", &BrandLifecycleObservationQueryDTO::control_domain_id)
-      .def_readonly("control_domain_revision",
-                    &BrandLifecycleObservationQueryDTO::control_domain_revision)
-      .def_readonly("provider_instance_id",
-                    &BrandLifecycleObservationQueryDTO::provider_instance_id)
-      .def_readonly("provider_manifest_id",
-                    &BrandLifecycleObservationQueryDTO::provider_manifest_id)
-      .def_readonly("provider_manifest_revision",
-                    &BrandLifecycleObservationQueryDTO::provider_manifest_revision)
-      .def_readonly("provider_runtime_unit_id",
-                    &BrandLifecycleObservationQueryDTO::provider_runtime_unit_id)
-      .def_readonly("provider_runtime_epoch",
-                    &BrandLifecycleObservationQueryDTO::provider_runtime_epoch)
-      .def("locally_valid", &BrandLifecycleObservationQueryDTO::locally_valid)
       .def(py::self == py::self)
       .def(py::self != py::self);
 
@@ -589,161 +273,6 @@ void register_component_lifecycle_bindings(py::module_& module) {
           "facts",
           [](const BrandLifecycleObservationDTO& value) { return immutable_snapshot(value.facts); })
       .def("locally_valid", &BrandLifecycleObservationDTO::locally_valid)
-      .def("matches", &BrandLifecycleObservationDTO::matches)
-      .def(py::self == py::self)
-      .def(py::self != py::self);
-
-  py::class_<BrandLifecyclePrimitiveIntentDTO>(module, "BrandLifecyclePrimitiveIntentDTO",
-                                               py::is_final())
-      .def(py::init<LifecycleTransactionId, LifecycleTransactionGeneration, ControllableComponentId,
-                    ControlDomainId, ControlDomainRevision, ProviderInstanceId, ProviderManifestId,
-                    ProviderManifestRevision, RuntimeUnitId, RuntimeEpoch, LifecyclePrimitiveId,
-                    LifecyclePrimitiveAttemptId, std::uint64_t, std::int64_t,
-                    ComponentLifecycleStateDTO>(),
-           py::arg("lifecycle_transaction_id"), py::arg("lifecycle_transaction_generation"),
-           py::arg("controllable_component_id"), py::arg("control_domain_id"),
-           py::arg("control_domain_revision"), py::arg("provider_instance_id"),
-           py::arg("provider_manifest_id"), py::arg("provider_manifest_revision"),
-           py::arg("provider_runtime_unit_id"), py::arg("provider_runtime_epoch"),
-           py::arg("lifecycle_primitive_id"), py::arg("lifecycle_primitive_attempt_id"),
-           py::arg("expected_observation_generation"), py::arg("remaining_duration_ns"),
-           py::arg("requested_state"))
-      .def_readonly("lifecycle_transaction_id",
-                    &BrandLifecyclePrimitiveIntentDTO::lifecycle_transaction_id)
-      .def_readonly("lifecycle_transaction_generation",
-                    &BrandLifecyclePrimitiveIntentDTO::lifecycle_transaction_generation)
-      .def_readonly("controllable_component_id",
-                    &BrandLifecyclePrimitiveIntentDTO::controllable_component_id)
-      .def_readonly("control_domain_id", &BrandLifecyclePrimitiveIntentDTO::control_domain_id)
-      .def_readonly("control_domain_revision",
-                    &BrandLifecyclePrimitiveIntentDTO::control_domain_revision)
-      .def_readonly("provider_instance_id", &BrandLifecyclePrimitiveIntentDTO::provider_instance_id)
-      .def_readonly("provider_manifest_id", &BrandLifecyclePrimitiveIntentDTO::provider_manifest_id)
-      .def_readonly("provider_manifest_revision",
-                    &BrandLifecyclePrimitiveIntentDTO::provider_manifest_revision)
-      .def_readonly("provider_runtime_unit_id",
-                    &BrandLifecyclePrimitiveIntentDTO::provider_runtime_unit_id)
-      .def_readonly("provider_runtime_epoch",
-                    &BrandLifecyclePrimitiveIntentDTO::provider_runtime_epoch)
-      .def_readonly("lifecycle_primitive_id",
-                    &BrandLifecyclePrimitiveIntentDTO::lifecycle_primitive_id)
-      .def_readonly("lifecycle_primitive_attempt_id",
-                    &BrandLifecyclePrimitiveIntentDTO::lifecycle_primitive_attempt_id)
-      .def_readonly("expected_observation_generation",
-                    &BrandLifecyclePrimitiveIntentDTO::expected_observation_generation)
-      .def_readonly("remaining_duration_ns",
-                    &BrandLifecyclePrimitiveIntentDTO::remaining_duration_ns)
-      .def_readonly("requested_state", &BrandLifecyclePrimitiveIntentDTO::requested_state)
-      .def("locally_valid", &BrandLifecyclePrimitiveIntentDTO::locally_valid)
-      .def(py::self == py::self)
-      .def(py::self != py::self);
-
-  py::class_<LifecycleSubstepResultDTO>(module, "LifecycleSubstepResultDTO", py::is_final())
-      .def(py::init<LifecyclePrimitiveId, std::optional<LifecyclePrimitiveId>,
-                    LifecycleTransitionOutcomeDTO, std::int64_t, std::int64_t,
-                    std::optional<ErrorDTO>>(),
-           py::arg("substep_id"), py::arg("within"), py::arg("outcome"), py::arg("started_at_ns"),
-           py::arg("finished_at_ns"), py::arg("error") = std::nullopt)
-      .def_readonly("substep_id", &LifecycleSubstepResultDTO::substep_id)
-      .def_readonly("within", &LifecycleSubstepResultDTO::within)
-      .def_readonly("outcome", &LifecycleSubstepResultDTO::outcome)
-      .def_readonly("started_at_ns", &LifecycleSubstepResultDTO::started_at_ns)
-      .def_readonly("finished_at_ns", &LifecycleSubstepResultDTO::finished_at_ns)
-      .def_readonly("error", &LifecycleSubstepResultDTO::error)
-      .def("locally_valid", &LifecycleSubstepResultDTO::locally_valid)
-      .def(py::self == py::self)
-      .def(py::self != py::self);
-
-  py::class_<LifecycleSubstepEventDTO> substep_event(module, "LifecycleSubstepEventDTO",
-                                                     py::is_final());
-  py::enum_<LifecycleSubstepEventDTO::Phase>(substep_event, "Phase")
-      .value("kStarted", LifecycleSubstepEventDTO::Phase::kStarted)
-      .value("kFinished", LifecycleSubstepEventDTO::Phase::kFinished);
-  substep_event
-      .def(py::init<LifecyclePrimitiveAttemptId, LifecyclePrimitiveId,
-                    std::optional<LifecyclePrimitiveId>, LifecycleSubstepEventDTO::Phase,
-                    std::int64_t, std::optional<LifecycleTransitionOutcomeDTO>,
-                    std::optional<std::string>>(),
-           py::arg("attempt_id"), py::arg("substep_id"), py::arg("within"), py::arg("phase"),
-           py::arg("at_ns"), py::arg("outcome") = std::nullopt,
-           py::arg("error_code") = std::nullopt)
-      .def_readonly("attempt_id", &LifecycleSubstepEventDTO::attempt_id)
-      .def_readonly("substep_id", &LifecycleSubstepEventDTO::substep_id)
-      .def_readonly("within", &LifecycleSubstepEventDTO::within)
-      .def_readonly("phase", &LifecycleSubstepEventDTO::phase)
-      .def_readonly("at_ns", &LifecycleSubstepEventDTO::at_ns)
-      .def_readonly("outcome", &LifecycleSubstepEventDTO::outcome)
-      .def_readonly("error_code", &LifecycleSubstepEventDTO::error_code)
-      .def("locally_valid", &LifecycleSubstepEventDTO::locally_valid)
-      .def(py::self == py::self)
-      .def(py::self != py::self);
-
-  py::class_<LifecycleTransitionObservationDTO>(module, "LifecycleTransitionObservationDTO",
-                                                py::is_final())
-      .def(py::init<ComponentLifecycleStateDTO, std::vector<LifecycleFactDTO>, std::uint64_t,
-                    std::uint64_t, std::int64_t>(),
-           py::arg("observed_state"), py::arg("facts"), py::arg("observation_generation"),
-           py::arg("source_sequence"), py::arg("at_ns"))
-      .def_readonly("observed_state", &LifecycleTransitionObservationDTO::observed_state)
-      .def_property_readonly("facts",
-                             [](const LifecycleTransitionObservationDTO& value) {
-                               return immutable_snapshot(value.facts);
-                             })
-      .def_readonly("observation_generation",
-                    &LifecycleTransitionObservationDTO::observation_generation)
-      .def_readonly("source_sequence", &LifecycleTransitionObservationDTO::source_sequence)
-      .def_readonly("at_ns", &LifecycleTransitionObservationDTO::at_ns)
-      .def("locally_valid", &LifecycleTransitionObservationDTO::locally_valid)
-      .def(py::self == py::self)
-      .def(py::self != py::self);
-
-  py::class_<BrandLifecyclePrimitiveResultDTO>(module, "BrandLifecyclePrimitiveResultDTO",
-                                               py::is_final())
-      .def(py::init<LifecycleTransactionId, LifecycleTransactionGeneration, ControllableComponentId,
-                    ControlDomainId, ControlDomainRevision, ProviderInstanceId, ProviderManifestId,
-                    ProviderManifestRevision, RuntimeUnitId, RuntimeEpoch, LifecyclePrimitiveId,
-                    LifecyclePrimitiveAttemptId, std::uint64_t, LifecycleTransitionOutcomeDTO,
-                    std::optional<ErrorDTO>, std::vector<LifecycleSubstepResultDTO>>(),
-           py::arg("lifecycle_transaction_id"), py::arg("lifecycle_transaction_generation"),
-           py::arg("controllable_component_id"), py::arg("control_domain_id"),
-           py::arg("control_domain_revision"), py::arg("provider_instance_id"),
-           py::arg("provider_manifest_id"), py::arg("provider_manifest_revision"),
-           py::arg("provider_runtime_unit_id"), py::arg("provider_runtime_epoch"),
-           py::arg("lifecycle_primitive_id"), py::arg("lifecycle_primitive_attempt_id"),
-           py::arg("expected_observation_generation"), py::arg("outcome"),
-           py::arg("error") = std::nullopt,
-           py::arg("substeps") = std::vector<LifecycleSubstepResultDTO>{})
-      .def_readonly("lifecycle_transaction_id",
-                    &BrandLifecyclePrimitiveResultDTO::lifecycle_transaction_id)
-      .def_readonly("lifecycle_transaction_generation",
-                    &BrandLifecyclePrimitiveResultDTO::lifecycle_transaction_generation)
-      .def_readonly("controllable_component_id",
-                    &BrandLifecyclePrimitiveResultDTO::controllable_component_id)
-      .def_readonly("control_domain_id", &BrandLifecyclePrimitiveResultDTO::control_domain_id)
-      .def_readonly("control_domain_revision",
-                    &BrandLifecyclePrimitiveResultDTO::control_domain_revision)
-      .def_readonly("provider_instance_id", &BrandLifecyclePrimitiveResultDTO::provider_instance_id)
-      .def_readonly("provider_manifest_id", &BrandLifecyclePrimitiveResultDTO::provider_manifest_id)
-      .def_readonly("provider_manifest_revision",
-                    &BrandLifecyclePrimitiveResultDTO::provider_manifest_revision)
-      .def_readonly("provider_runtime_unit_id",
-                    &BrandLifecyclePrimitiveResultDTO::provider_runtime_unit_id)
-      .def_readonly("provider_runtime_epoch",
-                    &BrandLifecyclePrimitiveResultDTO::provider_runtime_epoch)
-      .def_readonly("lifecycle_primitive_id",
-                    &BrandLifecyclePrimitiveResultDTO::lifecycle_primitive_id)
-      .def_readonly("lifecycle_primitive_attempt_id",
-                    &BrandLifecyclePrimitiveResultDTO::lifecycle_primitive_attempt_id)
-      .def_readonly("expected_observation_generation",
-                    &BrandLifecyclePrimitiveResultDTO::expected_observation_generation)
-      .def_readonly("outcome", &BrandLifecyclePrimitiveResultDTO::outcome)
-      .def_readonly("error", &BrandLifecyclePrimitiveResultDTO::error)
-      .def_property_readonly("substeps",
-                             [](const BrandLifecyclePrimitiveResultDTO& value) {
-                               return immutable_snapshot(value.substeps);
-                             })
-      .def("locally_valid", &BrandLifecyclePrimitiveResultDTO::locally_valid)
-      .def("matches", &BrandLifecyclePrimitiveResultDTO::matches)
       .def(py::self == py::self)
       .def(py::self != py::self);
 
@@ -1004,140 +533,6 @@ void register_component_lifecycle_bindings(py::module_& module) {
       .def("locally_valid", &StopCertificateRefDTO::locally_valid)
       .def(py::self == py::self)
       .def(py::self != py::self);
-
-  py::class_<ComponentLifecycleDomainStatusDTO>(module, "ComponentLifecycleDomainStatusDTO",
-                                                py::is_final())
-      .def(py::init<ControlDomainId, std::optional<ExpectedControlDomainRevisionDTO>,
-                    std::optional<ResolvedLifecycleControlDomainScopeDTO>,
-                    std::optional<ResolvedLifecycleProviderOccurrenceDTO>,
-                    std::optional<ComponentLifecycleStateDTO>,
-                    std::optional<ComponentLifecycleStateDTO>, ComponentLifecycleRequestedStateDTO,
-                    ComponentLifecycleDomainActionStateDTO,
-                    std::vector<BrandLifecyclePrimitiveResultDTO>, std::optional<ErrorDTO>,
-                    std::vector<LifecycleSubstepEventDTO>,
-                    std::optional<LifecycleTransitionObservationDTO>,
-                    std::optional<LifecycleTransitionObservationDTO>>(),
-           py::arg("control_domain_id"), py::arg("expected_domain"), py::arg("current_scope"),
-           py::arg("resolved_provider_occurrence"), py::arg("previous_state"),
-           py::arg("current_state"), py::arg("requested_state"), py::arg("action_state"),
-           py::arg("primitive_attempts"), py::arg("error"),
-           py::arg("substep_events") = std::vector<LifecycleSubstepEventDTO>{},
-           py::arg("observed_before") = std::nullopt, py::arg("observed_after") = std::nullopt)
-      .def_readonly("control_domain_id", &ComponentLifecycleDomainStatusDTO::control_domain_id)
-      .def_readonly("expected_domain", &ComponentLifecycleDomainStatusDTO::expected_domain)
-      .def_readonly("current_scope", &ComponentLifecycleDomainStatusDTO::current_scope)
-      .def_readonly("resolved_provider_occurrence",
-                    &ComponentLifecycleDomainStatusDTO::resolved_provider_occurrence)
-      .def_readonly("previous_state", &ComponentLifecycleDomainStatusDTO::previous_state)
-      .def_readonly("current_state", &ComponentLifecycleDomainStatusDTO::current_state)
-      .def_readonly("requested_state", &ComponentLifecycleDomainStatusDTO::requested_state)
-      .def_readonly("action_state", &ComponentLifecycleDomainStatusDTO::action_state)
-      .def_property_readonly("primitive_attempts",
-                             [](const ComponentLifecycleDomainStatusDTO& value) {
-                               return immutable_snapshot(value.primitive_attempts);
-                             })
-      .def_readonly("error", &ComponentLifecycleDomainStatusDTO::error)
-      .def_property_readonly("substep_events",
-                             [](const ComponentLifecycleDomainStatusDTO& value) {
-                               return immutable_snapshot(value.substep_events);
-                             })
-      .def_readonly("observed_before", &ComponentLifecycleDomainStatusDTO::observed_before)
-      .def_readonly("observed_after", &ComponentLifecycleDomainStatusDTO::observed_after)
-      .def("locally_valid", &ComponentLifecycleDomainStatusDTO::locally_valid)
-      .def(py::self == py::self)
-      .def(py::self != py::self);
-
-  py::class_<ComponentLifecycleStatusDTO>(module, "ComponentLifecycleStatusDTO", py::is_final())
-      .def(py::init<ComponentLifecycleAcceptedDTO, ComponentLifecycleIntentDTO, std::uint64_t,
-                    RequestOwnerEpoch, std::optional<ComponentLifecycleStateDTO>,
-                    std::optional<ComponentLifecycleStateDTO>, ComponentLifecycleRequestedStateDTO,
-                    ComponentLifecycleTransactionPhaseDTO,
-                    std::vector<ComponentLifecycleDomainStatusDTO>, bool, std::optional<ComponentLifecycleTerminalResultDTO>,
-                    std::optional<ErrorDTO>, std::int64_t, std::int64_t, std::int64_t>(),
-           py::arg("acceptance"), py::arg("accepted_intent"), py::arg("status_sequence"),
-           py::arg("status_owner_epoch"), py::arg("previous_state"), py::arg("current_state"),
-           py::arg("requested_state"), py::arg("phase"), py::arg("domains"),
-           py::arg("reconciliation_required"),
-           py::arg("terminal_result"), py::arg("error"), py::arg("accepted_at_ns"),
-           py::arg("latest_updated_at_ns"), py::arg("remaining_duration_ns"))
-      .def_readonly("acceptance", &ComponentLifecycleStatusDTO::acceptance)
-      .def_readonly("accepted_intent", &ComponentLifecycleStatusDTO::accepted_intent)
-      .def_readonly("status_sequence", &ComponentLifecycleStatusDTO::status_sequence)
-      .def_readonly("status_owner_epoch", &ComponentLifecycleStatusDTO::status_owner_epoch)
-      .def_readonly("previous_state", &ComponentLifecycleStatusDTO::previous_state)
-      .def_readonly("current_state", &ComponentLifecycleStatusDTO::current_state)
-      .def_readonly("requested_state", &ComponentLifecycleStatusDTO::requested_state)
-      .def_readonly("phase", &ComponentLifecycleStatusDTO::phase)
-      .def_property_readonly("domains",
-                             [](const ComponentLifecycleStatusDTO& value) {
-                               return immutable_snapshot(value.domains);
-                             })
-      .def_readonly("reconciliation_required",
-                    &ComponentLifecycleStatusDTO::reconciliation_required)
-      .def_readonly("terminal_result", &ComponentLifecycleStatusDTO::terminal_result)
-      .def_readonly("error", &ComponentLifecycleStatusDTO::error)
-      .def_readonly("accepted_at_ns", &ComponentLifecycleStatusDTO::accepted_at_ns)
-      .def_readonly("latest_updated_at_ns", &ComponentLifecycleStatusDTO::latest_updated_at_ns)
-      .def_readonly("remaining_duration_ns", &ComponentLifecycleStatusDTO::remaining_duration_ns)
-      .def("locally_valid", &ComponentLifecycleStatusDTO::locally_valid)
-      .def(py::self == py::self)
-      .def(py::self != py::self);
-
-  py::class_<CCLCLifecycleRequestResultDTO>(module, "CCLCLifecycleRequestResultDTO", py::is_final())
-      .def(py::init<RequestReplayStatusDTO, std::optional<ComponentLifecycleAcceptedDTO>,
-                    std::optional<ComponentLifecycleStatusDTO>, std::optional<ErrorDTO>>(),
-           py::arg("replay_status"), py::arg("acceptance") = std::nullopt,
-           py::arg("status") = std::nullopt, py::arg("rejection") = std::nullopt)
-      .def_readonly("replay_status", &CCLCLifecycleRequestResultDTO::replay_status)
-      .def_readonly("acceptance", &CCLCLifecycleRequestResultDTO::acceptance)
-      .def_readonly("status", &CCLCLifecycleRequestResultDTO::status)
-      .def_readonly("rejection", &CCLCLifecycleRequestResultDTO::rejection)
-      .def("locally_valid", &CCLCLifecycleRequestResultDTO::locally_valid);
-
-  py::class_<RouteSelectionComponentExpectationDTO>(module, "RouteSelectionComponentExpectationDTO",
-                                                    py::is_final())
-      .def(py::init<ControllableComponentId, ComponentLifecycleGeneration,
-                    ComponentLifecycleStateDTO>(),
-           py::arg("controllable_component_id"), py::arg("expected_component_lifecycle_generation"),
-           py::arg("expected_component_lifecycle_state"))
-      .def_readonly("controllable_component_id",
-                    &RouteSelectionComponentExpectationDTO::controllable_component_id)
-      .def_readonly("expected_component_lifecycle_generation",
-                    &RouteSelectionComponentExpectationDTO::expected_component_lifecycle_generation)
-      .def_readonly("expected_component_lifecycle_state",
-                    &RouteSelectionComponentExpectationDTO::expected_component_lifecycle_state)
-      .def("locally_valid", &RouteSelectionComponentExpectationDTO::locally_valid)
-      .def(py::self == py::self);
-
-  py::class_<RouteSelectionIntentDTO>(module, "RouteSelectionIntentDTO", py::is_final())
-      .def(py::init<PublicRequestContextDTO, RetainedBundleId, GraphRevision,
-                    DesiredControlConfigurationDTO, ExpectedActiveControlConfigurationDTO,
-                    std::vector<RouteSelectionComponentExpectationDTO>, RequestAttributionDTO,
-                    std::optional<AdmissionGeneration>,
-                    std::optional<ProgramNodeAdmissionEvidenceDTO>>(),
-           py::arg("request_context"), py::arg("expected_retained_bundle_id"),
-           py::arg("expected_graph_revision"), py::arg("desired_configuration"),
-           py::arg("expected_active_control_configuration"), py::arg("component_expectations"),
-           py::arg("attribution"), py::arg("expected_admission_generation") = std::nullopt,
-           py::arg("program_node_evidence") = std::nullopt)
-      .def_readonly("request_context", &RouteSelectionIntentDTO::request_context)
-      .def_readonly("expected_retained_bundle_id",
-                    &RouteSelectionIntentDTO::expected_retained_bundle_id)
-      .def_readonly("expected_graph_revision", &RouteSelectionIntentDTO::expected_graph_revision)
-      .def_readonly("desired_configuration", &RouteSelectionIntentDTO::desired_configuration)
-      .def_readonly("expected_active_control_configuration",
-                    &RouteSelectionIntentDTO::expected_active_control_configuration)
-      .def_property_readonly("component_expectations",
-                             [](const RouteSelectionIntentDTO& value) {
-                               return immutable_snapshot(value.component_expectations);
-                             })
-      .def_readonly("attribution", &RouteSelectionIntentDTO::attribution)
-      .def_readonly("expected_admission_generation",
-                    &RouteSelectionIntentDTO::expected_admission_generation)
-      .def_readonly("program_node_evidence", &RouteSelectionIntentDTO::program_node_evidence)
-      .def("locally_valid", &RouteSelectionIntentDTO::locally_valid)
-      .def("replay_equal", &RouteSelectionIntentDTO::replay_equal)
-      .def(py::self == py::self);
 }
 
 }  // namespace manyforge::core::python

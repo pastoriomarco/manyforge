@@ -76,18 +76,6 @@ StopAcceptedValue(const core::StopAcceptedDTO &value);
 [[nodiscard]] std::string_view
 StopStatusStateName(const core::StopStatusStateDTO state) noexcept;
 
-[[nodiscard]] std::string_view
-StopFaultTriggerName(const core::StopFaultTriggerDTO trigger) noexcept;
-
-[[nodiscard]] std::string_view
-StopFaultLatchStateName(const core::StopFaultLatchStateDTO state) noexcept;
-
-[[nodiscard]] std::string_view StopFaultRecoveryStatusName(
-    const core::StopFaultRecoveryStatusDTO status) noexcept;
-
-[[nodiscard]] std::string_view StopFaultRecoveryEvidenceKindName(
-    const core::StopFaultRecoveryEvidenceKindDTO kind) noexcept;
-
 [[nodiscard]] CanonicalValue
 StopCertificateRefValue(const core::StopCertificateRefDTO &value);
 
@@ -103,20 +91,6 @@ StopStatusSummaryValue(const core::StopStatusDTO &value);
 
 [[nodiscard]] CanonicalValue
 StopProjectionStatusValue(const core::StopDurableProjectionStatusDTO &value);
-
-[[nodiscard]] CanonicalValue
-StopFaultLatchValue(const core::StopFaultLatchDTO &value);
-
-[[nodiscard]] CanonicalValue
-GlobalIoRuleRecoveryOfferValue(const core::IoGlobalRuleRecoveryOfferDTO &offer);
-[[nodiscard]] CanonicalValue
-GlobalIoRuleRecoveryResultValue(const core::IoGlobalRuleRecoveryResultDTO &result);
-
-[[nodiscard]] CanonicalValue
-StopFaultOfferValue(const core::StopFaultRecoveryOfferDTO &offer);
-
-[[nodiscard]] CanonicalValue
-StopFaultRecoveryResultValue(const core::StopFaultRecoveryResultDTO &value);
 
 [[nodiscard]] std::string_view
 StopCertificateResultName(core::StopCertificateResultDTO result) noexcept;
@@ -177,18 +151,11 @@ StopHistoryAttemptValue(const core::StopAttemptedStageResultDTO &attempt,
 [[nodiscard]] CanonicalValue
 StopHistorySettlementValue(const core::StopScopeEntryDTO &entry);
 
-[[nodiscard]] CanonicalValue
-StopHistoryFaultValue(const std::optional<core::StopFaultLatchDTO> &fault);
-
 [[nodiscard]] CanonicalValue StopTerminalHistoryProjectionValue(
     const core::StopJournalTerminalProjectionDTO &projection,
     const std::string_view source_owner_epoch,
     const std::string_view durable_projection_digest,
     const bool include_details);
-
-[[nodiscard]] CanonicalValue StopFaultClearHistoryProjectionValue(
-    const core::StopJournalFaultClearProjectionDTO &projection,
-    const std::string_view source_owner_epoch);
 
 [[nodiscard]] CanonicalValue BoundedStopTerminalHistoryProjectionValue(
     const core::StopJournalTerminalProjectionDTO &projection,
@@ -238,6 +205,23 @@ IoSourceCursorValue(const core::IoSourceCursorDTO &value);
 
 [[nodiscard]] CanonicalValue IoSignalObservationValue(
     const core::IoSignalObservationDTO& value);
+
+/// CONTRACTS §1-§5, §7, §8 wire values (JSON, snake_case, `*_ns`).
+[[nodiscard]] CanonicalValue FaultValue(const core::Fault& fault);
+[[nodiscard]] CanonicalValue ActionResultValue(const core::ActionResult& result);
+[[nodiscard]] CanonicalValue ComponentStateValue(const core::ComponentState& state);
+[[nodiscard]] CanonicalValue CellLatchValue(const core::CellLatch& latch);
+/// The Kernel's `ReadRuleHolds()` rows as errors: `{code, message,
+/// details: {rule_id}}`.
+[[nodiscard]] CanonicalValue RuleHoldsValue(const std::vector<core::ErrorDTO>& holds);
+/// A signal's wire id: `<controllable_component_id>/<signal_name>`.
+[[nodiscard]] std::string SignalIdText(const core::IoSignalId& signal);
+[[nodiscard]] std::optional<core::IoSignalId> ParseSignalIdText(std::string_view text);
+/// `controller_owned` is present on outputs only (CONTRACTS §7); `age_ns`
+/// only with `age` (the event stream's state compares samples without it).
+[[nodiscard]] CanonicalValue SignalSampleValue(const core::SignalSample& sample,
+                                               const core::IoSignalDescriptorDTO& descriptor,
+                                               bool age = true);
 [[nodiscard]] CanonicalValue IoWatchRegistrationValue(
     const core::IoWatchRegistrationDTO& value);
 [[nodiscard]] CanonicalValue IoWatchResultValue(

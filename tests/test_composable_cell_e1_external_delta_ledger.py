@@ -240,16 +240,16 @@ def test_clearance_margin_patch_is_carried_with_dossier_and_build_digest(
     tmp_path: Path,
 ) -> None:
     """M6 clearance: patch 0015 is in the checked manifest, its ledger delta and
-    dossier exist, and the recorded build-content digest is the 0010-0015 tree."""
+    dossier exist, and the recorded build-content digest is the patched 0.8 tree."""
 
-    patch = "patches/0015-roboplan-070-scene-collision-pair-margins.patch"
+    patch = "patches/0015-roboplan-080-scene-collision-pair-margins.patch"
     manifest = [
         line.split()
         for line in (_PATCH_ROOT / "patches.sha256").read_text(encoding="utf-8").splitlines()
     ]
-    assert manifest[-1][1] == patch
+    digest = dict((relative, sha) for sha, relative in manifest)[patch]
     body = (_PATCH_ROOT / patch).read_text(encoding="utf-8")
-    assert hashlib.sha256(body.encode("utf-8")).hexdigest() == manifest[-1][0]
+    assert hashlib.sha256(body.encode("utf-8")).hexdigest() == digest
     touched = set(re.findall(r"^diff --git a/(\S+) ", body, re.MULTILINE))
     assert touched == {
         "roboplan_core/include/roboplan/core/scene.hpp",
@@ -268,10 +268,10 @@ def test_clearance_margin_patch_is_carried_with_dossier_and_build_digest(
         for row in ledger["deltas"]
         if row["id"] == "roboplan_patch_0015_scene_collision_pair_margins"
     )
-    assert delta["local_sources"][0]["sha256"] == manifest[-1][0]
+    assert delta["local_sources"][0]["sha256"] == digest
     assert (_REPO_ROOT / delta["disposition"]["upstream_dossier"]).is_file()
 
-    # When setup-docker has materialized the exact source, the six-patch series
+    # When setup-docker has materialized the exact source, the patch series
     # applies in manifest order, as both Dockerfiles do (umask 0002), and yields
     # the recorded build-content digest.
     source = _REPO_ROOT / ".docker" / "roboplan"
@@ -295,7 +295,7 @@ def test_clearance_margin_patch_is_carried_with_dossier_and_build_digest(
             "--ledger",
             str(_LEDGER),
             "--source-id",
-            "roboplan_0_7_0_ua1_foundation",
+            "roboplan_0_8_0_foundation",
             "--root",
             str(root),
             "--content-kind",

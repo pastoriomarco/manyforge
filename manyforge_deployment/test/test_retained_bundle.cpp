@@ -19,7 +19,7 @@
 #include <utility>
 #include <vector>
 
-#include "native_execution_runtime_unit_internal.hpp"
+#include "execution_host_unit_internal.hpp"
 #include "planning_resource_map_internal.hpp"
 #include "retained_bundle_internal.hpp"
 #include "retention_store_fixtures.hpp"

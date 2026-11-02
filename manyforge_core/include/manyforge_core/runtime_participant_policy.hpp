@@ -12,12 +12,11 @@
 
 namespace manyforge::core {
 
-/// Cold-resolved Deployment choice for one physical motion target. Source
-/// import/preset resolution belongs to Deployment; no defaults are calculated
+/// Cold-resolved Deployment choice for one physical motion target. Typed value
+/// or preset resolution belongs to Deployment; no defaults are calculated
 /// during admission. This is private policy, not caller-supplied motion intent.
 struct OrdinaryMotionJerkPolicy final {
   bool enabled{};
-  bool machine_required{};
   std::map<std::string, CoordinateJerkDTO, std::less<>> limits;
 
   friend bool operator==(const OrdinaryMotionJerkPolicy&,
@@ -69,7 +68,7 @@ class RuntimeParticipantPolicySelection final {
     const RuntimeParticipantBinding& participant);
 
 /// Seal the independently compiled ordinary-motion profile against its exact
-/// target and source-joint scope. Required equipment limits cannot be disabled.
+/// target and source-joint scope.
 [[nodiscard]] Result<RuntimeParticipantPolicySelection> apply_deployment_motion_jerk_policy(
     const RuntimeParticipantPolicySelection& selection, const RuntimeParticipantBinding& binding,
     OrdinaryMotionJerkPolicy profile);

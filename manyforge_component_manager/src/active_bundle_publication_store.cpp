@@ -1189,8 +1189,12 @@ class SqliteActiveBundlePublicationStore::Impl final {
         "FROM active_bundle_publication_receipts "
         "ORDER BY publication_generation LIMIT ?");
     rows.Bind(1, kMaximumActiveBundlePublicationReceipts + 1);
+    // Eviction removes the oldest receipts, so the retained receipts are one
+    // contiguous generation window ending at the head (starting at 1 until the
+    // first eviction).
     std::optional<StoredReceipt> last;
     std::int64_t observed_count = 0;
+    std::int64_t first_generation = 0;
     while (rows.Step()) {
       ++observed_count;
       if (observed_count > kMaximumActiveBundlePublicationReceipts) {
@@ -1200,18 +1204,20 @@ class SqliteActiveBundlePublicationStore::Impl final {
       auto receipt = ReceiptFromRow(rows);
       const auto generation = static_cast<std::int64_t>(
           receipt.receipt.publication_generation.value());
+      if (observed_count == 1)
+        first_generation = generation;
       const bool bootstrap =
           std::holds_alternative<BootstrapPublicationTransactionDTO>(
               receipt.receipt.request.transaction_ref);
-      if (generation != observed_count ||
-          bootstrap != (observed_count == 1) ||
+      if (generation != first_generation + observed_count - 1 ||
+          bootstrap != (generation == 1) ||
           receipt.receipt.request
                   .expected_previous_publication_generation.has_value() !=
-              (observed_count != 1) ||
-          (observed_count != 1 &&
+              (generation != 1) ||
+          (generation != 1 &&
            receipt.receipt.request
                    .expected_previous_publication_generation->value() !=
-               static_cast<std::uint64_t>(observed_count - 1))) {
+               static_cast<std::uint64_t>(generation - 1))) {
         throw ActiveBundlePublicationIntegrityError(
             "publication receipt chain is not contiguous");
       }
@@ -1287,11 +1293,6 @@ class SqliteActiveBundlePublicationStore::Impl final {
       transaction.Commit();
       return existing->receipt;
     }
-    if (integrity.receipt_count >=
-        kMaximumActiveBundlePublicationReceipts) {
-      throw ActiveBundlePublicationLimitError(
-          "active-bundle publication receipt limit is exhausted");
-    }
     const auto current_generation =
         static_cast<std::int64_t>(integrity.current_generation.value());
     if (encoded.expected_previous_generation != current_generation) {
@@ -1312,6 +1313,23 @@ class SqliteActiveBundlePublicationStore::Impl final {
     const auto publication_generation = current_generation + 1;
     const auto pointer_digest = PublicPointerDigest(
         cell_id_, publication_generation, request_digest);
+    // Bound by eviction, never refusal: drop the oldest receipt in this same
+    // transaction. It is never the head (the inventory is full), and no
+    // reader needs it: Read and the read-only reader answer only for the
+    // head (an older generation is stale_generation either way), and exact
+    // Publish replay matters only for the in-flight transaction, whose
+    // receipt is the head or not yet written. A replay of an evicted old
+    // transaction cannot republish: its expected previous generation is
+    // older than the head, so the compare-and-swap below refuses it.
+    if (integrity.receipt_count >=
+        kMaximumActiveBundlePublicationReceipts) {
+      Statement evict(
+          database_,
+          "DELETE FROM active_bundle_publication_receipts WHERE "
+          "publication_generation=(SELECT MIN(publication_generation) FROM "
+          "active_bundle_publication_receipts)");
+      static_cast<void>(evict.Step());
+    }
 
     Statement insert(
         database_,
@@ -1407,7 +1425,8 @@ class SqliteActiveBundlePublicationStore::Impl final {
           "SELECT COUNT(*) FROM active_bundle_publication_receipts");
       if (receipt_count < 0 ||
           receipt_count > kMaximumActiveBundlePublicationReceipts ||
-          receipt_count != head.generation) {
+          receipt_count > head.generation ||
+          (receipt_count == 0) != (head.generation == 0)) {
         throw ActiveBundlePublicationIntegrityError(
             "active-bundle publication head and receipt cardinality "
             "disagree");
@@ -1427,7 +1446,9 @@ class SqliteActiveBundlePublicationStore::Impl final {
       const auto receipt = ReceiptByGenerationLocked(
           static_cast<std::int64_t>(generation.value()));
       transaction.Commit();
-      if (!receipt.has_value()) {
+      // An evicted older generation is still answered as stale.
+      if (!receipt.has_value() &&
+          static_cast<std::int64_t>(generation.value()) >= head.generation) {
         return Result<ActiveBundlePublicationReceiptDTO>::Err(ErrorDTO{
             "missing_reference",
             "active-bundle publication generation is not present",

@@ -45,7 +45,7 @@ def _geometric_candidate(project: Path) -> Path:
     contact["freshness"] = {"mode": "sample_age", "maximum_age_ns": 5_000_000_000}
     candidate = build_scenario_document(
         scenario_id=SCENARIO_ID,
-        name="Geometric input retained Apply (process test)",
+        name=SCENARIO_ID,
         description="Adds the first geometric input to a retained robot cell.",
         program_draft=original["program_draft"],
         deployment_draft=deployment,
@@ -53,7 +53,9 @@ def _geometric_candidate(project: Path) -> Path:
         manyforge_version=(REPOSITORY_ROOT / "VERSION").read_text(encoding="utf-8").strip(),
         last_known_status="unknown",
     )
-    target = directory / f"{SCENARIO_ID}.geometric-apply.scenario"
+    # Same Scenario identity at a second path: folder, id and name are one name.
+    target = directory / "geometric-apply" / f"{SCENARIO_ID}.scenario"
+    target.parent.mkdir()
     save_scenario_artifact(
         candidate, str(target), allowed_roots=[str(directory)], overwrite=False,
         source_project_path=str(project),
@@ -68,12 +70,9 @@ def test_first_geometric_profile_recollects_retained_cell_sources() -> None:
         components = _activate_loaded_components(stack)
         assert {"lite6_robot", "lite_gripper", "station_io"}.issubset(components)
         _wait_components_reached_requested_target(stack, components)
-        with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
-            before = {
-                component: headless.cclc_component(component)["provider_occurrences"]
-                for component in ("lite6_robot", "lite_gripper")
-            }
 
+        # Load is Close, then Apply of the file (CONTRACTS §11): every
+        # component comes back prepared and is enabled again.
         candidate = _geometric_candidate(project)
         _disable_for_reload(stack, "station_io")
         applied = _load(stack, candidate, activate_components=False)
@@ -82,9 +81,6 @@ def test_first_geometric_profile_recollects_retained_cell_sources() -> None:
         assert applied["retained_bundle_id"] != before_apply["retained_bundle_id"]
 
         with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
-            for component, occurrences in before.items():
-                current = headless.cclc_component(component)
-                assert current["provider_occurrences"] == occurrences, current
             owner = headless.execution_identity()["identity"]["owner_epoch"]
             request = {
                 "schema_version": "manyforge.target_observation_query.v1",

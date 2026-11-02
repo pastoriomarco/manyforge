@@ -31,7 +31,6 @@ std::shared_ptr<core::IoActivationRuleCatalogDTO> Catalog() {
        std::make_shared<const core::CheckedIoCondition>(checked.value()),
        {core::InterruptSourceId("program.blackboard")},
        core::IoActivationAllMotionScopeDTO{},
-       std::nullopt,
        1,
        std::nullopt});
   catalog->referenced_program_blackboard_keys = {"permit"};
@@ -45,9 +44,7 @@ std::shared_ptr<core::IoRuleWaitingForProgramCatalogDTO> WaitingCatalog() {
            core::RetainedBundleId("bundle.actual"),
            core::GraphRevision("graph.actual")},
           {{core::InterruptPolicyId("global.waiting"), nullptr, {},
-            core::IoActivationAllMotionScopeDTO{}, std::nullopt, 1,
-            std::nullopt,
-            core::InterruptPostLatchDisposition::kAwaitOperatorAck,
+            core::IoActivationAllMotionScopeDTO{}, 1, std::nullopt,
             {"permit", "ready"}}}});
 }
 
@@ -375,7 +372,7 @@ TEST(GlobalRuleEventResponseTest,
 
 TEST(GlobalRuleEventResponseTest, NotifyUnknownIncludesTypedReasonAndCatalogIdentity) {
   const auto catalog = Catalog();
-  catalog->rules.front().notify_on_trip = true;
+  catalog->rules.front().on_trip = core::IoRuleOnTripDTO::kNotify;
   core::IoRuleStateBaselineDTO baseline{
       catalog->context, 2U,
       {{catalog->rules.front().policy_id, core::IoGlobalRuleState::kUnknown,
@@ -391,6 +388,57 @@ TEST(GlobalRuleEventResponseTest, NotifyUnknownIncludesTypedReasonAndCatalogIden
   const auto &reason = *row.find_object_member("unavailable_reason");
   EXPECT_EQ(reason.find_object_member("code")->as_string(), "io_watch_bound_exceeded");
   EXPECT_EQ(reason.find_object_member("details")->find_object_member("limit")->as_string(), "4");
+}
+
+// CONTRACTS §1, §4, §16: a member's state names its owner and role; an
+// owner's fault lists the members it concerns; both are absent otherwise.
+TEST(ComponentStateResponseTest, CarriesOwnerRoleAndFaultConcerns) {
+  core::ComponentState member;
+  member.component_id = "lite6_robot";
+  member.owner_id = "lite6";
+  member.role = "arm";
+  member.lifecycle = core::ComponentLifecycle::kOffline;
+  member.reason = core::ComponentStateReason{"owner_unavailable", "through lite6: rebooting"};
+  const auto value = ComponentStateValue(member);
+  EXPECT_EQ(value.find_object_member("owner_id")->as_string(), "lite6");
+  EXPECT_EQ(value.find_object_member("role")->as_string(), "arm");
+  EXPECT_EQ(value.find_object_member("reason")->find_object_member("code")->as_string(),
+            "owner_unavailable");
+
+  core::ComponentState owner;
+  owner.component_id = "lite6";
+  owner.lifecycle = core::ComponentLifecycle::kFault;
+  owner.fault = core::Fault{core::FaultCode::kVendorFault, "C33", true,
+                            core::FaultOperatorAction::kRecover, "C33", "I/O module",
+                            {"lite6_robot_controller_io"}, 0};
+  const auto owned = ComponentStateValue(owner);
+  EXPECT_EQ(owned.find_object_member("owner_id"), nullptr);
+  EXPECT_EQ(owned.find_object_member("role"), nullptr);
+  const auto *concerns = owned.find_object_member("fault")->find_object_member("concerns");
+  ASSERT_NE(concerns, nullptr);
+  ASSERT_EQ(concerns->as_array().size(), 1U);
+  EXPECT_EQ(concerns->as_array()[0].as_string(), "lite6_robot_controller_io");
+
+  owner.fault->concerns.clear();
+  EXPECT_EQ(ComponentStateValue(owner).find_object_member("fault")->find_object_member("concerns"),
+            nullptr);
+}
+
+TEST(ComponentStateResponseTest, CarriesAdapterDetailsInOrderOnlyWhenPresent) {
+  core::ComponentState state;
+  state.component_id = "lite6";
+  state.lifecycle = core::ComponentLifecycle::kPrepared;
+  EXPECT_EQ(ComponentStateValue(state).find_object_member("details"), nullptr);
+
+  state.details = {{"mode", "position"}, {"state", "ready"}};
+  const auto value = ComponentStateValue(state);
+  const auto *details = value.find_object_member("details");
+  ASSERT_NE(details, nullptr);
+  ASSERT_EQ(details->as_array().size(), 2U);
+  EXPECT_EQ(details->as_array()[0].find_object_member("name")->as_string(), "mode");
+  EXPECT_EQ(details->as_array()[0].find_object_member("value")->as_string(), "position");
+  EXPECT_EQ(details->as_array()[1].find_object_member("name")->as_string(), "state");
+  EXPECT_EQ(details->as_array()[1].find_object_member("value")->as_string(), "ready");
 }
 
 } // namespace

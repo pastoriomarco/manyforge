@@ -11,6 +11,8 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
+#include <variant>
 #include <vector>
 
 namespace manyforge::core {
@@ -35,6 +37,16 @@ enum class IoFreshnessMode { kSampleAge, kProviderValidity };
 /// Receipt/liveness evidence is independent of whether a value changes.
 enum class IoSignalLivenessMode { kInProcess, kPeriodic, kChangeOnly };
 
+/// CONTRACTS §7 sample source: `device` = read from the device;
+/// `manyforge_write` = our accepted write, not yet seen differently; `outside`
+/// = changed outside ManyForge; `last_write` = no read-back exists, so this is
+/// the last accepted write. Adapters report it; the core never infers it.
+enum class IoSignalSampleSource { kDevice, kManyforgeWrite, kOutside, kLastWrite };
+
+/// The core-held signal of an output with read-back that isn't controller
+/// owned (CONTRACTS §7, plan V2-7) is named `<output name>` + this suffix.
+inline constexpr std::string_view kChangedOutsideSignalSuffix = ".changed_outside";
+
 struct IoFreshnessContractDTO final {
   IoFreshnessMode mode;
   std::optional<Duration> maximum_age_ns;
@@ -53,8 +65,32 @@ struct IoSignalDescriptorDTO final {
   /// Required for inputs, absent for outputs. Source-kind qualification supplies
   /// this value; periodic inputs use freshness.maximum_age_ns as their sole budget.
   std::optional<IoSignalLivenessMode> liveness{};
+  /// Outputs only (CONTRACTS §7): read-only for ManyForge; writes are refused
+  /// before sending with `io_output_controller_owned`.
+  bool controller_owned{false};
+  /// Outputs only: the owning component declares `io_output_readback`. With
+  /// read-back and not controller owned, the core holds the output's
+  /// `changed_outside` signal.
+  bool readback{false};
   friend bool operator==(const IoSignalDescriptorDTO&, const IoSignalDescriptorDTO&) = default;
 };
+
+[[nodiscard]] inline bool HoldsChangedOutside(const IoSignalDescriptorDTO& descriptor) {
+  return descriptor.direction == IoSignalDirection::kOutput && descriptor.readback &&
+         !descriptor.controller_owned;
+}
+
+/// `<signal_id>.changed_outside`: an in-process boolean input of the output's
+/// component, on its own core-held source (conditions name both).
+[[nodiscard]] inline IoSignalId ChangedOutsideSignalId(const IoSignalId& output) {
+  return {output.controllable_component_id,
+          output.name + std::string(kChangedOutsideSignalSuffix)};
+}
+
+[[nodiscard]] inline InterruptSourceId ChangedOutsideSourceId(const IoSignalId& output) {
+  return InterruptSourceId("core.changed_outside." + output.controllable_component_id.value() +
+                           "." + output.name);
+}
 
 /// Owner identity and generation come from existing host/activation authority.
 struct IoSignalCatalogDTO final {
@@ -85,6 +121,7 @@ struct IoSignalUpdateDTO final {
   IoSampleValidity validity;
   std::optional<bool> value;
   std::optional<ErrorDTO> error;
+  IoSignalSampleSource source{IoSignalSampleSource::kDevice};
   friend bool operator==(const IoSignalUpdateDTO&, const IoSignalUpdateDTO&) = default;
 };
 
@@ -109,6 +146,7 @@ struct IoSignalPublicationDTO final {
   IoSampleValidity validity;
   std::optional<bool> value;
   std::optional<ErrorDTO> error;
+  IoSignalSampleSource source{IoSignalSampleSource::kDevice};
   friend bool operator==(const IoSignalPublicationDTO&, const IoSignalPublicationDTO&) = default;
 };
 
@@ -199,6 +237,29 @@ struct IoSignalObservationDTO final {
   std::optional<ErrorDTO> source_error;
   TimePoint evaluated_at_ns{};
 };
+
+/// CONTRACTS §7 `SignalSample`, the one published view of a signal. Program
+/// conditions and rules use a sample only when `fresh`.
+struct SignalSample final {
+  IoSignalId signal_id;
+  std::optional<std::variant<bool, double>> value;
+  IoSignalSampleSource source{IoSignalSampleSource::kDevice};
+  Duration age_ns{};
+  bool fresh{};
+  friend bool operator==(const SignalSample&, const SignalSample&) = default;
+};
+
+[[nodiscard]] inline SignalSample ToSignalSample(const IoSignalObservationDTO& observation) {
+  SignalSample sample{observation.descriptor.signal_id, std::nullopt,
+                      IoSignalSampleSource::kDevice, 0,
+                      observation.availability == IoSignalAvailability::kFresh};
+  if (const auto& latest = observation.latest_sample) {
+    if (latest->publication.value) sample.value = *latest->publication.value;
+    sample.source = latest->publication.source;
+    sample.age_ns = observation.evaluated_at_ns - latest->received_at_ns;
+  }
+  return sample;
+}
 
 /// Immutable routing/bounds snapshot for the existing host ingress lifetime.
 struct IoSignalIngressSourceDTO final {

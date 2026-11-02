@@ -17,7 +17,6 @@ from manyforge_composer.backend.deployment_draft import (
     DeploymentDraftError,
     DeploymentDraftSession,
     _edit_controlled_stop_profile,
-    compile_deployment_document,
     validate_deployment_draft_document,
 )
 from manyforge_composer.backend.draft_session import ComposerDraftSession
@@ -34,7 +33,6 @@ from manyforge_composer.backend.authoring_workspace import AuthoringWorkspace
 from manyforge_composer.backend.routes_headless import create_headless_router
 from manyforge_composer.backend.state import (
     ComposerState,
-    _controllable_composition_change_kinds,
 )
 from manyforge_composer.backend.app import create_app
 from manyforge_composer.backend.security import UNTITLED_SCENARIO_PATH
@@ -53,445 +51,6 @@ def test_scene_preparation_unavailable_keeps_typed_http_error() -> None:
         _raise(failure)
     assert error.value.status_code == 503
     assert error.value.detail == {"code": failure.code, "message": str(failure)}
-
-
-def _import_jerk_source():
-    # DX753: this archival native Lite 6 Draft retains ordinary-motion jerk
-    # metadata for import validation; it does not select an execution backend.
-    document = json.loads(
-        (
-            Path(__file__).resolve().parents[2]
-            / "manyforge_deployment/test/fixtures/native_execution/"
-            "lite6_lite_gripper_pick_and_place.native.deployment.yaml"
-        ).read_text()
-    )
-    runtime = document["graph"]["runtime_units"][0]
-    target = runtime["configuration"]["motion_target_limits"][0]
-    return (
-        document,
-        target["ordinary_motion_jerk"],
-        (
-            runtime["runtime_unit_id"],
-            target["controllable_component_id"],
-            target["command_target_id"],
-            [f"joint{index}" for index in range(1, 7)],
-        ),
-    )
-
-
-def test_moveit_jerk_import_preserves_activation_overrides_and_source_metadata():
-    import manyforge_headless_py as native
-
-    document, settings, selection = _import_jerk_source()
-    settings["joint_limits"] = [{"source_joint_name": "joint1", "override_rad_s3": 10}]
-    raw = """joint_limits:
-  joint1: {has_jerk_limits: true, max_jerk: 12}
-  joint2: {has_jerk_limits: false, max_jerk: 99}
-  joint3: {has_jerk_limits: false, max_jerk: 0}
-  unrelated: {has_jerk_limits: true, max_jerk: 100}
-"""
-    original = json.dumps(document)
-    source_id = "robot_moveit_config/config/joint_limits.yaml"
-    result = native.import_moveit_angular_jerk_limits(
-        original, raw, source_id, *selection
-    )
-    assert result == native.compile_deployment_draft(result["canonical_json"])
-    assert result == native.import_moveit_angular_jerk_limits(
-        result["canonical_json"], raw, source_id, *selection
-    )
-    imported = json.loads(result["canonical_json"])
-    target = imported["graph"]["runtime_units"][0]["configuration"][
-        "motion_target_limits"
-    ][0]
-    assert target["ordinary_motion_jerk"]["enabled"] is False
-    assert target["ordinary_motion_jerk"]["preset_reference_time_s"] == 1
-    rows = target["ordinary_motion_jerk"]["joint_limits"]
-    assert [row["source_joint_name"] for row in rows] == ["joint1", "joint2"]
-    assert rows[0]["override_rad_s3"] == 10
-    for row, enabled, maximum in zip(rows, [True, False], [12, 99], strict=True):
-        assert row["imported"] == {
-            "enabled": enabled,
-            "maximum_rad_s3": maximum,
-            "machine_required": False,
-            "source_id": source_id,
-            "source_digest": "sha256:" + hashlib.sha256(raw.encode()).hexdigest(),
-        }
-    assert imported["policies"] == document["policies"]
-    assert json.dumps(document) == original
-
-
-@pytest.mark.parametrize(
-    "row",
-    [
-        "{has_jerk_limits: true}",
-        "{has_jerk_limits: true, max_jerk: 0}",
-        "{has_jerk_limits: 'true', max_jerk: 12}",
-        "{has_jerk_limits: true, max_jerk: true}",
-        "{has_jerk_limits: false, max_jerk: -1}",
-        "{max_jerk: 12, max_jerk: 14}",
-    ],
-)
-def test_moveit_jerk_import_rejects_malformed_limits(row):
-    import manyforge_headless_py as native
-
-    document, _settings, selection = _import_jerk_source()
-    with pytest.raises(Exception):
-        native.import_moveit_angular_jerk_limits(
-            json.dumps(document),
-            "joint_limits:\n  joint1: " + row,
-            "robot/config/joint_limits.yaml",
-            *selection,
-        )
-
-
-def test_moveit_import_cannot_weaken_required_limits_or_overrides():
-    import manyforge_headless_py as native
-
-    document, settings, selection = _import_jerk_source()
-    settings["enabled"] = True
-    settings["joint_limits"] = [
-        {
-            "source_joint_name": "joint1",
-            "override_rad_s3": 10,
-            "imported": {
-                "maximum_rad_s3": 12,
-                "enabled": True,
-                "machine_required": True,
-                "source_id": "robot/config/joint_limits.yaml",
-                "source_digest": _DIGEST,
-            },
-        }
-    ]
-    for row in [
-        "{}",
-        "{has_jerk_limits: false, max_jerk: 12}",
-        "{has_jerk_limits: true, max_jerk: 13}",
-        "{has_jerk_limits: true, max_jerk: 9}",
-    ]:
-        with pytest.raises(Exception, match="required limit|override"):
-            native.import_moveit_angular_jerk_limits(
-                json.dumps(document),
-                "joint_limits:\n  joint1: " + row,
-                "robot/config/joint_limits.yaml",
-                *selection,
-            )
-    with pytest.raises(Exception, match="unique"):
-        native.import_moveit_angular_jerk_limits(
-            json.dumps(document),
-            "joint_limits: {}",
-            "robot/config/joint_limits.yaml",
-            *selection[:3],
-            ["joint1", "joint1"],
-        )
-    with pytest.raises(Exception, match="motion target"):
-        native.import_moveit_angular_jerk_limits(
-            json.dumps(document),
-            "joint_limits: {}",
-            "robot/config/joint_limits.yaml",
-            *selection[:2],
-            "foreign-target",
-            selection[3],
-        )
-
-
-def test_pinned_lite6_moveit_source_without_jerk_does_not_invent_limits():
-    import manyforge_headless_py as native
-
-    document, _settings, selection = _import_jerk_source()
-    source_id = "xarm_moveit_config/config/lite6/joint_limits.yaml"
-    raw = (
-        Path(__file__).resolve().parents[2]
-        / "manyforge_example_models/models"
-        / "lite6_lite_gripper/upstream_source"
-        / source_id
-    ).read_text()
-    result = native.import_moveit_angular_jerk_limits(
-        json.dumps(document), raw, source_id, *selection
-    )
-    assert result == native.compile_deployment_draft(json.dumps(document))
-
-
-@pytest.mark.parametrize(
-    "enabled,machine_required,two_robots,target_index",
-    [
-        (False, False, False, 0),
-        (True, False, False, 0),
-        (True, True, False, 0),
-        (True, False, True, 0),
-        (True, False, True, 1),
-    ],
-)
-def test_ordinary_jerk_source_roundtrip_preserves_choice_and_provenance(
-    tmp_path, enabled, machine_required, two_robots, target_index
-):
-    source = json.loads(
-        (
-            Path(__file__).resolve().parents[2]
-            # DX753: archival native Draft metadata preserves ordinary-motion
-            # jerk authoring round trips without selecting an execution backend.
-            / "manyforge_deployment/test/fixtures/native_execution/"
-            "lite6_lite_gripper_pick_and_place.native.deployment.yaml"
-        ).read_text()
-    )
-    if two_robots:
-        # Reuse the real component definition, with disjoint instance identities.
-        # Shared cell-wide providers/catalogs remain singletons.
-        for section in (source, source["graph"], source["policies"]):
-            for rows in section.values():
-                if not isinstance(rows, list):
-                    continue
-                rows.extend(
-                    json.loads(json.dumps(row).replace("lite6_robot", "peer_robot"))
-                    for row in list(rows)
-                    if isinstance(row, dict)
-                    and any(
-                        isinstance(value, str) and value.startswith("lite6_robot")
-                        for value in row.values()
-                    )
-                )
-        # Both components share the stable native cell host. Duplicate their
-        # addressed configuration rows inside that host, as the compiler does.
-        configuration = source["graph"]["runtime_units"][0]["configuration"]
-        for name in (
-            "motion_target_limits",
-            "direct_control_joint_limits",
-            "gripper_target_configurations",
-        ):
-            rows = configuration[name]
-            rows.extend(
-                json.loads(json.dumps(row).replace("lite6_robot", "peer_robot"))
-                for row in list(rows)
-            )
-        configuration["initial_joint_positions_rad"] *= 2
-    native_units = source["graph"]["runtime_units"]
-    assert len(native_units) == 1
-    assert native_units[0]["runtime_unit_id"] == "robot_cell.native_execution"
-    configuration = native_units[0]["configuration"]
-    targets = configuration["motion_target_limits"]
-    assert [row["controllable_component_id"] for row in targets] == (
-        ["lite6_robot", "peer_robot"] if two_robots else ["lite6_robot"]
-    )
-    target = targets[target_index]
-    assert target["ordinary_motion_jerk"]["enabled"] is False
-    settings = {
-        "enabled": enabled,
-        "preset_reference_time_s": 1.25,
-        "joint_limits": [
-            {
-                "source_joint_name": "joint1",
-                "override_rad_s3": 10.0,
-                "imported": {
-                    "maximum_rad_s3": 12.0,
-                    "enabled": True,
-                    "machine_required": machine_required,
-                    "source_id": "robot_moveit_config/config/joint_limits.yaml",
-                    "source_digest": _DIGEST,
-                },
-            }
-        ],
-    }
-    client, state = _client(tmp_path)
-    # Exercise an ordinary runtime-configuration Draft edit on an existing
-    # component composition, without using Draft-only Open to add the robots.
-    original = tmp_path / "original.deployment.yaml"
-    original.write_text(json.dumps(source))
-    _seed_existing_deployment(
-        state, source, saved_path=str(original), compiler=compile_deployment_document
-    )
-    workspace = client.get("/api/deployment/workspace").json()
-    changed = client.post(
-        "/api/deployment/draft/mutations",
-        json=_request(
-            workspace,
-            path=[
-                "graph",
-                "runtime_units",
-                0,
-                "configuration",
-                "motion_target_limits",
-                target_index,
-                "ordinary_motion_jerk",
-            ],
-            value=settings,
-        ),
-    )
-    assert changed.status_code == 200, changed.text
-    assert changed.json()["draft"]["differsFromSaved"] is True
-    if machine_required:
-        jerk_path = [
-            "graph",
-            "runtime_units",
-            0,
-            "configuration",
-            "motion_target_limits",
-            target_index,
-            "ordinary_motion_jerk",
-        ]
-        for suffix, value in [
-            (["enabled"], False),
-            (["joint_limits", 0, "imported", "enabled"], False),
-            (["joint_limits", 0, "override_rad_s3"], 13.0),
-        ]:
-            rejected = client.post(
-                "/api/deployment/draft/mutations",
-                json=_request(
-                    changed.json(),
-                    path=jerk_path + suffix,
-                    value=value,
-                    kind="invalid-" + "-".join(map(str, suffix)),
-                ),
-            )
-            assert rejected.status_code == 400, (suffix, rejected.status_code)
-            assert rejected.json()["detail"]["code"] == "deployment_draft_invalid"
-            assert (
-                client.get("/api/deployment/workspace").json()["draft"]
-                == changed.json()["draft"]
-            )
-    saved = tmp_path / "jerk.deployment.yaml"
-    saved_response = client.post(
-        "/api/deployment/save-as",
-        json=_request(
-            changed.json(), path=str(saved), confirmOverwrite=False, kind="save"
-        ),
-    )
-    assert saved_response.status_code == 200, saved_response.text
-    opened_again = client.post(
-        "/api/deployment/open-draft",
-        json=_request(
-            saved_response.json(), path=str(saved), confirmDiscard=False, kind="reopen"
-        ),
-    )
-    assert opened_again.status_code == 200, opened_again.text
-    assert opened_again.json()["draft"]["differsFromSaved"] is False
-    reopened = compile_deployment_document(saved.read_text())
-    assert reopened.document == opened_again.json()["draft"]["document"]
-    assert (
-        reopened.document["graph"]["runtime_units"][0]["configuration"][
-            "motion_target_limits"
-        ][target_index]["ordinary_motion_jerk"]
-        == settings
-    )
-    # Off retains the numbers but does not activate them; the independent
-    # controlled-Stop choices are unchanged in either case.
-    assert reopened.document["policies"] == source["policies"]
-    expected_native_unit = deepcopy(native_units[0])
-    expected_native_unit["configuration"]["motion_target_limits"][target_index][
-        "ordinary_motion_jerk"
-    ] = settings
-    # The selected target changes; every peer and host configuration field
-    # survives the Save/Open round trip exactly.
-    assert reopened.document["graph"]["runtime_units"] == [expected_native_unit]
-    restored = DeploymentDraftSession()
-    restored.restore_retained_state(state.deployment_draft_session.retained_state())
-    assert restored.snapshot() == state.deployment_draft_session.snapshot()
-    client.close()
-
-
-@pytest.mark.parametrize("enabled", [False, True])
-def test_explicit_stop_jerk_migration_recompiles_and_preserves_existing_settings(
-    enabled,
-):
-    import manyforge_headless_py
-
-    source = json.loads(
-        (
-            Path(__file__).resolve().parents[2]
-            / "examples/lite6_lite_gripper_pick_and_place.deployment.yaml"
-        ).read_text()
-    )
-    rows = [
-        row
-        for row in source["policies"]["stop_stage_parameters"]
-        if row["provider_contract_ref"]["contract_schema_id"]
-        == "manyforge.value_schema.provider_contract.motion_controlled_stop.v1"
-    ]
-    assert len(rows) >= 2
-    preserved = deepcopy(source)
-    for row in rows:
-        del row["default_contract_parameters"]["jerk_limits_enabled"]
-        row["provider_contract_ref"][
-            "contract_schema_revision"
-        ] = "sha256:afbbcda3b81eabff2bbdffb5658fb1fcd3331cde896cadf0681793a2f9db90dd"
-    # A reviewed choice must survive migration of another route/target.
-    rows[0]["default_contract_parameters"]["jerk_limits_enabled"] = not enabled
-    original = json.dumps(source)
-    with pytest.raises(Exception):
-        manyforge_headless_py.compile_deployment_draft(original)
-    result = manyforge_headless_py.migrate_controlled_stop_jerk_choice(
-        original, enabled
-    )
-    compiled = manyforge_headless_py.compile_deployment_draft(result["canonical_json"])
-    assert result == compiled
-    migrated = json.loads(result["canonical_json"])
-    expected = deepcopy(preserved)
-    expected_rows = [
-        row
-        for row in expected["policies"]["stop_stage_parameters"]
-        if row["provider_contract_ref"]["contract_schema_id"]
-        == "manyforge.value_schema.provider_contract.motion_controlled_stop.v1"
-    ]
-    for index, row in enumerate(expected_rows):
-        row["default_contract_parameters"]["jerk_limits_enabled"] = (
-            not enabled if index == 0 else enabled
-        )
-    expected_result = manyforge_headless_py.compile_deployment_draft(
-        json.dumps(expected)
-    )
-    assert migrated == json.loads(expected_result["canonical_json"])
-    assert json.dumps(source) == original
-    # Idempotent even with the opposite migration choice: explicit values win.
-    assert (
-        manyforge_headless_py.migrate_controlled_stop_jerk_choice(
-            result["canonical_json"], not enabled
-        )
-        == result
-    )
-    rows[0]["provider_contract_ref"]["contract_schema_revision"] = _DIGEST
-    with pytest.raises(Exception, match="recognized schema revision"):
-        manyforge_headless_py.migrate_controlled_stop_jerk_choice(
-            json.dumps(source), enabled
-        )
-    with pytest.raises(TypeError):
-        manyforge_headless_py.migrate_controlled_stop_jerk_choice(original, "on")
-
-
-def test_explicit_max_stop_time_is_profile_owned_and_not_refused_at_apply():
-    # Q51/item 24 (as `main`): the robot's own `max_stop_time_s` is part of its
-    # controlled-Stop profile; a value shorter than the deceleration is not an
-    # Apply-time refusal, and the cell-wide timing table is gone.
-    document = json.loads(
-        (
-            Path(__file__).resolve().parents[2]
-            / "examples/lite6_lite_gripper_pick_and_place.deployment.yaml"
-        ).read_text()
-    )
-    assert "stop_timing_parameters" not in document["policies"]
-    binding = next(
-        row
-        for row in document["graph"]["control_bindings"]
-        if row["capability_id"] == "execution.trajectory.execute"
-    )
-    rows = [
-        row
-        for row in document["policies"]["stop_stage_parameters"]
-        if row["control_binding_id"] == binding["control_binding_id"]
-        and row["stop_escalation_stage_id"] == "motion_controlled_stop"
-    ]
-    assert rows
-    for row in rows:
-        assert "max_stop_time_s" not in row["default_contract_parameters"]
-        row["default_contract_parameters"]["deceleration_time_s"] = 1.1
-        row["default_contract_parameters"]["max_stop_time_s"] = 0.5
-    compiled = compile_deployment_document(json.dumps(document))
-    for row in compiled.document["policies"]["stop_stage_parameters"]:
-        if (
-            row["control_binding_id"] == binding["control_binding_id"]
-            and row["stop_escalation_stage_id"] == "motion_controlled_stop"
-        ):
-            assert row["default_contract_parameters"]["max_stop_time_s"] == 0.5
-    document["policies"]["stop_timing_parameters"] = []
-    with pytest.raises(DeploymentDraftError):
-        compile_deployment_document(json.dumps(document))
 
 
 @pytest.mark.parametrize("enabled", [False, True])
@@ -783,12 +342,11 @@ def _focused_document() -> dict[str, Any]:
     ]
     document["graph"]["runtime_units"] = [
         {
-            "runtime_unit_id": "robot.native_execution",
-            "runtime_profile_id": "manyforge.native_execution_runtime",
+            "runtime_unit_id": "robot.ros2_control_execution",
+            "runtime_profile_id": "manyforge.ros2_control_execution_runtime",
             "runtime_profile_revision": _DIGEST,
             "dependency_runtime_unit_ids": [],
             "configuration": {
-                "mode": "simulated",
                 "execution_tick_hz": 100,
                 "collision_monitor_period_ms": 50,
                 "planner_rng_seed": 12345,
@@ -1276,76 +834,6 @@ def test_deployment_open_edit_save_discard_share_one_revision_fenced_workspace(
     )
 
 
-def test_opening_new_controllable_composition_requires_activation_without_mutation(
-    tmp_path: Path,
-) -> None:
-    client, state = _client(tmp_path)
-    source = _document()
-    source["graph"]["controllable_components"] = [
-        {"controllable_component_id": "robot"}
-    ]
-    artifact = tmp_path / "new-composition.deployment.yaml"
-    artifact.write_text(json.dumps(source), encoding="utf-8")
-    before = client.get("/api/deployment/workspace").json()
-
-    rejected = client.post(
-        "/api/deployment/open-draft",
-        json=_request(
-            before,
-            path=str(artifact),
-            confirmDiscard=False,
-            kind="open-controllable-composition",
-        ),
-    )
-
-    assert rejected.status_code == 409
-    assert rejected.json()["detail"]["code"] == "deployment_activation_required"
-    assert rejected.json()["detail"]["activationRequired"] is True
-    assert rejected.json()["detail"]["changedGraphKinds"] == [
-        "controllable_components"
-    ]
-    after = client.get("/api/deployment/workspace").json()
-    assert after["draft"] == before["draft"]
-    assert after["authoringWorkspace"] == before["authoringWorkspace"]
-    assert state.deployment_draft_session.retained_state()["document"] is None
-
-
-def test_generic_mutation_rejects_controllable_graph_change_without_mutation(
-    tmp_path: Path,
-) -> None:
-    client, _state = _client(tmp_path)
-    source = tmp_path / "empty-composition.deployment.yaml"
-    source.write_text(json.dumps(_document()), encoding="utf-8")
-    initial = client.get("/api/deployment/workspace").json()
-    opened = client.post(
-        "/api/deployment/open-draft",
-        json=_request(initial, path=str(source), confirmDiscard=False, kind="open"),
-    ).json()
-
-    rejected = client.post(
-        "/api/deployment/draft/mutations",
-        json=_request(
-            opened,
-            path=["graph", "control_bindings"],
-            value=[{"control_binding_id": "robot.arm"}],
-            kind="add-control-binding",
-        ),
-    )
-
-    assert rejected.status_code == 409
-    assert rejected.json()["detail"]["code"] == "deployment_activation_required"
-    assert rejected.json()["detail"]["activationRequired"] is True
-    assert "control_bindings" in rejected.json()["detail"]["changedGraphKinds"]
-    after = client.get("/api/deployment/workspace").json()
-    assert after["draft"] == opened["draft"]
-    assert after["authoringWorkspace"]["workspaceEpoch"] == opened[
-        "authoringWorkspace"
-    ]["workspaceEpoch"]
-    assert after["authoringWorkspace"]["workspaceRevision"] == opened[
-        "authoringWorkspace"
-    ]["workspaceRevision"]
-
-
 def test_pose_only_controllable_component_edit_remains_draftable(
     tmp_path: Path,
 ) -> None:
@@ -1399,172 +887,6 @@ def test_pose_only_controllable_component_edit_remains_draftable(
     ][0]["root_pose_in_cell"] == pose
 
 
-def test_draft_composition_classifier_uses_model_identity_not_placement_fields() -> None:
-    intent_before = {
-        "api_version": "manyforge.deployment_intent.v2",
-        "components": [
-            {
-                "component_id": "robot",
-                "component_profile_id": "robot_profile",
-                "model_source": {"urdf": "robot.urdf"},
-                "root_pose_in_cell": {"position_m": [0.0, 0.0, 0.0]},
-                "target_settings": {},
-                "configuration": {},
-            }
-        ],
-        "attachments": [],
-    }
-    intent_after = deepcopy(intent_before)
-    intent_after["components"][0]["root_pose_in_cell"] = {
-        "position_m": [1.0, 0.0, 0.0]
-    }
-    assert _controllable_composition_change_kinds(intent_before, intent_after) == ()
-
-    before = _document()
-    before["graph"]["model_instances"] = [
-        {
-            "model_instance_id": "robot.model",
-            "model_asset_id": "robot_model",
-            "model_revision": _DIGEST,
-            "root_pose_in_cell": {"position_m": [0.0, 0.0, 0.0]},
-        }
-    ]
-    after = deepcopy(before)
-    after["graph"]["model_instances"][0]["root_pose_in_cell"] = {
-        "position_m": [2.0, 0.0, 0.0]
-    }
-
-    assert _controllable_composition_change_kinds(before, after) == ()
-
-    after["graph"]["model_instances"][0]["model_asset_id"] = "other_model"
-    assert _controllable_composition_change_kinds(before, after) == (
-        "model_instances",
-    )
-
-
-def test_controllable_add_remove_and_replacement_are_activation_only() -> None:
-    def component(identity: str, model: str = "robot.urdf") -> dict[str, Any]:
-        return {
-            "component_id": identity,
-            "component_profile_id": "native_robot",
-            "model_source": {"urdf": model},
-            "target_settings": {},
-            "configuration": {},
-        }
-
-    def intent(*components: dict[str, Any]) -> dict[str, Any]:
-        return {
-            "api_version": "manyforge.deployment_intent.v2",
-            "components": list(components),
-            "attachments": [],
-        }
-
-    empty = intent()
-    one = intent(component("robot-a"))
-    two = intent(component("robot-a"), component("robot-b"))
-    replacement = intent(component("robot-a", "replacement.urdf"))
-    for before, after, expected in (
-        (empty, one, "controllable_components"),
-        (one, two, "controllable_components"),
-        (two, one, "controllable_components"),
-        (one, replacement, "model_instances"),
-    ):
-        assert expected in _controllable_composition_change_kinds(before, after)
-
-
-def test_draft_composition_classifier_fails_closed_on_mixed_or_unknown_schema() -> None:
-    compiled = _document()
-    unknown = deepcopy(compiled)
-    unknown["api_version"] = "manyforge.deployment.v2"
-    intent = {
-        "api_version": "manyforge.deployment_intent.v2",
-        "components": [],
-        "attachments": [],
-    }
-
-    assert _controllable_composition_change_kinds(compiled, unknown) is None
-    assert _controllable_composition_change_kinds(compiled, intent) is None
-
-
-def test_scenario_component_settings_are_draft_parameters() -> None:
-    """Decision A: a Scenario component's configuration and target settings
-    are ordinary Draft parameters; the confirmed Apply replaces the component.
-    A compiled runtime unit's configuration stays unclassified."""
-
-    intent = {
-        "api_version": "manyforge.deployment_intent.v2",
-        "components": [
-            {
-                "component_id": "robot",
-                "component_profile_id": "robot_profile",
-                "model_source": {"urdf": "robot.urdf"},
-                "target_settings": {"arm": {"maximum_tcp_linear_speed_mps": 0.1}},
-                "configuration": {"controller_endpoint": "controller-a"},
-            }
-        ],
-        "attachments": [],
-    }
-    changed_intent = deepcopy(intent)
-    changed_intent["components"][0]["configuration"]["controller_endpoint"] = (
-        "controller-b"
-    )
-    changed_intent["components"][0]["target_settings"]["arm"][
-        "maximum_tcp_linear_speed_mps"
-    ] = 0.2
-    assert _controllable_composition_change_kinds(intent, changed_intent) == ()
-    # A model change in the same edit is still composition.
-    changed_intent["components"][0]["model_source"] = {"urdf": "other.urdf"}
-    assert _controllable_composition_change_kinds(intent, changed_intent) == (
-        "model_instances",
-    )
-
-    compiled = _focused_document()
-    changed_compiled = deepcopy(compiled)
-    changed_compiled["graph"]["runtime_units"][0]["configuration"][
-        "controller_endpoint"
-    ] = "controller-b"
-    assert _controllable_composition_change_kinds(compiled, changed_compiled) is None
-
-
-def test_unclassifiable_deployment_shape_rejects_without_mutation(
-    tmp_path: Path,
-) -> None:
-    client, _state = _client(tmp_path)
-    source = tmp_path / "classifiable.deployment.yaml"
-    source.write_text(json.dumps(_document()), encoding="utf-8")
-    initial = client.get("/api/deployment/workspace").json()
-    opened = client.post(
-        "/api/deployment/open-draft",
-        json=_request(initial, path=str(source), confirmDiscard=False, kind="open"),
-    ).json()
-
-    rejected = client.post(
-        "/api/deployment/draft/mutations",
-        json=_request(
-            opened,
-            path=["graph", "model_instances"],
-            value="not-an-array",
-            kind="unknown-graph-shape",
-        ),
-    )
-
-    assert rejected.status_code == 409
-    assert (
-        rejected.json()["detail"]["code"]
-        == "deployment_activation_classification_unavailable"
-    )
-    assert rejected.json()["detail"]["activationRequired"] is True
-    assert rejected.json()["detail"]["classificationAvailable"] is False
-    after = client.get("/api/deployment/workspace").json()
-    assert after["draft"] == opened["draft"]
-    assert after["authoringWorkspace"]["workspaceEpoch"] == opened[
-        "authoringWorkspace"
-    ]["workspaceEpoch"]
-    assert after["authoringWorkspace"]["workspaceRevision"] == opened[
-        "authoringWorkspace"
-    ]["workspaceRevision"]
-
-
 def test_invalid_or_stale_deployment_mutation_never_changes_the_draft(
     tmp_path: Path,
 ) -> None:
@@ -1610,7 +932,7 @@ def test_invalid_or_stale_deployment_mutation_never_changes_the_draft(
     )
 
 
-def test_authored_deployment_apply_carries_one_prepared_identity_through_confirmation(
+def test_deployment_preview_and_apply_are_orchestrated_server_side(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from manyforge_composer.backend import routes_deployment_draft
@@ -1618,7 +940,7 @@ def test_authored_deployment_apply_carries_one_prepared_identity_through_confirm
     client, state = _client(tmp_path)
     project = (
         Path(__file__).resolve().parents[2]
-        / "examples/lite6_pick_and_place.scenario"
+        / "examples/mock_lite6_pick_and_place.scenario"
     )
     source = project / "deployment.yaml"
     state.allowed_fs_roots.append(str(project.parents[1]))
@@ -1660,7 +982,7 @@ def test_authored_deployment_apply_carries_one_prepared_identity_through_confirm
     edited = client.get("/api/deployment/workspace").json()
     state.authoring_workspace.remember_project(
         document={
-            "scenario_id": "lite6_pick_and_place",
+            "scenario_id": "mock_lite6_pick_and_place",
             "program_role_assignment": json.loads(
                 (project / "assignment.yaml").read_text(encoding="utf-8")
             ),
@@ -1704,293 +1026,226 @@ def test_authored_deployment_apply_carries_one_prepared_identity_through_confirm
                 },
             }
 
-    state.headless_client = CandidateHeadless()  # type: ignore[assignment]
-    effects: list[tuple[dict[str, Any], bool]] = []
+        def execution_control_state(self):
+            # No manual operation: a held run is Reset by the Apply.
+            return {"control_state": {"manual_operations": []}}
 
-    confirmation_token = "sha256:" + "c" * 64
+    lifecycles = {"lite6_robot": "enabled", "lite_gripper": "enabled", "camera": "enabled"}
+    actions: list[tuple[str, str]] = []
+    results: dict[str, dict[str, Any]] = {}
+    cycle = {"state": "idle_after_reset"}
 
-    def execute_candidate(
-        intent,
-        _claim,
-        *,
-        apply,
-        prepared=None,
-        prepare_only=False,
-    ):
-        prepared_activation = {
-            "schema_version": "manyforge.prepared_activation_input.v6",
-            "prepared_activation_id": "sha256:" + "9" * 64,
-            "origin": {"kind": "scenario", "scenario_id": intent["scenario_id"],
-                       "source_document_digest": intent["source_document_digest"],
-                       "project_path": intent["project_path"]},
-            "captured_input_digest": intent["captured_input_digest"],
-            "deployment_artifact_id": edited["draft"]["deploymentArtifactId"],
-            "deployment_revision": candidate_revision,
-            "retained_bundle_id": "sha256:" + "a" * 64,
-            "graph_revision": "sha256:" + "7" * 64,
-            "program_id": program["program_id"],
-            "program_revision": program["program_revision"],
-            "program_outcome": {"kind": "bound", "program_binding_id": "sha256:" + "b" * 64},
-            "node_environment_digest": "sha256:" + "d" * 64,
-            "assistant_mode": "forbidden",
+    def _components(_self):
+        rows = []
+        for component_id, lifecycle in lifecycles.items():
+            row: dict[str, Any] = {"component_id": component_id, "lifecycle": lifecycle}
+            if component_id in results:
+                row["last_action"] = results[component_id]
+            rows.append(row)
+        return rows
+
+    def _component_action(_self, component_id, action):
+        actions.append((action, component_id))
+        lifecycles[component_id] = "prepared"
+        results[component_id] = {
+            "action": action, "outcome": "succeeded",
+            "started_at_ns": len(actions), "finished_at_ns": len(actions),
         }
-        if prepared is None:
-            confirmation_required = (
-                apply and intent.get("confirmation_token") != confirmation_token
-            )
-            result = {
-                "status": (
-                    "confirmation_required"
-                    if confirmation_required
-                    else "applied" if apply else "previewed"
-                ),
-                "confirmation_token": (
-                    confirmation_token if confirmation_required else None
-                ),
-                "prepared_activation": prepared_activation,
-                "candidate_preview": (
-                    {"diff": {"runtime_units": {"changed": ["runtime"]}}}
-                    if confirmation_required
-                    else None
-                ),
-                "manager_apply": None,
-                "preparation": (
-                    {
-                        "request_owner_epoch": intent[
-                            "preparation_request_owner_epoch"
-                        ],
-                        "request_id": intent["preparation_request_id"],
-                    }
-                    if confirmation_required
-                    else None
-                ),
-                "phases_ms": {"preparation_ms": 1.0},
-                "apply_id": None,
-            }
-            prepared = {
-                "result": result,
-                "confirmation_required": confirmation_required,
-            }
+        return {"action": action}
+
+    CandidateHeadless.components = _components  # type: ignore[attr-defined]
+    CandidateHeadless.component_action = _component_action  # type: ignore[attr-defined]
+    CandidateHeadless.program_cycle_status = lambda _self: dict(cycle)  # type: ignore[attr-defined]
+    CandidateHeadless.authoring_admission = lambda _self: {"admission_generation": 3}  # type: ignore[attr-defined]
+    CandidateHeadless.manager_apply_status = (  # type: ignore[attr-defined]
+        lambda _self, apply_id, generation: {"ok": True, "state": "succeeded"}
+    )
+    state.headless_client = CandidateHeadless()  # type: ignore[assignment]
+    impact = {
+        "components": [
+            {"controllable_component_id": "lite6_robot", "disposition": "replace",
+             "replacement_reasons": ["description"]},
+            {"controllable_component_id": "lite_gripper", "disposition": "remove",
+             "replacement_reasons": []},
+            {"controllable_component_id": "camera", "disposition": "retain",
+             "replacement_reasons": []},
+        ]
+    }
+    submitted: list[dict[str, Any]] = []
+
+    def execute_candidate(intent, claim, *, apply, prepared=None,
+                          prepare_only=False, confirmed=False):
+        result = {
+            "status": "accepted" if apply else "previewed",
+            "confirmation_token": None,
+            "prepared_activation": {},
+            "candidate_preview": {"impact": impact},
+            "manager_apply": None,
+            "preparation": None,
+            "phases_ms": {},
+            "apply_id": "apply-1" if apply else None,
+            "apply_generation": 1 if apply else None,
+        }
         if prepare_only:
-            assert _claim is None, "preparation must precede admission acquisition"
-            return prepared
-        assert intent["scene_initialization"] == "initialize"
-        effects.append((deepcopy(intent), apply))
-        result = deepcopy(prepared["result"])
-        if result["status"] == "confirmation_required":
-            return result
+            assert claim is None
+            assert confirmed is apply, "the server confirms its own Apply"
+            return {"result": result}
+        if apply:
+            submitted.append(deepcopy(intent))
+            # The Manager removes the gripper and restarts the robot.
+            lifecycles.pop("lite_gripper")
+            lifecycles["lite6_robot"] = "not_prepared"
         return result
 
     state.execute_authored_deployment_candidate = execute_candidate  # type: ignore[method-assign]
 
-    class PreviewMustNotClaim(_Coordinator):
-        def execute_external_submission(self, *args, **kwargs):
-            pytest.fail("effect-free Deployment Preview must not claim admission")
-
-    coordinator = state.authoring_admission
-    state.authoring_admission = PreviewMustNotClaim()  # type: ignore[assignment]
     preview = client.post(
-        "/api/deployment/draft/preview",
-        json=_request(edited, kind="preview", local=False),
+        "/api/deployment/preview", json={}
     )
     assert preview.status_code == 200, preview.text
-    assert preview.json()["result"]["status"] == "previewed"
-    confirmation = client.post(
-        "/api/deployment/draft/apply",
-        json=_request(edited, kind="apply", local=False),
-    )
-    assert confirmation.status_code == 202, confirmation.text
-    assert confirmation.json()["result"]["status"] == "confirmation_required"
-    assert confirmation.json()["result"]["confirmation_token"] == confirmation_token
-    state.authoring_admission = coordinator
-    assert current["deployment_revision"] == base_revision
-    assert effects[-1][0]["program"] == program
-    assert effects[-1][0]["deployment"] == edited["draft"]["document"]
-    capture_calls_after_preparation = capture_calls
+    previewed = preview.json()
+    assert previewed["components"] == [
+        {"component_id": "lite6_robot", "disposition": "replace",
+         "reasons": ["description"], "restarts": True},
+        {"component_id": "lite_gripper", "disposition": "remove",
+         "reasons": [], "restarts": False},
+        {"component_id": "camera", "disposition": "retain",
+         "reasons": [], "restarts": False},
+    ]
+    assert previewed["attachment_changed_components"] == []
+    assert previewed["detached_components"] == []
+    assert previewed["program"]["executable"] is True
+    scope = previewed["scope"]
+    assert scope["deployment_draft_id"] == edited["draft"]["id"]
+    assert scope["source_document_digest"] == "sha256:" + "6" * 64
+    assert actions == []
 
-    # The confirmation covers the complete activation input: the Program
-    # Draft, assignment and source the Deployment compiles with too. Any of
-    # them changed since is a named pre-effect refusal.
-    program_snapshot = state.draft_session.snapshot()
-    scope = {
-        "deploymentDraftId": edited["draft"]["id"],
-        "deploymentDraftRevision": edited["draft"]["revision"],
-        "deploymentRevision": edited["draft"]["deploymentRevision"],
-        "programDraftId": program_snapshot["draft_id"],
-        "programDraftRevision": program_snapshot["draft_revision"],
-        "programRevision": program_snapshot["program_revision"],
-        "sourceDocumentDigest": "sha256:" + "6" * 64,
-        "programRoleAssignment": state.scenario_program_role_assignment,
-    }
-    effects_before_scope = len(effects)
-    for index, changed in enumerate(
-        (
-            {"programDraftRevision": program_snapshot["draft_revision"] + 1},
-            {"programRevision": "sha256:" + "0" * 64},
-            {"sourceDocumentDigest": "sha256:" + "5" * 64},
-            {"programRoleAssignment": {"component_roles": [], "target_roles": []}},
-            {"deploymentDraftRevision": edited["draft"]["revision"] + 1},
-        )
-    ):
-        refused = client.post(
-            "/api/deployment/draft/apply",
-            json=_request(
-                edited,
-                kind=f"apply-scope-changed-{index}",
-                confirmationToken=confirmation_token,
-                preparationRequestOwnerEpoch=confirmation.json()["result"][
-                    "preparation"
-                ]["request_owner_epoch"],
-                preparationRequestId=confirmation.json()["result"]["preparation"][
-                    "request_id"
-                ],
-                expectedActivationScope={**scope, **changed},
-            ),
-        )
-        assert refused.status_code == 409, refused.text
-        assert refused.json()["detail"] == {
-            "code": "activation_input_changed_after_confirmation",
-            "message": "Draft changed after confirmation; review again",
-            "effect": "none",
-            "producer": "composer",
-        }
-    assert len(effects) == effects_before_scope
-    assert capture_calls == capture_calls_after_preparation
+    cycle["state"] = "running"
+    refused = client.post(
+        "/api/deployment/apply", json={"scope": scope}
+    )
+    assert refused.status_code == 409, refused.text
+    assert refused.json()["detail"]["code"] == "apply_refused_run_in_progress"
+    assert actions == [] and submitted == []
+
+    cycle["state"] = "idle_after_reset"
+    # Bound to the Preview the user saw: a changed input is refused first.
+    stale = client.post(
+        "/api/deployment/apply",
+        json={"scope": {**scope, "deployment_draft_revision": -1}},
+    )
+    assert stale.status_code == 409, stale.text
+    assert stale.json()["detail"]["code"] == "activation_input_changed_after_confirmation"
+    assert actions == [] and submitted == []
 
     applied = client.post(
-        "/api/deployment/draft/apply",
-        json=_request(
-            edited,
-            kind="apply-confirmed",
-            expectedActivationScope=scope,
-            confirmationToken=confirmation_token,
-            preparationRequestOwnerEpoch=confirmation.json()["result"][
-                "preparation"
-            ]["request_owner_epoch"],
-            preparationRequestId=confirmation.json()["result"]["preparation"][
-                "request_id"
-            ],
-            local=False,
-        ),
+        "/api/deployment/apply", json={"scope": scope}
     )
-    assert applied.status_code == 202, applied.text
-    assert applied.json()["result"]["status"] == "applied"
-    # This regression proves preparation reuse only. The test double does not
-    # publish the candidate bundle through Manager's transition owner, so the
-    # Manager-facing observation stays unchanged.
-    assert current["deployment_revision"] == base_revision
-    # Confirmation performs the same bounded source capture again and rejects
-    # a changed digest before Manager teardown; Composer retains no operation
-    # journal or hidden candidate registry.
-    assert capture_calls == capture_calls_after_preparation + 2
-    assert applied.json()["result"]["prepared_activation"] == (
-        confirmation.json()["result"]["prepared_activation"]
-    )
-
-    # Manager's definite refusal of the candidate (Apply or preview) is a
-    # typed 409 carrying Manager's own code and message, not an anonymous 500.
-    manager_cause = "stale_admission_generation: admission generation 7 is not current (8)"
-
-    def manager_refuses(intent, claim, *, apply, prepared=None, prepare_only=False):
-        if prepare_only:
-            return execute_candidate(
-                intent, claim, apply=apply, prepared=prepared, prepare_only=True,
-            )
-        raise AuthoringOperationError(
-            "manager_apply_rejected",
-            f"Manager rejected the exact Deployment candidate: {manager_cause}",
-        )
-
-    state.execute_authored_deployment_candidate = manager_refuses  # type: ignore[method-assign]
-    rejected = client.post(
-        "/api/deployment/draft/apply",
-        json=_request(
-            edited,
-            kind="apply-manager-rejected",
-            expectedActivationScope=scope,
-            confirmationToken=confirmation_token,
-            preparationRequestOwnerEpoch=confirmation.json()["result"][
-                "preparation"
-            ]["request_owner_epoch"],
-            preparationRequestId=confirmation.json()["result"]["preparation"][
-                "request_id"
-            ],
-            local=False,
-        ),
-    )
-    assert rejected.status_code == 409, rejected.text
-    assert rejected.json()["detail"] == {
-        "code": "manager_apply_rejected",
-        "message": f"Manager rejected the exact Deployment candidate: {manager_cause}",
-        "producer": "composer",
+    assert applied.status_code == 200, applied.text
+    assert actions == [
+        ("disable", "lite_gripper"),
+        ("disable", "lite6_robot"),
+        ("prepare", "lite6_robot"),
+    ]
+    assert submitted[-1]["expected_admission_generation"] == 3
+    assert submitted[-1]["scene_initialization"] == "initialize"
+    assert applied.json() == {
+        "outcome": "succeeded",
+        "components": [
+            {"component_id": "lite6_robot", "disposition": "replace",
+             "lifecycle_after": "prepared"},
+            {"component_id": "lite_gripper", "disposition": "remove"},
+            {"component_id": "camera", "disposition": "retain",
+             "lifecycle_after": "enabled"},
+        ],
     }
 
-    def preview_refused(*_args, **_kwargs):
-        raise AuthoringOperationError(
-            "deployment_candidate_rejected",
-            f"Manager rejected the prepared Deployment candidate: {manager_cause}",
-        )
+    # Nothing changed since Applied: refused before the finished run's Reset
+    # or any disable, as in M7 (409 deployment_apply_nothing_to_apply).
+    from manyforge_composer.backend.deployment_defaults import with_defaults
 
-    state.execute_authored_deployment_candidate = preview_refused  # type: ignore[method-assign]
-    refused_preview = client.post(
-        "/api/deployment/draft/preview",
-        json=_request(edited, kind="preview-manager-rejected", local=False),
-    )
-    assert refused_preview.status_code == 409, refused_preview.text
-    assert refused_preview.json()["detail"] == {
-        "code": "deployment_candidate_rejected",
-        "message": f"Manager rejected the prepared Deployment candidate: {manager_cause}",
-        "producer": "composer",
-    }
-    state.execute_authored_deployment_candidate = execute_candidate  # type: ignore[method-assign]
-
-    # Nothing to apply: the Manager's Applied activation already is every
-    # input (Deployment, sources, assignment, Scenario) and the Applied
-    # Program is the Program Draft. Refused before admission or preparation.
+    document = with_defaults(state.deployment_draft_session.retained_state()["document"])
     applied_context = {
-        "deployment": deepcopy(edited["draft"]["document"]),
-        "model_source_closure": capture_sources(
-            state, edited["draft"]["document"]
-        ),
+        "deployment": document,
+        "model_source_closure": capture_sources(state, document),
         "program_role_assignment": deepcopy(state.scenario_program_role_assignment),
-        "source_document_digest": "sha256:" + "6" * 64,
-        "scenario_id": "lite6_pick_and_place",
+        "source_document_digest": state.scenario_source_document_digest,
+        "scenario_id": state.scenario_document_id,
         "scenario_project_path": state.scenario_project_path,
     }
+    # A published Scenario names its retained bundle and graph.
+    monkeypatch.setattr(state, "published_scenario", lambda: {"published_scenario": {
+        "retained_bundle_id": current["retained_bundle_id"],
+        "graph_revision": current["graph_revision"],
+    }})
     monkeypatch.setattr(
-        state, "published_scenario", lambda: {"published_scenario": {
-            "scenario_id": applied_context["scenario_id"],
-            "source_document_digest": applied_context["source_document_digest"],
-            "deployment_artifact_id": edited["draft"]["deploymentArtifactId"],
-            "deployment_revision": edited["draft"]["deploymentRevision"],
-            "retained_bundle_id": applied.json()["result"]["prepared_activation"]["retained_bundle_id"],
-            "graph_revision": applied.json()["result"]["prepared_activation"]["graph_revision"],
-            "program_id": program["program_id"],
-            "program_revision": program["program_revision"],
-            "program_outcome": deepcopy(applied.json()["result"]["prepared_activation"]["program_outcome"]),
-        }}
+        state, "applied_activation_for_publication", lambda _publication: applied_context
     )
     monkeypatch.setattr(
-        state, "applied_activation_for_publication", lambda _p: deepcopy(applied_context)
+        routes_deployment_draft, "_applied_program_revision",
+        lambda _state: state.draft_session.retained_state()["program"]["program_revision"],
     )
-    applied_program = {"program_revision": program["program_revision"]}
-    CandidateHeadless.program_applied = lambda _self: applied_program  # type: ignore[attr-defined]
-    effects_before_no_op = len(effects)
-    no_op = client.post(
-        "/api/deployment/draft/apply",
-        json=_request(edited, kind="apply-no-op", local=False),
+    resets: list[Any] = []
+    CandidateHeadless.program_cycle_reset = (  # type: ignore[attr-defined]
+        lambda _self, request: resets.append(request)
     )
-    assert no_op.status_code == 409, no_op.text
-    assert no_op.json()["detail"]["code"] == "deployment_apply_nothing_to_apply"
-    assert no_op.json()["detail"]["message"].startswith("Nothing to apply")
-    assert len(effects) == effects_before_no_op
-    # A Program Draft that differs from Applied is something to apply.
-    applied_program["program_revision"] = "sha256:" + "0" * 64
-    changed = client.post(
-        "/api/deployment/draft/apply",
-        json=_request(edited, kind="apply-program-differs", local=False),
+    cycle["state"] = "terminal_awaiting_reset"
+    before = (list(actions), len(submitted))
+    unchanged = client.post(
+        "/api/deployment/apply", json={"scope": client.post(
+            "/api/deployment/preview", json={}).json()["scope"]}
     )
-    assert changed.status_code == 202, changed.text
+    assert unchanged.status_code == 409, unchanged.text
+    assert unchanged.json()["detail"]["code"] == "deployment_apply_nothing_to_apply"
+    assert resets == [] and (actions, len(submitted)) == before
+
+
+def test_effective_values_read_the_current_deployment_draft(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client, state = _client(tmp_path)
+    assert client.get("/api/deployment/effective").json() == {"fields": {}}
+    retained = state.deployment_draft_session.retained_state()
+    retained["document"] = {
+        "api_version": "manyforge.deployment_intent.v2",
+        "components": [{"component_id": "robot", "configuration": {
+            "runtime_kind": "ros2_control",
+            "runtime_configuration": {"planner_rng_seed": 7}}}],
+        "attachments": [],
+    }
+    # This fixture's compiler reads only v1 documents; the route reads the
+    # retained Draft document as is.
+    monkeypatch.setattr(
+        state.deployment_draft_session, "retained_state", lambda: retained
+    )
+    fields = client.get("/api/deployment/effective").json()["fields"]
+    path = "components.0.configuration.runtime_configuration."
+    assert fields[path + "planner_rng_seed"] == {"value": 7, "default": 12345, "set": True}
+    assert fields[path + "execution_tick_hz"] == {"value": 100, "default": 100, "set": False}
+
+
+def test_draft_edits_accept_structural_changes(tmp_path: Path) -> None:
+    """The addition-only rule is gone: a removal is an ordinary Draft edit."""
+
+    client, _state = _client(tmp_path)
+    source = _document()
+    source["graph"]["control_bindings"] = [{"control_binding_id": "robot.arm"}]
+    artifact = tmp_path / "with-binding.deployment.yaml"
+    artifact.write_text(json.dumps(source), encoding="utf-8")
+    initial = client.get("/api/deployment/workspace").json()
+    opened = client.post(
+        "/api/deployment/open-draft",
+        json=_request(initial, path=str(artifact), confirmDiscard=False, kind="open"),
+    )
+    assert opened.status_code == 200, opened.text
+    removed = client.post(
+        "/api/deployment/draft/mutations",
+        json=_request(
+            opened.json(), path=["graph", "control_bindings"], value=[], kind="remove"
+        ),
+    )
+    assert removed.status_code == 200, removed.text
+    assert removed.json()["draft"]["document"]["graph"]["control_bindings"] == []
 
 
 def _scenario_revert_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -2004,7 +1259,7 @@ def _scenario_revert_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         routes_deployment_draft, "_active_catalog", lambda s: s.node_environment.catalog
     )
-    project = Path(__file__).resolve().parents[2] / "examples/lite6_pick_and_place.scenario"
+    project = Path(__file__).resolve().parents[2] / "examples/mock_lite6_pick_and_place.scenario"
     source = project / "deployment.yaml"
     state.allowed_fs_roots.append(str(project.parents[1]))
     _replace_deployment_session(state, DeploymentDraftSession())
@@ -2030,7 +1285,7 @@ def _scenario_revert_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     )
     state.authoring_workspace.remember_project(
         document={
-            "scenario_id": "lite6_pick_and_place",
+            "scenario_id": "mock_lite6_pick_and_place",
             "program_role_assignment": json.loads(
                 (project / "assignment.yaml").read_text(encoding="utf-8")),
         },
@@ -2078,12 +1333,24 @@ def _scenario_revert_setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
                 }},
             }
 
+        # The orchestrated Revert's reads: an idle cycle, an empty cell.
+        def program_cycle_status(self):
+            return {"state": "idle_after_reset"}
+
+        def components(self):
+            return []
+
+        def authoring_admission(self):
+            return {"admission_generation": 1}
+
     state.headless_client = CandidateHeadless()  # type: ignore[assignment]
     effects: list[dict[str, Any]] = []
 
-    def execute_candidate(intent, _claim, *, apply, prepared=None, prepare_only=False):
+    def execute_candidate(intent, _claim, *, apply, prepared=None, prepare_only=False,
+                          confirmed=False):
         assert apply
         if prepare_only:
+            assert confirmed, "the server confirms its own Revert"
             return {"result": {"status": "applied"}, "confirmation_required": False}
         effects.append(deepcopy(intent))
         return {"status": "applied"}
@@ -2102,10 +1369,10 @@ def test_scenario_revert_activates_saved_program_and_deployment_and_restores_bot
     client, state, compiled, saved_program, program_model, effects = (
         _scenario_revert_setup(tmp_path, monkeypatch)
     )
-    workspace = client.get("/api/deployment/workspace").json()
-    response = client.post("/api/deployment/revert", json=_request(workspace, kind="revert", local=False))
+    response = client.post("/api/deployment/revert", json={})
 
-    assert response.status_code == 202, response.text
+    assert response.status_code == 200, response.text
+    assert response.json() == {"outcome": "succeeded", "components": []}
     assert len(effects) == 1
     assert effects[0]["deployment"] == compiled.document
     assert effects[0]["program"] == saved_program
@@ -2114,6 +1381,31 @@ def test_scenario_revert_activates_saved_program_and_deployment_and_restores_bot
     assert state.draft_session.retained_state()["authoring"]["description"] == (
         program_model.to_dict()["description"]
     )
+
+
+def test_scenario_revert_goes_through_its_preview_and_is_bound_to_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _state, _compiled, _saved_program, _program_model, effects = (
+        _scenario_revert_setup(tmp_path, monkeypatch)
+    )
+    preview = client.post("/api/deployment/revert/preview", json={})
+    assert preview.status_code == 200, preview.text
+    assert preview.json()["components"] == []
+    assert effects == []  # the Preview changes nothing
+
+    scope = preview.json()["scope"]
+    stale = client.post(
+        "/api/deployment/revert",
+        json={"scope": {**scope, "program_draft_revision": -1}},
+    )
+    assert stale.status_code == 409, stale.text
+    assert stale.json()["detail"]["code"] == "activation_input_changed_after_confirmation"
+    assert effects == []
+
+    reverted = client.post("/api/deployment/revert", json={"scope": scope})
+    assert reverted.status_code == 200, reverted.text
+    assert len(effects) == 1
 
 
 def test_scenario_revert_partial_contained_install_keeps_the_claim(
@@ -2136,12 +1428,12 @@ def test_scenario_revert_partial_contained_install_keeps_the_claim(
     monkeypatch.setattr(
         state.draft_session, "install_prepared_replacement", fail_program_restore
     )
-    workspace = client.get("/api/deployment/workspace").json()
-    response = client.post("/api/deployment/revert", json=_request(workspace, kind="revert", local=False))
+    response = client.post("/api/deployment/revert", json={})
 
-    assert response.status_code == 503, response.text
-    assert response.json()["detail"]["code"] == "composer_workspace_install_failed"
-    assert "effect" not in response.json()["detail"]
+    # The orchestrated Revert ends `failed` with the failed step's code.
+    assert response.status_code == 200, response.text
+    assert response.json()["outcome"] == "failed"
+    assert response.json()["error"]["code"] == "composer_workspace_install_failed"
     assert state.authoring_workspace.failed_closed is not None
     assert effects == []
     # Never settled as proven no effect: the claim is retained, admission blocked.
@@ -2366,20 +1658,6 @@ def test_focused_motion_target_limit_updates_one_exact_target_atomically(
     assert rejected.json()["detail"]["code"] == (
         "deployment_motion_target_limit_scope_mismatch"
     )
-    assert client.get("/api/deployment/workspace").json()["draft"] == current["draft"]
-
-    unknown_check = client.post(
-        "/api/deployment/draft/motion-target-limit",
-        json=_request(
-            current,
-            controllable_component_id="robot",
-            command_target_id="arm",
-            maximum_tcp_linear_speed_mps=0.1,
-            tcp_speed_check="flange_only",
-            kind="unknown-check",
-        ),
-    )
-    assert unknown_check.status_code == 422
     assert client.get("/api/deployment/workspace").json()["draft"] == current["draft"]
 
 
@@ -2868,7 +2146,7 @@ def test_only_program_start_rejects_unapplied_deployment_before_transport(comman
                                   "speed_profile": {"velocity_scale": 1.0, "acceleration_scale": 1.0,
                                                     "max_tcp_linear_speed_mps": None},
                                   "timeouts": {"planning_timeout_s": 2.0, "execution_timeout_s": 10.0},
-                                  "cache_mode": "default", "planning_profile": "balanced",
+                                  "cache_mode": "default",
                                   "target_mode": "absolute", "per_joint_dynamics_limits": {},
                                   "motion_interrupt_scopes": [],
                                   "motion": {"kind": "joint_goal", "joint_names": ["joint1"], "positions_rad": [0.1]},
@@ -3077,6 +2355,45 @@ def test_configuration_confirmation_never_authorizes_bring_up(tmp_path: Path, de
     )
 
 
+def test_concurrent_preparations_wait_for_each_other_instead_of_refusing(tmp_path: Path) -> None:
+    import threading
+
+    state, intent, _preview = _configuration_preparation(tmp_path)
+    prepare = state.headless_client.prepare_activation
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    active = 0
+    overlapped = False
+
+    def one_at_a_time(request):
+        nonlocal active, overlapped
+        active += 1
+        overlapped = overlapped or active > 1
+        first_entered.set()
+        release_first.wait(5)
+        active -= 1
+        return prepare(request)
+
+    state.headless_client.prepare_activation = one_at_a_time  # type: ignore[union-attr]
+    results: list[dict[str, Any]] = []
+
+    def run() -> None:
+        results.append(state._prepare_authored_deployment_candidate(intent, None, apply=False))
+
+    first = threading.Thread(target=run)
+    first.start()
+    assert first_entered.wait(5)
+    second = threading.Thread(target=run)
+    second.start()
+    second.join(0.2)
+    assert second.is_alive()  # waits for the first preparation
+    release_first.set()
+    first.join(5)
+    second.join(5)
+    assert not overlapped
+    assert len(results) == 2
+
+
 def test_activation_order_comes_from_exact_applied_capture_not_draft(monkeypatch: pytest.MonkeyPatch) -> None:
     from manyforge_composer.backend.routes_deployment_draft import _workspace
     state = ComposerState()
@@ -3143,7 +2460,6 @@ def test_workspace_publishes_whether_saved_differs_from_the_exact_applied_deploy
 
 
 @pytest.mark.parametrize("origin", [
-    {"kind": "sealed_canonical_empty", "cell_id": "cell_a"},
     {"kind": "scenario", "scenario_id": "foreign", "source_document_digest": _DIGEST,
      "project_path": "/projects/foreign.scenario"},
     {"kind": "scenario", "scenario_id": "cell_a", "source_document_digest": "sha256:" + "f" * 64,
@@ -3235,15 +2551,15 @@ def test_add_component_is_a_draft_only_edit(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     "after",
     [
-        # An addition that also changes an existing row is not a pure addition.
+        # An addition that also changes an existing row.
         lambda: [_io_component("plc_io"), _io_component("station_io", 12)],
-        # Removing a component stays activation-only.
+        # Removing a component.
         lambda: [],
-        # Replacing one component by another is not an addition.
+        # Replacing one component by another.
         lambda: [_io_component("plc_io")],
     ],
 )
-def test_only_pure_component_additions_skip_the_activation_boundary(
+def test_every_component_edit_is_an_ordinary_draft_edit(
     tmp_path: Path, after
 ) -> None:
     client, state = _client(tmp_path)
@@ -3253,7 +2569,7 @@ def test_only_pure_component_additions_skip_the_activation_boundary(
     )
     before = client.get("/api/deployment/workspace").json()
 
-    rejected = client.post(
+    edited = client.post(
         "/api/deployment/draft/mutations",
         json=_request(
             before,
@@ -3264,24 +2580,18 @@ def test_only_pure_component_additions_skip_the_activation_boundary(
         ),
     )
 
-    assert rejected.status_code == 409, rejected.text
-    assert rejected.json()["detail"]["code"] in {
-        "deployment_activation_required",
-        "deployment_activation_classification_unavailable",
-    }
-    assert client.get("/api/deployment/workspace").json()["draft"] == before["draft"]
+    assert edited.status_code == 200, edited.text
+    assert edited.json()["draft"]["revision"] == before["draft"]["revision"] + 1
 
 
 def _scenario_robot_and_tool() -> dict[str, Any]:
     """A Scenario Draft: a Real robot and a gripper tool on its flange."""
 
     arm = _model_component("arm")
+    arm["lane"] = "real"
     arm["configuration"] = {
         "runtime_kind": "ros2_control",
-        "runtime_configuration": {
-            "real_profile": "lite6_real",
-            "device_address_ref": "cell_robot",
-        },
+        "runtime_configuration": {"device_address_ref": "cell_robot"},
     }
     hand = _model_component("hand", mounted=True)
     hand["configuration"] = {
@@ -3362,14 +2672,14 @@ def test_endpoint_edit_enters_the_draft_and_applies_as_a_confirmed_replace(
     assert edited.json()["managerApplied"] == before["managerApplied"]
 
     # Apply carries the Draft; the Manager reports the changed controller
-    # profile row as a replace (apply_component_delta.cpp), which is
-    # destructive, so Composer asks for the confirmation first.
+    # profile row and address as a replace (spec sections `address`, `launch`),
+    # which is destructive, so Composer asks for the confirmation first.
     apply_state, intent, preview = _configuration_preparation(tmp_path)
     intent["deployment"] = document
     preview["impact"]["components"][0] = {
         "controllable_component_id": "arm",
         "disposition": "replace",
-        "replacement_reasons": ["runtime_units"],
+        "replacement_reasons": ["address", "launch"],
     }
     preview["impact"]["destructive"] = True
     preview["candidate_receipt"]["destructive_impact"] = True
@@ -3462,42 +2772,8 @@ def test_add_tool_refuses_a_root_pose_on_the_mounted_tool(tmp_path: Path) -> Non
     assert client.get("/api/deployment/workspace").json()["draft"] == before["draft"]
 
 
-@pytest.mark.parametrize(
-    ("components", "attachments"),
-    [
-        # An attachment whose child already exists changes the composition.
-        (lambda: [_io_component("hand")], lambda: [_mount("hand", "arm")]),
-        # A new attachment between existing components only.
-        (lambda: [_io_component("hand")], lambda: [_mount("arm", "station")]),
-    ],
-)
-def test_add_components_refuses_attachments_of_existing_components(
-    tmp_path: Path, components, attachments
-) -> None:
-    client, state = _client(tmp_path)
-    _seed_existing_deployment(
-        state, _io_intent(_io_component("arm"), _io_component("station")),
-        compiler=validate_deployment_draft_document,
-    )
-    before = client.get("/api/deployment/workspace").json()
-
-    rejected = client.post(
-        "/api/deployment/draft/components",
-        json=_request(
-            before, components=components(), attachments=attachments(), kind="not-pure",
-        ),
-    )
-
-    assert rejected.status_code == 409, rejected.text
-    assert rejected.json()["detail"]["code"] in {
-        "deployment_activation_required",
-        "deployment_activation_classification_unavailable",
-    }
-    assert client.get("/api/deployment/workspace").json()["draft"] == before["draft"]
-
-
 @pytest.mark.parametrize("after", [lambda: [], lambda: [_mount("arm", "station")]])
-def test_changing_or_removing_an_attachment_stays_activation_only(
+def test_changing_or_removing_an_attachment_is_a_draft_edit(
     tmp_path: Path, after
 ) -> None:
     client, state = _client(tmp_path)
@@ -3506,12 +2782,12 @@ def test_changing_or_removing_an_attachment_stays_activation_only(
     _seed_existing_deployment(state, intent, compiler=validate_deployment_draft_document)
     before = client.get("/api/deployment/workspace").json()
 
-    rejected = client.post(
+    edited = client.post(
         "/api/deployment/draft/mutations",
         json=_request(
             before, path=["attachments"], operation="set", value=after(), kind="re-mount",
         ),
     )
 
-    assert rejected.status_code == 409, rejected.text
-    assert client.get("/api/deployment/workspace").json()["draft"] == before["draft"]
+    assert edited.status_code == 200, edited.text
+    assert edited.json()["draft"]["document"]["attachments"] == after()

@@ -6,7 +6,6 @@
 #include <string>
 #include <string_view>
 #include <vector>
-#include <variant>
 
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/program_contract.hpp>
@@ -31,29 +30,10 @@ struct PreparedScenarioOrigin final {
   friend bool operator==(const PreparedScenarioOrigin &, const PreparedScenarioOrigin &) = default;
 };
 
-struct PreparedSealedCanonicalEmptyOrigin final {
-  core::CellId cell_id;
-  core::DeploymentArtifactId deployment_artifact_id;
-  core::DeploymentRevision deployment_revision;
-  core::RetainedBundleId retained_bundle_id;
-  core::GraphRevision graph_revision;
-  core::ContentDigest admission_digest;
-  friend bool operator==(const PreparedSealedCanonicalEmptyOrigin &, const PreparedSealedCanonicalEmptyOrigin &) = default;
-};
-
-using PreparedActivationOrigin =
-    std::variant<PreparedScenarioOrigin, PreparedSealedCanonicalEmptyOrigin>;
-
-[[nodiscard]] PreparedActivationOrigin parse_prepared_activation_origin(const CanonicalValue &value);
-[[nodiscard]] CanonicalValue prepared_activation_origin_value(const PreparedActivationOrigin &origin);
-[[nodiscard]] core::ContentDigest sealed_canonical_empty_capture_digest(
-    const PreparedSealedCanonicalEmptyOrigin &origin);
-/// D6: whether a prepared receipt's origin is the Manager-verified sealed
-/// canonical-empty origin of exactly this candidate. Malformed means no.
-[[nodiscard]] bool prepared_receipt_is_canonical_empty_candidate(
-    const CanonicalValue &prepared_receipt, const core::CellId &cell_id,
-    const core::RetainedBundleId &candidate_retained_bundle_id,
-    const core::GraphRevision &candidate_graph_revision) noexcept;
+/// Every prepared activation comes from a Scenario, the empty cell (Close,
+/// New) included: an empty Deployment prepares like any other.
+[[nodiscard]] PreparedScenarioOrigin parse_prepared_activation_origin(const CanonicalValue &value);
+[[nodiscard]] CanonicalValue prepared_activation_origin_value(const PreparedScenarioOrigin &origin);
 
 /// Pure projection of the Program outcome in an immutable Apply receipt.
 /// This grants no Applied/currentness authority. Existing Headless ingress
@@ -97,14 +77,8 @@ public:
       noexcept {
     return prepared_activation_id_;
   }
-  [[nodiscard]] const PreparedActivationOrigin &origin() const noexcept {
+  [[nodiscard]] const PreparedScenarioOrigin &origin() const noexcept {
     return origin_;
-  }
-  [[nodiscard]] const PreparedScenarioOrigin *scenario_origin() const noexcept {
-    return std::get_if<PreparedScenarioOrigin>(&origin_);
-  }
-  [[nodiscard]] const PreparedSealedCanonicalEmptyOrigin *sealed_canonical_empty_origin() const noexcept {
-    return std::get_if<PreparedSealedCanonicalEmptyOrigin>(&origin_);
   }
   [[nodiscard]] const core::ContentDigest &captured_input_digest() const
       noexcept {
@@ -166,7 +140,7 @@ public:
 private:
   PreparedActivationInput(
       core::ContentDigest prepared_activation_id,
-      PreparedActivationOrigin origin,
+      PreparedScenarioOrigin origin,
       core::ContentDigest captured_input_digest,
       core::DeploymentArtifactId deployment_artifact_id,
       core::DeploymentRevision deployment_revision,
@@ -181,7 +155,7 @@ private:
       VerifiedPreparedActivationClosure closure);
 
   core::ContentDigest prepared_activation_id_;
-  PreparedActivationOrigin origin_;
+  PreparedScenarioOrigin origin_;
   core::ContentDigest captured_input_digest_;
   core::DeploymentArtifactId deployment_artifact_id_;
   core::DeploymentRevision deployment_revision_;

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "manyforge_composer"
-version = "0.1.0"
+version = "0.2.0"
 description = "ManyForge Composer structural and Program-authoring shell during the composable-cell runtime cutover"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Marco Pastorio" }]
@@ -28,7 +28,7 @@ visual = [
     "pin==3.9.0",
 ]
 headless = [
-    "manyforge_headless_api>=0.1.0,<0.2.0",
+    "manyforge_headless_api>=0.2.0,<0.3.0",
 ]
 
 [tool.setuptools]

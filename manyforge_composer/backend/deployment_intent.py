@@ -28,7 +28,6 @@ _MAX_COMPONENTS = 128
 _MAX_ATTACHMENTS = 256
 _MAX_PACKAGE_ROOTS = 128
 _MAX_TARGETS = 128
-_TCP_SPEED_CHECKS = ("active_tcp", "active_tcp_and_flange")
 _MAX_PATH_BYTES = 4096
 
 
@@ -236,14 +235,6 @@ def _validate_target_settings(value: Any, label: str) -> dict[str, dict[str, Any
             )
         if speed is not None:
             row["maximum_tcp_linear_speed_mps"] = float(speed)
-        if "tcp_speed_check" in row and (
-            speed is None or row["tcp_speed_check"] not in _TCP_SPEED_CHECKS
-        ):
-            _fail(
-                f"{label}.{target_id}.tcp_speed_check must be one of "
-                f"{', '.join(_TCP_SPEED_CHECKS)} on a row with "
-                "maximum_tcp_linear_speed_mps"
-            )
         if "controlled_stop" in row:
             row["controlled_stop"] = _validate_controlled_stop(
                 row["controlled_stop"], f"{label}.{target_id}.controlled_stop"
@@ -430,6 +421,123 @@ def _validate_model_free_component(
     }
 
 
+SENSOR_RUNTIME_KIND = "sensor"
+
+
+def _is_sensor_component(component: dict[str, Any]) -> bool:
+    configuration = component.get("configuration")
+    return (
+        isinstance(configuration, dict)
+        and configuration.get("runtime_kind") == SENSOR_RUNTIME_KIND
+    )
+
+
+def _validate_sensor_component(component: dict[str, Any], label: str) -> dict[str, Any]:
+    """A sensor component (`kind: sensor` model, e.g. the point-cloud
+    source): its model (no lane), empty target settings and an optional
+    lifecycle time; its runtime configuration (topic, source frame, limits)
+    is checked by the compiler."""
+
+    _require_exact_fields(
+        component,
+        required={
+            "component_id",
+            "component_profile_id",
+            "target_settings",
+            "configuration",
+        },
+        label=label,
+    )
+    if component["target_settings"] != {}:
+        _fail(f"{label}.target_settings must be empty for a sensor")
+    configuration = _require_object(component["configuration"], f"{label}.configuration")
+    _require_exact_fields(
+        configuration,
+        required={"runtime_kind", "runtime_configuration"},
+        optional={"lifecycle_command_timeout_s"},
+        label=f"{label}.configuration",
+    )
+    _require_object(
+        configuration["runtime_configuration"], f"{label}.configuration.runtime_configuration"
+    )
+    return {
+        "component_id": _require_id(component["component_id"], f"{label}.component_id"),
+        "component_profile_id": _require_id(
+            component["component_profile_id"], f"{label}.component_profile_id"
+        ),
+        "target_settings": {},
+        "configuration": deepcopy(configuration),
+    }
+
+
+def _is_machine_owner(component: dict[str, Any]) -> bool:
+    """A machine's owner row (CONTRACTS §16): no owner, no model source and no
+    runtime kind; it holds the machine's lane and address reference."""
+    configuration = component.get("configuration")
+    return (
+        "owner" not in component
+        and "model_source" not in component
+        and not (isinstance(configuration, dict) and "runtime_kind" in configuration)
+    )
+
+
+def _validate_active(component: dict[str, Any], label: str) -> dict[str, Any]:
+    """`active` is a boolean; only `false` is kept (the default is active).
+    Inactive rows stay in the file; the compiler leaves them out."""
+    if "active" not in component:
+        return {}
+    if type(component["active"]) is not bool:
+        _fail(f"{label}.active must be a boolean")
+    return {} if component["active"] else {"active": False}
+
+
+def _validate_machine_owner(component: dict[str, Any], label: str) -> dict[str, Any]:
+    _require_exact_fields(
+        component,
+        required={"component_id", "component_profile_id", "lane", "configuration"},
+        optional={"active"},
+        label=label,
+    )
+    configuration = _require_object(component["configuration"], f"{label}.configuration")
+    _require_exact_fields(
+        configuration, required=set(), optional={"device_address_ref"},
+        label=f"{label}.configuration",
+    )
+    normalized_configuration: dict[str, Any] = {}
+    if "device_address_ref" in configuration:
+        normalized_configuration["device_address_ref"] = _require_id(
+            configuration["device_address_ref"], f"{label}.configuration.device_address_ref"
+        )
+    return {
+        "component_id": _require_id(component["component_id"], f"{label}.component_id"),
+        "component_profile_id": _require_id(
+            component["component_profile_id"], f"{label}.component_profile_id"
+        ),
+        "lane": _require_id(component["lane"], f"{label}.lane"),
+        "configuration": normalized_configuration,
+        **_validate_active(component, label),
+    }
+
+
+def _validate_io_member(component: dict[str, Any], label: str) -> dict[str, Any]:
+    """A machine's I/O member: its signals come from its model."""
+    _require_exact_fields(
+        component,
+        required={"component_id", "component_profile_id", "owner", "role"},
+        optional={"active"},
+        label=label,
+    )
+    return {
+        "component_id": _require_id(component["component_id"], f"{label}.component_id"),
+        "component_profile_id": _require_id(
+            component["component_profile_id"], f"{label}.component_profile_id"
+        ),
+        "owner": _require_id(component["owner"], f"{label}.owner"),
+        "role": _require_id(component["role"], f"{label}.role"),
+        **_validate_active(component, label),
+    }
+
+
 def _validate_default_tcp(value: Any, label: str) -> dict[str, str]:
     """B5 `default_tcp` `{command_target_id, frame_role_id}`; the compiler
     checks the pair against the component's TCPs."""
@@ -501,14 +609,27 @@ def validate_deployment_intent(value: Any, *, source: str) -> dict[str, Any]:
     for index, raw_component in enumerate(components):
         label = f"{source}: components[{index}]"
         component = _require_object(raw_component, label)
-        if _is_model_free_component(component):
-            normalized = _validate_model_free_component(component, label)
+        model_free = _is_model_free_component(component)
+        sensor = _is_sensor_component(component)
+        if model_free or sensor or _is_machine_owner(component) or (
+            "owner" in component and "model_source" not in component
+        ):
+            if sensor:
+                normalized = _validate_sensor_component(component, label)
+            elif model_free:
+                normalized = _validate_model_free_component(component, label)
+            elif "owner" in component:
+                normalized = _validate_io_member(component, label)
+            else:
+                normalized = _validate_machine_owner(component, label)
             if normalized["component_id"] in component_ids:
                 _fail(f"{source}: duplicate component_id {normalized['component_id']!r}")
             component_ids.add(normalized["component_id"])
             normalized_components.append(normalized)
             continue
         is_mounted = component.get("component_id") in mounted
+        # A machine's arm member: no lane of its own (it runs on its owner's).
+        member = "owner" in component
         _require_exact_fields(
             component,
             required={
@@ -518,8 +639,10 @@ def validate_deployment_intent(value: Any, *, source: str) -> dict[str, Any]:
                 "target_settings",
                 "configuration",
             }
-            | (set() if is_mounted else {"root_pose_in_cell"}),
-            optional={"frame_prefix", "custom_tcps", "default_tcp"},
+            | (set() if is_mounted else {"root_pose_in_cell"})
+            | ({"owner", "role"} if member else set()),
+            optional={"frame_prefix", "custom_tcps", "default_tcp"}
+            | ({"active"} if member else {"lane"}),
             label=label,
         )
         component_id = _require_id(component["component_id"], f"{label}.component_id")
@@ -574,6 +697,13 @@ def validate_deployment_intent(value: Any, *, source: str) -> dict[str, Any]:
                 _require_object(component["configuration"], f"{label}.configuration")
             ),
         }
+        if "lane" in component:
+            # One of the model's `lanes.<lane>` rows; the compiler checks it.
+            normalized["lane"] = _require_id(component["lane"], f"{label}.lane")
+        if member:
+            normalized["owner"] = _require_id(component["owner"], f"{label}.owner")
+            normalized["role"] = _require_id(component["role"], f"{label}.role")
+            normalized.update(_validate_active(component, label))
         if not is_mounted:
             normalized["root_pose_in_cell"] = _validate_pose(
                 component["root_pose_in_cell"], f"{label}.root_pose_in_cell"

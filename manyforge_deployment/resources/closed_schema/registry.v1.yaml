@@ -18,7 +18,7 @@ catalog_schemas:
     qualification: qualified
   - record_kind: command_schema
     schema_id: manyforge.command_schema.v1
-    schema_revision: sha256:fdce9bb1facd259bde85f502197fd534dc05346a030605a55aa951d9e88c73dd
+    schema_revision: sha256:4f23fe66c0dd587d998a52a7b166bddd22d7ab8e5b28caacc48373ff373dcd84
     relative_path: catalog/manyforge.command_schema.v1.yaml
     qualification: qualified
   - record_kind: component_type
@@ -75,19 +75,14 @@ value_schemas:
     relative_path: value/manyforge.value_schema.runtime.empty.v1.yaml
     qualification: qualified
   - schema_id: manyforge.value_schema.runtime.io_provider_execution.v1
-    schema_revision: sha256:253091b4459b65d16bf23acc539e5d3c9ee65938008a147fd438ec6b6d8d53d7
+    schema_revision: sha256:500cfe739120003e06057cdf78a94f006eb4fc4ef157a7f55f70ab4d1aa45b1d
     relative_path: value/manyforge.value_schema.runtime.io_provider_execution.v1.yaml
-    qualification: qualified
-  # DX-753: retain archival native schema for shared Draft/import validation.
-  - schema_id: manyforge.value_schema.runtime.native_execution.v1
-    schema_revision: sha256:19db78f3505f27815b6a90556de58caa0541c91193ead9b6a643f475383d5190
-    relative_path: value/manyforge.value_schema.runtime.native_execution.v1.yaml
     qualification: qualified
   - schema_id: manyforge.value_schema.runtime.pose_source.v2
     schema_revision: sha256:a7e77850ee255f3bfc989e5105e1c37ca7c767fa63768160e75e81bb8e6e7173
     relative_path: value/manyforge.value_schema.runtime.pose_source.v2.yaml
     qualification: qualified
   - schema_id: manyforge.value_schema.runtime.ros2_control_execution.v1
-    schema_revision: sha256:fb270d54f86ecc3f03cc520ea6b7c13cd2a32fef86d7da0700532fb4b2de7b59
+    schema_revision: sha256:1c557174fd45649c43d2e20239ec614635ca31aa79608d87727e35edcf8c2c90
     relative_path: value/manyforge.value_schema.runtime.ros2_control_execution.v1.yaml
     qualification: qualified

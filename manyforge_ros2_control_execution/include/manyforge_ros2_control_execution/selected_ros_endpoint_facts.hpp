@@ -4,169 +4,74 @@
 #include <rclcpp/rclcpp.hpp>
 
 #include <algorithm>
-#include <array>
-#include <iomanip>
+#include <cstddef>
 #include <mutex>
 #include <optional>
-#include <set>
-#include <sstream>
 #include <string>
 
 namespace manyforge::ros2_control_execution {
 
-/// Observation of one lane-owned, exclusive ROS publisher role. Refresh is
-/// NRT; ReadError only copies maintained facts and checks the SDK graph event.
-/// A GID identifies a publisher endpoint, never an OS process/provider epoch.
-/// A graph event is domain-wide: Refresh settles it when a stable capture
-/// shows the cached publisher GIDs unchanged; a different GID set is a change.
+/// The publisher count of one lane-owned, exclusive ROS topic (EPC-1): an
+/// action needs exactly one publisher. 0 is not established, 2+ is
+/// `duplicate_component_instance`. Refresh (NRT, on the existing observation
+/// and admission checkpoints) stores the graph's count; ReadError only reads
+/// the stored count and the subscription's matched count. Nothing else on the
+/// ROS domain is looked at.
 class SelectedRosEndpointFacts final {
 public:
-  SelectedRosEndpointFacts(const rclcpp::Node::SharedPtr &node,
-                          std::string topic, std::string type)
-      : node_(node), topic_(std::move(topic)), type_(std::move(type)),
-        graph_event_(node->get_graph_event()) {}
+  SelectedRosEndpointFacts(const rclcpp::Node::SharedPtr &node, std::string topic)
+      : node_(node), topic_(std::move(topic)) {}
 
   void ObserveMatchedCount(const int count) {
     std::lock_guard lock(mutex_);
-    if (!matched_count_ || *matched_count_ != count) {
-      matched_count_ = count;
-      ++revision_;
-      dirty_ = true;
-    }
+    matched_count_ = static_cast<std::size_t>(std::max(count, 0));
   }
 
-  /// Called only by existing NRT observation/subscription checkpoints. No
-  /// wait, timer, worker, retry or effect is introduced.
   void Refresh() {
-    RefreshWith([&](const auto &node) {
-      return node->get_publishers_info_by_topic(topic_);
-    });
-  }
-
-private:
-  friend class JtcExecutionPortTestPeer;
-
-  template <typename ReadEndpoints> void RefreshWith(ReadEndpoints &&read_endpoints) {
-    // Multiple existing callbacks may observe the same graph edge. Serialize
-    // only this NRT graph capture, never a lifecycle/command owner lock.
-    std::lock_guard refresh_lock(refresh_mutex_);
-    std::uint64_t revision;
-    {
-      std::lock_guard lock(mutex_);
-      if (!dirty_ && !graph_event_->check())
-        return;
-      revision = revision_;
-    }
-    graph_event_->check_and_clear();
-    std::optional<core::ErrorDTO> error;
-    Gids gids;
-    const auto node = node_.lock();
-    if (!node) {
-      error = Unsettled("selected_endpoint_node_unavailable");
-    } else {
+    std::size_t count = 0;
+    std::optional<std::string> failure;
+    if (const auto node = node_.lock()) {
       try {
-        const auto endpoints = read_endpoints(node);
-        std::string first, second;
-        bool identifiable = true;
-        for (const auto &endpoint : endpoints) {
-          if (endpoint.topic_type() != type_) {
-            identifiable = false;
-            continue;
-          }
-          const auto &gid = endpoint.endpoint_gid();
-          if (std::all_of(gid.begin(), gid.end(),
-                          [](const auto byte) { return byte == 0; })) {
-            identifiable = false;
-            continue;
-          }
-          if (!gids.insert(gid).second)
-            continue;
-          std::ostringstream text;
-          text << endpoint.node_namespace() << '/' << endpoint.node_name()
-               << '@' << std::hex << std::setfill('0');
-          for (const auto byte : gid)
-            text << std::setw(2) << static_cast<unsigned>(byte);
-          if (first.empty()) first = text.str();
-          else if (second.empty()) second = text.str();
-        }
-        if (gids.size() > 1U) {
-          error = core::ErrorDTO{
-              "duplicate_component_instance",
-              "The selected ROS publisher role has conflicting endpoints.",
-              {{"reason", "duplicate_component_instance"}, {"topic", topic_},
-               {"endpoint_count", std::to_string(gids.size())},
-               {"first_endpoint", std::move(first)},
-               {"second_endpoint", std::move(second)},
-               {"evidence_kind", "ros_publisher_endpoints"}}};
-        } else if (!identifiable || gids.empty()) {
-          error = Unsettled("selected_endpoint_not_established");
-        }
+        count = node->count_publishers(topic_);
       } catch (const std::exception &cause) {
-        error = Unsettled("selected_endpoint_graph_read_failed");
-        error->details.emplace("cause", cause.what());
+        failure = cause.what();
       }
     }
     std::lock_guard lock(mutex_);
-    if (revision != revision_ || graph_event_->check()) {
-      dirty_ = true;
-      // A positive conflicting endpoint observation is kept; an unstable
-      // graph must never turn that observation into a clean result.
-      if (!error || error->code != "duplicate_component_instance")
-        error = Unsettled("selected_endpoint_graph_changed");
-    } else if (!error && established_gids_ && *established_gids_ != gids) {
-      // Stable capture of a different identity (also same-count replacement):
-      // commit it, but only a following stable capture may settle it.
-      established_gids_ = std::move(gids);
-      dirty_ = true;
-      error = Unsettled("selected_endpoint_graph_changed");
-    } else {
-      if (!error)
-        established_gids_ = std::move(gids);
-      dirty_ = false;
-    }
-    error_ = std::move(error);
+    publisher_count_ = count;
+    read_failure_ = std::move(failure);
   }
 
-public:
   [[nodiscard]] std::optional<core::ErrorDTO> ReadError() const {
     std::lock_guard lock(mutex_);
-    if (error_ && error_->code == "duplicate_component_instance")
-      return error_;
-    if (matched_count_ && *matched_count_ > 1) {
+    // The subscription's matched count is a second view of the same count.
+    const auto count = std::max(publisher_count_, matched_count_);
+    if (count > 1U) {
       return core::ErrorDTO{
           "duplicate_component_instance",
-          "The selected ROS publisher role has multiple matched endpoints.",
+          "The selected ROS topic has more than one publisher.",
           {{"reason", "duplicate_component_instance"}, {"topic", topic_},
-           {"endpoint_count", std::to_string(*matched_count_)},
-           {"evidence_kind", "ros_matched_publishers"}}};
+           {"endpoint_count", std::to_string(count)}}};
     }
-    if (dirty_ || graph_event_->check())
-      return Unsettled("selected_endpoint_graph_changed");
-    return error_;
+    if (publisher_count_ == 1U)
+      return std::nullopt;
+    core::ErrorDTO error{"component_instance_graph_unsettled",
+                         "The selected ROS publisher role is not established.",
+                         {{"reason", "component_instance_graph_unsettled"},
+                          {"topic", topic_},
+                          {"endpoint_count", std::to_string(publisher_count_)}}};
+    if (read_failure_)
+      error.details.emplace("cause", *read_failure_);
+    return error;
   }
 
 private:
-  using Gids = std::set<std::array<std::uint8_t, RMW_GID_STORAGE_SIZE>>;
-
-  [[nodiscard]] core::ErrorDTO Unsettled(std::string cause) const {
-    return {"component_instance_graph_unsettled",
-            "The selected ROS publisher role is not established.",
-            {{"reason", "component_instance_graph_unsettled"},
-             {"topic", topic_}, {"graph_reason", std::move(cause)}}};
-  }
-
   std::weak_ptr<rclcpp::Node> node_;
   const std::string topic_;
-  const std::string type_;
-  rclcpp::Event::SharedPtr graph_event_;
-  std::mutex refresh_mutex_;
   mutable std::mutex mutex_;
-  std::optional<int> matched_count_;
-  std::uint64_t revision_{};
-  bool dirty_{true};
-  // Publisher GIDs of the last stable, clean NRT capture.
-  std::optional<Gids> established_gids_;
-  std::optional<core::ErrorDTO> error_;
+  std::size_t publisher_count_{};
+  std::size_t matched_count_{};
+  std::optional<std::string> read_failure_;
 };
 
 } // namespace manyforge::ros2_control_execution

@@ -16,7 +16,7 @@ struct QualifiedSceneProductAdoptionRequestDTO final {
   ProjectionRevisionDTO expected_active_projection_revision;
   LogicalSceneSnapshotIdentityDTO expected_snapshot_identity;
   RetainedBundleDTO candidate_retained_bundle;
-  std::vector<ProjectionNativeRuntimeBindingDTO> native_runtime_bindings;
+  std::vector<ProjectionExecutionHostBindingDTO> execution_host_bindings;
 
   friend bool operator==(const QualifiedSceneProductAdoptionRequestDTO&,
                          const QualifiedSceneProductAdoptionRequestDTO&) = default;
@@ -41,7 +41,7 @@ struct QualifiedSceneConfigurationAdoptionRequestDTO final {
   ProjectionRevisionDTO expected_active_projection_revision;
   LogicalSceneSnapshotIdentityDTO expected_snapshot_identity;
   RetainedBundleDTO candidate_retained_bundle;
-  std::vector<ProjectionNativeRuntimeBindingDTO> native_runtime_bindings;
+  std::vector<ProjectionExecutionHostBindingDTO> execution_host_bindings;
 
   friend bool operator==(const QualifiedSceneConfigurationAdoptionRequestDTO&,
                          const QualifiedSceneConfigurationAdoptionRequestDTO&) = default;

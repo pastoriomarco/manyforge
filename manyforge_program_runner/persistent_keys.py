@@ -10,14 +10,16 @@ machine state.
 
 Stored values follow Manager's committed Scenario activations. Every
 publication after the canonical-empty bootstrap is one committed named Apply,
-and Manager lists all of them for its publication history. A stored value is
-kept unless an observed committed Apply no longer declares its key persistent
-with the same structure. The register remembers which committed Applies it
-has accounted for: a repeated or late notification changes nothing, and a
-committed Apply it never observed is reported as the named fault
-`applied_program_not_observed` (the values are kept and reconciled against
-the current Program). A new publication history (Manager restarted with new
-state) is accepted the same way: rows that fit the current Program stay.
+and Manager lists the ones its bounded journal still retains (older ones are
+evicted). A stored value is kept unless an observed committed Apply no longer
+declares its key persistent with the same structure. The register remembers
+which retained committed Applies it has accounted for: a repeated or late
+notification changes nothing, and a retained committed Apply it never
+observed is reported as the named fault `applied_program_not_observed` (the
+values are kept and reconciled against the current Program). A new
+publication history (Manager restarted with new state), or one whose
+last-reconciled activation Manager already evicted, is accepted the same way:
+rows that fit the current Program stay.
 """
 
 from __future__ import annotations
@@ -44,7 +46,7 @@ _SUPERSEDED_SCHEMA_VERSION: Final = "manyforge.persistent_key_register.v2"
 MAX_ROWS: Final = 4_096
 MAX_VALUE_BYTES: Final = 65_536
 MAX_EDITS: Final = 256
-# Manager bounds one publication history to 256 named Applies.
+# Manager's journal retains at most 256 named Applies (older ones are evicted).
 MAX_RECONCILED_APPLIES: Final = 1_024
 # Declared access that lets the operator change a key's value (Set, Reset, Clear).
 OPERATOR_WRITABLE_ACCESS: Final = frozenset({"write", "read_write"})
@@ -122,8 +124,9 @@ class PersistentKeyNotice:
 class CommittedActivation:
     """Manager's current committed Scenario activation.
 
-    ``committed_applies`` maps every committed Apply record of the current
-    publication history, this one included, to its Scenario project folder.
+    ``committed_applies`` maps every committed Apply record Manager retains
+    of the current publication history, this one included, to its Scenario
+    project folder.
     """
 
     record_digest: str
@@ -151,7 +154,8 @@ class PersistentKeyReconciliation:
 
     ``unobserved`` names committed Applies (record digest, project folder) this
     reconciliation found that the register never observed;
-    ``history_changed`` says the activation starts a new publication history.
+    ``history_changed`` says the activation starts a new publication history
+    (or one whose last-reconciled activation Manager already evicted).
     """
 
     outcome: str
@@ -560,9 +564,12 @@ class PersistentKeyRegister:
         The activation's Scenario keeps every row its Program still declares
         persistent with the same structure; the others are dropped with a
         notice. Nothing is dropped because a notification was missed: a
-        committed Apply of this history the register never observed is
-        recorded as the `applied_program_not_observed` fault instead, and a
-        new publication history is accepted. All changes are written in one
+        retained committed Apply of this history the register never observed
+        is recorded as the `applied_program_not_observed` fault instead, and a
+        new publication history is accepted. Manager evicts old committed
+        Applies, so the history continues while the last reconciled activation
+        is still retained; faults naming evicted Applies go with them. All
+        changes are written in one
         step. An activation already accounted for changes nothing, so
         repeated or late notifications are harmless.
         """
@@ -582,14 +589,24 @@ class PersistentKeyRegister:
                     else "stale"
                 )
             committed = dict(activation.committed_applies)
-            history_changed = not self._reconciled <= set(committed)
+            # Eviction drops the oldest Applies of the same history; only a
+            # lost last-reconciled activation breaks continuity (a restarted
+            # Manager, or one that evicted it while the register lagged).
+            history_changed = (
+                self._activation is not None
+                and self._activation["record_digest"] not in committed
+            )
             if history_changed:
                 # The faults named Applies of the previous history.
                 seen: frozenset[str] = frozenset()
                 unobserved: dict[str, str] = {}
             else:
                 seen = self._reconciled
-                unobserved = dict(self._unobserved)
+                unobserved = {
+                    digest: project
+                    for digest, project in self._unobserved.items()
+                    if digest in committed
+                }
             missed = (
                 ()
                 if self._activation is None and not history_changed

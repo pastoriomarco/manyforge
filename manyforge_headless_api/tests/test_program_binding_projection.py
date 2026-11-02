@@ -10,23 +10,18 @@ from manyforge_headless_api.program_binding_projection import (
 from manyforge_headless_api.program_binding_transport import ProgramBindingTransportError
 
 
-def _origin(kind="scenario"):
-    digest = "sha256:" + "a" * 64
-    if kind == "scenario":
-        return {"kind": kind, "scenario_id": "scenario_a", "source_document_digest": digest,
-                "project_path": "/projects/scenario_a.scenario"}
-    return {"kind": kind, "cell_id": "cell_a", "deployment_artifact_id": "deployment_a",
-            "deployment_revision": digest, "retained_bundle_id": digest,
-            "graph_revision": digest, "admission_digest": digest}
+def _origin(scenario_id="scenario_a"):
+    return {"kind": "scenario", "scenario_id": scenario_id, "source_document_digest": "sha256:" + "a" * 64,
+            "project_path": f"/projects/{scenario_id}.scenario"}
 
 
-def _publication(kind="sealed_canonical_empty"):
+def _publication(scenario_id="scenario_b"):
     rows = [{"apply_id": "apply-1", "apply_generation": 1,
              "scene_initialization": "initialize",
              "record_digest": "sha256:" + "a" * 64, "origin": _origin()},
             {"apply_id": "apply-2", "apply_generation": 2,
              "scene_initialization": "preserve",
-             "record_digest": "sha256:" + "b" * 64, "origin": _origin(kind)}]
+             "record_digest": "sha256:" + "b" * 64, "origin": _origin(scenario_id)}]
     return {"schema_version": "manyforge.committed_scenario_activation.v3", **deepcopy(rows[-1]),
             "publication_generation": 3, "program": None, "committed_applies": rows}
 
@@ -37,60 +32,66 @@ def test_typed_history_keeps_every_apply_and_returns_exact_source_without_mutati
     assert validate_committed_scenario_activation(value) is value
     assert value == original
     assert len(value["committed_applies"]) + 1 == value["publication_generation"]
-    assert value["origin"]["kind"] == "sealed_canonical_empty"
-    later = _publication("scenario")
+    assert value["origin"]["scenario_id"] == "scenario_b"
+    later = _publication("scenario_a")
     later["committed_applies"].insert(1, value["committed_applies"][1])
     later["committed_applies"][-1].update({"apply_id": "apply-3", "apply_generation": 3,
                                          "record_digest": "sha256:" + "c" * 64})
     later.update({"apply_id": "apply-3", "apply_generation": 3,
                   "record_digest": "sha256:" + "c" * 64, "publication_generation": 4})
     assert validate_committed_scenario_activation(later) is later
-    assert [row["origin"]["kind"] for row in later["committed_applies"]] == ["scenario", "sealed_canonical_empty", "scenario"]
+    assert [row["origin"]["scenario_id"] for row in later["committed_applies"]] == [
+        "scenario_a", "scenario_b", "scenario_a"]
+    # Manager's journal evicted the older Applies: the retained ones remain
+    # the history (F7: more Applies than the journal retains).
+    evicted = _publication()
+    evicted["committed_applies"].pop(0)
+    evicted["publication_generation"] = 400
+    assert validate_committed_scenario_activation(evicted) is evicted
 
 
-@pytest.mark.parametrize("mutation", ["omit_empty", "omit_old", "current_foreign_origin", "duplicate",
-    "unsorted", "v1", "old_scenario_key", "sealed_program", "foreign_current_id", "foreign_current_generation"])
+@pytest.mark.parametrize("mutation", ["omit_current", "more_than_published", "current_foreign_origin", "duplicate",
+    "unsorted", "v1", "old_scenario_key", "foreign_current_id", "foreign_current_generation"])
 def test_typed_history_rejects_incomplete_or_mismatched_publication(mutation):
     value = _publication()
-    if mutation == "omit_empty": value["committed_applies"].pop()
-    elif mutation == "omit_old": value["committed_applies"].pop(0)
-    elif mutation == "current_foreign_origin": value["origin"]["admission_digest"] = "sha256:" + "f" * 64
+    if mutation == "omit_current": value["committed_applies"].pop()
+    elif mutation == "more_than_published": value["publication_generation"] = 2
+    elif mutation == "current_foreign_origin": value["origin"]["scenario_id"] = "foreign"
     elif mutation == "duplicate": value["committed_applies"][0] = deepcopy(value["committed_applies"][1])
     elif mutation == "unsorted": value["committed_applies"].reverse()
     elif mutation == "v1": value["schema_version"] = "manyforge.committed_scenario_activation.v1"
     elif mutation == "old_scenario_key": value["scenario_id"] = "fake"
-    elif mutation == "sealed_program": value["program"] = {"program_id": "fake"}
     elif mutation == "foreign_current_id": value["apply_id"] = "foreign"
     elif mutation == "foreign_current_generation": value["apply_generation"] = 3
     with pytest.raises(ProgramBindingTransportError):
         validate_committed_scenario_activation(value)
 
 
-@pytest.mark.parametrize("change", [{"kind": "unknown"}, {"scenario_id": "fake"},
-    {"cell_id": "x" * 129}, {"source_document_digest": None}, {"admission_digest": "sha256:invalid"}])
-def test_typed_history_validates_all_rows_before_consumer_scenario_subset(change):
-    value = _publication("scenario")
-    value["committed_applies"][0]["origin"] = {**_origin("sealed_canonical_empty"), **change}
+@pytest.mark.parametrize("change", [{"kind": "unknown"}, {"scenario_id": "s" * 257},
+    {"cell_id": "cell_a"}, {"source_document_digest": None}, {"project_path": "relative"}])
+def test_typed_history_validates_every_row(change):
+    value = _publication()
+    value["committed_applies"][0]["origin"] = {**_origin(), **change}
     with pytest.raises(ProgramBindingTransportError):
         validate_committed_scenario_activation(value)
 
 
 @pytest.mark.parametrize("purpose", [None, "initialize_once", True, "", "reset"])
 def test_committed_scene_initialization_rejects_untyped_purpose(purpose):
-    value = _publication("scenario")
+    value = _publication()
     value["scene_initialization"] = purpose
     with pytest.raises(ProgramBindingTransportError):
         validate_committed_scenario_activation(value)
 
 
 def test_committed_scene_initialization_is_joined_to_exact_current_history():
-    value = _publication("scenario")
+    value = _publication()
     value["scene_initialization"] = "initialize"
     with pytest.raises(ProgramBindingTransportError):
         validate_committed_scenario_activation(value)
 
 
-def test_sealed_empty_can_request_scene_initialization():
+def test_an_apply_can_request_scene_initialization():
     value = _publication()
     value["scene_initialization"] = "initialize"
     value["committed_applies"][-1]["scene_initialization"] = "initialize"

@@ -16,11 +16,9 @@ import type {
   ObservedMotionTarget,
   OperationObservation,
   OperationStateName,
-  OutputEvidence,
   Pose3Value,
   ResourceSourceKind,
   SceneRevisionValue,
-  StopFaultTrigger,
   TcpEntryIdentity,
   TargetStopResponse,
   ManualControlAvailability,
@@ -320,38 +318,23 @@ function manualControlMotionDescriptorAt(
         .map((value, index) => {
           const itemPath = `${base}.joint_limits[${index}]`;
           const row = objectAt(value, itemPath);
-          exactKeysAt(row, ['source_joint_name', 'source', 'maximum_rad_s3', 'preset_rad_s3', 'imported'], itemPath);
+          exactKeysAt(row, ['source_joint_name', 'source', 'maximum_rad_s3', 'preset_rad_s3'], itemPath);
           const source = stringAt(row.source, `${itemPath}.source`);
-          if (!['off', 'override', 'imported', 'preset'].includes(source)) {
+          if (!['off', 'override', 'preset'].includes(source)) {
             return fail(itemPath, 'a known jerk-limit source');
           }
           const maximumRadS3 = nullableNumberAt(row.maximum_rad_s3, `${itemPath}.maximum_rad_s3`);
           const presetRadS3 = nullableNumberAt(row.preset_rad_s3, `${itemPath}.preset_rad_s3`);
-          const imported = row.imported === null ? null : (() => {
-            const importedPath = `${itemPath}.imported`;
-            const info = objectAt(row.imported, importedPath);
-            exactKeysAt(info, ['maximum_rad_s3', 'enabled', 'machine_required', 'source_id', 'source_digest'], importedPath);
-            return {
-              maximumRadS3: positiveNumberAt(info.maximum_rad_s3, `${importedPath}.maximum_rad_s3`),
-              enabled: booleanAt(info.enabled, `${importedPath}.enabled`),
-              machineRequired: booleanAt(info.machine_required, `${importedPath}.machine_required`),
-              sourceId: stringAt(info.source_id, `${importedPath}.source_id`),
-              sourceDigest: digestAt(info.source_digest, `${importedPath}.source_digest`),
-            };
-          })();
           if ((enabled ? maximumRadS3 === null || source === 'off' : maximumRadS3 !== null || source !== 'off')
             || (maximumRadS3 !== null && maximumRadS3 <= 0)
             || (presetRadS3 !== null && presetRadS3 <= 0)
-            || (source === 'preset' && maximumRadS3 !== presetRadS3)
-            || (source === 'imported' && (!imported?.enabled || maximumRadS3 !== imported.maximumRadS3))
-            || (imported?.enabled && maximumRadS3 !== null && maximumRadS3 > imported.maximumRadS3)
-            || (imported?.machineRequired && (!enabled || !imported.enabled))) {
-            return fail(itemPath, 'consistent effective jerk limits and provenance');
+            || (source === 'preset' && maximumRadS3 !== presetRadS3)) {
+            return fail(itemPath, 'consistent effective jerk limits');
           }
           return {
             sourceJointName: stringAt(row.source_joint_name, `${itemPath}.source_joint_name`),
-            source: source as 'off' | 'override' | 'imported' | 'preset',
-            maximumRadS3, presetRadS3, imported,
+            source: source as 'off' | 'override' | 'preset',
+            maximumRadS3, presetRadS3,
           };
         });
       if (jointLimits.length !== joints.length || jointLimits.some((row, index) => row.sourceJointName !== joints[index].sourceJointName)) {
@@ -1025,13 +1008,6 @@ export function parseExecutionControlStatus(
     row.program_run_id,
     `executionTargets.targets.program_run_id[${index}]`,
   )));
-  const ioRuns = new Set((ioSignalBindings ?? []).flatMap((row) => (
-    row.outputCommand === undefined ? [] : [row.outputCommand.programRunId]
-  )));
-  if (ioRuns.size > 1 || [...ioRuns].some((run) => allowedProgramRuns.has(run))) {
-    return fail('executionTargets.targets.io_signal_bindings', 'one distinct direct I/O Program run');
-  }
-  for (const run of ioRuns) allowedProgramRuns.add(run);
   const manualRows = arrayAt(
     control.manual_operations,
     'executionControlState.control_state.manual_operations',
@@ -1058,25 +1034,12 @@ export function parseExecutionControlStatus(
         'one of the exact direct-control Program runs',
       );
     }
-    const outputRows = (ioSignalBindings ?? []).filter((row) => row.outputCommand?.programRunId === programRunId);
-    if (outputRows.length > 0 && !outputRows.some((row) => row.programBindingId === operation.program_binding_id)) {
-      return fail(`executionControlState.control_state.manual_operations[${index}].program_binding_id`,
-        'one of the current direct I/O bindings');
-    }
     const observed = parseOperationObservation({
       command: 'read',
       ok: true,
       operation,
       resident: projection.resident,
     });
-    if (outputRows.length > 0 && !outputRows.some((row) => (
-      row.programBindingId === operation.program_binding_id
-      && row.controllableComponentId === observed.controllableComponentId
-      && row.commandTargetId === observed.commandTargetId
-    ))) {
-      return fail(`executionControlState.control_state.manual_operations[${index}].operation`,
-        'the exact direct I/O binding and physical target');
-    }
     if (!observed.resident && ![
       'completed', 'stopped', 'failed', 'interrupted', 'intervention_required', 'cancelled_pre_dispatch',
     ].includes(observed.state)) {
@@ -1807,7 +1770,7 @@ function normalizedOwnerStatusAt(value: unknown): ExecutionOwnerStatus {
     'executionStatus.status.cell_stop_action',
   );
   exactKeysAt(cellStop, [
-    'available', 'expected_stop_generation', 'fault', 'latest_terminal',
+    'available', 'expected_stop_generation', 'latest_terminal',
     'unavailable_reason',
   ], 'executionStatus.status.cell_stop_action');
   const cellStopAvailable = booleanAt(
@@ -1905,61 +1868,6 @@ function normalizedOwnerStatusAt(value: unknown): ExecutionOwnerStatus {
       executedStages,
     };
   }
-  let cellStopFault: ExecutionOwnerStatus['cellStopAction']['fault'] = null;
-  if (cellStop.fault !== null) {
-    const path = 'executionStatus.status.cell_stop_action.fault';
-    const fault = objectAt(cellStop.fault, path);
-    exactKeysAt(fault, [
-      'certificate', 'latch_generation', 'latch_id', 'observed_triggers', 'reason_code',
-      'recovery_status', 'state', 'trigger',
-    ], path);
-    const stateName = stringAt(fault.state, `${path}.state`);
-    if (!['latched', 'recovery_pending', 'cleared'].includes(stateName)) {
-      return fail(`${path}.state`, 'a Stop fault latch state');
-    }
-    const stopFaultTriggers: readonly string[] = [
-      'scope_promotion', 'escalated', 'partial', 'failed_uncontained',
-      'physical_rest_unproven', 'persistence_degraded', 'post_reserve_fence_failed',
-    ];
-    const trigger = stringAt(fault.trigger, `${path}.trigger`);
-    if (!stopFaultTriggers.includes(trigger)) {
-      return fail(`${path}.trigger`, 'a Stop fault trigger');
-    }
-    const observedTriggers = arrayAt(fault.observed_triggers, `${path}.observed_triggers`)
-      .map((value, index) => {
-        const name = stringAt(value, `${path}.observed_triggers[${index}]`);
-        if (!stopFaultTriggers.includes(name)) {
-          return fail(`${path}.observed_triggers[${index}]`, 'a Stop fault trigger');
-        }
-        return name as StopFaultTrigger;
-      });
-    const recoveryStatus = stringAt(
-      fault.recovery_status,
-      `${path}.recovery_status`,
-    );
-    if (![
-      'waiting_for_observation', 'waiting_for_quiescence',
-      'waiting_for_configuration', 'waiting_for_external_reconciliation',
-      'waiting_for_durable_record', 'ready', 'recovery_pending', 'cleared',
-    ].includes(recoveryStatus)) {
-      return fail(`${path}.recovery_status`, 'a Stop fault recovery status');
-    }
-    cellStopFault = {
-      latchId: stringAt(fault.latch_id, `${path}.latch_id`),
-      latchGeneration: positiveIntegerAt(
-        fault.latch_generation,
-        `${path}.latch_generation`,
-      ),
-      state: stateName as 'latched' | 'recovery_pending' | 'cleared',
-      trigger: trigger as StopFaultTrigger,
-      observedTriggers,
-      recoveryStatus: recoveryStatus as NonNullable<ExecutionOwnerStatus['cellStopAction']['fault']>['recoveryStatus'],
-      reasonCode: stringAt(fault.reason_code, `${path}.reason_code`),
-      certificate: fault.certificate === null
-        ? null
-        : certificateRefAt(fault.certificate, `${path}.certificate`),
-    };
-  }
   // Every addressed target is parsed on its own: a gripper never needs a
   // motion target on the same component, and neither needs the other.
   const motionEntries = arrayAt(
@@ -2052,7 +1960,6 @@ function normalizedOwnerStatusAt(value: unknown): ExecutionOwnerStatus {
         'executionStatus.status.cell_stop_action.expected_stop_generation',
       ),
       latestTerminal,
-      fault: cellStopFault,
     },
   };
 }
@@ -2669,37 +2576,12 @@ const OPERATION_STATES = new Set<OperationStateName>([
   'cancelled_pre_dispatch',
 ]);
 
-const OUTPUT_EVIDENCE = new Set<OutputEvidence>([
-  'not_submitted', 'submitted', 'source_accepted', 'source_rejected', 'acceptance_unknown',
-]);
-
-/**
- * One participant's binding identity and optional correlated output evidence
- * (SX-2119): a provider participant has both control-binding fields null and a
- * real capability-provider binding; evidence is omitted when absent and an
- * explicit null or unknown spelling is invalid. Evidence is the source's
- * acceptance, never the physical effect.
- */
-export function participantOutputEvidenceAt(
-  participant: Record<string, unknown>,
-  path: string,
-): OutputEvidence | undefined {
+/** One participant's binding identity: always its controller's control binding. */
+function checkParticipantBinding(participant: Record<string, unknown>, path: string): void {
   const text = (key: string) => typeof participant[key] === 'string' && participant[key] !== '';
-  if ('control_binding_id' in participant || 'control_binding_revision' in participant) {
-    if (participant.control_binding_id === null && participant.control_binding_revision === null) {
-      if (!text('capability_provider_binding_id') || !text('capability_provider_binding_revision')) {
-        return fail(path, 'a provider participant with its capability-provider binding');
-      }
-    } else if (!text('control_binding_id') || !text('control_binding_revision')) {
-      return fail(path, 'a paired control binding or both control-binding fields null');
-    }
+  if (!text('control_binding_id') || !text('control_binding_revision')) {
+    fail(path, 'a paired control binding');
   }
-  if (!('output_evidence' in participant)) return undefined;
-  const evidence = participant.output_evidence;
-  if (typeof evidence !== 'string' || !OUTPUT_EVIDENCE.has(evidence as OutputEvidence)) {
-    return fail(`${path}.output_evidence`, 'a known output evidence value');
-  }
-  return evidence as OutputEvidence;
 }
 
 export function parseOperationObservation(value: unknown): OperationObservation {
@@ -2763,10 +2645,7 @@ export function parseOperationObservation(value: unknown): OperationObservation 
   if (revision < 1) {
     return fail('operationObservation.operation.operation_revision', 'positive');
   }
-  const outputEvidence = participantOutputEvidenceAt(
-    participant,
-    'operationObservation.operation.participants[0]',
-  );
+  checkParticipantBinding(participant, 'operationObservation.operation.participants[0]');
   const optionalParticipantText = (key: string): string | undefined => (
     typeof participant[key] === 'string' && participant[key] !== ''
       ? participant[key] as string
@@ -2799,6 +2678,5 @@ export function parseOperationObservation(value: unknown): OperationObservation 
     targetRoleId: optionalParticipantText('target_role_id'),
     controllableComponentId: optionalParticipantText('controllable_component_id'),
     commandTargetId: optionalParticipantText('command_target_id'),
-    ...(outputEvidence === undefined ? {} : { outputEvidence }),
   };
 }

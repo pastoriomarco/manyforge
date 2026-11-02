@@ -80,10 +80,6 @@ struct ResolvedExecutionBindingDTO final {
   TargetRoleId target_role_id;
   std::vector<ProgramFrameRoleBindingDTO> frame_role_bindings;
   std::vector<ProgramCollisionBodyRoleBindingDTO> collision_body_role_bindings;
-  /// Frames held under the admitted TCP linear-speed limit, computed once at
-  /// admission (`speed_check_frames`): `tcp_frame` first, then the robot
-  /// flange under `active_tcp_and_flange`. Empty checks `tcp_frame` alone.
-  std::vector<ResolvedFrameDTO> speed_check_frames{};
 
   friend bool operator==(const ResolvedExecutionBindingDTO&,
                          const ResolvedExecutionBindingDTO&) = default;
@@ -210,7 +206,7 @@ struct ExecuteRequestDTO {
   TimeoutsDTO timeouts;
   CacheMode cache_mode;
   ResolvedMotionSpecDTO motion;
-  PlanningProfileDTO planning_profile = PlanningProfileDTO::kFirstFeasible;
+  PlannerOverrideDTO planner{};
   MotionTargetModeDTO target_mode = MotionTargetModeDTO::kAbsolute;
   /// Required for relative pose/Cartesian targets; forbidden for absolute
   /// targets (which use goal_frame_reference) and relative joint deltas.

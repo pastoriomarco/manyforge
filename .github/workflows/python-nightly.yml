@@ -1,0 +1,119 @@
+name: python-nightly
+
+# Heavy tier: nightly (on dev), on demand, and on release tags. Not on PRs.
+# - bindings: the ROS-free I2 compiler bindings (scripts/ci/run-core-bindings.sh)
+#   inside the development image.
+# - slow: the Python tests marked `slow`, which python-tests.yml deselects.
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  bindings:
+    name: I2 compiler bindings (AMD64 Docker)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'schedule' && 'dev' || '' }}
+
+      - name: Prepare pinned RoboPlan Docker context
+        run: ./scripts/setup-docker.sh --prepare-only
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Same cache scope as cpp-asan/cpp-tsan: one dev-image build serves all.
+      - name: Build development image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          tags: manyforge-python-ci:${{ github.sha }}
+          cache-from: type=gha,scope=manyforge-dev
+          cache-to: type=gha,scope=manyforge-dev,mode=max,ignore-error=true
+
+      - name: Run I2 bindings in immutable image
+        shell: bash
+        run: |
+          set -euo pipefail
+          image_id="$(docker image inspect "manyforge-python-ci:${GITHUB_SHA}" --format '{{.Id}}')"
+          if [[ ! "${image_id}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Could not resolve immutable development image identity" >&2
+            exit 1
+          fi
+          echo "Qualified image: ${image_id}"
+          docker run --rm --platform linux/amd64 \
+            -e WORKSPACE=/workspace \
+            -e MANYFORGE_BUILD_DIR=/tmp/manyforge-ci-build \
+            -e PYTHONPYCACHEPREFIX=/tmp/manyforge-pycache \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            -w /workspace \
+            "${image_id}" \
+            bash -lc 'set -euo pipefail; git config --global --add safe.directory /workspace; ./scripts/test-all.sh bindings'
+
+  slow:
+    name: Python tests marked slow
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      HEADLESS_BUILD: ${{ github.workspace }}/build/headless
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'schedule' && 'dev' || '' }}
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build ccache pkg-config \
+            libsqlite3-dev libssl-dev libexpat1-dev zlib1g-dev libyaml-dev \
+            libdouble-conversion-dev libutf8proc-dev
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: .github/workflows/python-tests.yml
+      - name: Install Python dependencies (same pins as python-tests.yml)
+        run: |
+          python -m pip install \
+            pytest==9.0.3 pytest-xdist==3.8.0 numpy==2.3.5 py_trees==2.4.0 \
+            pybind11==3.0.3 pyyaml==6.0.3 rfc8785==0.1.4 pillow==10.2.0 \
+            trimesh==4.11.5 yourdfpy==0.0.60 fastapi==0.135.3 \
+            "uvicorn[standard]==0.44.0" httpx==0.28.1 httpx2==2.12.0 \
+            websockets==16.0 mcp==1.27.0
+      - name: Restore ccache (seeded by python-tests.yml)
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ccache-headless-py-${{ github.run_id }}
+          restore-keys: ccache-headless-py-
+      - name: Build the expression binding (manyforge_headless_py)
+        run: |
+          cmake -S manyforge_headless -B "$HEADLESS_BUILD" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DMANYFORGE_CORE_BUILD_SQLITE_OPERATION_JOURNAL=ON \
+            -DMANYFORGE_HEADLESS_BUILD_PYTHON=ON \
+            -Dpybind11_DIR="$(python3 -c 'import pybind11; print(pybind11.get_cmake_dir())')"
+          cmake --build "$HEADLESS_BUILD" --parallel 4 --target manyforge_headless_py
+      - name: pytest -m slow
+        run: |
+          export PYTHONPATH="$HEADLESS_BUILD:$GITHUB_WORKSPACE:$GITHUB_WORKSPACE/manyforge_behavior"
+          pytest -c pytest.ini --rootdir . -p no:cacheprovider \
+            -p no:launch_testing -p no:launch_ros --durations=25 -v -n auto -m slow \
+            manyforge_behavior/tests manyforge_headless_api/tests manyforge_program_runner/tests

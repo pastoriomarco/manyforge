@@ -10,7 +10,7 @@
 #include <limits>
 
 #include <manyforge_core/types/collision.hpp>
-#include <manyforge_core/types/motion_spec.hpp>
+#include <manyforge_core/types/planner_settings.hpp>
 #include <roboplan/core/path_utils.hpp>
 #include <roboplan_rrt/rrt.hpp>
 #include <roboplan_simple_ik/simple_ik.hpp>
@@ -18,8 +18,7 @@
 namespace manyforge::roboplan_backend {
 
 /// The configured step (Deployment `collision_check_step_rad`) on the first
-/// attempt, min(step, 0.01) on retries; validation of the attempt's
-/// trajectory uses the same step (core::collision_check_step_for_attempt).
+/// attempt, min(step, 0.01) on retries (core::collision_check_step_for_attempt).
 inline constexpr double collision_check_step_size_for_attempt(
     const std::uint32_t planning_attempt_index,
     const double configured_step_rad = core::kDefaultCollisionCheckStepRad) noexcept {
@@ -38,45 +37,23 @@ inline constexpr bool shortcut_candidate_for_attempt(
   return planning_attempt_index <= 1U;
 }
 
+/// RRT options from the effective planner block (Deployment default with the
+/// motion's override applied). best_of_n plans with first-path RRT, repeated
+/// by the candidate computer.
 inline roboplan::RRTOptions production_rrt_options(
     const std::string& group_name, double max_planning_time_s,
     const std::uint32_t planning_attempt_index = 0U,
-    const double configured_step_rad = core::kDefaultCollisionCheckStepRad) {
+    const core::PlannerSettingsDTO& planner = {}) {
   roboplan::RRTOptions options;
   options.group_name = group_name;
   options.max_planning_time = max_planning_time_s;
-  options.max_nodes = 5000;
-  options.collision_check_step_size =
-      collision_check_step_size_for_attempt(planning_attempt_index,
-                                            configured_step_rad);
-  // Preserve ManyForge's qualified first-feasible policy inherited from the
-  // 0.4 baseline. Later RoboPlan releases add budget-spending and optimal
-  // variants, but they remain opt-in capabilities.
-  options.rrt_star = false;
-  options.fast_return = true;
-  return options;
-}
-
-inline roboplan::RRTOptions planning_profile_rrt_options(
-    roboplan::RRTOptions options,
-    core::PlanningProfileDTO profile) {
-  switch (profile) {
-    case core::PlanningProfileDTO::kFirstFeasible:
-      options.rrt_star = false;
-      options.fast_return = true;
-      break;
-    case core::PlanningProfileDTO::kBalanced:
-      // Rewire while searching, but return the first complete candidate. This
-      // improves the in-search tree without deliberately spending the
-      // remaining request budget after feasibility has been established.
-      options.rrt_star = true;
-      options.fast_return = true;
-      break;
-    case core::PlanningProfileDTO::kQualityBounded:
-      options.rrt_star = true;
-      options.fast_return = false;
-      break;
-  }
+  options.max_nodes = planner.max_nodes;
+  options.collision_check_step_size = collision_check_step_size_for_attempt(
+      planning_attempt_index, planner.collision_check_step_rad);
+  options.rrt_connect = planner.search == core::PlannerSearchDTO::kRrtConnect;
+  // rrt_star rewires and spends the node/time budget on the cheapest path.
+  options.rrt_star = planner.optimize == core::PlannerOptimizeDTO::kRrtStar;
+  options.fast_return = !options.rrt_star;
   return options;
 }
 
@@ -111,17 +88,6 @@ inline roboplan::SimpleIkOptions production_planning_ik_options(
   options.max_restarts = 50;
   options.max_time = 1.0;
   options.fast_return = true;
-  return options;
-}
-
-inline roboplan::SimpleIkOptions planning_profile_ik_options(
-    roboplan::SimpleIkOptions options,
-    core::PlanningProfileDTO profile) {
-  // Quality-bounded planning searches the bounded restart set for the
-  // seed-nearest feasible solution. The other profiles return the first
-  // feasible IK candidate; Balanced spends quality effort in path search.
-  options.fast_return =
-      profile != core::PlanningProfileDTO::kQualityBounded;
   return options;
 }
 

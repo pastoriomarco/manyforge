@@ -19,7 +19,7 @@ describe('activation failure notice', () => {
         failureAcknowledgement: 'unavailable',
         failure: {
           code: 'runtime_composition_publication_verification_failed',
-          message: 'native CCLC candidate routes are not ready.',
+          message: 'native candidate routes are not ready.',
           phase: 'runtime_converged',
           effectDisposition: 'unknown',
           causeCode: 'typed_cause_code',
@@ -40,7 +40,7 @@ describe('activation failure notice', () => {
     expect(notice.message).toContain('Applied state was not confirmed (apply.a)');
     expect(notice.message).toContain('The runtime remains locked');
     expect(notice.message).toContain(
-      'Close and preserve evidence: ./scripts/compose-dev.sh stop --keep-evidence',
+      'Stop the workbench and keep evidence: ./scripts/compose-dev.sh stop --keep-evidence',
     );
     expect(notice.message).toMatch(
       /Reload: \.\/scripts\/compose-dev\.sh stop --keep-evidence && \.\/scripts\/compose-dev\.sh start --project 'scenarios\/operator'"'"'s test cell\.scenario'$/,
@@ -310,7 +310,7 @@ describe('activation failure notice', () => {
       'Scenario refused: RoboPlan addressed planner construction is inconsistent (component arm.1). '
         + 'The Scenario was not applied and nothing changed: composing its configuration found an '
         + 'inconsistency in its data or setup. Fix the cause named in the details, then restart the '
-        + 'workbench before loading again. Close and preserve evidence: '
+        + 'workbench before loading again. Stop the workbench and keep evidence: '
         + './scripts/compose-dev.sh stop --keep-evidence, then start the workbench again. (apply.r)',
     );
     expect(notice.message).not.toContain('runtime remains locked');
@@ -336,19 +336,19 @@ describe('activation failure notice', () => {
 
     expect(notice.message).toContain('The runtime remains locked');
     expect(notice.message).toContain(
-      'The Saved Scenario is outside the mounted repository, so a new workbench cannot reload it; only Close is available.',
+      'The Saved Scenario is outside the mounted repository, so a new workbench cannot reload it; only stopping the workbench is available.',
     );
     expect(notice.message).toContain('./scripts/compose-dev.sh stop --keep-evidence');
     expect(notice.message).not.toContain('start --project');
     expect(notice.message).toMatch(
-      /Close and preserve evidence: \.\/scripts\/compose-dev\.sh stop --keep-evidence$/,
+      /Stop the workbench and keep evidence: \.\/scripts\/compose-dev\.sh stop --keep-evidence$/,
     );
   });
 
   it.each([
     '/workspace/scenarios/cell.scenario.yaml',
     '/workspace/scenarios/cell.scenario.yml',
-  ])('offers only Close for single-file Saved Scenario %s', (scenarioPath) => {
+  ])('offers only stopping the workbench for single-file Saved Scenario %s', (scenarioPath) => {
     const notice = shownNotice('activation.d:1', 'apply.d', {
       state: 'unknown_effect',
       failureAcknowledgement: 'unavailable',
@@ -365,7 +365,7 @@ describe('activation failure notice', () => {
     }, scenarioPath, false);
 
     expect(notice.message).toContain(
-      'The Saved Scenario is a single-file artifact, while this workbench start command accepts Scenario project directories; only Close is available.',
+      'The Saved Scenario is a single-file artifact, while this workbench start command accepts Scenario project directories; only stopping the workbench is available.',
     );
     expect(notice.message).toContain('./scripts/compose-dev.sh stop --keep-evidence');
     expect(notice.message).not.toContain('start --project');

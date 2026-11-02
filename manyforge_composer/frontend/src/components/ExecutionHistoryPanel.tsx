@@ -4,6 +4,8 @@ import { api, HISTORIAN_PAGE_LIMIT } from '../api/client';
 import { HistoryDiscovery } from './HistoryDiscovery';
 import type { HistorianListQuery } from '../api/client';
 import type { HistorianDetail, HistorianRetention } from '../types/headless';
+import { parseProgramRunEnd } from '../api/parsers/components';
+import { runEndPresentation, type RunEndPresentation } from '../state/componentPresentation';
 
 export type HistorySeverityFilter = 'all' | 'info' | 'warning' | 'error';
 export type HistoryAlarmFilter =
@@ -39,6 +41,12 @@ export interface ExecutionHistoryEventView {
 }
 
 const MAXIMUM_MOUNTED_HISTORY_ROWS = 32;
+
+/** CONTRACTS §9: the run end a Program run's end event carries, if this is one. */
+export function historyRunEnd(payload: Record<string, unknown>): RunEndPresentation | null {
+  if (payload.run_end === undefined || payload.run_end === null) return null;
+  return runEndPresentation(parseProgramRunEnd(payload.run_end, 'history.run_end'));
+}
 
 export function historySeverityGroup(
   severity: string | null | undefined,
@@ -343,6 +351,7 @@ export function ExecutionHistoryPanel({
                 <strong>{selectedDetail.event.eventType.replaceAll('_', ' ')}</strong>
                 <code>sequence {selectedDetail.sequence}</code>
               </header>
+              <HistoryRunEnd payload={selectedDetail.event.payload} />
               <div className="history-detail-sections">
                 {Object.entries(selectedDetail.sections).map(([name, section]) => (
                   <details key={name} open={section.available}>
@@ -359,4 +368,10 @@ export function ExecutionHistoryPanel({
       )}
     </section>
   );
+}
+
+function HistoryRunEnd({ payload }: { payload: Record<string, unknown> }) {
+  const end = historyRunEnd(payload);
+  if (end === null) return null;
+  return <p className={`run-end tone-${end.tone}`} role="status"><strong>{end.label}</strong> · {end.text}</p>;
 }

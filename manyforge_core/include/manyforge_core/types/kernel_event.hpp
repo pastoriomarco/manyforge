@@ -41,23 +41,6 @@ enum class KernelEventType {
   kInterventionAcknowledged,
   kErrorRaised,        // error occurred
   kCollisionDetected,  // collision detected during execution
-  // Kernel-native interrupt events (spec/260 §7). Details carry the required
-  // event payload in string-normalized form.
-  kInterruptSignalIngested,
-  kInterruptSignalRejectedStale,
-  kInterruptSignalRejectedClassViolation,
-  kInterruptSignalRejected,
-  kInterruptLatched,
-  kInterruptSuppressedByActiveMask,
-  kInterruptQueued,
-  kInterruptDroppedQueueOverflow,
-  kInterruptPreemptApplied,
-  kInterruptDispositionApplied,
-  kInterruptCleared,
-  kInterruptIngestOverflow,
-  kInterruptSourceClassViolation,
-  kInterruptRecoveryHandlerStarted,
-  kInterruptRecoveryHandlerCompleted,
   // Motion-scoped interrupt outcomes (spec/260 §7).
   // `motion_interrupt_scope_armed` / `motion_interrupt_scope_reaped`
   // surface the binding lifecycle. `motion_interrupt_queued_update_dropped`

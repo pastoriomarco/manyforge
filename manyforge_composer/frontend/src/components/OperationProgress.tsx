@@ -21,7 +21,6 @@ export function OperationProgress({ operation, ownerEpoch, source }: {
     <progress aria-label="Operation progress" max={1} value={progress} />
     <span>
       {operation.state.replaceAll('_', ' ')} · {Math.round(progress * 100)}%
-      {operation.outputEvidence === undefined ? null : ` · output ${operation.outputEvidence.replaceAll('_', ' ')}`}
     </span>
   </>;
 }

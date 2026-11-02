@@ -436,8 +436,8 @@ namespace manyforge::scene::logical_scene_owner_detail {
 /// Returns the exact Scene-owned current native binding set. A maintenance
 /// completion supplies the complete set; only a pre-UA4 store falls back to
 /// its immutable migration snapshot.
-[[nodiscard]] std::vector<core::ProjectionNativeRuntimeBindingDTO>
-ActiveNativeRuntimeBindings(const DurableState &state) {
+[[nodiscard]] std::vector<core::ProjectionExecutionHostBindingDTO>
+ActiveExecutionHostBindings(const DurableState &state) {
   for (auto initialization = state.maintenance_initializations.rbegin();
        initialization != state.maintenance_initializations.rend();
        ++initialization) {
@@ -445,7 +445,7 @@ ActiveNativeRuntimeBindings(const DurableState &state) {
       return initialization->bindings;
     }
   }
-  const auto &bindings = state.active_native_runtime_bindings;
+  const auto &bindings = state.active_execution_host_bindings;
   if (!std::is_sorted(bindings.begin(), bindings.end(),
                       core::CanonicalProjectionNativeBindingLess) ||
       std::adjacent_find(bindings.begin(), bindings.end()) != bindings.end()) {
@@ -784,7 +784,7 @@ ReadProjectionEvidenceState(sqlite3 *database,
                             const std::uint64_t transaction_sequence,
                             const ProjectionRevisionDTO &proposed) {
   ProjectionEvidenceState evidence;
-  std::optional<core::ProjectionNativeRuntimeBindingDTO> previous_binding;
+  std::optional<core::ProjectionExecutionHostBindingDTO> previous_binding;
   Statement attempts(
       database,
       "SELECT projection_ordinal,provider_binding_id,"
@@ -799,7 +799,7 @@ ReadProjectionEvidenceState(sqlite3 *database,
       throw LogicalSceneOwnerIntegrityError(
           "logical-scene projection attempt ordinals are not contiguous");
     }
-    core::ProjectionNativeRuntimeBindingDTO binding{
+    core::ProjectionExecutionHostBindingDTO binding{
         core::CapabilityProviderBindingId(attempts.Text(1)),
         core::CapabilityProviderBindingRevision(attempts.Text(2)),
         core::RuntimeUnitId(attempts.Text(3)),
@@ -1441,7 +1441,7 @@ ReadAcceptance(sqlite3 *database,
       "graph_revision,scene_id,scene_revision_id,scene_content_hash,"
       "transaction_sequence,topology_epoch,policy_epoch,configured_policy_id,"
       "configured_policy_revision_id,configured_policy_content_hash,"
-      "object_count,carried_attachment_count,native_runtime_binding_count "
+      "object_count,carried_attachment_count,execution_host_binding_count "
       "FROM canonical_empty_scene_acceptance ORDER BY singleton LIMIT 2");
   if (!statement.Step()) {
     return std::nullopt;
@@ -1708,15 +1708,15 @@ ReadMigratedStructuralCompletions(sqlite3 *database) {
   return completions;
 }
 
-[[nodiscard]] std::vector<core::ProjectionNativeRuntimeBindingDTO>
-ReadActiveNativeRuntimeBindings(sqlite3 *database) {
+[[nodiscard]] std::vector<core::ProjectionExecutionHostBindingDTO>
+ReadActiveExecutionHostBindings(sqlite3 *database) {
   Statement statement(
       database,
       "SELECT binding_ordinal,provider_binding_id,"
       "provider_binding_revision,runtime_unit_id,runtime_epoch FROM "
-      "logical_scene_migrated_active_native_runtime_bindings "
+      "logical_scene_migrated_active_execution_host_bindings "
       "ORDER BY binding_ordinal LIMIT 257");
-  std::vector<core::ProjectionNativeRuntimeBindingDTO> bindings;
+  std::vector<core::ProjectionExecutionHostBindingDTO> bindings;
   while (statement.Step()) {
     if (bindings.size() >= kMaximumNativeProjectionBindings ||
         statement.Integer(0) != static_cast<std::int64_t>(bindings.size())) {
@@ -1795,7 +1795,9 @@ ReadMaintenanceInitializations(sqlite3 *database,
     const auto binding_count = intents.Integer(14);
     if (sequence <= 0 || generation <= 0 || predecessor_revision <= 0 ||
         target_revision <= 0 || binding_count < 0 || binding_count > 256 ||
-        sequence != static_cast<std::int64_t>(result.size() + 1U)) {
+        (!result.empty() &&
+         static_cast<std::uint64_t>(sequence) <=
+             result.back().initialization_sequence)) {
       throw LogicalSceneOwnerIntegrityError(
           "maintenance initialization intent is structurally invalid");
     }
@@ -2096,8 +2098,8 @@ ReadDurableState(sqlite3 *database,
         ReadMigratedStructuralCompletions(database);
     state.maintenance_initializations =
         ReadMaintenanceInitializations(database, fixed_query.cell_id);
-    state.active_native_runtime_bindings =
-        ReadActiveNativeRuntimeBindings(database);
+    state.active_execution_host_bindings =
+        ReadActiveExecutionHostBindings(database);
     state.legacy_native_effects_uncertain =
         ReadLegacyNativeEffectsUncertain(database);
   }
@@ -2404,7 +2406,7 @@ void ValidateBoundedHistoryMigrationMetadata(sqlite3 *database) {
       database,
       "SELECT schema_id,schema_version,migration_artifact_digest,"
       "maximum_resident_scene_transactions,"
-      "maximum_retained_native_recoveries "
+      "maximum_retained_recoveries "
       "FROM logical_scene_bounded_history_migrations ORDER BY singleton "
       "LIMIT 2");
   if (!statement.Step()) {
@@ -2847,7 +2849,7 @@ void InsertBoundedHistoryMigrationMetadata(sqlite3 *database) {
       database, "INSERT INTO logical_scene_bounded_history_migrations("
                 "singleton,schema_id,schema_version,migration_artifact_digest,"
                 "maximum_resident_scene_transactions,"
-                "maximum_retained_native_recoveries) VALUES(1,?,?,?,?,?)");
+                "maximum_retained_recoveries) VALUES(1,?,?,?,?,?)");
   statement.Bind(1, kBoundedHistoryStoreSchemaId);
   statement.Bind(2, kBoundedHistoryStoreSchemaVersion);
   statement.Bind(3, BoundedHistoryMigrationArtifactDigest());
@@ -2971,7 +2973,7 @@ void ValidateCanonicalEmptyIntent(
   // Check cardinality before the DTO's canonical-binding loop. A retained
   // execution-host process is infrastructure, not a native scene projection;
   // the structurally empty predecessor still has zero native bindings.
-  if (!intent.native_runtime_bindings.empty()) {
+  if (!intent.execution_host_bindings.empty()) {
     throw LogicalSceneOwnerConflictError(
         "canonical-empty owner does not implement nonzero native bindings");
   }
@@ -3107,7 +3109,7 @@ void InsertAcceptance(sqlite3 *database, const AcceptedState &accepted) {
       "scene_content_hash,transaction_sequence,topology_epoch,policy_epoch,"
       "configured_policy_id,configured_policy_revision_id,"
       "configured_policy_content_hash,object_count,carried_attachment_count,"
-      "native_runtime_binding_count) "
+      "execution_host_binding_count) "
       "VALUES(1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
   statement.Bind(1, accepted.bootstrap_id.value());
   statement.Bind(2, CheckedSafeCounter(accepted.bootstrap_generation.value(),

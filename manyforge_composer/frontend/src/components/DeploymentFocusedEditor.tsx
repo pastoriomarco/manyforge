@@ -1,8 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import { ComponentStreamsSection } from './ComponentStreamsSection';
 import { PoseSourceComponentSection } from './PoseSourceComponentForm';
 import { AiModelComponentSection } from './AiModelComponentForm';
 import { LifecycleBudgetField } from './LifecycleBudgetField';
+import { effectiveField, useEffectiveValues } from '../hooks/useEffectiveValues';
+import type { EffectiveValues } from '../types/components';
 import { PneumaticIoEditor, pneumaticIoProblem } from './PneumaticIoEditor';
 import { pneumaticGripperDrafts, type PneumaticGripperDraft } from '../utils/pneumaticGripperAuthoring';
 import {
@@ -21,7 +23,7 @@ import {
   type GeometricContactRobotOption,
 } from './IoSignalConfigurationSection';
 import {
-  IO_DEVICE_MAXIMUM_LIFECYCLE_TIMEOUT_S,
+  LIFECYCLE_TIMEOUT_HELP,
   IO_DEVICE_PROVISIONAL_OUTPUT_ACK_TIMEOUT_S,
   declaredIoInputs,
   declaredIoOutputs,
@@ -67,7 +69,6 @@ import type {
   DeploymentControlledStopProfile,
   JsonValue,
   SourceModelProjection,
-  TcpSpeedCheck,
 } from '../types/api';
 import type {
   ManualControlGripperDescriptor,
@@ -100,6 +101,8 @@ interface DeploymentFocusedEditorProps {
   executionGroupIds?: readonly string[] | null;
   systemSignalChoices?: readonly CarriedObjectLostSignalChoice[];
   systemSignalsNeedApply?: boolean;
+  /** Outputs holding a core-held `changed outside` signal (pushed I/O samples). */
+  changedOutsideOutputs?: ReadonlySet<string>;
   /** The Program Draft's scene object ids; null without a Program. */
   programSceneIds?: readonly string[] | null;
 }
@@ -114,16 +117,23 @@ interface RuntimeConfiguration {
   configurationPath: Array<string | number>;
   intentTargetSettings: Record<string, JsonValue> | null;
   framePrefix: string | null;
+  /** The component's lane (`components[].lane`); null when it names none. */
+  lane: string | null;
   /** A model-free I/O device (runtime_kind io_provider): I/O sections only. */
   ioProvider: boolean;
   /** A model-free pose source (runtime_kind pose_source): edited in its own section. */
   poseSource: boolean;
   /** A model-free AI model endpoint (runtime_kind ai_model): edited in its own section. */
   aiModel: boolean;
+  /** A sensor (runtime_kind sensor, e.g. the point-cloud source): edited in its own section. */
+  sensor: boolean;
 }
 
 const POSE_SOURCE_RUNTIME_KIND = 'pose_source';
 const AI_MODEL_RUNTIME_KIND = 'ai_model';
+const SENSOR_RUNTIME_KIND = 'sensor';
+/** An absolute ROS topic name (the compiler checks it fully). */
+const ROS_TOPIC = /^\/[A-Za-z0-9_/~{}]*$/;
 
 interface MotionTargetLimit {
   runtimeIndex: number;
@@ -131,7 +141,6 @@ interface MotionTargetLimit {
   componentId: string;
   targetId: string;
   value: number;
-  tcpSpeedCheck: TcpSpeedCheck;
   settingsPath: Array<string | number>;
 }
 
@@ -159,6 +168,8 @@ interface GripperTargetConfigurationDraft {
   pneumaticIo?: JsonValue;
   // Opt-in grasp confirmation, kept verbatim; the owner validates it.
   graspConfirmation?: JsonValue;
+  // Optional override of the component's Stop finish tolerance (position units).
+  stopFinishTolerance?: number;
   touchLinks: string[];
   mountFrame: string;
   attachFrame: string;
@@ -207,9 +218,11 @@ function runtimeConfigurations(
         framePrefix: configuration.runtime_kind === 'ros2_control'
           ? (typeof component?.frame_prefix === 'string' ? component.frame_prefix : '')
           : null,
+        lane: typeof component?.lane === 'string' ? component.lane : null,
         ioProvider: isIoProviderComponent(component ?? undefined),
         poseSource: configuration.runtime_kind === POSE_SOURCE_RUNTIME_KIND,
         aiModel: configuration.runtime_kind === AI_MODEL_RUNTIME_KIND,
+        sensor: configuration.runtime_kind === SENSOR_RUNTIME_KIND,
       }];
     });
   }
@@ -228,9 +241,11 @@ function runtimeConfigurations(
         configurationPath: ['graph', 'runtime_units', index, 'configuration'],
         intentTargetSettings: null,
         framePrefix: null,
+        lane: null,
         ioProvider: false,
         poseSource: false,
         aiModel: false,
+        sensor: false,
       }]
       : [];
   });
@@ -277,7 +292,6 @@ function motionTargetLimits(runtimes: RuntimeConfiguration[]): MotionTargetLimit
           componentId,
           targetId,
           value: limit,
-          tcpSpeedCheck: row?.tcp_speed_check === 'active_tcp' ? 'active_tcp' : 'active_tcp_and_flange',
           settingsPath: runtime.intentTargetSettings === null
             ? [...runtime.configurationPath, 'motion_target_limits', rowIndex]
             : ['components', runtime.index, 'target_settings', targetId],
@@ -356,6 +370,7 @@ function gripperTargetConfigurations(
       const deliveryResultTimeoutS = row?.delivery_result_timeout_s;
       const pneumaticIo = row?.pneumatic_io;
       const graspConfirmation = row?.grasp_confirmation;
+      const stopFinishTolerance = row?.stop_finish_tolerance;
       const touchLinks = row?.touch_links;
       const mountFrame = row?.mount_frame;
       const attachFrame = row?.attach_frame;
@@ -375,6 +390,11 @@ function gripperTargetConfigurations(
             || typeof deliveryResultTimeoutS !== 'number'
             || !Number.isFinite(deliveryResultTimeoutS)
             || deliveryResultTimeoutS <= 0))
+        || (stopFinishTolerance !== undefined
+          && (actuationKind !== 'position_commanded'
+            || typeof stopFinishTolerance !== 'number'
+            || !Number.isFinite(stopFinishTolerance)
+            || stopFinishTolerance < 0))
         || !Array.isArray(touchLinks)
         || touchLinks.some((item) => typeof item !== 'string')
         || typeof mountFrame !== 'string'
@@ -397,6 +417,7 @@ function gripperTargetConfigurations(
         ...(deliveryResultTimeoutS === undefined ? {} : { deliveryResultTimeoutS }),
         ...(pneumaticIo === undefined ? {} : { pneumaticIo }),
         ...(graspConfirmation === undefined ? {} : { graspConfirmation }),
+        ...(stopFinishTolerance === undefined ? {} : { stopFinishTolerance }),
         touchLinks: touchLinks as string[],
         mountFrame,
         attachFrame,
@@ -423,6 +444,8 @@ function gripperConfigurationValue(
       ? { delivery_result_timeout_s: draft.deliveryResultTimeoutS } : {}),
     ...(draft.pneumaticIo === undefined ? {} : { pneumatic_io: draft.pneumaticIo }),
     ...(draft.graspConfirmation === undefined ? {} : { grasp_confirmation: draft.graspConfirmation }),
+    ...(draft.actuationKind === 'position_commanded' && draft.stopFinishTolerance !== undefined
+      ? { stop_finish_tolerance: draft.stopFinishTolerance } : {}),
     touch_links: [...draft.touchLinks].sort(),
     mount_frame: draft.mountFrame,
     attach_frame: draft.attachFrame,
@@ -985,13 +1008,10 @@ function DirectControlJointLimitsEditor({
           const ordinaryJoint = ordinaryRows.map(objectValue).find((row) => (
             row?.source_joint_name === limit.sourceJointName
           ));
-          const imported = objectValue(ordinaryJoint?.imported);
           // Only explicit Draft caps are known here. Presets and final
-          // consistency remain the native activation owner's responsibility.
+          // consistency remain the activation owner's responsibility.
           const jerkMaximum = ordinary?.enabled !== true ? 0
-            : numberValue(ordinaryJoint?.override_rad_s3)
-              ?? (imported?.enabled === true ? numberValue(imported.maximum_rad_s3) : null)
-              ?? undefined;
+            : numberValue(ordinaryJoint?.override_rad_s3) ?? undefined;
           return (
             <section className="deployment-joint-cap" key={limit.sourceJointName}>
               <header>
@@ -1059,7 +1079,6 @@ function OrdinaryMotionJerkEditor({ controller, runtime, limit, descriptor }: {
   const disabled = !controller.mutationAvailable || controller.busy || applied === null;
   const enabled = settings.enabled === true;
   const joints = Array.isArray(settings.joint_limits) ? settings.joint_limits : [];
-  const required = joints.some((row) => objectValue(objectValue(row)?.imported)?.machine_required === true);
   const manualCaps = directControlJointLimits(runtime).filter((row) => (
     row.componentId === limit.componentId && row.targetId === limit.targetId
     && row.maxJerkRadS3 !== null
@@ -1075,7 +1094,7 @@ function OrdinaryMotionJerkEditor({ controller, runtime, limit, descriptor }: {
     else next.override_rad_s3 = value;
     return commit({ joint_limits: [
       ...joints.filter((row) => objectValue(row)?.source_joint_name !== sourceJointName),
-      ...(next.imported !== undefined || value !== null ? [next] : []),
+      ...(value !== null ? [next] : []),
     ] });
   };
   return (
@@ -1088,7 +1107,7 @@ function OrdinaryMotionJerkEditor({ controller, runtime, limit, descriptor }: {
           <select aria-label={`${limit.componentId} / ${limit.targetId} ordinary motion jerk`}
             disabled={disabled} value={enabled ? 'on' : 'off'}
             onChange={(event) => { void commit({ enabled: event.target.value === 'on' }); }}>
-            <option value="off" disabled={required || manualCaps.length > 0}>Off</option>
+            <option value="off" disabled={manualCaps.length > 0}>Off</option>
             <option value="on">Enforce limits</option>
           </select>
         </label>
@@ -1103,19 +1122,15 @@ function OrdinaryMotionJerkEditor({ controller, runtime, limit, descriptor }: {
         <summary>Ordinary joint jerk limits</summary>
         {applied.jointLimits.map((joint) => {
           const draft = joints.map(objectValue).find((row) => row?.source_joint_name === joint.sourceJointName);
-          const imported = objectValue(draft?.imported);
-          const ceiling = imported?.enabled === true ? numberValue(imported.maximum_rad_s3) ?? undefined : undefined;
           return <section className="deployment-joint-cap" key={joint.sourceJointName}>
             <OptionalNumberDraft label={joint.sourceJointName} unit="rad/s³"
               value={numberValue(draft?.override_rad_s3)} disabled={disabled || !enabled}
               minimum={manualCaps.find((row) => row.sourceJointName === joint.sourceJointName)?.maxJerkRadS3 ?? undefined}
-              maximum={ceiling} placeholder={ceiling === undefined ? 'ManyForge preset' : `Imported: ${ceiling}`}
+              placeholder="ManyForge preset"
               onCommit={(value) => override(joint.sourceJointName, value)} />
-            <small title={joint.imported ? `${joint.imported.sourceId}\n${joint.imported.sourceDigest}`
-              : 'ManyForge preset uses the model acceleration and saved reference time; it is not manufacturer data.'}>
+            <small title="ManyForge preset uses the model acceleration and saved reference time; it is not manufacturer data.">
               Applied: {joint.maximumRadS3 === null ? 'off' : `${format(joint.maximumRadS3)} rad/s³ · ${joint.source}`}
               {' · '}Preset: {format(joint.presetRadS3)} rad/s³
-              {joint.imported?.machineRequired && ' · machine-required'}
             </small>
           </section>;
         })}
@@ -1220,25 +1235,10 @@ function ModelAndTargetSection({
                   )}
                 />
                 <p className="field-help">
-                  Maximum TCP speed enforced for this target after Apply.
+                  Maximum TCP speed enforced at the active TCP for this target after Apply.
                   Individual motion nodes and manual commands may request a
                   slower speed.
                 </p>
-                <label className="deployment-focused-field"
-                  title="The flange is the point the robot's own TCP speed limit refers to.">
-                  <span>Check TCP speed at</span>
-                  <select aria-label={`${limit.componentId} / ${limit.targetId} TCP speed check`}
-                    disabled={editingDisabled} value={limit.tcpSpeedCheck}
-                    onChange={(event) => { void controller.updateMotionTargetLimit(
-                      limit.componentId,
-                      limit.targetId,
-                      limit.value,
-                      event.target.value as TcpSpeedCheck,
-                    ); }}>
-                    <option value="active_tcp_and_flange">Active TCP and flange</option>
-                    <option value="active_tcp">Active TCP only</option>
-                  </select>
-                </label>
                 {matching !== null
                   && matching.maximumTcpLinearSpeedMps !== limit.value && (
                   <p className="deployment-applied-comparison">
@@ -1326,14 +1326,152 @@ function PneumaticIoDraftFields({ controller, row, document }: {
   );
 }
 
-function NativeRuntimeSection({
+/**
+ * One Deployment field shown with its effective value and default (CONTRACTS
+ * §11): writing it adds it to the Draft, Reset to default removes it. Not shown
+ * until the backend reports the field.
+ */
+function EffectiveNumberDraft({ controller, effective, path, disabled, ...field }: {
+  controller: DeploymentWorkspaceController;
+  effective: EffectiveValues | null;
+  path: Array<string | number>;
+  label: string;
+  title?: string;
+  unit?: string;
+  min?: number;
+  exclusiveMin?: number;
+  max?: number;
+  step?: number;
+  disabled: boolean;
+}) {
+  const row = effectiveField(effective, path);
+  if (row === null || typeof row.value !== 'number') return null;
+  return (
+    <div className="deployment-effective-field">
+      <NumberDraft {...field} value={row.value} disabled={disabled}
+        onCommit={(value) => controller.mutate(path, 'set', value)} />
+      <small>{row.set ? `Set · default ${String(row.default)}` : 'Default'}</small>
+      <EffectiveReset controller={controller} effective={effective} path={path} label={field.label}
+        disabled={disabled} />
+    </div>
+  );
+}
+
+/** A boolean Deployment field as a checkbox, with its effective value and default (CONTRACTS §11). */
+function EffectiveCheckbox({ controller, effective, path, label, title, disabled }: {
+  controller: DeploymentWorkspaceController;
+  effective: EffectiveValues | null;
+  path: Array<string | number>;
+  label: string;
+  title: string;
+  disabled: boolean;
+}) {
+  const row = effectiveField(effective, path);
+  if (row === null || typeof row.value !== 'boolean') return null;
+  return (
+    <div className="deployment-effective-field">
+      <label className="toggle-control" title={title}>
+        <input type="checkbox" aria-label={label} checked={row.value} disabled={disabled}
+          onChange={(event) => { void controller.mutate(path, 'set', event.target.checked); }} />
+        {label}
+      </label>
+      <small>{row.set ? `Set · default ${row.default === true ? 'on' : 'off'}` : 'Default'}</small>
+      <EffectiveReset controller={controller} effective={effective} path={path} label={label}
+        disabled={disabled} />
+    </div>
+  );
+}
+
+/** Reset to default for a field the Draft sets (CONTRACTS §11); nothing when it is not set. */
+function EffectiveReset({ controller, effective, path, label, disabled }: {
+  controller: DeploymentWorkspaceController;
+  effective: EffectiveValues | null;
+  path: Array<string | number>;
+  label: string;
+  disabled: boolean;
+}) {
+  const row = effectiveField(effective, path);
+  if (row === null || !row.set) return null;
+  return (
+    <button type="button" className="quiet-button" disabled={disabled}
+      aria-label={`Reset ${label} to default`} title={`Default: ${String(row.default)}`}
+      onClick={() => { void controller.mutate(path, 'remove'); }}>Reset to default</button>
+  );
+}
+
+/**
+ * Sensor components (`kind: sensor` models, runtime_kind `sensor`): the
+ * point-cloud source's topic and source frame (required, no default; a
+ * sensor has no lane) and its limits, with their effective values.
+ */
+function SensorSection({ controller, runtimes, effective }: {
+  controller: DeploymentWorkspaceController;
+  runtimes: RuntimeConfiguration[];
+  effective: EffectiveValues | null;
+}) {
+  const disabled = !controller.mutationAvailable || controller.busy;
+  return (
+    <details className="dcard" open>
+      <summary>Point-cloud source</summary>
+      <div className="deployment-focused-body">
+        {runtimes.map((runtime) => {
+          const { settings, path: prefix } = runtimeSettingsAt(runtime);
+          const id = runtime.runtimeUnitId;
+          return (
+            <section className="deployment-runtime-unit" key={id} aria-label={`${id} sensor settings`}>
+              <header><strong>{id}</strong></header>
+              <div className="deployment-focused-form-grid">
+                <label className="deployment-focused-field">
+                  <span>Topic</span>
+                  <DraftTextInput aria-label={`${id} topic`}
+                    value={typeof settings.topic === 'string' ? settings.topic : ''} disabled={disabled}
+                    validate={(value) => (ROS_TOPIC.test(value.trim()) ? null
+                      : 'Enter an absolute ROS topic, e.g. /camera/points.')}
+                    onCommit={(value) => { void controller.mutate([...prefix, 'topic'], 'set', value.trim()); }} />
+                </label>
+                <label className="deployment-focused-field">
+                  <span>Source frame</span>
+                  <DraftTextInput aria-label={`${id} source frame`}
+                    value={typeof settings.source_frame_id === 'string' ? settings.source_frame_id : ''}
+                    disabled={disabled} placeholder="frame the cloud is published in"
+                    validate={(value) => (value.trim() !== '' ? null : 'Enter the frame the cloud is published in.')}
+                    onCommit={(value) => { void controller.mutate([...prefix, 'source_frame_id'], 'set', value.trim()); }} />
+                </label>
+                <EffectiveNumberDraft controller={controller} effective={effective}
+                  path={[...prefix, 'max_points']} label="Max points" min={1} max={200000} step={1}
+                  disabled={disabled} />
+                <EffectiveNumberDraft controller={controller} effective={effective}
+                  path={[...prefix, 'minimum_period_s']} label="Minimum period" unit="s" min={0} max={10}
+                  disabled={disabled} />
+              </div>
+              <p className="field-help">Shown in the 3D view while a viewer is open and the component is enabled; its <code>pointcloud</code> stream shows freshness only (none until something publishes the topic), never a fault.</p>
+            </section>
+          );
+        })}
+      </div>
+    </details>
+  );
+}
+
+/** The effective value of a Deployment field (CONTRACTS §11), or undefined until reported. */
+function plannerOptimize(value: unknown): 'first' | 'rrt_star' | 'best_of_n' {
+  return value === 'rrt_star' || value === 'best_of_n' ? value : 'first';
+}
+
+function effectiveValue(effective: EffectiveValues | null, path: Array<string | number>): unknown {
+  return effectiveField(effective, path)?.value;
+}
+
+function ExecutionHostSection({
   controller,
   runtimes,
   document,
+  effective,
 }: {
   controller: DeploymentWorkspaceController;
   runtimes: RuntimeConfiguration[];
   document: Record<string, JsonValue>;
+  effective: EffectiveValues | null;
 }) {
   const disabled = !controller.mutationAvailable || controller.busy;
   const pneumaticRows = pneumaticGripperDrafts(document).filter((row) => (
@@ -1341,7 +1479,7 @@ function NativeRuntimeSection({
   ));
   return (
     <details className="dcard">
-      <summary>Native runtime configuration</summary>
+      <summary>Execution host configuration</summary>
       <div className="deployment-focused-body">
         {controller.error !== null && controller.errorCauseCode === 'pneumatic_io_presets_coincident' && (
           <p className="inline-message severity-error" role="alert">The gripper's Open and Close presets have the same position. Choose distinct preset positions before using pneumatic I/O.</p>
@@ -1349,7 +1487,7 @@ function NativeRuntimeSection({
         {controller.error !== null && controller.errorCauseCode === 'pneumatic_io_unsupported_on_isaac' && (
           <p className="inline-message severity-error" role="alert">This pneumatic I/O mapping is not supported by Isaac. Use an unmapped Isaac gripper configuration.</p>
         )}
-        {runtimes.length === 0 && <p className="muted">No native runtime configuration is declared.</p>}
+        {runtimes.length === 0 && <p className="muted">No execution host configuration is declared.</p>}
         {runtimes.map((runtime) => {
           const { settings, path: prefix } = runtimeSettingsAt(runtime);
           const positions = settings.initial_joint_positions_rad;
@@ -1362,97 +1500,153 @@ function NativeRuntimeSection({
                     onCommit={(value) => controller.mutate(['components', runtime.index, 'frame_prefix'], 'set', value)} />
                 )}
                 {runtime.intentTargetSettings !== null && (
-                  <LifecycleBudgetField controller={controller} componentIndex={runtime.index}
+                  <LifecycleBudgetField controller={controller} effective={effective} componentIndex={runtime.index}
                     componentId={runtime.runtimeUnitId} disabled={disabled} />
                 )}
-                {numberValue(settings.execution_tick_hz) !== null && (
-                  <NumberDraft
-                    label="Execution cadence"
-                    value={settings.execution_tick_hz as number}
-                    unit="Hz"
-                    min={1}
-                    max={10000}
-                    disabled={disabled}
-                    onCommit={(value) => controller.mutate([...prefix, 'execution_tick_hz'], 'set', value)}
-                  />
-                )}
-                {numberValue(settings.collision_monitor_period_ms) !== null && (
-                  <NumberDraft
-                    label="Collision monitor period"
-                    value={settings.collision_monitor_period_ms as number}
-                    unit="ms"
-                    min={1}
-                    max={60000}
-                    disabled={disabled}
-                    onCommit={(value) => controller.mutate([...prefix, 'collision_monitor_period_ms'], 'set', value)}
-                  />
-                )}
-                {numberValue(settings.planner_rng_seed) !== null && (
-                  <NumberDraft
-                    label="Planner seed"
-                    value={settings.planner_rng_seed as number}
-                    min={0}
-                    disabled={disabled}
-                    onCommit={(value) => controller.mutate([...prefix, 'planner_rng_seed'], 'set', value)}
-                  />
+                <EffectiveNumberDraft controller={controller} effective={effective}
+                  path={[...prefix, 'execution_tick_hz']} label="Execution cadence" unit="Hz"
+                  min={1} max={10000} disabled={disabled} />
+                <EffectiveNumberDraft controller={controller} effective={effective}
+                  path={[...prefix, 'collision_monitor_period_ms']} label="Collision monitor period" unit="ms"
+                  min={1} max={60000} disabled={disabled} />
+                <EffectiveNumberDraft controller={controller} effective={effective}
+                  path={[...prefix, 'planner_rng_seed']} label="Planner seed" min={0} disabled={disabled} />
+                {effectiveField(effective, [...prefix, 'cartesian_timing']) !== null && (
+                  <label className="deployment-focused-field"
+                    title="How Cartesian paths are timed when a node does not choose. Constant TCP speed holds the tool speed along the path; Time-optimal moves as fast as the limits allow. The TCP speed limit holds either way.">
+                    <span>Cartesian timing</span>
+                    <select
+                      aria-label="Cartesian timing"
+                      value={effectiveValue(effective, [...prefix, 'cartesian_timing']) === 'time_optimal' ? 'time_optimal' : 'constant_speed'}
+                      disabled={disabled}
+                      onChange={(event) => {
+                        void controller.mutate([...prefix, 'cartesian_timing'], 'set', event.target.value);
+                      }}
+                    >
+                      <option value="constant_speed">Constant TCP speed</option>
+                      <option value="time_optimal">Time-optimal</option>
+                    </select>
+                    <EffectiveReset controller={controller} effective={effective}
+                      path={[...prefix, 'cartesian_timing']} label="Cartesian timing" disabled={disabled} />
+                  </label>
                 )}
                 {runtime.configuration.runtime_kind === 'ros2_control' && (
                   <>
-                    <NumberDraft
-                      label="Collision clearance"
-                      title="Planned and validated moves keep at least this from obstacles the collision policy does not allow them to touch; 0 turns it off. A motion's own clearance replaces it. Default 0 (off)."
-                      value={numberValue(settings.collision_clearance_m) ?? 0}
-                      unit="m"
-                      min={0}
-                      max={0.05}
-                      step={0.0005}
-                      disabled={disabled}
-                      onCommit={(value) => controller.mutate([...prefix, 'collision_clearance_m'], 'set', value)}
-                    />
-                    <NumberDraft
-                      label="Collision check step"
-                      title="Joint-space distance between collision-checked configurations, for the planner and for validation of the executed curve. A replan after a refusal, and its validation, use the finer of this and 0.01 rad. Default 0.05 rad."
-                      value={numberValue(settings.collision_check_step_rad) ?? 0.05}
-                      unit="rad"
-                      exclusiveMin={0}
-                      max={0.2}
-                      disabled={disabled}
-                      onCommit={(value) => controller.mutate([...prefix, 'collision_check_step_rad'], 'set', value)}
-                    />
+                    <EffectiveNumberDraft controller={controller} effective={effective}
+                      path={[...prefix, 'collision_clearance_m']} label="Collision clearance"
+                      title="Planned and validated moves keep at least this from obstacles the collision policy does not allow them to touch; 0 turns it off. A motion's own clearance replaces it."
+                      unit="m" min={0} max={0.05} step={0.0001} disabled={disabled} />
+                    <EffectiveNumberDraft controller={controller} effective={effective}
+                      path={[...prefix, 'collision_check_step_rad']} label="Collision check step"
+                      title="Joint-space distance between the configurations the planner collision-checks. A replan after a refusal uses the finer of this and 0.01 rad. A motion's planner block can override it."
+                      unit="rad" exclusiveMin={0} max={0.2} disabled={disabled} />
+                    <EffectiveCheckbox controller={controller} effective={effective}
+                      path={[...prefix, 'collision_check_fresh_plans']} label="Check fresh plans before dispatch"
+                      title="Collision-checks every waypoint of a newly planned move before it starts (ManyForge's engine); a failing plan is replanned. Off: only the planner's own checks (Collision check step) run before the move; the runtime lookahead still stops a move about to collide."
+                      disabled={disabled} />
+                    {effectiveField(effective, [...prefix, 'planner_search']) !== null && (
+                      <label className="deployment-focused-field"
+                        title="How the planner searches for a joint path when a motion does not choose. RRT-Connect grows trees from start and goal and connects them; RRT grows one tree from the start.">
+                        <span>Planner search</span>
+                        <select
+                          aria-label="Planner search"
+                          value={effectiveValue(effective, [...prefix, 'planner_search']) === 'rrt' ? 'rrt' : 'rrt_connect'}
+                          disabled={disabled}
+                          onChange={(event) => {
+                            void controller.mutate([...prefix, 'planner_search'], 'set', event.target.value);
+                          }}
+                        >
+                          <option value="rrt_connect">RRT-Connect</option>
+                          <option value="rrt">RRT</option>
+                        </select>
+                        <EffectiveReset controller={controller} effective={effective}
+                          path={[...prefix, 'planner_search']} label="Planner search" disabled={disabled} />
+                      </label>
+                    )}
+                    {effectiveField(effective, [...prefix, 'planner_optimize']) !== null && (
+                      <label className="deployment-focused-field"
+                        title="Which path the planner keeps when a motion does not choose. First path returns the first path found. RRT* rewires and spends the node and time budget on the shortest path. Best of N plans N times and keeps the shortest path.">
+                        <span>Planner optimize</span>
+                        <select
+                          aria-label="Planner optimize"
+                          value={plannerOptimize(effectiveValue(effective, [...prefix, 'planner_optimize']))}
+                          disabled={disabled}
+                          onChange={(event) => {
+                            void controller.mutate([...prefix, 'planner_optimize'], 'set', event.target.value);
+                          }}
+                        >
+                          <option value="first">First path</option>
+                          <option value="rrt_star">RRT*</option>
+                          <option value="best_of_n">Best of N</option>
+                        </select>
+                        <EffectiveReset controller={controller} effective={effective}
+                          path={[...prefix, 'planner_optimize']} label="Planner optimize" disabled={disabled} />
+                      </label>
+                    )}
+                    {plannerOptimize(effectiveValue(effective, [...prefix, 'planner_optimize'])) === 'best_of_n' && (
+                      <EffectiveNumberDraft controller={controller} effective={effective}
+                        path={[...prefix, 'planner_n']} label="Planner N"
+                        title="How many paths Best of N plans; the shortest one is kept."
+                        min={2} max={32} step={1} disabled={disabled} />
+                    )}
+                    <EffectiveNumberDraft controller={controller} effective={effective}
+                      path={[...prefix, 'planner_max_nodes']} label="Planner node budget"
+                      title="The most tree nodes one plan may sample before it gives up (RRT* stops here too)."
+                      min={100} max={1000000} step={1} disabled={disabled} />
+                    {effectiveField(effective, [...prefix, 'motion_timing']) !== null && (
+                      <label className="deployment-focused-field"
+                        title="How joint and pose moves are timed. Smooth times every move within the joint limits and then slows the whole move uniformly until the tool stays under its speed limit, giving gentle starts and stops. Fast keeps the tool near its speed limit with abrupt acceleration changes, so use it where cycle time matters and the arm and payload tolerate it. Cartesian paths follow Cartesian timing. The TCP speed limit holds either way.">
+                        <span>Motion timing</span>
+                        <select
+                          aria-label="Motion timing"
+                          value={effectiveValue(effective, [...prefix, 'motion_timing']) === 'fast' ? 'fast' : 'smooth'}
+                          disabled={disabled}
+                          onChange={(event) => {
+                            void controller.mutate([...prefix, 'motion_timing'], 'set', event.target.value);
+                          }}
+                        >
+                          <option value="smooth">Smooth (slower, M8-style)</option>
+                          <option value="fast">Fast (near the TCP speed limit)</option>
+                        </select>
+                        <EffectiveReset controller={controller} effective={effective}
+                          path={[...prefix, 'motion_timing']} label="Motion timing" disabled={disabled} />
+                      </label>
+                    )}
                   </>
                 )}
-                {runtime.configuration.runtime_kind === 'ros2_control' && typeof settings.real_profile === 'string' && (
+                {runtime.configuration.runtime_kind === 'ros2_control' && runtime.lane === 'real' && (
                   <label className="deployment-focused-field"
-                    title="Where a soft Stop's 0.1 s lead-in starts. Commanded position continues what the controller already commands. Measured position starts where the robot is measured; it trails the command, so the Stop can fall back to the hard stop. Default: Commanded position.">
+                    title="Where a soft Stop's 0.1 s lead-in starts. Commanded position continues what the controller already commands. Measured position starts where the robot is measured; it trails the command, so the Stop can fall back to the hard stop.">
                     <span>Stop lead-in start</span>
                     <select
                       aria-label="Stop lead-in start"
-                      value={settings.stop_lead_in_anchor === 'measured' ? 'measured' : 'commanded'}
+                      value={effectiveValue(effective, [...prefix, 'stop_lead_in_anchor']) === 'measured' ? 'measured' : 'commanded'}
                       disabled={disabled}
                       onChange={(event) => {
-                        void (event.target.value === 'measured'
-                          ? controller.mutate([...prefix, 'stop_lead_in_anchor'], 'set', 'measured')
-                          : controller.mutate([...prefix, 'stop_lead_in_anchor'], 'remove'));
+                        void controller.mutate([...prefix, 'stop_lead_in_anchor'], 'set', event.target.value);
                       }}
                     >
                       <option value="commanded">Commanded position</option>
                       <option value="measured">Measured position</option>
                     </select>
+                    <EffectiveReset controller={controller} effective={effective}
+                      path={[...prefix, 'stop_lead_in_anchor']} label="Stop lead-in start" disabled={disabled} />
                   </label>
                 )}
-                {runtime.configuration.runtime_kind === 'ros2_control' && typeof settings.real_profile === 'string' && (
+                {runtime.configuration.runtime_kind === 'ros2_control' && runtime.lane === 'real' && (
                   <label className="toggle-control"
-                    title="Selected (default): before a motion that needs another TCP, the robot's controller is sent that TCP offset, and the motion starts once the robot has settled. Unselected: the controller's TCP offset is kept at zero (the flange) and no TCP is ever sent; the payload is still sent. Save and Apply are required.">
+                    title="Selected: before a motion that needs another TCP, the robot's controller is sent that TCP offset, and the motion starts once the robot has settled. Unselected: the controller's TCP offset is kept at zero (the flange) and no TCP is ever sent; the payload is still sent. Save and Apply are required.">
                     <input type="checkbox"
                       aria-label="Send TCP offset to controller"
-                      checked={settings.controller_tcp_offset_sync !== false}
+                      checked={effectiveValue(effective, [...prefix, 'controller_tcp_offset_sync']) !== false}
                       disabled={disabled}
                       onChange={(event) => {
-                        void (event.target.checked
-                          ? controller.mutate([...prefix, 'controller_tcp_offset_sync'], 'remove')
-                          : controller.mutate([...prefix, 'controller_tcp_offset_sync'], 'set', false));
+                        void controller.mutate([...prefix, 'controller_tcp_offset_sync'], 'set', event.target.checked);
                       }} />
                     Send TCP offset to controller
+                    <EffectiveReset controller={controller} effective={effective}
+                      path={[...prefix, 'controller_tcp_offset_sync']} label="Send TCP offset to controller"
+                      disabled={disabled} />
                   </label>
                 )}
               </div>
@@ -1709,6 +1903,72 @@ function gripperRowPath(
 }
 
 /**
+ * A position gripper's Stop finish tolerance override: a Stop that finds the
+ * fingers this close to the commanded target lets the command finish instead
+ * of cancelling it. Writes on Enter or blur; blank removes the override (the
+ * component's default); Escape restores the Draft value.
+ */
+function StopFinishToleranceField({ controller, row, path, descriptor }: {
+  controller: DeploymentWorkspaceController;
+  row: GripperTargetConfigurationDraft;
+  path: Array<string | number>;
+  descriptor: ManualControlGripperDescriptor | null;
+}) {
+  const source = row.stopFinishTolerance === undefined ? '' : String(row.stopFinishTolerance);
+  const [value, setValue] = useState(source);
+  const [valueSource, setValueSource] = useState(source);
+  const [error, setError] = useState<string | null>(null);
+  if (valueSource !== source) {
+    setValueSource(source);
+    setValue(source);
+    setError(null);
+  }
+  if (row.actuationKind !== 'position_commanded') return null;
+  const disabled = !controller.mutationAvailable || controller.busy;
+  const commit = async () => {
+    const text = value.trim();
+    if (text === source) return;
+    if (text === '') {
+      setError(null);
+      await controller.mutate([...path, 'stop_finish_tolerance'], 'remove');
+      return;
+    }
+    const parsed = Number(text);
+    if (!Number.isFinite(parsed) || parsed < 0) {
+      setError('Stop finish tolerance must be a number of 0 or more.');
+      return;
+    }
+    setError(null);
+    await controller.mutate([...path, 'stop_finish_tolerance'], 'set', parsed);
+  };
+  return (
+    <label className="deployment-focused-field">
+      <span>Stop finish tolerance</span>
+      <span className="deployment-number-with-unit">
+        <input
+          type="number"
+          step="any"
+          min={0}
+          value={value}
+          placeholder="Component default"
+          disabled={disabled}
+          aria-invalid={error !== null}
+          onChange={(event) => { setValue(event.target.value); setError(null); }}
+          onBlur={() => { void commit(); }}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter') event.currentTarget.blur();
+            if (event.key === 'Escape') { setValue(source); setError(null); }
+          }}
+        />
+        <small>{descriptor?.unit ?? ''}</small>
+      </span>
+      <small className="field-help">A Stop this close to the target lets the command finish instead of cancelling it. Blank keeps the component default; 0 always cancels.</small>
+      {error !== null && <span className="deployment-field-error inline-message severity-error" role="alert">{error}</span>}
+    </label>
+  );
+}
+
+/**
  * The row's opt-in grasp confirmation. Like the other fields here, it writes
  * itself into the Draft once complete: the select on change, the stall window
  * on Enter or blur; Escape restores the Draft value. An incomplete or invalid
@@ -1808,7 +2068,7 @@ function GraspConfirmationFields({ controller, row, path, descriptor }: {
       </p>
       {!position && form.policy === 'required' && grasped === null && (
         <p className="inline-message severity-warning" role="status">
-          Required needs a mapped Workpiece grasped input on this pneumatic gripper. Map it in this gripper's pneumatic I/O under Native runtime configuration; until then the Deployment refuses this setting.
+          Required needs a mapped Workpiece grasped input on this pneumatic gripper. Map it in this gripper's pneumatic I/O under Execution host configuration; until then the Deployment refuses this setting.
         </p>
       )}
       {error !== null && <p className="deployment-field-error inline-message severity-error" role="alert">{error}</p>}
@@ -1924,8 +2184,12 @@ function GripperSection({
           <>
             <p className="muted">No current addressed gripper descriptor is available.</p>
             {authored.filter((row) => componentId === null || row.componentId === componentId).map((row) => (
-              <GraspConfirmationFields key={JSON.stringify([row.componentId, row.targetId])} controller={controller}
-                row={row} path={gripperRowPath(runtimes, row)} descriptor={null} />
+              <Fragment key={JSON.stringify([row.componentId, row.targetId])}>
+                <GraspConfirmationFields controller={controller}
+                  row={row} path={gripperRowPath(runtimes, row)} descriptor={null} />
+                <StopFinishToleranceField controller={controller}
+                  row={row} path={gripperRowPath(runtimes, row)} descriptor={null} />
+              </Fragment>
             ))}
           </>
         ) : (
@@ -2095,10 +2359,14 @@ function GripperSection({
               </fieldset>
             )}
             {source !== null && (
-              <GraspConfirmationFields key={descriptorKey(descriptor)} controller={controller}
-                row={source} path={gripperRowPath(runtimes, source)} descriptor={descriptor} />
+              <>
+                <GraspConfirmationFields key={descriptorKey(descriptor)} controller={controller}
+                  row={source} path={gripperRowPath(runtimes, source)} descriptor={descriptor} />
+                <StopFinishToleranceField key={`stop-finish-${descriptorKey(descriptor)}`} controller={controller}
+                  row={source} path={gripperRowPath(runtimes, source)} descriptor={descriptor} />
+              </>
             )}
-            <p className="field-help">The Deployment owns tool geometry, presets, motion time, and grasp confirmation. Transport, state authority, completion, and the grasp feedback policy above are exact addressed-owner facts and remain read-only.</p>
+            <p className="field-help">The Deployment owns tool geometry, presets, motion time, grasp confirmation, and the Stop finish tolerance. Transport, state authority, completion, and the grasp feedback policy above are exact addressed-owner facts and remain read-only.</p>
           </>
         )}
       </div>
@@ -2118,6 +2386,7 @@ export function DeploymentFocusedEditor({
   programSceneIds = null,
   systemSignalChoices = [],
   systemSignalsNeedApply = false,
+  changedOutsideOutputs,
 }: DeploymentFocusedEditorProps) {
   const document = controller.workspace?.draft.document ?? null;
   const componentId = typeof scope === 'object' ? scope.componentId : null;
@@ -2128,11 +2397,13 @@ export function DeploymentFocusedEditor({
   const runtimes = useMemo(() => runtimeConfigurations(document).filter((runtime) => (
     componentId === null || runtimeHoldsComponent(runtime, componentId)
   )), [componentId, document]);
-  // Model-free components (I/O devices, pose sources, AI models) have no model,
-  // motion, gripper, frame or Stop inputs.
+  // Model-free components (I/O devices, pose sources, AI models) and sensors
+  // have no robot model, motion, gripper, frame or Stop inputs.
   const motionRuntimes = useMemo(
-    () => runtimes.filter((runtime) => !runtime.ioProvider && !runtime.poseSource && !runtime.aiModel),
+    () => runtimes.filter((runtime) => (
+      !runtime.ioProvider && !runtime.poseSource && !runtime.aiModel && !runtime.sensor)),
     [runtimes]);
+  const sensorRuntimes = useMemo(() => runtimes.filter((runtime) => runtime.sensor), [runtimes]);
   const limits = useMemo(() => motionTargetLimits(motionRuntimes)
     .filter((limit) => componentId === null || limit.componentId === componentId), [componentId, motionRuntimes]);
   const controlledStop = useMemo(() => controlledStopTargets(document)
@@ -2143,7 +2414,9 @@ export function DeploymentFocusedEditor({
   const ownGripperDescriptors = useMemo(() => gripperDescriptors.filter((descriptor) => (
     componentId === null || descriptor.controllableComponentId === componentId
   )), [componentId, gripperDescriptors]);
-  const ioRuntimes = useMemo(() => runtimes.filter((runtime) => !runtime.poseSource && !runtime.aiModel).map((runtime) => ({
+  const effective = useEffectiveValues(controller);
+  const ioRuntimes = useMemo(() => runtimes.filter((runtime) => (
+    !runtime.poseSource && !runtime.aiModel && !runtime.sensor)).map((runtime) => ({
     index: runtime.index,
     runtimeUnitId: runtime.runtimeUnitId,
     configuration: runtime.configuration,
@@ -2183,7 +2456,8 @@ export function DeploymentFocusedEditor({
         limits={limits}
         runtimes={motionRuntimes}
       />}
-      {shown.native && <NativeRuntimeSection controller={controller} runtimes={motionRuntimes} document={document} />}
+      {shown.native && <ExecutionHostSection controller={controller} runtimes={motionRuntimes} document={document}
+        effective={effective} />}
       {shown.stop && <ControlledStopSection controller={controller} targets={controlledStop} />}
       {shown.gripper && <GripperSection controller={controller} descriptors={ownGripperDescriptors} runtimes={motionRuntimes}
         componentId={componentId} />}
@@ -2193,16 +2467,21 @@ export function DeploymentFocusedEditor({
       )}
       {shown.ioSignals && <IoSignalConfigurationSection controller={controller} runtimes={ioRuntimes}
         geometricContactRobots={geometricContactRobots} />}
-      <PoseSourceComponentSection controller={controller} programSceneIds={programSceneIds} scope={scope} />
-      <AiModelComponentSection controller={controller} scope={scope} />
+      <PoseSourceComponentSection controller={controller} effective={effective} programSceneIds={programSceneIds}
+        scope={scope} />
+      <AiModelComponentSection controller={controller} effective={effective} scope={scope} />
+      {sensorRuntimes.length > 0 && scope !== 'cell' && (
+        <SensorSection controller={controller} runtimes={sensorRuntimes} effective={effective} />
+      )}
       <ComponentStreamsSection controller={controller} scope={scope} />
       {intent && cell && (
-        <MotionTakeoverSection controller={controller} document={document} />
+        <MotionTakeoverSection controller={controller} document={document} effective={effective} />
       )}
       {intent && cell && (
         <GlobalInterruptRulesSection controller={controller} document={document} programKeys={programKeys}
           stopChains={stopChains} executionGroupIds={executionGroupIds}
-          systemSignalChoices={systemSignalChoices} systemSignalsNeedApply={systemSignalsNeedApply} />
+          systemSignalChoices={systemSignalChoices} systemSignalsNeedApply={systemSignalsNeedApply}
+          changedOutsideOutputs={changedOutsideOutputs} effective={effective} />
       )}
     </section>
   );
@@ -2210,8 +2489,6 @@ export function DeploymentFocusedEditor({
 
 const TAKEOVER_TOTAL_KEY = 'motion_takeover_preparation_budget_s';
 const TAKEOVER_PLANNING_KEY = 'motion_takeover_planning_budget_s';
-/** The backend's frozen derived default for an omitted planning budget. */
-const TAKEOVER_DEFAULT_PLANNING_FRACTION = 0.8;
 
 /**
  * Moving takeover timing in `policies`: the total preparation time (the
@@ -2219,15 +2496,17 @@ const TAKEOVER_DEFAULT_PLANNING_FRACTION = 0.8;
  * strictly below it (absent = derived, 80% of the total). The difference is
  * left for validation, the join and controller delivery.
  */
-function MotionTakeoverSection({ controller, document }: {
+function MotionTakeoverSection({ controller, document, effective }: {
   controller: DeploymentWorkspaceController;
   document: Record<string, JsonValue>;
+  /** `GET /api/deployment/effective`: the planning budget's derived default (CONTRACTS §11). */
+  effective: EffectiveValues | null;
 }) {
   const policies = objectValue(document.policies);
   const total = numberValue(policies?.[TAKEOVER_TOTAL_KEY]);
   const planning = numberValue(policies?.[TAKEOVER_PLANNING_KEY]);
-  const effectivePlanning = planning
-    ?? (total === null ? null : total * TAKEOVER_DEFAULT_PLANNING_FRACTION);
+  const reported = effectiveValue(effective, ['policies', TAKEOVER_PLANNING_KEY]);
+  const effectivePlanning = planning ?? (total !== null && typeof reported === 'number' ? reported : null);
   const [error, setError] = useState<string | null>(null);
   const disabled = !controller.mutationAvailable || controller.busy;
   const commit = async (key: string, value: number | null) => {
@@ -2259,7 +2538,7 @@ function MotionTakeoverSection({ controller, document }: {
           placeholder="takeover off" ariaLabel="Takeover total preparation time" disabled={disabled}
           onCommit={(value) => commit(TAKEOVER_TOTAL_KEY, value)} />
         <OptionalNumberDraft label="Planning budget" value={planning} unit="s"
-          placeholder={effectivePlanning === null ? 'takeover off' : `default ${format(effectivePlanning)}`}
+          placeholder={total === null ? 'takeover off' : effectivePlanning === null ? 'default' : `default ${format(effectivePlanning)}`}
           ariaLabel="Takeover planning budget" disabled={disabled || total === null}
           onCommit={(value) => commit(TAKEOVER_PLANNING_KEY, value)} />
         {total === null && <p className="muted">Takeover is off: a motion requested while another one runs is refused as busy.</p>}
@@ -2323,7 +2602,7 @@ function IoDeviceSection({ controller, document, geometricContactRobots, compone
             <button type="button" disabled={disabled} onClick={() => setAdding(true)}>Add I/O device</button>
           </div>
         ))}
-        <p className="field-help">An I/O device is a model-free component whose connection to its I/O (subscription or service client) is its own control domain: own Enable/Disable, time limit and re-sync recovery. Sources: Mock, generic ROS Bool / SetBool, Universal Robots io_states / set_io and ros2_control GPIO. I/O physically on a robot is declared here too: it shares the robot's driver without owning it, and the robot's Enable/Disable does not touch it. It has no model, pose, frames or Stop settings and is not drawn in the 3D scene.</p>
+        <p className="field-help">An I/O device is a model-free component whose connection to its I/O (subscription or service client) is its own control domain: own Enable/Disable, time limit and re-sync recovery. Sources: Mock, generic ROS Bool / SetBool and ros2_control GPIO. A machine's own I/O banks are not declared here: they are its I/O members. It has no model, pose, frames or Stop settings and is not drawn in the 3D scene.</p>
       </div>
     </details>
   );
@@ -2379,7 +2658,7 @@ export function AddIoDeviceForm({ controller, document, geometricContactRobots, 
           <span className="deployment-number-with-unit">
             <input aria-label="I/O device lifecycle command time limit" inputMode="decimal"
               value={draft.lifecycleTimeoutS} disabled={disabled}
-              title={`Enable/Disable of this device's driver must finish within this time (above 0, at most ${IO_DEVICE_MAXIMUM_LIFECYCLE_TIMEOUT_S} s).`}
+              title={LIFECYCLE_TIMEOUT_HELP}
               onChange={(event) => update({ ...draft, lifecycleTimeoutS: event.target.value })} />
             <small>s</small>
           </span>
@@ -2429,7 +2708,7 @@ function IoDeviceEditor({ controller, device, disabled }: {
     setError(null);
   }, [shownAck]);
   // Writes the device's one row; the acknowledgement timeout is kept only
-  // while the device has ROS SetBool / UR set_io outputs (contracts 68, 82).
+  // while the device has ROS SetBool outputs (contracts 68, 82).
   const commitRow = async (timeoutS: number, ackS: number | null) => {
     setError(null);
     // A refusal shows once, in the yellow Deployment notice row.
@@ -2471,7 +2750,7 @@ function IoDeviceEditor({ controller, device, disabled }: {
             <span>Lifecycle command time limit</span>
             <span className="deployment-number-with-unit">
               <input aria-label={`${device.componentId} lifecycle command time limit`} inputMode="decimal"
-                value={text} disabled={disabled}
+                value={text} disabled={disabled} title={LIFECYCLE_TIMEOUT_HELP}
                 onChange={(event) => { setText(event.target.value); setError(null); }}
                 onBlur={() => { void commit(); }}
                 onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); }} />
@@ -2484,7 +2763,7 @@ function IoDeviceEditor({ controller, device, disabled }: {
               <span className="deployment-number-with-unit">
                 <input aria-label={`${device.componentId} output acknowledgement timeout`} inputMode="decimal"
                   value={ackText} disabled={disabled}
-                  title="How long a ROS SetBool or UR set_io output write waits for the service's acceptance. Without it in time the write's effect is unknown and the output stays blocked until the device is re-synced."
+                  title="How long a ROS SetBool output write waits for the service's acceptance. Without it in time the write's effect is unknown and the output stays blocked until the device is re-synced."
                   onChange={(event) => { setAckText(event.target.value); setError(null); }}
                   onBlur={() => { void commitAck(); }}
                   onKeyDown={(event) => { if (event.key === 'Enter') event.currentTarget.blur(); }} />
@@ -2512,22 +2791,34 @@ function IoDeviceEditor({ controller, device, disabled }: {
   );
 }
 
-const ON_TRIP_HELP = 'Gate (default): while the condition holds, new motion in the scope is refused and moving motion gets its Stop; motion is allowed again when it clears, with no acknowledgement. Full Stop: the cell gets a Full Stop and the rule stays latched until the operator clears it. A Program Reset never clears it. Notify: a trip only updates the rule state for the Program to read; motion is not affected. If a Notify rule cannot watch its signals (setup failed, or a signal is stale or lost), it gates its scope like a Gate rule until it can watch again.';
-const IDLE_BEHAVIOUR_HELP = 'Full Stop only. Default: latches while a Program Run is in flight and the robot is still; ignored when no Run exists. Moving motion is always stopped.';
+const ON_TRIP_HELP = 'Stop: a trip issues the same Stop as the operator\'s Stop on the rule\'s scope; then, while the condition holds, Execute, Resume and manual motion in the scope are held and show the rule as the reason. They are available again by themselves when it clears. Notify: a trip only updates the rule state for the Program to read; motion is not affected. Any active rule that can\'t watch its signals holds its scope until it can watch again. A rule trip is never a fault and never latches the cell.';
+const AFTER_STOP_HELP = 'Stop only. Hold (default): the run is held where it was stopped; the operator Resumes once the rule clears. Fail the stopped node: it fails with interrupt_fault and the tree handles it (Fallback, Retry); the run keeps going, and while the condition holds a new motion in the scope fails at once.';
+// Short option labels; the selected option's full meaning shows under its field.
+const ON_TRIP_OPTIONS = {
+  stop: { label: 'Stop and hold', hint: 'Stop, then hold the scope while the condition holds.' },
+  notify: { label: 'Notify only', hint: 'Notify: the Program reads the state; no Stop.' },
+} as const;
+const AFTER_STOP_OPTIONS = {
+  hold: { label: 'Hold the run', hint: 'Hold: Resume from where it stopped.' },
+  fail_node: { label: 'Fail the node', hint: 'Fail the stopped node; the run continues.' },
+} as const;
+const ACTIVE_AT_START_HELP = 'Where the rule starts at every run and at Load. An inactive rule doesn\'t watch, trip, stop or hold; the Program node "Set rule active" changes it during a run.';
 
 /**
- * Global (Deployment) interrupt rules, `policies.interrupt_rules` (schema04
- * §3): each with its condition, scope, priority, on-trip reaction (gate, Full
- * Stop, or publish-only notify; Full Stop also has an idle behaviour) and Stop
- * entry stage. A rule publishes the read-only key
+ * Global (Deployment) interrupt rules, `policies.interrupt_rules` (CONTRACTS
+ * §8): each with its condition, scope, priority, on-trip reaction (stop or
+ * notify), what happens after the Stop, its Stop entry stage and whether it
+ * is active at start. A rule publishes the read-only key
  * `interrupt_state.<rule_id>`. The whole list is committed per change.
  */
 export function GlobalInterruptRulesSection({
   controller, document, programKeys, stopChains = NO_STOP_CHAINS, executionGroupIds = null,
-  systemSignalChoices = [], systemSignalsNeedApply = false,
+  systemSignalChoices = [], systemSignalsNeedApply = false, changedOutsideOutputs, effective = null,
 }: {
   controller: DeploymentWorkspaceController;
   document: Record<string, JsonValue>;
+  /** `GET /api/deployment/effective` (CONTRACTS §11): `after_stop` and `active_at_start` defaults. */
+  effective?: EffectiveValues | null;
   /** Null when there is no Program: its user-key operands then wait for one (contract 106). */
   programKeys: readonly BlackboardKeyDeclaration[] | null;
   /** A global rule's entry stage must be qualified by every published robot chain. */
@@ -2536,13 +2827,15 @@ export function GlobalInterruptRulesSection({
   executionGroupIds?: readonly string[] | null;
   systemSignalChoices?: readonly CarriedObjectLostSignalChoice[];
   systemSignalsNeedApply?: boolean;
+  /** Outputs holding a core-held `changed outside` signal (pushed I/O samples). */
+  changedOutsideOutputs?: ReadonlySet<string>;
 }) {
   const rows = globalRulesOf(document);
   const stopStages = useMemo(() => commonStopStages(stopChains), [stopChains]);
   // Operands of a new rule; each rule's own list adds the keys it reads that no Program declares.
   const choices = useMemo(
-    () => globalRuleChoices(document, programKeys, undefined, systemSignalChoices),
-    [document, programKeys, systemSignalChoices],
+    () => globalRuleChoices(document, programKeys, undefined, systemSignalChoices, changedOutsideOutputs),
+    [changedOutsideOutputs, document, programKeys, systemSignalChoices],
   );
   const [error, setError] = useState<string | null>(null);
   const section = useRef<HTMLDetailsElement>(null);
@@ -2573,7 +2866,8 @@ export function GlobalInterruptRulesSection({
         return at !== index && typeof id === 'string' ? [id] : [];
       });
       const problem = globalRuleProblem(next[index], others,
-        globalRuleChoices(document, programKeys, objectValue(next[index])?.condition, systemSignalChoices));
+        globalRuleChoices(document, programKeys, objectValue(next[index])?.condition, systemSignalChoices,
+          changedOutsideOutputs));
       if (problem !== null) {
         setError(problem);
         return;
@@ -2591,13 +2885,15 @@ export function GlobalInterruptRulesSection({
       if (value === undefined) delete merged[key];
       else merged[key] = value;
     }
+    // on_trip is required (CONTRACTS §8); a row without it is shown as stop.
+    if (merged.on_trip === undefined) merged.on_trip = 'stop';
     void commit(rows.map((row, at) => (at === index ? merged : row)), index);
   };
   return (
     <details ref={section} className="dcard" open={rows.length > 0}>
       <summary>Global interrupt rules</summary>
       <div className="deployment-focused-body">
-        <p className="field-help">A global rule publishes the read-only key <code>interrupt_state.&lt;rule id&gt;</code> (clear, tripped or latched); Program nodes read a rule only through that key. Gate and Full Stop stop motion in their scope; Notify only updates the key. A rule that cannot watch its signals shows "can't watch" with the reason, and blocks motion in its scope until it can watch again. A signal that is published only on change cannot be detected as stale.</p>
+        <p className="field-help">A global rule publishes the read-only key <code>interrupt_state.&lt;rule id&gt;</code> (inactive, clear or tripped); Program nodes read a rule only through that key. Stop stops motion in its scope and holds it while the condition holds; Notify only updates the key. An active rule that can't watch its signals shows "can't watch" with the reason and holds its scope until it can watch again. A signal that is published only on change cannot be detected as stale.</p>
         {systemSignalsNeedApply && (
           <p className="field-help">Apply to list system signals.</p>
         )}
@@ -2610,10 +2906,14 @@ export function GlobalInterruptRulesSection({
           const groupChoices = [...new Set([...(executionGroupIds ?? []), ...groups])].sort();
           const groupsAvailable = executionGroupIds !== null && executionGroupIds.length > 0;
           const ruleId = typeof rule.rule_id === 'string' ? rule.rule_id : `rule ${index + 1}`;
-          const ruleChoices = globalRuleChoices(document, programKeys, rule.condition, systemSignalChoices);
+          const ruleChoices = globalRuleChoices(document, programKeys, rule.condition, systemSignalChoices,
+            changedOutsideOutputs);
           const keyNotes = globalRuleKeyNotes(rule.condition, programKeys);
-          const notifyHasDisallowedFields = rule.on_trip === 'notify' && (
-            rule.idle_behaviour !== undefined || rule.stop_entry_stage_id !== undefined
+          const stops = rule.on_trip !== 'notify';
+          const afterStop = String(effectiveValue(effective, ['policies', 'interrupt_rules', index, 'after_stop'])
+            ?? rule.after_stop ?? '');
+          const notifyHasDisallowedFields = !stops && (
+            rule.after_stop !== undefined || rule.stop_entry_stage_id !== undefined
           );
           const notifyProblem = notifyHasDisallowedFields
             ? globalRuleProblem(
@@ -2657,7 +2957,7 @@ export function GlobalInterruptRulesSection({
                     <option value="execution_groups" disabled={!groupsAvailable && scopeKind !== 'execution_groups'}>
                       Execution groups{groupsAvailable ? '' : ' (apply a Program first)'}
                     </option>
-                    <option value="everything">Everything (Full Stop)</option>
+                    <option value="everything">Everything</option>
                   </select>
                 </label>
                 {scopeKind === 'execution_groups' && (
@@ -2682,37 +2982,48 @@ export function GlobalInterruptRulesSection({
                 )}
                 <label className="deployment-focused-field" title={ON_TRIP_HELP}>
                   <span>On trip</span>
-                  <select aria-label={`${ruleId} on trip`}
-                    value={rule.on_trip === 'full_stop' || rule.on_trip === 'notify' ? rule.on_trip : ''}
+                  <select aria-label={`${ruleId} on trip`} value={stops ? 'stop' : 'notify'}
                     disabled={disabled}
-                    onChange={(event) => update(index, event.target.value === 'full_stop'
-                      ? { on_trip: 'full_stop' }
-                      : event.target.value === 'notify'
-                        ? { on_trip: 'notify', idle_behaviour: undefined, stop_entry_stage_id: undefined }
-                        // Only Full Stop has an idle behaviour; gate and notify do not.
-                        : { on_trip: undefined, idle_behaviour: undefined })}>
-                    <option value="">Gate: refuse motion while active (default)</option>
-                    <option value="full_stop">Full Stop, operator clears</option>
-                    <option value="notify">Notify: Program reads the state, no Stop</option>
+                    onChange={(event) => update(index, event.target.value === 'notify'
+                      // After the Stop and the entry stage apply to stop only.
+                      ? { on_trip: 'notify', after_stop: undefined, stop_entry_stage_id: undefined }
+                      : { on_trip: 'stop' })}>
+                    <option value="stop">{ON_TRIP_OPTIONS.stop.label}</option>
+                    <option value="notify">{ON_TRIP_OPTIONS.notify.label}</option>
                   </select>
+                  <small>{ON_TRIP_OPTIONS[stops ? 'stop' : 'notify'].hint}</small>
+                </label>
+                {stops && (
+                  <label className="deployment-focused-field" title={AFTER_STOP_HELP}>
+                    <span>After the Stop</span>
+                    <select aria-label={`${ruleId} after stop`}
+                      value={afterStop} disabled={disabled}
+                      onChange={(event) => update(index, { after_stop: event.target.value })}>
+                      {effectiveField(effective, ['policies', 'interrupt_rules', index, 'after_stop']) === null
+                        && rule.after_stop === undefined && <option value="">default</option>}
+                      <option value="hold">{AFTER_STOP_OPTIONS.hold.label}</option>
+                      <option value="fail_node">{AFTER_STOP_OPTIONS.fail_node.label}</option>
+                    </select>
+                    {(afterStop === 'hold' || afterStop === 'fail_node')
+                      && <small>{AFTER_STOP_OPTIONS[afterStop].hint}</small>}
+                    <EffectiveReset controller={controller} effective={effective}
+                      path={['policies', 'interrupt_rules', index, 'after_stop']} label={`${ruleId} after stop`}
+                      disabled={disabled} />
+                  </label>
+                )}
+                <label className="deployment-focused-field" title={ACTIVE_AT_START_HELP}>
+                  <span>Active at start</span>
+                  <input type="checkbox" aria-label={`${ruleId} active at start`}
+                    checked={(effectiveValue(effective, ['policies', 'interrupt_rules', index, 'active_at_start'])
+                      ?? rule.active_at_start) === true} disabled={disabled}
+                    onChange={(event) => update(index, { active_at_start: event.target.checked })} />
+                  <EffectiveReset controller={controller} effective={effective}
+                    path={['policies', 'interrupt_rules', index, 'active_at_start']} label={`${ruleId} active at start`}
+                    disabled={disabled} />
                 </label>
                 {notifyProblem !== null && (
                   <p className="deployment-field-error inline-message severity-error" role="alert"
                     aria-label={`${ruleId} notify settings`}>{notifyProblem}</p>
-                )}
-                {rule.on_trip === 'full_stop' && (
-                  <label className="deployment-focused-field" title={IDLE_BEHAVIOUR_HELP}>
-                    <span>When nothing moves</span>
-                    <select aria-label={`${ruleId} idle behaviour`} value={typeof rule.idle_behaviour === 'string' ? rule.idle_behaviour : ''}
-                      disabled={disabled}
-                      onChange={(event) => update(index, {
-                        idle_behaviour: event.target.value === '' ? undefined : event.target.value,
-                      })}>
-                      <option value="">Default (latch during a Run, else ignore)</option>
-                      <option value="latch">Latch</option>
-                      <option value="ignore">Ignore (records one info row)</option>
-                    </select>
-                  </label>
                 )}
               </div>
               <div className="deployment-focused-field">
@@ -2746,7 +3057,7 @@ export function GlobalInterruptRulesSection({
                   );
                 })()}
               </div>
-              {rule.on_trip !== 'notify' && <div className="deployment-focused-field">
+              {stops && <div className="deployment-focused-field">
                 <span>Stop entry stage</span>
                 <StopStagePicker label={`${ruleId} stop entry stage`}
                   value={typeof rule.stop_entry_stage_id === 'string' ? rule.stop_entry_stage_id : undefined}

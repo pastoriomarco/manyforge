@@ -1,6 +1,6 @@
 api_version: manyforge.command_schema.v1
 command_schema_id: gripper.command_position
-command_schema_revision: sha256:4808a6bec7d020cb66df2082325e1838471a2604deaddfd1afe31dae427140e9
+command_schema_revision: sha256:b8e74c2c32f4bf438905efe148b7fbf6f452bb91c1bf83a30b0404a1c2533f08
 compatible_capabilities:
   - capability_id: tool.gripper.command
     capability_definition_revision: sha256:a24b841e7c0323815a3576869d5819340bc6a98f1c2ffd5b47131e26698e9392
@@ -15,6 +15,9 @@ channel_role_selectors: []
 caller_options:
   - option_id: command_duration_s
     value_kind: nonnegative_duration_seconds
+    required: false
+  - option_id: wait_for_duration
+    value_kind: bool
     required: false
 completion_rule: goal_fenced_target_reached
 confirmation_rule: binding_feedback_required

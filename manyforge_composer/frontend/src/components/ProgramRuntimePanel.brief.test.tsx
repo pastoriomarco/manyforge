@@ -188,6 +188,7 @@ it('shows a brief warning for a new takeover fallback on either path', async () 
     facts: {
       nodeInstanceId: 'move', incumbentOperationId: 'op.1', path,
       code, message: code === null ? null : 'late', failureStage, preparationMs: 40.5, budgetMs: 30,
+      planningCapMs: 24,
     },
   });
   const { createRoot } = await import('react-dom/client');
@@ -202,7 +203,7 @@ it('shows a brief warning for a new takeover fallback on either path', async () 
   expect(shown).toMatchObject({
     severity: 'warning',
     domain: 'runtime',
-    title: 'Spring-back fallback on move · takeover preparation late (prep 41 of 30 ms)',
+    title: 'Spring-back fallback on move · takeover preparation late (planning cap 24 ms · prep 41 of 30 ms)',
     message: 'Recorded in the runtime-control events.',
   });
   await act(() => { vi.advanceTimersByTime(BRIEF_NOTICE_MS); });
@@ -211,7 +212,7 @@ it('shows a brief warning for a new takeover fallback on either path', async () 
     fallback(2, 'spring_back_hold', 'takeover_preparation_late'),
     fallback(3, 'ordinary_containment', null),
   ]);
-  expect(shown?.title).toBe('Stop fallback on move (prep 41 of 30 ms)');
+  expect(shown?.title).toBe('Stop fallback on move (planning cap 24 ms · prep 41 of 30 ms)');
   expect(shown?.severity).toBe('warning');
   await act(() => { vi.advanceTimersByTime(BRIEF_NOTICE_MS); });
   expect(shown).toBeNull();
@@ -222,7 +223,7 @@ it('shows a brief warning for a new takeover fallback on either path', async () 
     fallback(4, 'spring_back_hold', 'planning_timeout', 'spring_back_planning'),
   ]);
   expect(shown?.title).toBe(
-    'Spring-back fallback on move · planning timeout during spring_back_planning (prep 41 of 30 ms)',
+    'Spring-back fallback on move · planning timeout during spring_back_planning (planning cap 24 ms · prep 41 of 30 ms)',
   );
   await act(() => { vi.advanceTimersByTime(BRIEF_NOTICE_MS); });
   expect(shown).toBeNull();

@@ -25,10 +25,10 @@ gripper:
   attach_frame: link_tcp
   touch_links: [left_finger, left_inner_knuckle, left_outer_knuckle, right_finger, right_inner_knuckle, right_outer_knuckle, xarm_gripper_base_link]
 lanes:
-  mock:
-    controllers:                  # its gripper-only Mock row (no arm controller)
-      template: ufactory
-      hardware_component_name: MockXArmGripperSystem
-      gripper_controller: xarm_gripper_controller
-      hard_stop_completion_timeout_s: 1.5
-      gripper_result_timeout_s: 5.0
+  mock:                           # Mock lane adapter (manyforge_ros2_control_execution/lane/)
+    adapter: mock
+    controller: xarm_gripper_controller
+    controllers_file: mock_controllers.yaml
+    hard_stop_completion_timeout_s: 1.5
+    gripper_result_timeout_s: 5.0
+    gripper_stop_finish_tolerance: 0.04   # rad of drive travel (5% of the 0.85 stroke): a Stop this close lets the command finish

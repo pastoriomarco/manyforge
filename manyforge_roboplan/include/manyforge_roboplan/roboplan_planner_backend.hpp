@@ -59,6 +59,15 @@ class IRoboPlanCandidateClient {
   [[nodiscard]] virtual core::Result<void> replace_retained_model(
       const RoboPlanWorkerModelDTO& model);
 
+  /// Replace the planner settings (seed, collision-check step; cell context)
+  /// a retained-projection worker is started with. A worker started with
+  /// other settings is retired; the next request starts one with these.
+  /// Fixed test clients keep their own.
+  [[nodiscard]] virtual core::Result<void> replace_retained_settings(
+      const RoboPlanCandidateComputerConfig&) {
+    return core::Result<void>::Ok();
+  }
+
   /// Non-blocking cancellation of only the currently active request.
   virtual void request_cancel() noexcept = 0;
 };
@@ -68,7 +77,7 @@ struct RoboPlanPlannerBackendConfig final {
   double default_single_shot_ik_timeout_s{0.05};
 };
 
-/// Resource-addressed IPlannerBackend adapter for RoboPlan 0.7.
+/// Resource-addressed IPlannerBackend adapter for RoboPlan 0.8.
 ///
 /// This boundary validates the complete Kernel-issued participant/projection
 /// identity, strips it to the exact private candidate contract, and restores
@@ -110,6 +119,12 @@ class RoboPlanPlannerBackend final : public core::IPlannerBackend {
   /// on its predecessor model before the replacement becomes visible.
   [[nodiscard]] core::Result<void> ReplaceRetainedModel(
       const RoboPlanWorkerModelDTO& model);
+
+  /// Replace the planner settings of this unchanged planner under the
+  /// Manager's Apply fence (they are cell context: a retained component
+  /// takes the candidate's). An in-flight query finishes on the old ones.
+  [[nodiscard]] core::Result<void> ReplaceRetainedSettings(
+      const RoboPlanCandidateComputerConfig& settings);
 
   [[nodiscard]] const RoboPlanCandidateBindingDTO& candidate_binding() const noexcept {
     return candidate_binding_;

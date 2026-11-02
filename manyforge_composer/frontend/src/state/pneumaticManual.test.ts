@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 import { statusFixture } from '../testFixtures/robotControl';
-import type { ExecutionOwnerStatus, OperationObservation } from '../types/robotControl';
-import { manualPneumaticValves, manualValveIntent, writeManualPneumaticValves } from './pneumaticManual';
+import type { SetOutputResult } from '../types/components';
+import type { ExecutionOwnerStatus } from '../types/robotControl';
+import { manualPneumaticValves, writeManualPneumaticValves } from './pneumaticManual';
 import { buildGripperCommandIntent } from './robotControl';
 
 function mapped(): ExecutionOwnerStatus {
@@ -19,99 +20,53 @@ function mapped(): ExecutionOwnerStatus {
     { controllableComponentId: 'z_io', signalName: 'close_valve', openValue: true, closeValue: false },
     { controllableComponentId: 'a_io', signalName: 'open_valve', openValue: false, closeValue: true },
   ];
-  status.ioSignalBindings = descriptor.pneumaticOutputs.map((row, index) => ({
-    programBindingId: `binding-${index}`, targetRoleId: `target-${index}`,
-    controllableComponentId: row.controllableComponentId, commandTargetId: 'io',
-    outputCommand: { programId: `program-${index}`, programRevision: `revision-${index}`, programRunId: 'direct-control-io-owner',
-      componentRoleId: `component-${index}`, capabilityId: 'io.gpio.set_output',
-      commandSchemaId: 'io.write', commandSchemaRevision: 'schema-1' },
-    signalRoleBindings: [{ resourceRoleId: `signal-${index}`, signalName: row.signalName,
-      valueType: 'bool', direction: 'output', transitionCapability: 'sampled_only', signalDescriptorDigest: 'digest' }],
-  }));
   return status;
 }
 
-function completed(operationId: string, patch: Partial<OperationObservation> = {}): OperationObservation {
-  return { operationId, operationRevision: 1, resident: false, state: 'completed', progress: 1,
-    activeStopId: null, activeStopGeneration: null, terminalError: null, outputEvidence: 'source_accepted', ...patch };
-}
-
 describe('manual pneumatic outputs', () => {
-  it('resolves exact Applied I/O bindings, writes false first and creates distinct requests', () => {
+  it('resolves the Applied valves by signal id, false writes first', () => {
     const status = mapped();
-    const valves = manualPneumaticValves(status, 0.04);
-    expect(valves.map((row) => [row.componentId, row.value])).toEqual([['a_io', false], ['z_io', true]]);
-    const first = manualValveIntent(status, valves[0], 'request-a');
-    const second = manualValveIntent(status, valves[1], 'request-b');
-    expect(first.program_binding_id).toBe('binding-1');
-    expect(first.participants[0].payload.command_value).toEqual({ kind: 'io_signal_write', resource_role_id: 'signal-1', value: false });
-    expect(first.program_run_id).toBe(second.program_run_id);
-    expect(first.request_context.request_id).not.toBe(second.request_context.request_id);
-    expect(manualPneumaticValves(status, 0.02).map((row) => [row.componentId, row.value]))
-      .toEqual([['z_io', false], ['a_io', true]]);
+    expect(manualPneumaticValves(status, 0.04).map((row) => [row.signalId, row.value]))
+      .toEqual([['a_io/open_valve', false], ['z_io/close_valve', true]]);
+    expect(manualPneumaticValves(status, 0.02).map((row) => [row.signalId, row.value]))
+      .toEqual([['z_io/close_valve', false], ['a_io/open_valve', true]]);
     const logical = buildGripperCommandIntent(status, 0.02, 'logical');
     expect(logical.participants[0].payload).toMatchObject({ command_value: {
       kind: 'gripper_position', position: { kind: 'linear_m', value_m: 0 },
     } });
-    expect(buildGripperCommandIntent(status, 0.03, 'logical-open').participants[0].payload)
-      .toMatchObject({ command_value: { position: { kind: 'linear_m', value_m: 0.04 } } });
     status.directControlGripper!.targetDescriptor.namedPresets[0].masterPosition = 0;
     expect(() => manualPneumaticValves(status, 0)).toThrow('different positions');
-    status.directControlGripper!.targetDescriptor.namedPresets[0].masterPosition = 0.04;
-    status.ioSignalBindings!.push(status.ioSignalBindings![1]);
-    expect(() => manualPneumaticValves(status, 0.04)).toThrow('no unique direct I/O binding');
   });
 
-  it('waits for confirmed nonresident completion before issuing the next valve', async () => {
+  it('writes each valve through the one output write path, one after the other', async () => {
     const events: string[] = [];
-    let serial = 0;
-    const submit = vi.fn(async (intent: ReturnType<typeof manualValveIntent>) => {
-      events.push(`send:${intent.participants[0].payload.command_value.value}`);
-      return { result: { accepted: { request_id: intent.request_context.request_id, operation_id: `op-${serial}` } } };
+    const setOutput = vi.fn(async (signalId: string, value: boolean): Promise<SetOutputResult> => {
+      events.push(`${signalId}=${value}`);
+      return { outcome: 'succeeded' };
     });
-    let readCount = 0;
-    const read = vi.fn(async (operationId: string) => {
-      events.push(`read:${operationId}`);
-      readCount += 1;
-      return completed(operationId, readCount === 1 ? { resident: true } : {});
-    });
-    await writeManualPneumaticValves(mapped(), 0.04, {
-      nextRequestId: () => `req-${++serial}`, checkCurrent: vi.fn(), submit, read,
-      wait: async () => { events.push('wait'); },
-    });
-    expect(events).toEqual(['send:false', 'read:op-1', 'wait', 'read:op-1', 'send:true', 'read:op-2']);
+    await writeManualPneumaticValves(mapped(), 0.04, { checkCurrent: () => events.push('check'), setOutput });
+    expect(events).toEqual(['check', 'a_io/open_valve=false', 'check', 'z_io/close_valve=true']);
   });
 
-  it.each(['acceptance_unknown', 'source_rejected', 'not_submitted'] as const)(
-    'stops on %s and does not send the next valve', async (evidence) => {
-      const submit = vi.fn(async (intent: ReturnType<typeof manualValveIntent>) => ({
-        result: { accepted: { request_id: intent.request_context.request_id, operation_id: 'op' } },
-      }));
-      await expect(writeManualPneumaticValves(mapped(), 0.04, {
-        nextRequestId: () => 'request', checkCurrent: vi.fn(), submit,
-        read: async () => completed('op', { state: 'failed', outputEvidence: evidence }), wait: async () => {},
-      })).rejects.toThrow(evidence);
-      expect(submit).toHaveBeenCalledOnce();
-    },
-  );
-
-  it('never repeats an unconfirmed submission', async () => {
-    const submit = vi.fn(async () => { throw new Error('delivery unconfirmed'); });
-    await expect(writeManualPneumaticValves(mapped(), 0.04, {
-      nextRequestId: () => 'request', checkCurrent: vi.fn(), submit,
-      read: vi.fn(), wait: vi.fn(),
-    })).rejects.toThrow('delivery unconfirmed');
-    expect(submit).toHaveBeenCalledOnce();
-  });
-
-  it('does not send another valve when the accepted operation cannot be observed', async () => {
-    const submit = vi.fn(async (intent: ReturnType<typeof manualValveIntent>) => ({
-      result: { accepted: { request_id: intent.request_context.request_id, operation_id: 'op' } },
+  it.each([
+    ['failed', 'Valve write a_io/open_valve failed'],
+    ['unknown', 'Valve write a_io/open_valve outcome unknown (not resent)'],
+  ] as const)('stops on a %s write with its code and never resends it', async (outcome, text) => {
+    const setOutput = vi.fn(async (): Promise<SetOutputResult> => ({
+      outcome, error: { code: 'io_output_write_failed', message: 'device refused' },
     }));
+    const failure = writeManualPneumaticValves(mapped(), 0.04, { checkCurrent: vi.fn(), setOutput });
+    await expect(failure).rejects.toThrow(text);
+    await expect(writeManualPneumaticValves(mapped(), 0.04, { checkCurrent: vi.fn(), setOutput }))
+      .rejects.toThrow('io_output_write_failed');
+    expect(setOutput).toHaveBeenCalledTimes(2);
+  });
+
+  it('sends nothing once the Deployment changed', async () => {
+    const setOutput = vi.fn();
     await expect(writeManualPneumaticValves(mapped(), 0.04, {
-      nextRequestId: () => 'request', checkCurrent: vi.fn(), submit,
-      read: async () => { throw new Error('observation unavailable'); }, wait: vi.fn(),
-    })).rejects.toThrow('observation unavailable');
-    expect(submit).toHaveBeenCalledOnce();
+      checkCurrent: () => { throw new Error('Deployment changed'); }, setOutput,
+    })).rejects.toThrow('Deployment changed');
+    expect(setOutput).not.toHaveBeenCalled();
   });
 });

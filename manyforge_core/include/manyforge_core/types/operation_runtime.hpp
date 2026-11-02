@@ -5,7 +5,6 @@
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/execution_status.hpp>
 #include <manyforge_core/types/io_motion_rule.hpp>
-#include <manyforge_core/types/io_output.hpp>
 #include <manyforge_core/types/participant_binding_identity.hpp>
 #include <manyforge_core/types/operation_intent.hpp>
 #include <manyforge_core/types/runtime_scale.hpp>
@@ -71,8 +70,6 @@ struct OperationParticipantStateDTO final {
   /// Actual participant proof; absence grants no effect/settlement knowledge.
   std::optional<ParticipantExecutionFact> terminal_fact{};
   std::vector<IoMotionRuleOutcomeDTO> io_rule_outcomes{};
-  /// Actual correlated provider fact, separate from a local dispatch receipt.
-  std::optional<IoOutputEvidence> output_evidence{};
 
   OperationParticipantStateDTO() = default;
 
@@ -82,14 +79,13 @@ struct OperationParticipantStateDTO final {
       ParticipantBindingIdentityDTO identity, OperationParticipantPayloadKind kind,
       OperationStateKind phase, double supplied_progress, std::vector<ResourceId> owned_resources,
       std::optional<ErrorDTO> error, std::optional<ProgramNodeExecutionScopeDTO> scope = {},
-      std::optional<ParticipantExecutionFact> fact = {}, std::vector<IoMotionRuleOutcomeDTO> rules = {},
-      std::optional<IoOutputEvidence> output = {})
+      std::optional<ParticipantExecutionFact> fact = {}, std::vector<IoMotionRuleOutcomeDTO> rules = {})
       : participant_id(std::move(participant)), command_id(std::move(goal)),
         command_generation(goal_generation), controllable_component_id(std::move(component)),
         command_target_id(std::move(target)), capability_id(std::move(capability)),
         binding_identity(std::move(identity)), payload_kind(kind), state(phase), progress(supplied_progress),
         resources(std::move(owned_resources)), terminal_error(std::move(error)), execution_scope(std::move(scope)),
-        terminal_fact(std::move(fact)), io_rule_outcomes(std::move(rules)), output_evidence(output) {}
+        terminal_fact(std::move(fact)), io_rule_outcomes(std::move(rules)) {}
 
   OperationParticipantStateDTO(
       OperationParticipantId participant, ControllerGoalId goal, ControllerGoalGeneration goal_generation,
@@ -181,12 +177,16 @@ struct MotionTakeoverDecisionDTO final {
   std::int64_t elapsed_since_acceptance_ns{};
   std::int64_t preparation_budget_ns{};
   std::optional<StopCertificateRefDTO> stop_certificate{};
+  // The planning cap that applied: the explicit planning budget, or 4/5 of
+  // the preparation budget. This is the deadline a planning timeout trips.
+  std::int64_t planning_budget_ns{};
 
   [[nodiscard]] bool locally_valid() const noexcept {
     const bool moving = path == MotionTakeoverPathDTO::kMovingReplacement;
     return !incumbent_operation_id.empty() && !to_string(path).empty() &&
            decided_at_ns >= 0 && elapsed_since_acceptance_ns >= 0 &&
            elapsed_since_acceptance_ns <= decided_at_ns && preparation_budget_ns > 0 &&
+           planning_budget_ns >= 0 &&
            (moving ? !cause && !stop_certificate : cause && !cause->code.empty()) &&
            (!stop_certificate || stop_certificate->locally_valid());
   }
@@ -483,13 +483,6 @@ enum class OperationControlKind {
   kAcknowledgeCompleted,
 };
 
-struct UncertainOutputAcknowledgementDTO final {
-  OperationId operation_id;
-  OperationRevision operation_revision;
-  friend bool operator==(const UncertainOutputAcknowledgementDTO&,
-                         const UncertainOutputAcknowledgementDTO&) = default;
-};
-
 struct OperationControlRequestDTO final {
   PublicRequestContextDTO request_context;
   OperationId operation_id;
@@ -500,9 +493,6 @@ struct OperationControlRequestDTO final {
   /// Private authored control-node origin, distinct from the target operation.
   /// Public control payloads cannot supply this field.
   std::optional<ProgramNodeExecutionScopeDTO> execution_scope{};
-  /// Reset only, explicit operator choice. Absence never acknowledges unknown
-  /// output effects; automatic retirement/Scenario Close cannot populate it.
-  std::optional<std::vector<UncertainOutputAcknowledgementDTO>> acknowledged_uncertain_outputs{};
 
   friend bool operator==(const OperationControlRequestDTO&,
                          const OperationControlRequestDTO&) = default;

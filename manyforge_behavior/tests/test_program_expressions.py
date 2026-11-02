@@ -426,6 +426,7 @@ def test_shared_value_source_cases_are_accepted(case: dict[str, Any]) -> None:
 @pytest.mark.parametrize(
     "case", _SOURCE_CONFORMANCE["refused"], ids=lambda case: case["name"]
 )
+@pytest.mark.slow
 def test_shared_value_source_cases_are_refused(case: dict[str, Any]) -> None:
     with pytest.raises(ProgramValidationError) as raised:
         _conformance_program(case)
@@ -484,6 +485,7 @@ def test_shared_pose_value_cases_are_accepted(case: dict[str, Any]) -> None:
 @pytest.mark.parametrize(
     "case", _POSE_CONFORMANCE["refused"], ids=lambda case: case["name"]
 )
+@pytest.mark.slow
 def test_shared_pose_value_cases_are_refused(case: dict[str, Any]) -> None:
     with pytest.raises(ProgramValidationError) as raised:
         _pose_conformance_program(case)

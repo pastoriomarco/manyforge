@@ -6,11 +6,12 @@
 #include <manyforge_core/pick_place_planning_owner.hpp>
 #include <manyforge_core/resource_addressed_execution_kernel.hpp>
 #include <manyforge_core/types/io_blackboard.hpp>
-#include <manyforge_core/types/io_rule_recovery.hpp>
+#include <manyforge_core/types/component_state.hpp>
 #include <manyforge_core/types/program_execution_control.hpp>
 #include <manyforge_core/types/program_io.hpp>
 #include <manyforge_core/types/program_mock_simulation.hpp>
 #include <manyforge_roboplan/program_reset_position.hpp>
+#include <variant>
 
 namespace manyforge::roboplan_backend::host_detail {
 
@@ -140,9 +141,6 @@ DecodeProgramRunStopIntent(const CanonicalValue &value,
 DecodeFullStopIntent(const CanonicalValue &value,
                      const core::RequestAttributionDTO &attribution);
 
-[[nodiscard]] core::StopFaultRecoveryIntentDTO
-DecodeStopFaultRecoveryIntent(const CanonicalValue &value);
-
 [[nodiscard]] core::RuntimeScaleControlSelectorDTO
 DecodeRuntimeScaleControlSelector(const CanonicalValue &value);
 
@@ -199,14 +197,24 @@ enum class CommandKind {
   kReleaseProgramRunStopFence,
   kFullStop,
   kMalformedStop,
-  kGetStopFault,
-  kRecoverStopFault,
+  /// CONTRACTS §1, §5, §7, §8: the published component model (control
+  /// socket, in-memory).
+  kReadComponentModel,
+  /// CONTRACTS §2: one component action (control socket).
+  kComponentAction,
+  /// CONTRACTS §8 node `rules.set_active`.
+  kSetRuleActive,
+  /// CONTRACTS §8: every rule back to `active_at_start` (run end).
+  kResetRuleActivation,
+  /// CONTRACTS §7 node `io.clear_outside_change`.
+  kClearOutsideChange,
+  /// CONTRACTS §7: one manual output write (`set_io_output`).
+  kSetIoOutput,
   kSetRuntimeScaleControl,
   kSetOperationRuntimeScale,
   kGetRuntimeScaleControl,
   kPlanPick,
   kPlanPlace,
-  kForceClose,
   /// Active TCP (M7): every robot's Active TCP (the Runner's baseline).
   kReadActiveTcp,
   kResolveAttachActiveTcp,
@@ -353,8 +361,16 @@ struct Command final {
   std::optional<core::StopIntentDTO> stop;
   std::optional<core::FullStopIntentDTO> full_stop;
   std::optional<MalformedStopCommand> malformed_stop;
-  std::optional<core::StopFaultRecoveryIntentDTO> stop_fault_recovery;
-  std::optional<core::IoGlobalRuleRecoveryIntentDTO> global_io_rule_recovery{};
+  std::optional<std::string> component_id{};
+  std::optional<core::ComponentAction> component_action{};
+  std::optional<core::InterruptPolicyId> rule_id{};
+  bool rule_active{};
+  std::optional<core::IoSignalId> outside_change_output{};
+  /// `set_io_output`: the output, its value and who writes it (`origin`
+  /// `manual` or `program`; a manual write waits while motion executes, §7).
+  std::optional<core::IoSignalId> io_output_signal{};
+  std::variant<bool, double> io_output_value{false};
+  bool io_output_manual{};
   std::optional<core::RuntimeScaleControlRequestDTO> runtime_scale_control;
   std::optional<core::RuntimeScaleRequestDTO> operation_runtime_scale;
   std::optional<core::RuntimeScaleControlSelectorDTO>
@@ -369,8 +385,6 @@ struct Command final {
   bool observation_cursor_supplied{};
   std::optional<core::PickSequencePlanningIntentDTO> pick_planning;
   std::optional<core::PlaceSequencePlanningIntentDTO> place_planning;
-  /// Item 37 Force close: `arm` (with `stop_generation`) or `close_operations`.
-  std::optional<std::string> force_close_step{};
 };
 
 [[nodiscard]] Command DecodeCommand(std::string_view bytes);

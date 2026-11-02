@@ -189,16 +189,6 @@
         "program_run_id": "program-cycle.1",
         "program_runner_owner_epoch": "program-runner.epoch.1"
       }
-    },
-    {
-      "allowed": false,
-      "command_kind": "stop_recovery",
-      "disabled_reason": "program_cycle_state_running",
-      "semantic_target": {
-        "cycle_generation": 1,
-        "program_run_id": "program-cycle.1",
-        "program_runner_owner_epoch": "program-runner.epoch.1"
-      }
     }
   ],
   "causal_client_sequence": null,
@@ -237,7 +227,6 @@
     "generated_at_ns": 1000000000,
     "graph_revision": "sha256:0000000000000000000000000000000000000000000000000000000000000002",
     "kernel_assessment_revision": 0,
-    "latch_id": null,
     "manual_result": {
       "disabled_reason_code": "manual_result_owner_not_acknowledged",
       "enabled": false
@@ -396,11 +385,13 @@
     "owner_epoch": "program-runner.epoch.1",
     "owner_id": "program-runner.cell-a",
     "reason_code": "no_feasible_candidate",
+    "run_end": null,
     "run_revision": 5,
     "schema_version": "manyforge.program_run_status.v3",
     "state": "intervention_required",
     "tree_status": "running"
   },
+  "run_end": null,
   "run_revision": 5,
   "runtime_control_revision": 1,
   "runtime_controls": {
@@ -410,11 +401,16 @@
           "group_id": "all",
           "held_node_count": 3,
           "node_count": 3,
+          "ordinary_held_node_count": 3,
           "resource_ids": [],
           "resume_allowed": false,
           "resume_unavailable_reason": "selected_owner_recovery_unavailable",
-          "runtime_scale_selector": null,
-          "runtime_scale_unavailable_reason": "captured_motion_target_binding_unavailable",
+          "runtime_scale_selector": {
+            "component_role_id": "robot",
+            "program_binding_id": "sha256:0000000000000000000000000000000000000000000000000000000000000003",
+            "target_role_id": "arm"
+          },
+          "runtime_scale_unavailable_reason": null,
           "start_allowed": false,
           "start_unavailable_reason": "selected_owner_recovery_unavailable",
           "state": "held",
@@ -424,11 +420,16 @@
           "group_id": "arm",
           "held_node_count": 1,
           "node_count": 1,
+          "ordinary_held_node_count": 1,
           "resource_ids": [],
           "resume_allowed": false,
           "resume_unavailable_reason": "selected_owner_recovery_unavailable",
-          "runtime_scale_selector": null,
-          "runtime_scale_unavailable_reason": "captured_motion_target_binding_unavailable",
+          "runtime_scale_selector": {
+            "component_role_id": "robot",
+            "program_binding_id": "sha256:0000000000000000000000000000000000000000000000000000000000000003",
+            "target_role_id": "arm"
+          },
+          "runtime_scale_unavailable_reason": null,
           "start_allowed": false,
           "start_unavailable_reason": "selected_owner_recovery_unavailable",
           "state": "held",
@@ -438,11 +439,16 @@
           "group_id": "tools",
           "held_node_count": 1,
           "node_count": 1,
+          "ordinary_held_node_count": 1,
           "resource_ids": [],
           "resume_allowed": false,
           "resume_unavailable_reason": "selected_owner_recovery_unavailable",
-          "runtime_scale_selector": null,
-          "runtime_scale_unavailable_reason": "captured_motion_target_binding_unavailable",
+          "runtime_scale_selector": {
+            "component_role_id": "robot",
+            "program_binding_id": "sha256:0000000000000000000000000000000000000000000000000000000000000003",
+            "target_role_id": "arm"
+          },
+          "runtime_scale_unavailable_reason": null,
           "start_allowed": false,
           "start_unavailable_reason": "selected_owner_recovery_unavailable",
           "state": "held",
@@ -480,7 +486,6 @@
       "generated_at_ns": 1000000000,
       "graph_revision": "sha256:0000000000000000000000000000000000000000000000000000000000000002",
       "kernel_assessment_revision": 0,
-      "latch_id": null,
       "manual_result": {
         "disabled_reason_code": "manual_result_owner_not_acknowledged",
         "enabled": false
@@ -550,7 +555,6 @@
           "generated_at_ns": 1000000000,
           "graph_revision": "sha256:0000000000000000000000000000000000000000000000000000000000000002",
           "kernel_assessment_revision": 0,
-          "latch_id": null,
           "manual_result": {
             "disabled_reason_code": "manual_result_owner_not_acknowledged",
             "enabled": false
@@ -620,7 +624,6 @@
           "generated_at_ns": 1000000000,
           "graph_revision": "sha256:0000000000000000000000000000000000000000000000000000000000000002",
           "kernel_assessment_revision": 0,
-          "latch_id": null,
           "manual_result": {
             "disabled_reason_code": "manual_result_owner_not_acknowledged",
             "enabled": false

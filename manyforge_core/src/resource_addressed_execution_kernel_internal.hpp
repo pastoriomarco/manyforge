@@ -23,9 +23,6 @@
 #include <manyforge_core/stop_scope_resolver.hpp>
 #include <manyforge_core/stop_terminal_reducer.hpp>
 #include "stop_terminal_reducer_internal.hpp"
-#include <manyforge_core/component_lifecycle_admission.hpp>
-
-#include "component_lifecycle_journal_codec_internal.hpp"
 #include <manyforge_core/types/capability_definition.hpp>
 #include <manyforge_core/types/error_catalog.generated.hpp>
 #include <numeric>
@@ -55,11 +52,6 @@ class ScopeExit final {
 
 template <typename Function>
 ScopeExit(Function) -> ScopeExit<Function>;
-
-[[nodiscard]] inline bool is_active_stop_fault_latch(
-    const std::optional<StopFaultLatchDTO>& latch) noexcept {
-  return latch.has_value() && latch->state != StopFaultLatchStateDTO::kCleared;
-}
 
 [[nodiscard]] inline ErrorDTO error(std::string code, std::string message, std::string reason) {
   return ErrorDTO{std::move(code), std::move(message), {{"reason", std::move(reason)}}};
@@ -211,19 +203,18 @@ extract_published_active_control_configurations(
 }
 
 [[nodiscard]] inline std::vector<DomainActiveControlConfigurationDTO> route_publication_identities(
-    const std::map<ControlDomainId, RuntimeDomainConfigurationReadbackDTO>& readbacks,
+    const std::map<ControlDomainId, RuntimeRouteConfigurationReadbackDTO>& readbacks,
     const RuntimeRouteConfigurationReadbackDTO* replacement = nullptr) {
   std::vector<DomainActiveControlConfigurationDTO> result;
   result.reserve(readbacks.size() + (replacement != nullptr ? 1U : 0U));
   for (const auto& [domain_id, readback] : readbacks) {
-    if (readback.provider() != nullptr ||
-        (replacement != nullptr &&
-         domain_id == replacement->active_configuration.control_domain_id)) {
+    if (replacement != nullptr &&
+        domain_id == replacement->active_configuration.control_domain_id) {
       continue;
     }
     result.push_back(DomainActiveControlConfigurationDTO{
-        domain_id, readback.controller().active_configuration.active_control_configuration_id,
-        readback.controller().active_configuration.active_control_configuration_generation});
+        domain_id, readback.active_configuration.active_control_configuration_id,
+        readback.active_configuration.active_control_configuration_generation});
   }
   if (replacement != nullptr) {
     result.push_back(DomainActiveControlConfigurationDTO{
@@ -368,7 +359,6 @@ derive_route_readiness_projection(
          left.default_fault_stop_profile == right.default_fault_stop_profile &&
          left.deployment_maximum_tcp_linear_speed_mps ==
              right.deployment_maximum_tcp_linear_speed_mps &&
-         left.speed_check_flange_frame == right.speed_check_flange_frame &&
          left.intrinsic_direct_control == right.intrinsic_direct_control &&
          left.direct_control_joint_limits == right.direct_control_joint_limits &&
          left.motion_takeover_preparation_budget_s == right.motion_takeover_preparation_budget_s &&
@@ -390,6 +380,8 @@ derive_route_readiness_projection(
   // their resolved target, model, frame, resource and provider facts below
   // still have to match. Contact/grasp templates are likewise authored
   // Program inputs consumed by later admitted operations, not controller state.
+  // The moving-takeover budgets are cell context: a retained controller takes
+  // the candidate's, so they are not compared.
   candidate_controller_binding.program_id = a.program_id;
   candidate_controller_binding.program_revision = a.program_revision;
   candidate_controller_binding.program_binding_id = a.program_binding_id;
@@ -408,11 +400,8 @@ derive_route_readiness_projection(
       left.default_fault_stop_profile != right.default_fault_stop_profile ||
       left.deployment_maximum_tcp_linear_speed_mps !=
           right.deployment_maximum_tcp_linear_speed_mps ||
-      left.speed_check_flange_frame != right.speed_check_flange_frame ||
       left.intrinsic_direct_control != right.intrinsic_direct_control ||
       left.direct_control_joint_limits != right.direct_control_joint_limits ||
-      left.motion_takeover_preparation_budget_s != right.motion_takeover_preparation_budget_s ||
-      left.motion_takeover_planning_budget_s != right.motion_takeover_planning_budget_s ||
       left.participant_policy.has_value() != right.participant_policy.has_value() ||
       (left.participant_policy.has_value() &&
        left.participant_policy->value() != right.participant_policy->value()) ||
@@ -508,7 +497,7 @@ struct StopStaticFacts final {
   }
 
   std::map<ControllableComponentId, StopScopeComponentSnapshotDTO> components;
-  std::map<ResourceId, std::pair<ControllableComponentId, bool>> resource_owners;
+  std::map<ResourceId, ControllableComponentId> resource_owners;
   for (const auto& registration : registrations) {
     const auto& binding = registration.binding.value();
     if (!retained_bundle_id.has_value()) {
@@ -525,41 +514,25 @@ struct StopStaticFacts final {
       throw std::invalid_argument(
           "runtime participants do not share one current graph revision for Stop resolution");
     }
-    if (!registration.stop_readiness && !binding.io_output_binding) {
-      // Other unqualified registrations do not self-attest lifecycle membership.
+    if (!registration.stop_readiness) {
+      // Unqualified registrations do not self-attest lifecycle membership.
       continue;
     }
-    // Output membership comes from its sealed logical channel and actual CCLC
-    // generation. It does not create a physical Stop plan or readiness proof.
-    const auto& component_id = binding.io_output_binding
-                                   ? binding.controllable_component_id
-                                   : registration.stop_readiness->value().controllable_component_id;
-    const auto generation =
-        binding.io_output_binding
-            ? binding.io_output_binding->component_lifecycle_generation
-            : registration.stop_readiness->value().component_lifecycle_generation;
+    const auto& component_id = registration.stop_readiness->value().controllable_component_id;
+    const auto generation = registration.stop_readiness->value().component_lifecycle_generation;
     auto [component, inserted] = components.try_emplace(
         component_id, StopScopeComponentSnapshotDTO{component_id, generation, {}});
     if (!inserted && component->second.component_lifecycle_generation != generation) {
       throw std::invalid_argument(
           "runtime participant Stop readiness disagrees on component lifecycle generation");
     }
-    const auto append_resource = [&](const ResourceId& resource_id, bool logical_output) {
-      const auto [owner, owner_inserted] =
-          resource_owners.emplace(resource_id, std::pair{component_id, logical_output});
-      if (!owner_inserted &&
-          ((owner->second.first != component_id && (!logical_output || !owner->second.second)) ||
-           owner->second.second != logical_output)) {
+    for (const auto& resource : binding.resources) {
+      const auto [owner, owner_inserted] = resource_owners.emplace(resource.resource_id, component_id);
+      if (!owner_inserted && owner->second != component_id) {
         throw std::invalid_argument(
             "runtime Stop readiness assigns one resource to multiple components");
       }
-      component->second.resources.push_back(resource_id);
-      if (logical_output) component->second.logical_output_resources.push_back(resource_id);
-    };
-    if (binding.io_output_binding) {
-      append_resource(*binding.io_output_binding->signal.output_resource, true);
-    } else {
-      for (const auto& resource : binding.resources) append_resource(resource.resource_id, false);
+      component->second.resources.push_back(resource.resource_id);
     }
   }
 
@@ -578,10 +551,6 @@ struct StopStaticFacts final {
     std::sort(component.resources.begin(), component.resources.end());
     component.resources.erase(std::unique(component.resources.begin(), component.resources.end()),
                               component.resources.end());
-    std::sort(component.logical_output_resources.begin(), component.logical_output_resources.end());
-    component.logical_output_resources.erase(
-        std::unique(component.logical_output_resources.begin(), component.logical_output_resources.end()),
-        component.logical_output_resources.end());
     facts.components.push_back(std::move(component));
   }
   return facts;
@@ -855,12 +824,6 @@ resolve_contact_grasp_binding(const MotionParticipantIntentDTO& motion,
       binding.frame_bindings,
       binding.collision_body_bindings};
 
-  // The one admitted limit holds at every point of this set (planner retime
-  // and post-plan validation); the flange comes from the robot, never the
-  // Program.
-  exact_binding.speed_check_frames = speed_check_frames(
-      exact_binding.tcp_frame, registration.speed_check_flange_frame);
-
   ExecuteRequestDTO request(std::move(exact_binding));
   request.move_id = motion.move_id.value();
   request.tolerances = motion.tolerances;
@@ -892,7 +855,7 @@ resolve_contact_grasp_binding(const MotionParticipantIntentDTO& motion,
   request.speed_profile = std::move(effective_speed.value());
   request.timeouts = motion.timeouts;
   request.cache_mode = motion.cache_mode;
-  request.planning_profile = motion.planning_profile;
+  request.planner = motion.planner;
   request.target_mode = motion.target_mode;
   request.target_reference = motion.target_reference;
   request.offset_reference = motion.offset_reference;
@@ -1048,16 +1011,22 @@ resolve_contact_grasp_binding(const MotionParticipantIntentDTO& motion,
   }
 
   double command_duration_s = 0.0;
+  bool wait_for_duration = false;
   for (const auto& option : command.caller_options) {
-    if (option.option_id.value() != "command_duration_s") {
+    const auto* value_s = std::get_if<double>(&option.value);
+    const auto* value_bool = std::get_if<bool>(&option.value);
+    if (option.option_id.value() == "command_duration_s" && value_s != nullptr) {
+      command_duration_s = *value_s;
+    } else if (option.option_id.value() == "wait_for_duration" && value_bool != nullptr) {
+      wait_for_duration = *value_bool;
+    } else {
       return reject<GripperCommandRequestDTO>(
           "the command carries an option not declared by its schema", "command_option_unsupported",
           ErrorCode::kInvalidRequest);
     }
-    command_duration_s = option.value_s;
   }
 
-  const auto& value = std::get<GripperPositionCommandValueDTO>(command.command_value);
+  const auto& value = command.command_value;
   const auto kind = coordinate_kind(value.position);
   if (kind != binding.resources.front().coordinate_kind) {
     return reject<GripperCommandRequestDTO>(
@@ -1081,6 +1050,7 @@ resolve_contact_grasp_binding(const MotionParticipantIntentDTO& motion,
   request.joint_name = resource.compiled_resource_name;
   request.target_position = target_position;
   request.duration_s = command_duration_s;
+  request.wait_for_duration = wait_for_duration;
   request.max_effort = max_effort;
   request.commanded_state = "position";
   request.actuation_kind = kind == CoordinateKind::kAngular ? "angular" : "linear";
@@ -1149,9 +1119,6 @@ resolve_contact_grasp_binding(const MotionParticipantIntentDTO& motion,
         "prepared motion is missing accepted-trajectory diagnostics",
         "prepared_motion_diagnostics_missing", ErrorCode::kInvariantViolation);
   }
-  std::vector<std::string> speed_check_frame_role_ids;
-  for (const auto& frame : motion->plan_request.speed_check_frames)
-    speed_check_frame_role_ids.push_back(frame_role_id(frame));
   return Result<PreparedMotionDiagnosticsDTO>::Ok(PreparedMotionDiagnosticsDTO{
       participant.participant_id, participant.prepared_contract_digest, motion->move_id,
       motion->trajectory.joint_names,
@@ -1159,31 +1126,7 @@ resolve_contact_grasp_binding(const MotionParticipantIntentDTO& motion,
       motion->requested_tcp_linear_speed_mps,
       motion->deployment_maximum_tcp_linear_speed_mps,
       *motion->plan_request.speed_profile.max_tcp_linear_speed_mps,
-      std::move(speed_check_frame_role_ids)});
-}
-
-[[nodiscard]] inline Result<PreparedOperationParticipantDTO> build_prepared_io_output_participant(
-    const OperationIntentDTO& intent, const CapabilityCommandIntentDTO& command,
-    const RuntimeParticipantBinding& binding, const OperationId& operation,
-    OperationRevision revision, const OperationParticipantId& participant) {
-  const auto* value = std::get_if<IoSignalWriteCommandValueDTO>(&command.command_value);
-  if (!value || !command.caller_options.empty())
-    return reject<PreparedOperationParticipantDTO>(
-        "output command has unsupported value or options", "io_output_command_value_invalid",
-        ErrorCode::kInvalidRequest);
-  return MakePreparedIoOutputParticipant(operation, revision, participant, intent.program_run_id,
-                                         command, binding);
-}
-
-[[nodiscard]] inline ResolvedPreparedCapabilityCommandExecutionRequestDTO
-output_preparation_request(std::shared_ptr<const PreparedOperationParticipantDTO> participant,
-                           const RuntimeParticipantBinding& binding) {
-  const auto& output = std::get<PreparedIoOutputCommandDTO>(participant->payload);
-  const auto provider = participant->provider()->lifecycle_provider;
-  ResolvedPreparedIoOutputCommandAuthorityDTO authority{output.signal_id, output.output_resource,
-                                                        output.command_value.value, provider,
-                                                        output.completion_policy};
-  return {std::move(participant), binding, std::move(authority)};
+      std::vector<std::string>{frame_role_id(motion->plan_request.tcp_frame)}});
 }
 
 [[nodiscard]] inline Result<PreparedOperationParticipantDTO> build_prepared_capability_command_participant(
@@ -1207,8 +1150,8 @@ output_preparation_request(std::shared_ptr<const PreparedOperationParticipantDTO
                                        {},
                                        {},
                                        command.completion_timeout_s.value(),
-                                       schema.completion_rule.value(),
-                                       schema.confirmation_rule.value(),
+                                       schema.completion_rule,
+                                       schema.confirmation_rule,
                                        schema.stop_evidence_requirements};
   std::vector<ResourceId> resources;
   resources.reserve(binding.resources.size());
@@ -1597,21 +1540,6 @@ struct ResourceAddressedExecutionKernel::RuntimeScaleControlReplayEntry final {
   RuntimeScaleControlScope scope;
 };
 
-struct ResourceAddressedExecutionKernel::StopFaultRecoveryReplayEntry final {
-  using Intent = std::variant<StopFaultRecoveryIntentDTO, IoGlobalRuleRecoveryIntentDTO>;
-  using Result = std::variant<StopFaultRecoveryResultDTO, IoGlobalRuleRecoveryResultDTO>;
-  Intent intent;
-  Result result;
-  // Uncertain journal commits retry this exact payload, never a newly evaluated
-  // timestamp or a newly minted token. The original latch stays in its row.
-  std::optional<IoGlobalRuleRecoveryRecordDTO> pending_global_record{};
-  [[nodiscard]] const RequestId& request_id() const {
-    return std::visit([](const auto& value) -> const RequestId& {
-      return value.request_context.request_id;
-    }, intent);
-  }
-};
-
 struct ResourceAddressedExecutionKernel::OperationRecoveryReplayEntry final {
   OperationId operation_id;
   OperationRevision operation_revision{0U};
@@ -1706,7 +1634,6 @@ inline void bind_recovery_request(KernelRecoveryActionRequestDTO& request,
   request.expected_assessment_revision = assessment.assessment_revision;
   request.expected_control_command_epoch = assessment.control_command_epoch;
   request.expected_execution_id = assessment.execution_id;
-  request.expected_latch_id = assessment.latch_id;
   request.expected_stop_certificate_id = assessment.stop_certificate_id;
   request.expected_stop_owner_generation = assessment.stop_owner_generation;
   // Freshness is authorized and consumed by the addressed owner. Its local
@@ -1785,10 +1712,9 @@ struct ActiveOperationParticipant final {
 
   [[nodiscard]] bool non_motion_transaction() const noexcept {
     return payload_kind == OperationParticipantPayloadKind::kCapabilityCommand &&
-           (binding.value().io_output_binding.has_value() ||
-            (gripper_actuation == GripperActuationKind::kPneumatic && stop_readiness &&
-             stop_readiness->value().resolved_stop_base_plan.gripper_actuation_kind ==
-                 GripperActuationKind::kPneumatic));
+           gripper_actuation == GripperActuationKind::kPneumatic && stop_readiness &&
+           stop_readiness->value().resolved_stop_base_plan.gripper_actuation_kind ==
+               GripperActuationKind::kPneumatic;
   }
   [[nodiscard]] bool stop_owns_reconciliation() const noexcept {
     return stop_containment_owned;
@@ -1836,9 +1762,6 @@ struct ActiveOperationParticipant final {
 // An authored payload/capability alone never grants the Stop-only exception.
 [[nodiscard]] inline bool non_motion_registration(
     const RuntimeParticipantExecutionRegistration& registration) {
-  if (registration.binding.value().io_output_binding)
-    return registration.engine && registration.prepared_motion_engine &&
-           !registration.stop_readiness && !registration.binding.value().control_path;
   return registration.binding.value().capability_id.value() == "tool.gripper.command" &&
       registration.engine && registration.stop_readiness &&
       registration.stop_readiness->value().resolved_stop_base_plan.gripper_actuation_kind ==
@@ -2103,8 +2026,6 @@ class ResourceAddressedExecutionKernel::OperationCommitGuard final {
     } catch (...) {
       // Destruction must still release the ordinary gate during exception
       // unwinding. No provider call or storage retry belongs in this guard.
-      std::lock_guard state_lock(owner_.state_mutex_);
-      owner_.motion_admission_closed_ = true;
     }
     lock_.unlock();
   }
@@ -2127,18 +2048,6 @@ class ResourceAddressedExecutionKernel::OperationCommitGuard final {
     return std::any_of(participants.begin(), participants.end(),
                        [&](const auto& participant) { return participant.state == state; });
   };
-  const auto final_output_failure = [](const auto& row) {
-    if (row.state != OperationStateKind::kFailed ||
-        row.payload_kind != OperationParticipantPayloadKind::kCapabilityCommand ||
-        !row.binding_identity.provider() || !row.output_evidence || !row.terminal_fact ||
-        row.terminal_fact->kind != ParticipantExecutionFactKind::kLocalFailure ||
-        row.terminal_fact->error != row.terminal_error)
-      return false;
-    return (*row.output_evidence == IoOutputEvidence::kNotSubmitted &&
-            row.terminal_fact->effect == ParticipantEffectKnowledge::kNoEffect) ||
-           (*row.output_evidence == IoOutputEvidence::kSourceRejected &&
-            row.terminal_fact->effect == ParticipantEffectKnowledge::kEffectSettled);
-  };
   const auto completed_or = [&](const OperationStateKind state) {
     return !participants.empty() &&
            std::all_of(participants.begin(), participants.end(), [&](const auto& participant) {
@@ -2148,8 +2057,7 @@ class ResourceAddressedExecutionKernel::OperationCommitGuard final {
                       participant.terminal_error &&
                       participant.terminal_error->details.contains("pneumatic_transaction_final") &&
                       participant.terminal_error->details.at("pneumatic_transaction_final") ==
-                          "true") ||
-                     final_output_failure(participant));
+                          "true"));
            });
   };
   const auto final_pneumatic_failure = [](const auto& row) {
@@ -2160,14 +2068,12 @@ class ResourceAddressedExecutionKernel::OperationCommitGuard final {
   if (any_state(OperationStateKind::kInterventionRequired) ||
       any_state(OperationStateKind::kInterrupted) ||
       std::any_of(participants.begin(), participants.end(), [&](const auto& row) {
-        return row.state == OperationStateKind::kFailed && !final_pneumatic_failure(row) &&
-               !final_output_failure(row);
+        return row.state == OperationStateKind::kFailed && !final_pneumatic_failure(row);
       }))
     return OperationStateKind::kInterventionRequired;
   if (any_state(OperationStateKind::kFailed) &&
       std::all_of(participants.begin(), participants.end(), [&](const auto& row) {
-        return row.state == OperationStateKind::kCompleted || final_pneumatic_failure(row) ||
-               final_output_failure(row);
+        return row.state == OperationStateKind::kCompleted || final_pneumatic_failure(row);
       }))
     return OperationStateKind::kFailed;
   if (all_state(OperationStateKind::kCompleted)) {
@@ -2547,13 +2453,17 @@ struct ResourceAddressedExecutionKernel::GlobalInterruptStopParticipant final {
 };
 
 struct ResourceAddressedExecutionKernel::GlobalInterruptStopSelection final {
-  // A normal rule response has actual watch evidence. A notify rule that
-  // cannot watch instead carries its actual setup/input error, never a token.
+  // A `stop` rule's trip, or any active rule that lost its signals
+  // (`watch_lost`; no registration when its setup failed): the operator's
+  // Stop on the rule's scope.
   InterruptPolicyId policy_id;
   std::optional<IoRuleRegistrationDTO> registration;
   std::optional<IoRuleEvidenceDTO> evidence;
-  std::optional<ErrorDTO> watch_error;
+  bool watch_lost;
   bool everything;
+  // `after_stop: fail_node`: the Program's own Stop, its motion fails with
+  // `interrupt_fault`; otherwise the operator's hold.
+  bool fail_node;
   int priority;
   std::vector<GlobalInterruptStopParticipant> participants;
   std::vector<ResourceId> scope_resources;
@@ -2565,7 +2475,6 @@ struct ResourceAddressedExecutionKernel::StopTransaction final {
   std::optional<StopId> stop_id;
   StopGeneration stop_generation{0U};
   bool full_stop{};
-  bool persistence_degraded{};
   EmergencyStopProjectionStateDTO acceptance_projection_state{
       EmergencyStopProjectionStateDTO::kPending};
   bool progress_in_flight{};
@@ -2590,7 +2499,6 @@ struct ResourceAddressedExecutionKernel::StopTransaction final {
   std::optional<StopCertificateDTO> certificate;
   std::optional<StopControlWorkToken> terminal_projection_token;
   std::optional<std::string> malformed_ingress_reason;
-  std::optional<StopFaultLatchDTO> fault_latch;
   /// Stop-path collision facts that arrived before participant work existed;
   /// consumed when the work is initialized.
   std::vector<std::tuple<OperationId, OperationParticipantId, ErrorDTO>>
@@ -2649,15 +2557,7 @@ template <typename Transaction>
 struct ResourceAddressedExecutionKernel::StopTerminalRecord final {
   StopStatusDTO status;
   StopCertificateDTO certificate;
-  std::optional<StopFaultLatchDTO> fault_latch;
   std::optional<StopControlWorkToken> terminal_projection_token;
-  std::unique_ptr<StopSurveillanceReducerState> surveillance_state;
-  std::optional<ScheduleHandle> surveillance_schedule_handle;
-  std::uint64_t surveillance_schedule_generation{};
-  bool surveillance_callback_pending{};
-  std::optional<StopControlWorkToken> surveillance_projection_token;
-  std::int64_t next_surveillance_sample_ns{};
-  std::int64_t next_surveillance_checkpoint_ns{};
   std::optional<StopAcceptedDTO> accepted{};
 };
 
@@ -2670,10 +2570,7 @@ struct ResourceAddressedExecutionKernel::StopProjectionJob final {
   std::optional<EmergencyStopAffectedStateSnapshotDTO> affected_state;
   std::optional<StopStatusDTO> terminal_status;
   std::optional<StopCertificateDTO> terminal_certificate;
-  std::optional<StopFaultLatchDTO> terminal_fault_latch;
   std::vector<OperationStateDTO> terminal_operation_states;
-  std::optional<StopPostTerminalSurveillanceDTO> surveillance_checkpoint;
-  std::optional<StopFaultLatchDTO> surveillance_fault_latch;
 };
 
 namespace resource_addressed_kernel_detail {
@@ -2684,8 +2581,7 @@ inline constexpr std::size_t kMaximumResidentStopTerminalRecords = 64U;
 // depends on this sole non-critical projection worker. Each Stop projection is
 // one journal attempt: the journal hands its writer to a waiting Stop
 // projection right after the one write in progress, so a failed attempt is a
-// genuine storage fault and fails closed through the persistence fault latch.
-// The status records that single attempt as its retry generation.
+// genuine storage fault; it is recorded and logged. The status records that single attempt as its retry generation.
 inline constexpr std::uint64_t kStopJournalProjectionAttempt = 1U;
 
 [[nodiscard]] inline std::int64_t checked_deadline(std::int64_t now, std::int64_t duration) noexcept {
@@ -2941,212 +2837,6 @@ inline constexpr std::uint64_t kStopJournalProjectionAttempt = 1U;
   return std::get<ResourceId>(left.subject) < std::get<ResourceId>(right.subject);
 }
 
-[[nodiscard]] inline bool stop_surveillance_source_plan_less(
-    const StopSurveillanceSourcePlanDTO& left,
-    const StopSurveillanceSourcePlanDTO& right) noexcept {
-  if (stop_scope_entry_key_less(left.scope_key, right.scope_key)) {
-    return true;
-  }
-  if (stop_scope_entry_key_less(right.scope_key, left.scope_key)) {
-    return false;
-  }
-  return left.evidence_requirement.evidence_item_id < right.evidence_requirement.evidence_item_id;
-}
-
-[[nodiscard]] inline Result<std::vector<StopSurveillanceSourcePlanDTO>> stop_surveillance_source_plans(
-    const StopCertificateDTO& certificate) {
-  std::vector<StopSurveillanceSourcePlanDTO> plans;
-  for (const auto& attempt : certificate.attempted_stage_results) {
-    if (attempt.authority != StopStageResultAuthorityDTO::kAuthoritative) {
-      continue;
-    }
-    const auto stage_index = attempt.result.request.stage_index;
-    const auto& stages = attempt.result.request.participant_stop_plan.stage_commands;
-    if (stage_index >= stages.size()) {
-      return reject<std::vector<StopSurveillanceSourcePlanDTO>>(
-          "terminal Stop result names an invalid prepared stage", "stop_surveillance_stage_invalid",
-          ErrorCode::kInvariantViolation);
-    }
-    for (const auto& resolved : stages[stage_index].resolved_stage.evidence_requirements) {
-      plans.push_back(StopSurveillanceSourcePlanDTO{attempt.scope_key, resolved.requirement,
-                                                    resolved.resolved_source});
-    }
-  }
-  std::sort(plans.begin(), plans.end(), stop_surveillance_source_plan_less);
-  plans.erase(std::unique(plans.begin(), plans.end()), plans.end());
-  if (plans.empty() || plans.size() > kMaximumStopSurveillanceSources ||
-      !std::all_of(plans.begin(), plans.end(), [](const auto& plan) {
-        return !stop_surveillance_source_plan_field_error(plan).has_value();
-      })) {
-    return reject<std::vector<StopSurveillanceSourcePlanDTO>>(
-        "terminal Stop has no canonical surveillance evidence sources",
-        "stop_surveillance_sources_unavailable", ErrorCode::kMissingReference);
-  }
-  return Result<std::vector<StopSurveillanceSourcePlanDTO>>::Ok(std::move(plans));
-}
-
-[[nodiscard]] inline bool stop_requires_surveillance(const StopCertificateDTO& certificate,
-                                              const StopFaultLatchDTO& latch) noexcept {
-  // Q32: a component-incident containment no longer waits for observed
-  // measured rest after its Stop finished.
-  static_cast<void>(latch);
-  return certificate.result == StopCertificateResultDTO::kPartial ||
-         certificate.result == StopCertificateResultDTO::kFailedUncontained;
-}
-
-[[nodiscard]] inline StopFaultTriggerDTO primary_fault_trigger(const StopCertificateDTO& certificate,
-                                                        const bool persistence_degraded) noexcept {
-  if (certificate.result == StopCertificateResultDTO::kFailedUncontained) {
-    return StopFaultTriggerDTO::kFailedUncontained;
-  }
-  if (certificate.result == StopCertificateResultDTO::kPartial) {
-    return StopFaultTriggerDTO::kPartial;
-  }
-  if (certificate.result == StopCertificateResultDTO::kSucceededEscalated) {
-    return StopFaultTriggerDTO::kEscalated;
-  }
-  if (certificate.resolution_disposition == StopResolutionDispositionDTO::kPromotedToFull) {
-    return StopFaultTriggerDTO::kScopePromotion;
-  }
-  return persistence_degraded ? StopFaultTriggerDTO::kPersistenceDegraded
-                              : StopFaultTriggerDTO::kPhysicalRestUnproven;
-}
-
-[[nodiscard]] inline std::string fault_trigger_reason(const StopFaultTriggerDTO trigger) {
-  switch (trigger) {
-    case StopFaultTriggerDTO::kScopePromotion:
-      return "stop_scope_promoted";
-    case StopFaultTriggerDTO::kEscalated:
-      return "stop_escalated";
-    case StopFaultTriggerDTO::kPartial:
-      return "stop_partial";
-    case StopFaultTriggerDTO::kFailedUncontained:
-      return "stop_failed_uncontained";
-    case StopFaultTriggerDTO::kPhysicalRestUnproven:
-      return "stop_physical_rest_unproven";
-    case StopFaultTriggerDTO::kPersistenceDegraded:
-      return "stop_persistence_degraded";
-    case StopFaultTriggerDTO::kPostReserveFenceFailed:
-      return "stop_post_reserve_fence_failed";
-  }
-  return "stop_fault";
-}
-
-/// Records one latched trigger in `latch.observed_triggers` (distinct, in
-/// first-seen order, so the enum bounds the list). `latch.trigger` must already
-/// be the primary cause. A new trigger that is not the primary writes one
-/// typed line, so a lower-priority cause is never dropped silently.
-inline void observe_fault_trigger(StopFaultLatchDTO& latch, const StopFaultTriggerDTO trigger) {
-  auto& observed = latch.observed_triggers;
-  if (std::find(observed.begin(), observed.end(), trigger) != observed.end()) return;
-  observed.push_back(trigger);
-  if (trigger == latch.trigger) return;
-  const auto name = stop_fault_trigger_name(trigger);
-  const auto primary = stop_fault_trigger_name(latch.trigger);
-  (void)std::fprintf(stderr,
-                     "manyforge_fault code=stop_fault_trigger_observed trigger=%.*s primary=%.*s\n",
-                     static_cast<int>(name.size()), name.data(),
-                     static_cast<int>(primary.size()), primary.data());
-}
-
-[[nodiscard]] inline int fault_trigger_priority(const StopFaultTriggerDTO trigger) noexcept {
-  switch (trigger) {
-    // An unfenced accepted Stop is the root cause; a later certificate never
-    // replaces it.
-    case StopFaultTriggerDTO::kPostReserveFenceFailed:
-      return 7;
-    case StopFaultTriggerDTO::kFailedUncontained:
-      return 6;
-    case StopFaultTriggerDTO::kPartial:
-      return 5;
-    case StopFaultTriggerDTO::kPhysicalRestUnproven:
-      return 4;
-    case StopFaultTriggerDTO::kEscalated:
-      return 3;
-    case StopFaultTriggerDTO::kScopePromotion:
-      return 2;
-    case StopFaultTriggerDTO::kPersistenceDegraded:
-      return 1;
-  }
-  return 0;
-}
-
-/// Operations and resources a fault latch holds for physical recovery. A
-/// pre-dispatch-cancelled participant whose no-effect outcome settled
-/// (exactly the entries the terminal reducer does not count as unsettled) has
-/// no stop stage and no motion-rest obligation; its resources are only latched
-/// when another captured subject also covers them.
-[[nodiscard]] inline std::pair<std::vector<OperationId>, std::vector<ResourceId>> fault_latch_capture(
-    const StopCertificateDTO& certificate) {
-  using Settlement = StopParticipantScopeFactsDTO::TerminalSettlementState;
-  std::vector<OperationId> operations;
-  std::vector<ResourceId> resources;
-  operations.reserve(certificate.scope_entries.size());
-  resources.reserve(certificate.scope_entries.size());
-  for (const auto& entry : certificate.scope_entries) {
-    if (const auto* participant = std::get_if<StopParticipantScopeKeyDTO>(&entry.key.subject)) {
-      operations.push_back(participant->operation_id);
-      const auto& facts = std::get<StopParticipantScopeFactsDTO>(entry.facts);
-      const bool settled_without_effect =
-          entry.dispatch_state == StopScopeDispatchStateDTO::kNeverDispatchedCancelled &&
-          (facts.terminal_settlement == Settlement::kSettled ||
-           facts.terminal_settlement == Settlement::kNotRequired);
-      if (!settled_without_effect) {
-        resources.insert(resources.end(), facts.resources.begin(), facts.resources.end());
-      }
-    } else {
-      resources.push_back(std::get<ResourceId>(entry.key.subject));
-    }
-  }
-  std::sort(operations.begin(), operations.end());
-  operations.erase(std::unique(operations.begin(), operations.end()), operations.end());
-  std::sort(resources.begin(), resources.end());
-  resources.erase(std::unique(resources.begin(), resources.end()), resources.end());
-  return {std::move(operations), std::move(resources)};
-}
-
-[[nodiscard]] inline bool terminal_fault_required(const StopCertificateDTO& certificate,
-                                           const bool persistence_degraded) noexcept {
-  // Items 25 and Q29: no Stop outcome (escalated, partial or uncontained)
-  // latches the cell by itself; `main` had no cell-wide Stop-fault latch.
-  return persistence_degraded ||
-         certificate.resolution_disposition == StopResolutionDispositionDTO::kPromotedToFull;
-}
-
-[[nodiscard]] inline StopFaultLatchDTO persistence_fault_latch(
-    const CellId& cell_id, const RequestOwnerEpoch& owner_epoch,
-    const RetainedBundleId& retained_bundle_id, const GraphRevision& graph_revision,
-    const StopCertificateDTO& certificate, const StopFaultLatchGeneration generation,
-    StopDurableProjectionStatusDTO terminal_projection) {
-  auto [operations, resources] = fault_latch_capture(certificate);
-  const StopCertificateRefDTO reference{certificate.stop_certificate_id,
-                                        certificate.stop_certificate_revision, certificate.stop_id,
-                                        certificate.stop_generation};
-  return StopFaultLatchDTO{
-      cell_id,
-      certificate.stop_id,
-      certificate.stop_generation,
-      reference,
-      StopFaultLatchId("stop-fault." + owner_epoch.value() + "." +
-                       std::to_string(generation.value())),
-      generation,
-      StopFaultTriggerDTO::kPersistenceDegraded,
-      true,
-      std::move(operations),
-      std::move(resources),
-      retained_bundle_id,
-      graph_revision,
-      std::move(terminal_projection),
-      StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kNotApplicable, std::nullopt,
-                                     std::nullopt},
-      StopFaultLatchStateDTO::kLatched,
-      1U,
-      StopFaultRecoveryStatusDTO::kWaitingForDurableRecord,
-      "stop_persistence_degraded",
-      {},
-      {StopFaultTriggerDTO::kPersistenceDegraded}};
-}
-
 }  // namespace resource_addressed_kernel_detail
 
 namespace resource_addressed_kernel_detail {
@@ -3159,21 +2849,24 @@ inline bool global_rule_registration_matches(const IoRuleRegistrationDTO& token,
 }
 }  // namespace resource_addressed_kernel_detail
 
+// One installed global rule (CONTRACTS §8). An inactive rule holds no
+// registration. An active rule watches through its registration; without one
+// (`qualification_error`) it can't watch and gates its scope until a fresh
+// rearm succeeds. A trip is consumed once; the registration is renewed when
+// the condition is false again so the next edge trips anew.
 struct ResourceAddressedExecutionKernel::GlobalIoRuleRuntime final {
   IoRuleStateDTO state;
   std::optional<IoRuleRegistrationDTO> registration;
   std::optional<IoRuleEvidenceDTO> evidence;
   std::optional<ErrorDTO> qualification_error;
-  bool response_consumed{};
-  bool waiting_for_inactive{};
-  std::optional<StopAcceptedDTO> response{};
-  std::optional<IoRuleRegistrationDTO> latch_registration{};
-  std::optional<IoRuleEvidenceDTO> latched_evidence{};
-  std::optional<IoRuleEvidenceDTO> last_source_loss{};
-  bool source_loss_latch{};
-  // A notify arm failure must reach scoped containment before a retry can
-  // open the gate over a moving operation.
-  bool notify_failure_needs_containment{};
+  bool active{};
+  bool trip_consumed{};
+  // AUD-6: a `stop`/`hold` trip holds the Program run like the operator's
+  // Stop; set at the trip, cleared once the run's hold is issued.
+  bool hold_run{};
+  // Watched at least once since Load or activation: a missing Program key
+  // baseline before that is not a loss (the run publishes its keys first).
+  bool watched{};
 };
 
 struct ResourceAddressedExecutionKernel::StagedGlobalIoRuleCatalog final {
@@ -3409,15 +3102,8 @@ class ResourceAddressedExecutionKernel::CellCloseAdmissionLease final
     // DX583/Q121: inspect actual Kernel facts under the existing admission
     // lease and a brief state lock. Neither state nor submission spans SQL;
     // Stop remains recognizable, and callers recheck immediately precommit.
-    // D6: an active Stop-fault latch never blocks Close. Close moves nothing;
-    // the latch is a fact about its robots and is kept (never cleared here).
+    // The cell latch never blocks Close (R3).
     std::lock_guard state_lock(owner_.state_mutex_);
-    owner_.refresh_stop_fault_latch_locked();
-    // Item 37: after the operator's confirmed Full Stop, Force close retires
-    // the targets while operations are still resident; its own Kernel step
-    // then moves them into history. A newer Stop or a newly admitted
-    // operation ends the arm.
-    if (owner_.force_close_stop_generation_.has_value()) return Result<void>::Ok();
     for (const auto& [id, operation] : owner_.active_operations_) {
       if (operation->containment_effect_uncertain())
         return Result<void>::Err(ErrorDTO{"cell_close_containment_uncertain", "Close cannot infer rest from an uncertain terminal", {{"operation_id", id.value()}}});
@@ -3443,73 +3129,9 @@ class ResourceAddressedExecutionKernel::CellCloseAdmissionLease final
     return Result<void>::Ok();
   }
 
-  [[nodiscard]] Result<void> PrepareCommandEligibilityClosure(
-      const CCLCLifecycleTargetRetirementIntentDTO& intent) override {
-    if (prepared_ || !intent.locally_valid())
-      return Result<void>::Err(error("cell_close_eligibility_preparation_invalid",
-                                    "Close eligibility requires one exact valid retirement",
-                                    "invalid_or_repeated_preparation"));
-    const auto current = ValidatePrerequisites();
-    if (!current.ok()) return current;
-    try {
-      auto prepared = intent;
-      std::vector<ComponentCommandReadinessDTO*> entries;
-      entries.reserve(intent.expected_targets.size());
-      {
-        std::lock_guard state_lock(owner_.state_mutex_);
-        for (const auto& target : intent.expected_targets) {
-          const auto entry = owner_.component_command_readiness_.find(
-              target.controllable_component_id);
-          // Absence is already command-closed. The projection map does not
-          // erase entries, and this same admission lease excludes publishers.
-          if (entry != owner_.component_command_readiness_.end())
-            entries.push_back(&entry->second);
-        }
-      }
-      prepared_.emplace(std::move(prepared));
-      entries_ = std::move(entries);
-      return Result<void>::Ok();
-    } catch (...) {
-      return Result<void>::Err(error("cell_close_eligibility_preparation_unavailable",
-                                    "Close eligibility values could not be prepared before retirement",
-                                    "preparation_allocation_failed"));
-    }
-  }
-
-  [[nodiscard]] bool CloseCommandEligibilityAfterRetirement(
-      const CCLCLifecycleTargetRetirementIntentDTO& intent,
-      const CCLCLifecycleTargetRetirementResultDTO& retired) noexcept override {
-    // Complete equality is comparison-only: locally_valid() on a constructed
-    // result would copy vectors and must never run after durable commitment.
-    if (!prepared_ || consumed_ || *prepared_ != intent ||
-        retired.replay_status != RequestReplayStatusDTO::kAcceptedNew ||
-        retired.request_context != prepared_->request_context ||
-        retired.scope != prepared_->scope ||
-        retired.retired_targets != prepared_->expected_targets)
-      return false;
-    std::lock_guard state_lock(owner_.state_mutex_);
-    for (auto* entry : entries_) entry->command_eligible = false;
-    owner_.close_retired_product_ = true;
-    consumed_ = true;
-    return true;
-  }
-
-  [[nodiscard]] bool CloseCommandEligibilityForUnknownRetirement(
-      const CCLCLifecycleTargetRetirementIntentDTO& intent) noexcept override {
-    if (!prepared_ || consumed_ || *prepared_ != intent) return false;
-    std::lock_guard state_lock(owner_.state_mutex_);
-    for (auto* entry : entries_) entry->command_eligible = false;
-    owner_.close_retired_product_ = true;
-    consumed_ = true;
-    return true;
-  }
-
  private:
   ResourceAddressedExecutionKernel& owner_;
   std::unique_lock<std::recursive_mutex> admission_lock_;
-  std::optional<CCLCLifecycleTargetRetirementIntentDTO> prepared_;
-  std::vector<ComponentCommandReadinessDTO*> entries_;
-  bool consumed_{};
 };
 
 

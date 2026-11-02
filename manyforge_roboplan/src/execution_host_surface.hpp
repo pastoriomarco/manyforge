@@ -67,11 +67,12 @@ public:
   int Run(const std::stop_token stop_token = {});
 
 private:
-  [[nodiscard]] CanonicalValue ReadVolatileMotionTrace(const Command &command) const;
-#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
+  /// `response_capacity` is the client's AtomicResponseCapacity; it bounds an
+  /// inline trace, never a disk snapshot.
   [[nodiscard]] CanonicalValue
-  Ros2ControlLifecycleObservationValue(Composition &composition) const;
-
+  ReadVolatileMotionTrace(const Command &command,
+                          std::size_t response_capacity) const;
+#if defined(MANYFORGE_ROS2_CONTROL_EXECUTION_HOST)
   [[nodiscard]] CanonicalValue
   Ros2ControlTransportDiagnosticValue(Composition &composition) const;
 #endif
@@ -230,11 +231,30 @@ private:
   ReadStop(const Command &command,
            core::ResourceAddressedExecutionKernel &addressed_kernel) const;
 
-  [[nodiscard]] CanonicalValue RecoverGlobalIoRule(
-      const core::IoGlobalRuleRecoveryIntentDTO &intent,
-      core::ResourceAddressedExecutionKernel &owner) const;
-  [[nodiscard]] CanonicalValue ReadStopFault(
+  /// CONTRACTS §1, §5, §7, §8 `read_component_model` (control socket):
+  /// `component_states`, `cell_latch`, `signal_samples`, `rule_holds` and
+  /// `required_signal_ids` (the inputs the Applied Program reads).
+  [[nodiscard]] CanonicalValue ReadComponentModelResponse(
       core::ResourceAddressedExecutionKernel &addressed_kernel) const;
+  /// CONTRACTS §2: starts one component action (`component_action`).
+  [[nodiscard]] CanonicalValue ComponentActionResponse(const Command &command) const;
+  /// CONTRACTS §7 `set_io_output`: the Kernel admits the write
+  /// (`cell_latched`, `rule_holds`), then the component's adapter writes it.
+  /// A refusal is an error reply; the write's outcome is `result`.
+  [[nodiscard]] CanonicalValue SetIoOutputResponse(
+      const Command &command, core::ResourceAddressedExecutionKernel &addressed_kernel) const;
+  /// Who reads the component model fields.
+  enum class ComponentModelRead {
+    /// `read_component_model` (control socket): every field, samples with
+    /// their age; never waits for an Apply holding the composition.
+    kControl,
+    /// The `events` reply and the event stream's `state`: the signal samples
+    /// without their age, so only a value, source or freshness change makes a
+    /// new state (CONTRACTS §7).
+    kState,
+  };
+  [[nodiscard]] CanonicalValue::Object ComponentModelFields(
+      core::ResourceAddressedExecutionKernel &addressed_kernel, ComponentModelRead read) const;
 
   [[nodiscard]] CanonicalValue EventsResponse(const Command &command) const;
 
@@ -307,7 +327,8 @@ private:
   ///
   /// - Control socket: Stop, Program Stop, Program-selection Stop, full and
   ///   malformed Stop, plus the in-memory reads Stop progression needs
-  ///   (Stop status, Stop fault) and the operator-alarm attention heartbeat.
+  ///   (Stop status, component states and the cell latch) and the
+  ///   operator-alarm attention heartbeat.
   ///   It reaches only the stable Kernel, without the composition lock, so
   ///   neither planning nor an Apply delays it. Each request is a bounded
   ///   copy under the Kernel's state lock.
@@ -322,8 +343,7 @@ private:
   ///   from Manager (ReadsManagerScene). One worker, FIFO.
   ///
   /// Cross-lane fences: Reset, recovery and Stop-fence release name the
-  /// exact operation revision, Stop id and generation, or Stop-fault latch
-  /// they act on, and their clients issue them only after reading that state
+  /// exact operation revision, or Stop id and generation they act on, and their clients issue them only after reading that state
   /// on the control socket. A stale name is refused (the Program owner also
   /// refuses a cycle Reset while its Stop is not terminal); a Kernel Reset of
   /// a participant still stopping hard-stops it first, so no ordering of the
@@ -375,7 +395,6 @@ private:
   core::RequestOwnerEpoch owner_epoch_;
   core::ProgramRunId direct_control_program_run_id_;
   core::ProgramRunId direct_control_gripper_program_run_id_;
-  core::ProgramRunId direct_control_io_program_run_id_;
   ExecutionCompositionAccess &composition_access_;
   component_manager::detail::ManagerLivenessCommandAdmission
       &manager_liveness_admission_;

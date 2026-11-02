@@ -78,5 +78,27 @@ TEST(IoLivenessResponseTest, OutputHasNoInputLivenessDeclaration) {
                   .find_object_member("liveness")
                   ->is_null());
 }
+TEST(IoLivenessResponseTest, SignalSampleCarriesItsAgeOnlyWhenAsked) {
+  // CONTRACTS §7: the event stream's `state` compares samples without their
+  // age, so an aging sample alone never makes a new state.
+  const core::IoSignalId id{core::ControllableComponentId("component.io"), "input"};
+  core::IoSignalDescriptorDTO descriptor{
+      id, core::InterruptSourceId("source.io"), core::IoSignalValueType::kBoolean,
+      core::IoSignalDirection::kInput, core::IoSignalUpdateMode::kSampled,
+      core::IoTransitionCapability::kSampledOnly,
+      {core::IoFreshnessMode::kSampleAge, std::optional<core::Duration>{100}}, std::nullopt,
+      core::IoSignalLivenessMode::kPeriodic};
+  core::SignalSample sample{id, true, core::IoSignalSampleSource::kDevice, 7, true};
+  const auto aged = SignalSampleValue(sample, descriptor);
+  ASSERT_NE(aged.find_object_member("age_ns"), nullptr);
+  const auto ageless = SignalSampleValue(sample, descriptor, false);
+  EXPECT_EQ(ageless.find_object_member("age_ns"), nullptr);
+  EXPECT_TRUE(ageless.find_object_member("fresh")->as_bool());
+  EXPECT_EQ(ageless.find_object_member("source")->as_string(), "device");
+  EXPECT_TRUE(ageless.find_object_member("value")->as_bool());
+  sample.age_ns = 9;
+  EXPECT_EQ(content_identity::canonical_json(SignalSampleValue(sample, descriptor, false)),
+            content_identity::canonical_json(ageless));
+}
 } // namespace
 } // namespace manyforge::roboplan_backend::host_detail

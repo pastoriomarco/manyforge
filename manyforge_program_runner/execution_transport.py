@@ -30,7 +30,6 @@ from manyforge_headless_api.models import (
     ProgramRunStopIntentRequest,
     ProgramOperationQuery,
     FullStopIntentRequest,
-    StopFaultRecoveryIntentRequest,
     StopIntentRequest,
     TargetObservationQuery,
     TcpEntryRequest,
@@ -572,7 +571,6 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
                 "program_run_admission_in_flight",
                 # Operator-alarm motion attention (spec 450 §5.2).
                 "operator_alarm_interlock_active",
-                "unacknowledged_operator_alarms",
                 "operator_alarm_state_unavailable",
             }:
                 # These closed Kernel rejections all precede release. A lost,
@@ -943,9 +941,40 @@ class ProgramRunnerExecutionTransport(ExecutionCommandClient):
             self._request(ProgramRunStopIntentRequest, body)
         )
 
-    def recover_stop_fault(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        return super().recover_stop_fault(
-            self._request(StopFaultRecoveryIntentRequest, body)
+    def set_rule_active(self, rule_id: str, active: bool) -> dict[str, Any]:
+        """Kernel `set_rule_active` (node `rules.set_active`, CONTRACTS §8)."""
+
+        return self._exchange(
+            {
+                "api_version": EXECUTION_COMMAND_VERSION,
+                "command": "set_rule_active",
+                "rule_id": rule_id,
+                "active": active,
+            }
+        )
+
+    def reset_rule_activation(self) -> dict[str, Any]:
+        """Kernel `reset_rule_activation`: every rule to `active_at_start`."""
+
+        return self._exchange(
+            {
+                "api_version": EXECUTION_COMMAND_VERSION,
+                "command": "reset_rule_activation",
+            }
+        )
+
+    def clear_outside_change(
+        self, controllable_component_id: str, signal_name: str
+    ) -> dict[str, Any]:
+        """Kernel `clear_outside_change` (node `io.clear_outside_change`)."""
+
+        return self._exchange(
+            {
+                "api_version": EXECUTION_COMMAND_VERSION,
+                "command": "clear_outside_change",
+                "controllable_component_id": controllable_component_id,
+                "signal_name": signal_name,
+            }
         )
 
     def _pick_place(

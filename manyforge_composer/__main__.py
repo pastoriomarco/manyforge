@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import logging
 import os
 from pathlib import Path
@@ -89,61 +88,35 @@ def _open_startup_scenario_document(
         # acquires its claim; lifespan recovery is an idempotent recheck.
         state.authoring_admission.recover()
         from manyforge_composer.backend.routes_scenario_documents import (
-            LoadScenarioDocumentRequest,
             load_exact_scenario_document,
         )
 
-        program_state = state.draft_session.retained_state()
-        deployment_state = state.deployment_draft_session.retained_state()
-        workspace = state.authoring_workspace.identity()
-        admission = headless_client.authoring_admission()
-        generation = admission.get("admission_generation")
-        if type(generation) is not int:
-            raise RuntimeError("startup authoring admission is unavailable")
-        request = LoadScenarioDocumentRequest.model_validate(
-            {
-                "path": project_path,
-                "confirmDiscard": False,
-                "draftId": program_state["draft_id"],
-                "expectedDraftRevision": program_state["draft_revision"],
-                "deploymentDraftId": deployment_state["draft_id"],
-                "expectedDeploymentDraftRevision": deployment_state[
-                    "draft_revision"
-                ],
-                "expectedWorkspaceEpoch": workspace.workspace_epoch,
-                "expectedWorkspaceRevision": workspace.workspace_revision,
-                "expectedAdmissionGeneration": generation,
-                "requestOwnerEpoch": state.authoring_admission.owner_epoch,
-                "requestId": "startup-scenario-document-"
-                + hashlib.sha256(
-                    project_path.encode("utf-8")
-                ).hexdigest()[:24],
-            }
-        )
-        load_exact_scenario_document(state, request)
+        result = load_exact_scenario_document(state, project_path)
+        if result["outcome"] != "succeeded":
+            # The orchestrated Load ended at a failed step; nothing is retried.
+            raise _StartupLoadFailed(result["error"])
     except Exception as error:  # Every refused startup load takes this one path.
         detail = getattr(error, "detail", None)
         code = detail.get("code") if isinstance(detail, dict) else None
         reason = (
-            "a Scenario is still applied. Close it, then Load."
-            if code == "scenario_close_required"
-            else str(detail.get("message") if isinstance(detail, dict) else error)
+            str(detail.get("message") if isinstance(detail, dict) else error)
             or type(error).__name__
         )
-        message = (
-            # Refused after the workspace commit: the project is open, but the
-            # Manager effect is uncertain. Nothing is rolled back or retried.
-            f"Startup project {project_path} was opened in the workspace, but "
-            f"its activation was not confirmed: {reason}"
-            if code == "scenario_load_activation_not_confirmed"
-            else f"Startup project {project_path} was not opened: {reason}"
-        )
+        message = f"Startup project {project_path} was not activated: {reason}"
         logging.getLogger(__name__).warning("%s", message, exc_info=code is None)
         state.startup_scenario_notice = {
             "path": project_path,
             "code": code if isinstance(code, str) else "startup_scenario_load_failed",
             "message": message,
         }
+
+
+class _StartupLoadFailed(RuntimeError):
+    """The startup Load's ApplyResult ended `failed`; carries its error."""
+
+    def __init__(self, error: dict) -> None:
+        super().__init__(error.get("message", ""))
+        self.detail = error
 
 
 def main() -> None:

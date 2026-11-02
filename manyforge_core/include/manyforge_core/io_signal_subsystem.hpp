@@ -79,7 +79,16 @@ class IoSignalSubsystem final : public IIoSignalService {
   Result<void> EvaluateRules() override;
   Result<std::optional<TimePoint>> NextRuleExpiry() const override;
 
+  Result<void> ClearOutsideChange(const IoSignalId& output) override;
+  Result<void> ClearComponentOutsideChanges(const ControllableComponentId& component) override;
   Result<IoSignalObservationDTO> ReadSignal(const IoSignalId& signal) const override;
+  /// Every mutation above raises the event-stream change signal when a
+  /// signal's value, source or freshness changed (never for age alone). A
+  /// fresh sample turns stale with no mutation: the host calls
+  /// `RefreshSamples` at `NextSampleExpiry` (the earliest such moment; empty
+  /// when no age-checked signal is fresh).
+  [[nodiscard]] std::optional<TimePoint> NextSampleExpiry() const;
+  void RefreshSamples();
   Result<IoWatchRegistrationDTO> RegisterLevelWatch(const IoLevelWatchRequestDTO& request) override;
   Result<IoWatchResultDTO> ReadWatch(const IoWatchRegistrationDTO& registration) const override;
   Result<void> ReleaseWatch(const IoWatchRegistrationDTO& registration) override;

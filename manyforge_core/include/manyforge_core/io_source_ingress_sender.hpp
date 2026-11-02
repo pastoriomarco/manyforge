@@ -16,6 +16,7 @@
 
 #include <atomic>
 #include <limits>
+#include <manyforge_core/component_stream_health.hpp>
 #include <manyforge_core/ports/iio_signal_ingress.hpp>
 #include <memory>
 #include <mutex>
@@ -66,6 +67,9 @@ class IoSourceIngressSender final {
 
   void Receive(std::vector<IoSignalUpdateDTO> updates, IoSourceIngressAcquisitionReceipt receipt) {
     std::lock_guard lock(mutex_);
+    // IO-1: every message is an arrival on the device's `inputs` stream,
+    // also while its delivery is paused.
+    if (arrivals_) arrivals_->RecordArrival();
     if (!accepting_ || receipt.driver_observation_generation != driver_generation_.load() ||
         receipt.callback_incarnation != incarnation_)
       return;
@@ -103,6 +107,12 @@ class IoSourceIngressSender final {
       return false;
     Lose(IoIngressLossReason::kDisconnected, clock_.now());
     return true;
+  }
+
+  /// IO-1: the device's `inputs` stream (absent: none declared).
+  void SetArrivalRecorder(std::shared_ptr<StreamRecorder> arrivals) {
+    std::lock_guard lock(mutex_);
+    arrivals_ = std::move(arrivals);
   }
 
   /// Rebind delivery of the same actual retained driver under the existing
@@ -209,6 +219,7 @@ class IoSourceIngressSender final {
   std::uint64_t ingress_sequence_ = 0;
   std::uint64_t enqueued_sequence_ = 0;
   std::optional<IoIngressLossReason> last_loss_;
+  std::shared_ptr<StreamRecorder> arrivals_;
 };
 
 }  // namespace manyforge::core

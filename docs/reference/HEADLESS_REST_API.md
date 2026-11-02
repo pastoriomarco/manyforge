@@ -3,13 +3,13 @@
   Regenerate with:
     cd <repository-root>
     python3 scripts/regen-public-contracts.py headless-rest
-  Last regenerated: 2026-10-28 20:23:00 UTC
+  Last regenerated: 2026-11-02 14:57:37 UTC
   Generator source: scripts/regen-public-contracts.py:gen_headless_rest_api
 -->
 
 # Headless Runtime REST API
 
-This is the independent headless projection over Manager, logical-scene, scene-runtime, Alarm Lifecycle, Historian, and the selected addressed execution owner and independent Program runner. Reads return owner-issued facts. Alarm acknowledgement, Manager and Program Apply, execution submission, no-motion preview, Program Run, explicit Program Stop, and confirmed CCLC lifecycle/route requests are attributed intents. Generic `/api/control/state` and `/api/control/commands` provide the freshness-aware REST form of the same transport-neutral control ingress used by `/ws/control`; no command is automatically replayed. The API never owns or reduces execution, Program-run, lifecycle, or controller-route state. Preview cannot dispatch, and approval uses the ordinary operation endpoint. An unconfigured or lost Program runner makes Program-owned routes unavailable and is never interpreted as idle; independently owned native operation and Stop routes remain available when their owner is configured. No condition mutation endpoint exists. `/api/health` reports only `headless_projection_ready`; robot readiness has no H0 owner and is explicitly unavailable. The alarm page defaults to 32 records and is bounded at 128, history defaults to and is bounded at 32 records, ordinary request bodies are bounded at 1 MiB, Program Apply at 17 MiB, model-attempt audit at 256 KiB, native/HTTP responses at 64 MiB, and private Program-runner responses at 32 MiB. Program diagnostic captures are separately limited to 64 KiB and asynchronously written by the existing Historian. Their producer-clock values, omissions and delivery losses are available through History/debug export and recorder health, not the high-rate control/viewer stream. Skill expansion is effect-free, selects one exact installed NodeEnvironment and requires ordinary Program/Binding validation before any subsequent execution.
+This is the independent headless projection over Manager, logical-scene, scene-runtime, Alarm Lifecycle, Historian, and the selected addressed execution owner and independent Program runner. Reads return owner-issued facts. Alarm acknowledgement, Manager and Program Apply, execution submission, no-motion preview, Program Run, explicit Program Stop, and component actions are attributed intents. Generic `/api/control/state` and `/api/control/commands` provide the freshness-aware REST form of the same transport-neutral control ingress used by `/ws/control`; no command is automatically replayed. The API never owns or reduces execution, Program-run, lifecycle, or controller-route state. Preview cannot dispatch, and approval uses the ordinary operation endpoint. An unconfigured or lost Program runner makes Program-owned routes unavailable and is never interpreted as idle; independently owned native operation and Stop routes remain available when their owner is configured. No condition mutation endpoint exists. `/api/health` reports only `headless_projection_ready`; robot readiness has no H0 owner and is explicitly unavailable. The alarm page defaults to 32 records and is bounded at 128, history defaults to and is bounded at 32 records, ordinary request bodies are bounded at 1 MiB, Program Apply at 17 MiB, model-attempt audit at 256 KiB, native/HTTP responses at 64 MiB, and private Program-runner responses at 32 MiB. Program diagnostic captures are separately limited to 64 KiB and asynchronously written by the existing Historian. Their producer-clock values, omissions and delivery losses are available through History/debug export and recorder health, not the high-rate control/viewer stream. Skill expansion is effect-free, selects one exact installed NodeEnvironment and requires ordinary Program/Binding validation before any subsequent execution.
 
 The live schema is available at `/openapi.json` and `/docs` while the API process is running.
 
@@ -23,25 +23,11 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `GET` | `/api/assistant/modes` |  | Assistant Modes |
 | `GET` | `/api/assistant/modes/{mode_id}` |  | Assistant Mode |
 | `GET` | `/api/assistant/modes/{mode_id}/context` |  | Assistant Mode Context |
-| `GET` | `/api/cclc/components/{component_id}` |  | Cclc Component Snapshot |
-| `GET` | `/api/cclc/components/{component_id}/lifecycle-snapshot` |  | Cclc Component Lifecycle Snapshot |
-| `POST` | `/api/cclc/components/{component_id}/process/stop` |  | Stop Component Process |
-| `GET` | `/api/cclc/components/{component_id}/process/stop-offer` |  | Component Process Stop Offer |
-| `POST` | `/api/cclc/components/{component_id}/process/stop/result` |  | Component Process Stop Result |
-| `GET` | `/api/cclc/components/{component_id}/route-templates` |  | Cclc Route Templates |
-| `POST` | `/api/cclc/lifecycle/requests` |  | Cclc Lifecycle Submit |
-| `POST` | `/api/cclc/lifecycle/requests/result` |  | Cclc Lifecycle Request Result |
-| `GET` | `/api/cclc/lifecycle/transactions/{transaction_id}` |  | Cclc Lifecycle Status |
-| `GET` | `/api/cclc/owner` |  | Cclc Owner Identity |
-| `POST` | `/api/cclc/routes/requests` |  | Cclc Route Submit |
-| `POST` | `/api/cclc/routes/requests/result` |  | Cclc Route Request Result |
-| `GET` | `/api/cclc/routes/transactions/{transaction_id}` |  | Cclc Route Status |
-| `POST` | `/api/cclc/targets/retire` |  | Retire Lifecycle Targets |
-| `POST` | `/api/cclc/targets/retire/result` |  | Lifecycle Target Retirement Result |
-| `GET` | `/api/cclc/targets/retirement-offer` |  | Lifecycle Target Retirement Offer |
-| `POST` | `/api/cclc/targets/settlement` |  | Lifecycle Owner Settlement |
 | `GET` | `/api/cell/authoring-admission` |  | Authoring Admission |
-| `GET` | `/api/component-overview` |  | Component Overview |
+| `GET` | `/api/cell/latch` |  | Cell Latch |
+| `GET` | `/api/components` |  | Components |
+| `POST` | `/api/components/actions` |  | Component Group Action |
+| `POST` | `/api/components/{component_id}/actions` |  | Component Action |
 | `POST` | `/api/control/commands` |  | Execution Control Command |
 | `GET` | `/api/control/diagnostics` |  | Execution Control Diagnostics |
 | `GET` | `/api/control/state` |  | Execution Control Projection |
@@ -54,13 +40,11 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `GET` | `/api/execution/alarms/metrics` |  | Alarm Metrics |
 | `POST` | `/api/execution/alarms/{condition_id}/acknowledge` |  | Acknowledge Alarm |
 | `POST` | `/api/execution/capability-command-previews` |  | Execution Preview Capability Command |
-| `POST` | `/api/execution/cell-recover` |  | Execution Cell Recover |
-| `POST` | `/api/execution/cell-recover/abort` |  | Execution Cell Recover Abort |
 | `GET` | `/api/execution/control-state` |  | Execution Control State |
 | `GET` | `/api/execution/diagnostics` |  | Execution Diagnostics |
-| `POST` | `/api/execution/force-close` |  | Execution Force Close |
 | `POST` | `/api/execution/full-stop` |  | Execution Full Stop |
 | `GET` | `/api/execution/history` |  | History |
+| `POST` | `/api/execution/history/apply-outcomes` |  | History Apply Outcome |
 | `GET` | `/api/execution/history/captures` |  | History Captures |
 | `GET` | `/api/execution/history/discovery` |  | History Discovery |
 | `GET` | `/api/execution/history/export` |  | History Export |
@@ -81,15 +65,15 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `GET` | `/api/execution/program-runs/{program_run_id}/admitted-speeds` |  | Program Run Admitted Speeds |
 | `GET` | `/api/execution/runtime-scale-control` |  | Execution Get Runtime Scale Control |
 | `POST` | `/api/execution/runtime-scale-control` |  | Execution Set Runtime Scale Control |
-| `GET` | `/api/execution/stop-fault` |  | Execution Stop Fault |
-| `POST` | `/api/execution/stop-fault/recover` |  | Execution Recover Stop Fault |
 | `POST` | `/api/execution/stops` |  | Execution Stop |
 | `GET` | `/api/execution/targets` |  | Execution Targets |
 | `GET` | `/api/health` |  | Health |
+| `GET` | `/api/io` |  | Io Signals |
+| `POST` | `/api/io/{signal_id}/set` |  | Set Io Output |
 | `POST` | `/api/manager/apply` |  | Manager Apply |
 | `POST` | `/api/manager/apply/acknowledge` |  | Manager Apply Acknowledge |
+| `POST` | `/api/manager/apply/release-for-new` |  | Manager Apply Release For New |
 | `GET` | `/api/manager/apply/status` |  | Manager Apply Status |
-| `GET` | `/api/manager/canonical-empty-selection` |  | Canonical Empty Selection |
 | `POST` | `/api/manager/deployment-candidates/preview` |  | Manager Deployment Candidate Preview |
 | `GET` | `/api/manager/diff` |  | Manager Diff |
 | `GET` | `/api/manager/graph` |  | Manager Graph |
@@ -110,6 +94,7 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `POST` | `/api/program/persistent-values` |  | Set Program Persistent Value |
 | `POST` | `/api/program/persistent-values/clear` |  | Clear Program Persistent Values |
 | `POST` | `/api/program/persistent-values/reset` |  | Reset Program Persistent Value |
+| `GET` | `/api/program/readiness` |  | Program Readiness |
 | `GET` | `/api/program/runs` |  | Program Runs |
 | `POST` | `/api/program/runs` |  | Program Run Start |
 | `GET` | `/api/program/runs/{program_run_id}` |  | Program Run Read |
@@ -139,22 +124,6 @@ OpenAPI version: `3.1.0`. Title: `ManyForge Headless Runtime API`.
 | `GET` | `/api/viewer-model/urdf` |  | Viewer Model Urdf |
 
 ## Route notes
-
-### `POST /api/activation-preparations`
-
-With `origin.kind: sealed_canonical_empty` this prepares Scenario Close. Close is a sequence the caller runs in order: Reset the Program cycle; detach every carried object (`POST /api/scene/transactions`, `detach_carried_object_at_current_pose`); disable each component and stop its processes; then prepare, preview and apply this canonical-empty configuration (`scene_initialization: preserve`). Only then New or Load. The Apply keeps the Scene, so this preparation is refused with 409 `scenario_close_attachment_present` while any carried object remains: `details.carried_objects` names each `scene_resource_id` with its carrier (`controllable_component_id`, `command_target_id`). Nothing is prepared; detach, then prepare again. Only the first preparation after a Force close step `close_operations`, before its step `end`, keeps an attachment (a part whose detach was refused because the robot's process is already gone). The Composer Close runs this sequence.
-
-### `POST /api/execution/cell-recover`
-
-Recover cell, one server-side composite. Send `request_context` with `request_id`, `source_label` and an optional `correlation_id`; every fence is read from the current owners. An optional `expected_incident_ids` lists the open incident IDs the operator was shown: an open incident not listed refuses the press `cclc_incident_changed` before any step (its details name it), each acknowledgement is pinned to the incident read (one closed meanwhile, with nothing else open, is an ordinary Recover), and the press's later Recovers acknowledge none (an incident opened meanwhile refuses them `cclc_incident_open`); absent, every open incident is acknowledged. It acknowledges open component incidents, attempts the current cell Stop-fault latch recovery, and submits Recover for components whose previously recovered cause was still reported at the press and remains so. It then tries to enable again each component whose Active target an incident retired, until Active is restored or another target replaces it (CCLC's `active_target_retired_by_incident`; a component with an open incident but no such retirement is only acknowledged) (Recover, Prepare, Enable; `component_rearm_*` reasons, for example the emergency stop still engaged), listing it in `recovered_components` on success. Each step waits within that component's own lifecycle allowance (the timeout CCLC accepted it with), so a press may outlast one HTTP call: send the same `request_id` again to wait for its result. A robot moved from its own interface on an idle cell is re-armed here too (Recover; the driver re-drives Prepare and Enable), although a motion command no longer needs it: its vendor adapter re-engages the robot at rest before the trajectory. A robot still moving is refused `component_rearm_required` here. A refused recovery still returns a JSON result: read `outcome` (`done` or `not_recovered`), `reason.code`, `acknowledged_incidents`, `latch_cleared` and `recovered_components` rather than treating HTTP success as recovery. Example reason codes (not exhaustive): `stop_fault_recovery_unavailable`, `stop_fault_recovery_closing` (Scenario Close keeps the latch; the latch recovery was refused, but incident acknowledgements earlier in the same press may already have happened), `stop_fault_latch_replaced`, `cclc_incident_changed`, `cell_state_unavailable`, `stale_request_owner_epoch` (CCLC restarted during the press; the refused step had no effect, earlier ones are listed; press again), `cell_recover_in_progress` and `cell_recover_outcome_unknown` (a step may have reached its owner: inspect and reconcile, do not assume nothing happened). `done` does not prove that every robot is ready to move. Repeating a `request_id` returns the stored result, or `cell_recover_in_progress`, without reading state again; this replay is in memory per Headless process, bounded, and lost on restart or eviction. A resend with `replay_only: true` never starts a press: an unknown `request_id` (Headless restarted or the result was evicted) returns `cell_recover_outcome_unknown` with `details.replay` `request_id_unknown`. Use a new `request_id` for each new press. While a press runs, Scenario Close's lifecycle target retirement is refused `recover_cell_in_progress`; wait for the press or abort it (`POST /api/execution/cell-recover/abort`).
-
-### `POST /api/execution/cell-recover/abort`
-
-Abort the running Recover cell press, the operator's voluntary action. Send only `request_context` with `request_id`, `source_label` and an optional `correlation_id`. No later step of the press starts; the step in flight is not cancelled but settles within its own limit. The press then ends `not_recovered` with reason `cell_recover_aborted` (read it with its own `request_id`): its details name the step it stopped before (`before_step`), the re-enable steps done per component (`reenable_steps`, `component:recover+prepare;...`) and the components not enabled again (`not_reenabled`), next to `acknowledged_incidents`, `latch_cleared` and `recovered_components` (`before_step` `none` when the step in flight was the last and succeeded). If that step fails, its own reason is reported, with `details.aborted` `true` and the same lists. Abort is checked right before each owner write, so a read in progress sends nothing after it. Scenario Close is allowed again once the press has ended. With no press running the abort is refused `cell_recover_not_running`.
-
-### `POST /api/execution/force-close`
-
-Force close, the operator's explicit action after a Close refused for an uncertain outcome. The caller runs it in order. Step `stop` sends a cell Full Stop (`request_context` names the execution owner epoch; `expected_stop_generation` is `cell_stop_action.expected_stop_generation`) and waits briefly until the Kernel confirms it: its certificate is the newest and succeeded. Otherwise it is refused with 409 `scenario_force_close_stop_unconfirmed` (`details.reason`: `stop_pending`, `stop_superseded`, `stop_not_contained`) and the caller does nothing more. Then the caller retires the lifecycle targets (now admitted with resident operations). Step `close_operations` then moves every resident operation into history marked `cell_force_closed_by_operator`, frees its resources, clears the cell-wide motion block an unresolved operation closure left (`motion_block_cleared`; motion still needs Prepare and Enable), and records one History row (`scenario_force_closed`) naming the operations and outputs left in an unknown state. It is refused `scenario_force_close_not_closing` before the retirement and `scenario_force_close_operation_busy` while an operation is being updated (retry); a pending I/O-rule Stop response is not waited for. Orphan resources from an earlier restart are freed and their operations recorded settled, which ends that motion block too. Then the caller runs the ordinary Reset and detach while the component processes still run (a part whose detach is refused, such as when the robot's process is already gone, stays attached; the next empty preparation then skips the attachment check), disables each component where possible, stops its processes, and runs the canonical-empty Apply. On every exit, success or failure, the caller sends step `end`, which ends that attachment exception. Force close never commands an output: an output's physical state stays unknown. The cell Stop fault is kept.
 
 ### `GET /api/source-model`
 

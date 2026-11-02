@@ -102,7 +102,7 @@ def test_ready_baseline_then_later_rows_overlay_and_earlier_rows_do_not() -> Non
     model = GlobalRuleStatusModel()
     model.observe(
         _OWNER, _catalog(["door", "light"]), _ready({"door": "clear", "light": "clear"}, 10),
-        [_row(9, "door", "latched"), _row(11, "light", "tripped")],
+        [_row(9, "door", "inactive"), _row(11, "light", "tripped")],
     )
     assert model.rows() == [
         {"rule_id": "door", "state": "clear", "keys": []},
@@ -111,9 +111,9 @@ def test_ready_baseline_then_later_rows_overlay_and_earlier_rows_do_not() -> Non
     # Pending keeps the qualified cut and keeps following its rows.
     model.observe(
         _OWNER, _catalog(["door", "light"]), {"status": "projection_pending"},
-        [_row(12, "door", "latched")],
+        [_row(12, "door", "inactive")],
     )
-    assert _states(model) == {"door": "latched", "light": "tripped"}
+    assert _states(model) == {"door": "inactive", "light": "tripped"}
     # A newer ready cut supersedes rows at or before its boundary.
     model.observe(_OWNER, _catalog(["door", "light"]), _ready({"door": "clear", "light": "clear"}, 12), [])
     assert _states(model) == {"door": "clear", "light": "clear"}
@@ -129,10 +129,10 @@ def test_rows_read_before_the_baseline_still_count_after_it() -> None:
 
 def test_baseline_without_a_proving_catalog_or_null_is_pending() -> None:
     model = GlobalRuleStatusModel()
-    model.observe(_OWNER, _catalog(["door"]), _ready({"door": "latched"}, 1, catalog_generation="5"), [])
+    model.observe(_OWNER, _catalog(["door"]), _ready({"door": "inactive"}, 1, catalog_generation="5"), [])
     assert _states(model) == {"door": "pending"}
-    model.observe(_OWNER, _catalog(["door"]), _ready({"door": "latched"}, 1), [])
-    assert _states(model) == {"door": "latched"}
+    model.observe(_OWNER, _catalog(["door"]), _ready({"door": "inactive"}, 1), [])
+    assert _states(model) == {"door": "inactive"}
     model.observe(_OWNER, _catalog(["door"]), None, [])
     assert _states(model) == {"door": "pending"}
     # Pending without a qualified cut stays pending.
@@ -175,8 +175,8 @@ def test_malformed_wire_is_unknown_and_needs_a_cut_after_the_lost_rows() -> None
     assert model.rows() is None
     model.observe(_OWNER, _catalog(["door"]), _ready({"door": "clear"}, 6), [])
     assert _states(model) == {"door": "pending"}
-    model.observe(_OWNER, _catalog(["door"]), _ready({"door": "latched"}, 7), [])
-    assert _states(model) == {"door": "latched"}
+    model.observe(_OWNER, _catalog(["door"]), _ready({"door": "inactive"}, 7), [])
+    assert _states(model) == {"door": "inactive"}
 
 
 def test_another_owner_is_a_wire_error() -> None:
@@ -189,7 +189,7 @@ def test_another_owner_is_a_wire_error() -> None:
 def test_pending_invalidates_only_notify_until_ready() -> None:
     model = GlobalRuleStatusModel()
     catalog = _catalog(["door", "light"], notify_rule_ids=["door"])
-    model.observe(_OWNER, catalog, _ready({"door": "tripped", "light": "latched"}, 0), [])
+    model.observe(_OWNER, catalog, _ready({"door": "tripped", "light": "inactive"}, 0), [])
     model.observe(_OWNER, catalog, {"status": "projection_pending"},
                   [_row(1, "door", "tripped"), _row(2, "light", "clear")])
     assert _states(model) == {"door": "pending", "light": "clear"}
@@ -237,3 +237,15 @@ def test_unknown_event_reason_is_shown_and_removed_on_fresh_recovery() -> None:
 
     model.observe(_OWNER, catalog, baseline, [_row(3, "door", "clear")])
     assert model.rows() == [{"rule_id": "door", "state": "clear", "keys": []}]
+
+
+def test_rule_states_are_the_contract_states_and_latched_is_gone() -> None:
+    from manyforge_headless_api.global_rule_status import (
+        RULE_STATES,
+        InterruptStateWireError,
+        parse_baseline,
+    )
+
+    assert RULE_STATES == {"inactive", "clear", "tripped", "unknown"}
+    with pytest.raises(InterruptStateWireError):
+        parse_baseline(_ready({"door": "latched"}, 0))

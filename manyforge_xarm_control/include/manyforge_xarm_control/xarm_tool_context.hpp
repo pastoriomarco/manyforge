@@ -25,7 +25,7 @@
 
 #include <manyforge_core/types/error_code.hpp>
 #include <manyforge_core/types/tool_context.hpp>
-#include <manyforge_xarm_control/xarm_driver_services.hpp>
+#include <manyforge_xarm_control/contract.hpp>
 
 namespace manyforge::xarm_control {
 

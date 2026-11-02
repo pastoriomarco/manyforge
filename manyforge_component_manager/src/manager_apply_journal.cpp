@@ -8,9 +8,9 @@
 #include <manyforge_persistence/sqlite_read_only_preflight.hpp>
 #include <manyforge_core/admission_timing_diagnostic.hpp>
 #include <manyforge_core/runtime_contract_manifest_codec.hpp>
-#include <manyforge_core/component_lifecycle_value_codec.hpp>
 
 #include "embedded_manager_apply_journal_schema.hpp"
+#include "kernel_apply_fence_rpc_internal.hpp"
 #include <manyforge_component_manager/kernel_cell_admission_rpc_internal.hpp>
 #include "sqlite_store_startup_internal.hpp"
 
@@ -124,7 +124,7 @@ constexpr std::string_view kTerminalOutcomeDigestDomain =
     "manyforge.component-manager-terminal-outcome.ua4.v4";
 constexpr int kBusyTimeoutMilliseconds = 10000;
 constexpr std::int64_t kWalCheckpointTargetBytes = 16LL * 1024LL * 1024LL;
-constexpr std::int64_t kExpectedSchemaObjectCardinality = 45;
+constexpr std::int64_t kExpectedSchemaObjectCardinality = 27;
 
 [[noreturn]] void ThrowSqlite(sqlite3 *database, const int result,
                               const std::string_view context) {
@@ -913,7 +913,7 @@ std::string EncodeDomains(const ConfigurationFenceScopeDTO &scope) {
                 core::ProviderConfigurationFenceDomainDTO>(domain.payload);
           }))
     return "MF-PROVIDER-FENCE-DOMAINS-V1:" +
-           core::detail::EncodeConfigurationFenceScopeRecord(scope);
+           detail::EncodeConfigurationFenceScopeRecord(scope);
   const auto &domains = scope.domains;
   std::vector<std::string> tokens;
   tokens.reserve(domains.size() * 5U);
@@ -974,34 +974,6 @@ std::string EncodeActiveConfigurations(
   return EncodeTokens(tokens);
 }
 
-std::string EncodeExpectedConfigurations(
-    const std::vector<DomainActiveControlConfigurationDTO> &configurations,
-    const std::vector<core::ProviderConfigurationFenceLineageDTO> &lineages) {
-  if (lineages.empty())
-    return EncodeActiveConfigurations(configurations);
-  if (lineages.size() > kMaximumManagerApplyFenceDomains)
-    throw ManagerApplyJournalLimitError(
-        "provider lineage count exceeds the qualified bound");
-  std::vector<std::string> tokens;
-  tokens.reserve(lineages.size() * 3U);
-  for (const auto &lineage : lineages) {
-    if (!lineage.valid())
-      throw std::invalid_argument("provider lineage is invalid");
-    ValidateBoundedIdentity(lineage.control_domain_id.value(),
-                            "provider_lineage_domain");
-    ValidateBoundedIdentity(lineage.provider_runtime_epoch.value(),
-                            "provider_lineage_epoch");
-    tokens.push_back(lineage.control_domain_id.value());
-    tokens.push_back(lineage.provider_runtime_epoch.value());
-    tokens.push_back(std::to_string(
-        CheckedSigned(lineage.component_lifecycle_generation.value(),
-                      "provider_lineage_generation")));
-  }
-  return "MF-PROVIDER-CONFIGURATION-LINEAGES-V1:" +
-         EncodeTokens({EncodeActiveConfigurations(configurations),
-                       EncodeTokens(tokens)});
-}
-
 template <typename Revision>
 [[nodiscard]] std::optional<Revision> DecodeOptionalRevision(
     const std::vector<std::string> &tokens, const std::size_t presence_index,
@@ -1028,7 +1000,7 @@ ConfigurationFenceScopeDTO DecodeScope(const std::string &components_encoding,
                                        const std::string &resources_encoding) {
   constexpr std::string_view provider_prefix = "MF-PROVIDER-FENCE-DOMAINS-V1:";
   if (domains_encoding.starts_with(provider_prefix)) {
-    auto scope = core::detail::DecodeConfigurationFenceScopeRecord(
+    auto scope = detail::DecodeConfigurationFenceScopeRecord(
         std::string_view(domains_encoding).substr(provider_prefix.size()));
     if (scope.controllable_component_ids.size() >
             kMaximumManagerApplyFenceComponents ||
@@ -1130,42 +1102,6 @@ DecodeActiveConfigurations(const std::string &encoding) {
         ActiveControlConfigurationId(tokens[index + 1U]),
         ActiveControlConfigurationGeneration(generation),
     });
-  }
-  return result;
-}
-
-struct DecodedExpectedConfigurations final {
-  std::vector<DomainActiveControlConfigurationDTO> configurations;
-  std::vector<core::ProviderConfigurationFenceLineageDTO> lineages;
-};
-DecodedExpectedConfigurations
-DecodeExpectedConfigurations(const std::string &encoding) {
-  constexpr std::string_view prefix = "MF-PROVIDER-CONFIGURATION-LINEAGES-V1:";
-  if (!encoding.starts_with(prefix))
-    return {DecodeActiveConfigurations(encoding), {}};
-  const auto fields = DecodeTokens(encoding.substr(prefix.size()), 2U,
-                                   "provider configuration facts");
-  if (fields.size() != 2U)
-    throw ManagerApplyJournalIntegrityError(
-        "provider configuration facts are malformed");
-  DecodedExpectedConfigurations result{DecodeActiveConfigurations(fields[0]),
-                                       {}};
-  const auto tokens = DecodeTokens(
-      fields[1], kMaximumManagerApplyFenceDomains * 3U, "provider lineages");
-  if (tokens.empty() || tokens.size() % 3U != 0U)
-    throw ManagerApplyJournalIntegrityError(
-        "provider lineage tuple cardinality is invalid");
-  for (std::size_t i = 0U; i < tokens.size(); i += 3U) {
-    const auto generation =
-        ParseCanonicalUnsigned(tokens[i + 2U], "provider lineage generation");
-    if (generation == 0U ||
-        generation > static_cast<std::uint64_t>(
-                         std::numeric_limits<std::int64_t>::max()))
-      throw ManagerApplyJournalIntegrityError(
-          "provider lineage generation is invalid");
-    result.lineages.push_back({ControlDomainId(tokens[i]),
-                               RuntimeEpoch(tokens[i + 1U]),
-                               core::ComponentLifecycleGeneration(generation)});
   }
   return result;
 }
@@ -1650,8 +1586,7 @@ bool SameFenceIntent(const ApplyConfigurationFenceIntentDTO &lhs,
          lhs.expected_fence_generation == rhs.expected_fence_generation &&
          lhs.expected_active_control_configurations ==
              rhs.expected_active_control_configurations &&
-         lhs.reason == rhs.reason &&
-         lhs.expected_provider_lineages == rhs.expected_provider_lineages;
+         lhs.reason == rhs.reason;
 }
 
 struct EncodedAffectedScope final {
@@ -1781,9 +1716,7 @@ EncodeFenceAttempt(const ContentDigest &intent_digest,
       EncodeDomains(intent.scope),
       EncodeBindings(intent.scope.bindings),
       EncodeResources(intent.scope.resources),
-      EncodeExpectedConfigurations(
-          intent.expected_active_control_configurations,
-          intent.expected_provider_lineages),
+      EncodeActiveConfigurations(intent.expected_active_control_configurations),
       {},
   };
   std::string record;
@@ -2400,331 +2333,6 @@ EncodePublicationReceipt(const ManagerApplyPublicationReceiptDTO &publication) {
   return encoded;
 }
 
-const char *BringUpPhaseName(ManagerApplyBringUpChildPhase phase) {
-  switch (phase) {
-  case ManagerApplyBringUpChildPhase::kAccepted:
-    return "accepted";
-  case ManagerApplyBringUpChildPhase::kHolding:
-    return "holding";
-  case ManagerApplyBringUpChildPhase::kTerminal:
-    return "terminal";
-  }
-  throw std::invalid_argument("unknown configured bring-up child phase");
-}
-
-ManagerApplyBringUpChildPhase ParseBringUpPhase(std::string_view phase) {
-  if (phase == "accepted")
-    return ManagerApplyBringUpChildPhase::kAccepted;
-  if (phase == "holding")
-    return ManagerApplyBringUpChildPhase::kHolding;
-  if (phase == "terminal")
-    return ManagerApplyBringUpChildPhase::kTerminal;
-  throw ManagerApplyJournalIntegrityError(
-      "unknown stored bring-up child phase");
-}
-
-std::string EncodeBringUpProjection(const ProjectionRevisionDTO &revision) {
-  return EncodeTokens(
-      {revision.retained_bundle_id.value(), revision.graph_revision.value(),
-       revision.scene_revision.scene_id.value(),
-       std::to_string(CheckedSigned(revision.scene_revision.revision_id,
-                                    "scene_revision")),
-       revision.scene_revision.content_hash.value()});
-}
-
-ProjectionRevisionDTO DecodeBringUpProjection(std::string_view bytes) {
-  const auto fields = DecodeTokens(bytes, 5U, "bring-up projection");
-  if (fields.size() != 5U) {
-    throw ManagerApplyJournalIntegrityError("stored bring-up projection shape");
-  }
-  return {RetainedBundleId(fields[0]),
-          GraphRevision(fields[1]),
-          {SceneId(fields[2]),
-           ParseCanonicalSqliteUnsigned(fields[3], "scene_revision", true),
-           ContentDigest(fields[4])}};
-}
-
-std::string
-EncodeBringUpChild(const ManagerApplyBringUpChildRequestDTO &child) {
-  if (!child.valid())
-    throw std::invalid_argument("invalid bring-up child request");
-  return EncodeTokens(
-      {core::EncodeComponentLifecycleIntent(child.intent),
-       EncodeBringUpProjection(child.candidate_projection_revision),
-       child.candidate_retained_bundle_digest.value(),
-       std::to_string(CheckedSigned(child.candidate_retained_bundle_bytes,
-                                    "candidate_bundle_bytes")),
-       child.runtime_unit_id.value(), child.runtime_epoch.value(),
-       child.manager_runtime_epoch.value()});
-}
-
-ManagerApplyBringUpChildRequestDTO DecodeBringUpChild(std::string_view bytes) {
-  const auto fields = DecodeTokens(bytes, 7U, "bring-up child");
-  if (fields.size() != 7U) {
-    throw ManagerApplyJournalIntegrityError("stored bring-up child shape");
-  }
-  return {
-      core::DecodeComponentLifecycleIntent(fields[0]),
-      DecodeBringUpProjection(fields[1]),
-      ContentDigest(fields[2]),
-      ParseCanonicalSqliteUnsigned(fields[3], "candidate_bundle_bytes", true),
-      RuntimeUnitId(fields[4]),
-      RuntimeEpoch(fields[5]),
-      RuntimeEpoch(fields[6])};
-}
-
-std::string EncodeBringUpPlan(const ManagerApplyBringUpPlanDTO &plan) {
-  if (!plan.valid())
-    throw std::invalid_argument("invalid configured bring-up plan");
-  std::vector<std::string> children;
-  for (const auto &child : plan.children)
-    children.push_back(EncodeBringUpChild(child));
-  const auto &publication = plan.expected_publication;
-  const auto &owner = std::get<NamedApplyPublicationTransactionDTO>(
-      publication.transaction_ref);
-  return EncodeTokens(
-      {plan.apply_id.value(),
-       std::to_string(
-           CheckedSigned(plan.apply_generation.value(), "apply_generation")),
-       plan.parent_intent_digest.value(),
-       EncodeComponents(plan.configured_components), EncodeTokens(children),
-       EncodeTokens(
-           {owner.apply_id.value(),
-            std::to_string(CheckedSigned(owner.apply_generation.value(),
-                                         "apply_generation")),
-            EncodeBringUpProjection(publication.candidate_projection_revision),
-            std::to_string(CheckedSigned(
-                publication.expected_previous_publication_generation->value(),
-                "previous_publication_generation")),
-            publication.private_materialization_content_digest.value()}),
-       plan.predecessor_public_pointer_digest.value()});
-}
-
-ManagerApplyBringUpPlanDTO DecodeBringUpPlan(std::string_view bytes) {
-  const auto fields = DecodeTokens(bytes, 7U, "bring-up plan");
-  if (fields.size() != 7U)
-    throw ManagerApplyJournalIntegrityError("stored bring-up plan shape");
-  const auto components = DecodeTokens(
-      fields[3], kMaximumManagerApplyFenceComponents, "configured components");
-  std::vector<ControllableComponentId> configured;
-  for (const auto &component : components)
-    configured.emplace_back(component);
-  const auto child_values = DecodeTokens(
-      fields[4], kMaximumManagerApplyFenceComponents, "bring-up children");
-  std::vector<ManagerApplyBringUpChildRequestDTO> children;
-  for (const auto &child : child_values)
-    children.push_back(DecodeBringUpChild(child));
-  const auto publication = DecodeTokens(fields[5], 5U, "bring-up publication");
-  if (publication.size() != 5U)
-    throw ManagerApplyJournalIntegrityError(
-        "stored bring-up publication shape");
-  auto candidate = DecodeBringUpProjection(publication[2]);
-  return {ApplyId(fields[0]),
-          ApplyGeneration(ParseCanonicalSqliteUnsigned(
-              fields[1], "apply_generation", true)),
-          ContentDigest(fields[2]),
-          std::move(configured),
-          std::move(children),
-          {NamedApplyPublicationTransactionDTO{
-               ApplyId(publication[0]),
-               ApplyGeneration(ParseCanonicalSqliteUnsigned(
-                   publication[1], "apply_generation", true))},
-           candidate, candidate.retained_bundle_id, candidate.graph_revision,
-           ActiveBundlePublicationGeneration(ParseCanonicalSqliteUnsigned(
-               publication[3], "previous_publication_generation", true)),
-           ContentDigest(publication[4])},
-          ContentDigest(fields[6])};
-}
-
-std::string BringUpPlanDigest(std::string_view encoding) {
-  std::string record;
-  AppendField(record, "domain",
-              "manyforge.component-manager-apply-bring-up-plan.v1");
-  AppendField(record, "plan", encoding);
-  return RawDigest(record);
-}
-
-std::string BringUpProofDigest(const ManagerApplyBringUpChildProofDTO &proof,
-                               std::string_view result_encoding) {
-  std::string record;
-  AppendField(record, "domain",
-              "manyforge.component-manager-apply-bring-up-child-proof.v1");
-  AppendField(record, "apply_id", proof.apply_id.value());
-  AppendField(record, "apply_generation",
-              std::to_string(CheckedSigned(proof.apply_generation.value(),
-                                           "apply_generation")));
-  AppendField(record, "plan_digest", proof.plan_digest.value());
-  AppendField(record, "component_id", proof.controllable_component_id.value());
-  AppendField(record, "phase", BringUpPhaseName(proof.phase));
-  AppendField(record, "result", result_encoding);
-  return RawDigest(record);
-}
-
-bool BringUpProofSucceeded(const ManagerApplyBringUpChildProofDTO &proof) {
-  return proof.phase == ManagerApplyBringUpChildPhase::kTerminal &&
-         proof.result.status.has_value() &&
-         proof.result.status->phase ==
-             core::ComponentLifecycleTransactionPhaseDTO::kSucceeded &&
-         proof.result.status->terminal_result ==
-             core::ComponentLifecycleTerminalResultDTO::kSucceeded &&
-         !proof.result.status->reconciliation_required &&
-         !proof.result.status->error.has_value();
-}
-
-void ValidateBringUpProof(
-    const ManagerApplyBringUpPlanDTO &plan, const ContentDigest &plan_digest,
-    const ManagerApplyBringUpChildProofDTO &proof,
-    const std::vector<PersistedManagerApplyBringUpChildProof> &previous) {
-  const auto child = std::find_if(
-      plan.children.begin(), plan.children.end(), [&](const auto &value) {
-        return value.intent.controllable_component_id ==
-               proof.controllable_component_id;
-      });
-  if (proof.apply_id != plan.apply_id ||
-      proof.apply_generation != plan.apply_generation ||
-      proof.plan_digest != plan_digest || child == plan.children.end() ||
-      !proof.result.locally_valid() ||
-      proof.result.incident_recovery.has_value()) {
-    throw ManagerApplyJournalIntegrityError(
-        "bring-up proof does not match its exact original child");
-  }
-  static_cast<void>(BringUpPhaseName(proof.phase));
-  if (!proof.result.acceptance.has_value()) {
-    if (proof.phase != ManagerApplyBringUpChildPhase::kAccepted ||
-        !proof.result.rejection.has_value() ||
-        proof.result.status.has_value()) {
-      throw ManagerApplyJournalIntegrityError(
-          "bring-up no-admission result is not an exact rejection");
-    }
-    return;
-  }
-  if (!proof.result.status.has_value()) {
-    throw ManagerApplyJournalIntegrityError(
-        "bring-up acceptance lacks its owner status");
-  }
-  const auto &status = *proof.result.status;
-  const auto &accepted = *proof.result.acceptance;
-  if (!status.locally_valid() || status.acceptance != accepted ||
-      !status.accepted_intent.replay_equal(child->intent) ||
-      status.selected_bring_up.has_value() ||
-      !status.apply_bring_up.has_value()) {
-    throw ManagerApplyJournalIntegrityError(
-        "bring-up owner status does not echo the original delegated request");
-  }
-  const auto &evidence = *status.apply_bring_up;
-  const auto &authority = evidence.parent_authority;
-  if (!authority.valid() || authority.parent.owner.apply_id != plan.apply_id ||
-      authority.parent.owner.apply_generation != plan.apply_generation ||
-      authority.parent.plan_digest != plan_digest ||
-      evidence.candidate_projection_revision !=
-          child->candidate_projection_revision ||
-      evidence.candidate_retained_bundle_digest !=
-          child->candidate_retained_bundle_digest ||
-      evidence.candidate_retained_bundle_bytes !=
-          child->candidate_retained_bundle_bytes ||
-      evidence.original_execution_host.runtime_unit_id !=
-          child->runtime_unit_id ||
-      evidence.original_execution_host.runtime_epoch != child->runtime_epoch ||
-      authority.held_fence_query.manager_runtime_epoch !=
-          child->manager_runtime_epoch ||
-      evidence.selected_scope.controllable_component_ids.size() != 1U ||
-      evidence.selected_scope.controllable_component_ids.front() !=
-          proof.controllable_component_id ||
-      evidence.original_request_payload_digest !=
-          core::ApplyDelegatedComponentLifecycleSemanticRequestDigest(
-              child->intent, child->candidate_projection_revision,
-              child->candidate_retained_bundle_digest,
-              child->candidate_retained_bundle_bytes, child->runtime_unit_id,
-              child->runtime_epoch, child->manager_runtime_epoch,
-              authority.parent)) {
-    throw ManagerApplyJournalIntegrityError(
-        "bring-up proof candidate, original epochs or parent authority "
-        "mismatch");
-  }
-  for (const auto &prior : previous) {
-    if (prior.proof.result.status.has_value() &&
-        prior.proof.result.status->apply_bring_up->parent_authority !=
-            authority) {
-      throw ManagerApplyJournalIntegrityError(
-          "bring-up children do not share one exact parent claim/fence");
-    }
-  }
-  if (proof.phase != ManagerApplyBringUpChildPhase::kAccepted) {
-    const auto initial =
-        std::find_if(previous.begin(), previous.end(), [&](const auto &value) {
-          return value.proof.controllable_component_id ==
-                     proof.controllable_component_id &&
-                 value.proof.phase == ManagerApplyBringUpChildPhase::kAccepted;
-        });
-    if (initial == previous.end() ||
-        !initial->proof.result.status.has_value() ||
-        initial->proof.result.status->acceptance != status.acceptance ||
-        initial->proof.result.status->apply_bring_up != status.apply_bring_up ||
-        status.status_sequence <
-            initial->proof.result.status->status_sequence) {
-      throw ManagerApplyJournalIntegrityError(
-          "bring-up child proof lacks its exact owner-minted acceptance");
-    }
-  }
-  if (proof.phase == ManagerApplyBringUpChildPhase::kHolding) {
-    if (status.status_owner_epoch != child->intent.request_context.request_owner_epoch ||
-        status.phase !=
-            core::ComponentLifecycleTransactionPhaseDTO::kVerifying ||
-        status.terminal_result.has_value() || status.reconciliation_required ||
-        status.error.has_value() ||
-        status.requested_state.presence !=
-            core::ComponentLifecycleRequestedStatePresenceDTO::kResolved ||
-        !status.requested_state.state.has_value() ||
-        status.current_state != status.requested_state.state) {
-      throw ManagerApplyJournalIntegrityError(
-          "bring-up holding is not a nonterminal verified configured target");
-    }
-    for (const auto &domain : status.domains) {
-      const bool retired = !domain.expected_domain.has_value();
-      if (domain.error.has_value() ||
-          (retired ? !domain.primitive_attempts.empty()
-                   : (domain.action_state !=
-                          core::ComponentLifecycleDomainActionStateDTO::
-                              kSucceeded ||
-                      !domain.current_scope.has_value() ||
-                      !domain.resolved_provider_occurrence.has_value() ||
-                      domain.requested_state.presence !=
-                          core::ComponentLifecycleRequestedStatePresenceDTO::
-                              kResolved ||
-                      !domain.requested_state.state.has_value() ||
-                      domain.current_state != domain.requested_state.state))) {
-        throw ManagerApplyJournalIntegrityError(
-            "bring-up holding lacks actual successful domain postconditions");
-      }
-    }
-  }
-  if (proof.phase == ManagerApplyBringUpChildPhase::kTerminal) {
-    if (!status.terminal_result.has_value() &&
-        status.phase !=
-            core::ComponentLifecycleTransactionPhaseDTO::kOutcomeUnknown) {
-      throw ManagerApplyJournalIntegrityError(
-          "bring-up terminal proof is not a truthful terminal or unknown "
-          "outcome");
-    }
-    if (BringUpProofSucceeded(proof)) {
-      if (status.status_owner_epoch != child->intent.request_context.request_owner_epoch) {
-        throw ManagerApplyJournalIntegrityError("a replaced child owner cannot manufacture successful live settlement");
-      }
-      const auto held = std::find_if(
-          previous.begin(), previous.end(), [&](const auto &value) {
-            return value.proof.controllable_component_id ==
-                       proof.controllable_component_id &&
-                   value.proof.phase == ManagerApplyBringUpChildPhase::kHolding;
-          });
-      if (held == previous.end() ||
-          status.status_sequence < held->proof.result.status->status_sequence) {
-        throw ManagerApplyJournalIntegrityError(
-            "bring-up success lacks its original actual holding proof");
-      }
-    }
-  }
-}
-
 std::filesystem::path ValidateDatabasePath(std::filesystem::path path) {
   if (path.empty()) {
     throw std::invalid_argument(
@@ -2840,10 +2448,11 @@ void ValidateApplyJournalIdentityAndSchema(
              ? std::string(sqlite3_db_filename(database, "main"))
              : source_path.string()) +
         " has format version " + std::to_string(user_version) +
-        "; expected v20. Preserve this file, including interrupted operations; "
+        "; expected v" + std::to_string(kManagerApplyJournalSchemaVersion) +
+        ". Preserve this file, including interrupted operations; "
         "reconcile the original operations with their owner and retained "
         "evidence "
-        "before explicitly selecting a fresh v20 journal. No migration, "
+        "before explicitly selecting a fresh journal. No migration, "
         "conversion "
         "or deletion is performed");
   }
@@ -2878,79 +2487,6 @@ void PreflightApplyJournal(const std::filesystem::path &database_path,
 
 } // namespace
 
-bool ManagerApplyBringUpChildRequestDTO::valid() const noexcept {
-  return intent.locally_valid() &&
-         (intent.intent == core::ComponentLifecycleIntentKindDTO::kPrepare ||
-          intent.intent == core::ComponentLifecycleIntentKindDTO::kEnable ||
-          intent.intent == core::ComponentLifecycleIntentKindDTO::kDisable) &&
-         !intent.program_node_evidence.has_value() &&
-         candidate_projection_revision.valid() &&
-         core::IsExactLowercaseSha256Digest(
-             candidate_retained_bundle_digest.value()) &&
-         candidate_retained_bundle_bytes > 0U &&
-         candidate_retained_bundle_bytes <=
-             static_cast<std::uint64_t>(
-                 std::numeric_limits<std::int64_t>::max()) &&
-         !runtime_unit_id.empty() && !runtime_epoch.empty() &&
-         !manager_runtime_epoch.empty();
-}
-
-bool ManagerApplyBringUpPlanDTO::valid() const noexcept {
-  const auto *owner = std::get_if<NamedApplyPublicationTransactionDTO>(
-      &expected_publication.transaction_ref);
-  if (apply_id.empty() || !apply_generation.nonzero() ||
-      !core::IsExactLowercaseSha256Digest(parent_intent_digest.value()) ||
-      !expected_publication.valid() || owner == nullptr ||
-      owner->apply_id != apply_id ||
-      owner->apply_generation != apply_generation ||
-      !core::IsExactLowercaseSha256Digest(
-          predecessor_public_pointer_digest.value()) ||
-      !core::IsExactLowercaseSha256Digest(
-          expected_publication.private_materialization_content_digest
-              .value()) ||
-      expected_publication.expected_previous_publication_generation->value() >=
-          static_cast<std::uint64_t>(
-              std::numeric_limits<std::int64_t>::max()) ||
-      configured_components.empty() ||
-      configured_components.size() > kMaximumManagerApplyFenceComponents ||
-      children.empty() || children.size() > configured_components.size())
-    return false;
-  for (std::size_t index = 0U; index < configured_components.size(); ++index) {
-    if (configured_components[index].empty() ||
-        (index != 0U &&
-         !(configured_components[index - 1U] < configured_components[index])))
-      return false;
-  }
-  for (std::size_t index = 0U; index < children.size(); ++index) {
-    const auto &child = children[index];
-    if (!child.valid() ||
-        child.candidate_projection_revision !=
-            expected_publication.candidate_projection_revision ||
-        !std::binary_search(configured_components.begin(),
-                            configured_components.end(),
-                            child.intent.controllable_component_id) ||
-        (index != 0U &&
-         !(children[index - 1U].intent.controllable_component_id <
-           child.intent.controllable_component_id)) ||
-        child.candidate_retained_bundle_digest !=
-            children.front().candidate_retained_bundle_digest ||
-        child.candidate_retained_bundle_bytes !=
-            children.front().candidate_retained_bundle_bytes ||
-        child.runtime_unit_id != children.front().runtime_unit_id ||
-        child.runtime_epoch != children.front().runtime_epoch ||
-        child.manager_runtime_epoch != children.front().manager_runtime_epoch)
-      return false;
-    for (std::size_t previous = 0U; previous < index; ++previous) {
-      if (children[previous].intent.request_context.request_owner_epoch ==
-              child.intent.request_context.request_owner_epoch &&
-          children[previous].intent.request_context.request_id ==
-              child.intent.request_context.request_id)
-        return false;
-    }
-  }
-  return true;
-}
-
 ContentDigest
 ComputeManagerApplyIntentDigest(const ManagerApplyIntentDTO &intent) {
   return ContentDigest(EncodeIntent(intent).intent_digest);
@@ -2959,11 +2495,6 @@ ComputeManagerApplyIntentDigest(const ManagerApplyIntentDTO &intent) {
 ContentDigest ComputeManagerApplyPrivateMaterializationDigest(
     const ManagerApplyPrivateMaterializationDTO &materialization) {
   return ContentDigest(EncodePrivateMaterialization(materialization).digest);
-}
-
-ContentDigest
-ComputeManagerApplyBringUpPlanDigest(const ManagerApplyBringUpPlanDTO &plan) {
-  return ContentDigest(BringUpPlanDigest(EncodeBringUpPlan(plan)));
 }
 
 bool ManagerApplyPreparedActivationDTO::valid() const noexcept {
@@ -3000,24 +2531,33 @@ const char *ToString(const ManagerApplyPhase phase) noexcept {
 
 // Durable evidence remains valid if the set of failures offered to operators
 // is narrowed in a later version. Scope policy belongs at the attempt boundary.
+// A failed Apply that still holds its accepted fence and published nothing:
+// releasable before effect (acknowledgement) or, whatever it changed, by New
+// (N7, CONTRACTS §15).
 static bool HasFailedApplyReleaseEvidence(const PersistedManagerApplyStatus &status) noexcept {
   if (!status.terminal_outcome || !status.affected_scope || !status.fence_attempt ||
-      !status.fence_acceptance || status.runtime_convergence_intent ||
-      status.latest_runtime_staged_ready || status.private_materialization ||
-      status.publication_receipt || status.fence_release_intent || status.fence_released ||
-      !status.bring_up_child_proofs.empty() ||
+      !status.fence_acceptance || status.publication_receipt ||
+      status.fence_release_intent || status.fence_released ||
       !status.affected_scope->affected_scope.component_delta.valid())
     return false;
   const auto &terminal = status.terminal_outcome->terminal_outcome;
-  return terminal.state == ManagerApplyTerminalOutcomeState::kFailed && terminal.failure &&
+  return terminal.state != ManagerApplyTerminalOutcomeState::kSucceeded && terminal.failure;
+}
+
+// Runtime staging is no effect: a host that refused the staged candidate
+// installed and published nothing (its failure is known before-effect).
+bool FailedApplyAcknowledgementEligible(const PersistedManagerApplyStatus &status) noexcept {
+  // The maintainer approved all proven-before-effect component/Scene changes
+  // (DX-2814).
+  if (!HasFailedApplyReleaseEvidence(status) || status.private_materialization) return false;
+  const auto &terminal = status.terminal_outcome->terminal_outcome;
+  return terminal.state == ManagerApplyTerminalOutcomeState::kFailed &&
          terminal.failure->effect_disposition == ManagerApplyEffectDisposition::kKnown &&
          terminal.failure->effect_boundary == ManagerApplyEffectBoundary::kBeforeEffect;
 }
 
-bool FailedApplyAcknowledgementEligible(const PersistedManagerApplyStatus &status) noexcept {
-  // The maintainer approved all proven-before-effect component/Scene changes
-  // (DX-2814); planned bring-up claims stay excluded.
-  return HasFailedApplyReleaseEvidence(status) && !status.bring_up_plan;
+bool FailedApplyNewReleaseEligible(const PersistedManagerApplyStatus &status) noexcept {
+  return HasFailedApplyReleaseEvidence(status);
 }
 
 ManagerApplyProgressDTO DeriveManagerApplyProgress(
@@ -3361,6 +2901,147 @@ public:
     return generation;
   }
 
+  // Bound the journal by eviction instead of refusal. Delete, inside the
+  // caller's write transaction, the oldest Apply (all generations of one
+  // Apply ID, rows in every table) that no owner can still read:
+  //  - it is terminal and holds no fence: none was accepted, its release is
+  //    recorded, or its failed-Apply release was acknowledged;
+  //  - its Kernel admission claim is provably settled, because the Kernel
+  //    settlement and owner-reconciliation readers look the held claim's
+  //    Apply up here: an acknowledged failed release; a success followed by a
+  //    later directly admitted Apply (the Kernel admits none while a
+  //    successful Apply's claim is held); a known failure that never accepted
+  //    a fence (its claim was refused or released with the terminal record);
+  //    or any other failure followed by such a settled success (its fresh
+  //    settlement settles every older held claim). A Composer-parented Apply
+  //    is reconciled from its terminal state, so it is settled when it
+  //    succeeded or failed known at acceptance, or was acknowledged;
+  //  - it is not the newest, newest terminal, newest successful or newest
+  //    published Apply (current-product, settlement-retry and replay
+  //    readers), and if newer than the newest success it accepted no fence
+  //    (a failed candidate the host may still run is looked up by Apply).
+  // Returns false when every retained Apply is still needed.
+  bool EvictOneApplyLocked() {
+    struct Row final {
+      std::string apply_id;
+      std::int64_t sequence{};
+      bool terminal{}, succeeded{}, known_accepted{}, known_unfenced{};
+      bool authoring{}, admitted{}, fence_held{}, acknowledged{};
+      std::optional<std::int64_t> publication;
+    };
+    Statement select(
+        database_,
+        "SELECT i.apply_id,i.accepted_sequence,t.outcome_state,"
+        "t.effect_disposition,t.failure_phase,"
+        "i.parent_authoring_claim IS NOT NULL,"
+        "EXISTS(SELECT 1 FROM manager_apply_affected_scopes x WHERE "
+        "x.apply_id=i.apply_id AND x.apply_generation=i.apply_generation),"
+        "EXISTS(SELECT 1 FROM manager_apply_fence_acceptances x WHERE "
+        "x.apply_id=i.apply_id AND x.apply_generation=i.apply_generation),"
+        "EXISTS(SELECT 1 FROM manager_apply_fence_released_records x WHERE "
+        "x.apply_id=i.apply_id AND x.apply_generation=i.apply_generation),"
+        "EXISTS(SELECT 1 FROM manager_apply_failed_release x WHERE "
+        "x.apply_id=i.apply_id AND x.apply_generation=i.apply_generation "
+        "AND x.acknowledged=1),"
+        "(SELECT x.publication_generation FROM "
+        "manager_apply_publication_receipts x WHERE "
+        "x.apply_id=i.apply_id AND x.apply_generation=i.apply_generation) "
+        "FROM manager_apply_intents i "
+        "LEFT JOIN manager_apply_terminal_outcomes t "
+        "ON t.apply_id=i.apply_id AND t.apply_generation=i.apply_generation "
+        "ORDER BY i.accepted_sequence");
+    std::vector<Row> rows;
+    rows.reserve(kMaximumManagerApplyIntents);
+    while (select.Step()) {
+      Row row;
+      row.apply_id = select.Text(0);
+      row.sequence = select.Integer(1);
+      row.terminal = !select.IsNull(2);
+      row.succeeded = row.terminal && select.Text(2) == "succeeded";
+      const bool known = !select.IsNull(3) && select.Text(3) == "known";
+      row.known_accepted =
+          known && !select.IsNull(4) && select.Text(4) == "accepted";
+      row.authoring = select.Integer(5) != 0;
+      row.admitted = select.Integer(6) != 0 && !row.authoring;
+      const bool fenced = select.Integer(7) != 0;
+      row.acknowledged = select.Integer(9) != 0;
+      row.fence_held = fenced && select.Integer(8) == 0 && !row.acknowledged;
+      row.known_unfenced = known && !fenced;
+      if (!select.IsNull(10))
+        row.publication = select.Integer(10);
+      rows.push_back(std::move(row));
+    }
+    if (rows.empty())
+      return false;
+
+    std::int64_t newest_terminal = 0, newest_success = 0, latest_admitted = 0;
+    std::int64_t newest_publication_sequence = 0, newest_publication = 0;
+    for (const auto &row : rows) {
+      if (row.terminal) newest_terminal = row.sequence;
+      if (row.succeeded) newest_success = row.sequence;
+      if (row.admitted) latest_admitted = row.sequence;
+      if (row.publication && *row.publication > newest_publication) {
+        newest_publication = *row.publication;
+        newest_publication_sequence = row.sequence;
+      }
+    }
+    // Rows are ordered by sequence: the nearest later success of each row.
+    std::vector<std::int64_t> next_success(rows.size(), 0);
+    for (std::size_t index = rows.size(); index-- > 1U;)
+      next_success[index - 1U] =
+          rows[index].succeeded ? rows[index].sequence : next_success[index];
+
+    const auto evictable = [&](const Row &row, const std::int64_t later_success) {
+      if (!row.terminal || row.fence_held ||
+          row.sequence == rows.back().sequence ||
+          row.sequence == newest_terminal || row.sequence == newest_success ||
+          row.sequence == newest_publication_sequence)
+        return false;
+      if (row.sequence > newest_success && !row.known_unfenced)
+        return false;
+      if (row.acknowledged)
+        return true;
+      if (row.authoring)
+        return row.succeeded || row.known_accepted;
+      if (row.succeeded)
+        return latest_admitted > row.sequence;
+      if (row.known_unfenced)
+        return true;
+      return later_success != 0 && latest_admitted > later_success;
+    };
+    std::map<std::string, bool> candidates;
+    std::vector<std::string> order;
+    for (std::size_t index = 0U; index < rows.size(); ++index) {
+      const auto [entry, inserted] =
+          candidates.emplace(rows[index].apply_id, true);
+      if (inserted)
+        order.push_back(rows[index].apply_id);
+      entry->second =
+          entry->second && evictable(rows[index], next_success[index]);
+    }
+    const auto victim = std::find_if(order.begin(), order.end(),
+                                     [&](const auto &id) { return candidates[id]; });
+    if (victim == order.end())
+      return false;
+    // Children first: every foreign key points at a table deleted later.
+    for (const char *table :
+         {"manager_apply_failed_release", "manager_apply_terminal_outcomes",
+          "manager_apply_fence_released_records",
+          "manager_apply_fence_release_intents",
+          "manager_apply_publication_receipts",
+          "manager_apply_private_materializations",
+          "manager_apply_runtime_staged_ready_sets",
+          "manager_apply_runtime_convergence_intents",
+          "manager_apply_fence_acceptances", "manager_apply_fence_attempts",
+          "manager_apply_affected_scopes", "manager_apply_intents"}) {
+      Statement remove(database_, std::string("DELETE FROM ") + table +
+                                      " WHERE apply_id=?");
+      remove.Bind(1, *victim);
+      static_cast<void>(remove.Step());
+    }
+    return true;
+  }
+
   ManagerApplyIntentWriteResult
   EnsureIntentValueLocked(const ManagerApplyIntentDTO &intent) {
     const auto encoded = EncodeIntent(intent);
@@ -3409,10 +3090,15 @@ public:
     const auto intent_count =
         ScalarInteger(database_, "SELECT COUNT(*) FROM manager_apply_intents");
     if (intent_count >=
-        static_cast<std::int64_t>(kMaximumManagerApplyIntents)) {
+            static_cast<std::int64_t>(kMaximumManagerApplyIntents) &&
+        !EvictOneApplyLocked()) {
       throw ManagerApplyJournalLimitError(
           "Apply intent inventory reached its fixed limit");
     }
+    // The newest Apply is never evicted, so this stays strictly increasing.
+    const auto accepted_sequence = ScalarInteger(
+        database_, "SELECT COALESCE(MAX(accepted_sequence),0)+1 "
+                   "FROM manager_apply_intents");
 
     Statement insert(
         database_,
@@ -3426,8 +3112,8 @@ public:
         "program_binding_id,prepared_activation_id,"
         "prepared_activation_receipt_json,"
         "expected_admission_generation,parent_authoring_claim,"
-        "intent_digest,scene_initialization"
-        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
+        "intent_digest,scene_initialization,accepted_sequence"
+        ") VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
     insert.Bind(1, intent.apply_id.value());
     insert.Bind(2, encoded.apply_generation);
     insert.Bind(3, intent.request_context.request_id.value());
@@ -3472,6 +3158,7 @@ public:
     }
     insert.Bind(22, encoded.intent_digest);
     insert.Bind(23, ToString(intent.scene_initialization));
+    insert.Bind(24, accepted_sequence);
     static_cast<void>(insert.Step());
 
     const auto stored = IntentLocked(intent.apply_id, encoded.apply_generation);
@@ -3497,9 +3184,7 @@ public:
       VerifiedRecordMap<PersistedManagerApplyPublicationReceipt>,
       VerifiedRecordMap<PersistedManagerApplyFenceReleaseIntent>,
       VerifiedRecordMap<PersistedManagerApplyFenceReleased>,
-      VerifiedRecordMap<PersistedManagerApplyTerminalOutcome>,
-      VerifiedRecordMap<PersistedManagerApplyBringUpPlan>,
-      VerifiedRecordMap<std::vector<PersistedManagerApplyBringUpChildProof>>>;
+      VerifiedRecordMap<PersistedManagerApplyTerminalOutcome>>;
 
   // Generation predecessors are checked only during writes. Read the
   // immediate predecessor through the uncached decoder, without recursively
@@ -3602,228 +3287,6 @@ public:
         });
   }
 
-  std::optional<PersistedManagerApplyBringUpPlan>
-  BringUpPlanLocked(const ApplyId &apply_id, std::int64_t generation) const {
-    return ReadVerifiedRecord<
-        PersistedManagerApplyBringUpPlan>({apply_id, generation, 0}, [&] {
-      Statement row(database_, "SELECT intent_digest,plan_encoding,plan_digest "
-                               "FROM manager_apply_bring_up_plans WHERE "
-                               "apply_id=? AND apply_generation=?");
-      row.Bind(1, apply_id.value());
-      row.Bind(2, generation);
-      if (!row.Step())
-        return std::optional<PersistedManagerApplyBringUpPlan>{};
-      const auto intent_digest = row.Text(0);
-      const auto encoding = row.Blob(1);
-      const auto digest = row.Text(2);
-      if (row.Step())
-        throw ManagerApplyJournalIntegrityError("duplicate bring-up plan");
-      try {
-        auto plan = DecodeBringUpPlan(encoding);
-        const auto intent = IntentLocked(apply_id, generation);
-        if (!intent.has_value() || !plan.valid() || plan.apply_id != apply_id ||
-            plan.apply_generation.value() !=
-                static_cast<std::uint64_t>(generation) ||
-            plan.parent_intent_digest != intent->intent_digest ||
-            plan.parent_intent_digest.value() != intent_digest ||
-            intent->intent.parent_authoring_claim.has_value() ||
-            !intent->intent.expected_admission_generation.has_value() ||
-            plan.expected_publication.candidate_retained_bundle_id !=
-                intent->intent.candidate_retained_bundle_id ||
-            plan.expected_publication.candidate_graph_revision !=
-                intent->intent.candidate_graph_revision ||
-            plan.expected_publication.candidate_projection_revision
-                    .scene_revision !=
-                intent->intent.expected_active_projection_revision
-                    .scene_revision ||
-            EncodeBringUpPlan(plan) != encoding ||
-            BringUpPlanDigest(encoding) != digest) {
-          throw ManagerApplyJournalIntegrityError(
-              "stored bring-up plan is not bound to its exact parent");
-        }
-        const auto &child = plan.children.front();
-        const ManagerApplyPrivateMaterializationDTO materialization{
-            child.candidate_projection_revision.scene_revision.content_hash,
-            apply_id,
-            plan.apply_generation,
-            child.candidate_projection_revision,
-            child.candidate_retained_bundle_digest,
-            child.candidate_retained_bundle_bytes};
-        if (ComputeManagerApplyPrivateMaterializationDigest(materialization) !=
-            plan.expected_publication.private_materialization_content_digest) {
-          throw ManagerApplyJournalIntegrityError(
-              "stored bring-up publication materialization mismatch");
-        }
-        return std::optional<PersistedManagerApplyBringUpPlan>{
-            {std::move(plan), ContentDigest(digest)}};
-      } catch (const ManagerApplyJournalIntegrityError &) {
-        throw;
-      } catch (const std::exception &) {
-        throw ManagerApplyJournalIntegrityError(
-            "stored bring-up plan contains an invalid value");
-      }
-    });
-  }
-
-  std::vector<PersistedManagerApplyBringUpChildProof>
-  BringUpChildProofsLocked(const ApplyId &apply_id,
-                           std::int64_t generation) const {
-    const auto read = ReadVerifiedRecord<
-        std::vector<PersistedManagerApplyBringUpChildProof>>(
-        {apply_id, generation, 0}, [&] {
-          std::vector<PersistedManagerApplyBringUpChildProof> proofs;
-          const auto plan = BringUpPlanLocked(apply_id, generation);
-          Statement rows(
-              database_,
-              "SELECT "
-              "plan_digest,component_id,phase,result_encoding,proof_digest "
-              "FROM manager_apply_bring_up_child_proofs WHERE apply_id=? AND "
-              "apply_generation=? "
-              "ORDER BY component_id,CASE phase WHEN 'accepted' THEN 0 WHEN "
-              "'holding' THEN 1 ELSE 2 END");
-          rows.Bind(1, apply_id.value());
-          rows.Bind(2, generation);
-          while (rows.Step()) {
-            try {
-              if (!plan.has_value() ||
-                  proofs.size() >= plan->plan.children.size() * 3U) {
-                throw ManagerApplyJournalIntegrityError(
-                    "stored bring-up child inventory exceeds its exact plan");
-              }
-              const auto encoding = rows.Blob(3);
-              ManagerApplyBringUpChildProofDTO proof{
-                  apply_id,
-                  ApplyGeneration(static_cast<std::uint64_t>(generation)),
-                  ContentDigest(rows.Text(0)),
-                  ControllableComponentId(rows.Text(1)),
-                  ParseBringUpPhase(rows.Text(2)),
-                  core::DecodeApplyDelegatedComponentLifecycleRequestResult(
-                      encoding)};
-              if (core::EncodeApplyDelegatedComponentLifecycleRequestResult(
-                      proof.result) != encoding ||
-                  BringUpProofDigest(proof, encoding) != rows.Text(4)) {
-                throw ManagerApplyJournalIntegrityError(
-                    "stored bring-up child proof digest mismatch");
-              }
-              ValidateBringUpProof(plan->plan, plan->plan_digest, proof,
-                                   proofs);
-              if (proof.result.status.has_value()) {
-                const auto &authority =
-                    proof.result.status->apply_bring_up->parent_authority;
-                const auto parent = IntentLocked(apply_id, generation);
-                const auto fence = FenceAcceptanceLocked(apply_id, generation);
-                if (!parent.has_value() || !fence.has_value() ||
-                    authority.parent_claim.intent.owner_epoch !=
-                        parent->intent.request_context.request_owner_epoch ||
-                    authority.parent_claim.intent.request_id !=
-                        parent->intent.request_context.request_id ||
-                    authority.parent_claim.intent
-                            .expected_admission_generation !=
-                        parent->intent.expected_admission_generation ||
-                    authority.held_fence_query.configuration_fence_id !=
-                        fence->accepted_fence.configuration_fence_id ||
-                    authority.held_fence_query.configuration_fence_generation !=
-                        fence->accepted_fence.configuration_fence_generation ||
-                    authority.held_fence_query.expected_scope !=
-                        fence->accepted_fence.captured_scope) {
-                  throw ManagerApplyJournalIntegrityError(
-                      "stored bring-up child is not joined to actual parent "
-                      "fence/claim");
-                }
-              }
-              if (BringUpProofSucceeded(proof))
-                RequireBringUpPublicationLocked(plan->plan);
-              proofs.push_back({std::move(proof), ContentDigest(rows.Text(4))});
-            } catch (const ManagerApplyJournalIntegrityError &) {
-              throw;
-            } catch (const std::exception &) {
-              throw ManagerApplyJournalIntegrityError(
-                  "stored bring-up child proof contains an invalid value");
-            }
-          }
-          return std::optional<
-              std::vector<PersistedManagerApplyBringUpChildProof>>{
-              std::move(proofs)};
-        });
-    return read.value_or(std::vector<PersistedManagerApplyBringUpChildProof>{});
-  }
-
-  void RequireBringUpPublicationLocked(
-      const ManagerApplyBringUpPlanDTO &plan) const {
-    // Avoid a recursive materialization -> child proofs -> publication chain:
-    // verify the exact publication row with its existing digest encoder here.
-    Statement row(
-        database_,
-        "SELECT candidate_retained_bundle_id,candidate_graph_revision,"
-        "candidate_scene_id,candidate_scene_revision_id,candidate_scene_"
-        "content_hash,"
-        "expected_previous_publication_generation,private_materialization_"
-        "content_digest,"
-        "publication_generation,durable_public_pointer_content_digest,"
-        "publication_receipt_digest "
-        "FROM manager_apply_publication_receipts WHERE apply_id=? AND "
-        "apply_generation=?");
-    row.Bind(1, plan.apply_id.value());
-    row.Bind(2,
-             CheckedSigned(plan.apply_generation.value(), "apply_generation"));
-    if (!row.Step())
-      throw ManagerApplyJournalIntegrityError(
-          "bring-up child success lacks exact actual publication");
-    const auto &candidate =
-        plan.expected_publication.candidate_projection_revision;
-    const auto previous =
-        CheckedSigned(plan.expected_publication
-                          .expected_previous_publication_generation->value(),
-                      "previous_publication_generation");
-    if (row.Text(0) != candidate.retained_bundle_id.value() ||
-        row.Text(1) != candidate.graph_revision.value() ||
-        row.Text(2) != candidate.scene_revision.scene_id.value() ||
-        row.Integer(3) != CheckedSigned(candidate.scene_revision.revision_id,
-                                        "scene_revision") ||
-        row.Text(4) != candidate.scene_revision.content_hash.value() ||
-        row.Integer(5) != previous ||
-        row.Text(6) != plan.expected_publication
-                           .private_materialization_content_digest.value() ||
-        row.Integer(7) != previous + 1) {
-      throw ManagerApplyJournalIntegrityError(
-          "bring-up child success has foreign publication identity");
-    }
-    const ManagerApplyPublicationReceiptDTO publication{
-        plan.expected_publication.private_materialization_content_digest,
-        {plan.expected_publication,
-         ActiveBundlePublicationGeneration(
-             static_cast<std::uint64_t>(row.Integer(7))),
-         ContentDigest(row.Text(8))}};
-    if (EncodePublicationReceipt(publication).digest != row.Text(9) ||
-        row.Step()) {
-      throw ManagerApplyJournalIntegrityError(
-          "bring-up child success publication digest mismatch");
-    }
-  }
-
-  void
-  RequireBringUpProofSetLocked(const PersistedManagerApplyBringUpPlan &plan,
-                               bool terminal) const {
-    const auto proofs = BringUpChildProofsLocked(
-        plan.plan.apply_id,
-        CheckedSigned(plan.plan.apply_generation.value(), "apply_generation"));
-    for (const auto &child : plan.plan.children) {
-      const auto found =
-          std::find_if(proofs.begin(), proofs.end(), [&](const auto &proof) {
-            return proof.proof.controllable_component_id ==
-                       child.intent.controllable_component_id &&
-                   proof.proof.phase ==
-                       (terminal ? ManagerApplyBringUpChildPhase::kTerminal
-                                 : ManagerApplyBringUpChildPhase::kHolding);
-          });
-      if (found == proofs.end() ||
-          (terminal && !BringUpProofSucceeded(found->proof))) {
-        throw ManagerApplyJournalIntegrityError(
-            "bring-up parent lacks every exact required child proof");
-      }
-    }
-  }
-
   /// Compose one complete status view for exactly one Apply generation. Used by
   /// both the single-identity read and the bounded inventory read so the two
   /// surfaces cannot derive different membership.
@@ -3846,8 +3309,6 @@ public:
         FenceReleaseIntentLocked(apply_id, apply_generation),
         FenceReleasedLocked(apply_id, apply_generation),
         TerminalOutcomeLocked(apply_id, apply_generation),
-        BringUpPlanLocked(apply_id, apply_generation),
-        BringUpChildProofsLocked(apply_id, apply_generation),
     };
   }
 
@@ -4114,8 +3575,8 @@ public:
           "stored Apply-fence attempt is structurally invalid");
     }
     try {
-      const auto configuration_facts =
-          DecodeExpectedConfigurations(active_configurations);
+      const auto configurations =
+          DecodeActiveConfigurations(active_configurations);
       ApplyConfigurationFenceIntentDTO intent{
           PublicRequestContextDTO{
               RequestId(request_id),
@@ -4134,9 +3595,8 @@ public:
           static_cast<std::uint64_t>(operation_generation),
           ConfigurationFenceGeneration(
               static_cast<std::uint64_t>(fence_generation)),
-          configuration_facts.configurations,
+          configurations,
           reason,
-          configuration_facts.lineages,
       };
       const ContentDigest parent_digest(intent_digest);
       const ContentDigest scope_digest(affected_scope_digest);
@@ -4612,23 +4072,6 @@ public:
             "stored private materialization is not bound to its exact Apply "
             "and authoritative Scene snapshot");
       }
-      if (const auto plan = BringUpPlanLocked(apply_id, apply_generation);
-          plan.has_value()) {
-        if (plan->plan.expected_publication
-                    .private_materialization_content_digest !=
-                ContentDigest(stored_digest) ||
-            plan->plan.expected_publication.candidate_projection_revision !=
-                materialization.candidate_projection_revision ||
-            plan->plan.children.front().candidate_retained_bundle_digest !=
-                materialization.retained_bundle_canonical_content_digest ||
-            plan->plan.children.front().candidate_retained_bundle_bytes !=
-                materialization.retained_bundle_canonical_byte_size) {
-          throw ManagerApplyJournalIntegrityError(
-              "selected materialization is not joined to its exact original "
-              "plan");
-        }
-        RequireBringUpProofSetLocked(*plan, false);
-      }
       return PersistedManagerApplyPrivateMaterialization{
           std::move(materialization), ContentDigest(stored_digest)};
     } catch (const ManagerApplyJournalIntegrityError &) {
@@ -4725,12 +4168,6 @@ public:
             "stored Apply publication is not bound to its exact predecessor "
             "records");
       }
-      if (const auto plan = BringUpPlanLocked(apply_id, apply_generation);
-          plan.has_value() && plan->plan.expected_publication !=
-                                  publication.publication_receipt.request) {
-        throw ManagerApplyJournalIntegrityError(
-            "selected publication differs from its exact original plan");
-      }
       return PersistedManagerApplyPublicationReceipt{
           std::move(publication), ContentDigest(stored_digest)};
     } catch (const ManagerApplyJournalIntegrityError &) {
@@ -4779,10 +4216,6 @@ public:
       };
       const auto encoded = EncodeFenceReleaseIntent(intent);
       const auto &evidence = intent.release_request.reconciliation_evidence;
-      if (const auto plan = BringUpPlanLocked(apply_id, apply_generation);
-          plan.has_value()) {
-        RequireBringUpProofSetLocked(*plan, true);
-      }
       const auto acceptance = FenceAcceptanceLocked(apply_id, apply_generation);
       const auto publication =
           PublicationReceiptLocked(apply_id, apply_generation);
@@ -4972,10 +4405,6 @@ public:
             "stored terminal Apply outcome digest is inconsistent");
       }
       if (outcome.state == ManagerApplyTerminalOutcomeState::kSucceeded) {
-        if (const auto plan = BringUpPlanLocked(apply_id, apply_generation);
-            plan.has_value()) {
-          RequireBringUpProofSetLocked(*plan, true);
-        }
         const auto released = FenceReleasedLocked(apply_id, apply_generation);
         const auto publication =
             PublicationReceiptLocked(apply_id, apply_generation);
@@ -5234,22 +4663,6 @@ public:
         database_, "SELECT COUNT(*) FROM manager_apply_fence_released_records");
     const auto terminal_outcome_count = ScalarInteger(
         database_, "SELECT COUNT(*) FROM manager_apply_terminal_outcomes");
-    const auto bring_up_plan_count = ScalarInteger(
-        database_, "SELECT COUNT(*) FROM manager_apply_bring_up_plans");
-    const auto bring_up_child_proof_count = ScalarInteger(
-        database_, "SELECT COUNT(*) FROM manager_apply_bring_up_child_proofs");
-    const auto selected_materialization_count = ScalarInteger(
-        database_,
-        "SELECT COUNT(*) FROM manager_apply_private_materializations m "
-        "JOIN manager_apply_bring_up_plans p ON p.apply_id=m.apply_id "
-        "AND p.apply_generation=m.apply_generation");
-    if (bring_up_plan_count < 0 || bring_up_plan_count > intent_count ||
-        bring_up_child_proof_count < 0 || selected_materialization_count < 0 ||
-        selected_materialization_count > bring_up_plan_count ||
-        selected_materialization_count > private_materialization_count) {
-      throw ManagerApplyJournalIntegrityError(
-          "stored bring-up cardinality is invalid");
-    }
     if (affected_scope_count < 0 || attempt_count < 0 || acceptance_count < 0 ||
         runtime_intent_count < 0 || runtime_staged_ready_count < 0 ||
         private_materialization_count < 0 || publication_receipt_count < 0 ||
@@ -5282,34 +4695,11 @@ public:
         fence_released_count > fence_release_intent_count ||
         fence_release_intent_count > publication_receipt_count ||
         publication_receipt_count > private_materialization_count ||
-        private_materialization_count - selected_materialization_count >
-            runtime_staged_ready_count ||
+        private_materialization_count > runtime_staged_ready_count ||
         attempt_count > affected_scope_count ||
         affected_scope_count > intent_count) {
       throw ManagerApplyJournalIntegrityError(
           "stored Apply-fence journal cardinality is invalid");
-    }
-    Statement bring_up_plans(
-        database_,
-        "SELECT apply_id,apply_generation FROM manager_apply_bring_up_plans "
-        "ORDER BY apply_id,apply_generation");
-    std::int64_t observed_plans = 0;
-    std::int64_t observed_child_proofs = 0;
-    while (bring_up_plans.Step()) {
-      const auto apply_id = ApplyId(bring_up_plans.Text(0));
-      const auto generation = bring_up_plans.Integer(1);
-      if (!BringUpPlanLocked(apply_id, generation).has_value() ||
-          ++observed_plans > intent_count) {
-        throw ManagerApplyJournalIntegrityError(
-            "stored bring-up plan inventory is inconsistent");
-      }
-      observed_child_proofs += static_cast<std::int64_t>(
-          BringUpChildProofsLocked(apply_id, generation).size());
-    }
-    if (observed_plans != bring_up_plan_count ||
-        observed_child_proofs != bring_up_child_proof_count) {
-      throw ManagerApplyJournalIntegrityError(
-          "stored bring-up child inventory has an unlinked or invalid proof");
     }
     Statement affected_scopes(
         database_,
@@ -5555,8 +4945,6 @@ public:
     timing.Count("manager_apply_integrity_release_intent_count", fence_release_intent_count);
     timing.Count("manager_apply_integrity_released_count", fence_released_count);
     timing.Count("manager_apply_integrity_terminal_count", terminal_outcome_count);
-    timing.Count("manager_apply_integrity_plan_count", bring_up_plan_count);
-    timing.Count("manager_apply_integrity_child_proof_count", bring_up_child_proof_count);
     timing.Count("manager_apply_integrity_failed_release_count",
                  static_cast<std::int64_t>(failed_release_count));
     return {
@@ -5577,8 +4965,6 @@ public:
         fence_release_intent_count,
         fence_released_count,
         terminal_outcome_count,
-        bring_up_plan_count,
-        bring_up_child_proof_count,
     };
   }
 
@@ -5640,191 +5026,6 @@ SqliteManagerApplyJournal::EnsureIntent(const ManagerApplyIntentDTO &intent) {
   const auto result = impl_->EnsureIntentValueLocked(intent);
   if (result.inserted)
     static_cast<void>(impl_->VerifyWriteLimitsLocked());
-  transaction.Commit();
-  return result;
-}
-
-ManagerApplyBringUpIntentWriteResult
-SqliteManagerApplyJournal::EnsureBringUpIntent(
-    const ManagerApplyIntentDTO &intent,
-    const ManagerApplyBringUpPlanDTO &plan) {
-  const auto encoding = EncodeBringUpPlan(plan);
-  const auto digest = BringUpPlanDigest(encoding);
-  const auto encoded_intent = EncodeIntent(intent);
-  if (plan.apply_id != intent.apply_id ||
-      plan.apply_generation != intent.apply_generation ||
-      plan.parent_intent_digest.value() != encoded_intent.intent_digest ||
-      intent.parent_authoring_claim.has_value() ||
-      !intent.expected_admission_generation.has_value()) {
-    throw ManagerApplyJournalConflictError(
-        "bring-up plan does not match its exact direct Manager parent");
-  }
-  std::lock_guard lock(impl_->mutex_);
-  impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
-  Impl::WriteVerificationScope write_verification(*impl_);
-  static_cast<void>(impl_->VerifyWriteLimitsLocked());
-  const auto existing_plan = impl_->BringUpPlanLocked(
-      intent.apply_id, encoded_intent.apply_generation);
-  const auto existing_parent =
-      impl_->IntentLocked(intent.apply_id, encoded_intent.apply_generation);
-  if (existing_parent.has_value() && !existing_plan.has_value()) {
-    throw ManagerApplyJournalConflictError(
-        "an ordinary accepted Apply cannot acquire a bring-up plan");
-  }
-  if (existing_plan.has_value() &&
-      (existing_plan->plan != plan ||
-       existing_plan->plan_digest.value() != digest)) {
-    throw ManagerApplyJournalConflictError(
-        "Apply already has a different configured bring-up plan");
-  }
-  const auto parent = impl_->EnsureIntentValueLocked(intent);
-  if (!existing_plan.has_value()) {
-    Statement insert(impl_->database_,
-                     "INSERT INTO manager_apply_bring_up_plans "
-                     "(apply_id,apply_generation,intent_digest,plan_encoding,"
-                     "plan_digest) VALUES (?,?,?,?,?)");
-    insert.Bind(1, intent.apply_id.value());
-    insert.Bind(2, encoded_intent.apply_generation);
-    insert.Bind(3, encoded_intent.intent_digest);
-    insert.BindBlob(4, encoding);
-    insert.Bind(5, digest);
-    static_cast<void>(insert.Step());
-  }
-  const auto stored = impl_->BringUpPlanLocked(intent.apply_id,
-                                               encoded_intent.apply_generation);
-  if (!stored.has_value() || stored->plan != plan ||
-      stored->plan_digest.value() != digest) {
-    throw ManagerApplyJournalIntegrityError(
-        "inserted configured bring-up plan cannot be verified");
-  }
-  static_cast<void>(impl_->VerifyWriteLimitsLocked());
-  transaction.Commit();
-  return {parent.record, *stored, parent.inserted};
-}
-
-std::optional<PersistedManagerApplyBringUpPlan>
-SqliteManagerApplyJournal::ReadBringUpPlan(const ApplyId &apply_id,
-                                           ApplyGeneration generation) const {
-  ValidateBoundedIdentity(apply_id.value(), "apply_id");
-  const auto value = CheckedSigned(generation.value(), "apply_generation");
-  std::lock_guard lock(impl_->mutex_);
-  impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN");
-  const auto verified_reads = impl_->UseVerifiedReadsLocked();
-  const auto result = impl_->BringUpPlanLocked(apply_id, value);
-  transaction.Commit();
-  return result;
-}
-
-std::optional<PersistedManagerApplyBringUpPlan>
-SqliteManagerApplyJournal::ReadBringUpPlanByRequest(
-    const RequestOwnerEpoch &owner, const RequestId &request) const {
-  ValidateBoundedIdentity(owner.value(), "request_owner_epoch");
-  ValidateBoundedIdentity(request.value(), "request_id");
-  std::lock_guard lock(impl_->mutex_);
-  impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN");
-  const auto verified_reads = impl_->UseVerifiedReadsLocked();
-  const auto parent = impl_->RequestLocked(owner, request);
-  const auto result =
-      parent.has_value()
-          ? impl_->BringUpPlanLocked(
-                parent->intent.apply_id,
-                CheckedSigned(parent->intent.apply_generation.value(),
-                              "apply_generation"))
-          : std::nullopt;
-  transaction.Commit();
-  return result;
-}
-
-ManagerApplyBringUpChildProofWriteResult
-SqliteManagerApplyJournal::EnsureBringUpChildProof(
-    const ManagerApplyBringUpChildProofDTO &proof) {
-  const auto generation =
-      CheckedSigned(proof.apply_generation.value(), "apply_generation");
-  const auto encoding =
-      core::EncodeApplyDelegatedComponentLifecycleRequestResult(proof.result);
-  const auto digest = BringUpProofDigest(proof, encoding);
-  std::lock_guard lock(impl_->mutex_);
-  impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN IMMEDIATE");
-  Impl::WriteVerificationScope write_verification(*impl_);
-  static_cast<void>(impl_->VerifyWriteLimitsLocked());
-  const auto plan = impl_->BringUpPlanLocked(proof.apply_id, generation);
-  if (!plan.has_value())
-    throw ManagerApplyJournalConflictError(
-        "bring-up child has no exact original parent plan");
-  const auto previous =
-      impl_->BringUpChildProofsLocked(proof.apply_id, generation);
-  ValidateBringUpProof(plan->plan, plan->plan_digest, proof, previous);
-  for (const auto &existing : previous) {
-    if (existing.proof.controllable_component_id ==
-            proof.controllable_component_id &&
-        existing.proof.phase == proof.phase) {
-      if (existing.proof_digest.value() != digest ||
-          core::EncodeApplyDelegatedComponentLifecycleRequestResult(
-              existing.proof.result) != encoding) {
-        throw ManagerApplyJournalConflictError(
-            "bring-up child milestone conflicts with its original proof");
-      }
-      transaction.Commit();
-      return {existing, false};
-    }
-  }
-  Statement insert(impl_->database_,
-                   "INSERT INTO manager_apply_bring_up_child_proofs "
-                   "(apply_id,apply_generation,plan_digest,component_id,phase,"
-                   "result_encoding,proof_digest) "
-                   "VALUES (?,?,?,?,?,?,?)");
-  insert.Bind(1, proof.apply_id.value());
-  insert.Bind(2, generation);
-  insert.Bind(3, proof.plan_digest.value());
-  insert.Bind(4, proof.controllable_component_id.value());
-  insert.Bind(5, BringUpPhaseName(proof.phase));
-  insert.BindBlob(6, encoding);
-  insert.Bind(7, digest);
-  static_cast<void>(insert.Step());
-  const auto stored =
-      impl_->BringUpChildProofsLocked(proof.apply_id, generation);
-  const auto result =
-      std::find_if(stored.begin(), stored.end(), [&](const auto &value) {
-        return value.proof.controllable_component_id ==
-                   proof.controllable_component_id &&
-               value.proof.phase == proof.phase;
-      });
-  if (result == stored.end() || result->proof_digest.value() != digest) {
-    throw ManagerApplyJournalIntegrityError(
-        "inserted bring-up child proof cannot be verified");
-  }
-  static_cast<void>(impl_->VerifyWriteLimitsLocked());
-  transaction.Commit();
-  return {*result, true};
-}
-
-std::optional<PersistedManagerApplyBringUpChildProof>
-SqliteManagerApplyJournal::ReadBringUpChildProof(
-    const ApplyId &apply_id, ApplyGeneration generation,
-    const ControllableComponentId &component,
-    ManagerApplyBringUpChildPhase phase) const {
-  ValidateBoundedIdentity(apply_id.value(), "apply_id");
-  ValidateBoundedIdentity(component.value(), "component_id");
-  const auto value = CheckedSigned(generation.value(), "apply_generation");
-  static_cast<void>(BringUpPhaseName(phase));
-  std::lock_guard lock(impl_->mutex_);
-  impl_->RequireOpen();
-  Transaction transaction(impl_->database_, "BEGIN");
-  const auto verified_reads = impl_->UseVerifiedReadsLocked();
-  const auto proofs = impl_->BringUpChildProofsLocked(apply_id, value);
-  const auto found =
-      std::find_if(proofs.begin(), proofs.end(), [&](const auto &proof) {
-        return proof.proof.controllable_component_id == component &&
-               proof.proof.phase == phase;
-      });
-  const auto result =
-      found == proofs.end()
-          ? std::optional<PersistedManagerApplyBringUpChildProof>{}
-          : *found;
   transaction.Commit();
   return result;
 }
@@ -6669,11 +5870,6 @@ SqliteManagerApplyJournal::EnsureFenceReleaseIntent(
         "fence-release intent does not match exact completed, fence, and "
         "publication evidence");
   }
-  if (const auto plan = impl_->BringUpPlanLocked(
-          evidence.owner_transaction.apply_id, encoded.apply_generation);
-      plan.has_value()) {
-    impl_->RequireBringUpProofSetLocked(*plan, true);
-  }
   if (const auto existing = impl_->FenceReleaseIntentLocked(
           owner.apply_id, encoded.apply_generation);
       existing.has_value()) {
@@ -6823,11 +6019,6 @@ SqliteManagerApplyJournal::EnsureTerminalOutcome(
   const bool succeeded =
       terminal_outcome.state == ManagerApplyTerminalOutcomeState::kSucceeded;
   if (succeeded) {
-    if (const auto plan = impl_->BringUpPlanLocked(terminal_outcome.apply_id,
-                                                   encoded.apply_generation);
-        plan.has_value()) {
-      impl_->RequireBringUpProofSetLocked(*plan, true);
-    }
     const auto released = impl_->FenceReleasedLocked(terminal_outcome.apply_id,
                                                      encoded.apply_generation);
     const auto publication = impl_->PublicationReceiptLocked(
@@ -6975,7 +6166,7 @@ void SqliteManagerApplyJournal::BeginFailedApplyRelease(
   Impl::WriteVerificationScope write_verification(*impl_);
   static_cast<void>(impl_->VerifyWriteLimitsLocked());
   const auto status = impl_->StatusLocked(apply_id, generation);
-  if (!status || !FailedApplyAcknowledgementEligible(*status) ||
+  if (!status || !HasFailedApplyReleaseEvidence(*status) ||
       impl_->FailedApplyReleaseLocked(apply_id, generation))
     throw ManagerApplyJournalConflictError("failed Apply cannot start another release attempt");
   Statement insert(impl_->database_,
@@ -7134,8 +6325,7 @@ void RequireExactManagerApplyClaim(const core::CellAdmissionClaimDTO &claim,
       status.intent.intent.request_context.request_owner_epoch,
       status.intent.intent.apply_id.value(),
       status.intent.intent.request_context.request_id,
-      status.bring_up_plan ? status.bring_up_plan->plan_digest
-                           : status.intent.intent_digest,
+      status.intent.intent_digest,
       *status.intent.intent.expected_admission_generation,
       {},
       std::nullopt,
@@ -7226,7 +6416,7 @@ core::Result<void> ValidateFreshManagerApplySuccessReadOnly(
           throw ManagerApplyJournalIntegrityError(
               "fresh_apply_original_status_missing");
         RequireExactManagerApplyClaim(fresh_claim, *status);
-        if (status->bring_up_plan || !status->terminal_outcome ||
+        if (!status->terminal_outcome ||
             !status->terminal_outcome->terminal_outcome.succeeded() ||
             status->terminal_outcome->terminal_outcome_digest !=
                 release.settlement.evidence_digest) {
@@ -7290,21 +6480,20 @@ core::Result<void> ValidateManagerApplyCellAdmissionSettlementReadOnly(
           "JOIN manager_apply_terminal_outcomes t "
           "ON t.apply_id=i.apply_id AND "
           "t.apply_generation=i.apply_generation "
-          // A completed no-effect release also settles a held failed Apply.
-          // Its recorded request and receipt are verified below, not by this
-          // existence check alone.
+          // A completed release (no-effect acknowledgement, or New for any
+          // failure, N7) also settles a held failed Apply. Its recorded
+          // request and receipt are verified below, not by this existence
+          // check alone.
           "AND (t.outcome_state='succeeded' OR "
           "(t.outcome_state='failed' AND t.effect_disposition='known' "
-          "AND (t.failure_phase='accepted' OR EXISTS "
+          "AND t.failure_phase='accepted') OR "
+          "(t.outcome_state<>'succeeded' AND EXISTS "
           "(SELECT 1 FROM manager_apply_failed_release f "
           "WHERE f.apply_id=t.apply_id AND f.apply_generation=t.apply_generation "
-          "AND f.released_fence_encoding IS NOT NULL)))) "
+          "AND f.released_fence_encoding IS NOT NULL))) "
           "WHERE i.apply_id=? AND i.request_owner_epoch=? AND i.request_id=? "
           "AND i.intent_digest=? AND i.expected_admission_generation=? "
-          "AND i.parent_authoring_claim IS NULL "
-          "AND NOT EXISTS (SELECT 1 FROM manager_apply_bring_up_plans p "
-          "WHERE p.apply_id=i.apply_id AND "
-          "p.apply_generation=i.apply_generation)");
+          "AND i.parent_authoring_claim IS NULL");
       row.Bind(1, claim.intent.owner_transaction_id);
       row.Bind(2, claim.intent.owner_epoch.value());
       row.Bind(3, claim.intent.request_id.value());
@@ -7313,13 +6502,14 @@ core::Result<void> ValidateManagerApplyCellAdmissionSettlementReadOnly(
                                 "expected_admission_generation"));
       const bool found = row.Step();
       digest = found ? std::optional<std::string>(row.Text(0)) : std::nullopt;
-      if (found && row.Text(2) == "failed" && row.Text(3) != "accepted") {
+      if (found && row.Text(2) != "succeeded" &&
+          !(row.Text(2) == "failed" && row.Text(3) == "accepted")) {
         const auto acknowledged = view.FailedApplyReleaseLocked(
             ApplyId(claim.intent.owner_transaction_id), row.Integer(1));
         if (!acknowledged || !acknowledged->released ||
             acknowledged->terminal_outcome_digest.value() != *digest)
           throw ManagerApplyJournalIntegrityError(
-              "failed Apply has no completed before-effect release");
+              "failed Apply has no completed release");
       }
       duplicate = found && row.Step();
       snapshot.Commit();
@@ -7397,62 +6587,13 @@ core::Result<PersistedManagerApplyStatus> ReadManagerApplyStatusReadOnly(
                                                    apply, nullptr);
 }
 
-core::Result<PersistedManagerApplyStatus> ReadManagerApplyBringUpStatusReadOnly(
-    const std::filesystem::path &database_path, const CellId &cell_id,
-    const core::ApplyComponentBringUpReferenceDTO &parent) {
-  const auto rejected = [](std::string reason) {
-    return core::Result<PersistedManagerApplyStatus>::Err(core::ErrorDTO{
-        "manager_apply_bring_up_read_unavailable",
-        "the exact retained configured bring-up parent cannot be observed",
-        {{"reason", std::move(reason)}}});
-  };
-  if (!parent.valid()) return rejected("parent_reference_invalid");
-  try {
-    PreflightApplyJournal(database_path, cell_id);
-  } catch (const std::exception &) {
-    return rejected("parent_journal_preflight_failed");
-  }
-  sqlite3 *database = nullptr;
-  const auto opened = sqlite3_open_v2(
-      database_path.string().c_str(), &database,
-      SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_NOFOLLOW,
-      nullptr);
-  if (opened != SQLITE_OK) {
-    if (database != nullptr) sqlite3_close(database);
-    return rejected("parent_journal_unavailable");
-  }
-  try {
-    Check(database, sqlite3_busy_timeout(database, kBusyTimeoutMilliseconds),
-          "configure read-only parent timeout");
-    Exec(database, "PRAGMA query_only=ON");
-    std::optional<PersistedManagerApplyStatus> result;
-    {
-      Transaction snapshot(database, "BEGIN");
-      ValidateApplyJournalIdentityAndSchema(database, cell_id, database_path);
-      SqliteManagerApplyJournal::Impl view(database, cell_id);
-      result = view.StatusWithFailedReleaseLocked(parent.owner.apply_id,
-          CheckedSigned(parent.owner.apply_generation.value(), "apply_generation"));
-      if (!result || !result->bring_up_plan ||
-          result->bring_up_plan->plan_digest != parent.plan_digest)
-        throw ManagerApplyJournalIntegrityError("retained parent plan identity mismatch");
-      snapshot.Commit();
-    }
-    sqlite3_close(database);
-    database = nullptr;
-    return core::Result<PersistedManagerApplyStatus>::Ok(std::move(*result));
-  } catch (const std::exception &) {
-    if (database != nullptr) sqlite3_close(database);
-    return rejected("parent_journal_or_identity_invalid");
-  }
-}
-
-core::Result<PersistedManagerApplyStatus> ReadManagerApplyBringUpStatusReadOnly(
+core::Result<PersistedManagerApplyStatus> ReadManagerApplyStatusByClaimIntentReadOnly(
     const std::filesystem::path &database_path, const CellId &cell_id,
     const core::CellAdmissionClaimIntentDTO &parent_claim_intent) {
   const auto rejected = [](std::string reason) {
     return core::Result<PersistedManagerApplyStatus>::Err(core::ErrorDTO{
-        "manager_apply_bring_up_read_unavailable",
-        "the exact retained configured bring-up parent cannot be observed",
+        "manager_apply_configuration_read_unavailable",
+        "the exact retained configuration Apply parent cannot be observed",
         {{"reason", std::move(reason)}}});
   };
   if (!core::ValidateCellAdmissionClaimIntent(parent_claim_intent).ok() ||
@@ -7500,8 +6641,7 @@ core::Result<PersistedManagerApplyStatus> ReadManagerApplyBringUpStatusReadOnly(
           intent->intent.request_context.request_owner_epoch,
           intent->intent.apply_id.value(),
           intent->intent.request_context.request_id,
-          result->bring_up_plan ? result->bring_up_plan->plan_digest
-                               : result->intent.intent_digest,
+          result->intent.intent_digest,
           *intent->intent.expected_admission_generation,
           {}, std::nullopt, std::nullopt, std::nullopt};
       if (parent_claim_intent != expected)
@@ -7560,8 +6700,6 @@ core::Result<PersistedManagerApplyStatus> ReadManagerApplyConfigurationStatusRea
           CheckedSigned(apply.apply_generation.value(), "apply_generation"));
       if (!result)
         throw ManagerApplyJournalIntegrityError("ordinary configuration parent missing");
-      if (result->bring_up_plan)
-        throw ManagerApplyJournalIntegrityError("configuration parent has linked bring-up plan");
       if (result->intent.intent.cell_id != cell_id)
         throw ManagerApplyJournalIntegrityError("configuration parent cell mismatch");
       const auto &intent = result->intent.intent;
@@ -7595,7 +6733,6 @@ core::Result<PersistedManagerApplyStatus> ReadManagerApplyConfigurationStatusRea
     // Legacy integrity exceptions can include source paths or nested errors.
     const std::string_view detail(error.what());
     if (detail == "ordinary configuration parent missing" ||
-        detail == "configuration parent has linked bring-up plan" ||
         detail == "configuration parent cell mismatch" ||
         detail == "configuration authoring parent claim mismatch" ||
         detail == "configuration direct admission generation missing" ||
@@ -7606,401 +6743,6 @@ core::Result<PersistedManagerApplyStatus> ReadManagerApplyConfigurationStatusRea
   } catch (const std::exception &) {
     if (database != nullptr) sqlite3_close(database);
     return rejected("parent_journal_or_identity_invalid");
-  }
-}
-
-core::Result<PersistedManagerApplyStatus> ReadNativeApplyParentStatusReadOnly(
-    const std::filesystem::path &database_path, const CellId &cell_id,
-    const core::NativeApplyPlanDTO &native_plan,
-    const deployment::RetainedBundle &verified_candidate) {
-  using ReadResult = core::Result<PersistedManagerApplyStatus>;
-  const auto rejected = [](std::string reason) {
-    return ReadResult::Err(core::ErrorDTO{
-        "native_apply_parent_read_unavailable",
-        "the exact retained native Apply parent cannot be observed",
-        {{"reason", std::move(reason)}}});
-  };
-  sqlite3 *database = nullptr;
-  try {
-    if (!native_plan.apply.valid() ||
-        !deployment::verify_retained_bundle_identity(verified_candidate))
-      return rejected("native_plan_or_candidate_invalid");
-    const auto &candidate = verified_candidate.value();
-    const auto &graph = candidate.cell_graph;
-    if (graph.cell_id != cell_id ||
-        native_plan.candidate_retained_bundle_id !=
-            verified_candidate.retained_bundle_id() ||
-        native_plan.candidate_graph_revision != graph.graph_revision ||
-        native_plan.components.size() > core::kMaximumCCLCComponentWatermarks ||
-        native_plan.routes.size() >
-            core::kMaximumCCLCActiveConfigurationWatermarks ||
-        native_plan.removed_components.size() >
-            core::kMaximumCCLCComponentWatermarks ||
-        native_plan.removed_domains.size() >
-            core::kMaximumCCLCActiveConfigurationWatermarks)
-      return rejected("native_plan_candidate_mismatch");
-    std::map<ControllableComponentId, std::vector<ControlDomainId>>
-        component_domains;
-    std::vector<ControllableComponentId> candidate_components;
-    for (const auto &component : graph.controllable_components) {
-      candidate_components.push_back(component.controllable_component_id);
-      component_domains.emplace(component.controllable_component_id,
-                                std::vector<ControlDomainId>{});
-    }
-    std::sort(candidate_components.begin(), candidate_components.end());
-    for (const auto &binding : graph.control_bindings)
-      component_domains.at(binding.controllable_component_id)
-          .push_back(binding.control_domain_id);
-    for (auto &[component, domains] : component_domains) {
-      static_cast<void>(component);
-      std::sort(domains.begin(), domains.end());
-      domains.erase(std::unique(domains.begin(), domains.end()), domains.end());
-    }
-    std::vector<ControllableComponentId> planned_components;
-    for (const auto &component : native_plan.components) {
-      if (!component.generation.nonzero() ||
-          component.generation.value() >
-              static_cast<std::uint64_t>(
-                  std::numeric_limits<std::int64_t>::max()) ||
-          component.state < core::ComponentLifecycleStateDTO::kUndeclared ||
-          component.state > core::ComponentLifecycleStateDTO::kDisabled)
-        return rejected("native_component_fact_invalid");
-      planned_components.push_back(component.component_id);
-    }
-    // Preserve the native journal's canonical ordering and detect duplicates;
-    // these planned generations/states remain the captured CCLC owner's facts.
-    if (planned_components != candidate_components)
-      return rejected("native_component_coverage_mismatch");
-    std::vector<ControlDomainId> candidate_domains;
-    for (const auto &desired : candidate.desired_control_configurations)
-      candidate_domains.push_back(desired.control_domain_id);
-    std::sort(candidate_domains.begin(), candidate_domains.end());
-    std::vector<ControlDomainId> planned_domains;
-    for (const auto &route : native_plan.routes) {
-      if (!route.generation.nonzero() ||
-          route.generation.value() >
-              static_cast<std::uint64_t>(
-                  std::numeric_limits<std::int64_t>::max()))
-        return rejected("native_route_fact_invalid");
-      planned_domains.push_back(route.control_domain_id);
-    }
-    if (planned_domains != candidate_domains)
-      return rejected("native_domain_coverage_mismatch");
-
-    PreflightApplyJournal(database_path, cell_id);
-    const auto opened = sqlite3_open_v2(
-        database_path.string().c_str(), &database,
-        SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_NOFOLLOW,
-        nullptr);
-    if (opened != SQLITE_OK) {
-      if (database != nullptr)
-        sqlite3_close(database);
-      database = nullptr;
-      return rejected("parent_journal_unavailable");
-    }
-    Check(database, sqlite3_busy_timeout(database, kBusyTimeoutMilliseconds),
-          "configure read-only native parent timeout");
-    Exec(database, "PRAGMA query_only=ON");
-    std::optional<PersistedManagerApplyStatus> result;
-    {
-      Transaction snapshot(database, "BEGIN");
-      ValidateApplyJournalIdentityAndSchema(database, cell_id, database_path);
-      SqliteManagerApplyJournal::Impl view(database, cell_id);
-      auto status = view.StatusWithFailedReleaseLocked(
-          native_plan.apply.apply_id,
-          CheckedSigned(native_plan.apply.apply_generation.value(),
-                        "apply_generation"));
-      if (!status || !status->affected_scope ||
-          status->intent.intent.candidate_retained_bundle_id !=
-              native_plan.candidate_retained_bundle_id ||
-          status->intent.intent.candidate_graph_revision !=
-              native_plan.candidate_graph_revision)
-        throw ManagerApplyJournalIntegrityError(
-            "native parent or affected scope identity mismatch");
-      std::vector<ControllableComponentId> retained_components;
-      std::vector<ControllableComponentId> removed_components;
-      std::set<ControlDomainId> predecessor_domains;
-      std::size_t candidate_rows = 0U;
-      for (const auto &row :
-           status->affected_scope->affected_scope.component_delta.components) {
-        const auto identity = deployment::derive_component_runtime_identity(
-            verified_candidate, row.controllable_component_id);
-        const auto domains =
-            component_domains.find(row.controllable_component_id);
-        if (identity != row.candidate_runtime_identity ||
-            (domains == component_domains.end()
-                 ? !row.candidate_domains.empty()
-                 : domains->second != row.candidate_domains))
-          throw ManagerApplyJournalIntegrityError(
-              "native candidate component identity mismatch");
-        if (identity)
-          ++candidate_rows;
-        if (row.disposition == deployment::ApplyComponentDisposition::kRetain)
-          retained_components.push_back(row.controllable_component_id);
-        if (row.disposition == deployment::ApplyComponentDisposition::kRemove)
-          removed_components.push_back(row.controllable_component_id);
-        predecessor_domains.insert(row.predecessor_domains.begin(),
-                                   row.predecessor_domains.end());
-      }
-      std::set<ControlDomainId> retained_domains;
-      for (const auto &desired : candidate.desired_control_configurations)
-        for (const auto &route : desired.binding_routes) {
-          const auto binding = std::find_if(
-              graph.control_bindings.begin(), graph.control_bindings.end(),
-              [&](const auto &value) {
-                return value.control_binding_id == route.control_binding_id;
-              });
-          if (binding == graph.control_bindings.end())
-            throw ManagerApplyJournalIntegrityError(
-                "native candidate desired binding missing");
-          if (std::binary_search(retained_components.begin(),
-                                 retained_components.end(),
-                                 binding->controllable_component_id))
-            retained_domains.insert(desired.control_domain_id);
-        }
-      std::vector<ControlDomainId> removed_domains;
-      std::set_difference(predecessor_domains.begin(),
-                          predecessor_domains.end(), candidate_domains.begin(),
-                          candidate_domains.end(),
-                          std::back_inserter(removed_domains));
-      if (candidate_rows != candidate_components.size() ||
-          native_plan.retained_components != retained_components ||
-          native_plan.removed_components != removed_components ||
-          native_plan.retained_domains !=
-              std::vector<ControlDomainId>(retained_domains.begin(),
-                                           retained_domains.end()) ||
-          native_plan.removed_domains != removed_domains ||
-          (status->bring_up_plan &&
-           status->bring_up_plan->plan.configured_components !=
-               candidate_components))
-        throw ManagerApplyJournalIntegrityError(
-            "native retained or removed closure mismatch");
-      if (status->bring_up_plan) {
-        const ContentDigest candidate_digest(
-            RawDigest(verified_candidate.canonical_bytes()));
-        for (const auto &child : status->bring_up_plan->plan.children)
-          if (child.candidate_retained_bundle_digest != candidate_digest ||
-              child.candidate_retained_bundle_bytes !=
-                  verified_candidate.canonical_bytes().size())
-            throw ManagerApplyJournalIntegrityError(
-                "native child retained candidate bytes mismatch");
-      }
-      result = std::move(status);
-      snapshot.Commit();
-    }
-    sqlite3_close(database);
-    database = nullptr;
-    return ReadResult::Ok(std::move(*result));
-  } catch (const std::exception &) {
-    if (database != nullptr)
-      sqlite3_close(database);
-    return rejected("parent_journal_or_native_identity_invalid");
-  }
-}
-
-core::Result<std::optional<PersistedManagerApplyStatus>>
-ReadNativeApplyPreparationFailureReadOnly(
-    const std::filesystem::path &database_path, const CellId &cell_id,
-    const core::NativeApplyPlanDTO &native_plan,
-    const deployment::RetainedBundle &verified_candidate,
-    const core::CellAdmissionClaimDTO &parent_claim,
-    const core::CellAdmissionRecoveryReceiptQueryDTO &claim_query,
-    const core::CellAdmissionRecoveryReceiptDTO &claim_receipt) {
-  using ReadResult = core::Result<std::optional<PersistedManagerApplyStatus>>;
-  const auto rejected = [](std::string reason) {
-    return ReadResult::Err(
-        core::ErrorDTO{"native_apply_preparation_failure_read_unavailable",
-                       "the exact original native Apply preparation failure "
-                       "cannot be observed",
-                       {{"reason", std::move(reason)}}});
-  };
-  // These are actual supplied recovery values, never a Kernel callback or a
-  // claim inferred from the owner journal. Validate them before entering SQL.
-  if (!core::ValidateCellAdmissionRecoveryReceiptQuery(claim_query).ok() ||
-      !core::ValidateCellAdmissionRecoveryReceipt(claim_receipt).ok() ||
-      claim_query.intent != parent_claim.intent ||
-      claim_query.expected_claim != std::optional(parent_claim) ||
-      claim_query.expected_release ||
-      claim_receipt.status !=
-          core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact ||
-      claim_receipt.matched_claim != std::optional(parent_claim))
-    return rejected("original_parent_not_held_exact");
-
-  auto read = ReadNativeApplyParentStatusReadOnly(
-      database_path, cell_id, native_plan, verified_candidate);
-  if (!read.ok())
-    return ReadResult::Err(read.error());
-  auto status = std::move(read.value());
-  const auto &intent = status.intent.intent;
-  if (intent.parent_authoring_claim) {
-    if (status.bring_up_plan || *intent.parent_authoring_claim != parent_claim)
-      return rejected("native_authoring_parent_claim_mismatch");
-  } else {
-    if (!intent.expected_admission_generation)
-      return rejected("native_parent_admission_identity_missing");
-    const core::CellAdmissionClaimIntentDTO expected{
-        core::CellAdmissionClaimKindDTO::kManagerApply,
-        core::CellAdmissionOwnerRoleDTO::kManager,
-        intent.request_context.request_owner_epoch,
-        intent.apply_id.value(),
-        intent.request_context.request_id,
-        status.bring_up_plan ? status.bring_up_plan->plan_digest
-                             : status.intent.intent_digest,
-        *intent.expected_admission_generation,
-        {},
-        std::nullopt,
-        std::nullopt,
-        std::nullopt};
-    if (parent_claim.intent != expected)
-      return rejected("native_original_parent_claim_intent_mismatch");
-  }
-  for (const auto &proof : status.bring_up_child_proofs)
-    if (!proof.proof.result.status ||
-        !proof.proof.result.status->apply_bring_up ||
-        proof.proof.result.status->apply_bring_up->parent_authority
-                .parent_claim != parent_claim)
-      return rejected("native_child_original_parent_claim_mismatch");
-
-  const auto &terminal = status.terminal_outcome;
-  // The native host's typed composition refusal is the same early failure,
-  // retained as a known `failed`.
-  const auto early_disposition = [](const ManagerApplyTerminalOutcomeDTO &outcome) {
-    const auto &failure = *outcome.failure;
-    return outcome.state == ManagerApplyTerminalOutcomeState::kUnknownEffect
-               ? failure.effect_disposition == ManagerApplyEffectDisposition::kUnknown
-               : outcome.state == ManagerApplyTerminalOutcomeState::kFailed &&
-                     failure.effect_disposition == ManagerApplyEffectDisposition::kKnown &&
-                     failure.cause_code == kScenarioCompositionRefusedCode;
-  };
-  const bool early =
-      terminal &&
-      terminal->terminal_outcome.failure &&
-      early_disposition(terminal->terminal_outcome) &&
-      terminal->terminal_outcome.failure->failure_code ==
-          "runtime_composition_preparation_failed" &&
-      terminal->terminal_outcome.failure->intent_digest ==
-          status.intent.intent_digest &&
-      terminal->terminal_outcome.failure->phase ==
-          ManagerApplyPhase::kRuntimeConverged &&
-      status.fence_attempt && status.fence_acceptance &&
-      status.runtime_convergence_intent && status.latest_runtime_staged_ready &&
-      !status.private_materialization && !status.publication_receipt &&
-      !status.fence_release_intent && !status.fence_released &&
-      std::all_of(status.bring_up_child_proofs.begin(),
-                  status.bring_up_child_proofs.end(), [](const auto &proof) {
-                    return proof.proof.phase ==
-                           ManagerApplyBringUpChildPhase::kAccepted;
-                  });
-  if (!early)
-    return ReadResult::Ok(std::nullopt);
-  return ReadResult::Ok(std::move(status));
-}
-core::Result<void> ValidateManagerApplyBringUpCellAdmissionSettlementReadOnly(
-    const std::filesystem::path &database_path, const CellId &cell_id,
-    const core::CellAdmissionClaimDTO &claim,
-    const core::CellAdmissionClaimReleaseDTO &release) {
-  const auto rejected = [](std::string reason) {
-    return core::Result<void>::Err(core::ErrorDTO{
-        "invariant_violation",
-        "Manager configured bring-up settlement is not owner-proven",
-        {{"reason", std::move(reason)}}});
-  };
-  if (!core::ValidateCellAdmissionClaimIntent(claim.intent).ok() ||
-      claim.intent.claim_kind !=
-          core::CellAdmissionClaimKindDTO::kManagerApply ||
-      claim.intent.owner_role != core::CellAdmissionOwnerRoleDTO::kManager ||
-      release.owner_role != claim.intent.owner_role ||
-      release.owner_epoch != claim.intent.owner_epoch ||
-      release.owner_transaction_id != claim.intent.owner_transaction_id ||
-      release.request_id != claim.intent.request_id ||
-      release.request_payload_digest != claim.intent.request_payload_digest ||
-      release.acquired_admission_generation !=
-          claim.acquired_admission_generation ||
-      release.claim_generation != claim.claim_generation ||
-      release.settlement.settlement_kind !=
-          core::CellAdmissionSettlementKindDTO::kTerminalEffectsSettled) {
-    return rejected("manager_bring_up_release_identity_mismatch");
-  }
-  sqlite3 *database = nullptr;
-  const auto opened = sqlite3_open_v2(
-      database_path.string().c_str(), &database,
-      SQLITE_OPEN_READONLY | SQLITE_OPEN_FULLMUTEX | SQLITE_OPEN_NOFOLLOW,
-      nullptr);
-  if (opened != SQLITE_OK) {
-    if (database != nullptr)
-      sqlite3_close(database);
-    return rejected("manager_bring_up_journal_unavailable");
-  }
-  try {
-    Check(database, sqlite3_busy_timeout(database, kBusyTimeoutMilliseconds),
-          "configure read-only settlement timeout");
-    Exec(database, "PRAGMA query_only=ON");
-    {
-      Transaction snapshot(database, "BEGIN");
-      ValidateApplyJournalIdentityAndSchema(database, cell_id, database_path);
-      SqliteManagerApplyJournal::Impl view(database, cell_id);
-      const auto parent =
-          view.RequestLocked(claim.intent.owner_epoch, claim.intent.request_id);
-      if (!parent.has_value() ||
-          parent->intent.apply_id.value() !=
-              claim.intent.owner_transaction_id ||
-          parent->intent.expected_admission_generation !=
-              claim.intent.expected_admission_generation ||
-          parent->intent.parent_authoring_claim.has_value()) {
-        throw ManagerApplyJournalIntegrityError(
-            "bring-up settlement parent identity mismatch");
-      }
-      const auto generation = CheckedSigned(
-          parent->intent.apply_generation.value(), "apply_generation");
-      if (!view.StatusWithFailedReleaseLocked(parent->intent.apply_id, generation))
-        throw ManagerApplyJournalIntegrityError(
-            "bring-up settlement parent status missing");
-      const auto plan =
-          view.BringUpPlanLocked(parent->intent.apply_id, generation);
-      const auto terminal =
-          view.TerminalOutcomeLocked(parent->intent.apply_id, generation);
-      if (!plan.has_value() ||
-          plan->plan_digest != claim.intent.request_payload_digest ||
-          !terminal.has_value() ||
-          terminal->terminal_outcome_digest !=
-              release.settlement.evidence_digest) {
-        throw ManagerApplyJournalIntegrityError(
-            "bring-up settlement plan or terminal evidence mismatch");
-      }
-      const auto proofs =
-          view.BringUpChildProofsLocked(parent->intent.apply_id, generation);
-      if (terminal->terminal_outcome.succeeded()) {
-        view.RequireBringUpProofSetLocked(*plan, true);
-        // Every successful child observed the same full original claim, not
-        // merely a matching attribution or a reconstructed owner epoch.
-        for (const auto &proof : proofs) {
-          if (proof.proof.result.status.has_value() &&
-              proof.proof.result.status->apply_bring_up->parent_authority
-                      .parent_claim != claim) {
-            throw ManagerApplyJournalIntegrityError(
-                "bring-up settlement is not the original held parent claim");
-          }
-        }
-      } else if (terminal->terminal_outcome.state !=
-                     ManagerApplyTerminalOutcomeState::kFailed ||
-                 terminal->terminal_outcome.failure->phase !=
-                     ManagerApplyPhase::kAccepted ||
-                 terminal->terminal_outcome.failure->effect_disposition !=
-                     ManagerApplyEffectDisposition::kKnown ||
-                 view.FenceAttemptLocked(parent->intent.apply_id, generation)
-                     .has_value() ||
-                 !proofs.empty()) {
-        throw ManagerApplyJournalIntegrityError(
-            "effectful or unknown bring-up failure retains its exclusion");
-      }
-      snapshot.Commit();
-    }
-    sqlite3_close(database);
-    database = nullptr;
-    return core::Result<void>::Ok();
-  } catch (const std::exception &) {
-    sqlite3_close(database);
-    return rejected("manager_bring_up_journal_read_failed");
   }
 }
 

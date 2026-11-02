@@ -1,5 +1,10 @@
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <thread>
+
 #include <manyforge_core/execution_progress_publication.hpp>
 
 namespace manyforge::core {
@@ -150,6 +155,51 @@ TEST(ExecutionProgressPublicationTest,
                                             ExecutionProgressAuthorityProfile::kCommandedSimulation,
                                             "invalid", 100),
                std::invalid_argument);
+}
+
+TEST(ExecutionProgressPublicationTest, ReaderOverlappingFeedbackWritesKeepsTheLatestCursor) {
+  // Live failure: the lookahead read the cursor while a feedback write was in
+  // flight and got valid=false, generation 0, time 0 for an active motion.
+  ExecutionProgressPublication publication(ExecutionProgressSourceKind::kBackendCommanded,
+                                           ExecutionProgressAuthorityProfile::kCommandedSimulation,
+                                           "mock_command_authority", 0);
+  constexpr std::uint64_t kGeneration = 8;
+  constexpr std::int64_t kWrites = 200000;
+  ASSERT_TRUE(publication.publish(kGeneration, 0, 0, 0).published);
+
+  std::atomic<bool> done{false};
+  std::thread writer([&]() {
+    for (std::int64_t time_ns = 1; time_ns <= kWrites; ++time_ns) {
+      (void)publication.publish(kGeneration, time_ns, time_ns, time_ns);
+      const auto until = std::chrono::steady_clock::now() + std::chrono::microseconds(1);
+      while (std::chrono::steady_clock::now() < until) {
+      }
+    }
+    done.store(true, std::memory_order_release);
+  });
+
+  std::int64_t reads = 0;
+  std::int64_t invalid = 0;
+  std::int64_t previous_time_ns = 0;
+  while (!done.load(std::memory_order_acquire)) {
+    const auto cursor = publication.acquire();
+    ++reads;
+    if (!cursor.valid || cursor.execution_generation != kGeneration) {
+      ++invalid;
+      continue;
+    }
+    EXPECT_GE(cursor.trajectory_time_ns, previous_time_ns);
+    EXPECT_EQ(cursor.source_timestamp_ns, cursor.trajectory_time_ns);
+    EXPECT_EQ(cursor.received_timestamp_ns, cursor.trajectory_time_ns);
+    previous_time_ns = cursor.trajectory_time_ns;
+  }
+  writer.join();
+
+  EXPECT_GT(reads, kWrites);
+  EXPECT_EQ(invalid, 0);
+  const auto last = publication.acquire();
+  EXPECT_TRUE(last.valid);
+  EXPECT_EQ(last.trajectory_time_ns, kWrites);
 }
 
 }  // namespace

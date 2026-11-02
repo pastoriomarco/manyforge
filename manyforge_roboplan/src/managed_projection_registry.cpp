@@ -37,7 +37,7 @@ namespace core = manyforge::core;
 namespace deployment = manyforge::deployment;
 
 [[noreturn]] void Fail(std::string detail) {
-  throw std::runtime_error("Native execution host: " + std::move(detail));
+  throw std::runtime_error("Execution host: " + std::move(detail));
 }
 
 void Require(bool condition, std::string detail) {
@@ -187,7 +187,7 @@ public:
           } else if constexpr (std::is_same_v<
                                    T, component_manager::detail::
                                           NativeProjectionHealthQuery>) {
-            return ProjectionHealth(value.native_runtime_binding,
+            return ProjectionHealth(value.execution_host_binding,
                                     value.selected_projection_revision);
           } else if constexpr (std::is_same_v<
                                    T, component_manager::detail::
@@ -207,14 +207,14 @@ public:
           } else if constexpr (std::is_same_v<
                                    T, component_manager::detail::
                                           NativeProjectionRetainRequest>) {
-            auto owner = LeaseOwner(value.native_runtime_binding,
+            auto owner = LeaseOwner(value.execution_host_binding,
                                     value.projection_lease_id);
             if (owner == nullptr) {
-              owner = RevisionHandle(value.native_runtime_binding,
+              owner = RevisionHandle(value.execution_host_binding,
                                      value.projection_revision);
             }
             auto retained =
-                IdleHandle(value.native_runtime_binding, "retain", owner)
+                IdleHandle(value.execution_host_binding, "retain", owner)
                     ->RetainProjectionBinding(value.projection_revision,
                                              value.projection_lease_id);
             if (!retained.ok()) {
@@ -226,15 +226,15 @@ public:
           } else if constexpr (std::is_same_v<
                                    T, component_manager::detail::
                                           NativeProjectionReleaseRequest>) {
-            auto owner = LeaseOwner(value.native_runtime_binding,
+            auto owner = LeaseOwner(value.execution_host_binding,
                                     value.projection_lease_id);
             if (owner != nullptr) {
-              IdleHandle(value.native_runtime_binding, "release", owner)
+              IdleHandle(value.execution_host_binding, "release", owner)
                   ->ReleaseProjection(value.projection_lease_id);
             } else {
               // Release is idempotent. An absent lease must not be redirected
               // to a progressing candidate, nor acknowledge a foreign binding.
-              Require(Find(value.native_runtime_binding) != nullptr,
+              Require(Find(value.execution_host_binding) != nullptr,
                       "native projection release names an unprepared binding");
             }
             owner.reset();
@@ -245,8 +245,8 @@ public:
                                    T, component_manager::detail::
                                           NativeProjectionSceneFrameRequest>) {
             auto resolved =
-                IdleHandle(value.native_runtime_binding, "frame_resolution",
-                           LeaseOwner(value.native_runtime_binding,
+                IdleHandle(value.execution_host_binding, "frame_resolution",
+                           LeaseOwner(value.execution_host_binding,
                                       value.query.projection_binding
                                           .projection_lease_id))
                     ->ResolveSceneFrame(value.query);
@@ -260,8 +260,8 @@ public:
                 std::is_same_v<T, component_manager::detail::
                                       NativeProjectionEffectivePolicyRequest>);
             auto projected =
-                IdleHandle(value.native_runtime_binding, "policy_projection",
-                           PolicyHandle(value.native_runtime_binding,
+                IdleHandle(value.execution_host_binding, "policy_projection",
+                           PolicyHandle(value.execution_host_binding,
                                         value.logical_scene))
                     ->ProjectEffectiveCollisionPolicy(
                         value.logical_scene,
@@ -380,7 +380,7 @@ public:
   [[nodiscard]] std::shared_ptr<RetainedPlannerSceneProjection>
   FindActiveProjection(
       const core::ProjectionRevisionDTO &expected,
-      const core::ProjectionNativeRuntimeBindingDTO &binding) const {
+      const core::ProjectionExecutionHostBindingDTO &binding) const {
     const auto projection = FindRevision(binding, expected);
     if (projection == nullptr || WorkPendingFor(Key(binding), projection)) {
       return nullptr;
@@ -395,7 +395,7 @@ public:
   [[nodiscard]] std::optional<core::ProjectionRevisionDTO>
   FindCurrentProjectionRevision(
       const core::ProjectionRevisionDTO &expected,
-      const core::ProjectionNativeRuntimeBindingDTO &binding) const {
+      const core::ProjectionExecutionHostBindingDTO &binding) const {
     const auto handle = FindRevision(binding, expected);
     if (handle == nullptr || WorkPendingFor(Key(binding), handle)) {
       return std::nullopt;
@@ -450,7 +450,7 @@ public:
       const ManagedProjectionKey key{
           provider.capability_provider_binding_id,
           provider.capability_provider_binding_revision};
-      const core::ProjectionNativeRuntimeBindingDTO binding{
+      const core::ProjectionExecutionHostBindingDTO binding{
           provider.capability_provider_binding_id,
           provider.capability_provider_binding_revision,
           core::RuntimeUnitId(config_.runtime_unit_id),
@@ -465,7 +465,7 @@ public:
         return false;
       }
       const auto health = projection->ProjectionHealth();
-      if (health.native_runtime_binding != binding ||
+      if (health.execution_host_binding != binding ||
           !health.healthy_for_identity(expected)) {
         ReportProjectionReadiness("not healthy " + key.first.value());
         return false;
@@ -495,7 +495,7 @@ public:
     // the resolver installation itself run afterwards, so a provider whose
     // worker holds the projection mutex cannot block this composition step.
     std::set<ManagedProjectionKey> required_keys;
-    std::vector<std::pair<core::ProjectionNativeRuntimeBindingDTO,
+    std::vector<std::pair<core::ProjectionExecutionHostBindingDTO,
                           std::shared_ptr<RetainedPlannerSceneProjection>>>
         required;
     {
@@ -530,7 +530,7 @@ public:
             provider.capability_provider_binding_revision};
         Require(required_keys.insert(key).second,
                 "active native projection binding is repeated");
-        const core::ProjectionNativeRuntimeBindingDTO expected_binding{
+        const core::ProjectionExecutionHostBindingDTO expected_binding{
             provider.capability_provider_binding_id,
             provider.capability_provider_binding_revision,
             core::RuntimeUnitId(config_.runtime_unit_id),
@@ -548,7 +548,7 @@ public:
 
     for (const auto &[binding, projection] : required) {
       const auto health = projection->ProjectionHealth();
-      Require(health.native_runtime_binding == binding &&
+      Require(health.execution_host_binding == binding &&
                   health.healthy_for_identity(expected),
               "active frame-resolver set contains a stale projection");
     }
@@ -565,7 +565,7 @@ public:
 private:
   struct JobProgress final {
     JobProgress(std::string operation_value,
-                core::ProjectionNativeRuntimeBindingDTO binding_value,
+                core::ProjectionExecutionHostBindingDTO binding_value,
                 std::string initial_milestone,
                 RetainedPlannerSceneProjection::Clock clock_value)
         : operation(std::move(operation_value)),
@@ -596,7 +596,7 @@ private:
     }
 
     std::string operation;
-    core::ProjectionNativeRuntimeBindingDTO binding;
+    core::ProjectionExecutionHostBindingDTO binding;
     RetainedPlannerSceneProjection::Clock clock;
     std::int64_t started_at_ns;
     std::int64_t last_progress_at_ns;
@@ -644,7 +644,7 @@ private:
     /// Candidate staging may keep its predecessor under the same binding;
     /// revision and lease selectors, never the provider key alone, choose the
     /// owner for revision-bearing requests.
-    core::ProjectionNativeRuntimeBindingDTO binding;
+    core::ProjectionExecutionHostBindingDTO binding;
     std::shared_ptr<RetainedPlannerSceneProjection> projection;
     PreparedIdentity identity;
   };
@@ -724,14 +724,14 @@ private:
     }
     return UncertainRebuild(
         job.request, job.accepted_health,
-        WorkerFailure("rebuild", job.request.expected_native_runtime_binding,
+        WorkerFailure("rebuild", job.request.expected_execution_host_binding,
                       "native_projection_rebuild_aborted",
                       "the Rebuild worker did not settle"));
   }
 
   [[nodiscard]] static core::ErrorDTO WorkerFailure(
       const std::string_view operation,
-      const core::ProjectionNativeRuntimeBindingDTO &binding,
+      const core::ProjectionExecutionHostBindingDTO &binding,
       const std::string_view reason, const std::string_view detail) {
     return core::ErrorDTO{
         "projection_state_uncertain",
@@ -810,12 +810,12 @@ private:
   }
 
   [[nodiscard]] static ManagedProjectionKey
-  Key(const core::ProjectionNativeRuntimeBindingDTO &binding) {
+  Key(const core::ProjectionExecutionHostBindingDTO &binding) {
     return {binding.provider_binding_id, binding.provider_binding_revision};
   }
 
   void RequireLocalBinding(
-      const core::ProjectionNativeRuntimeBindingDTO &binding) const {
+      const core::ProjectionExecutionHostBindingDTO &binding) const {
     Require(binding.valid() &&
                 binding.runtime_unit_id.value() == config_.runtime_unit_id &&
                 binding.runtime_epoch.value() == config_.runtime_epoch,
@@ -827,7 +827,7 @@ private:
   /// caller reaches a pending-map fast path, and the projection's own mutex is
   /// never acquired while the registry mutex is held.
   [[nodiscard]] std::shared_ptr<RetainedPlannerSceneProjection>
-  Find(const core::ProjectionNativeRuntimeBindingDTO &binding) const {
+  Find(const core::ProjectionExecutionHostBindingDTO &binding) const {
     RequireLocalBinding(binding);
     std::lock_guard lock(mutex_);
     const auto found = projections_.find(Key(binding));
@@ -839,7 +839,7 @@ private:
   }
 
   [[nodiscard]] std::vector<RegisteredProjection> OwnedProjections(
-      const core::ProjectionNativeRuntimeBindingDTO &binding) const {
+      const core::ProjectionExecutionHostBindingDTO &binding) const {
     RequireLocalBinding(binding);
     std::lock_guard lock(mutex_);
     std::vector<RegisteredProjection> result;
@@ -853,7 +853,7 @@ private:
   }
 
   [[nodiscard]] std::shared_ptr<RetainedPlannerSceneProjection> FindRevision(
-      const core::ProjectionNativeRuntimeBindingDTO &binding,
+      const core::ProjectionExecutionHostBindingDTO &binding,
       const core::ProjectionRevisionDTO &revision) const {
     RequireLocalBinding(binding);
     std::lock_guard lock(mutex_);
@@ -861,7 +861,7 @@ private:
   }
 
   [[nodiscard]] std::shared_ptr<RetainedPlannerSceneProjection>
-  FindRevisionLocked(const core::ProjectionNativeRuntimeBindingDTO &binding,
+  FindRevisionLocked(const core::ProjectionExecutionHostBindingDTO &binding,
                      const core::ProjectionRevisionDTO &revision) const {
     for (const auto *slots : {&projections_, &retired_projections_}) {
       const auto found = slots->find(Key(binding));
@@ -876,7 +876,7 @@ private:
   }
 
   [[nodiscard]] std::shared_ptr<RetainedPlannerSceneProjection> RevisionHandle(
-      const core::ProjectionNativeRuntimeBindingDTO &binding,
+      const core::ProjectionExecutionHostBindingDTO &binding,
       const core::ProjectionRevisionDTO &revision) const {
     auto projection = FindRevision(binding, revision);
     Require(projection != nullptr,
@@ -887,7 +887,7 @@ private:
   /// Release has no revision selector. Resolve its actual retained lease owner,
   /// without a second lease database or interpreting an ID as the latest model.
   [[nodiscard]] std::shared_ptr<RetainedPlannerSceneProjection> LeaseOwner(
-      const core::ProjectionNativeRuntimeBindingDTO &binding,
+      const core::ProjectionExecutionHostBindingDTO &binding,
       const core::ProjectionLeaseId &lease_id) const {
     std::shared_ptr<RetainedPlannerSceneProjection> owner;
     for (const auto &entry : OwnedProjections(binding)) {
@@ -915,7 +915,7 @@ private:
   }
 
   [[nodiscard]] std::shared_ptr<RetainedPlannerSceneProjection> PolicyHandle(
-      const core::ProjectionNativeRuntimeBindingDTO &binding,
+      const core::ProjectionExecutionHostBindingDTO &binding,
       const core::LogicalSceneSnapshotDTO &scene) const {
     std::shared_ptr<RetainedPlannerSceneProjection> owner;
     for (const auto &entry : OwnedProjections(binding)) {
@@ -934,7 +934,7 @@ private:
   }
 
   [[nodiscard]] std::shared_ptr<RetainedPlannerSceneProjection>
-  Handle(const core::ProjectionNativeRuntimeBindingDTO &binding) const {
+  Handle(const core::ProjectionExecutionHostBindingDTO &binding) const {
     auto projection = Find(binding);
     Require(projection != nullptr,
             "native projection request names an unprepared binding");
@@ -942,7 +942,7 @@ private:
   }
 
   [[nodiscard]] std::shared_ptr<RetainedPlannerSceneProjection> IdleHandle(
-      const core::ProjectionNativeRuntimeBindingDTO &binding,
+      const core::ProjectionExecutionHostBindingDTO &binding,
       const std::string_view operation,
       std::shared_ptr<RetainedPlannerSceneProjection> projection = nullptr) const {
     // Resolve the complete binding first. Only then may a pending job reject a
@@ -959,7 +959,7 @@ private:
 
   [[nodiscard]] static core::ErrorDTO PendingOperationError(
       const std::string_view operation,
-      const core::ProjectionNativeRuntimeBindingDTO &binding) {
+      const core::ProjectionExecutionHostBindingDTO &binding) {
     return core::ErrorDTO{
         "projection_state_uncertain",
         "native projection " + std::string(operation) +
@@ -986,12 +986,12 @@ private:
           &request) {
     Require(request.valid(), "native projection transaction is invalid");
     auto projection = RevisionHandle(
-        request.native_runtime_binding,
+        request.execution_host_binding,
         request.transaction.prior_projection_revision);
     std::optional<core::ProjectionHealthDTO> pending;
     {
       std::lock_guard lock(mutex_);
-      pending = CapturedJobHealthLocked(Key(request.native_runtime_binding),
+      pending = CapturedJobHealthLocked(Key(request.execution_host_binding),
                                        projection);
     }
     if (!pending.has_value()) {
@@ -1004,7 +1004,7 @@ private:
       return result;
     }
     const auto failure =
-        PendingOperationError("transaction", request.native_runtime_binding);
+        PendingOperationError("transaction", request.execution_host_binding);
     auto uncertain = UncertainHealth(*pending, failure);
     core::ProjectionCommitResultDTO result{
         request.transaction.transaction_sequence,
@@ -1024,12 +1024,12 @@ private:
   [[nodiscard]] core::NativeProjectionBootstrapRebuildResultDTO
   BootstrapRebuild(const core::NativeProjectionBootstrapRebuildDTO &request) {
     Require(request.valid(), "native projection bootstrap rebuild is invalid");
-    auto projection = RevisionHandle(request.native_runtime_binding,
+    auto projection = RevisionHandle(request.execution_host_binding,
                                      request.canonical_empty_target);
     std::optional<core::ProjectionHealthDTO> pending;
     {
       std::lock_guard lock(mutex_);
-      pending = CapturedJobHealthLocked(Key(request.native_runtime_binding),
+      pending = CapturedJobHealthLocked(Key(request.execution_host_binding),
                                        projection);
     }
     if (!pending.has_value()) {
@@ -1043,11 +1043,11 @@ private:
       return result;
     }
     const auto failure = PendingOperationError(
-        "bootstrap_rebuild", request.native_runtime_binding);
+        "bootstrap_rebuild", request.execution_host_binding);
     core::NativeProjectionBootstrapRebuildResultDTO result{
         request.bootstrap_id,
         request.bootstrap_generation,
-        request.native_runtime_binding,
+        request.execution_host_binding,
         request.canonical_empty_target,
         request.planning_collision_model,
         request.initialized_logical_scene,
@@ -1067,23 +1067,23 @@ private:
   [[nodiscard]] core::NativeProjectionBootstrapStatusDTO BootstrapStatus(
       const core::NativeProjectionBootstrapStatusQueryDTO &query) {
     Require(query.valid(), "native projection bootstrap status is invalid");
-    auto projection = RevisionHandle(query.native_runtime_binding,
+    auto projection = RevisionHandle(query.execution_host_binding,
                                      query.canonical_empty_target);
     std::optional<core::ProjectionHealthDTO> pending;
     {
       std::lock_guard lock(mutex_);
-      pending = CapturedJobHealthLocked(Key(query.native_runtime_binding),
+      pending = CapturedJobHealthLocked(Key(query.execution_host_binding),
                                        projection);
     }
     if (!pending.has_value()) {
       return projection->BootstrapProjectionStatus(query);
     }
     const auto failure =
-        PendingOperationError("bootstrap_status", query.native_runtime_binding);
+        PendingOperationError("bootstrap_status", query.execution_host_binding);
     core::NativeProjectionBootstrapStatusDTO result{
         query.bootstrap_id,
         query.bootstrap_generation,
-        query.native_runtime_binding,
+        query.execution_host_binding,
         query.canonical_empty_target,
         core::NativeProjectionBootstrapStatusState::
             kFailedProjectionUncertain,
@@ -1102,7 +1102,7 @@ private:
   [[nodiscard]] core::ProjectionCommitResultDTO
   BeginRebuild(const core::NativeProjectionRebuildDTO &request) {
     Require(request.valid(), "native projection rebuild request is invalid");
-    const auto &binding = request.expected_native_runtime_binding;
+    const auto &binding = request.expected_execution_host_binding;
     auto projection = RevisionHandle(binding, request.target_projection_revision);
     const auto key = Key(binding);
     std::optional<PendingRebuild> superseded_rebuild;
@@ -1170,7 +1170,7 @@ private:
     auto job = std::make_shared<
         std::promise<core::ProjectionCommitResultDTO>>();
     auto result = job->get_future().share();
-    const auto binding = request.expected_native_runtime_binding;
+    const auto binding = request.expected_execution_host_binding;
     auto progress =
         std::make_shared<JobProgress>("rebuild", binding, "input_ready",
                                       clock_);
@@ -1222,7 +1222,7 @@ private:
 
   [[nodiscard]] static core::ProjectionHealthDTO ObservedHealth(
       const std::shared_ptr<RetainedPlannerSceneProjection> &projection,
-      const core::ProjectionNativeRuntimeBindingDTO &binding) {
+      const core::ProjectionExecutionHostBindingDTO &binding) {
     try {
       return projection->ProjectionHealth();
     } catch (...) {
@@ -1262,7 +1262,7 @@ private:
   /// terminal result reported an uncertain effect keeps reporting that result
   /// instead of reverting to the predecessor row after one read.
   [[nodiscard]] core::ProjectionHealthDTO ProjectionHealth(
-      const core::ProjectionNativeRuntimeBindingDTO &binding,
+      const core::ProjectionExecutionHostBindingDTO &binding,
       const std::optional<core::ProjectionRevisionDTO> &selected_revision) {
     auto projection = selected_revision.has_value()
                           ? RevisionHandle(binding, *selected_revision)
@@ -1302,7 +1302,7 @@ private:
   [[nodiscard]] const core::CapabilityProviderBindingDTO &
   RequireProviderBinding(
       const deployment::RetainedBundle &bundle,
-      const core::ProjectionNativeRuntimeBindingDTO &runtime_binding) const {
+      const core::ProjectionExecutionHostBindingDTO &runtime_binding) const {
     const auto &bindings = bundle.value().capability_provider_bindings;
     const auto found = std::find_if(
         bindings.begin(), bindings.end(), [&](const auto &candidate) {
@@ -1383,7 +1383,7 @@ private:
         [&](const ManagedProjectionCandidateInputs &inputs) {
           return SelectProjectionGroup(
               RequireProviderBinding(*inputs.bundle,
-                                     request.native_runtime_binding),
+                                     request.execution_host_binding),
               inputs.model_map);
         },
         [&](const ManagedProjectionCandidateInputs &inputs,
@@ -1401,8 +1401,8 @@ private:
   void Prepare(const component_manager::detail::NativeProjectionPrepareRequest
                    &request) {
     Require(request.valid(), "native projection preparation is invalid");
-    RequireLocalBinding(request.native_runtime_binding);
-    const auto key = Key(request.native_runtime_binding);
+    RequireLocalBinding(request.execution_host_binding);
+    const auto key = Key(request.execution_host_binding);
     ReclaimRetiredProjections();
     std::shared_ptr<RetainedPlannerSceneProjection> predecessor;
     std::uint64_t incarnation{};
@@ -1431,10 +1431,10 @@ private:
     }
     auto created = RetainedPlannerSceneProjection::CreateUninitialized(
         BuildProjectionAssets(request), request.planning_collision_model,
-        request.native_runtime_binding,
+        request.execution_host_binding,
         RetainedPlannerSceneProjectionConfig{
             "managed-native-projection-" +
-                request.native_runtime_binding.provider_binding_id.value() +
+                request.execution_host_binding.provider_binding_id.value() +
                 ".epoch." + config_.runtime_epoch + ".model." +
                 std::to_string(incarnation),
             256U},
@@ -1469,7 +1469,7 @@ private:
       }
       projections_.insert_or_assign(
           key, RegisteredProjection{
-                   request.native_runtime_binding, std::move(created.value()),
+                   request.execution_host_binding, std::move(created.value()),
                    PreparedIdentity{request.candidate_retained_bundle_id,
                                     request.candidate_graph_revision,
                                     request.planning_collision_model}});
@@ -1551,14 +1551,14 @@ void ManagedProjectionRegistry::Drain() { impl_->Drain(); }
 std::shared_ptr<RetainedPlannerSceneProjection>
 ManagedProjectionRegistry::FindActiveProjection(
     const core::ProjectionRevisionDTO &expected,
-    const core::ProjectionNativeRuntimeBindingDTO &binding) const {
+    const core::ProjectionExecutionHostBindingDTO &binding) const {
   return impl_->FindActiveProjection(expected, binding);
 }
 
 std::optional<core::ProjectionRevisionDTO>
 ManagedProjectionRegistry::FindCurrentProjectionRevision(
     const core::ProjectionRevisionDTO &expected,
-    const core::ProjectionNativeRuntimeBindingDTO &binding) const {
+    const core::ProjectionExecutionHostBindingDTO &binding) const {
   return impl_->FindCurrentProjectionRevision(expected, binding);
 }
 

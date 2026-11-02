@@ -41,22 +41,14 @@ CanonicalValue Object(std::string key, std::string value) {
   });
 }
 
-/// Condition ids of one gate kind in the Kernel-bound projection.
+/// Condition ids of the Kernel-bound projection (condition interlocks only).
 std::vector<std::string>
-GateMembers(const AlarmMotionAttentionProjection &projection,
-            const bool condition_interlock) {
+GateMembers(const AlarmMotionAttentionProjection &projection) {
   std::vector<std::string> result;
   for (const auto &member : projection.members) {
-    if (member.condition_interlock == condition_interlock) {
-      result.push_back(member.acknowledgement.condition_id);
-    }
+    result.push_back(member.acknowledgement.condition_id);
   }
   return result;
-}
-
-std::vector<std::string> SortedIds(std::vector<std::string> ids) {
-  std::sort(ids.begin(), ids.end());
-  return ids;
 }
 
 class AlarmOwnerTest : public ::testing::Test {
@@ -441,25 +433,17 @@ TEST_F(AlarmOwnerTest,
   EXPECT_NE(wire.find("\"owner_incarnation_us\":7"), std::string::npos);
   EXPECT_NE(wire.find("manyforge.operator_alarm_motion_attention.v3"),
             std::string::npos);
-  EXPECT_TRUE(GateMembers(projection, true).empty());
-  EXPECT_EQ(GateMembers(projection, false),
-            (SortedIds({global.condition_id, scoped.condition_id})));
-  for (const auto &member : projection.members) {
-    EXPECT_EQ(member.subject, member.acknowledgement.condition_id ==
-                                      global.condition_id
-                                  ? global.subject
-                                  : scoped.subject);
-  }
+  // V2-5: acknowledgement never gates work, so neither unacknowledged
+  // alarm (scoped or cell-global) is a motion-attention member.
+  EXPECT_TRUE(projection.members.empty());
+  EXPECT_EQ(scoped.lifecycle_state, AlarmLifecycleState::kActiveUnacknowledged);
+  EXPECT_EQ(global.lifecycle_state, AlarmLifecycleState::kActiveUnacknowledged);
 
   static_cast<void>(
       owner->Acknowledge(global.condition_id, global.activation_id,
                          global.record_revision, Caller(), std::nullopt, true));
   projection = *owner->MotionAttentionProjection();
-  EXPECT_EQ(GateMembers(projection, false),
-            std::vector<std::string>{scoped.condition_id});
-  ASSERT_EQ(projection.members.size(), 1U);
-  EXPECT_EQ(projection.members.front().subject.resource_ids,
-            std::vector<std::string>{"resource.arm.a"});
+  EXPECT_TRUE(projection.members.empty());
 
   owner->MarkSourceQualityUnknown("motion.source", "motion.epoch.1");
   EXPECT_FALSE(owner->MotionAttentionProjection()->reconciled);
@@ -489,8 +473,10 @@ TEST_F(AlarmOwnerTest,
   EXPECT_TRUE(before->reconciled);
   EXPECT_TRUE(before->members.empty());
 
-  static_cast<void>(
-      owner->Submit(MotionUpdate(1U, true, "operation.a", {"resource.arm.a"})));
+  // The condition interlock (no acknowledgement) is what gates motion.
+  auto interlock = CellGlobalUpdate(1U, true);
+  interlock.definition_id = "manyforge.runtime.alarm_scope_unavailable";
+  static_cast<void>(owner->Submit(interlock));
   const auto gating = owner->MotionAttentionProjection();
   EXPECT_EQ(gating->generation, owner->Snapshot().generation);
   ASSERT_EQ(gating->members.size(), 1U);
@@ -576,8 +562,7 @@ TEST_F(AlarmOwnerTest,
             scope.condition_id);
   EXPECT_EQ(owner->Metrics().motion_attention, 1U);
   auto projection = *owner->MotionAttentionProjection();
-  EXPECT_TRUE(GateMembers(projection, false).empty());
-  EXPECT_EQ(GateMembers(projection, true),
+  EXPECT_EQ(GateMembers(projection),
             std::vector<std::string>{scope.condition_id});
 
   // An acknowledgement attempt changes nothing; only the cause clears it.
@@ -586,29 +571,25 @@ TEST_F(AlarmOwnerTest,
                          scope.record_revision, Caller(), std::nullopt, true);
   EXPECT_EQ(attempted.status, "already_acknowledged");
   EXPECT_FALSE(attempted.changed);
-  EXPECT_EQ(GateMembers(*owner->MotionAttentionProjection(), true),
+  EXPECT_EQ(GateMembers(*owner->MotionAttentionProjection()),
             std::vector<std::string>{scope.condition_id});
 
-  // An acknowledgement-required alarm keeps the ISA-18.2 rule beside it:
-  // acknowledging it releases its own gate while the condition still gates.
+  // V2-5: an acknowledgement-required alarm beside it gates nothing, before
+  // or after its acknowledgement; only the condition still gates.
   const auto provider =
       owner->Submit(CellGlobalUpdate(1U, true)).records.front();
   EXPECT_TRUE(provider.acknowledgement_required);
-  EXPECT_EQ(owner->Snapshot().motion_attention_count, 2U);
-  // Both block: the interlock reason wins deterministically, and both
-  // memberships are reported so a client can show both remedies.
+  EXPECT_FALSE(GatesMotion(provider));
+  EXPECT_EQ(owner->Snapshot().motion_attention_count, 1U);
   projection = *owner->MotionAttentionProjection();
-  EXPECT_EQ(GateMembers(projection, true),
+  EXPECT_EQ(GateMembers(projection),
             std::vector<std::string>{scope.condition_id});
-  EXPECT_EQ(GateMembers(projection, false),
-            std::vector<std::string>{provider.condition_id});
   static_cast<void>(owner->Acknowledge(provider.condition_id,
                                        provider.activation_id,
                                        provider.record_revision, Caller(),
                                        std::nullopt, true));
   projection = *owner->MotionAttentionProjection();
-  EXPECT_TRUE(GateMembers(projection, false).empty());
-  EXPECT_EQ(GateMembers(projection, true),
+  EXPECT_EQ(GateMembers(projection),
             std::vector<std::string>{scope.condition_id});
 
   // Return to normal ends the gate at once and leaves the live list without
@@ -632,7 +613,7 @@ TEST_F(AlarmOwnerTest,
   EXPECT_EQ(recurred.status, "recurred");
   EXPECT_EQ(recurred.records.front().lifecycle_state,
             AlarmLifecycleState::kActiveAcknowledged);
-  EXPECT_EQ(GateMembers(*owner->MotionAttentionProjection(), true),
+  EXPECT_EQ(GateMembers(*owner->MotionAttentionProjection()),
             std::vector<std::string>{scope.condition_id});
 }
 
@@ -707,10 +688,10 @@ TEST_F(AlarmOwnerTest,
   auto snapshot = owner->Snapshot();
   EXPECT_TRUE(snapshot.reconciled);
   EXPECT_EQ(snapshot.live_count, 2U);
-  // Both gate: the retained alarm keeps its admitted resources after the
-  // replacement configuration no longer names them.
-  EXPECT_EQ(GateMembers(*owner->MotionAttentionProjection(), false),
-            (SortedIds({retained.condition_id, replacement.condition_id})));
+  // The retained alarm keeps its admitted resources after the replacement
+  // configuration no longer names them (neither gates motion: V2-5).
+  EXPECT_EQ(retained.subject.resource_ids, std::vector<std::string>{"resource.arm.a"});
+  EXPECT_TRUE(owner->MotionAttentionProjection()->members.empty());
 
   // The retained alarm still follows its lifecycle: its own return to normal
   // is accepted, and it can be acknowledged.

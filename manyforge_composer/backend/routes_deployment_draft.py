@@ -7,7 +7,10 @@ import hashlib
 import json
 import logging
 from pathlib import Path
-from typing import Any, Callable, Literal, NoReturn
+from contextlib import contextmanager
+import time
+import uuid
+from typing import Any, Callable, Iterator, Literal, NoReturn
 
 from fastapi import APIRouter, HTTPException
 from manyforge_behavior.canonical_artifact import (
@@ -19,7 +22,8 @@ from manyforge_behavior.model_source_capture import (
     capture_deployment_model_sources,
 )
 from manyforge_headless_api.client import HeadlessClientError
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from manyforge_headless_api.held_run_authoring import held_run_draft_edit_allowed
+from pydantic import BaseModel, ConfigDict, Field
 
 from .authoring_admission import (
     AuthoringOperationError,
@@ -45,10 +49,22 @@ from .deployment_intent import (
     rebase_deployment_intent_sources,
 )
 from .draft_session import DraftSessionError
-from .reset_apply_log import log_reset_apply_link
+from .apply_orchestration import (
+    DEFAULT_LIFECYCLE_TIMEOUT_S,
+    ApplyRefused,
+    ApplyStepFailed,
+    Preview,
+    candidate_preview,
+    lifecycle_timeouts,
+    one_apply_at_a_time,
+    preview_view,
+    recorded_apply,
+    run_apply,
+)
+from .deployment_defaults import effective_fields, with_defaults
 from .routes_draft import _active_catalog
 from .scenario_restore import saved_deployment_differs, saved_program_restore
-from .state import ComposerState, _controllable_composition_change_kinds
+from .state import ComposerState
 from .authoring_workspace import (
     AuthoringOperationContext,
     AuthoringWorkspaceError,
@@ -91,78 +107,6 @@ def _capture_model_sources(
             str(error),
             status_code=409,
         ) from error
-
-
-def _require_draftable_composition(
-    before: dict[str, Any] | None,
-    after: dict[str, Any],
-) -> None:
-    changed_kinds = _controllable_composition_change_kinds(before, after)
-    if changed_kinds is None:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "deployment_activation_classification_unavailable",
-                "message": (
-                    "This Deployment document is malformed or in the old "
-                    "compiled format, so its edit cannot be checked for "
-                    "component changes. Nothing was changed."
-                ),
-                "activationRequired": True,
-                "classificationAvailable": False,
-            },
-        )
-    if not changed_kinds:
-        return
-    raise HTTPException(
-        status_code=409,
-        detail={
-            "code": "deployment_activation_required",
-            "message": (
-                "This Deployment edit removes a live component or changes "
-                "its profile, model or attachments; a Draft edit cannot make "
-                "it. Close the Scenario, edit it, then Load it again."
-            ),
-            "activationRequired": True,
-            "changedGraphKinds": list(changed_kinds),
-        },
-    )
-
-
-def _adds_components_only(
-    before: dict[str, Any] | None,
-    after: dict[str, Any],
-) -> bool:
-    """Whether a Draft edit only adds component rows (Add component).
-
-    An added component is Draft-only: Manager Applied and the running cell
-    change only through the one confirmed Deployment Apply. Every existing
-    row and attachment must stay exactly as it was. A new attachment row
-    counts as part of the addition when its child is an added component (a
-    tool mounted on a robot's flange); changing or removing an attachment
-    stays activation-only.
-    """
-
-    if (
-        not isinstance(before, dict)
-        or before.get("api_version") != DEPLOYMENT_INTENT_API_VERSION
-        or after.get("api_version") != DEPLOYMENT_INTENT_API_VERSION
-    ):
-        return False
-    old = {row["component_id"]: row for row in before["components"]}
-    new = {row["component_id"]: row for row in after["components"]}
-    if not (old.keys() < new.keys() and all(new[key] == row for key, row in old.items())):
-        return False
-    attachments = list(after["attachments"])
-    for row in before["attachments"]:
-        if row not in attachments:
-            return False
-        attachments.remove(row)
-    added = new.keys() - old.keys()
-    return all(
-        isinstance(row.get("child"), dict) and row["child"].get("component_id") in added
-        for row in attachments
-    )
 
 
 class _Fence(BaseModel):
@@ -237,7 +181,6 @@ class UpdateMotionTargetLimitRequest(_LocalFence):
     controllable_component_id: str = Field(min_length=1, max_length=256)
     command_target_id: str = Field(min_length=1, max_length=256)
     maximum_tcp_linear_speed_mps: float = Field(gt=0.0, le=1000.0)
-    tcp_speed_check: Literal["active_tcp", "active_tcp_and_flange"] | None = None
 
 
 class SaveDeploymentRequest(_LocalFence):
@@ -253,102 +196,59 @@ class DiscardDeploymentRequest(_LocalFence):
     pass
 
 
-class _ManagerConfirmation(BaseModel):
-    """Manager's disruptive-impact confirmation of one exact prepared input."""
+class DeploymentCandidateRequest(_Fence):
+    """The fence of one server-run Preview/Apply/Revert (CONTRACTS §11).
+
+    Built by the server from the current Drafts, workspace and admission
+    generation (:func:`server_deployment_fence`); the request body is ``{}``.
+    """
+
+
+class ServerApplyRequest(BaseModel):
+    """CONTRACTS §11: Preview takes an empty body."""
 
     model_config = _DTO
 
-    confirmation_token: str | None = Field(
-        default=None,
-        alias="confirmationToken",
-        min_length=71,
-        max_length=71,
-        pattern=r"^sha256:[0-9a-f]{64}$",
-    )
-    preparation_request_owner_epoch: str | None = Field(
-        default=None,
-        alias="preparationRequestOwnerEpoch",
-        min_length=1,
-        max_length=256,
-    )
-    preparation_request_id: str | None = Field(
-        default=None,
-        alias="preparationRequestId",
-        min_length=1,
-        max_length=256,
-    )
 
-    @model_validator(mode="after")
-    def require_preparation_identity(self) -> "_ManagerConfirmation":
-        if self.confirmation_token is not None and (
-            self.preparation_request_owner_epoch is None
-            or self.preparation_request_id is None
-        ):
-            raise ValueError(
-                "confirmationToken requires both "
-                "preparationRequestOwnerEpoch and preparationRequestId"
-            )
-        return self
+class ConfirmedApplyRequest(ServerApplyRequest):
+    """Apply and Revert: the ``scope`` of the Preview the user confirmed.
+
+    When present, the Apply is refused before any effect if the activation
+    input changed since that Preview (``activation_input_changed_after_confirmation``).
+    """
+
+    scope: dict[str, Any] | None = None
 
 
-class RevertDeploymentRequest(_ManagerConfirmation, _Fence):
-    pass
-
-
-class PreviewDeploymentCandidateRequest(_Fence):
-    pass
-
-
-class ActivationScope(BaseModel):
-    """The complete activation input an operator confirmed.
+def activation_scope(state: ComposerState) -> dict[str, Any]:
+    """The complete activation input a Preview is computed from.
 
     Deployment activation compiles the Deployment Draft together with the
     current Program Draft, the Scenario's Program role assignment and its
-    source document. A confirmation names all of them; any change before the
-    Apply is sent refuses it so the operator reviews the new input.
+    source document; the scope names all of them.
     """
-
-    model_config = _DTO
-
-    deployment_draft_id: str = Field(
-        alias="deploymentDraftId", min_length=1, max_length=256
-    )
-    deployment_draft_revision: int = Field(
-        alias="deploymentDraftRevision", ge=0, le=9_007_199_254_740_991
-    )
-    deployment_revision: str | None = Field(
-        alias="deploymentRevision", max_length=256
-    )
-    program_draft_id: str = Field(alias="programDraftId", min_length=1, max_length=256)
-    program_draft_revision: int = Field(
-        alias="programDraftRevision", ge=0, le=9_007_199_254_740_991
-    )
-    program_revision: str | None = Field(alias="programRevision", max_length=256)
-    source_document_digest: str | None = Field(
-        alias="sourceDocumentDigest", max_length=256
-    )
-    program_role_assignment: dict[str, Any] | None = Field(
-        alias="programRoleAssignment"
-    )
-
-
-def _require_activation_scope(state: ComposerState, scope: ActivationScope) -> None:
-    """Refuse, before any effect, when the confirmed input changed."""
 
     deployment = state.deployment_draft_session.retained_state()
     document = deployment.get("document")
     program = state.draft_session.snapshot()
-    if (
-        deployment.get("draft_id") != scope.deployment_draft_id
-        or deployment.get("draft_revision") != scope.deployment_draft_revision
-        or (document.get("deployment_revision") if isinstance(document, dict) else None)
-        != scope.deployment_revision
-        or program.get("draft_id") != scope.program_draft_id
-        or program.get("draft_revision") != scope.program_draft_revision
-        or program.get("program_revision") != scope.program_revision
-        or state.scenario_source_document_digest != scope.source_document_digest
-        or state.scenario_program_role_assignment != scope.program_role_assignment
-    ):
+    return {
+        "deployment_draft_id": deployment.get("draft_id"),
+        "deployment_draft_revision": deployment.get("draft_revision"),
+        "deployment_revision": (
+            document.get("deployment_revision") if isinstance(document, dict) else None
+        ),
+        "program_draft_id": program.get("draft_id"),
+        "program_draft_revision": program.get("draft_revision"),
+        "program_revision": program.get("program_revision"),
+        "source_document_digest": state.scenario_source_document_digest,
+        "program_role_assignment": deepcopy(state.scenario_program_role_assignment),
+    }
+
+
+def require_activation_scope(state: ComposerState, scope: dict[str, Any] | None) -> None:
+    """Refuse, before any effect, when the confirmed input changed."""
+
+    if scope is not None and scope != activation_scope(state):
         raise refused_before_effect(
             409,
             {
@@ -356,6 +256,49 @@ def _require_activation_scope(state: ComposerState, scope: ActivationScope) -> N
                 "message": "Draft changed after confirmation; review again",
             },
         )
+
+
+@contextmanager
+def apply_slot() -> Iterator[None]:
+    """The one Apply slot; a second Apply is refused ``apply_in_progress``."""
+
+    try:
+        with one_apply_at_a_time():
+            yield
+    except ApplyRefused as refusal:
+        if refusal.code != "apply_in_progress":
+            raise
+        raise refused_before_effect(
+            409, {"code": refusal.code, "message": str(refusal)}
+        ) from refusal
+
+
+SERVER_REQUEST_OWNER_EPOCH = "composer-server"
+
+
+def server_admission_generation(state: ComposerState) -> int:
+    if state.headless_client is None:
+        raise DeploymentDraftError(
+            "deployment_candidate_unavailable",
+            "Deployment preview and Apply require the configured Manager",
+            status_code=503,
+        )
+    return state.headless_client.authoring_admission().get("admission_generation")
+
+
+def server_deployment_fence(state: ComposerState) -> DeploymentCandidateRequest:
+    """The current Deployment Draft, workspace and admission, as one fence."""
+
+    identity = state.authoring_workspace.identity()
+    return DeploymentCandidateRequest(
+        draft_id=identity.deployment_draft_id,
+        expected_draft_revision=identity.deployment_draft_revision,
+        expected_admission_generation=server_admission_generation(state),
+        request_owner_epoch=SERVER_REQUEST_OWNER_EPOCH,
+        request_id=f"composer-server.{uuid.uuid4()}",
+        expected_workspace_epoch=identity.workspace_epoch,
+        expected_workspace_revision=identity.workspace_revision,
+    )
 
 
 def _applied_program_revision(state: ComposerState) -> str | None:
@@ -367,18 +310,6 @@ def _applied_program_revision(state: ComposerState) -> str | None:
         return None
     revision = applied.get("program_revision") if isinstance(applied, dict) else None
     return revision if isinstance(revision, str) and revision else None
-
-
-class ApplyDeploymentCandidateRequest(_ManagerConfirmation, _Fence):
-    # The shared reference of an Apply that first Reset a held run; the
-    # Manager record keeps it instead of this request's own identity.
-    correlation_id: str | None = Field(
-        default=None, alias="correlationId", min_length=1, max_length=256
-    )
-    # The complete input the operator confirmed (see ActivationScope).
-    expected_activation_scope: ActivationScope | None = Field(
-        default=None, alias="expectedActivationScope"
-    )
 
 
 # Deployment Apply refusals raised before admission or any Manager submission
@@ -773,10 +704,6 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                 body.path, allowed_roots=state.allowed_fs_roots
             )
             compiled = state.deployment_draft_session.preview_source(source)
-            current_document = state.deployment_draft_session.retained_state().get(
-                "document"
-            )
-            _require_draftable_composition(current_document, compiled.document)
             commit = commit_local_authoring(
                 state,
                 body,
@@ -799,14 +726,9 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
     @router.post("/api/deployment/draft/mutations")
     def mutate_draft(body: UpdateDeploymentRequest) -> dict[str, Any]:
         try:
-            before = state.deployment_draft_session.retained_state()
-            if (
-                before.get("draft_id") != body.draft_id
-                or before.get("draft_revision") != body.expected_draft_revision
-            ):
-                state.deployment_draft_session.require_current(
-                    body.draft_id, body.expected_draft_revision
-                )
+            state.deployment_draft_session.require_current(
+                body.draft_id, body.expected_draft_revision
+            )
             compiled = state.deployment_draft_session.preview_update(
                 body.path,
                 body.value,
@@ -814,10 +736,6 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                 draft_id=body.draft_id,
                 expected_revision=body.expected_draft_revision,
             )
-            if not _adds_components_only(before.get("document"), compiled.document):
-                _require_draftable_composition(
-                    before.get("document"), compiled.document
-                )
             commit_draft_edit(
                 state,
                 body,
@@ -840,24 +758,15 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
         """Add component: new component rows and their attachment rows in one edit."""
 
         try:
-            before = state.deployment_draft_session.retained_state()
-            if (
-                before.get("draft_id") != body.draft_id
-                or before.get("draft_revision") != body.expected_draft_revision
-            ):
-                state.deployment_draft_session.require_current(
-                    body.draft_id, body.expected_draft_revision
-                )
+            state.deployment_draft_session.require_current(
+                body.draft_id, body.expected_draft_revision
+            )
             compiled = state.deployment_draft_session.preview_component_addition(
                 body.components,
                 body.attachments,
                 draft_id=body.draft_id,
                 expected_revision=body.expected_draft_revision,
             )
-            if not _adds_components_only(before.get("document"), compiled.document):
-                _require_draftable_composition(
-                    before.get("document"), compiled.document
-                )
             commit_draft_edit(
                 state,
                 body,
@@ -912,7 +821,6 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                     controllable_component_id=body.controllable_component_id,
                     command_target_id=body.command_target_id,
                     maximum_tcp_linear_speed_mps=(body.maximum_tcp_linear_speed_mps),
-                    tcp_speed_check=body.tcp_speed_check,
                     draft_id=body.draft_id,
                     expected_revision=body.expected_draft_revision,
                 )
@@ -1083,8 +991,11 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
         except Exception as error:
             _raise(error)
 
-    @router.post("/api/deployment/revert", status_code=202)
-    def revert(body: RevertDeploymentRequest) -> dict[str, Any]:
+    def revert_ports(body: DeploymentCandidateRequest) -> "HeadlessApplyPorts":
+        """Revert on the one Apply path (CONTRACTS §11): the Saved Scenario is
+        applied like any Deployment, and both Drafts return to Saved in the
+        workspace commit right before the Manager submission."""
+
         if state.headless_client is None:
             _raise(
                 DeploymentDraftError(
@@ -1162,7 +1073,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
         compiled_saved = state.deployment_draft_session.preview_source(
             json.dumps(saved, ensure_ascii=False, allow_nan=False)
         )
-        intent = {
+        base_intent = {
             "schema_version": "manyforge.composer_authoring_effect.v1",
             "scene_initialization": "initialize",
             "operation_kind": "revert_deployment",
@@ -1180,32 +1091,31 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                 "retained_bundle_id": current_bundle,
                 "graph_revision": current_graph,
             },
-            "expected_admission_generation": body.expected_admission_generation,
             "draft_id": body.draft_id,
             "draft_revision": body.expected_draft_revision,
             "manager_request_id": manager_request_id,
             "correlation_id": body.request_id,
-            "confirmation_token": body.confirmation_token,
-            "preparation_request_owner_epoch": (
-                body.preparation_request_owner_epoch
-                if body.confirmation_token is not None
-                else body.request_owner_epoch
-            ),
-            "preparation_request_id": (
-                body.preparation_request_id
-                if body.confirmation_token is not None
-                else body.request_id
-            ),
+            "confirmation_token": None,
+            "preparation_request_owner_epoch": body.request_owner_epoch,
+            "preparation_request_id": body.request_id,
         }
         if program is None:
-            intent["program_authoring"] = deepcopy(program_restore.saved_document)
+            base_intent["program_authoring"] = deepcopy(program_restore.saved_document)
 
-        prepared_candidate: dict[str, Any] | None = None
+        def revert_intent(generation: int) -> dict[str, Any]:
+            return {**deepcopy(base_intent), "expected_admission_generation": generation}
+
+        def prepare(intent: dict[str, Any]) -> dict[str, Any]:
+            # The server confirms the impact itself: it previewed this exact
+            # candidate (apply_orchestration) before disabling anything.
+            return state.execute_authored_deployment_candidate(
+                intent, None, apply=True, prepare_only=True, confirmed=True
+            )
+
+        current: dict[str, Any] = {}
 
         def validate(_claim: dict[str, Any] | None) -> dict[str, Any]:
-            nonlocal prepared_candidate
-            current = state.deployment_draft_session.retained_state()
-            if current != retained:
+            if state.deployment_draft_session.retained_state() != retained:
                 raise DeploymentDraftError(
                     "deployment_draft_stale",
                     "Deployment Draft changed before Revert",
@@ -1227,25 +1137,16 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                     status_code=409,
                 )
             if _claim is None:
-                prepared_candidate = state.execute_authored_deployment_candidate(
-                    intent, None, apply=True, prepare_only=True
-                )
-            return {"prepared_deployment_candidate": prepared_candidate}
+                current["prepared"] = prepare(current["intent"])
+            return {"prepared_deployment_candidate": current["prepared"]}
 
         def effect(claim: dict[str, Any] | None) -> dict[str, Any]:
-            if prepared_candidate is None:
-                raise DeploymentDraftError(
-                    "deployment_revert_preparation_missing",
-                    "Deployment Revert has no captured preparation",
-                    status_code=409,
-                )
-            result = state.execute_authored_deployment_candidate(
-                intent,
+            return state.execute_authored_deployment_candidate(
+                current["intent"],
                 claim,
                 apply=True,
-                prepared=prepared_candidate,
+                prepared=current["prepared"],
             )
-            return result
 
         def commit_saved_before_submit() -> None:
             # Both Drafts return to Saved in one whole-workspace commit fenced
@@ -1275,21 +1176,68 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                 ),
             )
 
-        return execute(
-            body,
-            "revert_deployment",
-            prepare=lambda: intent,
-            validate=validate,
-            commit_before_submit=commit_saved_before_submit,
-            effect=effect,
-            after_release=state.authoring_workspace.publish_commit_wake,
-        )
+        class _RevertPorts(HeadlessApplyPorts):
+            def preview(self) -> Preview:
+                intent = revert_intent(body.expected_admission_generation)
+                return candidate_preview(prepare(intent).get("candidate_preview"))
+
+            def apply(self) -> None:
+                # Disabling components may advance the admission generation:
+                # prepare and claim under the current one.
+                generation = self._client.authoring_admission().get("admission_generation")
+                current["intent"] = revert_intent(generation)
+                response = execute(
+                    body.model_copy(update={"expected_admission_generation": generation}),
+                    "revert_deployment",
+                    prepare=lambda: current["intent"],
+                    validate=validate,
+                    commit_before_submit=commit_saved_before_submit,
+                    effect=effect,
+                    after_release=state.authoring_workspace.publish_commit_wake,
+                )
+                self.wait_for_manager_apply(response["result"])
+
+        return _RevertPorts(state, saved)
+
+    @router.post("/api/deployment/revert/preview")
+    def preview_revert(body: ServerApplyRequest) -> dict[str, Any]:
+        """Per-component impact of reverting to the Saved Scenario (§11)."""
+        try:
+            scope = activation_scope(state)
+            return preview_view(
+                revert_ports(server_deployment_fence(state)).preview(), scope
+            )
+        except Exception as error:
+            _raise(error)
+
+    @router.post("/api/deployment/revert")
+    def revert(body: ConfirmedApplyRequest) -> dict[str, Any]:
+        """Apply of the Saved Scenario; both Drafts return to Saved. Returns
+        ApplyResult. Bound to the Revert Preview's ``scope`` when given."""
+
+        def run() -> dict[str, Any]:
+            try:
+                with apply_slot():
+                    require_activation_scope(state, body.scope)
+                    return orchestrated_apply(revert_ports(server_deployment_fence(state)))
+            except Exception as error:
+                _raise(error)
+
+        return recorded_apply(state.headless_client, "deployment_revert", run)
 
     def authored_candidate(
-        body: PreviewDeploymentCandidateRequest | ApplyDeploymentCandidateRequest,
+        body: DeploymentCandidateRequest,
         *,
         apply: bool,
+        refuse_unchanged: bool = False,
     ) -> dict[str, Any]:
+        """Preview, or confirmed Apply, of the current Draft through Manager.
+
+        The Apply is confirmed by the server: it previewed this candidate
+        itself (apply_orchestration) before disabling anything.
+        ``refuse_unchanged`` only refuses an unchanged Draft: the Apply checks
+        it before anything else, a finished run's Reset included.
+        """
         operation_kind = (
             "apply_deployment_candidate"
             if apply
@@ -1348,15 +1296,9 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                     status_code=409,
                 )
             )
-        scope = (
-            body.expected_activation_scope
-            if isinstance(body, ApplyDeploymentCandidateRequest)
-            else None
-        )
-        if scope is not None:
-            _require_activation_scope(state, scope)
+        deployment = with_defaults(deployment)
         source_closure = _capture_model_sources(state, deployment)
-        if apply:
+        if apply or refuse_unchanged:
             # Nothing to apply: every input already is the Manager's Applied
             # activation. Refused before admission, so no effect is possible.
             # An Applied fact that cannot be read now never proves a no-op.
@@ -1393,6 +1335,8 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                         ),
                     },
                 )
+            if refuse_unchanged:
+                return {}
         captured_input_digest = raw_sha256_digest(
             canonical_json_bytes(
                 {
@@ -1435,29 +1379,10 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             + hashlib.sha256(
                 f"{body.request_owner_epoch}:{body.request_id}".encode("utf-8")
             ).hexdigest()[:32],
-            "correlation_id": (
-                body.correlation_id
-                if isinstance(body, ApplyDeploymentCandidateRequest)
-                and body.correlation_id is not None
-                else body.request_id
-            ),
-            "confirmation_token": (
-                body.confirmation_token
-                if isinstance(body, ApplyDeploymentCandidateRequest)
-                else None
-            ),
-            "preparation_request_owner_epoch": (
-                body.preparation_request_owner_epoch
-                if isinstance(body, ApplyDeploymentCandidateRequest)
-                and body.confirmation_token is not None
-                else body.request_owner_epoch
-            ),
-            "preparation_request_id": (
-                body.preparation_request_id
-                if isinstance(body, ApplyDeploymentCandidateRequest)
-                and body.confirmation_token is not None
-                else body.request_id
-            ),
+            "correlation_id": body.request_id,
+            "confirmation_token": None,
+            "preparation_request_owner_epoch": body.request_owner_epoch,
+            "preparation_request_id": body.request_id,
             "draft_id": body.draft_id,
             "draft_revision": body.expected_draft_revision,
             "post_state": pre_state,
@@ -1469,8 +1394,6 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             state.deployment_draft_session.require_current(
                 body.draft_id, body.expected_draft_revision
             )
-            if scope is not None:
-                _require_activation_scope(state, scope)
             if state.deployment_draft_session.retained_state() != deployment_state:
                 raise DeploymentDraftError(
                     "deployment_draft_stale",
@@ -1506,6 +1429,7 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
                         _claim,
                         apply=apply,
                         prepare_only=True,
+                        confirmed=apply,
                     )
                 )
             except AuthoringOperationError as error:
@@ -1584,46 +1508,368 @@ def create_deployment_draft_router(state: ComposerState) -> APIRouter:
             effect=effect,
         )
 
-    @router.post("/api/deployment/draft/preview")
-    def preview_authored_candidate(
-        body: PreviewDeploymentCandidateRequest,
-    ) -> dict[str, Any]:
-        return authored_candidate(body, apply=False)
+    def apply_ports(body: DeploymentCandidateRequest) -> "_DraftApplyPorts":
+        return _DraftApplyPorts(state, body, authored_candidate)
 
-    @router.post("/api/deployment/draft/apply", status_code=202)
-    def apply_authored_candidate(
-        body: ApplyDeploymentCandidateRequest,
-    ) -> dict[str, Any]:
-        if body.correlation_id is None:
-            return authored_candidate(body, apply=True)
+    @router.post("/api/deployment/preview")
+    def preview_deployment(body: ServerApplyRequest) -> dict[str, Any]:
+        """Per-component impact of applying the current Draft (CONTRACTS §11),
+        the Program's outcome, attachment changes and detached components, and
+        the ``scope`` the Apply sends back."""
         try:
-            response = authored_candidate(body, apply=True)
-        except HTTPException as error:
-            detail = error.detail if isinstance(error.detail, dict) else {}
-            log_reset_apply_link(
-                "deployment_apply",
-                correlation_id=body.correlation_id,
-                request_id=body.request_id,
-                outcome="error",
-                error_code=detail.get("code"),
-                draft_id=body.draft_id,
-                draft_revision=body.expected_draft_revision,
+            scope = activation_scope(state)
+            return preview_view(
+                apply_ports(server_deployment_fence(state)).preview(), scope
             )
-            raise
-        result = response.get("result") if isinstance(response, dict) else None
-        manager = result.get("manager_apply") if isinstance(result, dict) else None
-        log_reset_apply_link(
-            "deployment_apply",
-            correlation_id=body.correlation_id,
-            request_id=body.request_id,
-            outcome=str(result.get("status")) if isinstance(result, dict) else "unknown",
-            apply_id=manager.get("apply_id") if isinstance(manager, dict) else None,
-            apply_generation=(
-                manager.get("apply_generation") if isinstance(manager, dict) else None
-            ),
-            draft_id=body.draft_id,
-            draft_revision=body.expected_draft_revision,
-        )
-        return response
+        except Exception as error:
+            _raise(error)
+
+    @router.post("/api/deployment/apply")
+    def apply_deployment(body: ConfirmedApplyRequest) -> dict[str, Any]:
+        """Orchestrated Apply of the current Draft; returns ApplyResult.
+        Bound to the Preview's ``scope`` when given."""
+
+        def run() -> dict[str, Any]:
+            try:
+                with apply_slot():
+                    require_activation_scope(state, body.scope)
+                    ports = apply_ports(server_deployment_fence(state))
+                    # Nothing to apply is refused before any effect, a finished
+                    # run's Reset included.
+                    ports.refuse_unchanged()
+                    return orchestrated_apply(ports)
+            except Exception as error:
+                _raise(error)
+
+        return recorded_apply(state.headless_client, "deployment_apply", run)
+
+    @router.get("/api/deployment/effective")
+    def effective_values() -> dict[str, Any]:
+        """Every defaulted field's value, default, and whether it is set."""
+        document = state.deployment_draft_session.retained_state().get("document")
+        return effective_fields(document if isinstance(document, dict) else None)
 
     return router
+
+
+def _error_text(error: Exception) -> tuple[str, str] | None:
+    """The typed code and message of a step's failure."""
+
+    if isinstance(error, HTTPException) and isinstance(error.detail, dict):
+        return str(error.detail.get("code")), str(error.detail.get("message", ""))
+    code = getattr(error, "code", None)
+    if isinstance(code, str) and code:
+        return code, str(error)
+    return None
+
+
+def manager_apply_failure(failure: dict[str, Any], terminal: str) -> ApplyStepFailed:
+    """The innermost typed cause of a Manager Apply failure.
+
+    The Manager retains its phase code with the cause's code and details; a
+    host composition refusal carries its own typed cause (`cause_code`,
+    `cause`, `component_id`) in those details. The deepest typed code wins,
+    with its message and the component it names.
+    """
+
+    details = failure.get("cause_details")
+    details = details if isinstance(details, dict) else {}
+    if details.get("cause_code"):
+        return ApplyStepFailed(
+            str(details["cause_code"]),
+            str(details.get("cause") or failure.get("message") or ""),
+            str(details["component_id"]) if details.get("component_id") else None,
+        )
+    return ApplyStepFailed(
+        str(failure.get("cause_code") or failure.get("code") or f"manager_apply_{terminal}"),
+        str(failure.get("message") or f"Manager Apply ended {terminal}"),
+        str(details["component_id"]) if details.get("component_id") else None,
+    )
+
+
+def orchestrated_apply(ports: Any) -> dict[str, Any]:
+    """Run one orchestrated Apply; a refusal before any effect is a 409.
+
+    The caller holds the Apply slot (:func:`apply_slot`).
+    """
+
+    try:
+        return run_apply(ports, error_code=_error_text)
+    except ApplyRefused as refusal:
+        raise refused_before_effect(
+            409, {"code": refusal.code, "message": str(refusal)}
+        ) from refusal
+
+
+class HeadlessApplyPorts:
+    """The component, Program-cycle and Manager-status reads of an Apply.
+
+    ``deployment`` is the candidate Deployment: its components' lifecycle
+    timeouts bound each step; a component that is only in the Applied one
+    (being removed) uses that one's, else the default.
+    """
+
+    _POLL_SECONDS = 0.2
+    _RESET_OWNER_EPOCH = "composer-server"
+
+    def __init__(
+        self, state: ComposerState, deployment: dict[str, Any] | None = None
+    ) -> None:
+        self._state = state
+        self._timeouts = {
+            **lifecycle_timeouts(state.applied_deployment_document),
+            **lifecycle_timeouts(deployment),
+        }
+        self._component_ids = {
+            str(row.get("component_id"))
+            for document in (state.applied_deployment_document, deployment)
+            for row in (document or {}).get("components") or ()
+            if isinstance(row, dict)
+        }
+
+    @property
+    def _client(self):
+        if self._state.headless_client is None:
+            raise ApplyRefused(
+                "deployment_candidate_unavailable",
+                "Deployment Apply requires the configured Manager",
+            )
+        return self._state.headless_client
+
+    def cycle_state(self) -> str | None:
+        return self._client.program_cycle_status().get("state")
+
+    def run_held(self) -> bool:
+        # The one held-run rule (Headless ``held_run_authoring``).
+        return held_run_draft_edit_allowed(
+            self._client.program_cycle_status(),
+            self._client.execution_control_state(),
+        )
+
+    def reset_cycle(self) -> None:
+        """Reset the finished or held run (as the Program tab's Reset, no
+        options) and return once the cycle is idle again and the Kernel's
+        authoring admission has reopened.
+
+        The Runner's Idle reaches the Kernel admission through the Manager's
+        readiness update, a moment later; the Apply's preparation and claim
+        need that admission (as the Program tab's Reset-then-Apply waits for
+        it). Bounded by :meth:`_apply_bound_s`, as the Manager Apply's wait;
+        past it the Apply fails ``program_cycle_reset_failed``, or
+        ``authoring_not_ready`` when the cycle is idle but admission stays
+        closed.
+        """
+
+        cycle = self._client.program_cycle_status()
+        generation = cycle.get("cycle_generation")
+        request_id = f"composer-apply-reset.{uuid.uuid4()}"
+        self._client.program_cycle_reset(
+            {
+                "request_id": request_id,
+                "request_owner_epoch": self._RESET_OWNER_EPOCH,
+                "source_label": "composer_apply",
+                "correlation_id": request_id,
+                "program_run_id": cycle.get("program_run_id"),
+                "expected_owner_epoch": cycle.get("program_runner_owner_epoch"),
+                "expected_cycle_generation": generation,
+                "expected_claim_generation": cycle.get("cycle_claim_generation"),
+                "terminal_reference": cycle.get("terminal_or_settlement_reference"),
+                "settlement_evidence_digest": cycle.get(
+                    "terminal_or_settlement_reference"
+                ),
+                "reload_initial_scene": False,
+                "reset_robot_position": False,
+            }
+        )
+        bound_s = self._apply_bound_s()
+        deadline = time.monotonic() + bound_s
+        while True:
+            current = self._client.program_cycle_status()
+            state = current.get("state")
+            idle = (
+                state == "idle_after_reset"
+                and isinstance(generation, int)
+                and isinstance(current.get("cycle_generation"), int)
+                and current["cycle_generation"] > generation
+            )
+            if idle:
+                if self._authoring_allowed():
+                    return
+            elif state not in (cycle.get("state"), "resetting"):
+                failure = current.get("failure")
+                failure = failure if isinstance(failure, dict) else {}
+                raise ApplyStepFailed(
+                    str(failure.get("code") or "program_cycle_reset_failed"),
+                    str(
+                        failure.get("message")
+                        or "The Program Reset before the Apply didn't finish"
+                    ),
+                )
+            if time.monotonic() >= deadline:
+                if idle:
+                    raise ApplyStepFailed(
+                        "authoring_not_ready",
+                        "Authoring admission didn't reopen within "
+                        f"{bound_s:g} s after the Program Reset",
+                    )
+                raise ApplyStepFailed(
+                    "program_cycle_reset_failed",
+                    f"The Program Reset before the Apply didn't finish within {bound_s:g} s",
+                )
+            time.sleep(self._POLL_SECONDS)
+
+    def _authoring_allowed(self) -> bool:
+        return self._client.authoring_admission().get("authoring_allowed") is True
+
+    def await_authoring(self) -> None:
+        """Return once the Kernel's authoring admission is open.
+
+        The Runner's Idle reaches the Kernel admission a moment after the
+        cycle reads idle (see :meth:`reset_cycle`): a Load or Apply right
+        after the operator's Reset waits for it (R3). Bounded by
+        :meth:`_apply_bound_s`; past it the Apply fails
+        ``authoring_not_ready``."""
+
+        if self._authoring_allowed():
+            return
+        bound_s = self._apply_bound_s()
+        deadline = time.monotonic() + bound_s
+        while not self._authoring_allowed():
+            if time.monotonic() >= deadline:
+                raise ApplyStepFailed(
+                    "authoring_not_ready",
+                    f"Authoring admission didn't reopen within {bound_s:g} s",
+                )
+            time.sleep(self._POLL_SECONDS)
+
+    def components(self) -> list[dict[str, Any]]:
+        return list(self._client.components())
+
+    def component_action(self, component_id: str, action: str) -> None:
+        self._client.component_action(component_id, action)
+
+    def lifecycle_timeout_s(self, component_id: str) -> float:
+        return self._timeouts.get(component_id, DEFAULT_LIFECYCLE_TIMEOUT_S)
+
+    def _apply_bound_s(self) -> float:
+        # The lifecycle timeouts of every component in the candidate or the
+        # installed cell (the components the host may stop or start; the
+        # default for one without an authored timeout, as the Manager's
+        # `HostApplyTimeout`), at least one default timeout. The installed
+        # components are read from the host: the remembered Applied document
+        # may not be verified yet.
+        installed = {str(row.get("component_id")) for row in self.components()}
+        return max(
+            DEFAULT_LIFECYCLE_TIMEOUT_S,
+            sum(self.lifecycle_timeout_s(component_id)
+                for component_id in self._component_ids | installed),
+        )
+
+    def wait_for_manager_apply(self, result: dict[str, Any]) -> None:
+        """Wait for an accepted Manager Apply to be terminal.
+
+        Bounded by :meth:`_apply_bound_s`; past it the outcome is unknown.
+        """
+
+        if result.get("status") != "accepted":
+            # `applied`: the exact configuration already is active.
+            return
+        apply_id = result["apply_id"]
+        generation = result["apply_generation"]
+        bound_s = self._apply_bound_s()
+        deadline = time.monotonic() + bound_s
+        while True:
+            status = self._client.manager_apply_status(apply_id, generation)
+            terminal = status.get("state") if status.get("ok") is True else None
+            if terminal == "succeeded":
+                return
+            if terminal in ("failed", "unknown_effect"):
+                # A terminal status carries the Manager's retained `failure`.
+                error = status.get("failure") if isinstance(status.get("failure"), dict) else {}
+                raise manager_apply_failure(error, terminal)
+            if time.monotonic() >= deadline:
+                raise ApplyStepFailed(
+                    "manager_apply_unknown_effect",
+                    f"The Manager Apply didn't finish within {bound_s:g} s",
+                )
+            time.sleep(self._POLL_SECONDS)
+
+    def wait_for_scene_clear(self, result: dict[str, Any]) -> None:
+        """Wait for Headless's Scene clear of a committed Apply without a
+        Program (New, and the New inside Load).
+
+        Once such an Apply is committed, Headless clears the Scene through
+        owner transactions, which hold the cell's authoring admission; the
+        Apply's result returns once that clear has ended (any outcome; it is
+        reported in the cycle status), so the next Load or Preview is
+        admitted. Bounded by :meth:`_apply_bound_s`; past it, or when the
+        cycle status can't be read, the Apply returns as it is.
+        """
+
+        manager_apply = result.get("manager_apply")
+        if (
+            result.get("status") != "accepted"
+            or not isinstance(manager_apply, dict)
+            or manager_apply.get("replay_status") != "accepted_new"
+        ):
+            # Headless clears the Scene only for a newly accepted Apply.
+            return
+        identity = (result["apply_id"], result["apply_generation"])
+        bound_s = self._apply_bound_s()
+        deadline = time.monotonic() + bound_s
+        while True:
+            try:
+                clear = self._client.program_cycle_status().get("scene_clear")
+            except HeadlessClientError as error:
+                logging.getLogger(__name__).warning(
+                    "Scene clear after Apply %s/%s not observed: %s",
+                    *identity, error.code,
+                )
+                return
+            if (
+                isinstance(clear, dict)
+                and (clear.get("apply_id"), clear.get("apply_generation")) == identity
+                and clear.get("state") != "pending"
+            ):
+                return
+            if time.monotonic() >= deadline:
+                logging.getLogger(__name__).warning(
+                    "Scene clear after Apply %s/%s didn't end within %g s",
+                    *identity, bound_s,
+                )
+                return
+            time.sleep(self._POLL_SECONDS)
+
+
+class _DraftApplyPorts(HeadlessApplyPorts):
+    """Apply of the current Deployment Draft (`POST /api/deployment/apply`)."""
+
+    def __init__(
+        self,
+        state: ComposerState,
+        body: DeploymentCandidateRequest,
+        authored_candidate: Callable[..., dict[str, Any]],
+    ) -> None:
+        document = state.deployment_draft_session.retained_state().get("document")
+        super().__init__(state, document if isinstance(document, dict) else None)
+        self._body = body
+        self._authored_candidate = authored_candidate
+
+    def refuse_unchanged(self) -> None:
+        """Refuse a Draft that already matches Applied (409
+        ``deployment_apply_nothing_to_apply``); no effect."""
+        self._authored_candidate(self._body, apply=False, refuse_unchanged=True)
+
+    def preview(self) -> Preview:
+        # The Apply's Preview runs after the run's Reset, before any disable
+        # (run_apply).
+        response = self._authored_candidate(self._body, apply=False)
+        return candidate_preview(response["result"].get("candidate_preview"))
+
+    def apply(self) -> None:
+        # Disabling components may advance the authoring admission generation;
+        # the server's own Apply uses the current one.
+        generation = self._client.authoring_admission().get("admission_generation")
+        body = self._body.model_copy(update={"expected_admission_generation": generation})
+        response = self._authored_candidate(body, apply=True)
+        self.wait_for_manager_apply(response["result"])

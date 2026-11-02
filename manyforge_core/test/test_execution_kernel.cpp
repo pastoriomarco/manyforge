@@ -31,7 +31,6 @@
 #include <manyforge_core/testing/fake_execution_port.hpp>
 #include <manyforge_core/trajectory/trajectory_splice.hpp>
 #include <manyforge_core/trajectory/trajectory_sampler.hpp>
-#include <manyforge_core/trajectory/validation_sampling.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_core/time/manual_scheduler.hpp>
 #include <manyforge_core/types/controller_lifecycle.hpp>
@@ -1171,7 +1170,7 @@ class MockExecution : public IExecutionBackend {
     ControlledStopResultDTO r;
     r.accepted = true;
     r.executed_stop_mode = profile.stop_mode;
-    r.stop_command_source = MotionInterruptStopCommandSource::kNativeSimulatedStop;
+    r.stop_command_source = MotionInterruptStopCommandSource::kFjtPreemptHold;
     r.backend_stop_confirmed = true;
     r.confirmation_latency_ns = 1'000'000;  // 1 ms
     return r;
@@ -1457,7 +1456,7 @@ class ControlledExecution : public IExecutionBackend {
     } else {
       r.accepted = true;
       r.executed_stop_mode = profile.stop_mode;
-      r.stop_command_source = MotionInterruptStopCommandSource::kNativeSimulatedStop;
+      r.stop_command_source = MotionInterruptStopCommandSource::kFjtPreemptHold;
       r.backend_stop_confirmed = true;
       r.confirmation_latency_ns = 1'000'000;
     }
@@ -2088,6 +2087,20 @@ CollisionPolicySnapshot make_test_collision_policy_snapshot() {
   return snapshot;
 }
 
+// A collision policy with one active support contact (an unrelated pair).
+// The planner switches that pair off, so a fresh plan under this policy is
+// collision-validated before dispatch.
+CollisionPolicySnapshot make_support_contact_test_policy() {
+  auto policy = make_test_collision_policy_snapshot();
+  policy.policy_id = "support_contact_test_policy";
+  SupportContactPolicyEntry entry;
+  entry.pair = CollisionPairId{"scene/insert/shape/0", "scene/fixture/shape/0"};
+  entry.mode = CollisionContactPolicyMode::kBoundedPenetration;
+  entry.max_contact_penetration_m = 0.005;
+  policy.support_contacts.push_back(entry);
+  return policy;
+}
+
 CollisionResult make_authoritative_collision_result() {
   CollisionResult result;
   result.in_collision = true;
@@ -2292,7 +2305,6 @@ KernelRecoveryActionRequestDTO bound_recovery_request(
   request.expected_assessment_revision = assessment.assessment_revision;
   request.expected_control_command_epoch = assessment.control_command_epoch;
   request.expected_execution_id = assessment.execution_id;
-  request.expected_latch_id = assessment.latch_id;
   request.expected_stop_certificate_id = assessment.stop_certificate_id;
   request.expected_stop_owner_generation = assessment.stop_owner_generation;
   return request;
@@ -2352,6 +2364,48 @@ class CollisionDetailsRecorder {
   ExecutionKernel& kernel_;
   mutable std::mutex mutex_;
   std::optional<std::map<std::string, std::string>> latest_;
+  SubscriptionHandle handle_;
+};
+
+// Records the pre-dispatch validation outcome: the error that refused a
+// cached trajectory (the kernel then re-plans it) and the
+// `collision_evidence` and collision wall time of the last pass.
+class ValidationOutcomeRecorder {
+ public:
+  explicit ValidationOutcomeRecorder(ExecutionKernel& kernel)
+      : kernel_(kernel), handle_(kernel.subscribe_events([this](const KernelEvent& event) {
+          std::lock_guard<std::mutex> lock(mutex_);
+          if (event.type == KernelEventType::kCacheRevalidationFailed) {
+            cache_refusal_ = event.error;
+          } else if (event.type == KernelEventType::kValidationPassed &&
+                     event.details.contains("collision_evidence")) {
+            collision_evidence_ = event.details.at("collision_evidence");
+            collision_validation_wall_ns_ = event.details.at("collision_validation_wall_ns");
+          }
+        })) {}
+  ValidationOutcomeRecorder(const ValidationOutcomeRecorder&) = delete;
+  ValidationOutcomeRecorder& operator=(const ValidationOutcomeRecorder&) = delete;
+  ~ValidationOutcomeRecorder() { kernel_.unsubscribe_events(handle_); }
+
+  [[nodiscard]] std::optional<ErrorDTO> cache_refusal() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return cache_refusal_;
+  }
+  [[nodiscard]] std::string collision_evidence() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return collision_evidence_;
+  }
+  [[nodiscard]] std::string collision_validation_wall_ns() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return collision_validation_wall_ns_;
+  }
+
+ private:
+  ExecutionKernel& kernel_;
+  mutable std::mutex mutex_;
+  std::optional<ErrorDTO> cache_refusal_;
+  std::string collision_evidence_;
+  std::string collision_validation_wall_ns_;
   SubscriptionHandle handle_;
 };
 
@@ -2440,9 +2494,14 @@ class ExecutionKernelTest : public ::testing::Test {
 
   void store_cache(const ExecuteRequestDTO& request, TrajectoryDTO trajectory,
                    std::uint32_t planning_attempt_index = 0U) {
+    store_cache(cache, request, std::move(trajectory), planning_attempt_index);
+  }
+
+  static void store_cache(TrajectoryCache& target, const ExecuteRequestDTO& request,
+                          TrajectoryDTO trajectory, std::uint32_t planning_attempt_index = 0U) {
     const auto resolved_request = prepared_motion_request(request).execution_request;
-    cache.store(trajectory_cache_key(resolved_request), std::move(trajectory),
-                trajectory_cache_intent_identity(resolved_request), planning_attempt_index);
+    target.store(trajectory_cache_key(resolved_request), std::move(trajectory),
+                 trajectory_cache_intent_identity(resolved_request), planning_attempt_index);
   }
 
   TrajectoryCacheKey cache_key(const std::string& move_id) const {
@@ -3094,29 +3153,6 @@ TEST_F(ExecutionKernelTest, AutomaticPlanningRetryUsesExactPreparedFailureCause)
   }
 }
 
-TEST_F(ExecutionKernelTest, AutomaticValidationRetryRequiresAuthoritativeBlockingCollision) {
-  std::optional<MotionRetryEligibilityDTO> failure_candidate;
-  const auto subscription = kernel.subscribe_events([&](const KernelEvent& event) {
-    if (event.type == KernelEventType::kParticipantSettled)
-      failure_candidate = event.retry_eligibility;
-  });
-  collision_engine->default_result = make_authoritative_collision_result();
-  const auto prepared =
-      kernel.PrepareMotion(prepared_motion_request(make_test_request("automatic_collision")));
-  ASSERT_TRUE(prepared.ok()) << prepared.error().message;
-  ASSERT_TRUE(kernel.wait_for_completion(2'000'000'000));
-  ASSERT_EQ(ended_as(kernel), "failed");
-  scheduler.advance_to(clock.now());
-  const auto assessment = kernel.get_recovery_assessment();
-  EXPECT_TRUE(assessment.retry_eligibility.eligible);
-  EXPECT_EQ(assessment.retry_eligibility.cause, MotionRetryCause::kPlanningNoEffect);
-  EXPECT_EQ(assessment.retry_eligibility.effect, MotionRetryEffect::kKnownNoEffect);
-  ASSERT_TRUE(failure_candidate.has_value());
-  EXPECT_EQ(*failure_candidate, assessment.retry_eligibility);
-  EXPECT_EQ(execution.execute_count, 0);
-  kernel.unsubscribe_events(subscription);
-}
-
 TEST_F(ExecutionKernelTest, AutomaticValidationRetryRejectsInconclusiveOrNonCollisionFailure) {
   for (const auto* reason : {"collision_validation_cancelled", "collision_validation_wall_timeout",
                              "stale_observed_robot_state", "contact_policy_violation"}) {
@@ -3143,12 +3179,43 @@ TEST_F(ExecutionKernelTest, AutomaticValidationRetryRejectsInconclusiveOrNonColl
   }
 }
 
+TEST_F(ExecutionKernelTest, AutomaticValidationRetryRequiresAuthoritativeBlockingCollision) {
+  std::optional<MotionRetryEligibilityDTO> failure_candidate;
+  const auto subscription = kernel.subscribe_events([&](const KernelEvent& event) {
+    if (event.type == KernelEventType::kParticipantSettled)
+      failure_candidate = event.retry_eligibility;
+  });
+  // A support contact (an unrelated pair) is active: the planner switches it
+  // off, so the fresh plan is collision-validated before dispatch.
+  collision_world_publisher.current_policy = make_support_contact_test_policy();
+  kernel.set_collision_validation_policy_snapshot(make_support_contact_test_policy());
+  collision_engine->default_result = make_authoritative_collision_result();
+  const auto prepared =
+      kernel.PrepareMotion(prepared_motion_request(make_test_request("automatic_collision")));
+  ASSERT_TRUE(prepared.ok()) << prepared.error().message;
+  ASSERT_TRUE(kernel.wait_for_completion(2'000'000'000));
+  ASSERT_EQ(ended_as(kernel), "failed");
+  scheduler.advance_to(clock.now());
+  const auto assessment = kernel.get_recovery_assessment();
+  EXPECT_TRUE(assessment.retry_eligibility.eligible);
+  EXPECT_EQ(assessment.retry_eligibility.cause, MotionRetryCause::kPlanningNoEffect);
+  EXPECT_EQ(assessment.retry_eligibility.effect, MotionRetryEffect::kKnownNoEffect);
+  ASSERT_TRUE(failure_candidate.has_value());
+  EXPECT_EQ(*failure_candidate, assessment.retry_eligibility);
+  EXPECT_EQ(execution.execute_count, 0);
+  kernel.unsubscribe_events(subscription);
+}
+
 TEST_F(ExecutionKernelTest, AutomaticValidationRetryRejectsAuthoritativeInconclusiveResult) {
   std::optional<MotionRetryEligibilityDTO> failure_candidate;
   const auto subscription = kernel.subscribe_events([&](const KernelEvent& event) {
     if (event.type == KernelEventType::kParticipantSettled)
       failure_candidate = event.retry_eligibility;
   });
+  // A support contact (an unrelated pair) is active: the planner switches it
+  // off, so the fresh plan is collision-validated before dispatch.
+  collision_world_publisher.current_policy = make_support_contact_test_policy();
+  kernel.set_collision_validation_policy_snapshot(make_support_contact_test_policy());
   auto inconclusive = make_authoritative_collision_result();
   inconclusive.engine_status = CollisionEngineStatus::kDiagnosticIncomplete;
   inconclusive.decision = CollisionDecisionResult::kInconclusiveFail;
@@ -3171,6 +3238,10 @@ TEST_F(ExecutionKernelTest, AutomaticValidationRetryRejectsAuthoritativeInconclu
 }
 
 TEST_F(ExecutionKernelTest, AutomaticValidationRetryRejectsGenericEngineFailureWithoutCollision) {
+  // A support contact (an unrelated pair) is active: the planner switches it
+  // off, so the fresh plan is collision-validated before dispatch.
+  collision_world_publisher.current_policy = make_support_contact_test_policy();
+  kernel.set_collision_validation_policy_snapshot(make_support_contact_test_policy());
   CollisionResult failed_query;
   // Engine failures use an inconclusive decision, preserved by policy merging;
   // kFail with no blocking pairs is reclassified as a clear policy result.
@@ -3373,7 +3444,7 @@ TEST_F(ExecutionKernelTest, RecoveryObservationPollAllowsReentrantLifecycleAdmis
                {{1U, StopResolutionDispositionDTO::kExact,
                  StopScopeResolutionReasonDTO::kExplicitFullStop, ContentDigest(kTestDigestB),
                  {}, {}, {}}},
-               {}, {}, {}, std::nullopt, std::nullopt, std::nullopt, clock.now(), std::nullopt});
+               {}, {}, {}, std::nullopt, clock.now(), std::nullopt});
           ASSERT_TRUE(certificate.ok()) << certificate.error().message;
           unsigned reentered = 0U;
           std::optional<KernelEvent> published;
@@ -3765,6 +3836,8 @@ TEST_F(ExecutionKernelTest, Execute_HappyPath_CachesTrajectory) {
 
 TEST_F(ExecutionKernelTest,
        Execute_LiveSceneRevisionChangeAfterBorrowedSnapshotDispatchesOnLatestScene) {
+  // A cached trajectory, so the stored path is collision-validated.
+  store_cache("move_scene_changed", make_test_trajectory());
   bool mutated_once = false;
   collision_engine->on_check = [this, &mutated_once](const CollisionQuery&) {
     if (!mutated_once) {
@@ -3790,20 +3863,20 @@ TEST_F(ExecutionKernelTest,
   ASSERT_TRUE(result.ok());
   EXPECT_EQ(ended_as(kernel), "completed");
   EXPECT_EQ(execution.execute_count, 1);
-  // One validation pass over the two stored waypoints (both joints 0 -> 1
-  // rad: sqrt(2) rad apart) and the interpolants at the planner's default
-  // collision-check step.
-  EXPECT_EQ(collision_engine->check_count.load(),
-            static_cast<int>(std::ceil(std::sqrt(2.0) / kDefaultCollisionCheckStepRad)) + 1);
+  EXPECT_EQ(planner.plan_count, 0);
+  // One validation pass over the two stored waypoints.
+  EXPECT_EQ(collision_engine->check_count.load(), 2);
   std::lock_guard<std::mutex> lock(events_mutex);
   EXPECT_TRUE(std::none_of(events.begin(), events.end(), [](const KernelEvent& e) {
     return e.type == KernelEventType::kErrorRaised;
   }));
 }
 
-TEST_F(ExecutionKernelTest, Execute_SameContentRevisionChangeDuringValidationDispatchesOnLatestScene) {
+TEST_F(ExecutionKernelTest, Execute_SameContentRevisionChangeBeforeDispatchDispatchesOnLatestScene) {
+  // The scene changes while the motion is planned, after its projection was
+  // retained; the fresh plan is validated against that retained projection.
   bool mutated_once = false;
-  collision_engine->on_check = [this, &mutated_once](const CollisionQuery&) {
+  planner.on_plan = [this, &mutated_once](int) {
     if (!mutated_once) {
       mutated_once = true;
       auto mutated = make_test_collision_world_snapshot();
@@ -3822,9 +3895,9 @@ TEST_F(ExecutionKernelTest, Execute_SameContentRevisionChangeDuringValidationDis
   EXPECT_FALSE(kernel.get_execution_snapshot().error.has_value());
 }
 
-TEST_F(ExecutionKernelTest, Execute_RepeatedLiveSceneRevisionChangesDuringValidationDispatchOnce) {
+TEST_F(ExecutionKernelTest, Execute_RepeatedLiveSceneRevisionChangesBeforeDispatchDispatchOnce) {
   std::uint64_t next_revision = 2;
-  collision_engine->on_check = [this, &next_revision](const CollisionQuery&) {
+  planner.on_plan = [this, &next_revision](int) {
     auto mutated = make_test_collision_world_snapshot();
     mutated.revision = CollisionWorldRevision{
         next_revision, test_digest("mutated-world-" + std::to_string(next_revision))};
@@ -3845,7 +3918,7 @@ TEST_F(ExecutionKernelTest, Execute_RepeatedLiveSceneRevisionChangesDuringValida
 TEST_F(ExecutionKernelTest, Execute_ObservedSceneLeaseAcceptsBoundedTargetPoseDriftBeforeDispatch) {
   enable_observed_box_lease("box");
   bool mutated_once = false;
-  collision_engine->on_check = [this, &mutated_once](const CollisionQuery&) {
+  planner.on_plan = [this, &mutated_once](int) {
     if (!mutated_once) {
       mutated_once = true;
       publish_observed_box_for_lease(
@@ -3907,10 +3980,10 @@ TEST_F(ExecutionKernelTest, Execute_RetainsOneExactProjectionThroughPlanValidati
             collision_world_publisher.current_policy->revision);
 }
 
-TEST_F(ExecutionKernelTest, Execute_ObservedSceneLeaseAcceptsTargetMovedAfterValidation) {
+TEST_F(ExecutionKernelTest, Execute_ObservedSceneLeaseAcceptsTargetMovedBeforeDispatch) {
   enable_observed_box_lease("box");
   bool mutated_once = false;
-  collision_engine->on_check = [this, &mutated_once](const CollisionQuery&) {
+  planner.on_plan = [this, &mutated_once](int) {
     if (!mutated_once) {
       mutated_once = true;
       publish_observed_box_for_lease(
@@ -3932,7 +4005,7 @@ TEST_F(ExecutionKernelTest, Execute_ObservedSceneLeaseAcceptsTargetMovedAfterVal
 TEST_F(ExecutionKernelTest, Execute_ObservedSceneLeaseAcceptsTargetShapeChange) {
   enable_observed_box_lease("box");
   bool mutated_once = false;
-  collision_engine->on_check = [this, &mutated_once](const CollisionQuery&) {
+  planner.on_plan = [this, &mutated_once](int) {
     if (!mutated_once) {
       mutated_once = true;
       publish_observed_box_for_lease(
@@ -3951,7 +4024,7 @@ TEST_F(ExecutionKernelTest, Execute_ObservedSceneLeaseAcceptsTargetShapeChange) 
 TEST_F(ExecutionKernelTest, Execute_ObservedSceneLeaseAcceptsNonTargetObjectChange) {
   enable_observed_box_lease("box");
   bool mutated_once = false;
-  collision_engine->on_check = [this, &mutated_once](const CollisionQuery&) {
+  planner.on_plan = [this, &mutated_once](int) {
     if (!mutated_once) {
       mutated_once = true;
       publish_observed_box_for_lease(
@@ -3971,7 +4044,7 @@ TEST_F(ExecutionKernelTest, Execute_ObservedSceneLeaseAcceptsNonTargetObjectChan
 TEST_F(ExecutionKernelTest, Execute_ObservedSceneLeaseAcceptsDefaultSnapshotObstacleDrift) {
   enable_observed_box_lease("box");
   bool mutated_once = false;
-  collision_engine->on_check = [this, &mutated_once](const CollisionQuery&) {
+  planner.on_plan = [this, &mutated_once](int) {
     if (!mutated_once) {
       mutated_once = true;
       publish_observed_box_for_lease(
@@ -4077,7 +4150,7 @@ TEST_F(ExecutionKernelTest, Execute_FailedCachedTrajectoryInvalidatesAndReplansO
   EXPECT_EQ(hit_events.load(std::memory_order_relaxed), 1);
   EXPECT_EQ(failure_events.load(std::memory_order_relaxed), 1);
   EXPECT_EQ(metrics.cache_invalidations, 1u);
-  // The re-planned, validated trajectory replaces the failed one.
+  // The re-planned trajectory replaces the failed one.
   EXPECT_TRUE(peek_cache(request.move_id).has_value());
 }
 
@@ -4763,13 +4836,16 @@ TEST_F(ExecutionKernelTest, Execute_StartStateMissingJointName_FailsClosed) {
 // --- Non-authoritative collision diagnostic comparator gate ---
 
 TEST_F(ExecutionKernelTest, Execute_CollisionRejectionOmitsDiagnosticCompareByDefault) {
+  // A cached trajectory: only it is collision-validated before dispatch.
+  store_cache("diagnostic_compare_gated_off", make_test_trajectory());
   collision_engine->default_result = make_authoritative_collision_result();
+  ValidationOutcomeRecorder outcome(kernel);
 
   execute_sync(make_test_request("diagnostic_compare_gated_off"));
 
-  const auto snapshot = kernel.get_execution_snapshot();
-  ASSERT_TRUE(snapshot.error.has_value());
-  for (const auto& [key, value] : snapshot.error->details) {
+  const auto refusal = outcome.cache_refusal();
+  ASSERT_TRUE(refusal.has_value());
+  for (const auto& [key, value] : refusal->details) {
     EXPECT_EQ(key.rfind("collision_diagnostic_compare_", 0), std::string::npos)
         << "unexpected diagnostic compare key on default config: " << key;
   }
@@ -4781,16 +4857,18 @@ TEST_F(ExecutionKernelTest, Execute_CollisionRejectionAppendsDiagnosticCompareWh
   ExecutionKernel gated_kernel{planner, context, execution, clock, scheduler, cache, config};
   configure_authoritative_collision_validation(gated_kernel, collision_world_publisher,
                                                collision_engine);
+  store_cache("diagnostic_compare_on", make_test_trajectory());
   collision_engine->default_result = make_authoritative_collision_result();
+  ValidationOutcomeRecorder outcome(gated_kernel);
 
   auto result = prepare_and_dispatch(gated_kernel, make_test_request("diagnostic_compare_on"));
   ASSERT_TRUE(result.ok());
   gated_kernel.wait_for_completion();
 
-  const auto snapshot = gated_kernel.get_execution_snapshot();
-  ASSERT_TRUE(snapshot.error.has_value());
+  const auto refusal = outcome.cache_refusal();
+  ASSERT_TRUE(refusal.has_value());
   bool found_compare_key = false;
-  for (const auto& [key, value] : snapshot.error->details) {
+  for (const auto& [key, value] : refusal->details) {
     if (key.rfind("collision_diagnostic_compare_", 0) == 0) {
       found_compare_key = true;
       break;
@@ -4801,179 +4879,53 @@ TEST_F(ExecutionKernelTest, Execute_CollisionRejectionAppendsDiagnosticCompareWh
 
 // --- Pre-execution collision ---
 
-TEST_F(ExecutionKernelTest, Execute_PreCollisionCheck_Blocks) {
+TEST_F(ExecutionKernelTest, Execute_PreCollisionCheck_RefusesACollidingCachedTrajectory) {
+  // The colliding cached trajectory is never sent: it is refused and the move
+  // re-planned; with `collision_check_fresh_plans` off, the fresh plan is
+  // dispatched on its planning evidence.
+  kernel.set_collision_check_fresh_plans(false);
+  store_cache("move_1", make_test_trajectory());
   collision_engine->default_result = make_authoritative_collision_result();
+  ValidationOutcomeRecorder outcome(kernel);
 
   execute_sync(make_test_request());
-  EXPECT_EQ(ended_as(kernel), "failed");
-  EXPECT_EQ(execution.execute_count, 0);
+  const auto refusal = outcome.cache_refusal();
+  ASSERT_TRUE(refusal.has_value());
+  EXPECT_EQ(refusal->code, kErrorValidationCollision);
+  EXPECT_EQ(planner.plan_count, 1);
+  EXPECT_EQ(ended_as(kernel), "completed");
+  EXPECT_EQ(execution.execute_count, 1);
+  EXPECT_EQ(outcome.collision_evidence(), "planning");
   EXPECT_FALSE(context.last_validation_options.run_collision_checks);
-}
-
-TEST_F(ExecutionKernelTest, Execute_ValidationRejectsCollisionStrictlyBetweenWaypoints) {
-  // M55 F-1: the only colliding configuration lies strictly between the two
-  // stored waypoints (0 and 1 rad). Checking the stored waypoints alone
-  // accepted it; the runtime lookahead then stopped the motion. The band is
-  // two planner steps wide, so a sample at the planner step lands in it.
-  collision_engine->result_for_query =
-      [](const CollisionQuery& query) -> std::optional<CollisionResult> {
-    const auto& names = query.robot_state.joint_names;
-    const auto j1 = std::find(names.begin(), names.end(), "j1");
-    if (j1 == names.end()) return std::nullopt;
-    const double position = query.robot_state.positions_rad.at(
-        static_cast<std::size_t>(std::distance(names.begin(), j1)));
-    if (position > 0.5 && position < 0.5 + 2.0 * kDefaultCollisionCheckStepRad) {
-      return make_authoritative_collision_result();
-    }
-    return std::nullopt;
-  };
-
-  execute_sync(make_test_request("collision_between_waypoints"));
-  EXPECT_EQ(ended_as(kernel), "failed");
-  EXPECT_EQ(execution.execute_count, 0);
-  const auto snapshot = kernel.get_execution_snapshot();
-  ASSERT_TRUE(snapshot.error.has_value());
-  EXPECT_EQ(snapshot.error->code, kErrorValidationCollision);
-  const auto& positions =
-      snapshot.error->details.at("collision_result_first_failure_positions_rad");
-  const double failing_j1 = std::stod(positions.substr(0, positions.find(',')));
-  EXPECT_GT(failing_j1, 0.0);
-  EXPECT_LT(failing_j1, 1.0);
 }
 
 // --- M6 collision clearance (security margin)
 
-TEST_F(ExecutionKernelTest, Config_CollisionClearanceAndCheckStepRejectOutOfRange) {
+TEST_F(ExecutionKernelTest, Config_CollisionClearanceRejectsOutOfRange) {
   for (const double bad : {-0.001, 0.0501}) {
     ExecutionKernelConfig config;
     config.collision_clearance_m = bad;
     EXPECT_THROW((ExecutionKernel{planner, context, execution, clock, scheduler, cache, config}),
                  std::invalid_argument);
   }
-  for (const double bad : {0.0, -0.01, 0.2001}) {
-    ExecutionKernelConfig config;
-    config.collision_check_step_rad = bad;
-    EXPECT_THROW((ExecutionKernel{planner, context, execution, clock, scheduler, cache, config}),
-                 std::invalid_argument);
-  }
-  // 0 turns the clearance off; no lower floor otherwise.
+  // 0.1 mm by default; 0 turns the clearance off; no lower floor otherwise.
+  EXPECT_DOUBLE_EQ(ExecutionKernelConfig{}.collision_clearance_m, 0.001);
   for (const double admitted : {0.0, 0.0002, 0.05}) {
     ExecutionKernelConfig config;
     config.collision_clearance_m = admitted;
     EXPECT_NO_THROW(
         (ExecutionKernel{planner, context, execution, clock, scheduler, cache, config}));
   }
-  for (const double admitted : {0.001, 0.2}) {
-    ExecutionKernelConfig config;
-    config.collision_check_step_rad = admitted;
-    EXPECT_NO_THROW(
-        (ExecutionKernel{planner, context, execution, clock, scheduler, cache, config}));
-  }
-}
-
-TEST_F(ExecutionKernelTest, Execute_ValidationChecksTheCurveAtTheConfiguredPlannerStep) {
-  // M6 decision 18: validation samples the executed curve at the planner's
-  // collision-check step, settable (Deployment collision_check_step_rad),
-  // measured like RoboPlan's configuration distance. Both joints 0 -> 1 rad
-  // (sqrt(2) rad) at 0.01: 142 steps, 143 checked states; not the default
-  // step's 30 and not the former fixed 0.0005 rad joint step's 2001.
-  ExecutionKernelConfig config;
-  config.collision_check_step_rad = 0.01;
-  ExecutionKernel stepped_kernel{planner, context, execution, clock, scheduler, cache, config};
-  configure_authoritative_collision_validation(stepped_kernel, collision_world_publisher,
-                                               collision_engine);
-  std::mutex positions_mutex;
-  std::map<std::int64_t, std::pair<double, double>> checked;
-  collision_engine->result_for_query =
-      [&](const CollisionQuery& query) -> std::optional<CollisionResult> {
-    if (query.waypoint_index) {
-      std::lock_guard lock(positions_mutex);
-      checked[*query.waypoint_index] = {clearance_test_joint(query, "j1"),
-                                        clearance_test_joint(query, "j2")};
-    }
-    return std::nullopt;
-  };
-
-  auto result = prepare_and_dispatch(stepped_kernel, make_test_request("planner_step"));
-  ASSERT_TRUE(result.ok()) << result.error().message;
-  stepped_kernel.wait_for_completion();
-  EXPECT_EQ(ended_as(stepped_kernel), "completed");
-  EXPECT_EQ(collision_engine->check_count.load(),
-            static_cast<int>(std::ceil(std::sqrt(2.0) / 0.01)) + 1);
-  std::lock_guard lock(positions_mutex);
-  ASSERT_EQ(checked.size(), 143U);
-  for (auto it = std::next(checked.begin()); it != checked.end(); ++it) {
-    const auto& [j1, j2] = it->second;
-    const auto& [p1, p2] = std::prev(it)->second;
-    EXPECT_LE(std::hypot(j1 - p1, j2 - p2), 0.01 + 1e-12);
-  }
-}
-
-TEST_F(ExecutionKernelTest, Execute_ValidationOfARetryUsesTheRetryPlannerStep) {
-  // SX-608: validation uses the step the trajectory was planned with. Both
-  // joints 0 -> 1 rad (sqrt(2) rad). The first attempt (0.05: 29 steps) has
-  // a sample at j1 = 15/29 = 0.51724 inside a thin band and is refused; the
-  // retry is planned at min(0.05, 0.01) and validated at 0.01 (142 steps,
-  // samples at 73/142 = 0.51408 and 74/142 = 0.52113, both outside the
-  // band), so it is accepted and dispatched.
-  std::mutex indexes_mutex;
-  std::int64_t max_index = -1;
-  collision_engine->result_for_query =
-      [&](const CollisionQuery& query) -> std::optional<CollisionResult> {
-    if (query.waypoint_index) {
-      std::lock_guard lock(indexes_mutex);
-      max_index = std::max(max_index, *query.waypoint_index);
-    }
-    const double j1 = clearance_test_joint(query, "j1");
-    if (j1 > 0.5170 && j1 < 0.5175) return make_authoritative_collision_result();
-    return std::nullopt;
-  };
-
-  const auto result = execute_sync(make_test_request("retry_step"));
-  ASSERT_TRUE(result.ok()) << result.error().message;
-  EXPECT_EQ(ended_as(kernel), "completed");
-  EXPECT_EQ(execution.execute_count, 1);
-  EXPECT_EQ(planner.last_request.planning_attempt_index, 1U);
-  EXPECT_DOUBLE_EQ(collision_check_step_for_attempt(kDefaultCollisionCheckStepRad, 1U), 0.01);
-  std::lock_guard lock(indexes_mutex);
-  EXPECT_EQ(max_index, static_cast<std::int64_t>(std::ceil(std::sqrt(2.0) / 0.01)));
-}
-
-TEST_F(ExecutionKernelTest, Execute_CachedRetryTrajectoryIsRevalidatedAtTheRetryStep) {
-  // SX-617: a trajectory planned on a retry (attempt 1, 0.01) is stored with
-  // its attempt; a later cache hit is revalidated at 0.01 (143 states), not
-  // at the first attempt's 0.05 (30 states), and the planner is not called.
-  store_cache(make_test_request("cached_retry"), make_test_trajectory(), 1U);
-  std::mutex indexes_mutex;
-  std::int64_t max_index = -1;
-  collision_engine->result_for_query =
-      [&](const CollisionQuery& query) -> std::optional<CollisionResult> {
-    if (query.waypoint_index) {
-      std::lock_guard lock(indexes_mutex);
-      max_index = std::max(max_index, *query.waypoint_index);
-    }
-    return std::nullopt;
-  };
-  const int plans_before = planner.plan_count;
-
-  const auto result = execute_sync(make_test_request("cached_retry"));
-  ASSERT_TRUE(result.ok()) << result.error().message;
-  EXPECT_EQ(ended_as(kernel), "completed");
-  EXPECT_EQ(planner.plan_count, plans_before);
-  EXPECT_EQ(kernel.get_metrics().cache_hits, 1U);
-  std::lock_guard lock(indexes_mutex);
-  EXPECT_EQ(max_index, static_cast<std::int64_t>(std::ceil(std::sqrt(2.0) / 0.01)));
 }
 
 TEST_F(ExecutionKernelTest, Execute_RetryTrajectoryIsCachedWithItsAttempt) {
-  // The retry of Execute_ValidationOfARetryUsesTheRetryPlannerStep is stored
-  // with attempt 1, so its reuse keeps the 0.01 step.
-  collision_engine->result_for_query =
-      [&](const CollisionQuery& query) -> std::optional<CollisionResult> {
-    const double j1 = clearance_test_joint(query, "j1");
-    if (j1 > 0.5170 && j1 < 0.5175) return make_authoritative_collision_result();
-    return std::nullopt;
-  };
+  // A refused cached trajectory is re-planned as attempt 1 (planner step
+  // min(step, 0.01)); the replan is stored with its attempt.
+  // This test is about the cached trajectory: the replan stands on the
+  // planner's check (`collision_check_fresh_plans` off).
+  kernel.set_collision_check_fresh_plans(false);
+  store_cache(make_test_request("retry_cached"), make_test_trajectory(), 0U);
+  collision_engine->default_result = make_authoritative_collision_result();
   const auto request = make_test_request("retry_cached");
   ASSERT_TRUE(execute_sync(request).ok());
   ASSERT_EQ(ended_as(kernel), "completed");
@@ -4984,11 +4936,12 @@ TEST_F(ExecutionKernelTest, Execute_RetryTrajectoryIsCachedWithItsAttempt) {
   EXPECT_EQ(stored.planning_attempt_index, 1U);
 }
 
-TEST_F(ExecutionKernelTest, Execute_DefaultClearanceIsOffAsInMerge55) {
-  // M6 final decision: the default clearance is 0. With no Deployment or
-  // move clearance, a pick whose fingers come within 1 mm of the part is
-  // accepted, no margins reach the planner or validation, and no start
-  // clearance query runs (merge 5.5 behaviour).
+TEST_F(ExecutionKernelTest, Execute_DefaultClearanceAppliesWithoutAConfiguredOne) {
+  // With no Deployment or move clearance, every planned move keeps
+  // kDefaultCollisionClearanceM from the bodies its policy does not let it
+  // touch. A pick whose fingers come within 1 mm of the part is accepted;
+  // the planner gets the default margins, and so do the start clearance query
+  // and the pre-dispatch check of the plan's two waypoints.
   ExecuteRequestDTO req = make_relative_object_request("clearance_default", "graspable");
   Pose3DTO reference;
   reference.position_m = {0.3, -0.2, 0.15};
@@ -5006,20 +4959,25 @@ TEST_F(ExecutionKernelTest, Execute_DefaultClearanceIsOffAsInMerge55) {
                                  0.004 - 0.003 * clearance_test_joint(query, "j1"));
   };
 
-  EXPECT_DOUBLE_EQ(kDefaultCollisionClearanceM, 0.0);
+  EXPECT_DOUBLE_EQ(kDefaultCollisionClearanceM, 0.001);
   const auto result = execute_sync(req);
   ASSERT_TRUE(result.ok()) << result.error().message;
   EXPECT_EQ(ended_as(kernel), "completed");
   EXPECT_EQ(execution.execute_count, 1);
-  EXPECT_FALSE(planner.last_request.retained_clearance_margins);
-  EXPECT_EQ(queries_with_margins.load(), 0);
+  const auto& margins = planner.last_request.retained_clearance_margins;
+  ASSERT_TRUE(margins);
+  EXPECT_DOUBLE_EQ(margins->margin_m, kDefaultCollisionClearanceM);
+  EXPECT_DOUBLE_EQ(margins->margin_for(target), kDefaultCollisionClearanceM);
+  EXPECT_DOUBLE_EQ(margins->margin_for(clearance_test_pair("table")), 0.001);
+  EXPECT_EQ(queries_with_margins.load(), 3);
 }
 
 TEST_F(ExecutionKernelTest, Execute_ClearanceAppliesToTheMoveTargetWithoutAContactPolicy) {
   // M6 decision 17: the move's target object is not exempt by itself. With a
-  // 3 mm clearance, a pick approach whose fingers come within 1 mm of it,
-  // with no contact-grasp policy, is refused as a clearance violation; the
-  // table keeps the clearance as well.
+  // 3 mm clearance and no contact-grasp policy, the planner keeps 3 mm from
+  // the target and from the table (a planner keeping it refuses an approach
+  // within 1 mm). The mock planner does not, so the pre-dispatch check refuses
+  // its plan, and every replan: the move fails and nothing is sent.
   ExecuteRequestDTO req = make_relative_object_request("clearance_pick", "graspable");
   req.clearance_m = 0.003;
   Pose3DTO reference;
@@ -5044,11 +5002,6 @@ TEST_F(ExecutionKernelTest, Execute_ClearanceAppliesToTheMoveTargetWithoutAConta
   execute_sync(req);
   EXPECT_EQ(ended_as(kernel), "failed");
   EXPECT_EQ(execution.execute_count, 0);
-  const auto snapshot = kernel.get_execution_snapshot();
-  ASSERT_TRUE(snapshot.error.has_value());
-  EXPECT_EQ(snapshot.error->code, kErrorValidationCollision);
-  EXPECT_EQ(snapshot.error->details.at("classification"), "clearance");
-  EXPECT_DOUBLE_EQ(std::stod(snapshot.error->details.at("collision_clearance_m")), 0.003);
   const auto& margins = planner.last_request.retained_clearance_margins;
   ASSERT_TRUE(margins);
   EXPECT_DOUBLE_EQ(margins->margin_for(target), 0.003);
@@ -5057,8 +5010,8 @@ TEST_F(ExecutionKernelTest, Execute_ClearanceAppliesToTheMoveTargetWithoutAConta
 
 TEST_F(ExecutionKernelTest, Execute_PerMoveClearanceReplacesTheDeploymentClearance) {
   // M6 decision 16: with a 3 mm Deployment clearance, the same pick with the
-  // move's own clearance_m of 0.5 mm is accepted, and the planner and
-  // validation both carry 0.5 mm; 0 turns the clearance off for the move.
+  // move's own clearance_m of 0.5 mm is accepted, and the planner and the
+  // pre-dispatch check carry 0.5 mm; 0 turns the clearance off for the move.
   ExecutionKernelConfig config;
   config.collision_clearance_m = 0.003;
   ExecutionKernel cell_kernel{planner, context, execution, clock, scheduler, cache, config};
@@ -5103,7 +5056,7 @@ TEST_F(ExecutionKernelTest, Execute_PerMoveClearanceReplacesTheDeploymentClearan
   EXPECT_DOUBLE_EQ(margins->margin_for(table), 0.0005);
   {
     std::lock_guard lock(margins_mutex);
-    EXPECT_EQ(validation_margins, (std::set<double>{0.0005}));
+    EXPECT_EQ(validation_margins, std::set<double>{0.0005});
   }
 
   // A computed completion waits for its acknowledgement before the next move.
@@ -5141,309 +5094,162 @@ TEST_F(ExecutionKernelTest, Execute_ClearanceReleasesAMoveThatStartsInsideIt) {
 }
 
 TEST_F(ExecutionKernelTest, Execute_ClearanceRefusesAMoveCloserToWhatItStartsNear) {
-  // The same start, but the move approaches the wall: refused once it comes
-  // closer than the released margin, as a clearance violation.
+  // The same start, but the move approaches the wall: a cached trajectory is
+  // refused once it comes closer than the released margin, as a clearance
+  // violation, and the move re-planned with that margin.
+  // This test is about the cached trajectory: the replan stands on the
+  // planner's check (`collision_check_fresh_plans` off).
+  kernel.set_collision_check_fresh_plans(false);
   collision_world_publisher.current_snapshot = std::make_shared<const CollisionWorldSnapshot>(
       make_clearance_test_world(make_test_collision_world_snapshot(), {"wall"}));
   const auto wall = clearance_test_pair("wall");
   collision_engine->result_for_query =
       [&](const CollisionQuery& query) -> std::optional<CollisionResult> {
-    return clearance_test_result(query, wall, 0.002 - 0.01 * clearance_test_joint(query, "j1"));
+    return clearance_test_result(query, wall, 0.002 - 0.001 * clearance_test_joint(query, "j1"));
   };
 
   auto request = make_test_request("clearance_jog_toward");
   request.clearance_m = 0.003;
+  store_cache(request, make_test_trajectory());
+  ValidationOutcomeRecorder outcome(kernel);
   execute_sync(request);
-  EXPECT_EQ(ended_as(kernel), "failed");
-  EXPECT_EQ(execution.execute_count, 0);
-  const auto snapshot = kernel.get_execution_snapshot();
-  ASSERT_TRUE(snapshot.error.has_value());
-  EXPECT_EQ(snapshot.error->code, kErrorValidationCollision);
-  EXPECT_EQ(snapshot.error->details.at("classification"), "clearance");
-}
-
-// --- Collision validation samples the executed curve (M55 F-1 / FIX2)
-
-namespace {
-// A fine step, so the curve tests see many inserted samples.
-constexpr double kTestStepRad = 0.0005;
-
-TrajectoryWaypointDTO waypoint(double time_s, std::vector<double> positions,
-                               std::vector<double> velocities = {},
-                               std::vector<double> accelerations = {}) {
-  TrajectoryWaypointDTO point;
-  point.time_from_start_s = time_s;
-  point.positions_rad = std::move(positions);
-  point.velocities_rad_s = std::move(velocities);
-  point.accelerations_rad_s2 = std::move(accelerations);
-  return point;
-}
-
-TrajectoryDTO two_joint_trajectory(std::vector<TrajectoryWaypointDTO> points) {
-  TrajectoryDTO trajectory;
-  trajectory.resources = {ResourceId("joint.1"), ResourceId("joint.2")};
-  trajectory.joint_names = {"j1", "j2"};
-  trajectory.waypoints = std::move(points);
-  return trajectory;
-}
-
-// Equal endpoints, start velocity +1 and end velocity -1 over 1 s: the
-// executed cubic is p(s) = s - s^2 (peak 0.25 at s = 0.5); the chord is 0.
-TrajectoryDTO curved_cubic_trajectory() {
-  return two_joint_trajectory({waypoint(0.0, {0.0, 0.0}, {1.0, 0.0}),
-                               waypoint(1.0, {0.0, 0.0}, {-1.0, 0.0})});
-}
-
-double max_consecutive_step(const TrajectoryDTO& trajectory) {
-  double step = 0.0;
-  for (std::size_t i = 1; i < trajectory.waypoints.size(); ++i) {
-    for (std::size_t j = 0; j < trajectory.joint_names.size(); ++j) {
-      step = std::max(step, std::abs(trajectory.waypoints[i].positions_rad[j] -
-                                     trajectory.waypoints[i - 1].positions_rad[j]));
-    }
-  }
-  return step;
-}
-
-std::optional<double> joint_position(const CollisionQuery& query, const std::string& name) {
-  const auto& names = query.robot_state.joint_names;
-  const auto found = std::find(names.begin(), names.end(), name);
-  if (found == names.end()) return std::nullopt;
-  return query.robot_state.positions_rad.at(
-      static_cast<std::size_t>(std::distance(names.begin(), found)));
-}
-}  // namespace
-
-TEST(CollisionValidationSamplingTest, SamplesTheExecutedSplineNotTheChord) {
-  const auto sampled = sample_for_collision_validation(
-      curved_cubic_trajectory(), kTestStepRad, kValidationMaxCheckedStates, {});
-  ASSERT_TRUE(sampled.ok()) << sampled.error().message;
-  const auto& samples = sampled.value().trajectory;
-  double peak = 0.0;
-  for (const auto& point : samples.waypoints) peak = std::max(peak, point.positions_rad[0]);
-  EXPECT_NEAR(peak, 0.25, 1e-6);
-  EXPECT_LE(max_consecutive_step(samples), kTestStepRad + 1e-12);
-  EXPECT_GT(sampled.value().inserted, 0U);
-}
-
-TEST(CollisionValidationSamplingTest, QuinticOvershootStaysWithinTheStep) {
-  // Equal endpoints with velocity and acceleration: the quintic leaves and
-  // returns; every joint step on the executed curve stays within the bound.
-  const auto trajectory = two_joint_trajectory(
-      {waypoint(0.0, {0.3, -0.2}, {2.0, -1.0}, {-5.0, 4.0}),
-       waypoint(0.5, {0.3, -0.2}, {-1.5, 0.5}, {3.0, -2.0})});
-  const auto sampled = sample_for_collision_validation(
-      trajectory, kTestStepRad, kValidationMaxCheckedStates, {});
-  ASSERT_TRUE(sampled.ok()) << sampled.error().message;
-  EXPECT_GT(sampled.value().inserted, 0U);
-  EXPECT_LE(max_consecutive_step(sampled.value().trajectory), kTestStepRad + 1e-12);
-  // The samples lie on the shared sampler's curve.
-  TrajectorySampleResult reference;
-  for (const auto& point : sampled.value().trajectory.waypoints) {
-    ASSERT_TRUE(
-        sample_trajectory_prevalidated(trajectory, point.time_from_start_s, reference).ok());
-    EXPECT_EQ(point.positions_rad, reference.positions_rad);
-  }
-}
-
-TEST(CollisionValidationSamplingTest, FractionsReferToTheStoredTrajectory) {
-  // 1 rad in the first segment, 0.001 rad in the second: a sample at 75% of
-  // the first segment is at stored fraction 0.375, not at 75% of the samples.
-  const auto trajectory = two_joint_trajectory(
-      {waypoint(0.0, {0.0, 0.0}), waypoint(1.0, {1.0, 0.0}), waypoint(2.0, {1.001, 0.0})});
-  const auto sampled = sample_for_collision_validation(
-      trajectory, kTestStepRad, kValidationMaxCheckedStates, {});
-  ASSERT_TRUE(sampled.ok()) << sampled.error().message;
-  const auto& points = sampled.value().trajectory.waypoints;
-  const auto& fractions = sampled.value().original_fractions;
-  ASSERT_EQ(points.size(), fractions.size());
-  EXPECT_EQ(fractions.front(), 0.0);
-  EXPECT_EQ(fractions.back(), 1.0);
-  for (std::size_t i = 0; i < points.size(); ++i) {
-    if (points[i].time_from_start_s == 1.0) {
-      EXPECT_EQ(fractions[i], 0.5);
-    }
-    if (std::abs(points[i].positions_rad[0] - 0.75) < 1e-9) {
-      EXPECT_NEAR(fractions[i], 0.375, 1e-12);
-    }
-    if (i > 0) {
-      EXPECT_GT(fractions[i], fractions[i - 1]);
-    }
-  }
-}
-
-TEST(CollisionValidationSamplingTest, RefusesAboveTheSampleBudgetAndOnCancellation) {
-  // Both joints 0 -> 1 rad: sqrt(2) / 0.0005 -> 2829 steps, 2830 samples.
-  const auto trajectory = make_test_trajectory();
-  const auto over = sample_for_collision_validation(trajectory, kTestStepRad, 2829, {});
-  ASSERT_FALSE(over.ok());
-  EXPECT_EQ(over.error().code, kErrorValidationCollision);
-  EXPECT_EQ(over.error().details.at("reason"), "collision_validation_sample_budget_exceeded");
-  EXPECT_TRUE(sample_for_collision_validation(trajectory, kTestStepRad, 2830, {}).ok());
-  const auto huge = sample_for_collision_validation(
-      make_test_trajectory_from({0.0, 0.0}, {1.0e300, 0.0}), kTestStepRad,
-      kValidationMaxCheckedStates, {});
-  ASSERT_FALSE(huge.ok());
-  EXPECT_EQ(huge.error().details.at("reason"), "collision_validation_sample_budget_exceeded");
-  int polls = 0;
-  const auto cancelled = sample_for_collision_validation(
-      trajectory, kTestStepRad, kValidationMaxCheckedStates,
-      [&polls]() -> const char* {
-        ++polls;
-        return "collision_validation_cancelled";
-      });
-  ASSERT_FALSE(cancelled.ok());
-  EXPECT_EQ(cancelled.error().details.at("reason"), "collision_validation_cancelled");
-  EXPECT_EQ(polls, 1);
-}
-
-TEST(CollisionValidationSamplingTest, StopInsideOneLongSegmentIsHonouredWithinThePollInterval) {
-  // One stored segment of 90 rad needs 180,000 samples. A stop that arrives
-  // after the second poll inside that segment ends sampling within one more
-  // poll interval, not at the end of the segment.
-  const auto trajectory = make_test_trajectory_from({0.0, 0.0}, {90.0, 0.0});
-  int polls = 0;
-  const auto stopped = sample_for_collision_validation(
-      trajectory, kTestStepRad, kValidationMaxCheckedStates,
-      [&polls]() -> const char* {
-        return ++polls >= 3 ? "collision_validation_wall_timeout" : nullptr;
-      });
-  ASSERT_FALSE(stopped.ok());
-  EXPECT_EQ(stopped.error().details.at("reason"), "collision_validation_wall_timeout");
-  EXPECT_EQ(stopped.error().details.at("stopped_at_segment"), "0");
-  EXPECT_EQ(polls, 3);
-  EXPECT_LE(std::stoul(stopped.error().details.at("inserted_samples")),
-            2 * kValidationSamplingPollInterval);
-}
-
-TEST(CollisionValidationSamplingTest, StepIsTheJointSpaceDistanceLikeThePlanner) {
-  // Both joints move 1 rad: the configuration distance is sqrt(2) rad, so
-  // the default planner step (0.05) gives ceil(sqrt(2) / 0.05) = 29 steps,
-  // and no two consecutive samples are farther apart than the step.
-  const auto trajectory = two_joint_trajectory(
-      {waypoint(0.0, {0.0, 0.0}), waypoint(1.0, {1.0, 1.0})});
-  const auto sampled = sample_for_collision_validation(
-      trajectory, kDefaultCollisionCheckStepRad, kValidationMaxCheckedStates, {});
-  ASSERT_TRUE(sampled.ok()) << sampled.error().message;
-  const auto& points = sampled.value().trajectory.waypoints;
-  ASSERT_EQ(points.size(), 30U);
-  for (std::size_t i = 1; i < points.size(); ++i) {
-    EXPECT_LE(std::hypot(points[i].positions_rad[0] - points[i - 1].positions_rad[0],
-                         points[i].positions_rad[1] - points[i - 1].positions_rad[1]),
-              kDefaultCollisionCheckStepRad + 1e-12);
-  }
-}
-
-TEST_F(ExecutionKernelTest, Execute_ValidationRejectsCollisionOnTheSplineNotTheChord) {
-  // Both stored waypoints are at 0, and so is every point of their chord; only
-  // the executed cubic reaches j1 > 0.2. Neither the stored waypoints nor the
-  // chord densification (F1) saw it.
-  PlanResultDTO plan;
-  plan.trajectory = curved_cubic_trajectory();
-  planner.next_result = plan;
-  collision_engine->result_for_query = [](const CollisionQuery& query) -> std::optional<CollisionResult> {
-    const auto j1 = joint_position(query, "j1");
-    if (j1 && *j1 > 0.2) return make_authoritative_collision_result();
-    return std::nullopt;
-  };
-  execute_sync(make_test_request("collision_on_spline"));
-  EXPECT_EQ(ended_as(kernel), "failed");
-  EXPECT_EQ(execution.execute_count, 0);
-  const auto snapshot = kernel.get_execution_snapshot();
-  ASSERT_TRUE(snapshot.error.has_value());
-  EXPECT_EQ(snapshot.error->code, kErrorValidationCollision);
-}
-
-TEST_F(ExecutionKernelTest, Execute_ValidationProjectsSplineSamplesWhenTheModelAddsJoints) {
-  // The projector adds a non-group joint to the positions only (its V/A stay
-  // group-sized). The spline is still sampled from the stored P/V/A, and every
-  // query carries the projected joint count.
-  context.expand_extra_joint = "finger";
-  PlanResultDTO plan;
-  plan.trajectory = curved_cubic_trajectory();
-  planner.next_result = plan;
-  std::mutex shapes_mutex;
-  std::set<std::size_t> shapes;
-  collision_engine->result_for_query =
-      [&](const CollisionQuery& query) -> std::optional<CollisionResult> {
-    {
-      std::lock_guard<std::mutex> lock(shapes_mutex);
-      shapes.insert(query.robot_state.positions_rad.size());
-    }
-    const auto j1 = joint_position(query, "j1");
-    if (j1 && *j1 > 0.2) return make_authoritative_collision_result();
-    return std::nullopt;
-  };
-  execute_sync(make_test_request("collision_on_spline_projected"));
-  EXPECT_EQ(ended_as(kernel), "failed");
-  EXPECT_EQ(execution.execute_count, 0);
-  std::lock_guard<std::mutex> lock(shapes_mutex);
-  EXPECT_EQ(shapes, (std::set<std::size_t>{3U}));
-}
-
-// Same contact-window decisions as before densification: the terminal
-// window refers to the stored trajectory's fractions, not to sample indexes.
-class ContactWindowFractionTest : public ExecutionKernelTest {
- protected:
-  void run_contact_at(bool early) {
-    install_mock_contact_grasp_world(collision_world_publisher, "graspable",
-                                     {"right_finger", "left_finger"});
-    install_mock_detached_logical_object(collision_world_publisher, "graspable");
-    const CollisionBodyId allowed_body(
-        "component/arm/model/arm_model/body/right_finger/collision/0");
-    const CollisionPairId pair{allowed_body, "scene/graspable/shape/0"};
-    PlanResultDTO plan;
-    // 1 rad in the first segment, 0.001 rad in the second.
-    plan.trajectory = two_joint_trajectory(
-        {waypoint(0.0, {0.0, 0.0}), waypoint(1.0, {1.0, 0.0}), waypoint(2.0, {1.001, 0.0})});
-    planner.next_result = plan;
-    collision_engine->result_for_query =
-        [pair, early](const CollisionQuery& query) -> std::optional<CollisionResult> {
-      const auto j1 = joint_position(query, "j1");
-      const bool contact = j1 && (early ? (*j1 > 0.84 && *j1 < 0.86) : *j1 >= 1.001);
-      if (contact) return make_contact_grasp_collision_result(pair, -0.001);
-      return std::nullopt;
-    };
-    auto request = make_test_request(early ? "grasp_contact_early" : "grasp_contact_final");
-    request.contact_policy_id = "pick_grasp";
-    request.runtime_object_bindings = {RuntimeObjectReferenceBindingDTO{
-        RuntimeObjectId("selected_object"), SceneResourceId("graspable")}};
-    request.resolved_contact_grasp =
-        ResolvedContactGraspBindingDTO{ContactPolicyId("pick_grasp"),
-                                       ContactPolicyRevision(kTestDigestA),
-                                       RuntimeObjectId("selected_object"),
-                                       SceneResourceId("graspable"),
-                                       {allowed_body},
-                                       ContactGraspEnvelopeDTO{0.002, 0.75}};
-    execute_sync(request);
-  }
-};
-
-TEST_F(ContactWindowFractionTest, ContactAt85PercentOfALongFirstSegmentIsBeforeTheWindow) {
-  // Stored fraction 0.425 < 0.75; renormalising by sample index (F1) gave ~0.85.
-  run_contact_at(true);
-  EXPECT_EQ(ended_as(kernel), "failed");
-  EXPECT_EQ(execution.execute_count, 0);
-}
-
-TEST_F(ContactWindowFractionTest, ContactAtTheStoredFinalWaypointIsInsideTheWindow) {
-  run_contact_at(false);
-  EXPECT_EQ(ended_as(kernel), "completed");
-  EXPECT_EQ(execution.execute_count, 1);
+  const auto refusal = outcome.cache_refusal();
+  ASSERT_TRUE(refusal.has_value());
+  EXPECT_EQ(refusal->code, kErrorValidationCollision);
+  EXPECT_EQ(refusal->details.at("classification"), "clearance");
+  EXPECT_DOUBLE_EQ(std::stod(refusal->details.at("collision_clearance_m")), 0.003);
+  EXPECT_EQ(planner.plan_count, 1);
+  ASSERT_TRUE(planner.last_request.retained_clearance_margins);
+  EXPECT_NEAR(planner.last_request.retained_clearance_margins->margin_for(wall),
+              0.002 - kClearanceStartReleaseToleranceM, 1e-12);
 }
 
 // --- Authoritative pre-execution collision via the manyforge_collision port
 
 TEST_F(ExecutionKernelTest, Execute_AuthoritativeCollisionPipelineRejectsCollision) {
+  // This test is about the cached trajectory: the replan stands on the
+  // planner's check (`collision_check_fresh_plans` off).
+  kernel.set_collision_check_fresh_plans(false);
+  store_cache("move_1", make_test_trajectory());
   collision_engine->default_result = make_authoritative_collision_result();
+  ValidationOutcomeRecorder outcome(kernel);
 
   execute_sync(make_test_request());
-  EXPECT_EQ(ended_as(kernel), "failed");
-  EXPECT_EQ(execution.execute_count, 0);
   EXPECT_GE(collision_engine->check_count.load(), 1);
+  const auto refusal = outcome.cache_refusal();
+  ASSERT_TRUE(refusal.has_value());
+  EXPECT_EQ(refusal->code, kErrorValidationCollision);
+  EXPECT_EQ(planner.plan_count, 1);
+}
+
+TEST_F(ExecutionKernelTest, Config_FreshPlanCheckIsOnByDefault) {
+  // N6 / CLR-2: the default comes from robot_defaults.tsv.
+  EXPECT_TRUE(kDefaultCollisionCheckFreshPlans);
+  EXPECT_EQ(ExecutionKernelConfig{}.collision_check_fresh_plans, kDefaultCollisionCheckFreshPlans);
+}
+
+TEST_F(ExecutionKernelTest, Execute_FreshPlanIsCollisionValidatedByDefault) {
+  // N6 / CLR-2: a trajectory planned for this request, with no active contact
+  // policy, gets the same pre-dispatch waypoint check as a cached one.
+  ValidationOutcomeRecorder outcome(kernel);
+
+  const auto result = execute_sync(make_test_request("fresh_plan_checked"));
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  EXPECT_EQ(ended_as(kernel), "completed");
+  EXPECT_EQ(planner.plan_count, 1);
+  EXPECT_EQ(execution.execute_count, 1);
+  // One validation pass over the plan's two waypoints.
+  EXPECT_EQ(collision_engine->check_count.load(), 2);
+  EXPECT_EQ(outcome.collision_evidence(), "pre_dispatch_validation");
+  RecordProperty("collision_validation_wall_ns", outcome.collision_validation_wall_ns());
+}
+
+TEST_F(ExecutionKernelTest, Execute_FreshCollidingPlanIsReplannedBeforeDispatch) {
+  // The first plan collides at its goal waypoint: it is never sent; the move
+  // is replanned within the authoritative-validation attempts and the second
+  // plan dispatched.
+  PlanResultDTO colliding_plan;
+  colliding_plan.trajectory = make_test_trajectory_from({0.0, 0.0}, {1.0, 1.0});
+  PlanResultDTO clear_plan;
+  clear_plan.trajectory = make_test_trajectory_from({0.0, 0.0}, {2.0, 2.0});
+  planner.result_sequence = {colliding_plan, clear_plan};
+  collision_engine->result_for_query =
+      [](const CollisionQuery& query) -> std::optional<CollisionResult> {
+    if (clearance_test_joint(query, "j1") == 1.0) return make_authoritative_collision_result();
+    return std::nullopt;
+  };
+  ValidationOutcomeRecorder outcome(kernel);
+
+  const auto result = execute_sync(make_test_request("fresh_plan_replanned"));
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  EXPECT_EQ(ended_as(kernel), "completed");
+  EXPECT_EQ(planner.plan_count, 2);
+  EXPECT_EQ(execution.execute_count, 1);
+  EXPECT_FALSE(outcome.cache_refusal().has_value());
+  EXPECT_EQ(outcome.collision_evidence(), "pre_dispatch_validation");
+}
+
+TEST_F(ExecutionKernelTest, Execute_FreshCollidingPlanFailsAfterTheValidationAttempts) {
+  // Every plan collides: 1 + authoritative_validation_collision_replan_attempts
+  // plans, none dispatched, and the move fails with the collision.
+  collision_engine->default_result = make_authoritative_collision_result();
+
+  execute_sync(make_test_request("fresh_plan_exhausted"));
+  EXPECT_EQ(ended_as(kernel), "failed");
+  EXPECT_EQ(planner.plan_count,
+            1 + ExecutionKernelConfig{}.authoritative_validation_collision_replan_attempts);
+  EXPECT_EQ(execution.execute_count, 0);
   const auto snapshot = kernel.get_execution_snapshot();
   ASSERT_TRUE(snapshot.error.has_value());
   EXPECT_EQ(snapshot.error->code, kErrorValidationCollision);
+}
+
+TEST_F(ExecutionKernelTest, Execute_FreshPlanCheckOffDispatchesOnPlanningEvidence) {
+  // With the Deployment's `collision_check_fresh_plans` off, the planner's
+  // own check stands for a fresh plan without an active contact policy.
+  // Dispatch runs the start-state and limit checks only; an engine that would
+  // refuse every state is never asked.
+  kernel.set_collision_check_fresh_plans(false);
+  collision_engine->default_result = make_authoritative_collision_result();
+  ValidationOutcomeRecorder outcome(kernel);
+
+  const auto result = execute_sync(make_test_request("fresh_plan_evidence"));
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  EXPECT_EQ(ended_as(kernel), "completed");
+  EXPECT_EQ(planner.plan_count, 1);
+  EXPECT_EQ(execution.execute_count, 1);
+  EXPECT_EQ(collision_engine->check_count.load(), 0);
+  EXPECT_GE(context.validate_count, 1);
+  EXPECT_FALSE(outcome.cache_refusal().has_value());
+  EXPECT_EQ(outcome.collision_evidence(), "planning");
+}
+
+TEST_F(ExecutionKernelTest, Execute_FreshPlanWithAnActiveContactPolicyIsCollisionValidated) {
+  // The planner switches the pairs of an active contact policy off, so its
+  // release / bounded-penetration / grasp rules are checked before dispatch.
+  collision_world_publisher.current_policy = make_support_contact_test_policy();
+  kernel.set_collision_validation_policy_snapshot(make_support_contact_test_policy());
+  ValidationOutcomeRecorder outcome(kernel);
+
+  const auto result = execute_sync(make_test_request("fresh_plan_contact_policy"));
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  EXPECT_EQ(ended_as(kernel), "completed");
+  EXPECT_EQ(planner.plan_count, 1);
+  EXPECT_EQ(collision_engine->check_count.load(), 2);
+  EXPECT_EQ(outcome.collision_evidence(), "pre_dispatch_validation");
+}
+
+TEST_F(ExecutionKernelTest, Execute_CachedTrajectoryIsCollisionValidatedBeforeDispatch) {
+  store_cache("cached_evidence", make_test_trajectory());
+  ValidationOutcomeRecorder outcome(kernel);
+
+  const auto result = execute_sync(make_test_request("cached_evidence"));
+  ASSERT_TRUE(result.ok()) << result.error().message;
+  EXPECT_EQ(ended_as(kernel), "completed");
+  EXPECT_EQ(planner.plan_count, 0);
+  EXPECT_EQ(execution.execute_count, 1);
+  EXPECT_EQ(collision_engine->check_count.load(), 2);
+  EXPECT_EQ(outcome.collision_evidence(), "pre_dispatch_validation");
 }
 
 TEST_F(ExecutionKernelTest, Execute_BoundedPenetrationLaterFirstContactEmitsNativePolicyViolation) {
@@ -5526,6 +5332,9 @@ TEST_F(ExecutionKernelTest, Execute_BoundedPenetrationLaterFirstContactEmitsNati
 }
 
 TEST_F(ExecutionKernelTest, Execute_AuthoritativeCollisionDiagnosticsReportClassifiedFailurePair) {
+  // This test is about the cached trajectory: the replan stands on the
+  // planner's check (`collision_check_fresh_plans` off).
+  kernel.set_collision_check_fresh_plans(false);
   CollisionPairId allowed_pair{"scene/box_a/shape/0", "scene/box_b/shape/0"};
   CollisionPairId blocking_pair{"scene/box_a/shape/0",
                                 "component/arm/model/arm_model/body/link1/collision/0"};
@@ -5547,11 +5356,18 @@ TEST_F(ExecutionKernelTest, Execute_AuthoritativeCollisionDiagnosticsReportClass
     events.push_back(e);
   });
 
+  store_cache("classified_failure_diagnostics", make_test_trajectory());
   execute_sync(make_test_request("classified_failure_diagnostics"));
 
-  const auto snapshot = kernel.get_execution_snapshot();
-  ASSERT_TRUE(snapshot.error.has_value());
-  const auto& details = snapshot.error->details;
+  std::optional<ErrorDTO> refusal;
+  {
+    std::lock_guard<std::mutex> lock(events_mutex);
+    for (const auto& event : events) {
+      if (event.type == KernelEventType::kCacheRevalidationFailed) refusal = event.error;
+    }
+  }
+  ASSERT_TRUE(refusal.has_value());
+  const auto& details = refusal->details;
   EXPECT_EQ(details.at("collision_result_first_pair"),
             "scene/box_a/shape/0 <-> scene/box_b/shape/0");
   EXPECT_EQ(details.at("collision_result_first_failure_pair"),
@@ -5561,33 +5377,22 @@ TEST_F(ExecutionKernelTest, Execute_AuthoritativeCollisionDiagnosticsReportClass
   EXPECT_EQ(details.at("collision_result_first_failure_joint_names"), "j1,j2");
   EXPECT_EQ(details.at("collision_result_first_failure_positions_rad"), "0,0");
   EXPECT_EQ(details.at("collision_result_first_failure_time_from_start_s"), "0.000000");
+  // The refusal's diagnostics reach the replan's kValidationFailed event.
   std::lock_guard<std::mutex> lock(events_mutex);
-  bool found_error_event = false;
-  for (const auto& event : events) {
-    if (event.type != KernelEventType::kErrorRaised) {
-      continue;
-    }
-    ASSERT_TRUE(event.error.has_value());
-    if (event.error->code != kErrorValidationCollision) {
-      continue;
-    }
-    found_error_event = true;
-    EXPECT_EQ(event.details.at("collision_result_first_failure_pair"),
-              "component/arm/model/arm_model/body/link1/collision/0 <-> "
-              "scene/box_a/shape/0");
-    EXPECT_EQ(event.details.at("collision_result_first_failure_classification"),
-              "blocking_collision");
-    EXPECT_EQ(event.error->details.at("collision_result_first_failure_pair"),
-              event.details.at("collision_result_first_failure_pair"));
-    EXPECT_EQ(event.details.at("collision_result_first_failure_positions_rad"), "0,0");
-    break;
-  }
-  EXPECT_TRUE(found_error_event);
-  EXPECT_EQ(execution.execute_count, 0);
+  const auto retry = std::find_if(events.begin(), events.end(), [](const KernelEvent& event) {
+    return event.type == KernelEventType::kValidationFailed &&
+           event.details.contains("collision_result_first_failure_pair");
+  });
+  ASSERT_NE(retry, events.end());
+  EXPECT_EQ(retry->details.at("reason"), "cache_revalidation_failed_replan");
+  EXPECT_EQ(retry->details.at("collision_result_first_failure_pair"),
+            details.at("collision_result_first_failure_pair"));
+  EXPECT_EQ(planner.plan_count, 1);
 }
 
 TEST_F(ExecutionKernelTest,
        Execute_AuthoritativeCollisionPipelineDispatchesWhenEngineReportsClean) {
+  store_cache("move_1", make_test_trajectory());
   auto result = execute_sync(make_test_request());
   ASSERT_TRUE(result.ok());
   EXPECT_EQ(execution.execute_count, 1);
@@ -5596,6 +5401,7 @@ TEST_F(ExecutionKernelTest,
 }
 
 TEST_F(ExecutionKernelTest, Execute_AuthoritativeCollisionUsesNonzeroDefaultQueryTimeout) {
+  store_cache("validation_default_timeout", make_test_trajectory());
   auto result = execute_sync(make_test_request("validation_default_timeout"));
 
   ASSERT_TRUE(result.ok());
@@ -5611,6 +5417,7 @@ TEST_F(ExecutionKernelTest, Execute_AuthoritativeCollisionUsesConfiguredValidati
   config.validation_collision_query_timeout_ns = 125'000'000;
   ExecutionKernel local_kernel{planner, context, execution, clock, scheduler, cache, config};
   configure_authoritative_collision_validation(local_kernel, local_publisher, local_engine);
+  store_cache("validation_timeout", make_test_trajectory());
 
   auto result = prepare_and_dispatch(local_kernel, make_test_request("validation_timeout"));
   ASSERT_TRUE(result.ok());
@@ -5631,6 +5438,7 @@ TEST_F(ExecutionKernelTest, Execute_AuthoritativeCollisionUsesPublisherPolicySna
   publisher_policy.policy_id = "publisher_dynamic_policy";
   publisher_policy.revision.revision_id = 42;
   collision_world_publisher.current_policy = publisher_policy;
+  store_cache("move_1", make_test_trajectory());
 
   auto result = execute_sync(make_test_request());
   ASSERT_TRUE(result.ok());
@@ -5662,7 +5470,10 @@ TEST_F(ExecutionKernelTest, Execute_AuthoritativeCollisionReplansAndDispatchesSe
   first_plan.trajectory = make_test_trajectory_from({0.0, 0.0}, {1.0, 1.0});
   PlanResultDTO second_plan;
   second_plan.trajectory = make_test_trajectory_from({0.0, 0.0}, {2.0, 2.0});
-  local_planner.result_sequence = {first_plan, second_plan};
+  // The first candidate is cached and collides at its goal; the planner
+  // returns the second, which passes the pre-dispatch check.
+  local_planner.result_sequence = {second_plan};
+  store_cache(local_cache, make_test_request("replan_collision"), *first_plan.trajectory);
   MockFocusedPorts local_context = context;
   MockCollisionWorldPublisher local_publisher;
   auto local_engine = std::make_shared<MockCollisionEngine>();
@@ -5670,11 +5481,10 @@ TEST_F(ExecutionKernelTest, Execute_AuthoritativeCollisionReplansAndDispatchesSe
                                local_clock,   local_scheduler, local_cache,
                                config};
   configure_authoritative_collision_validation(local_kernel, local_publisher, local_engine);
-  local_engine->result_for_query = [&](const CollisionQuery&) {
-    if (local_planner.plan_count <= 1) {
-      return std::make_optional(make_authoritative_collision_result());
-    }
-    return std::make_optional(CollisionResult{});
+  local_engine->result_for_query =
+      [](const CollisionQuery& query) -> std::optional<CollisionResult> {
+    if (clearance_test_joint(query, "j1") == 1.0) return make_authoritative_collision_result();
+    return std::nullopt;
   };
 
   std::mutex events_mutex;
@@ -5692,8 +5502,8 @@ TEST_F(ExecutionKernelTest, Execute_AuthoritativeCollisionReplansAndDispatchesSe
   ASSERT_TRUE(local_kernel.wait_for_completion(1'000'000'000));
 
   EXPECT_EQ(ended_as(local_kernel), "completed");
-  EXPECT_EQ(local_planner.plan_count, 2);
-  EXPECT_EQ(local_planner.planning_attempt_indices, (std::vector<std::uint32_t>{0, 1}));
+  EXPECT_EQ(local_planner.plan_count, 1);
+  EXPECT_EQ(local_planner.planning_attempt_indices, (std::vector<std::uint32_t>{1}));
   EXPECT_EQ(controlled_execution.execute_count, 1);
   ASSERT_FALSE(controlled_execution.last_execute_trajectory.waypoints.empty());
   EXPECT_EQ(controlled_execution.last_execute_trajectory.waypoints.back().positions_rad,
@@ -5706,7 +5516,7 @@ TEST_F(ExecutionKernelTest, Execute_AuthoritativeCollisionReplansAndDispatchesSe
   for (const auto& event : events) {
     if (event.type == KernelEventType::kValidationFailed) {
       auto reason = event.details.find("reason");
-      if (reason != event.details.end() && reason->second == "authoritative_validation_replan") {
+      if (reason != event.details.end() && reason->second == "cache_revalidation_failed_replan") {
         saw_retry_validation_failed = true;
       }
     }
@@ -5743,6 +5553,9 @@ TEST_F(ExecutionKernelTest, Execute_AuthoritativeCollisionReplanBudgetExhaustedF
                                local_clock,   local_scheduler, local_cache,
                                config};
   configure_authoritative_collision_validation(local_kernel, local_publisher, local_engine);
+  // An active support contact: each fresh plan is collision-validated.
+  local_publisher.current_policy = make_support_contact_test_policy();
+  local_kernel.set_collision_validation_policy_snapshot(make_support_contact_test_policy());
   local_engine->default_result = make_authoritative_collision_result();
 
   auto result = prepare_and_dispatch(local_kernel, make_test_request("replan_exhausted"));
@@ -5930,31 +5743,39 @@ TEST_F(ExecutionKernelTest, Execute_DoesNotPromoteDetachedCollisionOrNoncollidin
   blocking.decision = CollisionDecisionResult::kFail;
   blocking.pair_clearances.push_back({noncolliding_carried_pair, 0.0});
   local_engine->result_by_waypoint.emplace(0, std::move(blocking));
+  // A cached trajectory: the blocking start pair refuses it (nothing was
+  // promoted), and the move is re-planned.
+  store_cache(local_cache, make_test_request("reject-noncarried-start-contact"),
+              make_test_trajectory());
+  ValidationOutcomeRecorder outcome(local_kernel);
 
   const auto result =
       prepare_and_dispatch(local_kernel, make_test_request("reject-noncarried-start-contact"));
   ASSERT_TRUE(result.ok());
   ASSERT_TRUE(local_kernel.wait_for_completion(1'000'000'000));
-  EXPECT_EQ(ended_as(local_kernel), "failed");
-  EXPECT_EQ(local_execution.execute_count, 0);
   EXPECT_EQ(local_planner.plan_count, 1);
-  const auto snapshot = local_kernel.get_execution_snapshot();
-  ASSERT_TRUE(snapshot.error.has_value());
-  EXPECT_EQ(snapshot.error->code, kErrorValidationCollision);
-  EXPECT_EQ(snapshot.error->details.at("dynamically_discovered_start_contact_count"), "0");
+  const auto refusal = outcome.cache_refusal();
+  ASSERT_TRUE(refusal.has_value());
+  EXPECT_EQ(refusal->code, kErrorValidationCollision);
+  EXPECT_EQ(refusal->details.at("dynamically_discovered_start_contact_count"), "0");
 }
 
-TEST_F(ExecutionKernelTest, Execute_AuthoritativeValidationNonOkCollisionDoesNotReplan) {
+TEST_F(ExecutionKernelTest, Execute_AuthoritativeValidationNonOkCollisionReplansACachedTrajectory) {
+  // An inconclusive (timed-out) result refuses a cached trajectory like a
+  // collision does; the move is re-planned once and the fresh plan dispatched.
   ControlledExecution controlled_execution;
   ThreadSafeFakeClock local_clock;
   ThreadSafeManualScheduler local_scheduler;
   TrajectoryCache local_cache{CacheConfig{10}};
   ExecutionKernelConfig config;
+  // The fresh plan stands on the planner's check.
+  config.collision_check_fresh_plans = false;
   config.authoritative_validation_collision_replan_attempts = 2;
   MockPlanner local_planner;
   PlanResultDTO plan;
   plan.trajectory = make_test_trajectory_from({0.0, 0.0}, {1.0, 1.0});
-  local_planner.result_sequence = {plan, plan, plan};
+  local_planner.result_sequence = {plan};
+  store_cache(local_cache, make_test_request("replan_non_ok"), *plan.trajectory);
   MockFocusedPorts local_context = context;
   MockCollisionWorldPublisher local_publisher;
   auto local_engine = std::make_shared<MockCollisionEngine>();
@@ -5965,17 +5786,21 @@ TEST_F(ExecutionKernelTest, Execute_AuthoritativeValidationNonOkCollisionDoesNot
   auto non_ok_collision = make_authoritative_collision_result();
   non_ok_collision.engine_status = CollisionEngineStatus::kTimeout;
   local_engine->default_result = non_ok_collision;
+  ValidationOutcomeRecorder outcome(local_kernel);
 
   auto result = prepare_and_dispatch(local_kernel, make_test_request("replan_non_ok"));
   ASSERT_TRUE(result.ok());
+  ASSERT_TRUE(controlled_execution.wait_until_execute_called())
+      << "wait_until_execute_called timed out";
+  controlled_execution.complete();
   ASSERT_TRUE(local_kernel.wait_for_completion(1'000'000'000));
 
-  EXPECT_EQ(ended_as(local_kernel), "failed");
+  EXPECT_EQ(ended_as(local_kernel), "completed");
   EXPECT_EQ(local_planner.plan_count, 1);
-  EXPECT_EQ(controlled_execution.execute_count, 0);
-  auto snapshot = local_kernel.get_execution_snapshot();
-  ASSERT_TRUE(snapshot.error.has_value());
-  EXPECT_EQ(snapshot.error->details.at("collision_result_engine_status"), "timeout");
+  EXPECT_EQ(controlled_execution.execute_count, 1);
+  const auto refusal = outcome.cache_refusal();
+  ASSERT_TRUE(refusal.has_value());
+  EXPECT_EQ(refusal->details.at("collision_result_engine_status"), "timeout");
 }
 
 // --- Execute requires bound acknowledgement from terminal success ---
@@ -6037,77 +5862,6 @@ TEST_F(ExecutionKernelTest, Execute_FromInterventionRequired_Rejected) {
   EXPECT_EQ(ended_as(kernel), "failed_effect_uncertain");
   ASSERT_TRUE(rejected.error().details.contains("reason_code"));
   EXPECT_EQ(rejected.error().details.at("reason_code"), "intervention_required");
-}
-
-TEST_F(ExecutionKernelTest, ApplyRecoveryAction_AcknowledgeAndContinueDoesNotResetBackend) {
-  execution.next_terminal_state = ExecutionState::kInterventionRequired;
-  execution.snapshot.error = ErrorDTO{std::string(kErrorMotionInterruptBackendStopFailed),
-                                      "operator stop total failure",
-                                      {{"reason", "operator_stop_total_failure"},
-                                       {"phase", "operator_stop"},
-                                       {"requested_stop_mode", "hard_deceleration"},
-                                       {"executed_stop_mode", "hard_deceleration"}}};
-  auto first = execute_sync(make_test_request());
-  ASSERT_TRUE(first.ok());
-  EXPECT_EQ(ended_as(kernel), "failed_effect_uncertain");
-  EXPECT_EQ(execution.reset_count, 0);
-  install_at_rest_recovery_observation();
-
-  std::mutex events_mutex;
-  std::vector<KernelEvent> events;
-  kernel.subscribe_events([&](const KernelEvent& e) {
-    std::lock_guard<std::mutex> lock(events_mutex);
-    events.push_back(e);
-  });
-
-  auto ack =
-      apply_recovery_action_after_projection(kernel, RecoveryAction::kAcknowledgeAndContinue,
-                                             "operator_alice", "ui_acknowledge_and_continue");
-  ASSERT_TRUE(ack.accepted);
-  EXPECT_EQ(kernel.get_status().state, ExecutionState::kIdle);
-  EXPECT_EQ(execution.reset_count, 0);
-  const auto snapshot = kernel.get_execution_snapshot();
-  EXPECT_EQ(snapshot.state, ExecutionState::kIdle);
-  ASSERT_EQ(snapshot.joint_positions_rad.size(), 2u);
-  EXPECT_EQ(snapshot.joint_positions_rad[0], 1.0);
-  EXPECT_EQ(snapshot.joint_positions_rad[1], 1.0);
-
-  std::lock_guard<std::mutex> lock(events_mutex);
-  bool saw_retry_ack = false;
-  for (const auto& e : events) {
-    if (e.type == KernelEventType::kInterventionAcknowledged &&
-        e.details.contains("recovery_mode")) {
-      saw_retry_ack = true;
-      EXPECT_EQ(e.details.at("recovery_mode"), "acknowledge_and_continue");
-      EXPECT_EQ(e.details.at("backend_reset_performed"), "false");
-    }
-  }
-  EXPECT_TRUE(saw_retry_ack);
-}
-
-TEST_F(ExecutionKernelTest, ApplyRecoveryAction_AcknowledgeAndContinueRejectsWhileMoving) {
-  execution.next_terminal_state = ExecutionState::kInterventionRequired;
-  execution.snapshot.joint_velocities_rad_s = {0.2, 0.0};
-  execution.snapshot.error = ErrorDTO{std::string(kErrorMotionInterruptBackendStopFailed),
-                                      "operator stop not settled",
-                                      {{"reason", "stop_not_settled_measured_velocity"},
-                                       {"phase", "operator_stop"},
-                                       {"requested_stop_mode", "soft_on_path"},
-                                       {"executed_stop_mode", "soft_on_path"},
-                                       {"settle_velocity_threshold_rad_s", "0.01"}}};
-  auto first = execute_sync(make_test_request());
-  ASSERT_TRUE(first.ok());
-  EXPECT_EQ(ended_as(kernel), "failed_effect_uncertain");
-  execution.publish_observed_state(clock.now(), {1.0, 1.0}, {0.2, 0.0});
-
-  auto ack =
-      apply_recovery_action_after_projection(kernel, RecoveryAction::kAcknowledgeAndContinue,
-                                             "operator_alice", "ui_acknowledge_and_continue");
-  EXPECT_FALSE(ack.accepted);
-  ASSERT_TRUE(ack.error.has_value());
-  EXPECT_EQ(ack.error->details.at("reason"), reason_codes::kRecoveryObservedStateNotAtRest);
-  EXPECT_EQ(ended_as(kernel), "failed_effect_uncertain");
-  EXPECT_EQ(execution.reset_count, 0);
 }
 
 TEST_F(ExecutionKernelTest, Execute_FromFailed_ResetsStateAndRetriesWithoutBackendReset) {
@@ -6283,7 +6037,6 @@ TEST_F(ExecutionKernelTest, RuntimeMonitorPrepareFailureIsCriticalFaultWithoutDi
   const auto reset = kernel.reset_after_certified_containment(failed.value());
   ASSERT_TRUE(reset.accepted) << reset.error->message;
   EXPECT_EQ(ended_as(kernel), "working:Idle");
-  EXPECT_TRUE(kernel.get_recovery_assessment().latch_id.empty());
 
   collision_runtime_engine->runtime_query_prepare_status =
       RuntimeCollisionQueryPrepareStatus::kReady;
@@ -6391,8 +6144,7 @@ TEST_F(ExecutionKernelTest, RuntimeCollisionIsAFactAndCertifiedRetirementIsMotio
   {
     std::lock_guard<std::mutex> lock(events_mu);
     EXPECT_TRUE(std::none_of(events.begin(), events.end(), [](const KernelEvent& event) {
-      return event.type == KernelEventType::kInterruptLatched ||
-             event.type == KernelEventType::kParticipantSettled;
+      return event.type == KernelEventType::kParticipantSettled;
     }));
     const auto collision = std::find_if(events.begin(), events.end(), [](const auto& event) {
       return event.type == KernelEventType::kCollisionDetected;
@@ -6419,7 +6171,6 @@ TEST_F(ExecutionKernelTest, RuntimeCollisionIsAFactAndCertifiedRetirementIsMotio
   EXPECT_EQ(controlled_execution.retire_count.load(), retired_before + 1);
   EXPECT_EQ(controlled_execution.get_execution_snapshot().joint_positions_rad, positions_before);
   EXPECT_EQ(ended_as(controlled_kernel), "working:Idle");
-  EXPECT_TRUE(controlled_kernel.get_recovery_assessment().latch_id.empty());
 }
 
 TEST_F(ExecutionKernelTest, AddressedStopFenceWinsLookaheadHandoffBeforeInterruptedProjection) {
@@ -6512,9 +6263,6 @@ TEST_F(ExecutionKernelTest, AddressedStopFenceWinsLookaheadHandoffBeforeInterrup
   ASSERT_NE(handoff, captured.end());
   EXPECT_EQ(interrupted, captured.end());
   EXPECT_EQ(handoff->details.at("addressed_stop_authority_handoff"), "true");
-  EXPECT_TRUE(std::none_of(captured.begin(), captured.end(), [](const auto& event) {
-    return event.type == KernelEventType::kInterruptLatched;
-  }));
   EXPECT_EQ(controlled_kernel.get_status().state, ExecutionState::kExecuting);
 
   controlled_execution.release();
@@ -6615,9 +6363,6 @@ TEST_F(ExecutionKernelTest, CollisionLookahead_FutureCollisionSignalsAuthorityBe
   EXPECT_EQ(handoff_event->details.at("lookahead_cycle_deadline_ns"),
             lookahead_event->details.at("lookahead_cycle_deadline_ns"));
   EXPECT_FALSE(handoff_event->details.contains("lookahead_sample_times_ns"));
-  EXPECT_TRUE(std::none_of(captured_events.begin(), captured_events.end(), [](const auto& event) {
-    return event.type == KernelEventType::kInterruptLatched;
-  }));
 
   // Lookahead has atomically claimed this dispatch; a late natural-completion
   // callback must not publish a terminal progress marker, even though the
@@ -6712,10 +6457,9 @@ TEST_F(ExecutionKernelTest, CollisionLookahead_NaturalCompletionTerminalHandoffF
     std::lock_guard<std::mutex> lock(events_mutex);
     EXPECT_FALSE(std::any_of(events.begin(), events.end(), [](const KernelEvent& event) {
       const auto surface = event.details.find("surface");
-      return event.type == KernelEventType::kInterruptLatched ||
-             (surface != event.details.end() && surface->second == "observed_runtime_lookahead" &&
-              (event.type == KernelEventType::kCollisionDetected ||
-               event.type == KernelEventType::kErrorRaised));
+      return surface != event.details.end() && surface->second == "observed_runtime_lookahead" &&
+             (event.type == KernelEventType::kCollisionDetected ||
+              event.type == KernelEventType::kErrorRaised);
     }));
   }
 }
@@ -9991,8 +9735,8 @@ class PortParticipantKernelTest : public ExecutionKernelTest {
                                            participant.capability_id,
                                            participant.binding_identity.control_domain_id,
                                            participant.binding_identity.control_domain_revision,
-                                           participant.binding_identity.controller()->control_binding_id,
-                                           participant.binding_identity.controller()->control_binding_revision,
+                                           participant.binding_identity.controller.control_binding_id,
+                                           participant.binding_identity.controller.control_binding_revision,
                                            participant.controller().active_control_configuration_id,
                                            participant.controller().active_control_configuration_generation,
                                            participant.controller().controller_topology_id,
@@ -13953,8 +13697,8 @@ ResolvedParticipantStopStageDTO kernel_spring_stage(
       product.capability_id,
       product.binding_identity.control_domain_id,
       product.binding_identity.control_domain_revision,
-      product.binding_identity.controller()->control_binding_id,
-      product.binding_identity.controller()->control_binding_revision,
+      product.binding_identity.controller.control_binding_id,
+      product.binding_identity.controller.control_binding_revision,
       product.controller().active_control_configuration_id,
       product.controller().active_control_configuration_generation,
       product.controller().controller_topology_id,
@@ -14049,8 +13793,6 @@ StopCertificateDTO kernel_spring_certificate(const ParticipantStopStageResultDTO
        {entry},
        {{key, 1U, 300'000'000, StopStageResultAuthorityDTO::kAuthoritative, result}},
        std::nullopt,
-       std::nullopt,
-       std::nullopt,
        300'000'000,
        std::nullopt});
   if (!reduced.ok()) throw std::logic_error(reduced.error().message);
@@ -14138,7 +13880,7 @@ TEST_F(ExecutionKernelTest,
   const KernelRecoveryActionRequestDTO close{
       "ack.settled-failure.close", RecoveryAction::kCloseOperation, "operator",
       assessment.assessment_revision, assessment.control_command_epoch, assessment.execution_id,
-      assessment.latch_id, assessment.stop_certificate_id, assessment.stop_owner_generation,
+      assessment.stop_certificate_id, assessment.stop_owner_generation,
       "acknowledge contained failure", false};
   const auto resets = execution.reset_count;
   const auto stops = execution.stop_count;

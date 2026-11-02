@@ -312,6 +312,7 @@ def _held_run():
         owner_id="program-runner.cell-a",
         owner_epoch=_RUN_OWNER_EPOCH,
         ports=ports,
+        transport_timeout_s=30.0,
         run_id_factory=lambda: "program-run-1",
     )
     run_id = owner.start(admission).capture.program_run_id
@@ -460,7 +461,7 @@ def test_held_run_preview_is_the_execution_request_and_has_no_effects() -> None:
             "program_node_preview_input_invalid",
         ),
         (
-            {"proposed_inputs": [{"path": "planning_profile", "value": "quality_bounded"}]},
+            {"proposed_inputs": [{"path": "planner", "value": {"optimize": "balanced"}}]},
             "program_node_preview_input_invalid",
         ),
         (

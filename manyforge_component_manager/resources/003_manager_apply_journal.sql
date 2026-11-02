@@ -1,4 +1,4 @@
--- ManyForge UA4 typed named-Apply journal, version 20.
+-- ManyForge UA4 typed named-Apply journal, version 22.
 --
 -- This schema stores immutable named-Apply intents, including the exact UA2A
 -- prepared activation each operation accepted (captured source-closure digest,
@@ -17,15 +17,20 @@
 -- configuration, runtime, component or Scene change (an admission claim, a
 -- Kernel fence and fail-closed readiness may still exist). A terminal failure is never repaired, retried or
 -- rolled back.
--- It is deliberately not a mutable phase/event journal.
+-- It is deliberately not a mutable phase/event journal. Records are never
+-- updated. The journal is bounded by eviction: when the intent inventory is
+-- full, the Manager deletes the oldest Apply that no owner can still need
+-- (terminal, fence and admission claim provably released, not the newest,
+-- newest terminal, newest successful or newest published Apply), together
+-- with every row it owns. accepted_sequence orders Applies for that choice.
 
 PRAGMA application_id = 1296450128;
-PRAGMA user_version = 20;
+PRAGMA user_version = 22;
 
 CREATE TABLE IF NOT EXISTS apply_journal_metadata (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     schema_id TEXT NOT NULL,
-    schema_version INTEGER NOT NULL CHECK (schema_version = 20),
+    schema_version INTEGER NOT NULL CHECK (schema_version = 22),
     schema_artifact_digest TEXT NOT NULL,
     cell_id TEXT NOT NULL,
     maximum_apply_intents INTEGER NOT NULL
@@ -143,40 +148,19 @@ CREATE TABLE IF NOT EXISTS manager_apply_intents (
     scene_initialization TEXT NOT NULL
         CHECK (scene_initialization IN ('preserve', 'initialize')),
     intent_digest TEXT NOT NULL,
+    accepted_sequence INTEGER NOT NULL
+        CHECK (
+            accepted_sequence > 0
+            AND accepted_sequence <= 9223372036854775807
+        ),
     CHECK (
         (expected_admission_generation IS NOT NULL)
         <> (parent_authoring_claim IS NOT NULL)
     ),
     PRIMARY KEY (apply_id, apply_generation),
     UNIQUE (request_owner_epoch, request_id),
-    UNIQUE (apply_id, apply_generation, intent_digest)
-) WITHOUT ROWID, STRICT;
-
--- Q91 parent/child bookkeeping in the same immutable Apply journal. The
--- original intent and this complete plan are inserted atomically before effects.
-CREATE TABLE IF NOT EXISTS manager_apply_bring_up_plans (
-    apply_id TEXT NOT NULL,
-    apply_generation INTEGER NOT NULL CHECK (apply_generation > 0),
-    intent_digest TEXT NOT NULL,
-    plan_encoding BLOB NOT NULL CHECK (length(plan_encoding) > 0),
-    plan_digest TEXT NOT NULL,
-    PRIMARY KEY (apply_id, apply_generation),
-    UNIQUE (apply_id, apply_generation, plan_digest),
-    FOREIGN KEY (apply_id, apply_generation, intent_digest)
-        REFERENCES manager_apply_intents (apply_id, apply_generation, intent_digest)
-) WITHOUT ROWID, STRICT;
-
-CREATE TABLE IF NOT EXISTS manager_apply_bring_up_child_proofs (
-    apply_id TEXT NOT NULL,
-    apply_generation INTEGER NOT NULL CHECK (apply_generation > 0),
-    plan_digest TEXT NOT NULL,
-    component_id TEXT NOT NULL,
-    phase TEXT NOT NULL CHECK (phase IN ('accepted', 'holding', 'terminal')),
-    result_encoding BLOB NOT NULL CHECK (length(result_encoding) > 0),
-    proof_digest TEXT NOT NULL,
-    PRIMARY KEY (apply_id, apply_generation, component_id, phase),
-    FOREIGN KEY (apply_id, apply_generation, plan_digest)
-        REFERENCES manager_apply_bring_up_plans (apply_id, apply_generation, plan_digest)
+    UNIQUE (apply_id, apply_generation, intent_digest),
+    UNIQUE (accepted_sequence)
 ) WITHOUT ROWID, STRICT;
 
 CREATE TABLE IF NOT EXISTS manager_apply_affected_scopes (
@@ -532,20 +516,8 @@ BEGIN
     SELECT RAISE(ABORT, 'manager_apply_intents is immutable');
 END;
 
-CREATE TRIGGER IF NOT EXISTS manager_apply_intents_no_delete
-BEFORE DELETE ON manager_apply_intents
-BEGIN
-    SELECT RAISE(ABORT, 'manager_apply_intents is immutable');
-END;
-
 CREATE TRIGGER IF NOT EXISTS manager_apply_affected_scopes_no_update
 BEFORE UPDATE ON manager_apply_affected_scopes
-BEGIN
-    SELECT RAISE(ABORT, 'manager_apply_affected_scopes is immutable');
-END;
-
-CREATE TRIGGER IF NOT EXISTS manager_apply_affected_scopes_no_delete
-BEFORE DELETE ON manager_apply_affected_scopes
 BEGIN
     SELECT RAISE(ABORT, 'manager_apply_affected_scopes is immutable');
 END;
@@ -556,20 +528,8 @@ BEGIN
     SELECT RAISE(ABORT, 'manager_apply_fence_attempts is immutable');
 END;
 
-CREATE TRIGGER IF NOT EXISTS manager_apply_fence_attempts_no_delete
-BEFORE DELETE ON manager_apply_fence_attempts
-BEGIN
-    SELECT RAISE(ABORT, 'manager_apply_fence_attempts is immutable');
-END;
-
 CREATE TRIGGER IF NOT EXISTS manager_apply_fence_acceptances_no_update
 BEFORE UPDATE ON manager_apply_fence_acceptances
-BEGIN
-    SELECT RAISE(ABORT, 'manager_apply_fence_acceptances is immutable');
-END;
-
-CREATE TRIGGER IF NOT EXISTS manager_apply_fence_acceptances_no_delete
-BEFORE DELETE ON manager_apply_fence_acceptances
 BEGIN
     SELECT RAISE(ABORT, 'manager_apply_fence_acceptances is immutable');
 END;
@@ -580,20 +540,8 @@ BEGIN
     SELECT RAISE(ABORT, 'manager_apply_runtime_convergence_intents is immutable');
 END;
 
-CREATE TRIGGER IF NOT EXISTS manager_apply_runtime_convergence_intents_no_delete
-BEFORE DELETE ON manager_apply_runtime_convergence_intents
-BEGIN
-    SELECT RAISE(ABORT, 'manager_apply_runtime_convergence_intents is immutable');
-END;
-
 CREATE TRIGGER IF NOT EXISTS manager_apply_runtime_staged_ready_sets_no_update
 BEFORE UPDATE ON manager_apply_runtime_staged_ready_sets
-BEGIN
-    SELECT RAISE(ABORT, 'manager_apply_runtime_staged_ready_sets is immutable');
-END;
-
-CREATE TRIGGER IF NOT EXISTS manager_apply_runtime_staged_ready_sets_no_delete
-BEFORE DELETE ON manager_apply_runtime_staged_ready_sets
 BEGIN
     SELECT RAISE(ABORT, 'manager_apply_runtime_staged_ready_sets is immutable');
 END;
@@ -604,20 +552,8 @@ BEGIN
     SELECT RAISE(ABORT, 'manager_apply_private_materializations is immutable');
 END;
 
-CREATE TRIGGER IF NOT EXISTS manager_apply_private_materializations_no_delete
-BEFORE DELETE ON manager_apply_private_materializations
-BEGIN
-    SELECT RAISE(ABORT, 'manager_apply_private_materializations is immutable');
-END;
-
 CREATE TRIGGER IF NOT EXISTS manager_apply_publication_receipts_no_update
 BEFORE UPDATE ON manager_apply_publication_receipts
-BEGIN
-    SELECT RAISE(ABORT, 'manager_apply_publication_receipts is immutable');
-END;
-
-CREATE TRIGGER IF NOT EXISTS manager_apply_publication_receipts_no_delete
-BEFORE DELETE ON manager_apply_publication_receipts
 BEGIN
     SELECT RAISE(ABORT, 'manager_apply_publication_receipts is immutable');
 END;
@@ -628,20 +564,8 @@ BEGIN
     SELECT RAISE(ABORT, 'manager_apply_fence_release_intents is immutable');
 END;
 
-CREATE TRIGGER IF NOT EXISTS manager_apply_fence_release_intents_no_delete
-BEFORE DELETE ON manager_apply_fence_release_intents
-BEGIN
-    SELECT RAISE(ABORT, 'manager_apply_fence_release_intents is immutable');
-END;
-
 CREATE TRIGGER IF NOT EXISTS manager_apply_fence_released_records_no_update
 BEFORE UPDATE ON manager_apply_fence_released_records
-BEGIN
-    SELECT RAISE(ABORT, 'manager_apply_fence_released_records is immutable');
-END;
-
-CREATE TRIGGER IF NOT EXISTS manager_apply_fence_released_records_no_delete
-BEFORE DELETE ON manager_apply_fence_released_records
 BEGIN
     SELECT RAISE(ABORT, 'manager_apply_fence_released_records is immutable');
 END;
@@ -650,36 +574,6 @@ CREATE TRIGGER IF NOT EXISTS manager_apply_terminal_outcomes_no_update
 BEFORE UPDATE ON manager_apply_terminal_outcomes
 BEGIN
     SELECT RAISE(ABORT, 'manager_apply_terminal_outcomes is immutable');
-END;
-
-CREATE TRIGGER IF NOT EXISTS manager_apply_terminal_outcomes_no_delete
-BEFORE DELETE ON manager_apply_terminal_outcomes
-BEGIN
-    SELECT RAISE(ABORT, 'manager_apply_terminal_outcomes is immutable');
-END;
-
-CREATE TRIGGER IF NOT EXISTS manager_apply_bring_up_plans_no_update
-BEFORE UPDATE ON manager_apply_bring_up_plans
-BEGIN
-    SELECT RAISE(ABORT, 'manager_apply_bring_up_plans is immutable');
-END;
-
-CREATE TRIGGER IF NOT EXISTS manager_apply_bring_up_plans_no_delete
-BEFORE DELETE ON manager_apply_bring_up_plans
-BEGIN
-    SELECT RAISE(ABORT, 'manager_apply_bring_up_plans is immutable');
-END;
-
-CREATE TRIGGER IF NOT EXISTS manager_apply_bring_up_child_proofs_no_update
-BEFORE UPDATE ON manager_apply_bring_up_child_proofs
-BEGIN
-    SELECT RAISE(ABORT, 'manager_apply_bring_up_child_proofs is immutable');
-END;
-
-CREATE TRIGGER IF NOT EXISTS manager_apply_bring_up_child_proofs_no_delete
-BEFORE DELETE ON manager_apply_bring_up_child_proofs
-BEGIN
-    SELECT RAISE(ABORT, 'manager_apply_bring_up_child_proofs is immutable');
 END;
 
 -- Operator acknowledgement and its one fence-release attempt for a failed
@@ -703,12 +597,6 @@ CREATE TABLE IF NOT EXISTS manager_apply_failed_release (
         REFERENCES manager_apply_fence_acceptances
             (apply_id, apply_generation, acceptance_digest)
 ) WITHOUT ROWID, STRICT;
-
-CREATE TRIGGER IF NOT EXISTS manager_apply_failed_release_no_delete
-BEFORE DELETE ON manager_apply_failed_release
-BEGIN
-    SELECT RAISE(ABORT, 'manager_apply_failed_release cannot be deleted');
-END;
 
 CREATE TRIGGER IF NOT EXISTS manager_apply_failed_release_one_completion
 BEFORE UPDATE ON manager_apply_failed_release

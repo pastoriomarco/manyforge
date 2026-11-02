@@ -97,7 +97,7 @@ TEST(PreparedMotionEvidenceCodecTest,
   auto cartesian = Validation();
   auto& metrics = *cartesian.noncollision_result.trajectory_metrics;
   metrics.cartesian_fidelity_metrics = CartesianFidelityMetricsDTO{
-      0.005, 0.05, 0.001, 0.01, 0.0005, 0.002, 0.0015, 0.012, 0.01, 0.005, 2U};
+      0.005, 0.05, 0.001, 0.01, 0.0005, 0.002, 0.0015, 0.012};
   const auto encoded = EncodePreparedMotionValidationEvidence(cartesian);
   ASSERT_TRUE(encoded.ok()) << encoded.error().message;
   const auto decoded = DecodePreparedMotionValidationEvidence(encoded.value());
@@ -152,8 +152,8 @@ TEST(PreparedMotionEvidenceCodecTest, RoundTripsOneNestedMovingPairAndRejectsMal
   ASSERT_NE(moving, std::string::npos);
   unknown.insert(moving + std::string("\"moving_replacement\":{").size(), "\"unknown\":true,");
   EXPECT_FALSE(DecodePreparedMotionValidationEvidence(unknown).ok());
-  const CartesianFidelityMetricsDTO fidelity{0.005,  0.05,  0.001, 0.01,  0.0005, 0.002,
-                                             0.0015, 0.012, 0.01,  0.005, 2U};
+  const CartesianFidelityMetricsDTO fidelity{0.005,  0.05,  0.001, 0.01,
+                                             0.0005, 0.002, 0.0015, 0.012};
   auto bound_fidelity = Validation();
   bound_fidelity.noncollision_result.trajectory_metrics->cartesian_fidelity_metrics = fidelity;
   const auto bound_bytes = EncodePreparedMotionValidationEvidence(bound_fidelity);

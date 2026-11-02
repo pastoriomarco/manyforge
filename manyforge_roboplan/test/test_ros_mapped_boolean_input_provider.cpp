@@ -20,12 +20,10 @@
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_roboplan/ros_mapped_boolean_input_provider.hpp>
 #include <rclcpp/executors/single_threaded_executor.hpp>
-#include <ur_msgs/msg/io_states.hpp>
 
 namespace manyforge::roboplan_backend {
 namespace {
 using namespace std::chrono_literals;
-using UrMessage = ur_msgs::msg::IOStates;
 using GpioMessage = control_msgs::msg::DynamicInterfaceGroupValues;
 const core::InterruptSourceId kSource("source.io");
 const core::IoSourceIncarnation kIncarnation("activation.1");
@@ -105,48 +103,6 @@ protected:
 };
 
 TEST_F(RosMappedBooleanInputProviderTest,
-       UrMessageProducesOneAtomicFrameWithoutBorrowingOtherPins) {
-  auto publisher =
-      node->create_publisher<UrMessage>("/test/mapped_inputs", qos);
-  Connect({{descriptor("pin0"), UrDigitalInputSelector{0}},
-           {descriptor("pin17"), UrDigitalInputSelector{17}}});
-  ASSERT_TRUE(provider);
-  ASSERT_TRUE(
-      SpinUntil([&] { return publisher->get_subscription_count() == 1U; }));
-  EXPECT_TRUE(sink->frames.empty());
-  UrMessage message;
-  ur_msgs::msg::Digital pin;
-  pin.pin = 0;
-  pin.state = false;
-  message.digital_in_states.push_back(pin);
-  pin.pin = 17;
-  pin.state = true;
-  message.digital_in_states.push_back(pin);
-  // Output/flag arrays cannot masquerade as input evidence.
-  message.digital_out_states = message.digital_in_states;
-  clock.set(71);
-  publisher->publish(message);
-  ASSERT_TRUE(SpinUntil([&] { return sink->frames.size() == 1U; }));
-  const auto &first = sink->frames.front();
-  EXPECT_EQ(first.trusted_received_at_ns, 71);
-  EXPECT_EQ(first.source_id, kSource);
-  EXPECT_EQ(first.incarnation, kIncarnation);
-  EXPECT_EQ(first.source_sequence, 1U);
-  ASSERT_EQ(first.updates.size(), 2U);
-  EXPECT_EQ(first.updates[0].value, false);
-  EXPECT_EQ(first.updates[1].value, true);
-  message.digital_in_states.pop_back();
-  message.digital_in_states.push_back(message.digital_in_states.front());
-  publisher->publish(message);
-  ASSERT_TRUE(SpinUntil([&] { return sink->frames.size() == 2U; }));
-  for (const auto &update : sink->frames.back().updates) {
-    EXPECT_EQ(update.validity, core::IoSampleValidity::kInvalid);
-    EXPECT_FALSE(update.value);
-    EXPECT_FALSE(update.error);
-  }
-}
-
-TEST_F(RosMappedBooleanInputProviderTest,
        GpioUsesExactSelectorsAndStrictBooleanValues) {
   auto publisher =
       node->create_publisher<GpioMessage>("/test/mapped_inputs", qos);
@@ -189,17 +145,18 @@ TEST_F(RosMappedBooleanInputProviderTest,
 TEST_F(RosMappedBooleanInputProviderTest,
        ResumeRejectsBufferedOldChannelAndRequiresRealNewMessage) {
   auto publisher =
-      node->create_publisher<UrMessage>("/test/mapped_inputs", qos);
-  Connect({{descriptor("pin0"), UrDigitalInputSelector{0}}}, 1U);
+      node->create_publisher<GpioMessage>("/test/mapped_inputs", qos);
+  Connect({{descriptor("a"), RosGpioBooleanInputSelector{"bank/a", "in.0"}}}, 1U);
   ASSERT_TRUE(provider);
   ASSERT_TRUE(
       SpinUntil([&] { return publisher->get_subscription_count() == 1U; }));
   ASSERT_TRUE(provider->Resume(2U));
-  UrMessage message;
-  ur_msgs::msg::Digital pin;
-  pin.pin = 0;
-  pin.state = true;
-  message.digital_in_states.push_back(pin);
+  GpioMessage message;
+  message.interface_groups = {"bank/a"};
+  control_msgs::msg::InterfaceValue values;
+  values.interface_names = {"in.0"};
+  values.values = {1.0};
+  message.interface_values.push_back(values);
   publisher->publish(
       message); // old subscription channel, before executor entry
   ASSERT_TRUE(provider->Pause(3U));
@@ -212,7 +169,7 @@ TEST_F(RosMappedBooleanInputProviderTest,
 }
 
 TEST_F(RosMappedBooleanInputProviderTest,
-       RefusesMixedMessageKindsAndNonperiodicContracts) {
+       RefusesEmptySelectorsAndNonperiodicContracts) {
   const auto create = [&](std::vector<RosMappedBooleanInputSignal> signals) {
     return RosMappedBooleanInputProvider::Create(
         node, sink, clock,
@@ -220,15 +177,13 @@ TEST_F(RosMappedBooleanInputProviderTest,
         qos);
   };
   EXPECT_FALSE(
-      create({{descriptor("a"), UrDigitalInputSelector{0}},
-              {descriptor("b"), RosGpioBooleanInputSelector{"g", "i"}}})
-          .ok());
-  EXPECT_FALSE(create({{descriptor("a"), UrDigitalInputSelector{18}}}).ok());
+      create({{descriptor("a"), RosGpioBooleanInputSelector{"", "i"}}}).ok());
   auto change_only = descriptor("a");
   change_only.liveness = core::IoSignalLivenessMode::kChangeOnly;
   change_only.freshness = {core::IoFreshnessMode::kProviderValidity,
                            std::nullopt};
-  EXPECT_FALSE(create({{change_only, UrDigitalInputSelector{0}}}).ok());
+  EXPECT_FALSE(
+      create({{change_only, RosGpioBooleanInputSelector{"g", "i"}}}).ok());
 }
 } // namespace
 TEST_F(RosMappedBooleanInputProviderTest,
@@ -237,7 +192,7 @@ TEST_F(RosMappedBooleanInputProviderTest,
       kSource,
       kIncarnation,
       "relative",
-      {{descriptor("a"), UrDigitalInputSelector{0}}}};
+      {{descriptor("a"), RosGpioBooleanInputSelector{"g", "i"}}}};
   EXPECT_FALSE(RosMappedBooleanInputProvider::Create(node, sink, clock,
                                                      configuration, qos)
                    .ok());

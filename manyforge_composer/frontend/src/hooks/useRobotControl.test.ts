@@ -15,7 +15,6 @@ import {
   manualAvailabilityScopeFence,
   mountedToolsFromStatus,
   buildManualAvailabilityIntent,
-  CELL_RECOVER_REPLAY_PAUSE_MS,
   useRobotControl,
 } from './useRobotControl';
 import { gripperReceiptFixture, statusFixture } from '../testFixtures/robotControl';
@@ -694,7 +693,7 @@ describe('pneumatic manual availability observation', () => {
     expect(latest.selectedStatus!.directControl!.activeTcp!.entry!.frameRoleId).toBe('tcp');
     expect(send).toHaveBeenCalledTimes(1);
   });
-  it('disables mapped pneumatic manual control while a Program is running or held', async () => {
+  it('has no idle-only gate for mapped pneumatic manual control (V2-3)', async () => {
     const status = pneumaticStatus();
     Object.assign(status.directControlGripper!.targetDescriptor, {
       completionPolicy: 'no_output', pneumaticOutputs: [{ controllableComponentId: 'valve_io',
@@ -707,8 +706,7 @@ describe('pneumatic manual availability observation', () => {
     } as unknown as ComposerHeadlessState;
     await render(snapshot);
     await act(async () => { latest.selectMode('gripper'); latest.setManualPanelVisible(true); });
-    expect(latest.manualControlAllowed).toBe(false);
-    expect(latest.manualControlUnavailableReason).toContain('idle after Reset');
+    expect(latest.manualControlUnavailableReason ?? '').not.toContain('idle after Reset');
   });
   it('refuses a missing current observation when a pneumatic target becomes Position', async () => {
     const snapshot = { executionControlStatus: pneumaticStatus(), authoringAdmission: { admissionGeneration: 1 },
@@ -845,9 +843,6 @@ describe('pneumatic manual availability observation', () => {
       status.ioSignalBindings = descriptor.pneumaticOutputs.map((row, index) => ({
         programBindingId: `binding-${index}`, targetRoleId: `target-${index}`,
         controllableComponentId: row.controllableComponentId, commandTargetId: 'io',
-        outputCommand: { programId: `program-${index}`, programRevision: `revision-${index}`,
-          programRunId: 'direct-control-io-owner', componentRoleId: `component-${index}`,
-          capabilityId: 'io.gpio.set_output', commandSchemaId: 'io.write', commandSchemaRevision: 'schema-1' },
         signalRoleBindings: [{ resourceRoleId: `signal-${index}`, signalName: row.signalName,
           valueType: 'bool', direction: 'output', transitionCapability: 'sampled_only', signalDescriptorDigest: 'digest' }],
       }));
@@ -858,11 +853,13 @@ describe('pneumatic manual availability observation', () => {
       let releaseFirst!: () => void;
       const started = new Promise<void>((resolve) => { firstStarted = resolve; });
       const gate = new Promise<void>((resolve) => { releaseFirst = resolve; });
-      let sentCount = 0;
-      const send = vi.fn(async (_kind: string, _payload: unknown, requestId: string) => {
-        const operation = ++sentCount;
-        if (operation === 1) { firstStarted(); await gate; }
-        return { result: { accepted: { request_id: requestId, operation_id: `op-${operation}` } } };
+      const send = vi.fn(async (_kind: string, _payload: unknown, requestId: string) => (
+        { result: { accepted: { request_id: requestId, operation_id: 'gripper-op' } } }));
+      let writes = 0;
+      // The one output write path (CONTRACTS §7); the first valve write waits.
+      vi.spyOn(api.io, 'setOutput').mockImplementation(async () => {
+        if (++writes === 1) { firstStarted(); await gate; }
+        return { outcome: 'succeeded' };
       });
       const source = { sendExecutionCommand: send } as unknown as Parameters<typeof useRobotControl>[4];
       function SequenceHarness({ current }: { current: ComposerHeadlessState }) {
@@ -875,10 +872,6 @@ describe('pneumatic manual availability observation', () => {
       vi.mocked(api.execution.previewCapabilityCommand).mockImplementation(async (intent) => (
         gripperReceiptFixture(status, intent.request_context.request_id, 0.037)
       ));
-      vi.spyOn(api.execution, 'readManualValveOperation').mockImplementation(async (operationId) => ({
-        operationId, operationRevision: 1, resident: false, state: 'completed', progress: 1,
-        activeStopId: null, activeStopGeneration: null, terminalError: null, outputEvidence: 'source_accepted',
-      }));
       await act(async () => root.render(createElement(SequenceHarness, { current: snapshot })));
       await act(async () => { latest.selectMode('gripper'); latest.editGripper(0.037); });
       await act(async () => { await new Promise((resolve) => globalThis.setTimeout(resolve, 20)); });
@@ -892,250 +885,12 @@ describe('pneumatic manual availability observation', () => {
       await act(async () => root.render(createElement(SequenceHarness, { current: successor })));
       releaseFirst();
       await act(async () => { await approval; });
-      // Two distinct valve commands, then the gripper command; no automatic resend.
-      expect(send).toHaveBeenCalledTimes(3);
-      expect(api.execution.readManualValveOperation).toHaveBeenCalledTimes(2);
+      // Two valve writes, then the gripper command; no automatic resend.
+      expect(api.io.setOutput).toHaveBeenNthCalledWith(1, 'valve-a/open', false);
+      expect(api.io.setOutput).toHaveBeenNthCalledWith(2, 'valve-b/close', true);
+      expect(api.io.setOutput).toHaveBeenCalledTimes(2);
+      expect(send).toHaveBeenCalledTimes(1);
     },
   );
 });
 
-describe('Recover cell single press', () => {
-  let root: import('react-dom/client').Root;
-  let latest: ReturnType<typeof useRobotControl>;
-  function Harness({ snapshot }: { snapshot: ComposerHeadlessState }) {
-    const result = useRobotControl(true, true, true, snapshot);
-    useEffect(() => { latest = result; }, [result]);
-    return null;
-  }
-  beforeEach(async () => {
-    const document = Object.assign(new EventTarget(), { nodeType: 9, activeElement: null, defaultView: {} });
-    const makeNode = (tag: string) => Object.assign(new EventTarget(), {
-      nodeType: 1, nodeName: tag.toUpperCase(), tagName: tag.toUpperCase(),
-      namespaceURI: 'http://www.w3.org/1999/xhtml', ownerDocument: document, style: {},
-      appendChild: vi.fn(), removeChild: vi.fn(), insertBefore: vi.fn(),
-      setAttribute: vi.fn(), removeAttribute: vi.fn(),
-    });
-    Object.assign(document, { createElement: makeNode, documentElement: makeNode('html') });
-    document.defaultView = Object.assign(new EventTarget(), { document, HTMLIFrameElement: class {},
-      setTimeout: globalThis.setTimeout, clearTimeout: globalThis.clearTimeout });
-    vi.stubGlobal('window', document.defaultView);
-    vi.stubGlobal('document', document);
-    vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true);
-    const { createRoot } = await import('react-dom/client');
-    root = createRoot(makeNode('div') as unknown as Element);
-  });
-  afterEach(async () => {
-    await act(async () => root.unmount());
-    vi.restoreAllMocks();
-    vi.unstubAllGlobals();
-  });
-
-  it('keeps the Recover press and its result when the execution owner rejoins', async () => {
-    const status = statusFixture();
-    status.cellStopAction.fault = {
-      latchId: 'stop-fault.1', latchGeneration: 1, state: 'latched',
-      trigger: 'physical_rest_unproven', observedTriggers: ['physical_rest_unproven'],
-      recoveryStatus: 'ready', reasonCode: 'stop_fault_recovery_ready', certificate: null,
-    } as unknown as NonNullable<typeof status.cellStopAction.fault>;
-    const snapshot = { executionControlStatus: status, authoringAdmission: { admissionGeneration: 1 },
-      programCycle: { programRunnerOwnerEpoch: 'runner.1', programRunId: null, cycleGeneration: 1,
-        state: 'idle_after_reset', executionControlRevision: 1,
-        runtimeControls: { executionSelections: { selectionRevision: 1, groups: [] } } },
-    } as unknown as ComposerHeadlessState;
-    let finish!: (result: Awaited<ReturnType<typeof api.execution.cellRecover>>) => void;
-    const cellRecover = vi.spyOn(api.execution, 'cellRecover')
-      .mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
-    vi.spyOn(api.execution, 'manualAvailability').mockReturnValue(new Promise(() => {}));
-    await act(async () => root.render(createElement(Harness, { snapshot })));
-    let press!: Promise<void>;
-    await act(async () => { press = latest.recoverStopFault(); });
-    expect(latest.stopFaultRecoveryPending).toBe(true);
-    const successor = structuredClone(snapshot);
-    successor.executionControlStatus!.ownerEpoch = 'execution.rejoined';
-    await act(async () => root.render(createElement(Harness, { snapshot: successor })));
-    expect(latest.stopFaultRecoveryPending).toBe(true);
-    expect(cellRecover.mock.calls[0][2]?.aborted).toBe(false);
-    await act(async () => {
-      finish({ outcome: 'not_recovered', acknowledgedIncidents: [], latchCleared: true, recoveredComponents: [],
-        reason: { code: 'component_rearm_failed', message: 'm', details: {} } });
-      await press;
-    });
-    expect(latest.stopFaultRecoveryPending).toBe(false);
-    expect(latest.stopFaultRecoveryError).toContain('The cell latch was cleared.');
-    expect(cellRecover).toHaveBeenCalledTimes(1);
-  });
-
-  it('sends one Headless cell-recover per press and shows its typed reason', async () => {
-    const status = statusFixture();
-    status.cellStopAction.fault = {
-      latchId: 'stop-fault.1', latchGeneration: 1, state: 'latched',
-      trigger: 'physical_rest_unproven', observedTriggers: ['physical_rest_unproven'],
-      recoveryStatus: 'waiting_for_observation', reasonCode: 'stop_fault_recovery_waiting_for_observation',
-      certificate: null,
-    } as unknown as NonNullable<typeof status.cellStopAction.fault>;
-    const snapshot = { executionControlStatus: status, authoringAdmission: { admissionGeneration: 1 },
-      programCycle: { programRunnerOwnerEpoch: 'runner.1', programRunId: null, cycleGeneration: 1,
-        state: 'idle_after_reset', executionControlRevision: 1,
-        runtimeControls: { executionSelections: { selectionRevision: 1, groups: [] } } },
-    } as unknown as ComposerHeadlessState;
-    const cellRecover = vi.spyOn(api.execution, 'cellRecover')
-      .mockResolvedValueOnce({
-        outcome: 'not_recovered',
-        acknowledgedIncidents: [{ controllableComponentId: 'arm', incidentId: 'incident.1', causeClass: 'emergency_stop' }],
-        latchCleared: false,
-        recoveredComponents: [],
-        reason: { code: 'incident_open', message: 'm',
-          details: { controllable_component_id: 'arm', cause_class: 'emergency_stop' } },
-      })
-      .mockResolvedValueOnce({ outcome: 'done', acknowledgedIncidents: [], latchCleared: true, recoveredComponents: [], reason: null });
-    // The browser no longer chains the owners itself.
-    const submitLifecycle = vi.spyOn(api.cclc, 'submitLifecycle');
-    const stopFault = vi.spyOn(api.execution, 'stopFault');
-    vi.spyOn(api.execution, 'manualAvailability').mockReturnValue(new Promise(() => {}));
-    await act(async () => root.render(createElement(Harness, { snapshot })));
-
-    await act(async () => { await latest.recoverStopFault(); });
-    expect(cellRecover).toHaveBeenCalledTimes(1);
-    expect(latest.stopFaultRecoveryPending).toBe(false);
-    expect(latest.stopFaultRecoveryError).toContain('The arm incident is open again (emergency stop)');
-
-    await act(async () => { await latest.recoverStopFault(); });
-    expect(cellRecover).toHaveBeenCalledTimes(2);
-    expect(cellRecover.mock.calls[0]![0]).not.toBe(cellRecover.mock.calls[1]![0]);
-    expect(latest.stopFaultRecoveryError).toBeNull();
-    expect(submitLifecycle).not.toHaveBeenCalled();
-    expect(stopFault).not.toHaveBeenCalled();
-  });
-
-  it('replays the same request ID after an HTTP timeout until the final result', async () => {
-    const status = statusFixture();
-    status.cellStopAction.fault = {
-      latchId: 'stop-fault.1', latchGeneration: 1, state: 'latched',
-      trigger: 'physical_rest_unproven', observedTriggers: ['physical_rest_unproven'],
-      recoveryStatus: 'ready', reasonCode: 'stop_fault_recovery_ready',
-      certificate: null,
-    } as unknown as NonNullable<typeof status.cellStopAction.fault>;
-    const snapshot = { executionControlStatus: status, authoringAdmission: { admissionGeneration: 1 },
-      programCycle: { programRunnerOwnerEpoch: 'runner.1', programRunId: null, cycleGeneration: 1,
-        state: 'idle_after_reset', executionControlRevision: 1,
-        runtimeControls: { executionSelections: { selectionRevision: 1, groups: [] } } },
-    } as unknown as ComposerHeadlessState;
-    const timeout = new ApiError('Cell API did not respond in time', 503, {
-      detail: { code: 'headless_http_timeout', message: 'headless API request timed out',
-        details: {}, producer: 'composer' },
-    });
-    let finish!: (result: Awaited<ReturnType<typeof api.execution.cellRecover>>) => void;
-    const cellRecover = vi.spyOn(api.execution, 'cellRecover')
-      .mockRejectedValueOnce(timeout)
-      .mockResolvedValueOnce({ outcome: 'not_recovered', acknowledgedIncidents: [], latchCleared: false,
-        recoveredComponents: [],
-        reason: { code: 'cell_recover_in_progress', message: 'm', details: {} } })
-      .mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
-    // The in-progress pause runs at once here.
-    const pause = vi.spyOn(window, 'setTimeout')
-      .mockImplementation(((resolve: () => void) => globalThis.setTimeout(resolve, 0)) as never);
-    vi.spyOn(api.execution, 'manualAvailability').mockReturnValue(new Promise(() => {}));
-    await act(async () => root.render(createElement(Harness, { snapshot })));
-
-    let press!: Promise<void>;
-    await act(async () => {
-      press = latest.recoverStopFault();
-      await new Promise((resolve) => globalThis.setTimeout(resolve, 20));
-    });
-    // Timeout, then in progress: the third send waits, shown "Recovering… (in progress)".
-    expect(cellRecover).toHaveBeenCalledTimes(3);
-    expect(pause).toHaveBeenCalledWith(expect.any(Function), CELL_RECOVER_REPLAY_PAUSE_MS);
-    expect(latest.stopFaultRecoveryPending).toBe(true);
-    expect(latest.stopFaultRecoveryInProgress).toBe(true);
-
-    await act(async () => {
-      finish({ outcome: 'done', acknowledgedIncidents: [], latchCleared: true,
-        recoveredComponents: ['arm'], reason: null });
-      await press;
-    });
-    const ids = cellRecover.mock.calls.map((call) => call[0]);
-    expect(new Set(ids).size).toBe(1);
-    expect(cellRecover.mock.calls.every((call) => call[1] === cellRecover.mock.calls[0]![1])).toBe(true);
-    // Only the press itself may start a composite; every resend is replay-only.
-    expect(cellRecover.mock.calls.map((call) => call[3])).toEqual([false, true, true]);
-    expect(latest.stopFaultRecoveryPending).toBe(false);
-    expect(latest.stopFaultRecoveryInProgress).toBe(false);
-    expect(latest.stopFaultRecoveryError).toBeNull();
-  });
-
-  it('shows the final refusal reached through a replay, and stops on any other error', async () => {
-    const status = statusFixture();
-    status.cellStopAction.fault = {
-      latchId: 'stop-fault.1', latchGeneration: 1, state: 'latched',
-      trigger: 'physical_rest_unproven', observedTriggers: ['physical_rest_unproven'],
-      recoveryStatus: 'ready', reasonCode: 'stop_fault_recovery_ready',
-      certificate: null,
-    } as unknown as NonNullable<typeof status.cellStopAction.fault>;
-    const snapshot = { executionControlStatus: status, authoringAdmission: { admissionGeneration: 1 },
-      programCycle: { programRunnerOwnerEpoch: 'runner.1', programRunId: null, cycleGeneration: 1,
-        state: 'idle_after_reset', executionControlRevision: 1,
-        runtimeControls: { executionSelections: { selectionRevision: 1, groups: [] } } },
-    } as unknown as ComposerHeadlessState;
-    const timeout = new ApiError('timed out', 503, {
-      detail: { code: 'headless_http_timeout', message: 'm', details: {}, producer: 'composer' },
-    });
-    const cellRecover = vi.spyOn(api.execution, 'cellRecover')
-      .mockRejectedValueOnce(timeout)
-      .mockResolvedValueOnce({ outcome: 'not_recovered', acknowledgedIncidents: [],
-        latchCleared: true, recoveredComponents: [],
-        reason: { code: 'component_rearm_failed', message: 'm', details: {} } })
-      .mockRejectedValueOnce(new ApiError('unavailable', 503, {
-        detail: { code: 'headless_http_unavailable', message: 'm', details: {}, producer: 'composer' },
-      }));
-    vi.spyOn(api.execution, 'manualAvailability').mockReturnValue(new Promise(() => {}));
-    await act(async () => root.render(createElement(Harness, { snapshot })));
-
-    await act(async () => { await latest.recoverStopFault(); });
-    expect(cellRecover).toHaveBeenCalledTimes(2);
-    expect(cellRecover.mock.calls[0]![0]).toBe(cellRecover.mock.calls[1]![0]);
-    expect(latest.stopFaultRecoveryError).toContain('The cell latch was cleared.');
-
-    expect(cellRecover.mock.calls.map((call) => call[3])).toEqual([false, true]);
-
-    // Only an HTTP timeout is replayed; another failure ends the press.
-    await act(async () => { await latest.recoverStopFault(); });
-    expect(cellRecover).toHaveBeenCalledTimes(3);
-    expect(latest.stopFaultRecoveryPending).toBe(false);
-    expect(latest.stopFaultRecoveryError).not.toBeNull();
-  });
-
-  it('stops resending when Headless no longer holds the press (restart) and says so', async () => {
-    const status = statusFixture();
-    status.cellStopAction.fault = {
-      latchId: 'stop-fault.1', latchGeneration: 1, state: 'latched',
-      trigger: 'physical_rest_unproven', observedTriggers: ['physical_rest_unproven'],
-      recoveryStatus: 'ready', reasonCode: 'stop_fault_recovery_ready',
-      certificate: null,
-    } as unknown as NonNullable<typeof status.cellStopAction.fault>;
-    const snapshot = { executionControlStatus: status, authoringAdmission: { admissionGeneration: 1 },
-      programCycle: { programRunnerOwnerEpoch: 'runner.1', programRunId: null, cycleGeneration: 1,
-        state: 'idle_after_reset', executionControlRevision: 1,
-        runtimeControls: { executionSelections: { selectionRevision: 1, groups: [] } } },
-    } as unknown as ComposerHeadlessState;
-    const timeout = new ApiError('timed out', 503, {
-      detail: { code: 'headless_http_timeout', message: 'm', details: {}, producer: 'composer' },
-    });
-    const cellRecover = vi.spyOn(api.execution, 'cellRecover')
-      .mockRejectedValueOnce(timeout)
-      .mockResolvedValueOnce({ outcome: 'not_recovered', acknowledgedIncidents: [],
-        latchCleared: false, recoveredComponents: [],
-        reason: { code: 'cell_recover_outcome_unknown', message: 'm',
-          details: { replay: 'request_id_unknown' } } });
-    vi.spyOn(api.execution, 'manualAvailability').mockReturnValue(new Promise(() => {}));
-    await act(async () => root.render(createElement(Harness, { snapshot })));
-
-    await act(async () => { await latest.recoverStopFault(); });
-    // The replay-only resend found no press: no further resend, no new press.
-    expect(cellRecover).toHaveBeenCalledTimes(2);
-    expect(cellRecover.mock.calls.map((call) => call[3])).toEqual([false, true]);
-    expect(latest.stopFaultRecoveryPending).toBe(false);
-    expect(latest.stopFaultRecoveryError).toBe(
-      'Recovery outcome unknown after a restart: check the cell state and press Recover cell again.',
-    );
-  });
-});

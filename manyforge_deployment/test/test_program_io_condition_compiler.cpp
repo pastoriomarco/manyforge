@@ -4,11 +4,20 @@
 #include <manyforge_core/prepared_participant_stop_plan_codec.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/canonical_value.hpp>
+#include <manyforge_deployment/io_signal_catalog.hpp>
+#include <algorithm>
+#include <filesystem>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <tuple>
+#include <type_traits>
 #include <utility>
+#include <variant>
 #include <vector>
 
+#include "activation_component_profile_internal.hpp"
+#include "activation_deployment_intent_internal.hpp"
 #include "program_io_condition_compiler_internal.hpp"
 
 namespace {
@@ -583,6 +592,191 @@ TEST(ProgramIoConditionCompilerTest,
   EXPECT_TRUE(evaluate(*resolved.value().condition, values));
   values.back() = false;
   EXPECT_FALSE(evaluate(*resolved.value().condition, values));
+}
+
+// CONTRACTS §7 (plan V2-7): a Deployment condition names the core-held
+// `<output>.changed_outside` bool of an output with read-back that isn't
+// controller-owned; it resolves to the core's signal and source ids.
+c::IoSignalDescriptorDTO output_descriptor(std::string name, bool readback,
+                                           bool controller_owned) {
+  c::IoSignalDescriptorDTO descriptor{
+      {c::ControllableComponentId("device"), std::move(name)},
+      c::InterruptSourceId("device.outputs"),
+      c::IoSignalValueType::kBoolean,
+      c::IoSignalDirection::kOutput,
+      c::IoSignalUpdateMode::kChangeOnly,
+      c::IoTransitionCapability::kSampledOnly,
+      {c::IoFreshnessMode::kProviderValidity, std::nullopt},
+      c::ResourceId("device.valve"),
+      std::nullopt};
+  descriptor.readback = readback;
+  descriptor.controller_owned = controller_owned;
+  return descriptor;
+}
+
+V changed_outside_compare(std::string signal_name) {
+  return V(V::Object{
+      {"compare",
+       V(V::Object{
+           {"operand",
+            V(V::Object{{"signal",
+                         V(V::Object{{"controllable_component_id", V("device")},
+                                     {"signal_name", V(std::move(signal_name))}})}})},
+           {"op", V("==")},
+           {"value", V(true)}})}});
+}
+
+TEST(ProgramIoConditionCompilerTest,
+     GlobalChangedOutsideResolvesToTheCoreHeldSignalAndSource) {
+  Context context;
+  const auto descriptor = output_descriptor("valve", true, false);
+  context.signals.push_back({c::RuntimeUnitId("host"), c::CommandTargetId("gpio"),
+                             c::ResourceRoleId("valve"), descriptor, {}});
+  const auto compiled = d::detail::compile_authored_deployment_io_condition(
+      changed_outside_compare("valve.changed_outside"), context.keys,
+      context.signals);
+  ASSERT_TRUE(compiled.ok()) << compiled.error().message;
+  ASSERT_EQ(compiled.value().condition->inputs().size(), 1U);
+  EXPECT_EQ(compiled.value().condition->inputs().front().source,
+            c::IoConditionInputSourceDTO(
+                c::ChangedOutsideSignalId(descriptor.signal_id)));
+  EXPECT_EQ(compiled.value().required_signal_sources,
+            std::vector<c::InterruptSourceId>{
+                c::ChangedOutsideSourceId(descriptor.signal_id)});
+  EXPECT_TRUE(evaluate(*compiled.value().condition, {true}));
+  // The output itself is still not a condition input.
+  const auto output = d::detail::compile_authored_deployment_io_condition(
+      changed_outside_compare("valve"), context.keys, context.signals);
+  ASSERT_FALSE(output.ok());
+  EXPECT_EQ(output.error().details.at("reason"), "io_signal_direction_mismatch");
+}
+
+TEST(ProgramIoConditionCompilerTest,
+     GlobalChangedOutsideIsRefusedWithoutReadbackOrWhenControllerOwned) {
+  Context context;
+  for (const auto &[name, readback, owned] :
+       {std::tuple{std::string("blind"), false, false},
+        std::tuple{std::string("owned"), true, true}}) {
+    context.signals.push_back({c::RuntimeUnitId("host"),
+                               c::CommandTargetId("gpio"),
+                               c::ResourceRoleId(name),
+                               output_descriptor(name, readback, owned),
+                               {}});
+  }
+  for (const auto *name : {"blind.changed_outside", "owned.changed_outside"}) {
+    SCOPED_TRACE(name);
+    const auto refused = d::detail::compile_authored_deployment_io_condition(
+        changed_outside_compare(name), context.keys, context.signals);
+    ASSERT_FALSE(refused.ok());
+    EXPECT_EQ(refused.error().details.at("reason"),
+              "io_output_changed_outside_unavailable");
+  }
+  const auto unknown = d::detail::compile_authored_deployment_io_condition(
+      changed_outside_compare("missing.changed_outside"), context.keys,
+      context.signals);
+  ASSERT_FALSE(unknown.ok());
+  EXPECT_EQ(unknown.error().details.at("reason"), "io_signal_unbound");
+}
+
+c::JsonValueDTO json(const V &value) {
+  return std::visit(
+      [](const auto &item) -> c::JsonValueDTO {
+        using T = std::decay_t<decltype(item)>;
+        if constexpr (std::is_same_v<T, V::Array>) {
+          c::JsonValueDTO::Array result;
+          for (const auto &element : item) result.push_back(json(element));
+          return {std::move(result)};
+        } else if constexpr (std::is_same_v<T, V::Object>) {
+          c::JsonValueDTO::Object result;
+          for (const auto &[name, element] : item) result.emplace(name, json(element));
+          return {std::move(result)};
+        } else {
+          return {item};
+        }
+      },
+      value.storage());
+}
+
+// CONTRACTS §7, §8, §16: a real xArm control-box input (e.g. a light curtain
+// on CI0) drives a global rule. The I/O member's rows come from the curated
+// Lite 6 models on the real lane; the input is periodic with the model's
+// sample-age budget, so a stale stream leaves the rule unable to watch.
+TEST(ProgramIoConditionCompilerTest, RealXArmControlBoxInputCompilesIntoAGlobalRule) {
+  using Object = V::Object;
+  const auto member = [](std::string id, std::string model, std::string role) {
+    return V(Object{{"component_id", V(std::move(id))},
+                    {"component_profile_id", V(std::move(model))},
+                    {"owner", V("lite6")},
+                    {"role", V(std::move(role))}});
+  };
+  auto tool_io = member("lite6_tool_io", "ufactory.lite6_tool_io", "tool_io").as_object();
+  tool_io.emplace_back("active", V(false));
+  auto intent = d::detail::parse_activation_deployment_intent(
+      V(Object{{"api_version", V("manyforge.deployment_intent.v2")},
+               {"deployment_artifact_id", V("machine")},
+               {"name", V("machine")},
+               {"attachments", V(V::Array{})},
+               {"components",
+                V(V::Array{V(Object{{"component_id", V("lite6")},
+                                    {"component_profile_id", V("ufactory.lite6_machine")},
+                                    {"lane", V("real")},
+                                    {"configuration",
+                                     V(Object{{"device_address_ref", V("lite6_main")}})}}),
+                           member("lite6_io", "ufactory.lite6_controller_io", "controller_io"),
+                           V(std::move(tool_io))})},
+               {"policies", V(Object{})}}),
+      {});
+  intent.inactive_members.push_back(
+      {"lite6_robot", "ufactory.lite6", "lite6", "arm", "<robot name=\"lite6\"/>"});
+  const auto profiles = d::detail::resolve_activation_component_profiles(
+      std::filesystem::path(MANYFORGE_WORKSPACE_ROOT), intent);
+  d::detail::expand_activation_machine_members(intent, profiles);
+  const auto &rows = *intent.components.at(1)
+                          .configuration.find_object_member("runtime_configuration")
+                          ->find_object_member("io_signals");
+  const c::CellGraphDTO graph{
+      "manyforge.cell_graph.v1",
+      c::GraphRevision("graph.io"),
+      c::CellId("cell.io"),
+      {{c::RuntimeUnitId("host.io"),
+        c::RuntimeProfileId("profile.io"),
+        c::RuntimeProfileRevision("revision.io"),
+        {},
+        {{"io_signals", json(rows)},
+         {"controller_profiles", c::JsonValueDTO{c::JsonValueDTO::Array{}}},
+         {"initial_joint_positions_rad", c::JsonValueDTO{c::JsonValueDTO::Array{}}},
+         {"motion_target_limits", c::JsonValueDTO{c::JsonValueDTO::Array{}}}}}},
+      {},
+      {{c::ControllableComponentId("lite6_io"),
+        c::ComponentTypeId("io.module"),
+        c::ComponentTypeRevision("revision.io"),
+        {},
+        {c::RuntimeUnitId("host.io")},
+        {}}},
+      {},
+      {},
+      {}};
+  const auto signals = d::ResolveRetainedIoSignalCatalog(graph);
+  ASSERT_TRUE(signals.ok()) << signals.error().message;
+  const auto ci0 = std::find_if(signals.value().begin(), signals.value().end(),
+                                [](const auto &row) { return row.descriptor.signal_id.name == "CI0"; });
+  ASSERT_NE(ci0, signals.value().end());
+  EXPECT_EQ(ci0->provider.profile, d::kComponentAdapterIoProfile);
+  EXPECT_EQ(ci0->descriptor.liveness, c::IoSignalLivenessMode::kPeriodic);
+  EXPECT_EQ(ci0->descriptor.freshness.mode, c::IoFreshnessMode::kSampleAge);
+  EXPECT_EQ(ci0->descriptor.freshness.maximum_age_ns, std::optional<c::Duration>(100'000'000));
+  const auto condition = V(Object{
+      {"compare",
+       V(Object{{"operand",
+                 V(Object{{"signal", V(Object{{"controllable_component_id", V("lite6_io")},
+                                              {"signal_name", V("CI0")}})}})},
+                {"op", V("==")},
+                {"value", V(true)}})}});
+  const auto compiled =
+      d::detail::compile_authored_deployment_io_condition(condition, {}, signals.value());
+  ASSERT_TRUE(compiled.ok()) << compiled.error().message;
+  EXPECT_EQ(compiled.value().required_signal_sources,
+            std::vector<c::InterruptSourceId>{c::InterruptSourceId("lite6_io.CI0")});
 }
 
 } // namespace

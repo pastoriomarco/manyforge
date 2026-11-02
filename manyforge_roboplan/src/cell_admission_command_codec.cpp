@@ -82,7 +82,6 @@ core::CellAdmissionClaimKindDTO ClaimKind(std::string_view v) {
   for (auto x : {core::CellAdmissionClaimKindDTO::kProgramCycle,
                  core::CellAdmissionClaimKindDTO::kAuthoringMutation,
                  core::CellAdmissionClaimKindDTO::kManagerApply,
-                 core::CellAdmissionClaimKindDTO::kComponentLifecycle,
                  core::CellAdmissionClaimKindDTO::kAuthoredScene,
                  core::CellAdmissionClaimKindDTO::kManualOperation,
                  core::CellAdmissionClaimKindDTO::kInterventionOrRecovery,
@@ -95,7 +94,6 @@ core::CellAdmissionOwnerRoleDTO OwnerRole(std::string_view v) {
   for (auto x : {core::CellAdmissionOwnerRoleDTO::kProgramRunner,
                  core::CellAdmissionOwnerRoleDTO::kAuthoringOwner,
                  core::CellAdmissionOwnerRoleDTO::kManager,
-                 core::CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner,
                  core::CellAdmissionOwnerRoleDTO::kAuthoredSceneOwner,
                  core::CellAdmissionOwnerRoleDTO::kManualOperationOwner,
                  core::CellAdmissionOwnerRoleDTO::
@@ -396,19 +394,13 @@ OperatorAlarmAttention(const Value &v) {
                   core::kMaximumOperatorAlarmAttentionMembers,
           "operator-alarm attention membership is malformed or oversized");
   for (const auto &row : members.as_array()) {
-    Exact(row, 5U);
+    Exact(row, 4U);
     core::OperatorAlarmAttentionMemberDTO member;
     member.condition_id =
         Text(row, "condition_id", core::kMaximumOperatorAlarmAttentionTextBytes);
     member.activation_id = Text(row, "activation_id",
                                 core::kMaximumOperatorAlarmAttentionTextBytes);
     member.record_revision = Counter(row, "record_revision", 1U);
-    const auto gate = Text(row, "gate");
-    Require(gate == "condition_interlock" || gate == "acknowledgement",
-            "operator-alarm attention gate is unsupported");
-    member.gate = gate == "condition_interlock"
-                      ? core::OperatorAlarmAttentionGateDTO::kConditionInterlock
-                      : core::OperatorAlarmAttentionGateDTO::kAcknowledgement;
     const auto &subject = Member(row, "subject");
     Exact(subject, 3U);
     member.subject_kind = Text(subject, "subject_kind",

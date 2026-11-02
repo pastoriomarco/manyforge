@@ -340,8 +340,7 @@ resolve_and_verify_commissioning_evidence_ref(
 
 /// CP9 Deployment overrides of component stream parameters
 /// (`policies.component_streams`). Closed rows of `controllable_component_id`,
-/// `stream_id` and at least one of `budget_ns` (> 0), `severity`
-/// (`fault|blocking|warning`) and `recovery` (`ack|auto`); unique per
+/// `stream_id` and `budget_ns` (> 0); unique per
 /// `(controllable_component_id, stream_id)` and returned in that order.
 /// Graph occurrence is checked by the deployment and retained-bundle codecs.
 /// Throws DeploymentApplicabilityCodecError at
@@ -349,7 +348,7 @@ resolve_and_verify_commissioning_evidence_ref(
 [[nodiscard]] std::vector<core::StreamParameterOverrideDTO>
 decode_component_stream_overrides(const CanonicalValue& value);
 
-/// Canonical array of the rows (absent parameters omitted).
+/// Canonical array of the rows.
 [[nodiscard]] CanonicalValue encode_component_stream_overrides(
     const std::vector<core::StreamParameterOverrideDTO>& rows);
 

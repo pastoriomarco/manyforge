@@ -39,6 +39,7 @@ from .node_environment_client import (
     ActiveNodeEnvironmentProjectionError,
     read_active_node_environment,
 )
+from .apply_orchestration import recorded_apply
 from .reset_apply_log import log_reset_apply_link
 from .program_artifacts import (
     ProgramArtifactError,
@@ -277,8 +278,6 @@ def _non_executable_applied_context(
     publication = None
     try:
         publication = state._published_program_projection(status)
-        if publication is None:
-            raise ValueError("non-executable Scenario publication is absent")
         program_identity = Program.from_dict(
             program,
             _active_catalog(state),
@@ -1658,6 +1657,11 @@ def create_draft_router(state: ComposerState) -> APIRouter:
 
     @router.post("/api/program/apply")
     def apply_draft(body: ApplyDraftRequest) -> JSONResponse:
+        return recorded_apply(
+            state.headless_client, "program_apply", lambda: _apply_draft(body)
+        )
+
+    def _apply_draft(body: ApplyDraftRequest) -> JSONResponse:
         try:
             retained = state.draft_session.retained_state()
             document = retained.get("program")
@@ -1765,6 +1769,11 @@ def create_draft_router(state: ComposerState) -> APIRouter:
 
     @router.post("/api/program/revert", status_code=202)
     def revert_draft(body: RevertDraftRequest) -> JSONResponse:
+        return recorded_apply(
+            state.headless_client, "program_revert", lambda: _revert_draft(body)
+        )
+
+    def _revert_draft(body: RevertDraftRequest) -> JSONResponse:
         try:
             retained = state.draft_session.retained_state()
             restore = saved_program_restore(state, retained, _active_catalog(state))

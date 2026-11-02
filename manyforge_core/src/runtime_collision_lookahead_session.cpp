@@ -932,8 +932,25 @@ RuntimeCollisionLookaheadResult RuntimeCollisionLookaheadSession::run_job(const 
         result.reason = "runtime_contact_state_identity_invalid";
         return finish(std::move(result));
       }
-      support_state.emplace(*entry.pair, entry.support_state);
-      release_state.emplace(*entry.pair, entry.release_state);
+      auto support = entry.support_state;
+      auto release = entry.release_state;
+      const auto policy = policy_bundle->policy_index->support_contact_index.find(*entry.pair);
+      if (release.initialized && release.started_in_contact &&
+          policy != policy_bundle->policy_index->support_contact_index.end() &&
+          policy->second.mode == CollisionContactPolicyMode::kContactRelease) {
+        // LKA-1: the cursor (controller feedback) can trail the monitor's
+        // latest observation, so the first planned sample may lie before it
+        // in trajectory order. Keep only the motion-start facts; the first
+        // planned sample sets the contact, separation and depth baseline.
+        // The immediate monitor keeps comparing observation with observation.
+        support = SupportContactEvaluationState::kContactActive;
+        release.in_contact = true;
+        release.separated = false;
+        release.previous_depth_m = std::numeric_limits<double>::infinity();
+        release.best_depth_m = release.initial_depth_m.value_or(0.0);
+      }
+      support_state.emplace(*entry.pair, support);
+      release_state.emplace(*entry.pair, release);
     }
     pass.entering_support_contact_state = std::move(support_state);
     pass.entering_contact_release_state = std::move(release_state);

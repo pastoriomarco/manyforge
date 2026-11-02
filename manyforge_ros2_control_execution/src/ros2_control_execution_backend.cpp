@@ -140,6 +140,10 @@ struct Ros2ControlExecutionBackend::State {
     bool cancel_requested{false};
     bool cancel_sent{false};
     std::uint64_t cancel_sequence{0};
+    /// When it was sent and its trajectory's time (last waypoint), for its
+    /// expected end (`GoalActivity::expected_end`).
+    TimePoint sent_stamp_ns{0};
+    Duration trajectory_ns{0};
   };
   // Serializes SDK sends against retirement. No controller wait is permitted.
   std::mutex command_mutex;
@@ -239,8 +243,7 @@ Ros2ControlExecutionBackend::Ros2ControlExecutionBackend(
         "JTC adapter requires an exact binding epoch, route and joint set");
   state_->node = resources.node();
   state_->endpoints = std::make_shared<SelectedRosEndpointFacts>(
-      resources.node(), configuration.state_topic,
-      "control_msgs/msg/JointTrajectoryControllerState");
+      resources.node(), configuration.state_topic);
   std::weak_ptr<State> weak = state_;
   rclcpp::SubscriptionOptions options;
   options.event_callbacks.matched_callback =
@@ -422,6 +425,9 @@ ExecutionPortCommandResultDTO Ros2ControlExecutionBackend::SendGoal(
     State::Goal record;
     record.observation.key = key;
     record.observation.binding_epoch = state_->config.binding_epoch;
+    record.sent_stamp_ns = state_->clock.now();
+    record.trajectory_ns = static_cast<Duration>(
+        std::max(0.0, trajectory.waypoints.back().time_from_start_s) * 1e9);
     record.predecessor = state_->current;
     if (state_->config.motion_trace) {
       try {
@@ -881,6 +887,28 @@ std::optional<ExecutionControllerSampleDTO>
 Ros2ControlExecutionBackend::ReadSample() const {
   std::lock_guard lock(state_->mutex);
   return state_->sample;
+}
+Ros2ControlExecutionBackend::GoalActivity
+Ros2ControlExecutionBackend::ReadGoalActivity() const {
+  std::lock_guard lock(state_->mutex);
+  GoalActivity activity;
+  for (const auto &[key, goal] : state_->goals) {
+    const auto &observed = goal.observation;
+    if (observed.phase == ExecutionGoalPhase::kTerminal) continue;
+    activity.goal_running = true;
+    auto end = observed.accepted_stamp_ns.value_or(goal.sent_stamp_ns) + goal.trajectory_ns;
+    if (observed.latest_feedback)
+      end = observed.latest_feedback->local_receipt_stamp_ns + goal.trajectory_ns -
+            static_cast<Duration>(observed.latest_feedback->cursor_s * 1e9);
+    if (observed.cancel_sent_local_stamp) end = std::min(end, *observed.cancel_sent_local_stamp);
+    if (!activity.expected_end || end < *activity.expected_end) activity.expected_end = end;
+  }
+  if (!state_->goal_order.empty()) {
+    const auto &latest = state_->goals.at(state_->goal_order.back()).observation;
+    activity.last_cancelled = latest.phase == ExecutionGoalPhase::kTerminal &&
+                              latest.result == ExecutionGoalResult::kCanceled;
+  }
+  return activity;
 }
 ExecutionReadinessDTO Ros2ControlExecutionBackend::ReadReadiness() const {
   std::lock_guard lock(state_->mutex);

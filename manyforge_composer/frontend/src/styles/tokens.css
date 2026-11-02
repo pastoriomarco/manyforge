@@ -319,6 +319,9 @@
   --mf-z-notification: 90;
   --mf-z-modal: 100;
   --mf-z-modal-2: 110;
+  /* Instant command tooltips: above the floating runtime rail (modal-2) that
+     sits directly under the app header. */
+  --mf-z-tooltip: 120;
 
   --mf-font-mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
 

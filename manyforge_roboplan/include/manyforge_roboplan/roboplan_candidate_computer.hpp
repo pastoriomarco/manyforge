@@ -7,6 +7,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <roboplan/core/scene.hpp>
@@ -71,24 +72,25 @@ struct RoboPlanCandidateRequestDTO final {
   core::ResolvedMotionSpecDTO motion;
   core::TolerancesDTO tolerances;
   core::SpeedProfileDTO speed_profile;
-  core::PlanningProfileDTO planning_profile{
-      core::PlanningProfileDTO::kFirstFeasible};
+  /// The motion's planner override over the config's Deployment default.
+  core::PlannerOverrideDTO planner{};
   core::PerResourceDynamicsLimitsDTO dynamics_limits;
   double planning_timeout_s{5.0};
   std::uint32_t planning_attempt_index{};
   std::optional<core::ActionSpanDTO> action_span;
   std::optional<core::MovingReplacementInputDTO> moving_replacement{};
-  /// Points held under `speed_profile.max_tcp_linear_speed_mps` by the
-  /// retime, `tcp_frame` first; empty retimes `tcp_frame` alone.
-  std::vector<core::ResolvedFrameDTO> speed_check_frames{};
   /// Per-pair clearance margins the worker sets on its scene for this plan;
   /// pairs not listed keep margin 0. Filled by the process client from the
   /// selected retained projection.
   std::vector<RoboPlanPairMarginDTO> collision_pair_margins{};
+  /// Native body-name pairs (`first < second`) the selected contact policy
+  /// allows for this plan; the worker deactivates them on its scene. Filled
+  /// by the process client from the selected retained projection.
+  std::vector<std::pair<std::string, std::string>> contact_allowed_pairs{};
 };
 
 /// Caller-owned bounded-control hooks. The production wrapper supplies these
-/// from the Kernel clock and its killable worker lifecycle. RoboPlan 0.7 has no
+/// from the Kernel clock and its killable worker lifecycle. RoboPlan 0.8 has no
 /// cooperative cancellation hook inside every opaque numerical phase, so the
 /// process wrapper remains the final cancellation authority.
 struct RoboPlanCandidateControl final {
@@ -105,8 +107,26 @@ struct RoboPlanCandidateComputerConfig final {
   double trajectory_sample_period_s{0.01};
   /// RRT and shortcut `collision_check_step_size` of the first attempt
   /// (Deployment `collision_check_step_rad`); retries use min(step, 0.01).
-  /// Validation of each attempt's trajectory uses that attempt's step.
   double collision_check_step_rad{core::kDefaultCollisionCheckStepRad};
+  /// The rest of the Deployment planner block (`planner_search`,
+  /// `planner_optimize`, `planner_n`, `planner_max_nodes`); a request's
+  /// `planner` override replaces single members.
+  core::PlannerSearchDTO planner_search{core::kDefaultPlannerSearch};
+  core::PlannerOptimizeDTO planner_optimize{core::kDefaultPlannerOptimize};
+  std::uint32_t planner_n{core::kDefaultPlannerBestOfN};
+  std::uint32_t planner_max_nodes{core::kDefaultPlannerMaxNodes};
+  /// Deployment `cartesian_timing`: a Cartesian request without its own
+  /// `speed_mode` uses this.
+  core::CartesianSpeedModeDTO cartesian_timing{core::kDefaultCartesianTiming};
+  /// Deployment `motion_timing` (N12 / RP-3b): how joint and pose goals are
+  /// timed. Smooth: TOPP-RA without the TCP bound, then the final uniform
+  /// stretch to the TCP target. Fast: the RP-3 TCP bound inside TOPP-RA.
+  core::MotionTimingDTO motion_timing{core::kDefaultMotionTiming};
+
+  [[nodiscard]] core::PlannerSettingsDTO planner_defaults() const noexcept {
+    return {planner_search, planner_optimize, planner_n,
+            collision_check_step_rad, planner_max_nodes};
+  }
 };
 
 /// Serialized native candidate computation over one exact worker-owned

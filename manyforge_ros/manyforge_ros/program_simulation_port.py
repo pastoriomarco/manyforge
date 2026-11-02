@@ -568,7 +568,15 @@ class SimulationProgramTaskPort:
                     raise ValueError("node-attempt identity was reused with new intent")
                 return self._snapshot(current)
             if len(self._tasks) >= self._maximum_retained_tasks:
-                raise RuntimeError("simulation task retention is full")
+                # Bounded by eviction: drop the oldest finished task (its
+                # outcome was already observable); only in-flight work refuses.
+                finished = next(
+                    (key for key, retained in self._tasks.items() if retained.future.done()),
+                    None,
+                )
+                if finished is None:
+                    raise RuntimeError("simulation task retention is full")
+                del self._tasks[finished]
             future = self._executor.submit(self._invoke, operation, arguments)
             task = _Task(
                 task_id=task_id,

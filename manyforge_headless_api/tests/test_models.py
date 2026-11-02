@@ -27,7 +27,6 @@ from manyforge_headless_api.models import (
     OperationIntentRequest,
     OperationParticipantRequest,
     OperationRecoveryActionRequest,
-    ProgramNodeAdmissionEvidenceRequest,
     ProgramDiagnosticRequest,
     ProgramSelectionStopRequest,
     PickSequencePlanningRequest,
@@ -36,21 +35,6 @@ from manyforge_headless_api.models import (
     SceneTransactionRequest,
     StopIntentRequest,
 )
-
-
-@pytest.mark.parametrize("owner_api", ["cclc.lifecycle", "cclc.control_route"])
-def test_program_nodes_cannot_request_component_lifecycle_authority(owner_api: str) -> None:
-    with pytest.raises(ValidationError):
-        ProgramNodeAdmissionEvidenceRequest.model_validate(
-            {
-                "program_runner_owner_epoch": "runner.1",
-                "program_run_id": "run.1",
-                "parent_program_cycle_claim_generation": 1,
-                "node_instance_id": "node.1",
-                "node_attempt_id": "attempt.1",
-                "owner_api": owner_api,
-            }
-        )
 
 
 def test_candidate_preview_requires_exact_prepared_activation_identity() -> None:
@@ -128,7 +112,8 @@ _CONTRACT_FAILURE_DETAIL_KEYS = frozenset(
         "path",
         "source_kind",
         "source_reference",
-        "latch_id",
+        "rule_id",
+        "component_id",
         "retryable",
         "required_action",
     }
@@ -244,7 +229,6 @@ def _planning_motion(
         },
         "timeouts": {"planning_timeout_s": 1.0, "execution_timeout_s": 2.0},
         "cache_mode": "default",
-        "planning_profile": "first_feasible",
         "target_mode": "absolute",
         "target_reference": None,
         "offset_reference": None,
@@ -416,11 +400,11 @@ def _cartesian_path() -> dict[str, object]:
         "waypoints": [_planning_pose(0.1), _planning_pose(0.0)],
         "max_translation_step_m": 0.01,
         "max_rotation_step_rad": 0.1,
-        "speed_mode": "bounded",
         "max_angular_speed_rad_s": 0.2,
         "max_linear_acceleration_mps2": 0.3,
         "max_angular_acceleration_rad_s2": 0.4,
         "fallback_policy": "fail_closed",
+        "blend_radii_m": [0.0, 0.0],
     }
 
 
@@ -804,6 +788,34 @@ def test_motion_clearance_is_optional_and_bounded() -> None:
             MotionParticipantRequest.model_validate({**request, "clearance_m": value})
 
 
+def test_cartesian_path_speed_mode_optional_and_blend_radii_per_waypoint() -> None:
+    request = _planning_motion("path", _cartesian_path())
+    wire = MotionParticipantRequest.model_validate(request).model_dump(mode="json")
+    assert "speed_mode" not in wire["motion"]
+    assert wire["motion"]["blend_radii_m"] == [0.0, 0.0]
+    for mode in ("constant_speed", "time_optimal"):
+        request["motion"]["speed_mode"] = mode
+        parsed = MotionParticipantRequest.model_validate(request)
+        assert parsed.model_dump(mode="json")["motion"]["speed_mode"] == mode
+    request["motion"]["speed_mode"] = "bounded"
+    with pytest.raises(ValidationError):
+        MotionParticipantRequest.model_validate(request)
+    del request["motion"]["speed_mode"]
+    request["motion"]["blend_radii_m"] = [0.0, 0.02]
+    assert MotionParticipantRequest.model_validate(request).motion.blend_radii_m == [0.0, 0.02]
+    for radii in ([0.0], [0.0, 0.0, 0.0]):
+        request["motion"]["blend_radii_m"] = radii
+        with pytest.raises(ValidationError, match="one entry per waypoint"):
+            MotionParticipantRequest.model_validate(request)
+    for value in (-0.001, float("nan"), float("inf")):
+        request["motion"]["blend_radii_m"] = [0.0, value]
+        with pytest.raises(ValidationError):
+            MotionParticipantRequest.model_validate(request)
+    del request["motion"]["blend_radii_m"]
+    with pytest.raises(ValidationError):
+        MotionParticipantRequest.model_validate(request)
+
+
 def test_motion_reference_shape_fails_closed_before_native_admission() -> None:
     missing_reference = _planning_motion(
         "relative-pose",
@@ -996,7 +1008,7 @@ def test_apply_requires_one_exact_ua2a_prepared_activation() -> None:
     }
     assert ManagerApplyRequest.model_validate(body).scene_initialization == "preserve"
     assert ManagerApplyRequest.model_validate({**body, "scene_initialization": "initialize"}).scene_initialization == "initialize"
-    assert ManagerApplyRequest.model_validate({**body, "prepared_activation": _sealed_prepared_activation(),
+    assert ManagerApplyRequest.model_validate({**body, "prepared_activation": _empty_cell_prepared_activation(),
                                                "scene_initialization": "initialize"}).scene_initialization == "initialize"
     with pytest.raises(ValidationError):
         ManagerApplyRequest.model_validate({**body, "scene_initialization": "inferred"})
@@ -1614,6 +1626,17 @@ def test_gripper_command_requires_unit_tags_and_matching_nonnegative_effort() ->
     parsed = OperationParticipantRequest.model_validate(participant)
     assert parsed.payload.command_value.position.value_m == 0.004
 
+    # GRP-2: a bool option travels as value_bool; it is never coerced.
+    flagged = deepcopy(participant)
+    flagged["payload"]["caller_options"].append(
+        {"option_id": "wait_for_duration", "value_bool": True}
+    )
+    parsed = OperationParticipantRequest.model_validate(flagged)
+    assert parsed.payload.caller_options[1].value_bool is True
+    flagged["payload"]["caller_options"][1]["value_bool"] = 1
+    with pytest.raises(ValidationError):
+        OperationParticipantRequest.model_validate(flagged)
+
     mismatched = {
         **participant,
         "payload": {
@@ -1937,20 +1960,10 @@ def test_scene_upsert_and_current_pose_detach_are_closed_typed_operations() -> N
         SceneTransactionRequest.model_validate(malformed)
 
 
-def _sealed_prepared_activation() -> dict[str, object]:
-    import hashlib
-    import rfc8785
+def _empty_cell_prepared_activation() -> dict[str, object]:
+    """Close/New: an ordinary Scenario preparation of the empty cell."""
 
-    origin = {
-        "kind": "sealed_canonical_empty", "cell_id": "cell_a",
-        "deployment_artifact_id": "deployment.1", "deployment_revision": "sha256:" + "a" * 64,
-        "retained_bundle_id": "sha256:" + "2" * 64, "graph_revision": "sha256:" + "3" * 64,
-        "admission_digest": "sha256:" + "6" * 64,
-    }
-    return {**_prepared_activation(), "origin": origin,
-            "captured_input_digest": "sha256:" + hashlib.sha256(rfc8785.dumps({
-                "schema_version": "manyforge.sealed_canonical_empty_capture.v1", "origin": origin,
-            })).hexdigest(), "program_id": None, "program_revision": None,
+    return {**_prepared_activation(), "program_id": None, "program_revision": None,
             "program_outcome": {"kind": "no_program"}, "assistant_mode": "optional"}
 
 
@@ -1970,28 +1983,9 @@ def test_prepared_origins_are_closed_and_preserve_ordinary_identity_bound() -> N
             ManagerApplyPreparedActivation.model_validate(bad)
 
 
-@pytest.mark.parametrize("field,wrong", [
-    ("program_id", "fake-program"), ("program_revision", "sha256:" + "4" * 64),
-    ("program_outcome", {"kind": "bound", "program_binding_id": "sha256:" + "9" * 64}),
-    ("assistant_mode", "required"), ("deployment_revision", "sha256:" + "b" * 64),
-    ("retained_bundle_id", "sha256:" + "b" * 64), ("graph_revision", "sha256:" + "b" * 64),
-    ("deployment_artifact_id", "other"), ("captured_input_digest", "sha256:" + "b" * 64),
-])
-def test_sealed_origin_requires_exact_capture_candidate_and_no_program(field, wrong) -> None:
-    value = _sealed_prepared_activation()
-    assert ManagerApplyPreparedActivation.model_validate(value).origin.kind == "sealed_canonical_empty"
-    with pytest.raises(ValidationError):
-        ManagerApplyPreparedActivation.model_validate({**value, field: wrong})
-
-
-@pytest.mark.parametrize("field,wrong", [
-    ("scenario_id", "fake"), ("source_document_digest", None), ("cell_id", "x" * 129),
-    ("admission_digest", "not-a-digest"), ("kind", "scenario"),
-])
-def test_sealed_origin_refuses_mixed_or_unbounded_identity(field, wrong) -> None:
-    value = _sealed_prepared_activation()
-    with pytest.raises(ValidationError):
-        ManagerApplyPreparedActivation.model_validate({**value, "origin": {**value["origin"], field: wrong}})
+def test_the_empty_cell_preparation_has_a_scenario_origin() -> None:
+    value = _empty_cell_prepared_activation()
+    assert ManagerApplyPreparedActivation.model_validate(value).origin.kind == "scenario"
 
 
 @pytest.mark.parametrize("option", ["reload_initial_scene", "reset_robot_position"])
@@ -2126,72 +2120,11 @@ def test_runtime_control_audit_rows_pass_through_the_cycle_frame_unchanged():
     assert parsed.runtime_controls["runtime_controls"]["audit"] == audit
 
 
-def _output_payload(value: object = True, **extra: object) -> dict[str, object]:
-    payload = {
-        **_tool_payload(),
-        "command_schema_id": "cell.valve.io_signal_write",
-        "command_value": {
-            "kind": "io_signal_write", "resource_role_id": "valve", "value": value, **extra,
-        },
-    }
-    # Contract 65: an output write carries no caller deadline.
-    payload.pop("completion_timeout_s")
-    return payload
-
-
-def test_output_write_omits_the_caller_deadline_and_gripper_keeps_it() -> None:
-    participant = {
-        "component_role_id": "io_module", "target_role_id": "cell_io",
-        "required_capability_id": "io.gpio.set_output", "action_span": None,
-    }
-    parsed = OperationParticipantRequest.model_validate({**participant, "payload": _output_payload()})
-    assert "completion_timeout_s" not in parsed.model_dump(mode="json")["payload"]
-    with pytest.raises(ValidationError, match="provider policy owns it"):
-        OperationParticipantRequest.model_validate(
-            {**participant, "payload": {**_output_payload(), "completion_timeout_s": 30.0}}
-        )
+def test_gripper_command_requires_the_caller_deadline() -> None:
     gripper = _tool_payload()
     assert CapabilityCommandParticipantRequest.model_validate(gripper).model_dump(
         mode="json"
     )["completion_timeout_s"] == gripper["completion_timeout_s"]
     gripper.pop("completion_timeout_s")
-    with pytest.raises(ValidationError, match="completion_timeout_s is required"):
+    with pytest.raises(ValidationError, match="completion_timeout_s"):
         CapabilityCommandParticipantRequest.model_validate(gripper)
-
-
-@pytest.mark.parametrize("value", [True, False])
-def test_boolean_output_write_is_one_typed_command_value(value: bool) -> None:
-    participant = OperationParticipantRequest.model_validate({
-        "component_role_id": "io_module", "target_role_id": "cell_io",
-        "required_capability_id": "io.gpio.set_output", "action_span": None,
-        "payload": _output_payload(value),
-    })
-    assert participant.model_dump(mode="json")["payload"]["command_value"] == {
-        "kind": "io_signal_write", "resource_role_id": "valve", "value": value,
-    }
-
-
-@pytest.mark.parametrize(
-    "payload",
-    [
-        _output_payload(None),
-        _output_payload(0),
-        _output_payload("true"),
-        _output_payload(True, readback_signal_id="di_0"),
-        {**_output_payload(), "command_value": {"kind": "io_signal_write", "value": True}},
-    ],
-)
-def test_boolean_output_write_refuses_coercion_and_extra_authority(payload) -> None:
-    with pytest.raises(ValidationError):
-        OperationParticipantRequest.model_validate({
-            "component_role_id": "io_module", "target_role_id": "cell_io",
-            "required_capability_id": "io.gpio.set_output", "action_span": None,
-            "payload": payload,
-        })
-
-
-def test_pick_tool_phase_stays_a_gripper_command() -> None:
-    body = _pick_request()
-    body["tool_operation"]["participants"][0]["payload"] = _output_payload()
-    with pytest.raises(ValidationError, match="gripper capability command"):
-        PickSequencePlanningRequest.model_validate(body)

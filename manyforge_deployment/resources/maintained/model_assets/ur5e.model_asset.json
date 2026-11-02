@@ -107,8 +107,8 @@
         "media_type": "application/xml"
       },
       {
-        "byte_size": 8281,
-        "content_digest": "sha256:8ce7ed8976f2a9ee51e0facbf215e62d157b632b1cb9f9ff92feec72b5792837",
+        "byte_size": 8413,
+        "content_digest": "sha256:68a0fac102b425b336ec65089825dd90e37358571df0ed91189c9c32fddbf663",
         "logical_uri": "asset://ur5e/model.urdf",
         "media_type": "application/xml"
       }
@@ -138,7 +138,7 @@
       "source_group_name": "ur_manipulator"
     }
   ],
-  "model_revision": "sha256:4dc287f1f918d0fba28fa0c9e818eb406d43ad2c5a76cb8e0cd715ec89d0b285",
+  "model_revision": "sha256:1f110f1a9def9d6079e04861dea99f1ace22003ee00772c58c22264796509351",
   "resource_role_bindings": [
     {
       "resource_role_id": "arm_joints",

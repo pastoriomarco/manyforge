@@ -19,10 +19,10 @@ CREATE TABLE IF NOT EXISTS bootstrap_journal_metadata (
             maximum_bootstrap_attempts > 0
             AND maximum_bootstrap_attempts <= 64
         ),
-    maximum_native_runtime_bindings_per_attempt INTEGER NOT NULL
+    maximum_execution_host_bindings_per_attempt INTEGER NOT NULL
         CHECK (
-            maximum_native_runtime_bindings_per_attempt > 0
-            AND maximum_native_runtime_bindings_per_attempt <= 64
+            maximum_execution_host_bindings_per_attempt > 0
+            AND maximum_execution_host_bindings_per_attempt <= 64
         ),
     maximum_main_database_page_image_bytes INTEGER NOT NULL
         CHECK (
@@ -41,12 +41,12 @@ CREATE TABLE IF NOT EXISTS manager_bootstrap_intents (
         ),
     canonical_empty_retained_bundle_id TEXT NOT NULL,
     canonical_empty_graph_revision TEXT NOT NULL,
-    native_runtime_binding_set_digest TEXT NOT NULL,
+    execution_host_binding_set_digest TEXT NOT NULL,
     intent_digest TEXT NOT NULL,
     PRIMARY KEY (bootstrap_id, bootstrap_generation)
 ) WITHOUT ROWID, STRICT;
 
-CREATE TABLE IF NOT EXISTS manager_bootstrap_native_runtime_bindings (
+CREATE TABLE IF NOT EXISTS manager_bootstrap_execution_host_bindings (
     bootstrap_id TEXT NOT NULL,
     bootstrap_generation INTEGER NOT NULL,
     ordinal INTEGER NOT NULL CHECK (ordinal >= 0 AND ordinal < 64),
@@ -116,20 +116,20 @@ BEGIN
 END;
 
 CREATE TRIGGER IF NOT EXISTS manager_bootstrap_native_bindings_no_update
-BEFORE UPDATE ON manager_bootstrap_native_runtime_bindings
+BEFORE UPDATE ON manager_bootstrap_execution_host_bindings
 BEGIN
     SELECT RAISE(
         ABORT,
-        'manager_bootstrap_native_runtime_bindings is immutable'
+        'manager_bootstrap_execution_host_bindings is immutable'
     );
 END;
 
 CREATE TRIGGER IF NOT EXISTS manager_bootstrap_native_bindings_no_delete
-BEFORE DELETE ON manager_bootstrap_native_runtime_bindings
+BEFORE DELETE ON manager_bootstrap_execution_host_bindings
 BEGIN
     SELECT RAISE(
         ABORT,
-        'manager_bootstrap_native_runtime_bindings is immutable'
+        'manager_bootstrap_execution_host_bindings is immutable'
     );
 END;
 

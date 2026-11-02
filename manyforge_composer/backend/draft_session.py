@@ -98,7 +98,7 @@ _PROGRAM_MOTION_DEFAULTS = (
     "velocity_scale",
     "acceleration_scale",
     "translation_tol_m",
-    "max_blend_deviation_rad",
+    "blend_radius_m",
 )
 _PROGRAM_MOTION_CEILINGS = frozenset(
     {"velocity_scale", "acceleration_scale"}
@@ -2128,10 +2128,11 @@ class ComposerDraftSession:
             "parent_instance_id",
             "index",
             "position",
-            "planning_profile",
+            "planner",
             "motion_options",
             "tool_max_effort",
             "tool_command_duration_s",
+            "tool_wait_for_duration",
             "tool_completion_timeout_s",
             "tcp_endpoint",
         }
@@ -2307,9 +2308,10 @@ class ComposerDraftSession:
             "selected_object_id": arguments["scene_resource_id"],
             "tcp_endpoint": deepcopy(endpoint),
             "tool_position": deepcopy(arguments["tool_position"]),
-            "planning_profile": arguments.get("planning_profile", "first_feasible"),
             "motion_options": deepcopy(arguments.get("motion_options", {})),
         }
+        if "planner" in arguments:
+            template_parameters["planner"] = deepcopy(arguments["planner"])
         if operation == "pick":
             template_parameters["contact_policy_id"] = arguments["contact_policy_id"]
         else:
@@ -2320,6 +2322,7 @@ class ComposerDraftSession:
         for field in (
             "tool_max_effort",
             "tool_command_duration_s",
+            "tool_wait_for_duration",
             "tool_completion_timeout_s",
         ):
             if field in arguments:
@@ -2836,7 +2839,7 @@ class ComposerDraftSession:
             "velocity_scale",
             "acceleration_scale",
             "translation_tol_m",
-            "max_blend_deviation_rad",
+            "blend_radius_m",
             "parameter_bindings",
             "conflict_resolution",
         }:
@@ -2845,7 +2848,7 @@ class ComposerDraftSession:
             "velocity_scale": arguments["velocity_scale"],
             "acceleration_scale": arguments["acceleration_scale"],
             "translation_tol_m": arguments["translation_tol_m"],
-            "max_blend_deviation_rad": arguments["max_blend_deviation_rad"],
+            "blend_radius_m": arguments["blend_radius_m"],
         }
         if any(type(value) not in {int, float} or not math.isfinite(float(value)) for value in values.values()):
             _error("draft_arguments_invalid", "motion defaults must be finite numbers")
@@ -2855,8 +2858,8 @@ class ComposerDraftSession:
             _error("draft_arguments_invalid", "acceleration scale must be in (0, 1]")
         if not float(values["translation_tol_m"]) > 0.0:
             _error("draft_arguments_invalid", "Cartesian translation tolerance must be positive")
-        if float(values["max_blend_deviation_rad"]) < 0.0:
-            _error("draft_arguments_invalid", "Cartesian blend deviation must be non-negative")
+        if float(values["blend_radius_m"]) < 0.0:
+            _error("draft_arguments_invalid", "Cartesian blend radius must be non-negative")
         resolution = arguments["conflict_resolution"]
         if resolution not in {"reject", "reduce"}:
             _error("draft_arguments_invalid", "motion conflict resolution is invalid")
@@ -3050,6 +3053,8 @@ class ComposerDraftSession:
     def _scene_add(
         self, document: dict[str, Any], arguments: dict[str, Any], _catalog: NodeCatalog
     ) -> dict[str, Any]:
+        # `scene` is optional in a Program: the first object starts it.
+        document.setdefault("scene", [])
         scene = self._scene(document)
         resource = deepcopy(arguments["scene_resource"])
         identity = resource["scene_resource_id"]

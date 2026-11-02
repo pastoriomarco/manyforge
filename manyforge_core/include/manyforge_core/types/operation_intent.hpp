@@ -4,7 +4,6 @@
 #include <cstdint>
 #include <manyforge_core/types/action_span.hpp>
 #include <manyforge_core/types/command_schema.hpp>
-#include <manyforge_core/types/io_output_command_value.hpp>
 #include <manyforge_core/types/configuration_fence.hpp>
 #include <manyforge_core/types/execution_status.hpp>
 #include <manyforge_core/types/joint_dynamics_limits.hpp>
@@ -41,24 +40,21 @@ struct GripperPositionCommandValueDTO final {
                          const GripperPositionCommandValueDTO&) = default;
 };
 
-using CapabilityCommandValueDTO =
-    std::variant<GripperPositionCommandValueDTO, IoSignalWriteCommandValueDTO>;
-
-struct CommandDurationOptionDTO final {
+/// One caller option of a capability command, typed by its schema
+/// `value_kind`: a duration (`nonnegative_duration_seconds`, wire `value_s`)
+/// or a flag (`bool`, wire `value_bool`).
+struct CommandOptionDTO final {
   CommandOptionId option_id;
-  double value_s{};
-  friend bool operator==(const CommandDurationOptionDTO&,
-                         const CommandDurationOptionDTO&) = default;
+  std::variant<double, bool> value;
+  friend bool operator==(const CommandOptionDTO&, const CommandOptionDTO&) = default;
 };
 
 struct CapabilityCommandIntentDTO final {
   CommandSchemaId command_schema_id;
   CommandSchemaRevision command_schema_revision;
-  CapabilityCommandValueDTO command_value;
-  /// Required for the existing gripper command. Generic output commands omit
-  /// it: their mechanism's policy is resolved from the sealed provider.
+  GripperPositionCommandValueDTO command_value;
   std::optional<double> completion_timeout_s;
-  std::vector<CommandDurationOptionDTO> caller_options;
+  std::vector<CommandOptionDTO> caller_options;
   friend bool operator==(const CapabilityCommandIntentDTO&,
                          const CapabilityCommandIntentDTO&) = default;
 };
@@ -75,7 +71,8 @@ struct MotionParticipantIntentDTO final {
   SpeedProfileDTO speed_profile;
   TimeoutsDTO timeouts;
   CacheMode cache_mode{CacheMode::kDefault};
-  PlanningProfileDTO planning_profile{PlanningProfileDTO::kFirstFeasible};
+  /// The motion's planner override; unset members take the Deployment's.
+  PlannerOverrideDTO planner{};
   MotionTargetModeDTO target_mode{MotionTargetModeDTO::kAbsolute};
   std::optional<ReferenceDTO> target_reference;
   std::optional<ReferenceDTO> offset_reference;

@@ -6,17 +6,13 @@
 
 namespace manyforge::core {
 
-// Lean Stop record (operation journal v17). Only these versions decode; every
-// earlier version (acceptance v4-v11, terminal v3, fault clear v2) is refused
-// with "... API version is unsupported", never normalized or converted.
+// Lean Stop record (operation journal v18). Only these versions decode; every
+// earlier version (acceptance v4-v11, terminal v3-v4) is refused with
+// "... API version is unsupported", never normalized or converted.
 inline constexpr std::string_view kStopJournalAcceptanceProjectionApiVersion =
     "manyforge.internal.stop-journal-acceptance-projection.v12";
 inline constexpr std::string_view kStopJournalTerminalProjectionApiVersion =
-    "manyforge.internal.stop-journal-terminal-projection.v4";
-inline constexpr std::string_view kStopJournalSurveillanceProjectionApiVersion =
-    "manyforge.internal.stop-journal-surveillance-projection.v1";
-inline constexpr std::string_view kStopJournalFaultClearProjectionApiVersion =
-    "manyforge.internal.stop-journal-fault-clear-projection.v3";
+    "manyforge.internal.stop-journal-terminal-projection.v5";
 
 /// Error code returned by EncodeStopJournalTerminalProjection when two attempts
 /// name one participant-plan digest but carry unequal plans. The writer is
@@ -40,19 +36,17 @@ struct StopJournalAcceptanceProjectionDTO final {
 };
 
 /// Terminal projection; the in-memory DTO is unchanged and decoding rebuilds
-/// it completely. Wire v4 (the `stop_terminal_projected` journal row, the
+/// it completely. Wire v5 (the `stop_terminal_projected` journal row, the
 /// only stored copy):
 ///   [ version,
 ///     status_rest = [accepted, current_stages[], acceptance_projection,
-///                    terminal_projection, surveillance_projection,
-///                    surveillance|null],
-///     certificate = 23 fixed slots: the v3 certificate slots 0-11 and 13-22
-///                   (slot 12, evidence_items, is omitted) followed by
+///                    terminal_projection],
+///     certificate = 21 fixed slots: the certificate fields in declaration
+///                   order without evidence_items, ending with
 ///                   lane_hard_stop_requested[] (always present, may be []);
 ///                   inside each attempt, resolved participant stage slot 26
 ///                   (participant_stop_plan) holds the plan's
 ///                   participant_stop_invocation_plan_digest string,
-///     fault_latch|null,
 ///     plans = [prepared_plan_value...] sorted by digest, unique ]
 /// Decode: each attempt's plan comes from `plans` by digest; the certificate
 /// evidence comes from DeriveStopCertificateEvidence; the status comes from
@@ -66,39 +60,13 @@ struct StopJournalAcceptanceProjectionDTO final {
 struct StopJournalTerminalProjectionDTO final {
   StopStatusDTO stop_status;
   StopCertificateDTO certificate;
-  std::optional<StopFaultLatchDTO> fault_latch;
 
   friend bool operator==(const StopJournalTerminalProjectionDTO&,
                          const StopJournalTerminalProjectionDTO&) = default;
 };
 
-/// Closed structural payload for the latest durable surveillance checkpoint
-/// and its exact current non-cleared latch. Wire v1, unchanged.
-struct StopJournalSurveillanceProjectionDTO final {
-  StopPostTerminalSurveillanceDTO checkpoint;
-  StopFaultLatchDTO fault_latch;
-
-  friend bool operator==(const StopJournalSurveillanceProjectionDTO&,
-                         const StopJournalSurveillanceProjectionDTO&) = default;
-};
-
-/// Lean durable fault-clear record. Wire v3:
-///   ["...fault-clear-projection.v3", recovery_intent, recovery_result]
-/// The resulting status and certificate are not stored: the writer still
-/// derives and checks the exact successor status in-process, and recovery
-/// takes the certificate from the terminal row, the latch from
-/// recovery_result.latch, and the surveillance from the latest checkpoint
-/// (else the terminal status).
-struct StopJournalFaultClearProjectionDTO final {
-  StopFaultRecoveryIntentDTO recovery_intent;
-  StopFaultRecoveryResultDTO recovery_result;
-
-  friend bool operator==(const StopJournalFaultClearProjectionDTO&,
-                         const StopJournalFaultClearProjectionDTO&) = default;
-};
-
-/// Entry points: names and signatures are unchanged from v16. Each decoder
-/// accepts only canonical bytes of its current version.
+/// Entry points. Each decoder accepts only canonical bytes of its current
+/// version.
 [[nodiscard]] Result<std::string> EncodeStopJournalAcceptanceProjection(
     const StopJournalAcceptanceProjectionDTO& projection);
 [[nodiscard]] Result<StopJournalAcceptanceProjectionDTO> DecodeStopJournalAcceptanceProjection(
@@ -107,16 +75,6 @@ struct StopJournalFaultClearProjectionDTO final {
 [[nodiscard]] Result<std::string> EncodeStopJournalTerminalProjection(
     const StopJournalTerminalProjectionDTO& projection);
 [[nodiscard]] Result<StopJournalTerminalProjectionDTO> DecodeStopJournalTerminalProjection(
-    std::string_view canonical_bytes);
-
-[[nodiscard]] Result<std::string> EncodeStopJournalSurveillanceProjection(
-    const StopJournalSurveillanceProjectionDTO& projection);
-[[nodiscard]] Result<StopJournalSurveillanceProjectionDTO> DecodeStopJournalSurveillanceProjection(
-    std::string_view canonical_bytes);
-
-[[nodiscard]] Result<std::string> EncodeStopJournalFaultClearProjection(
-    const StopJournalFaultClearProjectionDTO& projection);
-[[nodiscard]] Result<StopJournalFaultClearProjectionDTO> DecodeStopJournalFaultClearProjection(
     std::string_view canonical_bytes);
 
 }  // namespace manyforge::core

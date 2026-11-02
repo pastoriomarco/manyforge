@@ -101,11 +101,12 @@ TEST(OperationStateResponseTest, TakeoverProjectsExactDecisionAndCertificate) {
       .decided_at_ns = INT64_MAX,
       .elapsed_since_acceptance_ns = 9007199254740993LL,
       .preparation_budget_ns = 1500000000,
-      .stop_certificate = std::nullopt};
+      .stop_certificate = std::nullopt,
+      .planning_budget_ns = 1200000000};
   auto response = OperationStateValue(state);
   const auto *decision = response.find_object_member("motion_takeover");
   ASSERT_NE(decision, nullptr);
-  EXPECT_EQ(decision->as_object().size(), 7U);
+  EXPECT_EQ(decision->as_object().size(), 8U);
   EXPECT_EQ(decision->find_object_member("incumbent_operation_id")->as_string(),
             "operation.incumbent");
   EXPECT_EQ(decision->find_object_member("path")->as_string(),
@@ -120,6 +121,8 @@ TEST(OperationStateResponseTest, TakeoverProjectsExactDecisionAndCertificate) {
             "9007199254740993");
   EXPECT_EQ(decision->find_object_member("preparation_budget_ns")->as_number(),
             1500000000.0);
+  EXPECT_EQ(decision->find_object_member("planning_budget_ns")->as_number(),
+            1200000000.0);
 
   const core::ErrorDTO cause{
       "motion_takeover_preparation_failed", "original planner failure",
@@ -146,7 +149,7 @@ TEST(OperationStateResponseTest, TakeoverProjectsExactDecisionAndCertificate) {
     response = OperationStateValue(state);
     decision = response.find_object_member("motion_takeover");
     ASSERT_NE(decision, nullptr);
-    EXPECT_EQ(decision->as_object().size(), 7U);
+    EXPECT_EQ(decision->as_object().size(), 8U);
     EXPECT_EQ(decision->find_object_member("path")->as_string(), spelling);
     EXPECT_EQ(content_identity::canonical_json(
                   *decision->find_object_member("cause")),
@@ -178,10 +181,7 @@ TEST(IoRuleResultResponseTest,
                                 std::nullopt, std::nullopt},
       .terminal_projection = {core::StopDurableProjectionStateDTO::kPending,
                               std::nullopt, std::nullopt},
-      .surveillance_projection = {core::StopDurableProjectionStateDTO::kNotApplicable,
-                                  std::nullopt, std::nullopt},
-      .stop_certificate = std::nullopt, .fault_latch = std::nullopt,
-      .surveillance = std::nullopt};
+      .stop_certificate = std::nullopt};
   for (const auto &[state, spelling] :
        {std::pair{core::StopDurableProjectionStateDTO::kPending, "pending"},
         std::pair{core::StopDurableProjectionStateDTO::kRecorded, "recorded"},

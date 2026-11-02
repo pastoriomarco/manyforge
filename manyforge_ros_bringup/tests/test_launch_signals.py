@@ -22,10 +22,10 @@ from manyforge_ros_bringup import launch_signals  # noqa: E402
 from manyforge_ros_bringup.launch_signals import keep_sigint_out_of_tasks  # noqa: E402
 
 LAUNCH_FILES = {
-    "mock_control.launch.py": "launch_setup",
-    "isaac_topic_based_control.launch.py": "_launch_setup",
+    "ros2_control.launch.py": "launch_setup",
     "isaac_gripper.launch.py": "_launch_setup",
     "sim_plc.launch.py": "launch_setup",
+    "pointcloud_source.launch.py": "launch_setup",
 }
 
 

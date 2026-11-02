@@ -75,7 +75,7 @@ describe('structured error display', () => {
   it('labels the required ErrorDTO details and any other API detail', () => {
     expect(structuredErrorRows({
       details: {
-        latch_id: 'latch.1',
+        component_id: 'arm.left',
         retryable: false,
         required_action: 'reset_cycle',
         maximum_admitted: 4,
@@ -84,17 +84,17 @@ describe('structured error display', () => {
       origin: null,
     })).toEqual([
       { label: 'Required action', value: 'reset cycle' },
+      { label: 'Component id', value: 'arm.left' },
       { label: 'Lane', value: 'ordinary' },
-      { label: 'Latch', value: 'latch.1' },
       { label: 'Maximum admitted', value: '4' },
       { label: 'Retryable', value: 'no' },
     ]);
     // A registered key outside its group is still shown, never dropped.
     expect(structuredErrorRows({
-      details: { path: '/projects/cell', reference_id: 'tool0', latch_id: null },
+      details: { path: '/projects/cell', reference_id: 'tool0', component_id: null },
       origin: null,
     })).toEqual([
-      { label: 'Latch', value: 'none' },
+      { label: 'Component id', value: 'none' },
       { label: 'Path', value: '/projects/cell' },
       { label: 'Reference id', value: 'tool0' },
     ]);

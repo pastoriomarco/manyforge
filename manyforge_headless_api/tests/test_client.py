@@ -136,34 +136,8 @@ def test_client_returns_bounded_strict_json_object() -> None:
         raw.close()
 
 
-def test_client_uses_the_component_overview_route() -> None:
-    requests: list[httpx.Request] = []
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
-        return httpx.Response(
-            200,
-            json={"schema_version": "manyforge.component_overview.v2"},
-            request=request,
-        )
-
-    raw = httpx.Client(
-        base_url="http://headless.test",
-        transport=httpx.MockTransport(handler),
-    )
-    client = HeadlessHttpClient("http://unused.test", client=raw)
-    try:
-        assert client.component_overview()["schema_version"] == (
-            "manyforge.component_overview.v2"
-        )
-    finally:
-        raw.close()
-    assert [request.url.path for request in requests] == ["/api/component-overview"]
-
-
 def test_client_relays_bounded_owner_json_without_reencoding() -> None:
     payloads = {
-        "/api/component-overview": b' {"schema_version":"overview.v1"}\n',
         "/api/execution/history": b'{"schema_version":"history.v1"}',
     }
     requests: list[httpx.Request] = []
@@ -179,15 +153,12 @@ def test_client_relays_bounded_owner_json_without_reencoding() -> None:
     client = HeadlessHttpClient("http://unused.test", client=raw)
     try:
         assert (
-            client.component_overview_payload() == payloads["/api/component-overview"]
-        )
-        assert (
             client.history_payload(params=(("limit", 32),))
             == payloads["/api/execution/history"]
         )
     finally:
         raw.close()
-    assert requests[1].url.params["limit"] == "32"
+    assert requests[0].url.params["limit"] == "32"
 
 
 def test_client_raw_json_relay_preserves_typed_owner_errors() -> None:

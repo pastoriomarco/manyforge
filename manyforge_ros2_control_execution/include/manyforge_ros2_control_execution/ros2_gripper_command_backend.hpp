@@ -89,6 +89,11 @@ struct Ros2GripperActionConfig {
     double max_position{};
   };
   std::optional<GraspStallWindow> grasp_stall_window;
+  /// Stop finish tolerance (the gripper's position units, >= 0): a Stop that
+  /// finds the fingers this close to the commanded target lets the action
+  /// goal finish instead of cancelling it (the stock GripperActionController
+  /// never answers a cancel that races its own success). 0 always cancels.
+  double stop_finish_tolerance{};
 };
 
 struct Ros2GripperLifecycleResult {
@@ -189,6 +194,11 @@ private:
     bool lifecycle_disable_terminal = false;
     bool lifecycle_disable_failed = false;
     bool lifecycle_cancel_dispatched = false;
+    // A Stop found the command already done (fingers within
+    // stop_finish_tolerance, or its command_duration_s elapsed): the goal of
+    // this command finishes and is never cancelled (also when its goal
+    // response arrives after the Stop).
+    bool stop_lets_goal_finish = false;
     std::uint64_t lifecycle_disable_command_id = 0;
     std::uint64_t lifecycle_disable_generation = 0;
     std::uint64_t command_id = 0;
@@ -207,6 +217,9 @@ private:
     std::optional<double> max_effort;
     double target_position = 0.0;
     double duration_s = 0.0;
+    bool wait_for_duration = false;
+    // The controller reported done; the command waits for duration_s.
+    bool controller_done = false;
     core::TimePoint started_at_ns = 0;
     std::optional<core::TimePoint> delivered_at_ns;
     std::optional<core::TimePoint> deadline_at_ns;
@@ -230,6 +243,10 @@ private:
   };
 
   void advance_pneumatic_locked(GripperRuntime &runtime) const;
+  // GRP-2: a controller completion of a wait_for_duration command before
+  // duration_s has elapsed holds it executing (controller_done); the
+  // lifecycle tick then completes it. False when the command completes now.
+  bool hold_until_duration_locked(GripperRuntime &runtime) const;
   void confirm_pneumatic_delivery_locked(GripperRuntime &runtime);
   void publish_pneumatic_display(const std::shared_ptr<GripperRuntime> &runtime,
                                  double fallback_position) noexcept;
@@ -250,6 +267,14 @@ private:
   void on_gripper_result(const std::shared_ptr<GripperRuntime> &runtime,
                          std::uint64_t command_id, std::uint64_t generation,
                          const GoalHandleGripper::WrappedResult &result);
+  // Sends the cancel of a pending disable's goal (command_id, generation).
+  // N10b: for a command already fenced by a Stop/invalidation, the server's
+  // ACCEPT settles it like the goal's own result, whichever comes first.
+  static void dispatch_disable_cancel(
+      const std::shared_ptr<GripperRuntime> &runtime,
+      const rclcpp_action::Client<GripperCommand>::SharedPtr &client,
+      const GoalHandleGripper::SharedPtr &goal, std::uint64_t command_id,
+      std::uint64_t generation);
   bool
   schedule_gripper_lifecycle(const std::shared_ptr<GripperRuntime> &runtime,
                              std::uint64_t command_id, std::uint64_t generation,

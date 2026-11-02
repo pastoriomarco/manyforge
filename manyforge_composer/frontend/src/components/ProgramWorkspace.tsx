@@ -85,6 +85,8 @@ interface ProgramWorkspaceProps {
   sourceModel: StructuralResourceState<SourceModelProjection>;
   deploymentWorkspace?: DeploymentWorkspaceResponse | null;
   systemSignalChoices?: readonly CarriedObjectLostSignalChoice[];
+  /** Outputs holding a core-held `changed outside` signal (`<component>/<signal>`). */
+  changedOutsideOutputs?: ReadonlySet<string>;
   systemSignalsNeedApply?: boolean;
   /** The scenario's Program role assignment (authoring workspace project facts). */
   programRoleAssignment?: Record<string, JsonValue> | null;
@@ -121,6 +123,7 @@ export function ProgramWorkspace({
   sourceModel,
   deploymentWorkspace = null,
   systemSignalChoices = [],
+  changedOutsideOutputs,
   systemSignalsNeedApply = false,
   programRoleAssignment = null,
   motionDescriptors = EMPTY_MOTION_DESCRIPTORS,
@@ -759,6 +762,7 @@ export function ProgramWorkspace({
                       : sourceModel.message}
                   deploymentWorkspace={deploymentWorkspace}
                   systemSignalChoices={systemSignalChoices}
+                  changedOutsideOutputs={changedOutsideOutputs}
                   systemSignalsNeedApply={systemSignalsNeedApply}
                   programRoleAssignment={programRoleAssignment}
                   motionDescriptors={motionDescriptors}

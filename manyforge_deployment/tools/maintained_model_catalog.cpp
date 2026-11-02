@@ -265,15 +265,13 @@ void replace_file_atomically(const std::filesystem::path &path,
                       "maintained source description");
   const auto parsed =
       deployment::parse_strict_json_model_yaml(description_bytes);
-  constexpr std::array<std::string_view, 7U> kDescriptionFields{
-      "api_version",
-      "assistant_profiles_source",
-      "deployments",
-      "historical_program_sources",
-      "historical_source_commit",
-      "model_families",
-      "runtime_restoration_profiles"};
-  require_shape(parsed.root(), kDescriptionFields, "description");
+  // `component_models` (descriptors of models without a model family) is
+  // optional and not read here.
+  std::vector<std::string_view> description_fields{"api_version",
+                                                   "model_families"};
+  if (parsed.root().find_object_member("component_models") != nullptr)
+    description_fields.push_back("component_models");
+  require_shape(parsed.root(), description_fields, "description");
   if (require_text(require_member(parsed.root(), "api_version", "description"),
                    "description.api_version") !=
       "manyforge.maintained_deployment_sources.v1") {
@@ -289,19 +287,18 @@ void replace_file_atomically(const std::filesystem::path &path,
     const auto &row = rows[index];
     const std::string label =
         "description.model_families[" + std::to_string(index) + "]";
-    constexpr std::array<std::string_view, 5U> kFamilyFields{
+    // A selectable family names its component model descriptor and may
+    // record its TCPs (both optional); the component types read the TCPs,
+    // the model asset reads neither.
+    std::vector<std::string_view> family_fields{
         "catalog_source", "model_asset_id", "model_family_id", "semantics",
         "source"};
-    // A descriptor-registered family may also record its TCPs (optional);
-    // the component types read them, the model asset does not.
-    constexpr std::array<std::string_view, 6U> kFamilyFieldsWithTcps{
-        "catalog_source", "model_asset_id",     "model_family_id",
-        "semantics",      "source",             "tcp_frame_role_ids"};
-    if (row.find_object_member("tcp_frame_role_ids") != nullptr) {
-      require_shape(row, kFamilyFieldsWithTcps, label);
-    } else {
-      require_shape(row, kFamilyFields, label);
-    }
+    for (const std::string_view optional :
+         {std::string_view("component_descriptor"),
+          std::string_view("tcp_frame_role_ids")})
+      if (row.find_object_member(optional) != nullptr)
+        family_fields.push_back(optional);
+    require_shape(row, family_fields, label);
     const auto &source = require_member(row, "source", label);
     constexpr std::array<std::string_view, 8U> kSourceFields{
         "accepted_package_uri_prefix",

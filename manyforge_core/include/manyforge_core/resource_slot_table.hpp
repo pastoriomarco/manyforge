@@ -42,7 +42,7 @@ struct ResourceSlotOwnerDTO final {
   OperationRevision operation_revision;
   OperationParticipantId participant_id;
   ParticipantBindingIdentityDTO binding_identity;
-  std::optional<ResourceSlotControllerAuthorityDTO> controller_authority;
+  ResourceSlotControllerAuthorityDTO controller_authority;
 
   ResourceSlotOwnerDTO() = default;
   ResourceSlotOwnerDTO(OperationId operation, OperationRevision revision,
@@ -59,21 +59,11 @@ struct ResourceSlotOwnerDTO final {
         binding_identity{std::move(domain), std::move(domain_revision),
                          ControllerParticipantBindingIdentityDTO{
                              std::move(binding), std::move(binding_revision), {}}},
-        controller_authority(ResourceSlotControllerAuthorityDTO{
-            std::move(topology), std::move(topology_revision), std::move(route),
-            std::move(configuration), configuration_generation, granularity}) {}
-  ResourceSlotOwnerDTO(OperationId operation, OperationRevision revision,
-                       OperationParticipantId participant,
-                       ParticipantBindingIdentityDTO provider_identity)
-      : operation_id(std::move(operation)),
-        operation_revision(revision),
-        participant_id(std::move(participant)),
-        binding_identity(std::move(provider_identity)) {}
-  [[nodiscard]] ResourceSlotControllerAuthorityDTO& controller() {
-    return controller_authority.value();
-  }
+        controller_authority{std::move(topology), std::move(topology_revision), std::move(route),
+                             std::move(configuration), configuration_generation, granularity} {}
+  [[nodiscard]] ResourceSlotControllerAuthorityDTO& controller() { return controller_authority; }
   [[nodiscard]] const ResourceSlotControllerAuthorityDTO& controller() const {
-    return controller_authority.value();
+    return controller_authority;
   }
   [[nodiscard]] bool valid() const noexcept;
   friend bool operator==(const ResourceSlotOwnerDTO&, const ResourceSlotOwnerDTO&) = default;
@@ -301,12 +291,6 @@ class ResourceSlotTable final {
   [[nodiscard]] Result<std::uint64_t> reconcile_unreconciled_external_or_orphan_goal(
       std::uint64_t expected_operation_resource_generation,
       const std::vector<ResourceId>& resources);
-
-  /// Item 37 Force close only: free every slot owned by one of `operations`,
-  /// whatever its phase, and every unowned orphan-unreconciled slot. No proof
-  /// of rest is checked: the caller's confirmed Full Stop and stopped
-  /// component processes stand in for it. Returns the freed orphan resources.
-  [[nodiscard]] std::vector<ResourceId> force_release(const std::vector<OperationId>& operations);
 
   /// Replace the selected runtime inventory while preserving every unchanged
   /// occupied slot. An empty candidate is the valid no-commandable-component

@@ -16,6 +16,7 @@ import {
   type PoseSourceComponent,
 } from '../utils/poseSourceAuthoring';
 import { DraftTextInput } from './common/DraftInputs';
+import type { EffectiveValues } from '../types/components';
 import { LifecycleBudgetField } from './LifecycleBudgetField';
 import type { FocusedEditorScope } from './DeploymentFocusedEditor';
 import { pneumaticGripperDrafts } from '../utils/pneumaticGripperAuthoring';
@@ -143,8 +144,9 @@ function OptionalBlock({ label, prefix, stored, initial, complete, disabled, onW
   );
 }
 
-function PoseSourceComponentForm({ controller, component, robotIds, gripperTargets, links }: {
+function PoseSourceComponentForm({ controller, effective, component, robotIds, gripperTargets, links }: {
   controller: DeploymentWorkspaceController;
+  effective: EffectiveValues | null;
   component: PoseSourceComponent;
   robotIds: string[];
   gripperTargets: Array<{ componentId: string; targetId: string }>;
@@ -210,7 +212,7 @@ function PoseSourceComponentForm({ controller, component, robotIds, gripperTarge
   return (
     <section className="deployment-pose-source" aria-label={`${prefix} pose source`}>
       <header><strong>{prefix}</strong></header>
-      <LifecycleBudgetField controller={controller} componentIndex={component.index}
+      <LifecycleBudgetField controller={controller} effective={effective} componentIndex={component.index}
         componentId={component.componentId} disabled={disabled} />
       <Field label="Stream budget (s)" prefix={prefix} type="number" disabled={disabled}
         value={budgetNs === null ? '' : budgetNs / 1e9} validate={range(1e-9, 60)}
@@ -503,8 +505,10 @@ function PoseSourceComponentForm({ controller, component, robotIds, gripperTarge
  * object is not in the current Program scene (orphans), which can be removed.
  * One component's page shows only its form; the cell settings only the orphans.
  */
-export function PoseSourceComponentSection({ controller, programSceneIds, scope = 'all' }: {
+export function PoseSourceComponentSection({ controller, effective = null, programSceneIds, scope = 'all' }: {
   controller: DeploymentWorkspaceController;
+  /** `GET /api/deployment/effective` (CONTRACTS §11), read once by the editor. */
+  effective?: EffectiveValues | null;
   /** The Program Draft's scene object ids; null without a Program (no orphan list). */
   programSceneIds: readonly string[] | null;
   scope?: FocusedEditorScope;
@@ -537,7 +541,8 @@ export function PoseSourceComponentSection({ controller, programSceneIds, scope 
       <summary>Pose sources</summary>
       <div className="deployment-focused-body">
         {components.map((component) => (
-          <PoseSourceComponentForm key={component.componentId} controller={controller} component={component}
+          <PoseSourceComponentForm key={component.componentId} controller={controller} effective={effective}
+            component={component}
             robotIds={robotIds} gripperTargets={gripperTargets}
             links={links.filter((link) => link.source_id === component.componentId)} />
         ))}

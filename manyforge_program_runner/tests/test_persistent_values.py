@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import stat
 from copy import deepcopy
@@ -30,7 +29,6 @@ import manyforge_program_runner.persistent_keys as persistent_keys
 from manyforge_program_runner.cycle_journal import ProgramCycleJournal
 from manyforge_program_runner.persistent_keys import PersistentKeyRegister
 from manyforge_program_runner.runtime import (
-    PERSISTENT_KEY_RECONCILIATION_VERSION,
     ProgramRunnerConfig,
     ProgramRunnerError,
     ProgramRuntime,
@@ -92,10 +90,14 @@ _REVISION = _DOCUMENT["program_revision"]
 class _Headless(_Transport):
     """Manager's committed Applies, as Headless projects the current one."""
 
-    def __init__(self, history: str = "manager-state.1") -> None:
+    def __init__(
+        self, history: str = "manager-state.1", retain: int | None = None
+    ) -> None:
         super().__init__()
         # Manager state: a restart with new state is a new history.
         self.history = history
+        # Manager's journal keeps the newest `retain` committed Applies.
+        self.retain = retain
         self.applies: list[dict[str, Any]] = []
         self.current: dict[str, Any] | Exception = {}
         self.apply(_DOCUMENT)
@@ -128,31 +130,6 @@ class _Headless(_Transport):
         self.current = {**committed, "program": deepcopy(document)}
         return committed["record_digest"]
 
-    def apply_sealed_empty(self) -> str:
-        """One named sealed-empty Apply stays in the complete history."""
-        origin = {
-            "kind": "sealed_canonical_empty",
-            "cell_id": "cell.test",
-            "deployment_artifact_id": "deployment.empty",
-            "deployment_revision": "sha256:" + "a" * 64,
-            "retained_bundle_id": "sha256:" + "b" * 64,
-            "graph_revision": "sha256:" + "c" * 64,
-            "admission_digest": "sha256:" + "d" * 64,
-        }
-        committed = {
-            "apply_id": f"apply.{len(self.applies) + 1}",
-            "apply_generation": 1,
-            "scene_initialization": "preserve",
-            "record_digest": "sha256:"
-            + hashlib.sha256(
-                f"{self.history}:{len(self.applies) + 1}".encode()
-            ).hexdigest(),
-            "origin": origin,
-        }
-        self.applies.append(committed)
-        self.current = {**deepcopy(committed), "program": None}
-        return self.current["record_digest"]
-
     def committed_scenario_activation(self) -> dict[str, Any]:
         if isinstance(self.current, Exception):
             raise self.current
@@ -163,7 +140,8 @@ class _Headless(_Transport):
                 "publication_generation": len(self.applies) + 1,
                 **deepcopy(self.current),
                 "committed_applies": sorted(
-                    deepcopy(self.applies), key=lambda row: row["record_digest"]
+                    deepcopy(self.applies[-(self.retain or len(self.applies)):]),
+                    key=lambda row: row["record_digest"],
                 ),
             }
         )
@@ -875,87 +853,32 @@ def test_an_edit_that_may_not_be_durable_is_reported_as_such(
     ) == "persistent_key_request_replayed"
 
 
-def test_sealed_current_reconciliation_is_read_only_and_repeated(tmp_path, monkeypatch):
-    runtime, headless = _runtime(tmp_path)
-    runtime.set_persistent_value(_set(runtime, "layer", 9))
-    register = runtime._persistent_keys  # noqa: SLF001
-    assert register is not None
-    original_bytes = register.path.read_bytes()
-    original_sequence = register.sequence
-    original_activation = deepcopy(register.activation)
-    digest = headless.apply_sealed_empty()
-    projection = headless.committed_scenario_activation()
-
-    def no_register_write(*_args, **_kwargs):
-        raise AssertionError("sealed origin must not reconcile the Scenario register")
-
-    monkeypatch.setattr(register, "reconcile", no_register_write)
-    expected = {
-        "schema_version": PERSISTENT_KEY_RECONCILIATION_VERSION,
-        "outcome": "no_scenario", "record_digest": digest,
-        "origin": projection["origin"], "dropped": [], "unobserved_applies": [],
-        "history_changed": False,
-    }
-    assert runtime.reconcile_persistent_values() == expected
-    assert runtime.reconcile_persistent_values() == expected
-    assert register.path.read_bytes() == original_bytes
-    assert register.sequence == original_sequence
-    assert register.activation == original_activation
-    assert register.values(_PROJECT)["layer"]["value"] == 9
-    assert _refusal(
-        lambda: runtime._committed_activation()  # noqa: SLF001
-    ) == "persistent_key_activation_unavailable"
-
-
-def test_sealed_current_checks_expected_record_before_scenario_refusal(tmp_path):
-    runtime, headless = _runtime(tmp_path)
-    register = runtime._persistent_keys  # noqa: SLF001
-    assert register is not None
-    original = register.path.read_bytes()
-    old_digest = headless.current["record_digest"]
-    actual = headless.apply_sealed_empty()
-    assert _refusal(lambda: runtime._reconcile_persistent_keys(  # noqa: SLF001
-        register, expected_record_digest=old_digest
-    )) == "program_run_applied_selection_stale"
-    assert _refusal(lambda: runtime._reconcile_persistent_keys(  # noqa: SLF001
-        register, expected_record_digest=actual
-    )) == "persistent_key_activation_unavailable"
-    assert register.path.read_bytes() == original
-
-
 @pytest.mark.parametrize(
     "defect",
     [
-        "duplicate", "missing_current", "foreign_origin", "bad_sealed_digest",
-        "sealed_program", "unknown_kind", "mixed_fields", "extra_field",
+        "duplicate", "missing_current", "unknown_kind", "mixed_fields", "extra_field",
+        "more_than_published",
     ],
 )
-def test_full_typed_history_is_validated_before_sealed_noop(tmp_path, monkeypatch, defect):
+def test_full_typed_history_is_validated_before_reconciliation(tmp_path, monkeypatch, defect):
     runtime, headless = _runtime(tmp_path)
     register = runtime._persistent_keys  # noqa: SLF001
     assert register is not None
     original = register.path.read_bytes()
-    headless.apply_sealed_empty()
     projection = headless.committed_scenario_activation()
     if defect == "duplicate":
         projection["committed_applies"].append(deepcopy(projection["committed_applies"][0]))
         projection["publication_generation"] += 1
     elif defect == "missing_current":
         projection["record_digest"] = "sha256:" + "e" * 64
-    elif defect == "foreign_origin":
-        projection["origin"]["cell_id"] = "cell.foreign"
-    elif defect == "bad_sealed_digest":
-        sealed = next(
-            row for row in projection["committed_applies"]
-            if row["origin"]["kind"] == "sealed_canonical_empty"
-        )
-        sealed["origin"]["admission_digest"] = "invalid"
-    elif defect == "sealed_program":
-        projection["program"] = deepcopy(_DOCUMENT)
+    elif defect == "more_than_published":
+        # More committed Applies than Apply publications: never explained by
+        # eviction, which only ever removes Applies.
+        projection["publication_generation"] = len(projection["committed_applies"])
     elif defect == "unknown_kind":
         projection["origin"]["kind"] = "unrecognized"
     elif defect == "mixed_fields":
-        projection["origin"]["scenario_id"] = _SCENARIO
+        projection["origin"]["cell_id"] = "cell.test"
     else:
         projection["unexpected_field"] = True
     # A fake transport bypasses its validator; the runtime must still reject
@@ -1010,19 +933,15 @@ def test_originless_projection_is_a_named_refusal_with_a_stale_parser(
     assert register.path.read_bytes() == original
 
 
-@pytest.mark.parametrize("current_kind", ["scenario", "sealed_canonical_empty"])
 @pytest.mark.parametrize("extra", [0, 1])
-def test_complete_history_bound_counts_sealed_rows(tmp_path, current_kind, extra):
+def test_complete_history_bound_counts_every_apply(tmp_path, extra):
     runtime, headless = _runtime(tmp_path)
     runtime.set_persistent_value(_set(runtime, "layer", 9))
     register = runtime._persistent_keys  # noqa: SLF001
     assert register is not None
     original = register.path.read_bytes()
     count = persistent_keys.MAX_RECONCILED_APPLIES + extra
-    scenario_rows = 2 if current_kind == "scenario" else 1
-    for _ in range(count - scenario_rows):
-        headless.apply_sealed_empty()
-    if current_kind == "scenario":
+    for _ in range(count - 1):
         headless.apply(_DOCUMENT)
     assert len(headless.committed_scenario_activation()["committed_applies"]) == count
     if extra:
@@ -1031,22 +950,48 @@ def test_complete_history_bound_counts_sealed_rows(tmp_path, current_kind, extra
         ) == "persistent_key_activation_unavailable"
         assert register.path.read_bytes() == original
     else:
-        result = runtime.reconcile_persistent_values()
-        assert result["outcome"] == (
-            "reconciled" if current_kind == "scenario" else "no_scenario"
-        )
+        assert runtime.reconcile_persistent_values()["outcome"] == "reconciled"
     assert register.values(_PROJECT)["layer"]["value"] == 9
 
 
-def test_distinct_scenario_a_empty_b_keeps_a_values_without_a_fake_scenario(tmp_path):
+@pytest.mark.parametrize("observed", [True, False])
+def test_manager_eviction_keeps_execute_admission_and_values(tmp_path, observed):
+    """F7: more Applies than Manager's journal retains never block the
+    persistent-key activation (Execute admission reads it)."""
+
+    runtime, headless = _runtime(tmp_path)
+    headless.retain = 256
+    runtime.set_persistent_value(_set(runtime, "layer", 9))
+    register = runtime._persistent_keys  # noqa: SLF001
+    assert register is not None
+    for _ in range(300):
+        headless.apply(_DOCUMENT)
+        if observed:
+            result = runtime.reconcile_persistent_values()
+            assert (result["outcome"], result["history_changed"]) == ("reconciled", False)
+            assert result["unobserved_applies"] == []
+    projection = headless.committed_scenario_activation()
+    assert projection["publication_generation"] == 302
+    assert len(projection["committed_applies"]) == 256
+    result = runtime.reconcile_persistent_values()
+    if observed:
+        assert result["outcome"] == "duplicate"
+    else:
+        # The register lagged past the retained window: continuity is lost,
+        # the retained Applies it never saw are named, values that fit stay.
+        assert result["history_changed"] is True
+        assert len(result["unobserved_applies"]) == 255
+    listed = runtime.read_persistent_values()
+    assert {row["key"]: row["value"] for row in listed["keys"]}["layer"] == 9
+    assert register.values(_PROJECT)["layer"]["value"] == 9
+    assert (listed["apply_observation_fault"] is None) is observed
+
+
+def test_distinct_scenario_b_keeps_a_values(tmp_path):
     runtime, headless = _runtime(tmp_path)
     runtime.set_persistent_value(_set(runtime, "layer", 9))
     register = runtime._persistent_keys  # noqa: SLF001
     assert register is not None
-    original = register.path.read_bytes()
-    empty = headless.apply_sealed_empty()
-    assert runtime.reconcile_persistent_values()["outcome"] == "no_scenario"
-    assert register.path.read_bytes() == original
     other_scenario = "cell-other"
     current = headless.apply(_DOCUMENT, other_scenario)
     result = runtime.reconcile_persistent_values()
@@ -1056,7 +1001,6 @@ def test_distinct_scenario_a_empty_b_keeps_a_values_without_a_fake_scenario(tmp_
     assert result["unobserved_applies"] == []
     assert register.values(_PROJECT)["layer"]["value"] == 9
     assert register.activation["project_path"] == "/projects/cell-other.scenario"
-    assert empty not in json.loads(register.path.read_text())["reconciled_applies"]
     assert _refusal(
         lambda: runtime.set_persistent_value(
             _set(runtime, "layer", 1, request_id="request.layer.other")

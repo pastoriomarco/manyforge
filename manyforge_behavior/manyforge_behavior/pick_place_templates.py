@@ -25,11 +25,12 @@ _COMMON_REQUIRED = frozenset(
 )
 _COMMON_OPTIONAL = frozenset(
     {
-        "planning_profile",
+        "planner",
         "tcp_endpoint",
         "motion_options",
         "tool_max_effort",
         "tool_command_duration_s",
+        "tool_wait_for_duration",
         "tool_completion_timeout_s",
     }
 )
@@ -51,7 +52,7 @@ _STATIC_FIELDS = frozenset(
         "tcp_endpoint",
         "carrier_frame_role",
         "contact_policy_id",
-        "planning_profile",
+        "planner",
     }
 )
 _WRAPPER_FIELDS = frozenset(
@@ -128,7 +129,8 @@ def build_pick_place_subtree(
     def literal(name: str, default: Any = None) -> Any:
         return deepcopy(values[name] if name in values else default)
 
-    planning_profile = literal("planning_profile", "first_feasible")
+    # Absent keeps the Deployment planner block.
+    planner = {"planner": literal("planner")} if "planner" in values else {}
     motion_options = literal("motion_options", {})
     if type(motion_options) is not dict:
         raise PickPlaceTemplateError("motion_options must be one object")
@@ -136,7 +138,7 @@ def build_pick_place_subtree(
         "target_role": literal("target_role"),
         "base_frame_role": literal("base_frame_role"),
         **deepcopy(tcp_selection),
-        "planning_profile": planning_profile,
+        **deepcopy(planner),
     }
     for name in (
         "acceleration_scale",
@@ -162,7 +164,7 @@ def build_pick_place_subtree(
     }
     plan_parameters.update(deepcopy(tcp_selection))
     plan_parameters.update(
-        planning_profile=planning_profile,
+        **deepcopy(planner),
         motion_options=deepcopy(motion_options),
         output_key=result_key,
     )
@@ -206,6 +208,7 @@ def build_pick_place_subtree(
     for source_name, destination in (
         ("tool_max_effort", "max_effort"),
         ("tool_command_duration_s", "command_duration_s"),
+        ("tool_wait_for_duration", "wait_for_duration"),
         ("tool_completion_timeout_s", "completion_timeout_s"),
     ):
         if source_name in sources:

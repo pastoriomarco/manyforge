@@ -5,6 +5,7 @@ import type {
   ComponentModelPayload,
   ComponentProfileFacts,
   ComponentTcpTarget,
+  MachineCatalogEntry,
 } from '../types/componentCatalog';
 import {
   allowedKeysAt,
@@ -20,7 +21,7 @@ import {
   vector3At,
 } from './parsers/shared';
 
-const KINDS: readonly ComponentCatalogKind[] = ['robot', 'tool', 'io_device', 'pose_source', 'ai_model'];
+const KINDS: readonly ComponentCatalogKind[] = ['robot', 'tool', 'io_device', 'pose_source', 'ai_model', 'sensor'];
 
 function strings(value: unknown, path: string): string[] {
   return arrayAt(value, path).map((item, index) => stringAt(item, `${path}[${index}]`));
@@ -51,6 +52,34 @@ function parseEntry(value: unknown, path: string): ComponentCatalogEntry {
   };
 }
 
+/** MACHINES-BOUNDARY §5 (amended): `{kind: "machine", model_id, title, lanes[], default_owner_id, owner_row, members[]}`. */
+function parseMachineEntry(value: unknown, path: string): MachineCatalogEntry {
+  const record = objectAt(value, path);
+  exactKeysAt(record, ['kind', 'model_id', 'title', 'lanes', 'default_owner_id', 'owner_row', 'members'], path);
+  return {
+    modelId: stringAt(record.model_id, `${path}.model_id`),
+    title: stringAt(record.title, `${path}.title`),
+    lanes: strings(record.lanes, `${path}.lanes`),
+    defaultOwnerId: stringAt(record.default_owner_id, `${path}.default_owner_id`),
+    ownerRow: jsonRecordAt(record.owner_row, `${path}.owner_row`),
+    members: arrayAt(record.members, `${path}.members`).map((item, index) => {
+      const memberPath = `${path}.members[${index}]`;
+      const member = objectAt(item, memberPath);
+      exactKeysAt(member, ['role', 'model_id', 'title', 'row'], memberPath);
+      return {
+        role: stringAt(member.role, `${memberPath}.role`),
+        modelId: stringAt(member.model_id, `${memberPath}.model_id`),
+        title: stringAt(member.title, `${memberPath}.title`),
+        row: jsonRecordAt(member.row, `${memberPath}.row`),
+      };
+    }),
+  };
+}
+
+function isMachineEntry(value: unknown): boolean {
+  return typeof value === 'object' && value !== null && (value as { kind?: unknown }).kind === 'machine';
+}
+
 function parsePayload(value: unknown, path: string): ComponentModelPayload {
   const record = objectAt(value, path);
   exactKeysAt(record, ['massKg', 'centerOfMassM'], path);
@@ -71,7 +100,7 @@ function parseTcpTarget(value: unknown, path: string): ComponentTcpTarget {
 
 function parseProfileFacts(value: unknown, path: string): ComponentProfileFacts {
   const record = objectAt(value, path);
-  allowedKeysAt(record, ['tags', 'attachmentInterfaces', 'tcpTargets'], ['payload', 'frameTargets', 'hasMotionTarget'], path);
+  allowedKeysAt(record, ['tags', 'attachmentInterfaces', 'tcpTargets'], ['payload', 'frameTargets', 'hasMotionTarget', 'lanes'], path);
   return {
     tags: strings(record.tags, `${path}.tags`),
     attachmentInterfaces: strings(record.attachmentInterfaces, `${path}.attachmentInterfaces`),
@@ -90,6 +119,7 @@ function parseProfileFacts(value: unknown, path: string): ComponentProfileFacts 
       }),
     }),
     ...(record.payload === undefined ? {} : { payload: parsePayload(record.payload, `${path}.payload`) }),
+    ...(record.lanes === undefined ? {} : { lanes: strings(record.lanes, `${path}.lanes`) }),
   };
 }
 
@@ -105,8 +135,10 @@ export function parseComponentCatalog(value: unknown): ComponentCatalog {
   return {
     schemaVersion: 'manyforge.composer_component_catalog.v1',
     projectRoot: nullableStringAt(record.projectRoot, `${path}.projectRoot`),
-    entries: arrayAt(record.entries, `${path}.entries`)
-      .map((entry, index) => parseEntry(entry, `${path}.entries[${index}]`)),
+    entries: arrayAt(record.entries, `${path}.entries`).flatMap((entry, index) => (
+      isMachineEntry(entry) ? [] : [parseEntry(entry, `${path}.entries[${index}]`)])),
+    machines: arrayAt(record.entries, `${path}.entries`).flatMap((entry, index) => (
+      isMachineEntry(entry) ? [parseMachineEntry(entry, `${path}.entries[${index}]`)] : [])),
     profilesWithoutEntry: strings(record.profilesWithoutEntry, `${path}.profilesWithoutEntry`),
     componentProfiles: Object.fromEntries(
       Object.entries(objectAt(record.componentProfiles, `${path}.componentProfiles`))

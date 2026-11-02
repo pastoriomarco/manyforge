@@ -69,6 +69,10 @@ nodes:
     node_id: motion.probe_search
     instance_id: probe
     parameters: {}
+  check:
+    node_id: gripper.check_status
+    instance_id: check
+    parameters: {}
   query:
     node_id: assistant.query_model
     instance_id: query
@@ -201,9 +205,9 @@ refused:
       target_role: {kind: program_parameter, reference: label}
     reason: cannot dynamically select runtime/binding semantics
   - name: effect condition selector
-    node: move
+    node: check
     value_sources:
-      planning_profile: {kind: program_parameter, reference: label}
+      expected_state: {kind: program_parameter, reference: label}
     reason: cannot dynamically select runtime/binding semantics
   - name: contact policy selector
     node: probe

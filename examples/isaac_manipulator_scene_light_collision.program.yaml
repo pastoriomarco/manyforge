@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: isaac_manipulator_scene_light_collision
-program_revision: sha256:cc9a618e0c4b05ebeeabbc504b3f916f2cc8ed9f73b6892238258974efe06185
+program_revision: sha256:2ac7519878a608f72a21387efe72b8c9ab1612e772c2841a8c5ff41223a2318e
 program_profile: composable-cell-v1
 name: isaac_manipulator_scene_light_collision
 description: Retained Isaac UR10e runtime-collision scenario. It starts from the exact light-scene geometry,
@@ -44,9 +44,6 @@ target_roles:
       parameters: {}
       disposition: required
     - capability_id: planning.motion.pose_goal
-      parameters: {}
-      disposition: required
-    - capability_id: planning.profile.balanced
       parameters: {}
       disposition: required
     - capability_id: planning.trajectory.time_parameterized

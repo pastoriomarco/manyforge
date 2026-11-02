@@ -122,13 +122,14 @@ TEST(NodeEnvironmentProjection,
             std::string::npos);
   EXPECT_NE(bytes.find("\"adapter_build_qualified\":true"), std::string::npos);
   EXPECT_EQ(bytes.find("\"adapter_build_qualified\":false"), std::string::npos);
-  // motion.set_tcp (50 nodes); it has no healthy owner in the empty package.
-  EXPECT_EQ(Count(bytes, "\"adapter_build_qualified\":true"), 50U);
+  // motion.set_tcp, rules.set_active and io.clear_outside_change (52 nodes);
+  // none has a healthy owner in the empty package.
+  EXPECT_EQ(Count(bytes, "\"adapter_build_qualified\":true"), 52U);
   EXPECT_EQ(Count(bytes, "\"adapter_build_qualified\":false"), 0U);
   EXPECT_NE(bytes.find("\"binding_available\":false"), std::string::npos);
   EXPECT_NE(bytes.find("\"owner_health_available\":false"), std::string::npos);
   EXPECT_EQ(Count(bytes, "\"owner_health_available\":true"), 14U);
-  EXPECT_EQ(Count(bytes, "\"owner_health_available\":false"), 36U);
+  EXPECT_EQ(Count(bytes, "\"owner_health_available\":false"), 38U);
   EXPECT_EQ(bytes.find("\"cclc_node_adapter_unavailable_until_i7\""),
             std::string::npos);
   EXPECT_EQ(bytes.find("\"kernel_policy_node_adapter_unavailable_until_i8\""),
@@ -192,8 +193,9 @@ TEST(NodeEnvironmentProjection,
     }
   }
   EXPECT_EQ(io_ids,
-            (std::vector<std::string>{"io.check_input", "io.get_input",
-                                      "io.set_output", "io.wait_for_input"}));
+            (std::vector<std::string>{"io.check_input", "io.clear_outside_change",
+                                      "io.get_input", "io.set_output",
+                                      "io.wait_for_input"}));
   EXPECT_EQ(interrupt_ids,
             (std::vector<std::string>{"motion.move_until_signal", "motion.probe_search"}));
 }

@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <title>ManyForge</title>
+  <rect width="64" height="64" rx="14" fill="#3b424c"/>
+  <path d="M13 49 L21 17 L32 38 L43 17 L47 33" fill="none" stroke="#1fc6e8" stroke-width="6" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="21" cy="17" r="4.5" fill="#e0218a"/>
+  <circle cx="32" cy="38" r="4.5" fill="#e0218a"/>
+  <circle cx="43" cy="17" r="4.5" fill="#e0218a"/>
+  <rect x="7" y="48" width="12" height="6" rx="2" fill="#c3c9d1"/>
+  <path d="M42 37 H54 M42 37 V45 M54 37 V45 M42 45 L44.5 48.5 M54 45 L51.5 48.5" fill="none" stroke="#e0218a" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

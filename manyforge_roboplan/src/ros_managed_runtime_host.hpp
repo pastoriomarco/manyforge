@@ -2,6 +2,7 @@
 
 #include <manyforge_component_manager/apply_completion.hpp>
 #include <manyforge_component_manager/selected_runtime_composition.hpp>
+#include <manyforge_core/types/component_state.hpp>
 #include <manyforge_core/types/typed_error.hpp>
 
 #include <cstddef>
@@ -40,10 +41,40 @@ auto DispatchHeartbeatForDrain(const char *first_stuck, bool shutting_down,
   return std::string(text.substr(0U, end));
 }
 
+/// CONTRACTS §11, §15 (N28): whether a replaced or removed component keeps
+/// the host Apply from going ahead. An `enabled` one does, unless its latest
+/// action is a failed Disable (the Apply's own, `apply_orchestration`), no
+/// action runs and it isn't moving: that one is stopped like a dead one.
+[[nodiscard]] inline bool
+LeavingComponentRefusesApply(const manyforge::core::ComponentState &state) {
+  using manyforge::core::ActionOutcome;
+  using manyforge::core::ComponentAction;
+  const bool disable_failed = state.last_action &&
+                              state.last_action->action == ComponentAction::kDisable &&
+                              state.last_action->outcome == ActionOutcome::kFailed;
+  return state.lifecycle == manyforge::core::ComponentLifecycle::kEnabled &&
+         !(disable_failed && !state.action &&
+           state.activity != manyforge::core::ComponentActivity::kBusy);
+}
+
+/// A component's site address that can't be resolved (no site settings file,
+/// unknown `device_address_ref`): the resolver's typed error, naming the
+/// component in its message and `details.component_id`.
+[[nodiscard]] inline manyforge::core::TypedError
+SiteAddressRefusal(const manyforge::core::ErrorDTO &error,
+                   const std::string &component_id) {
+  auto details = error.details;
+  details.insert_or_assign("component_id", component_id);
+  return {error.code, "component " + component_id + ": " + error.message,
+          std::move(details),
+          std::string(manyforge::component_manager::kExecutionHostProducer)};
+}
+
 /// The typed refusal of a candidate whose composition found a data or setup
-/// inconsistency. `details.cause` keeps the original message, and
-/// `component_id` the component being composed when known; both fit the
-/// Manager's retained failure bounds.
+/// inconsistency. `details.cause` keeps the original message, `cause_code`
+/// a typed cause's code, and `component_id` the component being composed
+/// when known (else the typed cause's own); all fit the Manager's retained
+/// failure bounds.
 [[nodiscard]] inline manyforge::core::TypedError
 ScenarioCompositionRefusal(const std::exception &error,
                            const std::string &component_id = {}) {
@@ -53,12 +84,19 @@ ScenarioCompositionRefusal(const std::exception &error,
       {"cause",
        BoundedUtf8(cause, component_manager::
                               kMaximumManagerApplyFailureCauseDetailValueBytes)}};
-  if (!component_id.empty())
+  const auto *typed = dynamic_cast<const manyforge::core::TypedError *>(&error);
+  std::string component = component_id;
+  if (component.empty() && typed != nullptr) {
+    const auto named = typed->details().find("component_id");
+    if (named != typed->details().end())
+      component = named->second;
+  }
+  if (!component.empty())
     details.emplace("component_id",
-                    BoundedUtf8(component_id,
+                    BoundedUtf8(component,
                                 component_manager::
                                     kMaximumManagerApplyFailureCauseDetailValueBytes));
-  if (const auto *typed = dynamic_cast<const manyforge::core::TypedError *>(&error))
+  if (typed != nullptr)
     details.emplace("cause_code", typed->code());
   return {std::string(component_manager::kScenarioCompositionRefusedCode),
           BoundedUtf8("Scenario refused: " + cause,
@@ -92,6 +130,27 @@ SelectedRuntimeCompositionRpcError(const std::exception &error) {
       typed->code() == manyforge::component_manager::kScenarioCompositionRefusedCode)
     return typed->error();
   return {"selected_runtime_composition_request_failed", error.what(), {}};
+}
+
+/// The failed host Apply result for a failure caught before the Apply
+/// changed anything installed: the RPC error of `failure` with
+/// `details.effect = none`, so the Manager releases the Apply's fence and
+/// claim (the predecessor is still what is installed).
+[[nodiscard]] inline manyforge::core::ErrorDTO
+HostApplyFailureBeforeEffect(const std::exception_ptr &failure) {
+  manyforge::core::ErrorDTO error;
+  try {
+    std::rethrow_exception(failure);
+  } catch (const std::exception &caught) {
+    error = SelectedRuntimeCompositionRpcError(caught);
+  } catch (...) {
+    error = {"selected_runtime_composition_request_failed",
+             "selected runtime-composition request failed", {}};
+  }
+  error.message = BoundedUtf8(
+      error.message, manyforge::component_manager::kMaximumManagerApplyFailureMessageBytes);
+  error.details.insert_or_assign("effect", "none");
+  return error;
 }
 
 } // namespace manyforge::roboplan_backend::host_detail

@@ -18,12 +18,17 @@ For runtime/operator-facing reference docs see:
 
 ## Clean Machine Install Order
 
-On a Jetson Orin with a small eMMC root, place the workbench caches on the
-NVMe as described in [`DEVELOPMENT_WORKBENCH.md`](DEVELOPMENT_WORKBENCH.md).
+On a Jetson with a small eMMC root, place the workbench caches on the NVMe
+(`MANYFORGE_DEV_CACHE_BASE`) as described in
+[`DEVELOPMENT_WORKBENCH.md`](DEVELOPMENT_WORKBENCH.md). On a Jetson, `build`
+selects NVIDIA's `noble-jetpack` package suite by itself.
 
 1. Prepare the host: Docker Engine with Compose v2 and BuildKit, `git`,
    Python 3, and enough disk for the image and build caches.
 1. Clone `manyforge` and change into the checkout.
+1. Optional: write the [site settings](DEVELOPMENT_WORKBENCH.md#site-settings)
+   file (robot addresses, project folders) and export
+   `MANYFORGE_DEV_SITE_SETTINGS` with its absolute path.
 1. Build the image once, then start the workbench:
    ```bash
    ./scripts/compose-dev.sh build
@@ -36,11 +41,13 @@ NVMe as described in [`DEVELOPMENT_WORKBENCH.md`](DEVELOPMENT_WORKBENCH.md).
 
 ## Runtime Selection
 
-Robot execution and the AI assistant are independent. The Scenario's
-Deployment selects one execution lane; the assistant is enabled by the
+Robot execution and the AI assistant are independent. Each component of the
+Scenario's Deployment runs on one execution lane (`components[].lane`; a
+machine member runs on its owner's lane); the assistant is enabled by the
 Deployment's `ai_model` component and never changes motion authority,
-controller binding, or robot-state precedence. All lanes run in the same
-workbench image and container.
+controller binding, or robot-state precedence. All lanes run ros2_control with
+the stock joint trajectory controller, in the same workbench image and
+container.
 
 When the Program Runner has no Manager liveness stream, it reads the Active
 TCP at registration and before work resumes. If the execution owner is replaced
@@ -52,49 +59,60 @@ accepted limitation can make a Program's Current TCP selection stale.
 
 #### Mock
 
-No simulator or robot. ManyForge drives ROS 2 mock controllers:
+No simulator or robot. ManyForge drives ros2_control mock hardware:
 
 ```bash
-./scripts/compose-dev.sh start --project examples/ur5e_lite6_wall_workbench.scenario
+./scripts/compose-dev.sh start --project examples/mock_dual_arm_workbench.scenario
 ```
 
-#### Isaac Sim (attach-only)
+#### Isaac Sim
 
-Start Isaac Sim yourself and open the scene; the workbench attaches to it and
-does not start Isaac Sim or load worlds. Then start the workbench with an
-Isaac Scenario project:
+Start Isaac Sim yourself and open the scene with its ROS 2 bridge and the ROS 2
+Simulation Interfaces services; the workbench does not start Isaac Sim or load
+worlds. Then start the workbench with an Isaac Scenario project, or Load one in
+Composer:
 
 ```bash
-./scripts/compose-dev.sh start --project examples/isaac-ur10e-light-scene.scenario
+./scripts/compose-dev.sh start --project examples/sim_ur10e_pick_and_place.scenario
 ```
 
-The workbench uses host networking so DDS can discover the Isaac endpoints;
-export any DDS settings (`ROS_DOMAIN_ID`, `RMW_IMPLEMENTATION`, …) in the shell
-that runs `start` (see [`DEVELOPMENT_WORKBENCH.md`](DEVELOPMENT_WORKBENCH.md)).
-The Isaac `commanded_sim` profile and the physical controller-observed profile
-have different state precedence; see
-[`../reference/ARCHITECTURE.md`](../reference/ARCHITECTURE.md#deployment-lanes).
+The workbench uses host networking so DDS can discover the Isaac endpoints.
+Use the same `ROS_DOMAIN_ID` (default 0) on both machines and leave
+`ROS_AUTOMATIC_DISCOVERY_RANGE` unset or `SUBNET` when Isaac runs on another
+host; export these in the shell that runs `start` (see
+[ROS and DDS](DEVELOPMENT_WORKBENCH.md#ros-and-dds)).
+
+A simulation that is not playing never blocks Enable, Activate or Execute.
+Simulated robots and tools keep their lifecycle with the reason **Simulation
+not playing** (never a fault), and a new motion or gripper command on them is
+refused with `simulation_not_playing` (the node fails; the tree handles it).
+Play the simulation in Isaac, or from the Program with a **Set simulation
+state** node before its motion.
 
 For the multi-machine Lite6 trocar workflow with Isaac ROS
 YOLOv8/FoundationPose perception, use
 [`ISAAC_LITE6_TROCAR_FOUNDATIONPOSE.md`](ISAAC_LITE6_TROCAR_FOUNDATIONPOSE.md).
 
-#### Real (Lite 6)
+<a id="real-lite-6"></a>
 
-Lite 6 is the supported Real model; physical execution is not yet qualified
-and requires attended robot sessions. Put the robot address in the site
-settings (`device_addresses`, see
-[`DEVELOPMENT_WORKBENCH.md`](DEVELOPMENT_WORKBENCH.md#project-folders)) and
-start a Real Scenario such as `examples/lite6_real_arm_observation.scenario`.
-A Real robot component names its vendor adapter explicitly in
-`runtime_configuration.adapter_family` (`xarm` for UFACTORY arms; the Real
-examples set it). ManyForge does not infer the family from the model. Apply
-refuses a Real robot without a supported family
-(`real_adapter_family_unknown`).
-**Run**, Resume, retry/replan, and Robot Control approval stay disabled until
-the robot is reported enabled and motion admission is open. Browser state is
-only an operator aid: the backend and execution adapter enforce the same
-refusal.
+#### Real (UFACTORY xArm)
+
+Real robots are UFACTORY xArm-family robots (xArm 5/6/7, Lite 6, UF850)
+through the vendor driver; Lite 6 is the model measured on hardware, and
+physical execution is not qualified and requires attended sessions. Put the
+robot address in the site settings (`device_addresses`), set
+`MANYFORGE_DEV_SITE_SETTINGS`, and Load a Real Scenario such as
+`examples/real_lite6_arm_observation.scenario`. The robot is a machine: its
+owner component carries the lane (`real`) and, on its machine card, the
+address key (`configuration.device_address_ref`); the adapter comes from the
+machine model's `lanes.real` row. Load and Prepare connect and clear the
+controller's errors with the motors off; the motors switch on only at the
+arm's **Enable**. See [Real robot setup](REAL_ROBOT_SETUP.md) for the full
+procedure, what each action does and troubleshooting.
+
+Execute, Run, Resume and Robot Control motion stay unavailable until the arm
+is enabled and the cell is not latched. Browser state is only an operator aid:
+the backend and execution adapter enforce the same refusal.
 
 For a real robot, the controller/driver observed state is the source of truth,
 not ManyForge-authored state:
@@ -157,89 +175,22 @@ nothing; one that resolves to a different TCP is refused. With the checkbox
 off, changing TCP only changes ManyForge's selection; no offset is sent. The
 configured controller offset target is 0 (the flange), and Enable re-syncs
 zero if the controller reports another offset. Payload updates are still sent
-as above. Controller-side TCP features then refer to the flange. The adapter's
-`enable_only` mode never sends offsets. If a sent offset is not confirmed (no
+as above. Controller-side TCP features then refer to the flange. If a sent offset is not confirmed (no
 answer, a failed re-engage, or the mismatch above), the arm reports a
 component fault; Recover clears this persistent fault, and the subsequent
 Enable re-syncs the Active TCP, sending its offset if the report differs. An
 offset changed in UFACTORY Studio is corrected at the next Enable. The accepted
 late-request residual is described in [TCPs](../authoring/TCPS.md#the-controllers-tcp-offset).
 
-**Disabled does not power down the motors.** On a UFACTORY arm, **Disable
-robot** (and the state **Disabled**) switches off the trajectory controller
-and the ros2_control hardware interface, so ManyForge sends no more commands.
-The vendor driver's deactivation only changes the arm's mode: the servo
-motors stay enabled and hold the arm in place. To power the motors down,
-press the emergency stop, or switch them off with the vendor tools (UFACTORY
-Studio, or `motion_enable(false)` in the vendor SDK). The next **Prepare**
-enables the motors again through the vendor activation. An error the
-controller still reports after an emergency stop has been released (for
-example C2) is shown on the component and cleared by the next **Prepare**. If
-the emergency stop (or its input) is still engaged, that Prepare fails with
-`xarm_error_persists_after_clear` and the error code. You can try again after
-releasing it. An emergency stop while the arm is
-working is an incident that stops the cell; **Recover cell** then tries to
-enable the arm again (Recover, Prepare, Enable) in the same press, and can be
-pressed again if it fails. Its Recover clears the error first. Before sending
-`clean_error`, the adapter reads `get_err_warn_code` and `get_state` on demand,
-each under the remaining step budget and the 10 s call cap. An answered service
-read error refuses the clear without sending it; an unanswered read leaves the
-clear unsent and reports `robot_controller_unresponsive`. After `clean_error`
-answers, it schedules three on-demand `get_err_warn_code` reads at 0, 150 and
-300 ms; when those services answer promptly, verification usually takes about
-0.3 s. A read with error code 0 proves the clear immediately, without another
-state read. When an error remains after polling, the adapter reads `get_state`
-once and compares the final on-demand error, warning and state values before
-and after.
-If the step expires before that state read can complete, the step fails with
-`component_lifecycle_deadline_expired`. A completed persistence
-result uses `xarm_error_persists_after_clear` and includes the latest error
-code. The clear is judged only on those three values (error, warning, state)
-before and after; the mode and motion enable are set and checked by Prepare
-and Enable. As for every lifecycle step, the result is succeeded, failed or
-connection lost, and what comes next is decided from the arm's current status.
-No answer within a call's allowed time reports the controller unresponsive; the clear request is never repeated. The
-full Recover can take longer because it also performs baseline, status and
-proof calls within the component budget; measure the complete path on the live
-controller. If the robot controller or its controller
-manager does not answer in time, the step ends at once with
-`robot_controller_unresponsive` or `controller_manager_unresponsive` and the
-arm reports a component fault (an incident) until a Recover finds both
-answering again. A Recover press acknowledges only the incidents it
-showed: if a newer incident replaced one, the press is refused
-(`cclc_incident_changed`, nothing acknowledged) and shows the new incident;
-review it and press again. If the incident was closed meanwhile and nothing
-else is open, the press proceeds as an ordinary Recover. API clients may send the same check
-(`expected_incident_ids` on `POST /api/execution/cell-recover`,
-`expected_incident_id` on a lifecycle Recover) or omit it. Prepare also reactivates the joint
-state broadcaster if the hardware plugin left it inactive, and waits for a
-broadcaster sample after the activation; **Enable** activates the trajectory
-controller. Each of these steps is bounded at 10 s on a UFACTORY arm.
-
-**Moving the arm from UFACTORY Studio.** While no Program runs and no
-ManyForge motion or operation holds the cell, a move or mode change from
-UFACTORY Studio is a warning on the component
-(`moved_externally:rearm_at_next_motion`), not an error. Press Run, Execute,
-jog or Move to as usual. During the Studio move the
-3D view and joint values follow the arm from the driver's own joint states
-(display only); those samples also keep the arm's joint stream fresh, so a
-lost joint-state broadcaster is not reported until they stop. Once the motion
-is admitted, and before it is planned, the arm's vendor adapter puts the robot
-back into joint-servo mode and the ready state (`set_mode(1)`, `set_state(0)`);
-the driver then switches its controllers back on, the trajectory controller
-holding the current pose, and the motion starts from there (about 2 s more).
-While the arm counts as moved, a jog or Move to preview starts from its live
-pose (the driver's joint states). Executing a preview made before the manual
-move plans the motion again from the current pose after the re-engage; only if
-the arm moves between that planning and the motion's start is it refused
-(`start_state_mismatch`, "preview again"), and nothing moves. While the arm is
-still moving under Studio, or the robot reports an error (an emergency stop is
-never re-enabled automatically), the motion fails typed
-(`motion_reengage_failed` with the cause) and nothing moves. **Recover cell**
-still re-arms a moved arm explicitly, and is the way back when the re-engage
-fails. While a Program or ManyForge motion is in progress the same move is an
-`external_control` incident: the cell stops, and only the operator's
-**Recover** re-arms the arm.
+**Motors.** Prepare and Recover never switch the motors on; the arm's
+**Enable** does (`motion_enable`, `set_mode(1)`, `set_state(0)` through the
+vendor hardware plugin). **Disable** switches off the trajectory controller
+and the ros2_control hardware interface, so ManyForge sends no more commands;
+it does not call `motion_enable(false)`. To power the arm down, press the
+emergency stop, use **Power off** on the machine, or the vendor tools. An
+error left after an emergency stop (for example C2) is normal: release the
+e-stop, then Recover the machine and Enable the arm
+([Real robot setup](REAL_ROBOT_SETUP.md#what-each-action-does-on-an-xarm)).
 
 ### Optional model and assistant surfaces
 
@@ -260,8 +211,9 @@ it with an `ai_model` component (`base_url`, `model`, optional token
 environment variable name `api_key_env`, which must start with
 `MANYFORGE_AI_`) next to an assistant profile. Run
 `export MANYFORGE_AI_<NAME>=<token>` before starting the workbench. Prepare
-and Enable never refuse because of the model server (with the default warning/auto `endpoint` stream); its reachability is the
-component's `endpoint` stream warning.
+and Enable never refuse because of the model server; its reachability is the
+freshness of the component's `endpoint` stream, which only shows stale and
+never faults the component.
 
 The workbench always starts the assistant bridge on `127.0.0.1:8100`. The AI
 tab is enabled when the active Deployment has an AI model component; otherwise
@@ -298,7 +250,8 @@ Setup and checks: [`ASSISTANT_E2E_COOKBOOK.md`](ASSISTANT_E2E_COOKBOOK.md).
 `./scripts/compose-dev.sh build` downloads and builds the pinned dependencies;
 you do not install them yourself. The pins live in `scripts/setup-docker.sh`
 (RoboPlan, ProxSuite, TOPPRA) and `Dockerfile.ros-lyrical-full` (ROS 2
-Lyrical, controller overlay, xArm driver, `ur_msgs`, Python packages).
+Lyrical, controller overlay, `topic_based_ros2_control`, xArm driver,
+Python packages).
 [`../../NOTICE`](../../NOTICE) lists them with their licences, and
 `third_party/roboplan/README.md` records the RoboPlan source identity and
 patches.
@@ -336,10 +289,15 @@ For the cross-cutting symptom → cause → diagnostic-step matrix see
 [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md), and for startup problems the
 [workbench troubleshooting table](DEVELOPMENT_WORKBENCH.md#operation-and-troubleshooting).
 
-### Tree does not progress after `Run`
+### Tree does not progress after Execute
 
-Check, on the Composer API (`http://127.0.0.1:9020`):
+Every Program starts held: press **Run** on each motion group in the Motion
+panel. If it still does not progress, check, on the Composer API
+(`http://127.0.0.1:9020`):
 
+- Execute/Resume readiness and its blocked reasons via
+  `GET /api/program/readiness`
+- the cell latch via `GET /api/cell/latch`
 - cycle state and recovery offer via `GET /api/cycle/status`
 - current alarms via `GET /api/execution/alarms`
 - recent events via `GET /api/execution/history`

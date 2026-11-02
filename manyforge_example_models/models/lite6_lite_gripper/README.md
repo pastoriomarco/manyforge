@@ -1,14 +1,12 @@
 # UFACTORY Lite6 + Lite Pneumatic Gripper
 
-> **Current boundary:** this static, provenance-pinned model bundle remains
-> usable as authoring/qualification input. It does not provide native, Isaac,
-> or real-robot runtime availability. The generation command and runtime notes
-> below record the captured source revision; do not reinterpret them as a
-> current xArm checkout or runnable lane.
+This bundle has no `component.yaml` and isn't placed in a Deployment: it is
+the source of the split models `../lite6` (the arm) and `../lite_gripper` (the
+tool), which are placed as separate components with the tool mounted on the
+arm's `flange`. It holds their meshes, licenses and upstream sources.
 
-Self-contained ManyForge preview model for UFACTORY Lite6 with the lite
-pneumatic gripper. `lite6_lite_gripper.urdf` and
-`lite6_lite_gripper.srdf` are the canonical ManyForge-vendored robot model and
+Self-contained model of the UFACTORY Lite6 with the lite pneumatic gripper.
+`lite6_lite_gripper.urdf` and `lite6_lite_gripper.srdf` are the canonical ManyForge-vendored robot model and
 preserve the ManyMove/xarm semantics, including the sibling-finger mimic and
 the complete Lite6/lite-gripper SRDF groups.
 
@@ -31,12 +29,6 @@ Generation-time source:
 - Arguments: `prefix=''`, `robot_type=lite`, `dof=6`, `add_gripper=true`,
   `limited=true`, `ros2_control_plugin=isaac`
 
-Historical runtime boundary:
-
-- ManyForge native execution used this static mesh/model bundle only.
-- It does not require xarm_ros2, uf_ros_lib, MoveIt, or ROS at runtime.
-- Real-robot execution used xarm_ros2 externally through ROS 2 contracts.
-
 Notes:
 
 - Mesh URIs were rewritten from `package://xarm_description/...` to
@@ -50,9 +42,7 @@ Notes:
   joint. The canonical document declares URDF 1.2 so independent consumers
   recognize the standard acceleration attribute. The pinned raw MoveIt input is retained at:
   `upstream_source/xarm_moveit_config/config/lite6/joint_limits.yaml`.
-  Historical native ManyForge
-  did not load that YAML directly; current lanes consume its normalized model
-  meaning through the same retained model adapter.
+  ManyForge doesn't load that YAML: the limits are in the canonical URDF.
 - The xarm fixed base mesh link remains `link_base`; no `base_link` alias is
   inserted into the canonical model.
 - `STATIC_MANIFEST.json` records the generated URDF/SRDF/license/mesh file

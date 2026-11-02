@@ -21,7 +21,7 @@ def report(shutdown="unknown", effects="unknown"):
         "shutdown": shutdown,
         "effects": effects,
         "history_coverage": "not_imported",
-        "journal_families": ["program_cycle", "scene", "manager", "cclc", "kernel_operation"],
+        "journal_families": ["program_cycle", "scene", "manager", "kernel_operation"],
         "message": "Previous session preserved; Scene and Manager facts unknown. No old state was adopted. Previous journal events may be absent from History.",
     }
 

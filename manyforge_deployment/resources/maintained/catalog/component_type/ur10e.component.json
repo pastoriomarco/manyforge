@@ -67,18 +67,6 @@
           "capability_id": "planning.motion.pose_goal"
         },
         {
-          "capability_definition_revision": "sha256:14c53dad299a42d6604eac14240d015e22a4bc1adb363fb252111e62a2d2ad90",
-          "capability_id": "planning.profile.balanced"
-        },
-        {
-          "capability_definition_revision": "sha256:e0f578ef9af205b3c7c184fb1124ffb4fe3c35874b5e993358b43a2dc43d2674",
-          "capability_id": "planning.profile.first_feasible"
-        },
-        {
-          "capability_definition_revision": "sha256:7f570672270455207d5fb8eb210cd1dd22a99d7909421cf0dc8036c32e4beffb",
-          "capability_id": "planning.profile.quality_bounded"
-        },
-        {
           "capability_definition_revision": "sha256:1fde55ff59f977844d1e42a115df0e66305953803e7f2830fec4821e3cd36385",
           "capability_id": "planning.trajectory.time_parameterized"
         },
@@ -135,7 +123,7 @@
     "model_role_id": "arm_model"
   },
   "component_type_id": "ur10e.component",
-  "component_type_revision": "sha256:653bebb71c9ed33c5a06c390f6c6f4fe36ad7686375d38c3be1939969e68ea09",
+  "component_type_revision": "sha256:66f8f19149031aaab9aa0916455219e527c0fb78962676b777e574d86181adef",
   "model_mounts": [],
   "model_roles": [
     {

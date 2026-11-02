@@ -6,7 +6,6 @@
 
 export const OPERATOR_ALARM_REFUSAL_CODES = [
   'operator_alarm_interlock_active',
-  'unacknowledged_operator_alarms',
   'operator_alarm_state_unavailable',
 ] as const;
 
@@ -15,8 +14,6 @@ export type OperatorAlarmRefusalCode = typeof OPERATOR_ALARM_REFUSAL_CODES[numbe
 const GUIDANCE: Readonly<Record<OperatorAlarmRefusalCode, string>> = {
   operator_alarm_interlock_active:
     'Motion is blocked by an active alarm condition. Resolve its cause; acknowledging the alarm does not release it.',
-  unacknowledged_operator_alarms:
-    'Motion is blocked by unacknowledged alarms. Acknowledge them, then try again.',
   operator_alarm_state_unavailable:
     'Motion is blocked because the alarm state is unavailable. Wait until alarm monitoring recovers, then try again.',
 };
@@ -47,19 +44,11 @@ export function refusalMembershipConditionIds(value: unknown): string[] {
 
 /**
  * The operator message for an attention refusal, or null for any other code.
- * When an interlock and unacknowledged alarms both match, both remedies apply.
+ * Acknowledgement never gates motion (V2-5): only an alarm condition
+ * interlock or unavailable alarm state refuses it.
  */
 export function operatorAlarmRefusalMessage(
   code: string | null | undefined,
-  details?: Readonly<Record<string, unknown>> | null,
 ): string | null {
-  if (!isOperatorAlarmRefusalCode(code)) return null;
-  const guidance = GUIDANCE[code];
-  if (
-    code === 'operator_alarm_interlock_active'
-    && refusalMembershipConditionIds(details?.unacknowledged_alarms).length > 0
-  ) {
-    return `${guidance} Then acknowledge the unacknowledged alarms.`;
-  }
-  return guidance;
+  return isOperatorAlarmRefusalCode(code) ? GUIDANCE[code] : null;
 }

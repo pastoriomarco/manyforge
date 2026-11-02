@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useRef, useState, type MouseEvent } from 'react';
 
-import { DEACTIVATION_REQUIRED_STATES, type CCLCController } from '../hooks/useCCLC';
 import type { DeploymentWorkspaceController } from '../hooks/useDeploymentWorkspace';
 import type { ProgramRuntimeController } from '../hooks/useProgramRuntime';
 import type { ProgramWorkspaceController } from '../hooks/useProgramWorkspace';
 import type { ResetApplyController } from '../hooks/useResetApply';
 import { programActionUnavailableReason, programApplyScenarioReason } from '../state/authoringWorkspace';
+import { busyLabel, busyReason } from '../state/busyOperation';
 import {
   deploymentActionUnavailableReason,
   deploymentSavedDiffersFromApplied,
@@ -13,21 +13,8 @@ import {
   scenarioActionRoute,
   type ScenarioAction,
 } from '../state/documentStates';
-import { globalRulesReadingComponents } from '../utils/interruptAuthoring';
-import { DeploymentApplyImpactSummary } from './DeploymentDocumentControls';
+import { ApplyImpact } from './ApplyImpact';
 import { OverlayPanel } from './OverlayPanel';
-
-/** Changed components a confirmed Apply must deactivate first (Q107), read fresh. */
-interface DeactivationOffer {
-  token: string;
-  phase: 'reading' | 'ready' | 'deactivating' | 'awaiting_admission' | 'applying' | 'stopped';
-  /** The admission the last Disable used; Apply waits for a newer one. */
-  consumedAdmissionGeneration?: number | null;
-  identity: string | null;
-  /** In reverse activation order: the order Deactivate runs. */
-  components: Array<{ id: string; state: string; reasons: string[] }>;
-  message: string | null;
-}
 
 function actionTitle(action: ScenarioAction): string {
   switch (action) {
@@ -43,7 +30,9 @@ function actionTitle(action: ScenarioAction): string {
  * Each action covers every document with changes, whichever workspace is
  * shown: whenever the Deployment differs it carries the action, together with
  * the Program, as one activation; otherwise the Program-only path does, which
- * never changes components or the Scene. Discard is Draft-only.
+ * never changes components or the Scene. Discard is Draft-only. A Deployment
+ * Apply is the server's one Apply path (CONTRACTS §11): Preview, confirm the
+ * per-component impact, Apply; the server disables, applies and prepares.
  */
 export function ScenarioActionControls({
   program,
@@ -51,8 +40,6 @@ export function ScenarioActionControls({
   runtime,
   resetApply = null,
   localInvalidEdit = false,
-  cclc = null,
-  authoringAdmissionGeneration = null,
 }: {
   program: ProgramWorkspaceController;
   deployment: DeploymentWorkspaceController;
@@ -60,10 +47,6 @@ export function ScenarioActionControls({
   /** Apply while a Program run exists Resets it first (one confirmation). */
   resetApply?: ResetApplyController | null;
   localInvalidEdit?: boolean;
-  /** The ordinary component lifecycle owner: reads states and deactivates. */
-  cclc?: CCLCController | null;
-  /** The current authoring admission generation from the live status. */
-  authoringAdmissionGeneration?: number | null;
 }) {
   const [action, setAction] = useState<ScenarioAction | null>(null);
   const [applyRefusal, setApplyRefusal] = useState<string | null>(null);
@@ -75,9 +58,12 @@ export function ScenarioActionControls({
   // Program reasons: the same order the Program controls always used.
   const programBusy = program.state.status === 'loading'
     || (program.state.status === 'ready' && program.state.pendingAction !== null);
-  const programBusyReason = programBusy ? 'Another Program operation is in progress.' : null;
+  // The one operation in progress (any document's) names itself in the tooltips.
+  const operation = program.busyOperation ?? deployment.busyOperation;
+  const operationReason = busyReason(operation);
+  const programBusyReason = programBusy ? operationReason ?? 'Another Program operation is in progress.' : null;
   const programApplyCommon = programBusyReason ?? (resetsRun && resetApply !== null
-    ? resetApply.unavailableReason('program') : program.documentUnavailableReason);
+    ? resetApply.unavailableReason() : program.documentUnavailableReason);
   const currentScenario = runtime.state.currentScenario?.currentScenario ?? null;
   const currentScenarioUnavailable = programApplyScenarioReason(runtime.state.currentScenario);
   const invalidEditReason = localInvalidEdit ? 'Review or discard the invalid local field edit first.' : null;
@@ -96,9 +82,14 @@ export function ScenarioActionControls({
   };
 
   // Deployment reasons: the same order the Deployment controls always used.
-  const deploymentBusyReason = deployment.busy ? 'Another Deployment operation is in progress.' : null;
-  const deploymentApplyCommon = deploymentBusyReason ?? (resetsRun && resetApply !== null
-    ? resetApply.unavailableReason('deployment') : deployment.documentUnavailableReason);
+  const deploymentBusyReason = deployment.busy ? operationReason ?? 'Another Deployment operation is in progress.' : null;
+  // While a run exists the Deployment Apply Resets a stopped or held run first
+  // (AUD-4, one shared Reset and Apply); a finished run awaiting Reset is
+  // reset by the server's Apply itself (R3).
+  const deploymentResetsRun = resetApply?.deploymentRunReset === true;
+  const deploymentApplyCommon = deploymentBusyReason ?? (resetApply === null || !resetApply.runExists
+    ? deployment.documentUnavailableReason
+    : deploymentResetsRun ? resetApply.unavailableReason('deployment') : deployment.mutationUnavailableReason);
   // A Deployment Apply carries the Program Draft, which must be complete.
   const programIncomplete = programWorkspace?.draft.program === null
     ? programWorkspace.draft.diagnostics[0]?.message ?? 'Complete the Program Draft before Apply.'
@@ -144,10 +135,16 @@ export function ScenarioActionControls({
   const beginAction = (next: ScenarioAction, event: MouseEvent<HTMLButtonElement>) => {
     if (routes[next].target === null) return;
     returnFocus.current = event.currentTarget;
-    // A Deployment Apply without a run goes straight to Manager, which asks
-    // for the exact impact confirmation below.
-    if (next === 'apply' && routes.apply.target === 'deployment' && !resetsRun) {
+    // A Deployment Apply previews first; its impact is confirmed below. The
+    // server refuses it while a run is in progress (Reset first).
+    if (next === 'apply' && routes.apply.target === 'deployment') {
       void deployment.applyDraft();
+      return;
+    }
+    // A Deployment Revert is an Apply of the Saved Scenario: previewed and
+    // confirmed the same way.
+    if (next === 'revert' && routes.revert.target === 'deployment') {
+      void deployment.revert();
       return;
     }
     setAction(next);
@@ -157,7 +154,7 @@ export function ScenarioActionControls({
     const target = routes[action].target;
     if (target === null) return;
     if (action === 'apply' && resetsRun && resetApply !== null) {
-      void resetApply.confirm(target === 'deployment' ? 'deployment' : 'program').then((refusal) => {
+      void resetApply.confirm().then((refusal) => {
         if (refusal === null) closeAction();
         else setApplyRefusal(refusal);
       });
@@ -165,93 +162,33 @@ export function ScenarioActionControls({
     }
     closeAction();
     if (action === 'discard') program.discardScenario();
-    else if (action === 'revert') {
-      if (target === 'deployment') void deployment.revert();
-      else program.revert();
-    } else program.apply();
+    else if (action === 'revert') program.revert();
+    else program.apply();
   };
 
-  // The Deployment Apply confirmation: Manager's exact impact, and the changed
-  // components that must be deactivated first.
-  const pendingConfirmation = deployment.pendingApplyConfirmation;
-  // A confirmed Revert restores the Saved documents; it never applies the Draft.
-  const reverting = deployment.pendingConfirmationAction === 'revert';
-  const [deactivation, setDeactivation] = useState<DeactivationOffer | null>(null);
-  const confirmationToken = pendingConfirmation?.result.confirmationToken ?? null;
-  const changedComponents = pendingConfirmation?.result.candidatePreview?.impact.components
-    .filter((row) => row.disposition === 'replace' || row.disposition === 'remove') ?? [];
-  const changedKey = JSON.stringify(changedComponents);
-  useEffect(() => {
-    const changed = JSON.parse(changedKey) as typeof changedComponents;
-    if (confirmationToken === null || cclc === null || changed.length === 0) {
-      setDeactivation(null);
-      return undefined;
-    }
-    const token = confirmationToken;
-    const abort = new AbortController();
-    setDeactivation({ token, phase: 'reading', identity: null, components: [], message: null });
-    cclc.readActivationSequence(abort.signal).then((observation) => {
-      if (abort.signal.aborted) return;
-      const components = observation.components
-        .filter((component) => DEACTIVATION_REQUIRED_STATES.includes(component.lifecycleState))
-        .flatMap((component) => {
-          const row = changed.find((candidate) => candidate.controllable_component_id === component.controllableComponentId);
-          return row === undefined ? [] : [{
-            id: component.controllableComponentId, state: component.lifecycleState, reasons: row.replacement_reasons,
-          }];
-        })
-        .reverse();
-      setDeactivation({ token, phase: 'ready', identity: observation.identity, components, message: null });
-    }, (reason: unknown) => {
-      if (abort.signal.aborted) return;
-      setDeactivation({ token, phase: 'stopped', identity: null, components: [], message:
-        `Component states are unavailable (${reason instanceof Error ? reason.message : 'read failed'}); `
-        + 'Apply is refused if a changed component is still active.' });
-    });
-    return () => abort.abort();
-    // The offer belongs to one exact confirmation and impact.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [confirmationToken, changedKey, cclc === null]);
-  const offer = deactivation !== null && deactivation.token === confirmationToken ? deactivation : null;
-  const deactivationNeeded = offer !== null && offer.components.length > 0;
-  // Planned deactivation leaves a rule waiting for its source, never latched.
-  const waitingRules = deactivationNeeded
-    ? globalRulesReadingComponents(deploymentWorkspace?.draft.document ?? null, offer.components.map((row) => row.id))
-    : [];
-  // Each Disable consumes authoring admission: the Apply must be built from the
-  // latest controller once the live status shows a newer admission generation.
-  const latestDeployment = useRef(deployment);
-  latestDeployment.current = deployment;
-  const deactivateAndApply = async () => {
-    if (cclc === null || offer === null || offer.phase !== 'ready' || offer.identity === null) return;
-    setDeactivation({ ...offer, phase: 'deactivating', message: null });
-    const result = await cclc.deactivateComponents(offer.components.map((row) => row.id), offer.identity);
-    if (!result.succeeded) {
-      setDeactivation({ ...offer, phase: 'stopped',
-        message: 'Deactivation stopped; Apply was not sent. See component lifecycle details.' });
-      return;
-    }
-    setDeactivation({ ...offer, phase: 'awaiting_admission', message: null,
-      consumedAdmissionGeneration: result.consumedAdmissionGeneration });
-  };
-  const awaitingGeneration = offer?.phase === 'awaiting_admission' ? offer.consumedAdmissionGeneration ?? null : undefined;
-  useEffect(() => {
-    if (awaitingGeneration === undefined || deactivation === null) return;
-    if (awaitingGeneration !== null && (authoringAdmissionGeneration === null
-      || authoringAdmissionGeneration <= awaitingGeneration)) return;
-    if (latestDeployment.current.documentUnavailableReason !== null) return;
-    setDeactivation({ ...deactivation, phase: 'applying' });
-    void latestDeployment.current.confirmApply();
-  }, [authoringAdmissionGeneration, awaitingGeneration, deployment.documentUnavailableReason, deactivation]);
-  const cancelConfirmation = () => {
-    if (offer?.phase === 'deactivating') cclc?.cancelActivation();
-    setDeactivation(null);
+  // The Deployment Apply (or Revert) confirmation: its Preview.
+  const preview = deployment.applyPreview;
+  const reverting = deployment.applyPreviewKind === 'revert';
+  const previewResetsRun = deploymentResetsRun && !reverting && resetApply !== null;
+  const cancelPreview = () => {
+    setApplyRefusal(null);
     deployment.cancelApplyConfirmation();
   };
-  // A confirmed Revert is gated as a Revert of the Saved input, never as an Apply of the Draft.
+  const confirmPreview = () => {
+    if (preview === null) return;
+    if (!previewResetsRun || resetApply === null) {
+      void deployment.confirmApply();
+      return;
+    }
+    void resetApply.confirm('deployment', preview.scope).then((refusal) => {
+      if (refusal === null) {
+        setApplyRefusal(null);
+        deployment.cancelApplyConfirmation();
+      } else setApplyRefusal(refusal);
+    });
+  };
   const confirmationReason = reverting ? deploymentReasons.revert : deploymentReasons.apply;
 
-  const applying = deployment.applying || program.state.pendingAction === 'apply';
   const selected = action === null ? null : routes[action];
   const covers = (target: 'deployment' | 'program' | 'scenario' | null) => target === 'deployment'
     ? 'the Deployment and the Program'
@@ -264,20 +201,20 @@ export function ScenarioActionControls({
         disabled={routes.discard.target === null}
         title={routes.discard.reason ?? 'Discard unapplied Draft changes and return to Applied.'}
         onClick={(event) => beginAction('discard', event)}
-      >Discard</button>
+      >{busyLabel(operation, 'discard', 'Discard')}</button>
       <button
         type="button"
         disabled={routes.revert.target === null}
         title={routes.revert.reason ?? `Restore Draft and Applied to Saved: ${covers(routes.revert.target)}.`}
         onClick={(event) => beginAction('revert', event)}
-      >Revert</button>
+      >{busyLabel(operation, ['revert_preview', 'revert'], 'Revert')}</button>
       <button
         type="button"
         className="primary-action"
         disabled={routes.apply.target === null}
-        title={routes.apply.reason ?? `${resetsRun ? 'Reset the current run, then apply' : 'Apply'} ${covers(routes.apply.target)}.`}
+        title={routes.apply.reason ?? `${resetsRun && routes.apply.target === 'program' ? 'Reset the current run, then apply' : 'Apply'} ${covers(routes.apply.target)}.`}
         onClick={(event) => beginAction('apply', event)}
-      >{applying ? 'Applying' : 'Apply'}</button>
+      >{busyLabel(operation, ['apply_preview', 'apply'], 'Apply')}</button>
 
       <OverlayPanel
         open={action !== null}
@@ -303,11 +240,7 @@ export function ScenarioActionControls({
         )}
         {action === 'revert' && (
           <div className="dialog-copy compact-confirmation">
-            <p>
-              Replace the Draft and Applied with the Saved Scenario: {covers(routes.revert.target)}.
-              {routes.revert.target === 'deployment'
-                && ' Changed components must be inactive first; Manager refuses to change an active one.'}
-            </p>
+            <p>Replace the Draft and Applied with the Saved Scenario: {covers(routes.revert.target)}.</p>
             <div className="dialog-actions">
               <button type="button" className="primary-action" disabled={routes.revert.target === null} onClick={confirm}>Revert to saved</button>
             </div>
@@ -335,12 +268,6 @@ export function ScenarioActionControls({
                 <span>{programWorkspace?.applicability.unavailableReason?.message}</span>
               </div>
             )}
-            {routes.apply.target === 'deployment' && (
-              <p>
-                Apply the Deployment and Program Drafts to runtime? Manager confirms any
-                disruptive impact before it changes components.
-              </p>
-            )}
             {resetsRun && <ResetsRunWarning />}
             {applyRefusal !== null && <p role="alert">{applyRefusal}</p>}
             <div className="dialog-actions">
@@ -352,83 +279,34 @@ export function ScenarioActionControls({
         )}
       </OverlayPanel>
 
-      {pendingConfirmation !== null && (
+      {deployment.applyConfirmationOpen && (
         <OverlayPanel
           open
-          title={deactivationNeeded
-            ? `Deactivate components and ${reverting ? 'revert' : 'apply'}?`
-            : reverting ? 'Revert Deployment configuration?' : 'Apply Deployment configuration change?'}
+          title={reverting ? 'Revert Deployment to saved?' : 'Apply Deployment configuration change?'}
           titleId="deployment-apply-confirmation-title"
           kind="dialog"
-          onClose={cancelConfirmation}
+          onClose={cancelPreview}
           compact
         >
           <div className="dialog-copy transport-confirmation">
-            {confirmationReason !== null && <p role="status">{confirmationReason}</p>}
-            {deactivationNeeded ? <>
-              <p>This {reverting ? 'Revert' : 'Apply'} changes these components, which must be inactive first:</p>
-              <ul>{offer.components.map((row) => (
-                <li key={row.id}>
-                  {row.id} ({row.state}){row.reasons.length > 0 && ` · changed: ${row.reasons.join(', ')}`}
-                </li>
-              ))}</ul>
-              <p>
-                Deactivate disables them in reverse Deployment order, then {reverting
-                  ? 'restores the Saved Deployment and Saved Program'
-                  : 'applies this exact Deployment Draft'}.
-                Changed and new components stay inactive; activate them separately.
-                {' '}Running operations remain protected by Manager admission.
-              </p>
-              {waitingRules.map((rule) => (
-                <p key={rule.ruleId}>
-                  Global rule {rule.ruleId} will wait for its source ({rule.componentIds.join(', ')} inactive):
-                  {' '}motion in its scope stays blocked until {rule.componentIds.length === 1 ? 'it is' : 'they are'} active again.
-                </p>
-              ))}
-            </> : (
-              <p>
-                {reverting
-                  ? 'Restoring the Saved Deployment and Saved Program changes the cell configuration.'
-                  : 'Applying this exact Deployment Draft changes the cell configuration.'} Changed or removed components must be inactive before Apply: deactivate them in Components first. New components start inactive; activate them separately.
-                {' '}Running operations remain protected by Manager admission.
-              </p>
-            )}
-            {offer?.phase === 'reading' && <p role="status">Reading component states…</p>}
-            {offer?.phase === 'deactivating' && <p role="status">{cclc?.activationProgress ?? 'Deactivating components…'}</p>}
-            {offer?.phase === 'awaiting_admission' && <p role="status">Components deactivated; waiting for updated backend authoring permissions…</p>}
-            {offer?.message != null && <p className="inline-message severity-error" role="alert">{offer.message}</p>}
-            {pendingConfirmation.result.candidatePreview !== null && (
-              <DeploymentApplyImpactSummary
-                impact={pendingConfirmation.result.candidatePreview.impact}
-              />
-            )}
-            <p>
-              <strong>{pendingConfirmation.result.preparedActivation.deploymentArtifactId}</strong>
-              {' · '}
-              <code>{pendingConfirmation.result.preparedActivation.deploymentRevision}</code>
-            </p>
+            {preview !== null && confirmationReason !== null && <p role="status">{confirmationReason}</p>}
+            {reverting && <p>Both Drafts return to the Saved Scenario, which is applied.</p>}
+            {preview === null
+              ? <p className="inline-message severity-info" role="status">Previewing impact…</p>
+              : <ApplyImpact preview={preview} />}
+            {previewResetsRun && <ResetsRunWarning />}
+            {previewResetsRun && applyRefusal !== null && <p role="alert">{applyRefusal}</p>}
             <div className="dialog-actions">
-              <button type="button" onClick={cancelConfirmation}>Cancel</button>
-              {deactivationNeeded ? (
-                <button
-                  type="button"
-                  className="danger-button"
-                  disabled={confirmationReason !== null || offer.phase !== 'ready'}
-                  title={deploymentApplyCommon ?? 'Deactivate the listed components, then apply the validated Deployment.'}
-                  onClick={() => { void deactivateAndApply(); }}
-                >{offer.phase === 'deactivating' ? 'Deactivating'
-                  : offer.phase === 'awaiting_admission' || offer.phase === 'applying' || deployment.applying
-                    ? 'Applying Deployment' : reverting ? 'Deactivate and revert' : 'Deactivate and apply'}</button>
-              ) : (
-                <button
-                  type="button"
-                  className="primary-action"
-                  disabled={confirmationReason !== null || offer?.phase === 'reading'}
-                  title={deploymentApplyCommon ?? 'Apply the validated Deployment to runtime.'}
-                  onClick={() => { void deployment.confirmApply(); }}
-                >{deployment.applying ? 'Applying Deployment'
-                  : reverting ? 'Confirm revert' : 'Confirm apply'}</button>
-              )}
+              <button type="button" onClick={cancelPreview}>Cancel</button>
+              <button
+                type="button"
+                className="primary-action"
+                disabled={preview === null || confirmationReason !== null}
+                title={preview === null ? 'Previewing impact…' : deploymentApplyCommon
+                  ?? 'Apply the Deployment: affected components are disabled, applied and prepared again.'}
+                onClick={confirmPreview}
+              >{deployment.applying ? 'Applying Deployment' : reverting ? 'Confirm revert'
+                : previewResetsRun ? 'Reset run and Apply' : 'Confirm apply'}</button>
             </div>
           </div>
         </OverlayPanel>

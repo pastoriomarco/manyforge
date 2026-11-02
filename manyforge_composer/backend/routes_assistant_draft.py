@@ -513,7 +513,11 @@ def create_assistant_draft_router(state: ComposerState) -> APIRouter:
             except _CallbackValidationResult as result_error:
                 return result_error.response
             except DraftSessionError as error:
-                draft_error(body, error, validation_as_result=True)
+                # A refused edit is the callback's validation result, not a 500.
+                try:
+                    draft_error(body, error, validation_as_result=True)
+                except _CallbackValidationResult as result_error:
+                    return result_error.response
             except AuthoringWorkspaceError as error:
                 raise _http_error(error) from error
             program = commit.snapshot.as_dict()["program"]

@@ -2,28 +2,35 @@
  * Apply while a Program run exists: the ordinary Reset, then the ordinary
  * Apply (maintainer, 2026-10-02).
  *
- * The Draft (Program, Scene or Deployment) may be edited while a run is held
- * with all its motion stopped. Its edits reach the robot only through Apply,
- * and Apply first ends the run: after one informed confirmation the browser
+ * The Program Draft (Scene included) may be edited while a run is held with
+ * all its motion stopped. Its edits reach the robot only through Apply, and
+ * Apply first ends the run: after one informed confirmation the browser
  * sends the exact-identity Reset, observes that Reset's correlated cycle Idle
  * (a receipt is never settlement) and authoring admission, then sends the
  * ordinary Apply of exactly the confirmed Draft revision and follows it with
  * the existing Apply tracker. Nothing is Saved, Executed, Run, resumed or
- * replayed automatically.
+ * replayed automatically. The Deployment Apply uses the same chain while a
+ * run is stopped or held (the server refuses it during a run, CONTRACTS §11);
+ * a finished run awaiting Reset is reset by the server's Apply itself.
  */
 import type {
   ManagerApplyStatus,
   ProgramCycleStatus,
   ResetApplyContext,
 } from '../types/api';
-import {
-  ACTIVATION_SCOPE_CHANGED,
-  sameActivationScope,
-  type DeploymentActivationScope,
-} from './activationScope';
+import type { ComposerHeadlessState } from '../types/headless';
 import { applyMayHaveActed, type ManagerApplyIdentity } from './managerApply';
 
 export type ResetApplyDocument = 'program' | 'deployment';
+
+/**
+ * A Deployment Apply must Reset the run first: one exists and isn't a
+ * finished run awaiting Reset, which the server's Apply resets itself (R3).
+ */
+export function deploymentApplyResetsRun(snapshot: ComposerHeadlessState | null): boolean {
+  return snapshot !== null
+    && !['idle_after_reset', 'terminal_awaiting_reset'].includes(snapshot.programCycle.state);
+}
 
 /** Everything confirmed at once: the run Reset ends and the Draft Applied. */
 export interface ResetApplyPlan {
@@ -37,12 +44,10 @@ export interface ResetApplyPlan {
   draftRevision: number;
   /** The Program revision (Program) or Deployment revision of the Draft. */
   draftContentRevision: string | null;
-  /** The Applied revision of the same document; it must not change. */
+  /** The Applied revision of the document; it must not change. */
   appliedRevision: string | null;
-  /** Deployment only: the complete activation input confirmed (the
-   * Deployment Draft, the Program Draft it compiles with, the role
-   * assignment and the source document). Null for a Program Apply. */
-  activationScope: DeploymentActivationScope | null;
+  /** Deployment only: the confirmed Preview's scope, sent with its Apply. */
+  scope: Record<string, unknown> | null;
 }
 
 export function resetApplyContext(plan: ResetApplyPlan): ResetApplyContext {
@@ -88,9 +93,6 @@ export type ResetApplyPhase =
     sent: boolean;
   }
   | { kind: 'awaiting_apply'; apply: ManagerApplyIdentity }
-  /** The Manager reported a disruptive Deployment change: the ordinary
-   * Apply confirmation now asks the operator; this chain is done. */
-  | { kind: 'confirmation_required' }
   | { kind: 'applied'; apply: ManagerApplyIdentity | null }
   | {
     kind: 'failed';
@@ -120,11 +122,6 @@ export interface ResetApplyFacts {
   /** The document's current Applied revision, null while not projected. */
   appliedRevision: string | null;
   activation: Pick<ManagerApplyStatus, 'applyId' | 'applyGeneration' | 'state' | 'failure'> | null;
-  /** Deployment only: the current complete activation input. */
-  activationScope: DeploymentActivationScope | null;
-  /** The Apply accepted after the operator confirmed a disruptive impact,
-   * when it carries this chain's correlation. */
-  correlatedApply: ManagerApplyIdentity | null;
 }
 
 export type ResetApplyStep =
@@ -205,17 +202,7 @@ export function nextResetApplyStep(
     if (facts.appliedRevision !== plan.appliedRevision) {
       return failed('apply', 'The Applied configuration changed after Reset. Apply was not sent; review the Draft and Apply again.');
     }
-    if (
-      plan.activationScope !== null
-      && !sameActivationScope(plan.activationScope, facts.activationScope)
-    ) {
-      return failed('apply', `${ACTIVATION_SCOPE_CHANGED} Apply was not sent; the Draft keeps its edits.`);
-    }
     return { kind: 'send_apply' };
-  }
-  if (phase.kind === 'confirmation_required' && facts.correlatedApply !== null) {
-    // The operator confirmed the impact: follow that Apply to settlement.
-    return { kind: 'phase', phase: { kind: 'awaiting_apply', apply: facts.correlatedApply } };
   }
   if (phase.kind === 'awaiting_apply') {
     const status = facts.activation;
@@ -250,7 +237,6 @@ export function resetApplyPhaseText(phase: ResetApplyPhase): string {
       : 'Reset delivery unknown: reconciling from the observed cycle. Reset is not resent, and nothing is Applied until its settlement is observed.';
     case 'applying': return phase.sent ? 'Applying the Draft…' : 'Idle reached; waiting for authoring admission to Apply.';
     case 'awaiting_apply': return `Apply ${phase.apply.applyId} accepted; waiting for activation to settle.`;
-    case 'confirmation_required': return 'Reset done. The Deployment change needs your confirmation of its impact before Apply.';
     case 'applied': return 'Applied; awaiting Execute/Run; not saved to Scenario.';
     case 'failed': return phase.message;
   }
@@ -260,11 +246,9 @@ export function resetApplyPhaseText(phase: ResetApplyPhase): string {
  * dismissing only stops following and never undoes, resends or resumes. */
 export function resetApplyDismissible(phase: ResetApplyPhase): boolean {
   return phase.kind === 'applied' || phase.kind === 'failed'
-    || phase.kind === 'confirmation_required'
     || (phase.kind === 'awaiting_idle' && phase.delivery === 'unconfirmed');
 }
 
 export function resetApplyTerminal(phase: ResetApplyPhase): boolean {
-  return phase.kind === 'applied' || phase.kind === 'failed'
-    || phase.kind === 'confirmation_required';
+  return phase.kind === 'applied' || phase.kind === 'failed';
 }

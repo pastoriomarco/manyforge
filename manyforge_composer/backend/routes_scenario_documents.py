@@ -5,10 +5,11 @@ from __future__ import annotations
 from copy import deepcopy
 import hashlib
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, Callable, NoReturn
 import uuid
 
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from manyforge_behavior.program import Program, TcpEndpointAliasAmbiguous
 from manyforge_behavior.canonical_artifact import canonical_json_bytes, raw_sha256_digest
@@ -49,9 +50,16 @@ from .authoring_workspace_fence import (
 )
 from .deployment_draft import DeploymentDraftError
 from .draft_session import DraftSessionError
+from .apply_orchestration import Preview, candidate_preview, recorded_apply
+from .deployment_defaults import with_defaults
 from .routes_deployment_draft import (
+    SERVER_REQUEST_OWNER_EPOCH,
+    HeadlessApplyPorts,
     _workspace as deployment_workspace,
+    apply_slot,
+    orchestrated_apply,
     prepare_deployment_discard,
+    server_admission_generation,
 )
 from .routes_draft import _workspace as program_workspace, prepare_program_discard
 from .scenario_artifacts import (
@@ -132,14 +140,48 @@ class SaveScenarioDocumentRequest(_ScenarioFence):
 
 
 class LoadScenarioDocumentRequest(_ScenarioFence):
+    """The fence of one server-run Load, built by :func:`_server_load_request`."""
+
     path: str = Field(min_length=1, max_length=4096)
-    confirm_discard: bool = Field(default=False, alias="confirmDiscard")
 
 
-class NewScenarioDocumentRequest(_ScenarioFence):
-    """Load the built-in, read-only empty Untitled Scenario."""
+class ScenarioLoadRequest(BaseModel):
+    """CONTRACTS §11 `POST /api/scenario/load` body. With an unsaved Draft the
+    Load is refused unless the caller confirms `discard_unsaved`."""
 
-    confirm_discard: bool = Field(default=False, alias="confirmDiscard")
+    model_config = _DTO
+
+    path: str = Field(min_length=1, max_length=4096)
+    discard_unsaved: bool = False
+
+
+class ScenarioEmptyRequest(BaseModel):
+    """CONTRACTS §11 `POST /api/scenario/new` body: refused with
+    an unsaved Draft unless the caller confirms `discard_unsaved`."""
+
+    model_config = _DTO
+
+    discard_unsaved: bool = False
+
+
+def _server_load_request(
+    state: ComposerState, path: str, identity: AuthoringWorkspaceIdentity
+) -> LoadScenarioDocumentRequest:
+    """The captured Drafts and workspace and the current admission, as the
+    fence of a Load."""
+
+    return LoadScenarioDocumentRequest(
+        path=path,
+        draft_id=identity.program_draft_id,
+        expected_draft_revision=identity.program_draft_revision,
+        deployment_draft_id=identity.deployment_draft_id,
+        expected_deployment_draft_revision=identity.deployment_draft_revision,
+        expected_workspace_epoch=identity.workspace_epoch,
+        expected_workspace_revision=identity.workspace_revision,
+        expected_admission_generation=server_admission_generation(state),
+        request_owner_epoch=SERVER_REQUEST_OWNER_EPOCH,
+        request_id=f"composer-server.{uuid.uuid4()}",
+    )
 
 
 class DiscardScenarioRequest(_ScenarioFence):
@@ -543,29 +585,81 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
             "workspace": workspace,
         }
 
-    @router.post("/api/scenario-documents/load")
-    def load_document(body: LoadScenarioDocumentRequest) -> dict[str, Any]:
-        return activate_document(body)
+    @router.post("/api/scenario/load", response_model=None)
+    def load_document(body: ScenarioLoadRequest) -> dict[str, Any] | JSONResponse:
+        """New, then Apply of the file (CONTRACTS §11); returns ApplyResult.
 
-    @router.post("/api/scenario-documents/new")
-    def new_document(body: NewScenarioDocumentRequest) -> dict[str, Any]:
-        # New is the ordinary Load of the built-in empty Untitled Scenario.
-        return activate_document(LoadScenarioDocumentRequest(
-            **body.model_dump(), path=str(UNTITLED_SCENARIO_PATH)
-        ))
+        The file is read and checked first, so one that can't be loaded
+        leaves the cell as it is. Then the New (an Apply of the empty cell,
+        with the unsaved-Draft protection) removes every component, and the
+        Apply of the file adds and prepares each one fresh. A failed New is
+        the Load's result.
 
-    def activate_document(body: LoadScenarioDocumentRequest) -> dict[str, Any]:
-        committed_path: str | None = None
+        A Load whose workspace install failed contains the workspace: the
+        status stays 503 and the body is the failed ApplyResult.
+        """
+        def run() -> dict[str, Any] | JSONResponse:
+            try:
+                with apply_slot():
+                    return activate_document(
+                        body.path,
+                        # The New removes every component; the Apply of the file
+                        # then adds and prepares each one fresh.
+                        discard_unsaved=True,
+                        empty_first=lambda: activate_document(
+                            str(UNTITLED_SCENARIO_PATH),
+                            discard_unsaved=body.discard_unsaved,
+                        ),
+                    )
+            except (AuthoringWorkspaceError, HTTPException) as error:
+                detail = getattr(error, "detail", None)
+                code = getattr(error, "code", None) or (
+                    detail.get("code") if isinstance(detail, dict) else None)
+                if code != "composer_workspace_failed_closed":
+                    raise
+                message = (detail.get("message") if isinstance(detail, dict)
+                           and isinstance(detail.get("message"), str) else str(error))
+                return JSONResponse(status_code=503, content={
+                    "outcome": "failed",
+                    "components": [],
+                    "error": {"code": code, "message": message},
+                })
+
+        return recorded_apply(state.headless_client, "scenario_load", run)
+
+    @router.post("/api/scenario/new")
+    def new_document(body: ScenarioEmptyRequest) -> dict[str, Any]:
+        """Apply of the empty cell (the built-in Untitled Scenario); the
+        Scene is initialized. R3: New always works."""
+
+        def run() -> dict[str, Any]:
+            with apply_slot():
+                return activate_document(
+                    str(UNTITLED_SCENARIO_PATH), discard_unsaved=body.discard_unsaved
+                )
+
+        return recorded_apply(state.headless_client, "scenario_new", run)
+
+    def activate_document(
+        path: str,
+        *,
+        discard_unsaved: bool,
+        empty_first: Callable[[], dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """One orchestrated Apply of a Scenario document (apply_orchestration).
+        The caller holds the Apply slot. ``empty_first`` (Load) runs the New
+        once the document is read and checked; a failed New is returned.
+
+        Every Apply initializes the Scene. The workspace (Program and
+        Deployment Drafts, Saved baselines, project facts) is replaced in one
+        fenced commit right before the Manager submission.
+        """
         committed_snapshot = None
-        activation: dict[str, Any] | None = None
         effects = OperationEffects()
         try:
-            _require_fence(state, body)
-            captured_workspace = state.authoring_workspace.snapshot()
-            _require_captured_workspace_fence(body, captured_workspace.identity)
             authoring_catalog = state.node_catalog
             (scenario_document, source_path, source_digest, source_diagnostics) = capture_scenario_artifact_with_diagnostics(
-                body.path, allowed_roots=state.allowed_fs_roots)
+                path, allowed_roots=state.allowed_fs_roots)
             scenario_document_id = scenario_document["scenario_id"]
             authoring = scenario_document["program_draft"]
             deployment = deepcopy(scenario_document["deployment_draft"])
@@ -622,6 +716,15 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                     "Scenario Load requires the configured Manager",
                     status_code=503,
                 )
+            if empty_first is not None:
+                emptied = empty_first()
+                if emptied["outcome"] != "succeeded":
+                    return emptied
+            captured_workspace = state.authoring_workspace.snapshot()
+            body = _server_load_request(state, path, captured_workspace.identity)
+            # Absent defaulted fields are filled only in what is compiled; the
+            # Drafts keep the document as authored.
+            deployment = with_defaults(deployment)
             source_closure = capture_deployment_model_sources(
                 deployment, project_root=Path(source_path)
             )
@@ -641,45 +744,45 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                     }
                 )
             )
-            manager_status = state.headless_client.manager_status()
-            _require_scenario_closed(state, manager_status)
-            bundle, graph, _epoch = state._manager_current(
-                manager_status, phase="scenario_load.preview"
-            )
-            activation_intent: dict[str, Any] = {
-                "scene_initialization": "initialize",
-                "scenario_id": scenario_document["scenario_id"],
-                "project_path": project_path,
-                "source_document_digest": source_digest,
-                "captured_input_digest": captured_digest,
-                "deployment": deepcopy(deployment),
-                "model_source_closure": source_closure,
-                "program": program.to_dict() if program is not None else None,
-                "program_authoring": deepcopy(authoring),
-                "program_role_assignment": assignment,
-                "expected_manager_current": {
-                    "retained_bundle_id": bundle,
-                    "graph_revision": graph,
-                },
-                "expected_admission_generation": body.expected_admission_generation,
-                "manager_request_id": "scenario-document-activation-"
-                + hashlib.sha256(
-                    f"{body.request_owner_epoch}:{body.request_id}".encode()
-                ).hexdigest()[:32],
-                "correlation_id": body.request_id,
-                "confirmation_token": None,
-                "draft_id": body.draft_id,
-                "draft_revision": body.expected_draft_revision,
-            }
-            # Load is the operator's deliberate confirmation to replace the
-            # current Scenario and activate this exact captured candidate, so
-            # its one preparation already accepts a disruptive or destructive
-            # impact. Manager rechecks the exact preview receipt and current
-            # publication when it accepts the operation.
-            activation_preview = state.execute_authored_deployment_candidate(
-                activation_intent, None, apply=True, prepare_only=True,
-                confirmed=True,
-            )
+            client = state.headless_client
+
+            def activation_intent(generation: int) -> dict[str, Any]:
+                bundle, graph, _epoch = state._manager_current(
+                    client.manager_status(), phase="scenario_load.preview"
+                )
+                return {
+                    "scene_initialization": "initialize",
+                    "scenario_id": scenario_document["scenario_id"],
+                    "project_path": project_path,
+                    "source_document_digest": source_digest,
+                    "captured_input_digest": captured_digest,
+                    "deployment": deepcopy(deployment),
+                    "model_source_closure": source_closure,
+                    "program": program.to_dict() if program is not None else None,
+                    "program_authoring": deepcopy(authoring),
+                    "program_role_assignment": assignment,
+                    "expected_manager_current": {
+                        "retained_bundle_id": bundle,
+                        "graph_revision": graph,
+                    },
+                    "expected_admission_generation": generation,
+                    "manager_request_id": "scenario-document-activation-"
+                    + hashlib.sha256(
+                        f"{body.request_owner_epoch}:{body.request_id}".encode()
+                    ).hexdigest()[:32],
+                    "correlation_id": body.request_id,
+                    "confirmation_token": None,
+                    "draft_id": body.draft_id,
+                    "draft_revision": body.expected_draft_revision,
+                }
+
+            def prepare(intent: dict[str, Any]) -> dict[str, Any]:
+                # The request is the operator's confirmation to replace the
+                # current Scenario with this exact candidate.
+                return state.execute_authored_deployment_candidate(
+                    intent, None, apply=True, prepare_only=True, confirmed=True,
+                )
+
             # Both retained Draft replacements are validated outside every
             # owner lock, and the whole load commits as one workspace
             # replacement: the successor Program and Deployment identities and
@@ -712,20 +815,9 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                     "Scenario Load requires authoring admission",
                     status_code=503,
                 )
-            activation_prepared: dict[str, Any] | None = None
+            current: dict[str, Any] = {}
 
-            def validate_load(claim: dict[str, Any]) -> None:
-                nonlocal activation_prepared
-                acquired_generation = claim.get("acquired_admission_generation")
-                if type(acquired_generation) is not int or acquired_generation < 1:
-                    raise ScenarioArtifactError(
-                        "scenario_activation_claim_invalid",
-                        "Authoring claim omitted its acquired admission generation",
-                        status_code=503,
-                    )
-                _require_captured_workspace_fence(
-                    body, state.authoring_workspace.identity()
-                )
+            def require_discard_confirmed() -> None:
                 current_program = state.draft_session.retained_state()
                 current_deployment = state.deployment_draft_session.retained_state()
                 has_unsaved_drafts = (
@@ -743,13 +835,26 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 if (
                     has_unsaved_drafts
                     and not state.current_drafts_match_remembered_scenario()
-                    and not body.confirm_discard
+                    and not discard_unsaved
                 ):
                     raise ScenarioArtifactError(
                         "scenario_discard_confirmation_required",
                         "Loading would replace unsaved Program or Deployment Draft changes",
                         status_code=409,
                     )
+
+            def validate_load(claim: dict[str, Any]) -> None:
+                acquired_generation = claim.get("acquired_admission_generation")
+                if type(acquired_generation) is not int or acquired_generation < 1:
+                    raise ScenarioArtifactError(
+                        "scenario_activation_claim_invalid",
+                        "Authoring claim omitted its acquired admission generation",
+                        status_code=503,
+                    )
+                _require_captured_workspace_fence(
+                    body, state.authoring_workspace.identity()
+                )
+                require_discard_confirmed()
                 # Preparation and Manager preview are effect-free and belong
                 # to the idle generation in the claim intent. Re-preparing
                 # after acquisition is invalid: the claim deliberately closes
@@ -758,7 +863,7 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                 current_bundle, current_graph, _ = state._manager_current(
                     state.headless_client.manager_status(), phase="scenario_load.claim"
                 )
-                if activation_intent["expected_manager_current"] != {
+                if current["intent"]["expected_manager_current"] != {
                     "retained_bundle_id": current_bundle,
                     "graph_revision": current_graph,
                 }:
@@ -767,10 +872,9 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                         "Deployment preview changed before the workspace commit",
                         status_code=409,
                     )
-                activation_prepared = activation_preview
 
             def commit_load() -> None:
-                nonlocal committed_path, committed_snapshot
+                nonlocal committed_snapshot
                 committed_snapshot = state.authoring_workspace.replace(
                     expected_identity=captured_workspace.identity,
                     install=install_load,
@@ -782,101 +886,92 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
                     ),
                     notify=False,
                 )
-                committed_path = source_path
                 # An opened Scenario supersedes a refused startup project.
                 state.startup_scenario_notice = None
 
             def submit_load(claim: dict[str, Any]) -> dict[str, Any]:
-                nonlocal activation
-                if activation_prepared is None:
-                    raise ScenarioArtifactError(
-                        "scenario_activation_preparation_missing",
-                        "Scenario Load candidate was not validated under its claim",
-                        status_code=503,
-                    )
-                activation = state.execute_authored_deployment_candidate(
-                    activation_intent,
+                return state.execute_authored_deployment_candidate(
+                    current["intent"],
                     claim,
                     apply=True,
-                    prepared=activation_prepared,
+                    prepared=current["prepared"],
                 )
-                return activation
 
-            activation = coordinator.execute_external_submission(
-                body.admission_envelope(),
-                operation_kind="load_scenario_document",
-                draft_id=body.draft_id,
-                draft_revision=body.expected_draft_revision,
-                payload={
-                    "path": source_path,
-                    "source_document_digest": source_digest,
-                    "captured_input_digest": captured_digest,
-                    "scenario_content_digest": _document_content_digest(
-                        scenario_document
-                    ),
-                },
-                validate_under_claim=validate_load,
-                submit=submit_load,
-                commit_before_submit=commit_load,
-                workspace=state.authoring_workspace,
-                after_release=state.authoring_workspace.publish_commit_wake,
-                effects=effects,
-            )
-            workspace = program_workspace(state)
+            class _LoadPorts(HeadlessApplyPorts):
+                def preview(self) -> Preview:
+                    intent = activation_intent(body.expected_admission_generation)
+                    return candidate_preview(prepare(intent).get("candidate_preview"))
+
+                def apply(self) -> None:
+                    # Disabling components may advance the admission
+                    # generation: prepare and claim under the current one.
+                    generation = client.authoring_admission().get(
+                        "admission_generation"
+                    )
+                    current["intent"] = activation_intent(generation)
+                    current["prepared"] = prepare(current["intent"])
+                    activation = coordinator.execute_external_submission(
+                        AuthoringMutationEnvelope(
+                            expected_admission_generation=generation,
+                            request_owner_epoch=body.request_owner_epoch,
+                            request_id=body.request_id,
+                        ),
+                        operation_kind="load_scenario_document",
+                        draft_id=body.draft_id,
+                        draft_revision=body.expected_draft_revision,
+                        payload={
+                            "path": source_path,
+                            "source_document_digest": source_digest,
+                            "captured_input_digest": captured_digest,
+                            "scenario_content_digest": _document_content_digest(
+                                scenario_document
+                            ),
+                        },
+                        validate_under_claim=validate_load,
+                        submit=submit_load,
+                        commit_before_submit=commit_load,
+                        workspace=state.authoring_workspace,
+                        after_release=state.authoring_workspace.publish_commit_wake,
+                        effects=effects,
+                    )
+                    self.wait_for_manager_apply(activation)
+                    if program is None:
+                        self.wait_for_scene_clear(activation)
+
+            # Unsaved Drafts are refused before any component is touched.
+            require_discard_confirmed()
+            if path == str(UNTITLED_SCENARIO_PATH):
+                # New always works (R3, N7): a failed Apply that still holds
+                # the cell, whatever it changed, is released; this New then
+                # stops and removes everything the host has.
+                try:
+                    release = client.manager_apply_release_for_new({
+                        "request_id": f"composer-new.{uuid.uuid4()}",
+                        "source_label": "manyforge_composer",
+                    })
+                except HeadlessClientError as error:
+                    if error.details.get("effect") != "none":
+                        effects.submitted()
+                    raise
+                if release.get("released") is not None:
+                    effects.submitted()
+            result = orchestrated_apply(_LoadPorts(state, deployment))
             return {
-                "status": activation["status"],
-                "activation": activation,
+                **result,
                 "diagnostics": diagnostics,
                 "source_diagnostics": source_diagnostics,
                 "path": source_path,
                 "scenario_id": scenario_document_id,
-                "incomplete": False,
-                "workspace": workspace,
-                # The exact composite post-image this Load committed, as
-                # every other authoring route returns it (not its identity).
-                "authoringWorkspace": committed_snapshot.as_dict(),
+                "workspace": program_workspace(state),
+                # The composite post-image this Load committed, or the current
+                # one when the Apply failed before the workspace commit.
+                "authoringWorkspace": (
+                    committed_snapshot.as_dict()
+                    if committed_snapshot is not None
+                    else state.authoring_workspace.snapshot().as_dict()
+                ),
             }
         except Exception as error:
-            if committed_path is not None and committed_snapshot is not None:
-                # The local workspace was committed before Manager submission.
-                # Preserve that observable partial result; never report Load as
-                # complete or silently roll it back when Manager rejects or its
-                # acceptance cannot be observed.
-                if getattr(error, "code", None) == "manager_apply_rejected":
-                    raise HTTPException(
-                        status_code=409,
-                        detail={
-                            "code": "manager_apply_rejected",
-                            "message": (
-                                "The Scenario workspace was replaced, but "
-                                f"{error}. Refresh the workspace before another action."
-                            ),
-                            "path": committed_path,
-                            "managerOutcome": "rejected",
-                            "causeCode": "manager_apply_rejected",
-                            "workspace": committed_snapshot.identity.as_dict(),
-                        },
-                    ) from error
-                manager_outcome = (
-                    "accepted"
-                    if isinstance(activation, dict)
-                    and activation.get("status") == "accepted"
-                    else "applied"
-                    if isinstance(activation, dict)
-                    and activation.get("status") == "applied"
-                    else "not_confirmed"
-                )
-                raise HTTPException(
-                    status_code=503,
-                    detail={
-                        "code": "scenario_load_activation_not_confirmed",
-                        "message": "The Scenario workspace was replaced, but Manager activation was not confirmed in this response. Inspect Manager operation status and refresh the workspace before retrying.",
-                        "path": committed_path,
-                        "managerOutcome": manager_outcome,
-                        "causeCode": getattr(error, "code", None),
-                        "workspace": committed_snapshot.identity.as_dict(),
-                    },
-                ) from error
             raise_operation_failure(error, effects, _raise)
 
     @router.post("/api/scenario-documents/export")
@@ -996,55 +1091,52 @@ def create_scenario_document_router(state: ComposerState) -> APIRouter:
     return router
 
 
-def _require_scenario_closed(
-    state: ComposerState, manager_status: dict[str, Any]
-) -> None:
-    """Every Load (also New's) starts only after the current owner proves Close.
+def require_empty_cell(state: ComposerState) -> None:
+    """Startup never replaces an applied Scenario (as M7): the Manager's
+    current cell must be empty (no model instances, no components)."""
 
-    The proof comes from the same current Manager head used for preview. A
-    Load of the Scenario that is currently applied is no exception: Load
-    never reapplies over a current Scenario.
-    """
-    # Existing freshness/identity checks.
-    state._manager_current(manager_status, phase="scenario_load.require_closed")
-    canonical_empty = manager_status["status"]["active"].get("canonical_empty")
-    if type(canonical_empty) is not bool:
-        raise ScenarioArtifactError(
+    status = state.headless_client.manager_status() if state.headless_client else {}
+    payload = status.get("status") if isinstance(status, dict) else None
+    active = payload.get("active") if isinstance(payload, dict) else None
+    graph = active.get("cell_graph") if isinstance(active, dict) else None
+    if not isinstance(graph, dict):
+        raise scenario_artifact_http_exception(ScenarioArtifactError(
             "scenario_load_current_configuration_unavailable",
-            "Scenario Load requires the Manager's current canonical-empty proof",
+            "Scenario Load requires the Manager's current configuration",
             status_code=409,
-        )
-    if not canonical_empty:
-        raise ScenarioArtifactError(
-            "scenario_close_required",
-            "Close first before loading a scenario",
+        ))
+    if graph.get("model_instances") or graph.get("controllable_components"):
+        raise scenario_artifact_http_exception(ScenarioArtifactError(
+            "scenario_new_required",
+            "A Scenario is still applied. Start a New Scenario, then Load.",
             status_code=409,
-        )
+        ))
 
 
-def load_exact_scenario_document(
-    state: ComposerState, body: LoadScenarioDocumentRequest
-) -> dict[str, Any]:
+def load_exact_scenario_document(state: ComposerState, path: str) -> dict[str, Any]:
     """Use the one Scenario-document Open/activate implementation at startup.
 
     Startup is intentionally not a second loader. Constructing the bounded
     router only binds its handlers; invoking this exact handler performs the
     same validation, workspace CAS, admission claim and Manager submission as
-    the public API without starting an HTTP client against ourselves.
+    the public API without starting an HTTP client against ourselves. A
+    Scenario still applied in the Manager (Composer restarted) is kept:
+    the startup Load is refused with ``scenario_new_required``.
     """
+
+    require_empty_cell(state)
 
     router = create_scenario_document_router(state)
     route = next(
         route
         for route in router.routes
         if isinstance(route, APIRoute)
-        and route.path == "/api/scenario-documents/load"
+        and route.path == "/api/scenario/load"
     )
-    return route.endpoint(body)
+    return route.endpoint(ScenarioLoadRequest(path=path))
 
 
 __all__ = [
-    "LoadScenarioDocumentRequest",
     "create_scenario_document_router",
     "load_exact_scenario_document",
 ]

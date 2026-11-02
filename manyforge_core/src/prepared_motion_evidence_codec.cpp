@@ -257,16 +257,11 @@ void require_digest(std::string_view value, std::string reason) {
   if (!value) return CanonicalValue(nullptr);
   if (!valid_cartesian_fidelity_metrics(*value)) fail("cartesian_fidelity_metrics_invalid");
   return CanonicalValue(CanonicalValue::Object{
-      {"accepted_max_blend_deviation_rad", CanonicalValue(value->accepted_max_blend_deviation_rad)},
       {"certified_max_rotation_error_rad", CanonicalValue(value->certified_max_rotation_error_rad)},
       {"certified_max_translation_error_m",
        CanonicalValue(value->certified_max_translation_error_m)},
       {"measured_max_rotation_error_rad", CanonicalValue(value->measured_max_rotation_error_rad)},
       {"measured_max_translation_error_m", CanonicalValue(value->measured_max_translation_error_m)},
-      {"planning_attempt_count",
-       CanonicalValue(static_cast<double>(value->planning_attempt_count))},
-      {"requested_max_blend_deviation_rad",
-       CanonicalValue(value->requested_max_blend_deviation_rad)},
       {"requested_rotation_tolerance_rad", CanonicalValue(value->requested_rotation_tolerance_rad)},
       {"requested_translation_tolerance_m",
        CanonicalValue(value->requested_translation_tolerance_m)},
@@ -278,13 +273,10 @@ void require_digest(std::string_view value, std::string reason) {
 [[nodiscard]] std::optional<CartesianFidelityMetricsDTO> parse_cartesian_fidelity(
     const CanonicalValue& value) {
   if (value.is_null()) return std::nullopt;
-  exact(value, {"accepted_max_blend_deviation_rad", "certified_max_rotation_error_rad",
-                "certified_max_translation_error_m", "measured_max_rotation_error_rad",
-                "measured_max_translation_error_m", "planning_attempt_count",
-                "requested_max_blend_deviation_rad", "requested_rotation_tolerance_rad",
-                "requested_translation_tolerance_m", "unsampled_rotation_bound_rad",
-                "unsampled_translation_bound_m"});
-  const auto attempts = unsigned_integer(member(value, "planning_attempt_count"), true);
+  exact(value, {"certified_max_rotation_error_rad", "certified_max_translation_error_m",
+                "measured_max_rotation_error_rad", "measured_max_translation_error_m",
+                "requested_rotation_tolerance_rad", "requested_translation_tolerance_m",
+                "unsampled_rotation_bound_rad", "unsampled_translation_bound_m"});
   CartesianFidelityMetricsDTO result{
       finite_number(member(value, "requested_translation_tolerance_m")),
       finite_number(member(value, "requested_rotation_tolerance_rad")),
@@ -293,12 +285,8 @@ void require_digest(std::string_view value, std::string reason) {
       finite_number(member(value, "unsampled_translation_bound_m")),
       finite_number(member(value, "unsampled_rotation_bound_rad")),
       finite_number(member(value, "certified_max_translation_error_m")),
-      finite_number(member(value, "certified_max_rotation_error_rad")),
-      finite_number(member(value, "requested_max_blend_deviation_rad")),
-      finite_number(member(value, "accepted_max_blend_deviation_rad")),
-      static_cast<std::uint32_t>(attempts)};
-  if (attempts > std::numeric_limits<std::uint32_t>::max() ||
-      !valid_cartesian_fidelity_metrics(result))
+      finite_number(member(value, "certified_max_rotation_error_rad"))};
+  if (!valid_cartesian_fidelity_metrics(result))
     fail("cartesian_fidelity_metrics_invalid");
   return result;
 }

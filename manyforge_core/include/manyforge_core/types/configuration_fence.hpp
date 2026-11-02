@@ -393,21 +393,6 @@ struct DomainActiveControlConfigurationDTO final {
                          const DomainActiveControlConfigurationDTO&) = default;
 };
 
-/// Captured actual predecessor driver lineage. This is durable observation
-/// carried by the existing admission receipt, never a new claim or grant.
-struct ProviderConfigurationFenceLineageDTO final {
-  ControlDomainId control_domain_id;
-  RuntimeEpoch provider_runtime_epoch;
-  ComponentLifecycleGeneration component_lifecycle_generation;
-
-  [[nodiscard]] bool valid() const noexcept {
-    return !control_domain_id.empty() && !provider_runtime_epoch.empty() &&
-           component_lifecycle_generation.nonzero();
-  }
-  friend bool operator==(const ProviderConfigurationFenceLineageDTO&,
-                         const ProviderConfigurationFenceLineageDTO&) = default;
-};
-
 /// Apply-specific projection of the generic configuration-fence intent.
 ///
 /// The generic `ConfigurationFenceIntentDTO` name remains reserved for spec
@@ -424,7 +409,6 @@ struct ApplyConfigurationFenceIntentDTO final {
   ConfigurationFenceGeneration expected_fence_generation;
   std::vector<DomainActiveControlConfigurationDTO> expected_active_control_configurations;
   std::string reason;
-  std::vector<ProviderConfigurationFenceLineageDTO> expected_provider_lineages{};
 
   [[nodiscard]] bool valid() const noexcept {
     if (owner_request_context.request_id.empty() ||
@@ -466,15 +450,7 @@ struct ApplyConfigurationFenceIntentDTO final {
         return false;
       }
     }
-    std::size_t provider_index = 0U;
-    for (const auto& domain : scope.domains) {
-      if (!domain.predecessor_control_domain_revision || domain.has_controller_predecessor())
-        continue;
-      if (provider_index >= expected_provider_lineages.size()) return false;
-      const auto& lineage = expected_provider_lineages[provider_index++];
-      if (!lineage.valid() || lineage.control_domain_id != domain.control_domain_id) return false;
-    }
-    return provider_index == expected_provider_lineages.size();
+    return true;
   }
 
   friend bool operator==(const ApplyConfigurationFenceIntentDTO&,
@@ -575,7 +551,6 @@ struct ConfigurationFenceAdmissionSnapshotDTO final {
   std::uint64_t affected_queued_operation_count;
   std::uint64_t affected_active_operation_count;
   ContentDigest result_digest;
-  std::vector<ProviderConfigurationFenceLineageDTO> provider_lineages{};
 
   [[nodiscard]] bool presence_valid() const noexcept {
     if (!echoed_query.valid() || !execution_host_epoch.valid() ||
@@ -587,15 +562,8 @@ struct ConfigurationFenceAdmissionSnapshotDTO final {
     }
 
     std::size_t configuration_index = 0U;
-    std::size_t provider_index = 0U;
     for (const auto& domain : echoed_query.affected_scope.domains) {
-      if (!domain.predecessor_control_domain_revision.has_value()) {
-        continue;
-      }
       if (!domain.has_controller_predecessor()) {
-        if (provider_index >= provider_lineages.size()) return false;
-        const auto& lineage = provider_lineages[provider_index++];
-        if (!lineage.valid() || lineage.control_domain_id != domain.control_domain_id) return false;
         continue;
       }
       if (configuration_index >= active_control_configurations.size()) {
@@ -606,8 +574,7 @@ struct ConfigurationFenceAdmissionSnapshotDTO final {
         return false;
       }
     }
-    return configuration_index == active_control_configurations.size() &&
-           provider_index == provider_lineages.size();
+    return configuration_index == active_control_configurations.size();
   }
 
   [[nodiscard]] bool matches(const ConfigurationFenceAdmissionQueryDTO& query) const noexcept {
@@ -621,8 +588,10 @@ struct ConfigurationFenceAdmissionSnapshotDTO final {
 /// Kernel-owned observation used to compare-and-swap an exact fence release.
 ///
 /// It binds the fence identity and whole-Apply scope to the current Kernel
-/// incarnation, active projection/publication, candidate-domain control
-/// configurations, affected-operation counts, and an owner-computed digest.
+/// incarnation, active projection/publication, the control configurations
+/// currently active for the scope's controller domains (a domain with none,
+/// e.g. new to the cell before install, has no row), affected-operation
+/// counts, and an owner-computed digest.
 struct ConfigurationFenceReconciliationEvidenceDTO final {
   ExecutionHostEpochDTO execution_host_epoch;
   ApplyFenceOwnerDTO owner_transaction;
@@ -653,14 +622,13 @@ struct ConfigurationFenceReconciliationEvidenceDTO final {
 
     std::size_t configuration_index = 0U;
     for (const auto& domain : reconciled_scope.domains) {
-      if (!domain.has_controller_candidate()) {
+      if (!domain.has_controller_side() ||
+          configuration_index >= active_control_configurations.size() ||
+          active_control_configurations[configuration_index].control_domain_id !=
+              domain.control_domain_id) {
         continue;
       }
-      if (configuration_index >= active_control_configurations.size()) {
-        return false;
-      }
-      const auto& configuration = active_control_configurations[configuration_index++];
-      if (!configuration.valid() || configuration.control_domain_id != domain.control_domain_id) {
+      if (!active_control_configurations[configuration_index++].valid()) {
         return false;
       }
     }
@@ -672,7 +640,8 @@ struct ConfigurationFenceReconciliationEvidenceDTO final {
 };
 
 /// Exact compare-and-swap release request. The evidence is obtained only from
-/// the Kernel status capability after scene Finalize is durable.
+/// the Kernel status capability after scene Finalize is durable, or after the
+/// execution host refused the Apply before any effect.
 struct ConfigurationFenceReleaseDTO final {
   ConfigurationFenceReconciliationEvidenceDTO reconciliation_evidence;
   RuntimeEpoch manager_runtime_epoch;
@@ -1013,326 +982,6 @@ struct ApplyFenceReconcileResultDTO final {
   [[nodiscard]] bool matches(const ApplyFenceRehydrateDTO& request) const noexcept {
     return presence_valid() && request.valid() && fence_results.size() == 1U &&
            fence_results.front().matches(request);
-  }
-};
-
-/// Narrow selected-lifecycle ownership in the existing configuration-fence ledger.
-struct SelectedBringUpFenceOwnerDTO final {
-  LifecycleTransactionId lifecycle_transaction_id;
-  LifecycleTransactionGeneration lifecycle_transaction_generation;
-  CellAdmissionClaimGeneration selected_claim_generation;
-
-  [[nodiscard]] bool valid() const noexcept {
-    return lifecycle_transaction_generation.nonzero() && selected_claim_generation.nonzero() &&
-           lifecycle_transaction_id.value() ==
-               "selected-lifecycle." + std::to_string(lifecycle_transaction_generation.value());
-  }
-  friend bool operator==(const SelectedBringUpFenceOwnerDTO&,
-                         const SelectedBringUpFenceOwnerDTO&) = default;
-};
-
-struct SelectedBringUpConfigurationFenceIntentDTO final {
-  PublicRequestContextDTO owner_request_context;
-  LifecycleTransactionId lifecycle_transaction_id;
-  LifecycleTransactionGeneration lifecycle_transaction_generation;
-  CellAdmissionClaimDTO selected_claim;
-  ConfigurationFenceAdmissionSnapshotDTO expected_admission;
-  ActiveBundlePublicationGeneration expected_publication_generation;
-  ConfigurationFenceScopeDTO selected_scope;
-  ProjectionRevisionDTO candidate_projection_revision;
-
-  [[nodiscard]] SelectedBringUpFenceOwnerDTO owner() const {
-    return {lifecycle_transaction_id, lifecycle_transaction_generation,
-            selected_claim.claim_generation};
-  }
-  [[nodiscard]] bool valid() const {
-    const auto& claim = selected_claim.intent;
-    if (claim.scope.configurations.size() !=
-        expected_admission.active_control_configurations.size())
-      return false;
-    for (std::size_t i = 0; i < claim.scope.configurations.size(); ++i) {
-      const auto& expected = expected_admission.active_control_configurations[i];
-      const auto& claimed = claim.scope.configurations[i];
-      if (claimed.control_domain_id != expected.control_domain_id ||
-          claimed.active_configuration_id != expected.active_control_configuration_id ||
-          claimed.active_configuration_generation !=
-              expected.active_control_configuration_generation)
-        return false;
-    }
-    return owner().valid() && ValidateCellAdmissionClaimIntent(claim).ok() &&
-           claim.claim_kind == CellAdmissionClaimKindDTO::kInterventionOrRecovery &&
-           claim.owner_role == CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner &&
-           claim.owner_transaction_id == lifecycle_transaction_id.value() &&
-           claim.request_id == owner_request_context.request_id &&
-           claim.owner_epoch == owner_request_context.request_owner_epoch &&
-           selected_claim.acquired_admission_generation.nonzero() &&
-           selected_claim.accepted_at_ns >= 0 && expected_admission.presence_valid() &&
-           expected_publication_generation.nonzero() &&
-           expected_admission.execution_host_epoch.publication_generation ==
-               expected_publication_generation &&
-           selected_scope.valid() && selected_scope.controllable_component_ids.size() == 1U &&
-           expected_admission.echoed_query.affected_scope == selected_scope &&
-           claim.scope.resources == selected_scope.resources &&
-           expected_admission.affected_queued_operation_count == 0U &&
-           expected_admission.affected_active_operation_count == 0U &&
-           candidate_projection_revision.valid();
-  }
-  [[nodiscard]] bool matches(const ConfigurationFenceAcceptedDTO& accepted) const {
-    const auto predecessor = expected_admission.configuration_fence_generation.value();
-    return valid() && accepted.valid() && accepted.captured_scope == selected_scope &&
-           predecessor < std::numeric_limits<std::uint64_t>::max() &&
-           accepted.configuration_fence_generation.value() == predecessor + 1U;
-  }
-  friend bool operator==(const SelectedBringUpConfigurationFenceIntentDTO&,
-                         const SelectedBringUpConfigurationFenceIntentDTO&) = default;
-};
-
-struct SelectedBringUpConfigurationFenceReconciliationEvidenceDTO final {
-  ExecutionHostEpochDTO execution_host_epoch;
-  SelectedBringUpFenceOwnerDTO owner_transaction;
-  ConfigurationFenceId configuration_fence_id;
-  ConfigurationFenceGeneration configuration_fence_generation;
-  ConfigurationFenceScopeDTO reconciled_scope;
-  std::uint64_t operation_resource_generation;
-  GraphRevision active_graph_revision;
-  ProjectionRevisionDTO active_projection_revision;
-  ActiveBundlePublicationGeneration active_publication_generation;
-  ContentDigest active_public_pointer_digest;
-  std::vector<DomainActiveControlConfigurationDTO> active_control_configurations;
-  std::uint64_t affected_queued_operation_count;
-  std::uint64_t affected_active_operation_count;
-  ContentDigest evidence_digest;
-
-  [[nodiscard]] bool valid() const noexcept {
-    if (!execution_host_epoch.valid() || !owner_transaction.valid() ||
-        configuration_fence_id.empty() || !configuration_fence_generation.nonzero() ||
-        !reconciled_scope.valid() || active_graph_revision.empty() ||
-        !active_projection_revision.valid() ||
-        active_projection_revision.graph_revision != active_graph_revision ||
-        !active_publication_generation.nonzero() || active_public_pointer_digest.empty() ||
-        evidence_digest.empty() ||
-        execution_host_epoch.publication_generation != active_publication_generation) {
-      return false;
-    }
-
-    std::size_t configuration_index = 0U;
-    for (const auto& domain : reconciled_scope.domains) {
-      if (!domain.has_controller_candidate()) {
-        continue;
-      }
-      if (configuration_index >= active_control_configurations.size()) {
-        return false;
-      }
-      const auto& configuration = active_control_configurations[configuration_index++];
-      if (!configuration.valid() || configuration.control_domain_id != domain.control_domain_id) {
-        return false;
-      }
-    }
-    return configuration_index == active_control_configurations.size();
-  }
-
-  friend bool operator==(const SelectedBringUpConfigurationFenceReconciliationEvidenceDTO&,
-                         const SelectedBringUpConfigurationFenceReconciliationEvidenceDTO&) =
-      default;
-};
-
-/// Exact selected release after the installed successor and held claim are
-/// verified by the existing owners; this does not clear the incident.
-struct SelectedBringUpConfigurationFenceReleaseDTO final {
-  SelectedBringUpConfigurationFenceReconciliationEvidenceDTO reconciliation_evidence;
-  RuntimeEpoch manager_runtime_epoch;
-
-  [[nodiscard]] bool valid() const noexcept {
-    return reconciliation_evidence.valid() && !manager_runtime_epoch.empty() &&
-           reconciliation_evidence.affected_queued_operation_count == 0U &&
-           reconciliation_evidence.affected_active_operation_count == 0U;
-  }
-
-  friend bool operator==(const SelectedBringUpConfigurationFenceReleaseDTO&,
-                         const SelectedBringUpConfigurationFenceReleaseDTO&) = default;
-};
-
-struct SelectedBringUpConfigurationFenceReleasedDTO final {
-  SelectedBringUpConfigurationFenceReleaseDTO request;
-  ExecutionHostEpochDTO execution_host_epoch;
-  std::int64_t released_at_ns;
-  RequestReplayStatusDTO replay_status;
-  ContentDigest release_receipt_digest;
-
-  [[nodiscard]] bool valid() const noexcept {
-    return request.valid() && execution_host_epoch.valid() &&
-           execution_host_epoch == request.reconciliation_evidence.execution_host_epoch &&
-           released_at_ns >= 0 && IsAcceptedRequestReplayStatus(replay_status) &&
-           !release_receipt_digest.empty();
-  }
-
-  friend bool operator==(const SelectedBringUpConfigurationFenceReleasedDTO&,
-                         const SelectedBringUpConfigurationFenceReleasedDTO&) = default;
-};
-
-struct SelectedBringUpConfigurationFenceStatusQueryDTO final {
-  SelectedBringUpFenceOwnerDTO owner_transaction;
-  ConfigurationFenceId configuration_fence_id;
-  ConfigurationFenceGeneration configuration_fence_generation;
-  ConfigurationFenceScopeDTO expected_scope;
-  RuntimeEpoch manager_runtime_epoch;
-
-  [[nodiscard]] bool valid() const noexcept {
-    return owner_transaction.valid() && !configuration_fence_id.empty() &&
-           configuration_fence_generation.nonzero() && expected_scope.valid() &&
-           !manager_runtime_epoch.empty();
-  }
-
-  friend bool operator==(const SelectedBringUpConfigurationFenceStatusQueryDTO&,
-                         const SelectedBringUpConfigurationFenceStatusQueryDTO&) = default;
-};
-
-struct SelectedBringUpConfigurationFenceStatusDTO final {
-  SelectedBringUpConfigurationFenceStatusQueryDTO echoed_query;
-  SelectedBringUpConfigurationFenceReconciliationEvidenceDTO reconciliation_evidence;
-  ConfigurationFenceState state;
-  bool admission_fenced;
-  std::optional<SelectedBringUpConfigurationFenceReleasedDTO> release_receipt;
-  std::string required_compensation_or_operator_direction;
-  ContentDigest result_digest;
-  std::optional<ErrorDTO> error;
-
-  [[nodiscard]] bool presence_valid() const noexcept {
-    if (!echoed_query.valid() || !reconciliation_evidence.valid() || result_digest.empty() ||
-        reconciliation_evidence.owner_transaction != echoed_query.owner_transaction ||
-        reconciliation_evidence.configuration_fence_id != echoed_query.configuration_fence_id ||
-        reconciliation_evidence.configuration_fence_generation !=
-            echoed_query.configuration_fence_generation ||
-        reconciliation_evidence.reconciled_scope != echoed_query.expected_scope ||
-        (error.has_value() && error->code.empty())) {
-      return false;
-    }
-    switch (state) {
-      case ConfigurationFenceState::kHeld:
-        return admission_fenced && !release_receipt.has_value() &&
-               required_compensation_or_operator_direction.empty() && !error.has_value();
-      case ConfigurationFenceState::kReleasePending:
-        return admission_fenced && !release_receipt.has_value() &&
-               !required_compensation_or_operator_direction.empty() && error.has_value();
-      case ConfigurationFenceState::kReleased:
-        return !admission_fenced && release_receipt.has_value() && release_receipt->valid() &&
-               release_receipt->request.reconciliation_evidence == reconciliation_evidence &&
-               required_compensation_or_operator_direction.empty() && !error.has_value();
-    }
-    return false;
-  }
-
-  [[nodiscard]] bool matches(
-      const SelectedBringUpConfigurationFenceStatusQueryDTO& query) const noexcept {
-    return presence_valid() && query.valid() && echoed_query == query;
-  }
-};
-
-struct SelectedBringUpFenceAcquireAttemptQueryDTO final {
-  SelectedBringUpConfigurationFenceIntentDTO persisted_intent;
-  ContentDigest persisted_attempt_digest;
-  RuntimeEpoch manager_runtime_epoch;
-
-  [[nodiscard]] bool valid() const noexcept {
-    return persisted_intent.valid() && !persisted_attempt_digest.empty() &&
-           !manager_runtime_epoch.empty();
-  }
-
-  friend bool operator==(const SelectedBringUpFenceAcquireAttemptQueryDTO&,
-                         const SelectedBringUpFenceAcquireAttemptQueryDTO&) = default;
-};
-
-struct SelectedBringUpFenceAcquireAttemptReconcileResultDTO final {
-  ExecutionHostEpochDTO execution_host_epoch;
-  SelectedBringUpFenceAcquireAttemptQueryDTO echoed_query;
-  ApplyFenceAcquireAttemptReconcileState state;
-  std::optional<ConfigurationFenceAcceptedDTO> accepted_fence;
-  bool admission_fenced;
-  std::string required_compensation_or_operator_direction;
-  ContentDigest result_digest;
-  std::optional<ErrorDTO> error;
-
-  [[nodiscard]] bool presence_valid() const noexcept {
-    if (!execution_host_epoch.valid() || !echoed_query.valid() || result_digest.empty()) {
-      return false;
-    }
-    const bool has_error = error.has_value();
-    if (has_error && error->code.empty()) {
-      return false;
-    }
-
-    switch (state) {
-      case ApplyFenceAcquireAttemptReconcileState::kAcceptedExact:
-        return accepted_fence.has_value() &&
-               echoed_query.persisted_intent.matches(*accepted_fence) && admission_fenced &&
-               !has_error && required_compensation_or_operator_direction.empty();
-      case ApplyFenceAcquireAttemptReconcileState::kNotSeen:
-        return !accepted_fence.has_value() && !has_error &&
-               required_compensation_or_operator_direction.empty();
-      case ApplyFenceAcquireAttemptReconcileState::kConflicting:
-      case ApplyFenceAcquireAttemptReconcileState::kUncertain:
-        return !accepted_fence.has_value() && admission_fenced && has_error &&
-               !required_compensation_or_operator_direction.empty();
-    }
-    return false;
-  }
-
-  [[nodiscard]] bool matches(
-      const SelectedBringUpFenceAcquireAttemptQueryDTO& query) const noexcept {
-    return presence_valid() && query.valid() && echoed_query == query;
-  }
-};
-
-enum class SelectedBringUpFenceReleaseAttemptState {
-  kReleasedExact,
-  kNotReleasedHeld,
-  kConflicting,
-  kUncertain
-};
-struct SelectedBringUpFenceReleaseAttemptQueryDTO final {
-  SelectedBringUpConfigurationFenceReleaseDTO persisted_request;
-  [[nodiscard]] bool valid() const noexcept { return persisted_request.valid(); }
-  friend bool operator==(const SelectedBringUpFenceReleaseAttemptQueryDTO&,
-                         const SelectedBringUpFenceReleaseAttemptQueryDTO&) = default;
-};
-struct SelectedBringUpFenceReleaseAttemptReconcileResultDTO final {
-  SelectedBringUpFenceReleaseAttemptQueryDTO echoed_query;
-  SelectedBringUpFenceReleaseAttemptState state;
-  std::optional<SelectedBringUpConfigurationFenceReleasedDTO> release_receipt;
-  std::optional<SelectedBringUpConfigurationFenceStatusDTO> observed_status;
-  std::optional<ErrorDTO> error;
-  [[nodiscard]] bool presence_valid() const noexcept {
-    if (!echoed_query.valid() || (error && error->code.empty()) ||
-        (observed_status && !observed_status->presence_valid()))
-      return false;
-    if (observed_status) {
-      const auto& request = echoed_query.persisted_request;
-      const auto& evidence = request.reconciliation_evidence;
-      const SelectedBringUpConfigurationFenceStatusQueryDTO expected{
-          evidence.owner_transaction, evidence.configuration_fence_id,
-          evidence.configuration_fence_generation, evidence.reconciled_scope,
-          request.manager_runtime_epoch};
-      if (observed_status->echoed_query != expected) return false;
-    }
-    switch (state) {
-      case SelectedBringUpFenceReleaseAttemptState::kReleasedExact:
-        return release_receipt && release_receipt->valid() &&
-               release_receipt->request == echoed_query.persisted_request && observed_status &&
-               observed_status->state == ConfigurationFenceState::kReleased &&
-               observed_status->reconciliation_evidence ==
-                   echoed_query.persisted_request.reconciliation_evidence &&
-               observed_status->release_receipt == release_receipt && !error;
-      case SelectedBringUpFenceReleaseAttemptState::kNotReleasedHeld:
-        return !release_receipt && observed_status &&
-               observed_status->state == ConfigurationFenceState::kHeld &&
-               observed_status->reconciliation_evidence ==
-                   echoed_query.persisted_request.reconciliation_evidence &&
-               !error;
-      case SelectedBringUpFenceReleaseAttemptState::kConflicting:
-      case SelectedBringUpFenceReleaseAttemptState::kUncertain:
-        return !release_receipt && error.has_value();
-    }
-    return false;
   }
 };
 

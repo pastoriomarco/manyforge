@@ -561,3 +561,39 @@ def test_admitted_immediate_failure_preserves_confirmed_active_tcp(monkeypatch, 
     with pytest.raises(HeadlessApiError) as invalid:
         transport._exchange({"command": "submit"})
     assert invalid.value.code == "execution_command_response_invalid"
+
+
+@pytest.mark.parametrize("outcome", ["succeeded", "failed", "unknown", "refused"])
+def test_program_output_write_is_the_manual_set_io_output_command(monkeypatch, tmp_path, outcome):
+    """CONTRACTS §7: one write path. The Program sends the same command as a
+    manual write, once; refusals and failed/unknown results keep their code."""
+
+    from manyforge_behavior.kernel_client import IoOutputWriteFailedError, KernelClient
+
+    transport = ProgramRunnerExecutionTransport(tmp_path, timeout_seconds=1.0)
+    kernel = KernelClient(transport)
+    packets: list[dict[str, Any]] = []
+    if outcome == "refused":
+        response = {"ok": False, "error": {"code": "cell_latched", "message": "latched"}}
+    else:
+        result: dict[str, Any] = {"outcome": outcome}
+        if outcome != "succeeded":
+            result["error"] = {"code": "io_output_acceptance_unknown", "message": "no reply"}
+        response = {"ok": True, "command": "set_io_output", "result": result}
+    monkeypatch.setattr(
+        ExecutionCommandClient, "_exchange_on",
+        lambda self, packet, socket: packets.append(packet) or deepcopy(response),
+    )
+    if outcome == "succeeded":
+        assert kernel.set_io_output("io.1", "do_0", True) == {"outcome": "succeeded"}
+    elif outcome == "refused":
+        with pytest.raises(HeadlessApiError) as refused:
+            kernel.set_io_output("io.1", "do_0", True)
+        assert refused.value.code == "cell_latched"
+    else:
+        with pytest.raises(IoOutputWriteFailedError) as failed:
+            kernel.set_io_output("io.1", "do_0", True)
+        assert failed.value.code == "io_output_acceptance_unknown"
+        assert failed.value.outcome == outcome
+    assert [packet["command"] for packet in packets] == ["set_io_output"]
+    assert packets[0]["request"] == {"signal_id": "io.1/do_0", "value": True, "origin": "program"}

@@ -148,7 +148,7 @@ description: Vision-guided pick-and-place Program. A bounded model request selec
 name: vision_guided_bin_pick
 program_id: vision_guided_bin_pick
 program_profile: composable-cell-v1
-program_revision: sha256:ffc363e9ab710f6153bd7796e0027d7ba93f31a398736d87dd0dcbed14a3f0c1
+program_revision: sha256:da65f79d2a4c3e18bb07066a9901493ffa55b17a128da4e59dee60bd19245726
 scene:
 - pose:
     frame_ref:
@@ -240,9 +240,6 @@ target_roles:
     - capability_id: planning.motion.pose_goal
       disposition: required
       parameters: {}
-    - capability_id: planning.profile.first_feasible
-      disposition: required
-      parameters: {}
     - capability_id: planning.trajectory.time_parameterized
       disposition: required
       parameters: {}
@@ -328,7 +325,6 @@ tree:
               descend_velocity_scale: 0.4
               retreat_velocity_scale: 0.4
             output_key: pick_place.pick_left_part
-            planning_profile: first_feasible
             selected_object_id: left_part
             synthesis:
               approach_offset_envelope:
@@ -383,7 +379,6 @@ tree:
           instance_id: pick_left_part.approach
           parameters:
             base_frame_role: base
-            planning_profile: first_feasible
             target_role: arm
             tcp_endpoint:
               kind: current
@@ -399,7 +394,6 @@ tree:
           parameters:
             base_frame_role: base
             contact_policy_id: selected_object_grasp
-            planning_profile: first_feasible
             target_role: arm
             tcp_endpoint:
               kind: current
@@ -441,7 +435,6 @@ tree:
           instance_id: pick_left_part.retreat
           parameters:
             base_frame_role: base
-            planning_profile: first_feasible
             target_role: arm
             tcp_endpoint:
               kind: current
@@ -484,7 +477,6 @@ tree:
               - 0.22
               - 0.26
               - 0.28
-            planning_profile: first_feasible
             selected_object_id: left_part
             target_role: arm
             tcp_endpoint:
@@ -498,7 +490,6 @@ tree:
           instance_id: place_left_part.approach
           parameters:
             base_frame_role: base
-            planning_profile: first_feasible
             target_role: arm
             tcp_endpoint:
               kind: current
@@ -513,7 +504,6 @@ tree:
           instance_id: place_left_part.descend
           parameters:
             base_frame_role: base
-            planning_profile: first_feasible
             target_role: arm
             tcp_endpoint:
               kind: current
@@ -548,7 +538,6 @@ tree:
           instance_id: place_left_part.retreat
           parameters:
             base_frame_role: base
-            planning_profile: first_feasible
             target_role: arm
             tcp_endpoint:
               kind: current
@@ -586,7 +575,6 @@ tree:
               descend_velocity_scale: 0.4
               retreat_velocity_scale: 0.4
             output_key: pick_place.pick_right_part
-            planning_profile: first_feasible
             selected_object_id: right_part
             synthesis:
               approach_offset_envelope:
@@ -641,7 +629,6 @@ tree:
           instance_id: pick_right_part.approach
           parameters:
             base_frame_role: base
-            planning_profile: first_feasible
             target_role: arm
             tcp_endpoint:
               kind: current
@@ -657,7 +644,6 @@ tree:
           parameters:
             base_frame_role: base
             contact_policy_id: selected_object_grasp
-            planning_profile: first_feasible
             target_role: arm
             tcp_endpoint:
               kind: current
@@ -699,7 +685,6 @@ tree:
           instance_id: pick_right_part.retreat
           parameters:
             base_frame_role: base
-            planning_profile: first_feasible
             target_role: arm
             tcp_endpoint:
               kind: current
@@ -742,7 +727,6 @@ tree:
               - 0.22
               - -0.26
               - 0.28
-            planning_profile: first_feasible
             selected_object_id: right_part
             target_role: arm
             tcp_endpoint:
@@ -756,7 +740,6 @@ tree:
           instance_id: place_right_part.approach
           parameters:
             base_frame_role: base
-            planning_profile: first_feasible
             target_role: arm
             tcp_endpoint:
               kind: current
@@ -771,7 +754,6 @@ tree:
           instance_id: place_right_part.descend
           parameters:
             base_frame_role: base
-            planning_profile: first_feasible
             target_role: arm
             tcp_endpoint:
               kind: current
@@ -806,7 +788,6 @@ tree:
           instance_id: place_right_part.retreat
           parameters:
             base_frame_role: base
-            planning_profile: first_feasible
             target_role: arm
             tcp_endpoint:
               kind: current

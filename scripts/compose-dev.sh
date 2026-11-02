@@ -336,7 +336,7 @@ enforce_retained_limit() {
         echo "WARNING ManyForge could not remove older retained container $older after retry" >&2
       fi
     else
-      echo "WARNING ManyForge kept legacy container $older: failed retry may hold sole open-incident journal; manually export or explicitly remove after investigation" >&2
+      echo "WARNING ManyForge kept legacy container $older: failed retry may hold its only console trace; manually export or explicitly remove after investigation" >&2
     fi
     container_ref=$current
   done <<<"$candidates"
@@ -528,10 +528,18 @@ case "$command" in
       done
       ros_identity=(--user "$(id -u):$(id -g)" --env HOME=/runner/home \
         --env MANYFORGE_BUILD_DIR=/runner/build)
+      # Fast DDS talks over UDP loopback, not shared memory: a process killed
+      # after a hang leaves its SHM port behind; long-lived participants (the
+      # execution host) keep writing into the unlinked old port, so a
+      # replacement that reuses its participant id never receives their
+      # requests (Fast DDS 3.6.2). An explicit value is kept. rmw_fastrtps
+      # always adds SHM under ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST.
+      export FASTDDS_BUILTIN_TRANSPORTS="${FASTDDS_BUILTIN_TRANSPORTS-UDPv4}"
       # Preserve explicitly configured DDS and build inputs. The image entrypoint owns
       # ROS/venv setup; this launcher neither sources a topology nor picks peers.
       for variable in ROS_DOMAIN_ID RMW_IMPLEMENTATION ROS_AUTOMATIC_DISCOVERY_RANGE \
           ROS_STATIC_PEERS FASTRTPS_DEFAULT_PROFILES_FILE FASTDDS_DEFAULT_PROFILES_FILE \
+          FASTDDS_BUILTIN_TRANSPORTS \
           ROS_DISCOVERY_SERVER ROS_SUPER_CLIENT CYCLONEDDS_URI \
           MANYFORGE_ROS2_CONTROL_BUILD_TESTING MANYFORGE_ROS_DEPENDENCY_SETUP_SCRIPTS; do
         if [[ -v "$variable" ]]; then
@@ -556,6 +564,9 @@ case "$command" in
     [[ -z "$stopped_container_receipt" ]] || session_proof=(--stopped-container-receipt "$stopped_container_receipt")
     python3 "$session_helper" "$runtime_root" --session-id "$session_id" --lock-fd "$session_lock_fd" "${session_proof[@]}" >/dev/null
     session_environment=(-e "MANYFORGE_DEV_COLD_SESSION_ID=$session_id")
+    # Motion-trace snapshots for the debug export are kept by default in the
+    # capped store (64 MiB, oldest first); set it empty to keep traces inline.
+    export MANYFORGE_MOTION_TRACE_DIR="${MANYFORGE_MOTION_TRACE_DIR-/tmp/manyforge-state/motion-traces}"
     for variable in MANYFORGE_MOTION_TRACE_DIR \
         MANYFORGE_EXPERIMENTAL_RELEASE_TIMER \
         MANYFORGE_EXPERIMENTAL_MIDTICK_STAMP MANYFORGE_EXPERIMENTAL_V0_PAYLOAD \

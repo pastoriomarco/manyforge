@@ -7,6 +7,7 @@ import {
   draftEditUnavailableReason,
   programApplyScenarioReason,
   requiredComponentFaultNotices,
+  scenarioReplacementUnavailableReason,
   authoringWorkspaceIdentity,
   deploymentLocalFence,
   programLocalFence,
@@ -227,6 +228,32 @@ describe('authoringWorkspace', () => {
         authoringAdmission: { authoringAllowed: false, admissionGeneration: 7 },
       }),
     )).toContain('editing requires Idle or all Program motion stopped');
+  });
+
+  it('leaves a finished or stopped run to the server for New and Load (R3)', () => {
+    const installed = published(workspaceSnapshot(5, 3, 4));
+    const finished = headlessState(5, {}, {
+      programCycle: { state: 'terminal_awaiting_reset' } as never,
+      authoringAdmission: { authoringAllowed: false, admissionGeneration: 7 },
+    });
+    expect(authoringUnavailableReason(installed, finished)).toBe(
+      'Program execution is terminal awaiting reset; authoring requires Idle.',
+    );
+    expect(scenarioReplacementUnavailableReason(installed, finished)).toBeNull();
+    // Every other gate still applies.
+    expect(scenarioReplacementUnavailableReason(installed, headlessState(6))).toBe(
+      'The displayed workspace is still synchronizing with the backend.',
+    );
+  });
+
+  it('never disables New or Load for a held authoring claim (R3)', () => {
+    const installed = published(workspaceSnapshot(5, 3, 4));
+    // A claim left held (e.g. after a refused Apply) closes Kernel admission.
+    const locked = headlessState(5, {}, {
+      authoringAdmission: { authoringAllowed: false, admissionGeneration: 7 },
+    });
+    expect(authoringUnavailableReason(installed, locked)).toBe('Authoring is currently locked by the backend.');
+    expect(scenarioReplacementUnavailableReason(installed, locked)).toBeNull();
   });
 
   it('never makes an Idle Draft edit wait for Kernel authoring admission', () => {

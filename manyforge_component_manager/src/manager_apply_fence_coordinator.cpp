@@ -50,7 +50,8 @@ PrepareFence(const SqliteManagerApplyJournal &apply_journal,
              const ManagerApplyIntentDTO &apply_intent,
              const manyforge::deployment::RetainedBundle &predecessor,
              const manyforge::deployment::RetainedBundle &candidate,
-             const ManagerApplyFenceExpectationDTO &expectation) {
+             const ManagerApplyFenceExpectationDTO &expectation,
+             const manyforge::deployment::SiteFacts &site_facts) {
   if (!apply_intent.valid()) {
     Fail("initial Apply intent is invalid");
   }
@@ -107,7 +108,8 @@ PrepareFence(const SqliteManagerApplyJournal &apply_journal,
   // The per-component decision is fixed with the scope, before any fence or
   // runtime effect: later phases execute it, they never re-derive it.
   auto component_delta =
-      manyforge::deployment::derive_apply_component_delta(predecessor, candidate);
+      manyforge::deployment::derive_apply_component_delta(predecessor, candidate,
+                                                          site_facts);
   if (!manyforge::deployment::apply_component_delta_is_fenced(component_delta,
                                                               scope)) {
     Fail("Apply changes a component runtime outside its derived fence scope");
@@ -139,7 +141,6 @@ PrepareFence(const SqliteManagerApplyJournal &apply_journal,
       expectation.expected_fence_generation,
       expectation.expected_active_control_configurations,
       "component-manager named Apply affected-scope admission",
-      expectation.expected_provider_lineages,
   };
   if (!affected_scope.valid() || !fence_intent.valid()) {
     Fail("Manager-owned Apply-fence expectation is incoherent with the "
@@ -373,9 +374,10 @@ ManagerApplyFenceEffectUncertainError::observed_rehydration() const noexcept {
 ManagerApplyFenceCoordinator::ManagerApplyFenceCoordinator(
     SqliteManagerApplyJournal &apply_journal,
     core::IManagerKernelApplyFencePort &kernel_fence,
-    core::RuntimeEpoch manager_runtime_epoch)
+    core::RuntimeEpoch manager_runtime_epoch, manyforge::deployment::SiteFacts site_facts)
     : apply_journal_(apply_journal), kernel_fence_(kernel_fence),
-      manager_runtime_epoch_(std::move(manager_runtime_epoch)) {
+      manager_runtime_epoch_(std::move(manager_runtime_epoch)),
+      site_facts_(std::move(site_facts)) {
   if (manager_runtime_epoch_.empty()) {
     Fail("Manager runtime epoch is empty");
   }
@@ -389,7 +391,7 @@ ManagerApplyFenceCoordinator::AcquireOrRecoverFence(
     const ManagerApplyFenceExpectationDTO &expectation) {
   std::lock_guard lock(operation_mutex_);
   auto prepared = PrepareFence(apply_journal_, apply_intent, predecessor,
-                               candidate, expectation);
+                               candidate, expectation, site_facts_);
 
   // All three immutable commits complete before this coordinator can invoke
   // Acquire: public intent, derived whole-Apply scope/fixed disposition, and

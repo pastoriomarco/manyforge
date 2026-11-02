@@ -7,6 +7,12 @@ import type {
 } from '../types/api';
 import type { TargetStopResponse } from '../types/robotControl';
 import {
+  CHANGED_OUTSIDE_SUFFIX,
+  ioSignalId,
+  type RuleAfterStop,
+  type RuleOnTrip,
+} from '../types/components';
+import {
   INTERRUPT_NODE_OUTCOME_VALUES,
   INTERRUPT_STATE_NAMESPACE,
   INTERRUPT_STATE_VALUES,
@@ -126,6 +132,7 @@ export function nodeConditionChoices(
   deploymentDocument: Record<string, JsonValue> | null = null,
   roleAssignment: Record<string, JsonValue> | null = null,
   systemSignals: readonly CarriedObjectLostSignalChoice[] = [],
+  changedOutside: ReadonlySet<string> = new Set(),
 ): ConditionOperandChoice[] {
   const declared = declaredIoSources(deploymentDocument);
   const targets = binding == null
@@ -146,6 +153,22 @@ export function nodeConditionChoices(
       && row.commandTargetId === target.command_target_id
     ));
     for (const row of target.signal_role_bindings ?? []) {
+      // V2-7: an eligible output offers its core-held `changed outside` signal.
+      if (row.direction === 'output'
+        && changedOutside.has(ioSignalId(target.controllable_component_id, row.signal_name))) {
+        const operand = { signal: {
+          target_role: target.target_role_id,
+          resource_role: `${row.resource_role_id}${CHANGED_OUTSIDE_SUFFIX}`,
+        } };
+        signals.push({
+          id: operandId(operand),
+          operand,
+          label: `${target.target_role_id} · ${row.resource_role_id} (${row.signal_name}) → changed outside`,
+          key: '',
+          valueType: 'bool',
+        });
+        continue;
+      }
       if (row.direction !== 'input') continue;
       if (row.resource_role_id === CARRIED_OBJECT_LOST_RESOURCE_ROLE
         && (!requiresCarriedObjectLost || systemSignal?.signalName !== row.signal_name)) continue;
@@ -470,35 +493,37 @@ export function interruptConditionKeyUses(
 
 /**
  * Contract 73: every arm (`all_motion`), the robots of selected Applied
- * Program execution groups (`{execution_groups}`, 1..N unique, sorted), or the
- * existing Full Stop (`everything`).
+ * Program execution groups (`{execution_groups}`, 1..N unique, sorted), or
+ * everything in the cell (`everything`).
  */
 export type GlobalRuleScope = 'all_motion' | 'everything' | { execution_groups: string[] };
 export type GlobalRuleScopeKind = 'all_motion' | 'execution_groups' | 'everything';
-export type IdleBehaviour = 'latch' | 'ignore';
-/**
- * What a trip does (omitted = gate): `gate` refuses new motion in scope while
- * the condition holds and releases by itself when it clears; `full_stop` trips
- * a cell Full Stop and latches until the operator clears it; `notify` only
- * publishes state on a normal trip, while its existing scoped gate applies
- * whenever it cannot watch its inputs.
- */
-export type OnTrip = 'gate' | 'full_stop' | 'notify';
 
+/**
+ * CONTRACTS §8. `on_trip: stop` issues the operator's Stop on the scope, then
+ * holds the scope (`rule_holds`) while the condition holds; `after_stop` says
+ * what happens to the stopped node (`hold`, the default, or `fail_node`).
+ * `notify` only publishes `interrupt_state.<rule_id>`. Any active rule that
+ * can't watch its signals holds its scope until it can. `active_at_start`
+ * (default false) is where every run and every Load starts.
+ */
 export interface GlobalInterruptRule {
   rule_id: string;
   condition: JsonValue;
   scope: GlobalRuleScope;
   /** 0–100; omitted = 0 (contract 59). */
   priority?: number;
-  on_trip?: OnTrip;
-  /** Only with `on_trip: full_stop`. */
-  idle_behaviour?: IdleBehaviour;
+  on_trip: RuleOnTrip;
+  /** Only with `on_trip: stop`; omitted = hold. */
+  after_stop?: RuleAfterStop;
+  /** Only with `on_trip: stop`; omitted = the robot's first stage. */
   stop_entry_stage_id?: string;
+  /** Omitted = false. */
+  active_at_start?: boolean;
 }
 
 const RULE_FIELDS = new Set([
-  'rule_id', 'condition', 'scope', 'priority', 'on_trip', 'idle_behaviour', 'stop_entry_stage_id',
+  'rule_id', 'condition', 'scope', 'priority', 'on_trip', 'after_stop', 'stop_entry_stage_id', 'active_at_start',
 ]);
 const PORTABLE_ID = /^[a-z][a-z0-9_.-]*$/;
 /** The components whose signals a condition reads (its source providers). */
@@ -550,7 +575,7 @@ export function globalRuleIds(document: Record<string, JsonValue> | null): strin
 export function newGlobalRule(existing: readonly string[], choice: ConditionOperandChoice | undefined): GlobalInterruptRule {
   let index = 1;
   while (existing.includes(`rule_${index}`)) index += 1;
-  return { rule_id: `rule_${index}`, condition: newCompare(choice), scope: 'all_motion', priority: 0 };
+  return { rule_id: `rule_${index}`, condition: newCompare(choice), scope: 'all_motion', priority: 0, on_trip: 'stop' };
 }
 
 /** The first problem of one rule row (closed fields, ids, ranges), or null. */
@@ -577,7 +602,7 @@ export function globalRuleProblem(
   if (scope !== 'all_motion' && scope !== 'everything') {
     const groups = objectOf(scope)?.execution_groups;
     if (!Array.isArray(groups) || groups.length === 0 || Object.keys(objectOf(scope) ?? {}).length !== 1) {
-      return 'Scope is all motion, everything (Full Stop) or at least one execution group.';
+      return 'Scope is all motion, everything or at least one execution group.';
     }
     if (groups.some((group) => typeof group !== 'string' || !GROUP_ID.test(group))) {
       return 'Execution group ids must be portable lower-case ids.';
@@ -586,17 +611,18 @@ export function globalRuleProblem(
     if (new Set(ids).size !== ids.length) return 'Execution group ids must be unique.';
     if (ids.some((group, at) => at > 0 && ids[at - 1] > group)) return 'Execution group ids must be sorted.';
   }
-  if (rule.on_trip !== undefined && rule.on_trip !== 'gate' && rule.on_trip !== 'full_stop' && rule.on_trip !== 'notify') {
-    return 'On trip is gate, full_stop or notify.';
+  if (rule.on_trip !== 'stop' && rule.on_trip !== 'notify') return 'On trip is stop or notify.';
+  if (rule.after_stop !== undefined && rule.after_stop !== 'hold' && rule.after_stop !== 'fail_node') {
+    return 'After the Stop is hold or fail_node.';
   }
-  if (rule.idle_behaviour !== undefined && rule.idle_behaviour !== 'latch' && rule.idle_behaviour !== 'ignore') {
-    return 'Idle behaviour is latch or ignore.';
-  }
-  if (rule.idle_behaviour !== undefined && rule.on_trip !== 'full_stop') {
-    return 'Idle behaviour applies to on_trip full_stop only.';
+  if (rule.on_trip === 'notify' && rule.after_stop !== undefined) {
+    return 'After the Stop does not apply to on_trip notify.';
   }
   if (rule.on_trip === 'notify' && rule.stop_entry_stage_id !== undefined) {
     return 'Stop entry stage does not apply to on_trip notify.';
+  }
+  if (rule.active_at_start !== undefined && typeof rule.active_at_start !== 'boolean') {
+    return 'Active at start is true or false.';
   }
   if (rule.stop_entry_stage_id !== undefined && (typeof rule.stop_entry_stage_id !== 'string' || rule.stop_entry_stage_id === '')) {
     return 'Stop entry stage must be a qualified stage id.';
@@ -656,6 +682,7 @@ export function globalRuleChoices(
   programKeys: readonly BlackboardKeyDeclaration[] | null,
   condition: JsonValue | undefined,
   systemSignals: readonly CarriedObjectLostSignalChoice[] = [],
+  changedOutside: ReadonlySet<string> = NO_SIGNAL_IDS,
 ): ConditionOperandChoice[] {
   const declared = (programKeys ?? []).filter((key) => !isStateKey(key.key));
   const known = new Set(declared.map((key) => key.key));
@@ -686,7 +713,68 @@ export function globalRuleChoices(
       ...(signal.provenance === undefined ? {} : { provenance: signal.provenance }),
     });
   }
-  return globalConditionChoices(inputs, [...declared, ...pending]);
+  const choices = globalConditionChoices(inputs, [...declared, ...pending]);
+  // One choice per signal first, then the keys.
+  return [
+    ...choices.slice(0, inputs.length),
+    ...changedOutsideChoices(document, changedOutside, condition),
+    ...choices.slice(inputs.length),
+  ];
+}
+
+const NO_SIGNAL_IDS: ReadonlySet<string> = new Set();
+
+/**
+ * The outputs whose core-held `changed outside` signal exists (CONTRACTS §7:
+ * outputs with read-back that aren't controller-owned): the base `signal_id`
+ * of every pushed `<signal_id>.changed_outside` sample.
+ */
+export function changedOutsideOutputs(samples: readonly { signal_id: string }[] | null): ReadonlySet<string> {
+  return new Set((samples ?? []).flatMap((sample) => (sample.signal_id.endsWith(CHANGED_OUTSIDE_SUFFIX)
+    ? [sample.signal_id.slice(0, -CHANGED_OUTSIDE_SUFFIX.length)] : [])));
+}
+
+/**
+ * "<output> → changed outside" operands (plan V2-7), nested under the
+ * Deployment's outputs that hold one; an operand the condition already reads
+ * stays listed so it remains editable while the cell isn't running.
+ */
+function changedOutsideChoices(
+  document: Record<string, JsonValue> | null,
+  eligible: ReadonlySet<string>,
+  condition: JsonValue | undefined,
+): ConditionOperandChoice[] {
+  return deploymentSignals(document, 'output').flatMap((output) => {
+    if (output.valueType !== 'bool') return [];
+    const operand = { signal: {
+      controllable_component_id: output.controllableComponentId,
+      signal_name: `${output.signalName}${CHANGED_OUTSIDE_SUFFIX}`,
+    } };
+    const id = operandId(operand);
+    if (!eligible.has(ioSignalId(output.controllableComponentId, output.signalName))
+      && !conditionOperandIds(condition).has(id)) return [];
+    return [{
+      id,
+      operand,
+      label: `${output.controllableComponentId} · ${output.signalName} → changed outside`,
+      key: '',
+      valueType: 'bool' as const,
+    }];
+  });
+}
+
+function conditionOperandIds(condition: JsonValue | undefined): Set<string> {
+  const found = new Set<string>();
+  const walk = (value: JsonValue | undefined) => {
+    const record = objectOf(value);
+    if (record === null) return;
+    const operand = objectOf(record.compare)?.operand;
+    if (operand !== undefined) found.add(operandId(operand));
+    for (const child of [...(Array.isArray(record.all) ? record.all : []),
+      ...(Array.isArray(record.any) ? record.any : []), record.not]) walk(child);
+  };
+  walk(condition);
+  return found;
 }
 
 /**
@@ -732,6 +820,13 @@ export function globalRuleScopeGroups(scope: JsonValue | undefined): string[] {
 
 /** Input signal rows of every component in a Deployment intent Draft. */
 export function deploymentInputSignals(document: Record<string, JsonValue> | null): DeploymentInputSignal[] {
+  return deploymentSignals(document, 'input');
+}
+
+function deploymentSignals(
+  document: Record<string, JsonValue> | null,
+  direction: 'input' | 'output',
+): DeploymentInputSignal[] {
   const components = Array.isArray(document?.components) ? document.components : [];
   const found = new Map<string, DeploymentInputSignal>();
   for (const value of components) {
@@ -742,11 +837,11 @@ export function deploymentInputSignals(document: Record<string, JsonValue> | nul
     if (!Array.isArray(rows)) continue;
     for (const rowValue of rows) {
       const row = objectOf(rowValue);
-      if (row?.direction !== 'input' || typeof row.controllable_component_id !== 'string'
+      if (row?.direction !== direction || typeof row.controllable_component_id !== 'string'
         || typeof row.signal_name !== 'string') continue;
       const valueType = row.value_type;
       if (valueType !== 'bool' && valueType !== 'int64' && valueType !== 'float64' && valueType !== 'string') continue;
-      const liveness = rowInputLiveness(row);
+      const liveness = direction === 'input' ? rowInputLiveness(row) : null;
       const signal: DeploymentInputSignal = {
         controllableComponentId: row.controllable_component_id,
         signalName: row.signal_name,

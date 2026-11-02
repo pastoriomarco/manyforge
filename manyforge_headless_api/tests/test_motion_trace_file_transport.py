@@ -101,6 +101,46 @@ def test_opted_in_file_preserves_normal_goals_derivatives_and_scale_facts(monkey
     assert math.copysign(1, trace["goals"][0]["trajectory"]["points"][0]["v"][0]) == -1
 
 
+def test_inline_trace_above_default_send_buffer_crosses_real_seqpacket(monkeypatch, tmp_path):
+    """Pins the inline read: the exact four-member request the host decodes,
+    and an inline response larger than the default unix send buffer, carried
+    in one packet once the accepted socket's own send buffer is raised (the
+    listener's never reaches it) and accepted unchanged by the parser."""
+    monkeypatch.delenv("MANYFORGE_MOTION_TRACE_DIR", raising=False)
+    trace = _normal_trace()
+    trace["goals"][1]["trajectory"]["points"] *= 3000
+    response = rfc8785.dumps({"api_version": "manyforge.execution_command_response.v1",
+                              "command": "read_volatile_motion_trace", "ok": True,
+                              "trace": trace})
+    assert 212_992 < len(response) < 400_000
+    endpoint = tmp_path / EXECUTION_SOCKET_FILE
+    with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as listener:
+        listener.bind(str(endpoint))
+        endpoint.chmod(0o600)
+        listener.listen(1)
+        listener.settimeout(3)
+
+        def answer():
+            connection, _ = listener.accept()
+            with connection:
+                connection.settimeout(3)
+                connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4 * 1024 * 1024)
+                command = json.loads(connection.recv(4096))
+                assert connection.send(response) == len(response)
+                return command
+
+        with ThreadPoolExecutor(max_workers=1) as worker:
+            answered = worker.submit(answer)
+            client = ExecutionCommandClient(tmp_path, timeout_seconds=2, attribution_transport="internal")
+            assert client.read_volatile_motion_trace(_MAX_BYTES) == trace
+            command = answered.result(timeout=3)
+    assert command == {"api_version": "manyforge.execution_command.v1",
+                       "attribution": {"transport": "internal", "assurance": "unverified",
+                                       "principal_id": None},
+                       "command": "read_volatile_motion_trace",
+                       "allowance_bytes": _MAX_BYTES}
+
+
 def test_large_trace_crosses_real_small_seqpacket_only_as_file_metadata(monkeypatch, tmp_path):
     monkeypatch.setenv("MANYFORGE_MOTION_TRACE_DIR", str(tmp_path))
     trace = _normal_trace()

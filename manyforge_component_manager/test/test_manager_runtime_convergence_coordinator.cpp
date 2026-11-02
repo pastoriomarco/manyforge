@@ -9,9 +9,7 @@
 #include <filesystem>
 #include <functional>
 #include <future>
-#include <manyforge_core/component_lifecycle_value_codec.hpp>
 #include <manyforge_core/resource_addressed_execution_kernel.hpp>
-#include <manyforge_core/sqlite_cclc_journal.hpp>
 #include <manyforge_core/sqlite_operation_journal.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
 #include <manyforge_core/time/manual_scheduler.hpp>
@@ -41,6 +39,7 @@
 #include "manyforge_component_manager/manager_selected_runtime_composition_coordinator.hpp"
 #include "manyforge_component_manager/reference_runtime_unit_admission.hpp"
 #include "manyforge_component_manager/retained_posix_runtime_unit_adapter.hpp"
+#include "gripper_only_retention_fixture.hpp"
 #include "lite6_controllable_retention_fixture.hpp"
 #include "runtime_only_retention_fixture.hpp"
 #include "canonical_empty_admission_internal.hpp"
@@ -183,11 +182,12 @@ MaterializeRosRuntimePackage(const std::filesystem::path &root,
                              std::string_view motion_limit_target =
                                  deployment::test::kLite6ArmTargetId,
                              std::string_view lifecycle_digest = {},
-                             std::string_view authored_name = {}) {
+                             std::string_view authored_name = {},
+                             std::optional<double> initial_joint1_position_rad = std::nullopt) {
   auto fixture = deployment::test::make_lite6_controllable_retention_fixture(
-      false, false, 1U, false, true, "runtime_only_cell", false, false,
-      "resource", false, lifecycle_digest, {}, true, false, false, std::nullopt, false,
-      motion_limit_target);
+      false, false, 1U, "runtime_only_cell", false, false,
+      "resource", false, lifecycle_digest, {}, false, false,
+      initial_joint1_position_rad, motion_limit_target);
   const deployment::test::Lite6ControllableCompilerInputArtifactSource
       input_source(fixture);
   auto qualified = fixture.qualified;
@@ -256,17 +256,11 @@ MaterializeRosRuntimePackage(const std::filesystem::path &root,
 
 [[nodiscard]] RuntimePackage MaterializeNoneInventoryPackage(
     const std::filesystem::path &root, std::string_view output_mode = "none",
-    std::string_view actuation_kind = "pneumatic", bool empty = false, bool include_arm = false,
+    std::string_view actuation_kind = "pneumatic", bool empty = false,
     bool feedback_alias = false) {
-  auto fixture = (include_arm || feedback_alias)
-      ? deployment::test::make_lite6_controllable_retention_fixture(
-          false, false, 1U, true, true, {}, false, true, "resource", true,
-          {}, {}, true, feedback_alias, !include_arm, std::nullopt, false,
-          deployment::test::kLite6ArmTargetId, std::nullopt, std::nullopt, {}, true, {},
-          "manyforge.provider.ros2_control", true, true, nullptr, nullptr,
-          false, false, actuation_kind, 0.2, output_mode)
-      : deployment::test::make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture(
-          {}, actuation_kind, 0.2, nullptr, output_mode);
+  // The Lite gripper as its own Mock ROS component.
+  auto fixture = deployment::test::make_lite_gripper_only_retention_fixture(
+      {}, actuation_kind, 0.2, output_mode, feedback_alias);
   const deployment::test::Lite6ControllableCompilerInputArtifactSource inputs(fixture);
   auto qualified = fixture.qualified;
   if (empty) {
@@ -1057,95 +1051,37 @@ public:
   std::function<Result<ManagerComponentProcessInventoryResultDTO>(
       const ManagerComponentProcessInventoryRequestDTO &)> installed_processes;
 
-  [[nodiscard]] ManagerSelectedRuntimeCompositionResultDTO InstallOrObserve(
-      const ManagerSelectedRuntimeCompositionRequestDTO &request) override {
+  // CONTRACTS §15 fake host: records each Apply and answers succeeded, or
+  // the scripted result, or throws on the scripted call (a lost exchange).
+  [[nodiscard]] Result<HostApplyResult>
+  ApplyOnHost(const RuntimeUnitId &runtime_unit_id,
+              const HostApplyRequest &request) override {
     ++calls;
-    phases.push_back(request.phase);
+    last_runtime_unit = runtime_unit_id;
     last_request = request;
     if (calls == fail_on_call) {
       if (before_failure) before_failure(request);
       if (failure_error) throw *failure_error;
-      throw std::runtime_error("scripted exact composition failure");
+      throw std::runtime_error("scripted exact host Apply failure");
     }
-    auto response_request = request;
-    if (foreign_response) {
-      response_request.manager_runtime_epoch = RuntimeEpoch("foreign-manager");
-    }
-    const auto preparing = (prepare_once && calls == 1) ||
-        (pending && pending(request));
-    if (preparing) {
-      return {std::move(response_request),
-              ManagerSelectedRuntimeCompositionState::kPreparing,
-              {}};
+    if (result) {
+      if (before_failure) before_failure(request);
+      return Result<HostApplyResult>::Ok(*result);
     }
     if (installed) installed(request);
-    return {std::move(response_request),
-            ManagerSelectedRuntimeCompositionState::kInstalled,
-            omit_receipts ? std::vector<ManagerRuntimeComponentReceiptDTO>{}
-                          : Receipts(request)};
-  }
-
-  [[nodiscard]] Result<ManagerApplyComponentBringUpResultDTO>
-  SubmitApplyComponentBringUp(const ManagerApplyComponentBringUpRequestDTO &request) override {
-    ++child_submit_calls;
-    if (child_submit) return child_submit(request);
-    return IManagerSelectedRuntimeCompositionPort::SubmitApplyComponentBringUp(request);
-  }
-
-  [[nodiscard]] Result<ManagerApplyComponentBringUpResultDTO>
-  ReadApplyComponentBringUp(const ManagerApplyComponentBringUpReadRequestDTO &request) override {
-    ++child_read_calls;
-    if (child_read) return child_read(request.request);
-    return IManagerSelectedRuntimeCompositionPort::ReadApplyComponentBringUp(request);
-  }
-
-  int child_submit_calls{0};
-  int child_read_calls{0};
-  std::function<Result<ManagerApplyComponentBringUpResultDTO>(
-      const ManagerApplyComponentBringUpRequestDTO &)> child_submit;
-  std::function<Result<ManagerApplyComponentBringUpResultDTO>(
-      const ManagerApplyComponentBringUpRequestDTO &)> child_read;
-
-  // What a conforming host reports: one live-owner receipt per retained,
-  // added or replaced component, re-sealing retained controllers when the
-  // product changed.
-  [[nodiscard]] static std::vector<ManagerRuntimeComponentReceiptDTO>
-  Receipts(const ManagerSelectedRuntimeCompositionRequestDTO &request) {
-    const auto product_changed =
-        request.predecessor_projection_revision.retained_bundle_id !=
-            request.candidate_projection_revision.retained_bundle_id ||
-        request.predecessor_projection_revision.graph_revision !=
-            request.candidate_projection_revision.graph_revision;
-    std::vector<ManagerRuntimeComponentReceiptDTO> receipts;
-    for (const auto &change : request.component_delta.components) {
-      if (change.disposition ==
-          deployment::ApplyComponentDisposition::kRemove) {
-        continue;
-      }
-      const auto retained =
-          change.disposition == deployment::ApplyComponentDisposition::kRetain;
-      receipts.push_back({change.controllable_component_id,
-                          change.disposition,
-                          change.candidate_runtime_identity,
-                          {{request.runtime_unit_id, request.runtime_epoch}},
-                          retained,
-                          retained && product_changed});
-    }
-    return receipts;
+    return Result<HostApplyResult>::Ok({HostApplyOutcome::kSucceeded, std::nullopt});
   }
 
   int fail_on_call{0};
-  // The typed failure the host returns instead of the generic one.
+  // The typed failure the exchange throws instead of the generic one.
   std::optional<core::TypedError> failure_error;
-  std::function<void(const ManagerSelectedRuntimeCompositionRequestDTO &)> installed;
-  std::function<void(const ManagerSelectedRuntimeCompositionRequestDTO &)> before_failure;
-  std::function<bool(const ManagerSelectedRuntimeCompositionRequestDTO &)> pending;
-  bool prepare_once{false};
-  bool foreign_response{false};
-  bool omit_receipts{false};
+  // A host decision returned instead of success.
+  std::optional<HostApplyResult> result;
+  std::function<void(const HostApplyRequest &)> installed;
+  std::function<void(const HostApplyRequest &)> before_failure;
   int calls{0};
-  std::vector<ManagerSelectedRuntimeCompositionPhase> phases;
-  std::optional<ManagerSelectedRuntimeCompositionRequestDTO> last_request;
+  std::optional<RuntimeUnitId> last_runtime_unit;
+  std::optional<HostApplyRequest> last_request;
 };
 
 class ScriptedCellAdmissionPort final : public core::IKernelCellAdmissionPort {
@@ -1307,7 +1243,7 @@ public:
             target.scene_revision,
             request.candidate_retained_bundle.cell_graph.cell_id,
         },
-        request.native_runtime_bindings,
+        request.execution_host_bindings,
         std::nullopt,
         std::nullopt,
         false,
@@ -1770,7 +1706,7 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
 }
 
 TEST(ManagerApplyRuntimeConvergenceCoordinator,
-     NativeExecutionHostRemovalRejectsBeforeRuntimeEffect) {
+     ExecutionHostRemovalRejectsBeforeRuntimeEffect) {
   ScopedPackageRoot native_root;
   ScopedPackageRoot candidate_root;
   ScopedPackageRoot state_root;
@@ -1789,11 +1725,11 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
   intent.candidate_retained_bundle_id = candidate.bundle->retained_bundle_id();
   intent.candidate_graph_revision =
       candidate.bundle->value().cell_graph.graph_revision;
-  const auto continuity = VerifyNativeExecutionHostContinuity(
+  const auto continuity = VerifyExecutionHostContinuity(
       *predecessor.bundle, *candidate.bundle, *predecessor.artifact_source);
   ASSERT_FALSE(continuity.ok());
   EXPECT_EQ(continuity.error().code,
-            "native_execution_host_incompatible");
+            "execution_host_incompatible");
   EXPECT_EQ(continuity.error().details.at("expected_runtime_unit_id"),
             predecessor.bundle->value().cell_graph.runtime_units.front()
                 .runtime_unit_id.value());
@@ -1861,7 +1797,7 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
     EXPECT_EQ(*product->manager_liveness_policy(),
               deployment::execution_runtime_contract::manager_liveness_policy());
   }
-  EXPECT_TRUE(VerifyNativeExecutionHostContinuity(
+  EXPECT_TRUE(VerifyExecutionHostContinuity(
       *predecessor.bundle, *candidate.bundle, *predecessor.artifact_source).ok());
 }
 
@@ -1884,10 +1820,10 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
     auto intent = ApplyIntent(*predecessor.bundle);
     intent.candidate_retained_bundle_id = candidate->bundle->retained_bundle_id();
     intent.candidate_graph_revision = candidate->bundle->value().cell_graph.graph_revision;
-    const auto continuity = VerifyNativeExecutionHostContinuity(
+    const auto continuity = VerifyExecutionHostContinuity(
         *predecessor.bundle, *candidate->bundle, *predecessor.artifact_source);
     ASSERT_FALSE(continuity.ok());
-    EXPECT_EQ(continuity.error().code, "native_execution_host_incompatible");
+    EXPECT_EQ(continuity.error().code, "execution_host_incompatible");
     EXPECT_EQ(continuity.error().details.at("reason"),
               "candidate_native_host_missing");
     const auto database = state_root.path() /
@@ -1922,7 +1858,7 @@ TEST(ManagerApplyRuntimeConvergenceCoordinator,
     auto intent = ApplyIntent(*predecessor.bundle);
     intent.candidate_retained_bundle_id = drifted.bundle->retained_bundle_id();
     intent.candidate_graph_revision = drifted.bundle->value().cell_graph.graph_revision;
-    EXPECT_TRUE(VerifyNativeExecutionHostContinuity(
+    EXPECT_TRUE(VerifyExecutionHostContinuity(
         *predecessor.bundle, *drifted.bundle, *predecessor.artifact_source).ok());
     const auto database = state_root.path() /
         (drifted.bundle->retained_bundle_id().value().substr(7U) + ".sqlite3");
@@ -2343,12 +2279,11 @@ TEST(ManagerNamedApplyCoordinator,
                                 SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, nullptr), SQLITE_OK);
       EXPECT_NE(sqlite3_exec(raw, "UPDATE manager_apply_failed_release SET acknowledgement_source_label='other'",
                              nullptr, nullptr, nullptr), SQLITE_OK);
-      EXPECT_NE(sqlite3_exec(raw, "DELETE FROM manager_apply_failed_release", nullptr, nullptr, nullptr), SQLITE_OK);
       sqlite3_stmt *schema_count = nullptr;
       ASSERT_EQ(sqlite3_prepare_v2(raw, "SELECT count(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'",
                                    -1, &schema_count, nullptr), SQLITE_OK);
       ASSERT_EQ(sqlite3_step(schema_count), SQLITE_ROW);
-      EXPECT_EQ(sqlite3_column_int64(schema_count, 0), 45);
+      EXPECT_EQ(sqlite3_column_int64(schema_count, 0), 27);
       EXPECT_EQ(sqlite3_finalize(schema_count), SQLITE_OK);
       EXPECT_EQ(sqlite3_close(raw), SQLITE_OK);
       SqliteManagerApplyJournal reopened(database, journal.cell_id());
@@ -2440,205 +2375,6 @@ TEST(ManagerNamedApplyCoordinator,
 
 
 TEST(ManagerNamedApplyCoordinator,
-     LinkedBringUpParentReplayAndRecoveryOnlyObserveRetainedFacts) {
-  ScopedPackageRoot package_root;
-  ScopedPackageRoot state_root;
-  auto package = MaterializeRosRuntimePackage(package_root.path());
-  RefusingBundleReloadSource bundle_source(*package.bundle_source);
-  bundle_source.refuse_reads = true;
-  const auto intent = ApplyIntent(*package.bundle);
-  const auto predecessor = PredecessorPublication(intent);
-  const auto &graph = package.bundle->value().cell_graph;
-  ASSERT_FALSE(graph.controllable_components.empty());
-  ASSERT_FALSE(graph.control_domains.empty());
-  ASSERT_FALSE(graph.control_bindings.empty());
-  const auto &component = graph.controllable_components.front();
-  const auto &domain = graph.control_domains.front();
-  const auto &binding = graph.control_bindings.front();
-  ASSERT_EQ(binding.controllable_component_id,
-            component.controllable_component_id);
-  ASSERT_EQ(binding.control_domain_id, domain.control_domain_id);
-  ASSERT_FALSE(binding.legal_control_route_ids.empty());
-  const core::ExpectedControlDomainRevisionDTO expected_domain{
-      domain.control_domain_id,
-      domain.control_domain_revision,
-      domain.controller().controller_topology_id,
-      domain.controller().topology_revision,
-      {core::ExpectedActiveControlConfigurationPresenceDTO::kAbsent, std::nullopt, std::nullopt},
-      {{binding.control_binding_id, binding.control_binding_revision,
-        binding.legal_control_route_ids.front()}}};
-  const core::ComponentLifecycleIntentDTO child_intent{
-      {RequestId("child.original.1"), RequestOwnerEpoch("cclc.original.1"),
-       "linked-parent-test", std::nullopt},
-      component.controllable_component_id,
-      core::ComponentLifecycleIntentKindDTO::kPrepare,
-      graph.graph_revision,
-      core::ComponentLifecycleGeneration(1U),
-      {expected_domain},
-      std::nullopt,
-      {},
-      *intent.expected_admission_generation,
-      std::nullopt};
-  const ManagerApplyBringUpChildRequestDTO child{
-      child_intent,
-      intent.expected_active_projection_revision,
-      ContentDigest(std::string(kDigestTwo)),
-      512U,
-      binding.provider_runtime_unit_id,
-      RuntimeEpoch("host.original.1"),
-      RuntimeEpoch("manager.original.1")};
-  const ManagerApplyPrivateMaterializationDTO materialization{
-      child.candidate_projection_revision.scene_revision.content_hash,
-      intent.apply_id,
-      intent.apply_generation,
-      child.candidate_projection_revision,
-      child.candidate_retained_bundle_digest,
-      child.candidate_retained_bundle_bytes};
-  const ManagerApplyBringUpPlanDTO plan{
-      intent.apply_id,
-      intent.apply_generation,
-      ComputeManagerApplyIntentDigest(intent),
-      {component.controllable_component_id},
-      {child},
-      {core::NamedApplyPublicationTransactionDTO{intent.apply_id,
-                                                 intent.apply_generation},
-       child.candidate_projection_revision, intent.candidate_retained_bundle_id,
-       intent.candidate_graph_revision, predecessor.publication_generation,
-       ComputeManagerApplyPrivateMaterializationDigest(materialization)},
-      predecessor.durable_public_pointer_content_digest};
-  ASSERT_TRUE(plan.valid());
-  const auto database = state_root.path() / "linked-parent.sqlite3";
-  SqliteManagerApplyJournal journal(database, intent.cell_id);
-  SqliteManagerApplyJournal independent_reader(database, intent.cell_id);
-  const auto parent = journal.EnsureBringUpIntent(intent, plan);
-  const ManagerApplyBringUpChildProofDTO rejected_child{
-      intent.apply_id,
-      intent.apply_generation,
-      parent.plan.plan_digest,
-      child_intent.controllable_component_id,
-      ManagerApplyBringUpChildPhase::kAccepted,
-      {core::RequestReplayStatusDTO::kAcceptedNew, std::nullopt, std::nullopt,
-       core::ErrorDTO{
-           "not_qualified", "original child refused without admission", {{"effect", "not_started"}}},
-       std::nullopt}};
-  const auto proof = journal.EnsureBringUpChildProof(rejected_child);
-  ScriptedPublicationStore publication_store(predecessor, &independent_reader);
-  FixedActiveRuntimePlanSource active_plan_source(
-      predecessor, BuildVerifiedRuntimeConvergencePlan(
-                       *package.bundle, *package.artifact_source, "linux",
-                       {std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)}));
-  ScriptedRuntimePorts runtime_ports(independent_reader);
-  MaintenanceSceneOwner scene_owner(
-      predecessor.request.candidate_projection_revision);
-  AggregateFencePort kernel_fence(independent_reader, predecessor);
-  ScriptedRuntimeCompositionPort runtime_composition;
-  ScriptedCellAdmissionPort cell_admission;
-  const core::CellAdmissionClaimIntentDTO claim_intent{
-      core::CellAdmissionClaimKindDTO::kManagerApply,
-      core::CellAdmissionOwnerRoleDTO::kManager,
-      intent.request_context.request_owner_epoch,
-      intent.apply_id.value(),
-      intent.request_context.request_id,
-      parent.plan.plan_digest,
-      *intent.expected_admission_generation,
-      {},
-      std::nullopt,
-      std::nullopt};
-  ASSERT_TRUE(cell_admission.AcquireCellAdmissionClaim(claim_intent).ok());
-  const auto held_admission = cell_admission.GetAuthoringAdmission();
-  ASSERT_FALSE(held_admission.authoring_allowed);
-  AlwaysIdleMaintenanceGate maintenance_gate;
-  ManagerPlannedMaintenanceCoordinator planned_maintenance(active_plan_source,
-                                                           maintenance_gate);
-  int progress_callbacks = 0;
-  int capture_calls = 0;
-  int mint_calls = 0;
-  ManagerNamedApplyCoordinator reopened(
-      journal, active_plan_source, bundle_source, *package.artifact_source,
-      publication_store, scene_owner, nullptr, kernel_fence, cell_admission,
-      runtime_composition, runtime_ports, runtime_ports, planned_maintenance,
-      RuntimeEpoch("manager.replaced.1"), "linux", {std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)},
-      [] { return 2'000U; },
-      [&] {
-        ++mint_calls;
-        return ApplyId("must-not-be-minted");
-      },
-      [&](const auto &, const auto &) {
-        ++capture_calls;
-        return std::vector<core::AddObjectRequestDTO>{};
-      },
-      {}, [&](const auto &) { ++progress_callbacks; });
-  const ManagerNamedApplyRequestDTO request{
-      intent.request_context,
-      package.bundle->value().deployment_artifact_id,
-      package.bundle->value().deployment_revision,
-      intent.expected_active_projection_revision.retained_bundle_id,
-      intent.expected_active_projection_revision.graph_revision,
-      intent.candidate_retained_bundle_id,
-      intent.prepared_activation,
-      intent.expected_admission_generation,
-      std::nullopt};
-  for (int observation = 0; observation < 2; ++observation) {
-    const auto pending = reopened.RecoverIncompleteApply();
-    ASSERT_TRUE(pending.has_value());
-    EXPECT_EQ(pending->state, ManagerNamedApplyResultState::kPending);
-    EXPECT_TRUE(pending->request_replayed);
-    EXPECT_FALSE(pending->terminal_outcome);
-    const auto replay = reopened.AcceptOrReplay(request);
-    EXPECT_EQ(replay.state, ManagerNamedApplyResultState::kPending);
-    EXPECT_TRUE(replay.request_replayed);
-    EXPECT_FALSE(replay.terminal_outcome);
-  }
-  EXPECT_EQ(journal.VerifyIntegrity().terminal_outcome_count, 0);
-  EXPECT_EQ(journal.ReadBringUpPlan(intent.apply_id, intent.apply_generation),
-            parent.plan);
-  const auto retained_proof =
-      journal.ReadBringUpChildProof(intent.apply_id, intent.apply_generation,
-                                    child_intent.controllable_component_id,
-                                    ManagerApplyBringUpChildPhase::kAccepted);
-  ASSERT_TRUE(retained_proof.has_value());
-  EXPECT_EQ(retained_proof->proof_digest, proof.record.proof_digest);
-  const ManagerApplyTerminalOutcomeDTO terminal{
-      intent.apply_id,
-      intent.apply_generation,
-      std::nullopt,
-      std::nullopt,
-      std::nullopt,
-      std::nullopt,
-      ManagerApplyTerminalOutcomeState::kFailed,
-      ManagerApplyFailureEvidenceDTO{
-          parent.intent.intent_digest, ManagerApplyPhase::kAccepted,
-          "not_qualified", "actual original parent refusal",
-          ManagerApplyEffectDisposition::kKnown,
-          "typed_cause_code",
-          {},
-          "component_manager",
-          ManagerApplyEffectBoundary::kUnknown}};
-  static_cast<void>(journal.EnsureTerminalOutcome(terminal));
-  const auto terminal_replay = reopened.AcceptOrReplay(request);
-  EXPECT_EQ(terminal_replay.state, ManagerNamedApplyResultState::kFailed);
-  EXPECT_EQ(terminal_replay.terminal_outcome, terminal);
-  EXPECT_FALSE(reopened.RecoverIncompleteApply());
-  EXPECT_EQ(cell_admission.GetAuthoringAdmission(), held_admission);
-  EXPECT_FALSE(cell_admission.last_release);
-  EXPECT_EQ(bundle_source.read_calls, 0);
-  EXPECT_EQ(active_plan_source.read_calls, 0);
-  EXPECT_EQ(runtime_ports.observe_calls, 0);
-  EXPECT_EQ(runtime_ports.ensure_calls, 0);
-  EXPECT_EQ(runtime_ports.stop_calls, 0);
-  EXPECT_EQ(scene_owner.begin_calls, 0);
-  EXPECT_EQ(scene_owner.install_scene_calls, 0);
-  EXPECT_EQ(runtime_composition.calls, 0);
-  EXPECT_EQ(publication_store.publish_calls, 0);
-  EXPECT_EQ(kernel_fence.observe_admission_calls, 0);
-  EXPECT_EQ(kernel_fence.acquire_calls, 0);
-  EXPECT_EQ(kernel_fence.release_calls, 0);
-  EXPECT_EQ(progress_callbacks, 0);
-  EXPECT_EQ(capture_calls, 0);
-  EXPECT_EQ(mint_calls, 0);
-}
-
-TEST(ManagerNamedApplyCoordinator,
      ReopenedManagerMarksNonterminalCaptureInterruptedWithoutEffects) {
   ScopedPackageRoot package_root;
   ScopedPackageRoot state_root;
@@ -2715,13 +2451,11 @@ TEST(ManagerNamedApplyCoordinator,
   EXPECT_EQ(kernel_fence.release_calls, 0);
 }
 
-// The fake original CCLC reports its own retained values; Manager must record
-// these values, never manufacture acceptance or Holding from the plan.
 // Real Scene owner protocol with native participant test clients. Production
 // host registration is separately qualified; no Scene row/status is faked.
 class AdoptionProjection final : public IPlannerSceneProjection {
 public:
-  explicit AdoptionProjection(ProjectionNativeRuntimeBindingDTO binding)
+  explicit AdoptionProjection(ProjectionExecutionHostBindingDTO binding)
       : health_{std::move(binding), 1U, ProjectionHealthState::kUninitialized,
                 std::nullopt, 1U, ContentDigest(std::string(kDigestOne)), std::nullopt} {}
   void Qualify(const ProjectionRevisionDTO &target) {
@@ -2739,7 +2473,7 @@ public:
             health_.native_projection_generation, false, health_, std::nullopt};
   }
   ProjectionCommitResultDTO RebuildProjection(const NativeProjectionRebuildDTO &request) override {
-    if (!request.valid() || request.expected_native_runtime_binding != health_.native_runtime_binding)
+    if (!request.valid() || request.expected_execution_host_binding != health_.execution_host_binding)
       throw std::runtime_error("foreign test native rebuild");
     ++effect_calls;
     if (std::exchange(accept_next_rebuild, false)) {
@@ -2806,9 +2540,9 @@ private:
 class AdoptionProjectionResolver final : public IPlannerSceneProjectionResolver {
 public:
   Result<std::shared_ptr<IPlannerSceneProjection>> ResolveProjection(
-      const ProjectionNativeRuntimeBindingDTO &binding) const override {
+      const ProjectionExecutionHostBindingDTO &binding) const override {
     for (const auto &client : clients) {
-      if (client->ProjectionHealth().native_runtime_binding == binding)
+      if (client->ProjectionHealth().execution_host_binding == binding)
         return Result<std::shared_ptr<IPlannerSceneProjection>>::Ok(client);
     }
     return Result<std::shared_ptr<IPlannerSceneProjection>>::Err({"missing_reference", "foreign projection", {}});
@@ -2816,9 +2550,9 @@ public:
   std::vector<std::shared_ptr<AdoptionProjection>> clients;
 };
 
-std::vector<ProjectionNativeRuntimeBindingDTO> AdoptionBindings(
+std::vector<ProjectionExecutionHostBindingDTO> AdoptionBindings(
     const deployment::RetainedBundle &bundle, const RuntimeEpoch &epoch) {
-  std::vector<ProjectionNativeRuntimeBindingDTO> result;
+  std::vector<ProjectionExecutionHostBindingDTO> result;
   for (const auto &provider : bundle.value().capability_provider_bindings) {
     if (!core::RequiresNativeSceneProjection(provider.capability_id, provider.capability_definition_revision)) continue;
     std::set<RuntimeUnitId> units;
@@ -2936,7 +2670,7 @@ ActiveBundlePublicationReceiptDTO EstablishActualScenePredecessor(
     scene::LogicalSceneOwner &owner, ScriptedPublicationStore &publication,
     const deployment::CanonicalEmptyRetainedBundleAdmission &admission,
     const deployment::RetainedBundle &predecessor,
-    const std::vector<ProjectionNativeRuntimeBindingDTO> &bindings) {
+    const std::vector<ProjectionExecutionHostBindingDTO> &bindings) {
   const auto accepted = owner.BeginProjectionBootstrap(
       {BootstrapId("actual-scene-bootstrap"), BootstrapGeneration(1U), admission.cell_id(),
        admission.retained_bundle().value(), {}});
@@ -3027,7 +2761,7 @@ TEST(ManagerNamedApplyCoordinator,
     ASSERT_EQ(actual_scene.empty.bundle->value().cell_graph.cell_id, package.bundle->value().cell_graph.cell_id);
     ASSERT_TRUE(package.bundle->value().cell_graph.controllable_components.empty());
     ASSERT_TRUE(package.bundle->value().cell_graph.control_domains.empty());
-    const auto continuity = VerifyNativeExecutionHostContinuity(
+    const auto continuity = VerifyExecutionHostContinuity(
         *actual_scene.empty.bundle, *package.bundle, *package.artifact_source);
     ASSERT_TRUE(continuity.ok()) << continuity.error().message;
     FixedActiveRuntimePlanSource active_plan_source(
@@ -3141,16 +2875,17 @@ TEST(ManagerNamedApplyCoordinator,
     };
 
     int prepare_acknowledgements = 0;
-    const auto accepted = coordinator.AcceptOrReplay(request, {},
+    const auto accepted = coordinator.AcceptOrReplay(request,
         [&](const auto &original, const auto &candidate, const auto &acknowledgement) {
           ++prepare_acknowledgements;
           EXPECT_EQ(original.request_context, request.request_context);
           EXPECT_EQ(candidate.canonical_bytes(), package.bundle->canonical_bytes());
           EXPECT_TRUE(acknowledgement.valid());
-          EXPECT_EQ(acknowledgement.request.apply_id, original.apply_id);
-          EXPECT_EQ(acknowledgement.request.apply_generation, original.apply_generation);
-          EXPECT_EQ(acknowledgement.request.phase, ManagerSelectedRuntimeCompositionPhase::kPrepare);
-          EXPECT_EQ(acknowledgement.state, ManagerSelectedRuntimeCompositionState::kInstalled);
+          EXPECT_EQ(acknowledgement.outcome, HostApplyOutcome::kSucceeded);
+          ASSERT_TRUE(runtime_composition.last_request.has_value());
+          EXPECT_EQ(runtime_composition.last_request->apply,
+                    (NamedApplyPublicationTransactionDTO{original.apply_id,
+                                                         original.apply_generation}));
           EXPECT_EQ(scene_owner.ordinary_install_calls, 0);
           EXPECT_EQ(publication_store.publish_calls, 0);
           EXPECT_EQ(runtime_composition.calls, 1);
@@ -3159,7 +2894,7 @@ TEST(ManagerNamedApplyCoordinator,
     EXPECT_FALSE(accepted.request_replayed);
     ASSERT_TRUE(journal.ReadRequest(request.request_context.request_owner_epoch,
                                    request.request_context.request_id));
-    const auto pending_replay = coordinator.AcceptOrReplay(request, {},
+    const auto pending_replay = coordinator.AcceptOrReplay(request,
         [](const auto &, const auto &, const auto &) {
           ADD_FAILURE() << "pending replay replaced the original capture";
         });
@@ -3206,7 +2941,7 @@ TEST(ManagerNamedApplyCoordinator,
       EXPECT_TRUE(waiting_replay.settlement_pending);
       EXPECT_EQ(settlement_attempts.size(), 1U);
       EXPECT_EQ(runtime_ports.ensure_calls, 1);
-      EXPECT_EQ(runtime_composition.calls, 3);
+      EXPECT_EQ(runtime_composition.calls, 1);
       EXPECT_EQ(publication_store.publish_calls, 1);
       auto another_request = request;
       another_request.request_context.request_id = RequestId("request.while-settlement-held");
@@ -3224,7 +2959,7 @@ TEST(ManagerNamedApplyCoordinator,
       EXPECT_EQ(settlement_attempts.size(), 1U);
       EXPECT_EQ(cell_admission.release_calls, 0);
       EXPECT_EQ(coordinator.PendingSettlementForHeartbeat(), heartbeat_reference);
-      EXPECT_EQ(runtime_composition.calls, 3);
+      EXPECT_EQ(runtime_composition.calls, 1);
       EXPECT_EQ(publication_store.publish_calls, 1);
 
       // A failed ordinary-heartbeat proof keeps the exact successful operation
@@ -3266,7 +3001,7 @@ TEST(ManagerNamedApplyCoordinator,
             *heartbeat_reference).has_value());
         EXPECT_EQ(settlement_attempts, attempts_before_read_error);
         EXPECT_EQ(publication_store.publish_calls, 1);
-        EXPECT_EQ(runtime_composition.calls, 3);
+        EXPECT_EQ(runtime_composition.calls, 1);
         continue;
       }
       if (fail_release) {
@@ -3286,7 +3021,7 @@ TEST(ManagerNamedApplyCoordinator,
             *heartbeat_reference).has_value());
         EXPECT_EQ(settlement_attempts, failed_attempts);
         EXPECT_EQ(cell_admission.release_calls, 1);
-        EXPECT_EQ(runtime_composition.calls, 3);
+        EXPECT_EQ(runtime_composition.calls, 1);
         EXPECT_EQ(publication_store.publish_calls, 1);
         continue;
       }
@@ -3331,34 +3066,30 @@ TEST(ManagerNamedApplyCoordinator,
     EXPECT_EQ(authored_scene_reads, 0);
     EXPECT_EQ(scene::EncodeLogicalSceneSnapshot(*actual_scene.owner.LogicalSnapshot()),
               actual_scene.snapshot_bytes);
-    // Finalize before publication, then once more after it under the held
-    // fence so the runtime owner adopts the published candidate (UA7W.L L6).
-    EXPECT_EQ(runtime_composition.calls, 3);
-    EXPECT_EQ(runtime_composition.phases,
-              (std::vector<ManagerSelectedRuntimeCompositionPhase>{
-                  ManagerSelectedRuntimeCompositionPhase::kPrepare,
-                  ManagerSelectedRuntimeCompositionPhase::kFinalize,
-                  ManagerSelectedRuntimeCompositionPhase::kFinalize}));
+    // One host Apply (CONTRACTS §15), before publication; no Finalize.
+    EXPECT_EQ(runtime_composition.calls, 1);
     ASSERT_TRUE(runtime_composition.last_request.has_value());
-    EXPECT_EQ(runtime_composition.last_request->phase,
-              ManagerSelectedRuntimeCompositionPhase::kFinalize);
-    // The host executes the exact durable decision, never a re-derived one.
-    const auto affected = journal.ReadAffectedScope(
+    EXPECT_TRUE(runtime_composition.last_request->valid());
+    EXPECT_EQ(runtime_composition.last_request->candidate_retained_bundle_id,
+              package.bundle->retained_bundle_id());
+    EXPECT_EQ(runtime_composition.last_request->candidate_graph_revision,
+              package.bundle->value().cell_graph.graph_revision);
+    // The empty candidate keeps, adds and removes nothing.
+    EXPECT_TRUE(runtime_composition.last_request->components.empty());
+    EXPECT_TRUE(runtime_composition.last_request->retained_components.empty());
+    EXPECT_TRUE(runtime_composition.last_request->removed_components.empty());
+    EXPECT_TRUE(runtime_composition.last_request->removed_domains.empty());
+    EXPECT_EQ(runtime_composition.last_runtime_unit,
+              std::optional(kernel_fence.original_execution_host->runtime_unit_id));
+    EXPECT_TRUE(journal.ReadPrivateMaterialization(
         completed->terminal_outcome->apply_id,
-        completed->terminal_outcome->apply_generation);
-    ASSERT_TRUE(affected.has_value());
-    EXPECT_EQ(runtime_composition.last_request->component_delta,
-              affected->affected_scope.component_delta);
-    EXPECT_TRUE(runtime_composition.last_request->component_delta.valid());
-    EXPECT_EQ(runtime_composition.last_request->predecessor_projection_revision
-                  .retained_bundle_id,
-              predecessor.request.candidate_retained_bundle_id);
+        completed->terminal_outcome->apply_generation).has_value());
     EXPECT_EQ(publication_store.publish_calls, 1);
     EXPECT_EQ(kernel_fence.acquire_calls, 1);
     EXPECT_EQ(kernel_fence.release_calls, 1);
     EXPECT_EQ(bundle_source.read_calls, accepted_bundle_reads);
 
-    const auto replayed = coordinator.AcceptOrReplay(request, {},
+    const auto replayed = coordinator.AcceptOrReplay(request,
         [&](const auto &, const auto &, const auto &) {
           ADD_FAILURE() << "replay reconstructed the original Prepare continuation";
         });
@@ -3374,7 +3105,7 @@ TEST(ManagerNamedApplyCoordinator,
     EXPECT_EQ(authored_scene_reads, 0);
     EXPECT_EQ(scene::EncodeLogicalSceneSnapshot(*actual_scene.owner.LogicalSnapshot()),
               actual_scene.snapshot_bytes);
-    EXPECT_EQ(runtime_composition.calls, 3);  // Replay repeats no effect.
+    EXPECT_EQ(runtime_composition.calls, 1);  // Replay repeats no effect.
     EXPECT_EQ(publication_store.publish_calls, 1);
     EXPECT_EQ(kernel_fence.acquire_calls, 1);
     EXPECT_EQ(kernel_fence.release_calls, 1);
@@ -3389,9 +3120,13 @@ TEST(ManagerNamedApplyCoordinator,
 }
 
 TEST(ManagerNamedApplyCoordinator,
-     PreparationAndFinalizationFailuresRetainDistinctOriginalTerminalEvidence) {
-  // 4: the host's typed Scenario composition refusal at Prepare.
-  for (const int failing_call : {1, 2, 3, 4}) {
+     HostApplyFailuresRetainDistinctOriginalTerminalEvidence) {
+  // 1: the host exchange is lost; 3: the original acknowledgement fails after
+  // the host accepted; 4: the host's typed Scenario composition refusal;
+  // 5: the host refuses an enabled replaced or removed component (CONTRACTS
+  // §15), a known failure with no publication; 6: a host failure the host
+  // caught before changing anything installed (`effect: none`, H1).
+  for (const int failing_call : {1, 3, 4, 5, 6}) {
     SCOPED_TRACE(failing_call);
     ScopedPackageRoot package_root;
     ScopedPackageRoot state_root;
@@ -3446,7 +3181,7 @@ TEST(ManagerNamedApplyCoordinator,
     ASSERT_EQ(actual_scene.empty.bundle->value().cell_graph.cell_id, package.bundle->value().cell_graph.cell_id);
     ASSERT_TRUE(package.bundle->value().cell_graph.controllable_components.empty());
     ASSERT_TRUE(package.bundle->value().cell_graph.control_domains.empty());
-    const auto continuity = VerifyNativeExecutionHostContinuity(
+    const auto continuity = VerifyExecutionHostContinuity(
         *actual_scene.empty.bundle, *package.bundle, *package.artifact_source);
     ASSERT_TRUE(continuity.ok()) << continuity.error().message;
     FixedActiveRuntimePlanSource active_plan_source(
@@ -3499,7 +3234,19 @@ TEST(ManagerNamedApplyCoordinator,
               {request, installed_processes, std::nullopt});
         };
     runtime_composition.fail_on_call =
-        failing_call == 3 ? 0 : failing_call == 4 ? 1 : failing_call;
+        failing_call == 1 || failing_call == 4 ? 1 : 0;
+    if (failing_call == 5)
+      runtime_composition.result = HostApplyResult{
+          HostApplyOutcome::kFailed,
+          core::ErrorDTO{"apply_requires_inactive_component",
+                         "configuration Apply cannot replace or remove enabled component arm.1",
+                         {{"component_id", "arm.1"}}}};
+    if (failing_call == 6)
+      runtime_composition.result = HostApplyResult{
+          HostApplyOutcome::kFailed,
+          core::ErrorDTO{"selected_runtime_composition_request_failed",
+                         "Execution host: retained native owner differs from the planned predecessor",
+                         {{"effect", "none"}}}};
     if (failing_call == 4)
       runtime_composition.failure_error = core::TypedError(
           std::string(kScenarioCompositionRefusedCode),
@@ -3509,34 +3256,18 @@ TEST(ManagerNamedApplyCoordinator,
           std::string(kExecutionHostProducer));
     const auto original_admission = cell_admission.GetAuthoringAdmission();
     ASSERT_TRUE(original_admission.authoring_allowed);
-    const auto native_database = state_root.path() / "native-plan.sqlite3";
-    std::optional<core::NativeApplyPlanDTO> original_native_plan;
-    std::optional<ManagerSelectedRuntimeCompositionRequestDTO> failed_request;
+    std::optional<HostApplyRequest> failed_request;
     std::optional<core::CellAdmissionClaimDTO> original_claim_before_failure;
     std::optional<core::ConfigurationFenceAcceptedDTO> original_fence_before_failure;
     runtime_composition.before_failure = [&](const auto &composition_request) {
       failed_request = composition_request;
       original_claim_before_failure = cell_admission.ReadHeldCellAdmissionClaim(
           core::CellAdmissionClaimKindDTO::kManagerApply);
-      const auto parent = journal.ReadStatus(composition_request.apply_id,
-                                            composition_request.apply_generation);
+      const auto parent = journal.ReadStatus(composition_request.apply.apply_id,
+                                            composition_request.apply.apply_generation);
       if (!original_claim_before_failure || !parent || !parent->fence_acceptance)
         throw std::runtime_error("fixture lost the original claim or accepted fence before injection");
       original_fence_before_failure = parent->fence_acceptance->accepted_fence;
-      core::SqliteCCLCJournal native_plan(native_database, cell_id);
-      const core::NamedApplyPublicationTransactionDTO planned_apply{
-          composition_request.apply_id, composition_request.apply_generation};
-      const core::NativeApplyPlanRequestDTO planned{
-          planned_apply,
-          package.bundle->retained_bundle_id(),
-          package.bundle->value().cell_graph.graph_revision,
-          {}, {}, {}, {}, {}, {}};
-      const auto recorded = native_plan.PlanNativeApply(planned);
-      if (!recorded.ok()) throw std::runtime_error(recorded.error().message);
-      original_native_plan = recorded.value();
-      const auto persisted = native_plan.LoadNativeApplyPlan(planned_apply);
-      if (!persisted.ok() || persisted.value() != original_native_plan)
-        throw std::runtime_error("fixture native plan was not durably exact before injection");
     };
     AlwaysIdleMaintenanceGate maintenance_gate;
     ManagerPlannedMaintenanceCoordinator planned_maintenance(
@@ -3569,19 +3300,19 @@ TEST(ManagerNamedApplyCoordinator,
     if (failing_call == 3) {
       original_acknowledgement = [&](const auto &, const auto &, const auto &acknowledgement) {
         ++prepare_acknowledgements;
-        EXPECT_EQ(acknowledgement.request.phase, ManagerSelectedRuntimeCompositionPhase::kPrepare);
-        EXPECT_EQ(acknowledgement.state, ManagerSelectedRuntimeCompositionState::kInstalled);
-        runtime_composition.before_failure(acknowledgement.request);
+        EXPECT_EQ(acknowledgement.outcome, HostApplyOutcome::kSucceeded);
+        runtime_composition.before_failure(*runtime_composition.last_request);
         throw std::runtime_error("original observer transition could not be qualified");
       };
     }
-    ASSERT_EQ(coordinator.AcceptOrReplay(request, {}, original_acknowledgement).state,
+    ASSERT_EQ(coordinator.AcceptOrReplay(request, original_acknowledgement).state,
               ManagerNamedApplyResultState::kPending);
     const auto failed = coordinator.RecoverIncompleteApply();
     ASSERT_TRUE(failed.has_value());
-    // Only the typed refusal proves the candidate was never installed.
-    ASSERT_EQ(failed->state, failing_call == 4 ? ManagerNamedApplyResultState::kFailed
-                                               : ManagerNamedApplyResultState::kUnknownEffect);
+    // Only the host's typed refusals prove the candidate was never installed.
+    const bool known = failing_call == 4 || failing_call == 5 || failing_call == 6;
+    ASSERT_EQ(failed->state, known ? ManagerNamedApplyResultState::kFailed
+                                   : ManagerNamedApplyResultState::kUnknownEffect);
     ASSERT_TRUE(failed->terminal_outcome.has_value());
     ASSERT_TRUE(failed->terminal_outcome->failure.has_value());
     const auto &failure = *failed->terminal_outcome->failure;
@@ -3592,7 +3323,11 @@ TEST(ManagerNamedApplyCoordinator,
               failing_call == 3 ? "original observer transition could not be qualified"
               : failing_call == 4
                   ? "Scenario refused: RoboPlan addressed planner construction is inconsistent"
-                  : "scripted exact composition failure");
+              : failing_call == 5
+                  ? "configuration Apply cannot replace or remove enabled component arm.1"
+              : failing_call == 6
+                  ? "Execution host: retained native owner differs from the planned predecessor"
+                  : "scripted exact host Apply failure");
     if (failing_call == 4) {
       EXPECT_EQ(failed->terminal_outcome->state, ManagerApplyTerminalOutcomeState::kFailed);
       EXPECT_EQ(failure.cause_code, kScenarioCompositionRefusedCode);
@@ -3601,30 +3336,28 @@ TEST(ManagerNamedApplyCoordinator,
                     {"cause", "RoboPlan addressed planner construction is inconsistent"},
                     {"component_id", "arm.1"}}));
       EXPECT_EQ(failure.producer, kExecutionHostProducer);
-      EXPECT_EQ(failure.effect_boundary, ManagerApplyEffectBoundary::kUnknown);
     }
-    EXPECT_EQ(runtime_composition.calls, failing_call == 2 ? 2 : 1);
-    EXPECT_EQ(runtime_composition.phases,
-              failing_call == 2
-                  ? (std::vector<ManagerSelectedRuntimeCompositionPhase>{
-                        ManagerSelectedRuntimeCompositionPhase::kPrepare,
-                        ManagerSelectedRuntimeCompositionPhase::kFinalize})
-                  : (std::vector<ManagerSelectedRuntimeCompositionPhase>{
-                        ManagerSelectedRuntimeCompositionPhase::kPrepare}));
+    // A host refusal changed nothing: it is before-effect and releases its
+    // fence and claim at once (like CLAIM-1), so authoring and New work again.
+    EXPECT_EQ(failure.effect_boundary, known ? ManagerApplyEffectBoundary::kBeforeEffect
+                                             : ManagerApplyEffectBoundary::kUnknown);
+    if (failing_call == 5) {
+      EXPECT_EQ(failed->terminal_outcome->state, ManagerApplyTerminalOutcomeState::kFailed);
+      EXPECT_EQ(failure.cause_code, "apply_requires_inactive_component");
+      EXPECT_EQ(failure.cause_details,
+                (std::map<std::string, std::string>{{"component_id", "arm.1"}}));
+      EXPECT_EQ(failure.producer, kExecutionHostProducer);
+      EXPECT_EQ(publication_store.publish_calls, 0);
+    }
+    EXPECT_EQ(runtime_composition.calls, 1);
     ASSERT_TRUE(failed_request);
-    EXPECT_EQ(failed_request->apply_id, failed->apply_id);
-    EXPECT_EQ(failed_request->apply_generation, failed->apply_generation);
-    EXPECT_EQ(failed_request->phase, failing_call == 2
-        ? ManagerSelectedRuntimeCompositionPhase::kFinalize
-        : ManagerSelectedRuntimeCompositionPhase::kPrepare);
-    ASSERT_TRUE(original_native_plan);
-    EXPECT_EQ(original_native_plan->apply,
-              (core::NamedApplyPublicationTransactionDTO{failed->apply_id, failed->apply_generation}));
-    EXPECT_EQ(original_native_plan->candidate_retained_bundle_id, package.bundle->retained_bundle_id());
-    EXPECT_EQ(original_native_plan->candidate_graph_revision, package.bundle->value().cell_graph.graph_revision);
-    // Both failing stages precede durable materialization/publication.
-    EXPECT_EQ(failure.phase, ManagerApplyPhase::kRuntimeConverged);
-    EXPECT_EQ(failure.effect_disposition, failing_call == 4
+    EXPECT_EQ(failed_request->apply.apply_id, failed->apply_id);
+    EXPECT_EQ(failed_request->apply.apply_generation, failed->apply_generation);
+    // Only a succeeded host Apply records the private materialization; every
+    // failure precedes publication.
+    EXPECT_EQ(failure.phase, failing_call == 3 ? ManagerApplyPhase::kComposed
+                                               : ManagerApplyPhase::kRuntimeConverged);
+    EXPECT_EQ(failure.effect_disposition, known
                                               ? ManagerApplyEffectDisposition::kKnown
                                               : ManagerApplyEffectDisposition::kUnknown);
     const auto status = journal.ReadStatus(failed->apply_id, failed->apply_generation);
@@ -3632,26 +3365,34 @@ TEST(ManagerNamedApplyCoordinator,
     EXPECT_EQ(failure.intent_digest, status->intent.intent_digest);
     ASSERT_TRUE(status->fence_acceptance.has_value());
     EXPECT_EQ(status->fence_acceptance->accepted_fence, original_fence_before_failure);
-    EXPECT_EQ(failed_request->configuration_fence_id,
-              status->fence_acceptance->accepted_fence.configuration_fence_id);
-    EXPECT_EQ(failed_request->configuration_fence_generation,
-              status->fence_acceptance->accepted_fence.configuration_fence_generation);
-    EXPECT_EQ(failed_request->configuration_fence_scope,
-              status->fence_acceptance->accepted_fence.captured_scope);
     EXPECT_TRUE(status->latest_runtime_staged_ready.has_value());
-    EXPECT_FALSE(status->private_materialization.has_value());
+    EXPECT_EQ(status->private_materialization.has_value(), failing_call == 3);
     EXPECT_FALSE(status->publication_receipt.has_value());
     EXPECT_FALSE(status->fence_released.has_value());
+    const auto host_refusal_release =
+        journal.ReadFailedApplyRelease(failed->apply_id, failed->apply_generation);
+    EXPECT_EQ(host_refusal_release.has_value() && host_refusal_release->acknowledged, known);
     EXPECT_EQ(scene_owner.ordinary_install_calls, 0);
     EXPECT_EQ(scene_owner.ordinary_begin_calls, 0);
     EXPECT_EQ(scene_owner.stage_calls, 1);
-    EXPECT_EQ(scene_owner.begin_calls, failing_call == 2 ? 1 : 0);
+    EXPECT_EQ(scene_owner.begin_calls, 0);
     const auto preserved = actual_scene.owner.ReadActiveSnapshot();
     ASSERT_TRUE(preserved);
     EXPECT_EQ(scene::EncodeLogicalSceneSnapshot(*preserved->shared()), actual_scene.snapshot_bytes);
     EXPECT_EQ(prepare_acknowledgements, failing_call == 3 ? 1 : 0);
-    EXPECT_EQ(kernel_fence.release_calls, 0);
-    EXPECT_EQ(settlement_calls, 0);
+    EXPECT_EQ(kernel_fence.release_calls, known ? 1 : 0);
+    EXPECT_EQ(settlement_calls, known ? 1 : 0);
+    if (known) {
+      EXPECT_FALSE(cell_admission.ReadHeldCellAdmissionClaim(
+          core::CellAdmissionClaimKindDTO::kManagerApply));
+      EXPECT_TRUE(cell_admission.GetAuthoringAdmission().authoring_allowed);
+      const auto replay = coordinator.AcceptOrReplay(request, original_acknowledgement);
+      EXPECT_EQ(replay.terminal_outcome, failed->terminal_outcome);
+      EXPECT_FALSE(coordinator.RecoverIncompleteApply().has_value());
+      EXPECT_EQ(runtime_composition.calls, 1);
+      EXPECT_EQ(kernel_fence.release_calls, 1);
+      continue;
+    }
     const auto original_claim = cell_admission.ReadHeldCellAdmissionClaim(
         core::CellAdmissionClaimKindDTO::kManagerApply);
     ASSERT_TRUE(original_claim.has_value());
@@ -3670,47 +3411,11 @@ TEST(ManagerNamedApplyCoordinator,
     const auto held = cell_admission.GetCellAdmissionRecoveryReceipt(held_query);
     ASSERT_TRUE(held.ok());
     EXPECT_EQ(held.value().status, core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact);
-    const core::NativeApplyParentPreparationFailureSource source =
-        [&](const core::NativeApplyPlanDTO &plan) -> core::Result<bool> {
-          if (!original_native_plan || plan != *original_native_plan)
-            return core::Result<bool>::Err({"fixture_plan_changed", "foreign native parent plan", {}});
-          const auto receipt = cell_admission.GetCellAdmissionRecoveryReceipt(held_query);
-          if (!receipt.ok()) return core::Result<bool>::Err(receipt.error());
-          const auto observed = ReadNativeApplyPreparationFailureReadOnly(
-              database, cell_id, plan, *package.bundle, *original_claim,
-              held_query, receipt.value());
-          if (!observed.ok()) return core::Result<bool>::Err(observed.error());
-          return core::Result<bool>::Ok(observed.value().has_value());
-        };
-    {
-      core::SqliteCCLCJournal native_plan(native_database, cell_id,
-          core::kDefaultCCLCExactResultHistory, core::kDefaultCCLCTerminalResultBytes,
-          {}, source);
-      const auto pending = native_plan.ReadUnsettledNativeApplyPlan();
-      ASSERT_TRUE(pending.ok());
-      // The old exact preparation classifier does not classify M's generic
-      // configuration failure. All unknown plans remain retained, never adopted.
-      ASSERT_TRUE(pending.value().has_value());
-      EXPECT_EQ(*pending.value(), original_native_plan->apply);
-      const auto retained_plan = native_plan.LoadNativeApplyPlan(original_native_plan->apply);
-      ASSERT_TRUE(retained_plan.ok());
-      EXPECT_EQ(retained_plan.value(), original_native_plan);
-      const auto still_held = cell_admission.GetCellAdmissionRecoveryReceipt(held_query);
-      ASSERT_TRUE(still_held.ok());
-      EXPECT_EQ(still_held.value().matched_claim, original_claim);
-      EXPECT_EQ(still_held.value().status, core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact);
-    }
     EXPECT_FALSE(cell_admission.GetAuthoringAdmission().authoring_allowed);
     const auto calls = runtime_composition.calls;
-    const auto replay = coordinator.AcceptOrReplay(request, {}, original_acknowledgement);
+    const auto replay = coordinator.AcceptOrReplay(request, original_acknowledgement);
     EXPECT_EQ(replay.terminal_outcome, failed->terminal_outcome);
     EXPECT_FALSE(coordinator.RecoverIncompleteApply().has_value());
-    {
-      core::SqliteCCLCJournal replayed_native(native_database, cell_id);
-      const auto replayed_plan = replayed_native.LoadNativeApplyPlan(original_native_plan->apply);
-      ASSERT_TRUE(replayed_plan.ok());
-      EXPECT_EQ(replayed_plan.value(), original_native_plan);
-    }
     const auto replayed_claim = cell_admission.GetCellAdmissionRecoveryReceipt(held_query);
     ASSERT_TRUE(replayed_claim.ok());
     EXPECT_EQ(replayed_claim.value().matched_claim, original_claim_before_failure);
@@ -3718,1064 +3423,48 @@ TEST(ManagerNamedApplyCoordinator,
     EXPECT_EQ(settlement_calls, 0);
     EXPECT_EQ(runtime_composition.calls, calls);
     EXPECT_EQ(prepare_acknowledgements, failing_call == 3 ? 1 : 0);
+    // Acknowledgement stays before-effect only.
+    EXPECT_EQ(coordinator.FailedApplyAcknowledgementStatus(failed->apply_id, failed->apply_generation),
+              FailedApplyAcknowledgementState::kUnavailable);
+    EXPECT_THROW(coordinator.AcknowledgeFailedApply(failed->apply_id, failed->apply_generation,
+                                                    core::RequestId("ack.unknown"), "operator"),
+                 core::TypedError);
+    // N7 (R3, CONTRACTS §15): New releases the fence and claim the failed
+    // Apply still holds, whatever it changed; the failure stays retained.
+    const auto released =
+        coordinator.ReleaseFailedApplyForNew(core::RequestId("composer-new.1"), "manyforge_composer");
+    ASSERT_TRUE(released.has_value());
+    EXPECT_EQ(released->apply_id, failed->apply_id);
+    EXPECT_EQ(released->apply_generation, failed->apply_generation);
+    EXPECT_EQ(kernel_fence.release_calls, 1);
+    EXPECT_EQ(settlement_calls, 1);
+    EXPECT_FALSE(cell_admission.ReadHeldCellAdmissionClaim(
+        core::CellAdmissionClaimKindDTO::kManagerApply));
+    EXPECT_TRUE(cell_admission.GetAuthoringAdmission().authoring_allowed);
+    EXPECT_EQ(coordinator.FailedApplyAcknowledgementStatus(failed->apply_id, failed->apply_generation),
+              FailedApplyAcknowledgementState::kUnavailable);
+    // Nothing holds the cell any more: the next New releases nothing.
+    EXPECT_FALSE(coordinator
+                     .ReleaseFailedApplyForNew(core::RequestId("composer-new.2"), "manyforge_composer")
+                     .has_value());
+    EXPECT_EQ(kernel_fence.release_calls, 1);
     journal.Close();
     independent_reader.Close();
     SqliteManagerApplyJournal reopened(database, cell_id);
     const auto retained = reopened.ReadStatus(failed->apply_id, failed->apply_generation);
     ASSERT_TRUE(retained.has_value());
     EXPECT_EQ(retained->terminal_outcome, status->terminal_outcome);
-    EXPECT_FALSE(retained->private_materialization.has_value());
+    EXPECT_EQ(retained->private_materialization.has_value(), failing_call == 3);
     EXPECT_FALSE(retained->fence_released.has_value());
-    core::SqliteCCLCJournal reopened_native(native_database, cell_id,
-        core::kDefaultCCLCExactResultHistory, core::kDefaultCCLCTerminalResultBytes,
-        {}, source);
-    const auto reopened_pending = reopened_native.ReadUnsettledNativeApplyPlan();
-    ASSERT_TRUE(reopened_pending.ok());
-    ASSERT_TRUE(reopened_pending.value().has_value());
-    EXPECT_EQ(*reopened_pending.value(), original_native_plan->apply);
-    const auto reopened_plan = reopened_native.LoadNativeApplyPlan(original_native_plan->apply);
-    ASSERT_TRUE(reopened_plan.ok());
-    EXPECT_EQ(reopened_plan.value(), original_native_plan);
+    const auto new_release = reopened.ReadFailedApplyRelease(failed->apply_id, failed->apply_generation);
+    ASSERT_TRUE(new_release.has_value());
+    EXPECT_TRUE(new_release->acknowledged);
     const auto reopened_claim = cell_admission.GetCellAdmissionRecoveryReceipt(held_query);
     ASSERT_TRUE(reopened_claim.ok());
-    EXPECT_EQ(reopened_claim.value().matched_claim, original_claim_before_failure);
-    EXPECT_EQ(reopened_claim.value().status, core::CellAdmissionRecoveryReceiptStatusDTO::kHeldExact);
-    EXPECT_EQ(settlement_calls, 0);
+    EXPECT_EQ(reopened_claim.value().status, core::CellAdmissionRecoveryReceiptStatusDTO::kReleasedExact);
+    EXPECT_EQ(settlement_calls, 1);
   }
 }
-
-TEST(ManagerNamedApplyCoordinator,
-     EmptyDeltaInstallationDoesNotRequireComponentReceipts) {
-  ScopedPackageRoot package_root;
-  ScopedPackageRoot state_root;
-  auto package = MaterializeRosRuntimePackage(
-      package_root.path(), true, deployment::test::kLite6ArmTargetId, {},
-      "runtime-only-configuration-candidate");
-  const auto intent_template = ApplyIntent(*package.bundle);
-  const auto initial_predecessor = PredecessorPublication(intent_template);
-  const auto database = state_root.path() / "receipt-apply.sqlite3";
-  SqliteManagerApplyJournal journal(database,
-                                    package.bundle->value().cell_graph.cell_id);
-  SqliteManagerApplyJournal independent_reader(
-      database, package.bundle->value().cell_graph.cell_id);
-  ScriptedPublicationStore publication_store(initial_predecessor, &independent_reader);
-  ScriptedCellAdmissionPort cell_admission;
-  RuntimeConfigurationSceneFixture actual_scene(
-      package_root.path(), state_root.path(), package, publication_store, cell_admission);
-  const auto &predecessor = actual_scene.predecessor;
-  ASSERT_NE(predecessor.request.candidate_retained_bundle_id, package.bundle->retained_bundle_id());
-  ASSERT_EQ(actual_scene.empty.bundle->value().cell_graph.cell_id, package.bundle->value().cell_graph.cell_id);
-  ASSERT_TRUE(package.bundle->value().cell_graph.controllable_components.empty());
-  ASSERT_TRUE(package.bundle->value().cell_graph.control_domains.empty());
-  const auto continuity = VerifyNativeExecutionHostContinuity(
-      *actual_scene.empty.bundle, *package.bundle, *package.artifact_source);
-  ASSERT_TRUE(continuity.ok()) << continuity.error().message;
-  FixedActiveRuntimePlanSource active_plan_source(
-      predecessor, BuildVerifiedRuntimeConvergencePlan(
-          *actual_scene.empty.bundle, *actual_scene.empty.artifact_source, "linux",
-          {std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)}));
-  ScriptedRuntimePorts runtime_ports(independent_reader);
-  AggregateFencePort kernel_fence(independent_reader, predecessor);
-  OriginalSceneAdapter scene_owner(actual_scene.owner, kernel_fence);
-  const auto actual_runtime_plan = BuildVerifiedRuntimeConvergencePlan(
-      *package.bundle, *package.artifact_source, "linux",
-      {std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)});
-  ASSERT_EQ(actual_runtime_plan.size(), 1U);
-  kernel_fence.original_execution_host = ExecutionHostEpochDTO{
-      actual_runtime_plan.front().runtime_unit_id,
-      RuntimeEpoch("process-epoch-1"), RequestOwnerEpoch("original-host-owner"),
-      ContentDigest(std::string(kDigestOne)), predecessor.publication_generation};
-  kernel_fence.allow_prepublication_status = true;
-  ScriptedRuntimeCompositionPort runtime_composition;
-  ASSERT_TRUE(deployment::verify_retained_bundle_identity(*actual_scene.empty.bundle));
-  const auto &installed_graph = actual_scene.empty.bundle->value().cell_graph;
-  ASSERT_TRUE(installed_graph.controllable_components.empty());
-  ASSERT_TRUE(installed_graph.control_domains.empty());
-  ASSERT_TRUE(installed_graph.control_bindings.empty());
-  // This fresh scripted owner has launched no component processes. Its exact
-  // verified predecessor and host/Manager epochs qualify that known inventory;
-  // an uncomposed inspection on any other fixture still refuses.
-  const ManagerComponentProcessInventoryRequestDTO installed_scope{
-      predecessor.request.candidate_projection_revision,
-      predecessor.publication_generation,
-      predecessor.durable_public_pointer_content_digest,
-      kernel_fence.original_execution_host->runtime_unit_id,
-      kernel_fence.original_execution_host->runtime_epoch,
-      RuntimeEpoch("manager-runtime.receipts.1"), true};
-  ASSERT_TRUE(installed_scope.valid());
-  ASSERT_EQ(installed_scope.predecessor_projection_revision.retained_bundle_id,
-            actual_scene.empty.bundle->retained_bundle_id());
-  ASSERT_EQ(installed_scope.predecessor_projection_revision.graph_revision,
-            installed_graph.graph_revision);
-  const std::vector<ManagerComponentProcessOccurrenceDTO> installed_processes{};
-  runtime_composition.installed_processes =
-      [installed_scope, installed_processes](
-          const ManagerComponentProcessInventoryRequestDTO &request) {
-        if (!request.valid() || request != installed_scope) {
-          return Result<ManagerComponentProcessInventoryResultDTO>::Err(
-              {"fixture_installed_inventory_foreign",
-               "installed process inspection does not name the fixture owner", {}});
-        }
-        return Result<ManagerComponentProcessInventoryResultDTO>::Ok(
-            {request, installed_processes, std::nullopt});
-      };
-  runtime_composition.omit_receipts = true;
-  ManagerActiveRuntimeCoordinator active_runtime(
-      active_plan_source, runtime_ports, runtime_ports, [] { return 1'000U; });
-  AlwaysIdleMaintenanceGate maintenance_gate;
-  ManagerPlannedMaintenanceCoordinator planned_maintenance(
-      active_plan_source, maintenance_gate);
-  ManagerNamedApplyCoordinator coordinator(
-      journal, active_plan_source, *package.bundle_source,
-      *package.artifact_source, publication_store, scene_owner, nullptr,
-      kernel_fence, cell_admission, runtime_composition, runtime_ports,
-      runtime_ports, planned_maintenance,
-      RuntimeEpoch("manager-runtime.receipts.1"), "linux",
-      {"posix.1-2017", std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)},
-      [] { return 1'000U; }, [] { return ApplyId("apply.receipts.1"); },
-      [](const auto &, const auto &) {
-        return std::vector<core::AddObjectRequestDTO>{};
-      });
-  const ManagerNamedApplyRequestDTO request{
-      intent_template.request_context,
-      package.bundle->value().deployment_artifact_id,
-      package.bundle->value().deployment_revision,
-      predecessor.request.candidate_retained_bundle_id,
-      predecessor.request.candidate_graph_revision,
-      package.bundle->retained_bundle_id(),
-      intent_template.prepared_activation,
-      cell_admission.GetAuthoringAdmission().admission_generation,
-      std::nullopt,
-  };
-  EXPECT_EQ(coordinator.AcceptOrReplay(request).state,
-            ManagerNamedApplyResultState::kPending);
-  const auto outcome = coordinator.RecoverIncompleteApply();
-  ASSERT_TRUE(outcome.has_value());
-  // This runtime-only candidate has no controllable components, so an empty
-  // receipt list is the exact complete receipt set and installation may
-  // publish. Non-empty deltas' missing-receipt refusal is tested directly by
-  // ComponentReceiptsMatchRequest.
-  EXPECT_EQ(outcome->state, ManagerNamedApplyResultState::kSucceeded);
-  EXPECT_EQ(runtime_composition.phases,
-            (std::vector<ManagerSelectedRuntimeCompositionPhase>{
-                ManagerSelectedRuntimeCompositionPhase::kPrepare,
-                ManagerSelectedRuntimeCompositionPhase::kFinalize,
-                ManagerSelectedRuntimeCompositionPhase::kFinalize}));
-  ASSERT_TRUE(runtime_composition.last_request.has_value());
-  EXPECT_TRUE(runtime_composition.last_request->component_delta.components.empty());
-  EXPECT_EQ(publication_store.publish_calls, 1);
-  EXPECT_EQ(scene_owner.stage_calls, 1);
-  EXPECT_EQ(scene_owner.begin_calls, 1);
-  EXPECT_EQ(scene_owner.complete_calls, 1);
-  EXPECT_EQ(scene_owner.ordinary_begin_calls, 0);
-  EXPECT_EQ(scene_owner.ordinary_install_calls, 0);
-  EXPECT_EQ(scene::EncodeLogicalSceneSnapshot(*actual_scene.owner.LogicalSnapshot()),
-            actual_scene.snapshot_bytes);
-}
-
-CCLCLifecycleRequestResultDTO InitialApplyChildResult(
-    const ManagerApplyComponentBringUpRequestDTO &request,
-    const deployment::RetainedBundle &candidate, const int stage,
-    const deployment::RetainedBundle *observed_predecessor = nullptr) {
-  const ComponentLifecycleAcceptedDTO accepted{
-      request.intent.request_context.request_id, RequestReplayStatusDTO::kAcceptedNew,
-      LifecycleTransactionId("apply-lifecycle.1"), LifecycleTransactionGeneration(1U),
-      request.intent.apply_generation_selection->candidate_generation, 42LL, 1000LL};
-  const ComponentLifecycleRequestedStateDTO requested{
-      ComponentLifecycleRequestedStatePresenceDTO::kResolved,
-      ComponentLifecycleStateDTO::kPrepared};
-  auto scope = request.parent_authority.held_fence_query.expected_scope;
-  scope.controllable_component_ids = {request.intent.controllable_component_id};
-  std::vector<ComponentLifecycleDomainStatusDTO> domains;
-  for (const auto &expected : request.intent.expected_control_domains) {
-    std::optional<ResolvedLifecycleControlDomainScopeDTO> current_scope;
-    std::optional<ResolvedLifecycleProviderOccurrenceDTO> provider;
-    if (stage != 0 || observed_predecessor != nullptr) {
-      std::vector<ResourceId> resources;
-      const auto &observed_bundle = stage == 0 ? *observed_predecessor : candidate;
-      const auto &graph = observed_bundle.value().cell_graph;
-      const auto desired = std::find_if(observed_bundle.value().desired_control_configurations.begin(),
-          observed_bundle.value().desired_control_configurations.end(), [&](const auto &row) {
-            return row.control_domain_id == expected.control_domain_id;
-          });
-      if (desired == observed_bundle.value().desired_control_configurations.end())
-        throw std::runtime_error("fixture lacks observed topology");
-      std::vector<ExpectedControlBindingRevisionDTO> observed_bindings;
-      for (const auto &binding : desired->binding_routes)
-        observed_bindings.push_back({binding.control_binding_id, binding.control_binding_revision, binding.control_route_id});
-      const auto first = std::find_if(graph.control_bindings.begin(), graph.control_bindings.end(),
-          [&](const auto &binding) { return binding.control_domain_id == expected.control_domain_id; });
-      if (first == graph.control_bindings.end()) throw std::runtime_error("fixture lacks provider");
-      for (const auto &binding : graph.control_bindings) {
-        if (binding.control_domain_id != expected.control_domain_id) continue;
-        for (const auto &resource : binding.resource_bindings) resources.push_back(resource.resource_id);
-      }
-      std::sort(resources.begin(), resources.end());
-      resources.erase(std::unique(resources.begin(), resources.end()), resources.end());
-      current_scope = ResolvedLifecycleControlDomainScopeDTO{
-          expected.control_domain_id, desired->control_domain_revision,
-          desired->controller_topology_id, desired->topology_revision, std::nullopt,
-          observed_bindings, resources};
-      provider = ResolvedLifecycleProviderOccurrenceDTO{
-          expected.control_domain_id, desired->control_domain_revision,
-          first->provider_instance_id, first->provider_manifest_id, first->provider_manifest_revision,
-          first->provider_runtime_unit_id, request.runtime_epoch, ContentDigest(std::string(kDigestOne))};
-    }
-    domains.push_back({expected.control_domain_id, expected, current_scope, provider,
-        stage == 0 && !observed_predecessor ? std::nullopt : std::optional(ComponentLifecycleStateDTO::kDeclared),
-        stage == 0 && !observed_predecessor ? std::nullopt : std::optional(stage <= 1 ? ComponentLifecycleStateDTO::kDeclared
-                                                                         : ComponentLifecycleStateDTO::kPrepared),
-        requested, stage < 2 ? ComponentLifecycleDomainActionStateDTO::kReserved
-                             : ComponentLifecycleDomainActionStateDTO::kSucceeded,
-        {}, std::nullopt});
-  }
-  const ApplyComponentBringUpEvidenceDTO evidence{
-      request.parent_authority, scope,
-      ApplyDelegatedComponentLifecycleSemanticRequestDigest(request.intent,
-          request.candidate_projection_revision, request.candidate_retained_bundle_digest,
-          request.candidate_retained_bundle_bytes, request.runtime_unit_id, request.runtime_epoch,
-          request.manager_runtime_epoch, request.parent_authority.parent),
-      request.candidate_projection_revision, request.candidate_retained_bundle_digest,
-      request.candidate_retained_bundle_bytes, {request.runtime_unit_id, request.runtime_epoch},
-      std::nullopt, std::nullopt, std::nullopt};
-  const ComponentLifecycleStatusDTO status{
-      accepted, request.intent, static_cast<std::uint64_t>(stage + 1),
-      request.intent.request_context.request_owner_epoch,
-      observed_predecessor ? std::optional(ComponentLifecycleStateDTO::kDeclared) : std::nullopt,
-      stage == 0 && !observed_predecessor ? std::nullopt : std::optional(stage <= 1 ? ComponentLifecycleStateDTO::kDeclared
-                                                                       : ComponentLifecycleStateDTO::kPrepared),
-      requested, stage == 0 ? ComponentLifecycleTransactionPhaseDTO::kAccepted
-                           : (stage == 3 ? ComponentLifecycleTransactionPhaseDTO::kSucceeded
-                                         : ComponentLifecycleTransactionPhaseDTO::kVerifying),
-      domains, false, stage == 3 ? std::optional(ComponentLifecycleTerminalResultDTO::kSucceeded)
-                                : std::nullopt,
-      std::nullopt, 42LL, 42LL + stage, stage == 3 ? 0LL : 900LL,
-      std::nullopt, evidence};
-  if (!status.locally_valid()) throw std::runtime_error("invalid original CCLC fixture status");
-  return {RequestReplayStatusDTO::kAcceptedNew, accepted, status, std::nullopt, std::nullopt};
-}
-
-TEST(ManagerNamedApplyCoordinator,
-     OriginalBringUpAcceptanceSealsCaptureAndReplayNeverReentersAdmission) {
-  for (int scenario = 0; scenario < 12; ++scenario) {
-    SCOPED_TRACE(scenario);
-    ScopedPackageRoot package_root;
-    ScopedPackageRoot state_root;
-    auto previous = MaterializeRosRuntimePackage(package_root.path(), true);
-    auto package = MaterializeRosRuntimePackage(package_root.path());
-    const auto prototype = ApplyIntent(*package.bundle);
-    const auto predecessor = PredecessorPublication(ApplyIntent(*previous.bundle));
-    ASSERT_TRUE(previous.bundle->value().cell_graph.controllable_components.empty());
-    ASSERT_FALSE(package.bundle->value().cell_graph.controllable_components.empty());
-    ASSERT_FALSE(package.bundle->value().cell_graph.control_bindings.empty());
-    ASSERT_FALSE(package.bundle->value().desired_control_configurations.empty());
-    ASSERT_EQ(package.bundle->value().cell_graph.control_bindings.front().controllable_component_id,
-              package.bundle->value().cell_graph.controllable_components.front().controllable_component_id);
-    const auto path = state_root.path() / "original-bring-up.sqlite3";
-    SqliteManagerApplyJournal journal(path, package.bundle->value().cell_graph.cell_id);
-    SqliteManagerApplyJournal independent_reader(path, journal.cell_id());
-    ScriptedPublicationStore publication_store(predecessor, &independent_reader);
-    FixedActiveRuntimePlanSource active_plan_source(
-        predecessor, BuildVerifiedRuntimeConvergencePlan(
-                         *previous.bundle, *previous.artifact_source, "linux",
-                         {std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)}));
-    ScriptedRuntimePorts runtime_ports(independent_reader);
-    MaintenanceSceneOwner scene_owner(predecessor.request.candidate_projection_revision);
-    AggregateFencePort kernel_fence(independent_reader, predecessor);
-    ScriptedRuntimeCompositionPort runtime_composition;
-    ScriptedCellAdmissionPort cell_admission;
-    cell_admission.return_invalid_held_generation = scenario == 6;
-    if (scenario == 7)
-      cell_admission.refuse_acquire = core::ErrorDTO{
-          "stale_generation", "cell-admission request rejected",
-          {{"reason", "expected_generation_stale"}}};
-    // The Kernel attempted durable acquisition but cannot prove its outcome.
-    if (scenario == 8)
-      cell_admission.refuse_acquire = core::ErrorDTO{
-          "persistence_outcome_unknown", "claim acquisition commit cannot be proved", {}};
-    // The request was sent and its reply was lost.
-    cell_admission.lose_acquire_reply = scenario == 9;
-    cell_admission.lose_acquire_reply_after_record = scenario == 10;
-    // A prior settled request for this id: no NEW claim, not "never had one".
-    if (scenario == 11)
-      cell_admission.refuse_acquire = core::ErrorDTO{
-          "request_result_expired", "cell-admission request rejected",
-          {{"reason", "request_result_compacted"}}};
-    AlwaysIdleMaintenanceGate maintenance_gate;
-    ManagerPlannedMaintenanceCoordinator planned_maintenance(active_plan_source, maintenance_gate);
-    int authored_scene_reads = 0;
-    ManagerNamedApplyCoordinator coordinator(
-        journal, active_plan_source, *package.bundle_source, *package.artifact_source,
-        publication_store, scene_owner, nullptr, kernel_fence, cell_admission,
-        runtime_composition, runtime_ports, runtime_ports, planned_maintenance,
-        RuntimeEpoch("manager-runtime.original"), "linux",
-        {std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)},
-        [] { return 1'000U; }, [] { return ApplyId("apply.original-bring-up"); },
-        [&](const auto &, const auto &) {
-          ++authored_scene_reads;
-          return std::vector<core::AddObjectRequestDTO>{};
-        });
-    ManagerNamedApplyRequestDTO request{
-        prototype.request_context, package.bundle->value().deployment_artifact_id,
-        package.bundle->value().deployment_revision,
-        predecessor.request.candidate_retained_bundle_id,
-        predecessor.request.candidate_graph_revision, package.bundle->retained_bundle_id(),
-        prototype.prepared_activation, core::AdmissionGeneration(7U), std::nullopt};
-    int original_source_calls = 0;
-    const ManagerNamedApplyCoordinator::OriginalBringUpPlanSource original =
-        [&](const ManagerApplyIntentDTO &intent, const deployment::RetainedBundle &old,
-            const deployment::RetainedBundle &candidate, const ManagerActiveRuntimePlanDTO &active) {
-          ++original_source_calls;
-          EXPECT_EQ(old.retained_bundle_id(), predecessor.request.candidate_retained_bundle_id);
-          EXPECT_EQ(candidate.retained_bundle_id(), package.bundle->retained_bundle_id());
-          EXPECT_EQ(active.active_publication, predecessor);
-          const auto &graph = candidate.value().cell_graph;
-          const auto &component = graph.controllable_components.front();
-          const core::ProjectionRevisionDTO target{
-              candidate.retained_bundle_id(), graph.graph_revision,
-              intent.expected_active_projection_revision.scene_revision};
-          core::ComponentLifecycleIntentDTO child_intent{
-              {core::RequestId("child.original"), intent.request_context.request_owner_epoch,
-               "Apply", std::nullopt},
-              component.controllable_component_id, core::ComponentLifecycleIntentKindDTO::kEnable,
-              intent.expected_active_projection_revision.graph_revision,
-              core::ComponentLifecycleGeneration(1U), {}, std::nullopt, {},
-              *intent.expected_admission_generation};
-          for (const auto &desired : candidate.value().desired_control_configurations) {
-            std::vector<core::ExpectedControlBindingRevisionDTO> bindings;
-            for (const auto &route : desired.binding_routes)
-              bindings.push_back({route.control_binding_id, route.control_binding_revision,
-                                  route.control_route_id});
-            const core::ExpectedActiveControlConfigurationDTO absent{
-                core::ExpectedActiveControlConfigurationPresenceDTO::kAbsent,
-                std::nullopt, std::nullopt};
-            const core::ExpectedControlDomainRevisionDTO domain{
-                desired.control_domain_id, desired.control_domain_revision,
-                desired.controller_topology_id, desired.topology_revision, absent, bindings};
-            child_intent.expected_control_domains.push_back(domain);
-          }
-          const auto digest = core::ContentDigest(deployment::sha256_digest(candidate.canonical_bytes()));
-          ManagerApplyBringUpChildRequestDTO child{
-              child_intent, target, digest, candidate.canonical_bytes().size(),
-              graph.control_bindings.front().provider_runtime_unit_id,
-              RuntimeEpoch("host.original"), RuntimeEpoch("manager-runtime.original")};
-          const ManagerApplyPrivateMaterializationDTO materialization{
-              target.scene_revision.content_hash, intent.apply_id, intent.apply_generation,
-              target, digest, candidate.canonical_bytes().size()};
-          const core::ActiveBundlePublicationRequestDTO publication{
-              core::NamedApplyPublicationTransactionDTO{intent.apply_id, intent.apply_generation},
-              target, target.retained_bundle_id, target.graph_revision,
-              predecessor.publication_generation,
-              ComputeManagerApplyPrivateMaterializationDigest(materialization)};
-          ManagerApplyBringUpPlanDTO plan{
-              intent.apply_id, intent.apply_generation, ComputeManagerApplyIntentDigest(intent),
-              {}, {child}, publication, predecessor.durable_public_pointer_content_digest};
-          for (const auto &row : graph.controllable_components)
-            plan.configured_components.push_back(row.controllable_component_id);
-          std::sort(plan.configured_components.begin(), plan.configured_components.end());
-          if (scenario == 1) plan.configured_components.push_back(core::ControllableComponentId("z.foreign"));
-          if (scenario == 2) plan.children.front().manager_runtime_epoch = RuntimeEpoch("manager.foreign");
-          if (scenario == 3) plan.predecessor_public_pointer_digest = ContentDigest("sha256:" + std::string(64U, 'c'));
-          if (scenario == 4) plan.children.front().candidate_retained_bundle_digest = ContentDigest("sha256:" + std::string(64U, 'd'));
-          if (scenario == 5) plan.children.front().intent.expected_admission_generation = core::AdmissionGeneration(8U);
-          return plan;
-        };
-    if (scenario == 6) {
-      const auto refused = coordinator.AcceptOrReplay(request, original);
-      // Untyped admission evidence: the claim's state is not proven.
-      ASSERT_EQ(refused.state, ManagerNamedApplyResultState::kUnknownEffect);
-      ASSERT_TRUE(refused.terminal_outcome);
-      ASSERT_TRUE(refused.terminal_outcome->failure);
-      EXPECT_EQ(refused.terminal_outcome->failure->failure_code, "apply_admission_failed");
-      // An untyped failure keeps the phase code as its cause, produced here.
-      EXPECT_EQ(refused.terminal_outcome->failure->cause_code, "apply_admission_failed");
-      EXPECT_EQ(refused.terminal_outcome->failure->producer, "component_manager");
-      // An untyped failure is no proof that no claim exists.
-      EXPECT_EQ(refused.terminal_outcome->failure->effect_boundary,
-                ManagerApplyEffectBoundary::kUnknown);
-      EXPECT_EQ(refused.terminal_outcome->failure->effect_disposition,
-                ManagerApplyEffectDisposition::kUnknown);
-      EXPECT_EQ(cell_admission.acquire_calls, 0);
-      EXPECT_EQ(cell_admission.lookup_intents.size(), 1U);
-    } else if (scenario == 7) {
-      // The Kernel's own refusal stays typed in the retained failure.
-      const auto refused = coordinator.AcceptOrReplay(request, original);
-      ASSERT_EQ(refused.state, ManagerNamedApplyResultState::kFailed);
-      ASSERT_TRUE(refused.terminal_outcome && refused.terminal_outcome->failure);
-      const auto &failure = *refused.terminal_outcome->failure;
-      EXPECT_EQ(failure.failure_code, "apply_admission_failed");
-      EXPECT_EQ(failure.cause_code, "stale_generation");
-      EXPECT_EQ(failure.cause_details,
-                (std::map<std::string, std::string>{{"reason", "expected_generation_stale"}}));
-      EXPECT_EQ(failure.producer, "kernel");
-      // The claim was never acquired: the source states "before any effect".
-      EXPECT_EQ(failure.effect_boundary, ManagerApplyEffectBoundary::kBeforeEffect);
-      EXPECT_EQ(failure.effect_disposition, ManagerApplyEffectDisposition::kKnown);
-      EXPECT_EQ(refused.terminal_outcome->state, ManagerApplyTerminalOutcomeState::kFailed);
-      EXPECT_NE(failure.failure_message.find("Kernel rejected Manager Apply admission"),
-                std::string::npos);
-      EXPECT_EQ(cell_admission.acquire_calls, 1);
-    } else if (scenario == 10) {
-      // The claim exists; the lost reply leaves the boundary unknown and
-      // nothing settles or releases the claim automatically.
-      const auto refused = coordinator.AcceptOrReplay(request, original);
-      ASSERT_EQ(refused.state, ManagerNamedApplyResultState::kUnknownEffect);
-      ASSERT_TRUE(refused.terminal_outcome && refused.terminal_outcome->failure);
-      EXPECT_EQ(refused.terminal_outcome->failure->effect_boundary,
-                ManagerApplyEffectBoundary::kUnknown);
-      EXPECT_EQ(refused.terminal_outcome->failure->effect_disposition,
-                ManagerApplyEffectDisposition::kUnknown);
-      EXPECT_EQ(refused.terminal_outcome->state,
-                ManagerApplyTerminalOutcomeState::kUnknownEffect);
-      EXPECT_FALSE(refused.settlement_pending);
-      EXPECT_EQ(cell_admission.acquire_calls, 1);
-      EXPECT_EQ(cell_admission.release_calls, 0);
-      EXPECT_FALSE(cell_admission.last_release.has_value());
-      EXPECT_FALSE(cell_admission.GetAuthoringAdmission().authoring_allowed);
-    } else if (scenario == 11) {
-      const auto refused = coordinator.AcceptOrReplay(request, original);
-      ASSERT_EQ(refused.state, ManagerNamedApplyResultState::kUnknownEffect);
-      ASSERT_TRUE(refused.terminal_outcome && refused.terminal_outcome->failure);
-      EXPECT_EQ(refused.terminal_outcome->failure->cause_code, "request_result_expired");
-      EXPECT_EQ(refused.terminal_outcome->failure->effect_boundary,
-                ManagerApplyEffectBoundary::kUnknown);
-      EXPECT_EQ(refused.terminal_outcome->failure->effect_disposition,
-                ManagerApplyEffectDisposition::kUnknown);
-      EXPECT_EQ(refused.terminal_outcome->state,
-                ManagerApplyTerminalOutcomeState::kUnknownEffect);
-    } else if (scenario == 8 || scenario == 9) {
-      // A claim may exist: never "before effect", whatever the cause's type.
-      const auto refused = coordinator.AcceptOrReplay(request, original);
-      ASSERT_EQ(refused.state, ManagerNamedApplyResultState::kUnknownEffect);
-      ASSERT_TRUE(refused.terminal_outcome && refused.terminal_outcome->failure);
-      const auto &failure = *refused.terminal_outcome->failure;
-      EXPECT_EQ(failure.failure_code, "apply_admission_failed");
-      EXPECT_EQ(failure.cause_code, scenario == 8 ? "persistence_outcome_unknown"
-                                                  : "apply_admission_failed");
-      EXPECT_EQ(failure.producer, scenario == 8 ? "kernel" : "component_manager");
-      EXPECT_EQ(failure.effect_boundary, ManagerApplyEffectBoundary::kUnknown);
-      EXPECT_EQ(refused.terminal_outcome->failure->effect_disposition,
-                ManagerApplyEffectDisposition::kUnknown);
-      EXPECT_EQ(refused.terminal_outcome->state,
-                ManagerApplyTerminalOutcomeState::kUnknownEffect);
-      EXPECT_EQ(cell_admission.acquire_calls, 1);
-    } else if (scenario != 0) {
-      EXPECT_THROW(static_cast<void>(coordinator.AcceptOrReplay(request, original)),
-                   ManagerNamedApplyCoordinatorError);
-      EXPECT_FALSE(journal.ReadRequest(request.request_context.request_owner_epoch,
-                                       request.request_context.request_id));
-      EXPECT_EQ(cell_admission.acquire_calls, 0);
-      EXPECT_TRUE(cell_admission.lookup_intents.empty());
-    } else {
-      const auto accepted = coordinator.AcceptOrReplay(request, original);
-      ASSERT_EQ(accepted.state, ManagerNamedApplyResultState::kPending);
-      const auto plan = journal.ReadBringUpPlan(accepted.apply_id, accepted.apply_generation);
-      ASSERT_TRUE(plan);
-      const auto stored = journal.ReadIntent(accepted.apply_id, accepted.apply_generation);
-      ASSERT_TRUE(stored);
-      ASSERT_EQ(cell_admission.lookup_intents.size(), 1U);
-      EXPECT_EQ(cell_admission.lookup_intents.front().request_payload_digest, plan->plan_digest);
-      EXPECT_EQ(cell_admission.acquire_calls, 1);
-      const auto held = cell_admission.GetCellAdmissionRecoveryReceipt(
-          {cell_admission.lookup_intents.front(), std::nullopt, std::nullopt});
-      ASSERT_TRUE(held.ok());
-      ASSERT_TRUE(held.value().matched_claim);
-      EXPECT_EQ(held.value().matched_claim->intent.request_payload_digest, plan->plan_digest);
-      const auto lookups = cell_admission.lookup_intents.size();
-      const ManagerNamedApplyCoordinator::OriginalBringUpPlanSource never_reconstruct =
-          [](const auto &, const auto &, const auto &, const auto &) -> ManagerApplyBringUpPlanDTO {
-            throw std::runtime_error("replayed source must not run");
-          };
-      EXPECT_TRUE(coordinator.AcceptOrReplay(request, never_reconstruct).request_replayed);
-      auto conflicting_purpose = request;
-      conflicting_purpose.scene_initialization =
-          ManagerSceneInitialization::kInitialize;
-      EXPECT_THROW(static_cast<void>(coordinator.AcceptOrReplay(
-                       conflicting_purpose, never_reconstruct)),
-                   ManagerNamedApplyCoordinatorError);
-      EXPECT_EQ(stored->intent.scene_initialization,
-                ManagerSceneInitialization::kPreserve);
-      EXPECT_TRUE(coordinator.AcceptOrReplay(request, never_reconstruct).request_replayed);
-      EXPECT_EQ(cell_admission.acquire_calls, 1);
-      EXPECT_EQ(cell_admission.lookup_intents.size(), lookups);
-    }
-    EXPECT_EQ(original_source_calls, 1);
-    EXPECT_EQ(authored_scene_reads, 0);
-    EXPECT_EQ(runtime_ports.ensure_calls, 0);
-    EXPECT_EQ(runtime_composition.calls, 0);
-    EXPECT_EQ(scene_owner.begin_calls, 0);
-    EXPECT_EQ(kernel_fence.acquire_calls, 0);
-    EXPECT_EQ(publication_store.publish_calls, 0);
-  }
-}
-
-
-TEST(ManagerNamedApplyCoordinator,
-     OriginalLinkedApplyUsesActualScenePreservingObjectsAttachmentsAndStopsOnUncertainty) {
-  for (int scenario = -1; scenario != 14; ++scenario) {
-    SCOPED_TRACE(scenario);
-    ScopedPackageRoot package_root;
-    ScopedPackageRoot state_root;
-    // Scenario 13 streams pose-only commits after the request and between
-    // Stage and Begin; Apply binds identity only and still succeeds.
-    const bool streaming = scenario == 13;
-    const bool initial = scenario == -1 || (scenario >= 7 && !streaming);
-    auto empty = MaterializeRosRuntimePackage(package_root.path(), true);
-    auto previous = MaterializeRosRuntimePackage(package_root.path(), initial, deployment::test::kLite6ArmTargetId, kDigestOne);
-    auto package = MaterializeRosRuntimePackage(package_root.path(), false, deployment::test::kLite6ArmTargetId, kDigestTwo);
-    const auto prototype = ApplyIntent(*package.bundle);
-    ASSERT_NE(previous.bundle->retained_bundle_id(), package.bundle->retained_bundle_id());
-    ASSERT_FALSE(package.bundle->value().cell_graph.controllable_components.empty());
-    ASSERT_FALSE(package.bundle->value().cell_graph.control_bindings.empty());
-    ASSERT_FALSE(package.bundle->value().desired_control_configurations.empty());
-    ASSERT_EQ(package.bundle->value().cell_graph.control_bindings.front().controllable_component_id,
-              package.bundle->value().cell_graph.controllable_components.front().controllable_component_id);
-    const auto path = state_root.path() / "original-bring-up.sqlite3";
-    SqliteManagerApplyJournal journal(path, package.bundle->value().cell_graph.cell_id);
-    SqliteManagerApplyJournal independent_reader(path, journal.cell_id());
-    ScriptedPublicationStore publication_store(PredecessorPublication(ApplyIntent(*empty.bundle)), &independent_reader);
-    ScriptedCellAdmissionPort cell_admission;
-    const auto admission = deployment::detail::publish_cell_scoped_canonical_empty_admission(
-        package_root.path(), deployment::cell_scoped_canonical_empty_admission_filename(journal.cell_id()), *empty.bundle);
-    AdoptionProjectionResolver resolver;
-    const auto old_bindings = AdoptionBindings(*previous.bundle, RuntimeEpoch("predecessor-projection-epoch-1"));
-    EXPECT_EQ(old_bindings.empty(), initial);
-    for (const auto &binding : old_bindings) resolver.clients.push_back(std::make_shared<AdoptionProjection>(binding));
-    const auto scene_path = state_root.path() / "actual-logical-scene.sqlite3";
-    scene::LogicalSceneOwner actual_scene(scene_path, admission, publication_store,
-        *package.bundle_source, resolver, cell_admission);
-    const auto predecessor = EstablishActualScenePredecessor(
-        actual_scene, publication_store, admission, *previous.bundle, old_bindings);
-    if (!initial) {
-    auto current = actual_scene.CurrentProjectionRevision();
-    SceneTransactionRequestDTO add{
-        {RequestId("actual-add"), actual_scene.CurrentRequestOwnerEpoch(), "Manager regression", std::nullopt},
-        {}, current, AddObjectRequestDTO{SceneResourceId("scene-box"), BoxShapeDTO{{0.1, 0.2, 0.3}},
-                                        Pose3DTO{}, CellSceneFrameRefDTO{journal.cell_id()}, {}},
-        cell_admission.GetAuthoringAdmission().admission_generation};
-    const auto added = actual_scene.Commit(add);
-    ASSERT_TRUE(added.success) << (added.error ? added.error->message : "missing error");
-    ASSERT_TRUE(added.committed_projection_revision);
-    current = *added.committed_projection_revision;
-    SceneTransactionRequestDTO attach{
-        {RequestId("actual-attach"), actual_scene.CurrentRequestOwnerEpoch(), "Manager regression", std::nullopt},
-        {}, current,
-        AttachCarriedObjectRequestDTO{CarriedObjectAttachmentId("attachment.1"), SceneResourceId("scene-box"),
-            ControllableComponentId("component.1"), CommandTargetId("arm"), FrameRoleId("tool_frame"),
-            {CollisionBodyRoleId("finger")}, {ComponentAttachmentRevision("component-attachment-revision-1")}},
-        cell_admission.GetAuthoringAdmission().admission_generation};
-    attach.program_node_evidence = ProgramNodeAdmissionEvidenceDTO{
-        RequestOwnerEpoch("runner.2"), ProgramRunId("program.2"), CellAdmissionClaimGeneration(9U),
-        "attach", "attach:attempt.1", "scene.carried_attachment"};
-    const auto attached = actual_scene.Commit(attach);
-    ASSERT_TRUE(attached.success) << (attached.error ? attached.error->message : "missing error");
-    }
-    if (streaming) {
-      SceneTransactionRequestDTO add_streamed{
-          {RequestId("actual-add-streamed"), actual_scene.CurrentRequestOwnerEpoch(), "Manager regression",
-           std::nullopt},
-          {}, actual_scene.CurrentProjectionRevision(),
-          AddObjectRequestDTO{SceneResourceId("streamed-box"), BoxShapeDTO{{0.1, 0.1, 0.1}},
-                              Pose3DTO{}, CellSceneFrameRefDTO{journal.cell_id()}, {}},
-          cell_admission.GetAuthoringAdmission().admission_generation};
-      const auto streamed = actual_scene.Commit(add_streamed);
-      ASSERT_TRUE(streamed.success) << (streamed.error ? streamed.error->message : "missing error");
-    }
-    cell_admission.last_release.reset();
-    const auto preserved = actual_scene.LogicalSnapshot();
-    ASSERT_EQ(preserved->objects.size(), initial ? 0U : (streaming ? 2U : 1U));
-    ASSERT_EQ(preserved->carried_object_attachments.size(), initial ? 0U : 1U);
-    // The adopted Scene: the latest one, after any streamed pose commit.
-    auto preserved_bytes = scene::EncodeLogicalSceneSnapshot(*preserved);
-    std::uint64_t streamed_sequence = 0U;
-    const auto stream_pose = [&](const double x_m) {
-      Pose3DTO pose;
-      pose.position_m.x_m = x_m;
-      ++streamed_sequence;
-      const SceneTransactionRequestDTO update{
-          {RequestId("streamed-pose-" + std::to_string(streamed_sequence)),
-           actual_scene.CurrentRequestOwnerEpoch(), "pose source", std::nullopt},
-          {}, actual_scene.CurrentProjectionRevision(),
-          UpdateObjectPoseRequestDTO{
-              SceneResourceId("streamed-box"), pose, CellSceneFrameRefDTO{journal.cell_id()},
-              SceneObjectProviderEvidenceDTO{ProviderInstanceId("stream-provider"),
-                                             ProviderManifestId("stream-manifest"),
-                                             ProviderManifestRevision(std::string(kDigestOne)),
-                                             "stream-epoch"},
-              false},
-          std::nullopt};
-      const auto committed = actual_scene.Commit(update);
-      ASSERT_TRUE(committed.success) << (committed.error ? committed.error->message : "missing error");
-      preserved_bytes = scene::EncodeLogicalSceneSnapshot(*actual_scene.LogicalSnapshot());
-    };
-    const auto original_scene_owner = actual_scene.CurrentRequestOwnerEpoch();
-    FixedActiveRuntimePlanSource active_plan_source(
-        predecessor, BuildVerifiedRuntimeConvergencePlan(
-                         *previous.bundle, *previous.artifact_source, "linux",
-                         {std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)}));
-    ScriptedRuntimePorts runtime_ports(independent_reader);
-    AggregateFencePort kernel_fence(independent_reader, predecessor);
-    OriginalSceneAdapter scene_owner(actual_scene, kernel_fence);
-    ScriptedRuntimeCompositionPort runtime_composition;
-    kernel_fence.original_execution_host = ExecutionHostEpochDTO{
-        package.bundle->value().cell_graph.control_bindings.front().provider_runtime_unit_id,
-        RuntimeEpoch("process-epoch-1"), RequestOwnerEpoch("original-host-owner"),
-        ContentDigest(std::string(kDigestOne)), predecessor.publication_generation};
-    // The replacement's observed predecessor metadata exists before Apply.
-    // Initial zero-component predecessors have no configuration rows.
-    for (const auto &desired : previous.bundle->value().desired_control_configurations) {
-      kernel_fence.predecessor_configurations.push_back({
-          desired.control_domain_id,
-          ActiveControlConfigurationId("predecessor." + desired.control_domain_id.value()),
-          ActiveControlConfigurationGeneration(1U)});
-    }
-    kernel_fence.foreign_attempt_digest = scenario == 9;
-    kernel_fence.stale_attempt_host = scenario == 10;
-    kernel_fence.released_attempt = scenario == 11;
-    kernel_fence.foreign_attempt_acceptance = scenario == 12;
-    runtime_composition.installed = [&](const auto &input) {
-      if (input.phase != ManagerSelectedRuntimeCompositionPhase::kPrepare) return;
-      EXPECT_TRUE(kernel_fence.installed_configurations.empty());
-      for (const auto &domain : input.configuration_fence_scope.domains) {
-        if (domain.candidate_control_domain_revision) {
-          kernel_fence.installed_configurations.push_back({
-              domain.control_domain_id,
-              ActiveControlConfigurationId("installed." + domain.control_domain_id.value()),
-              ActiveControlConfigurationGeneration(1U)});
-        }
-      }
-    };
-    scene_owner.before_stage = [&](const auto &input) {
-      EXPECT_TRUE(kernel_fence.installed_configurations.empty());
-      EXPECT_EQ(kernel_fence.status_calls, 0);
-      EXPECT_GT(kernel_fence.reconcile_calls, 0);
-      for (const auto &binding : input.native_runtime_bindings) {
-        const auto found = std::find_if(resolver.clients.begin(), resolver.clients.end(),
-            [&](const auto &client) { return client->ProjectionHealth().native_runtime_binding == binding; });
-        if (found != resolver.clients.end()) continue;
-        auto projection = std::make_shared<AdoptionProjection>(binding);
-        projection->accept_next_rebuild = scenario == 8;
-        resolver.clients.push_back(std::move(projection));
-      }
-      if (streaming) stream_pose(0.30);  // after the request, before Stage
-    };
-    scene_owner.before_begin = [&](const auto &) {
-      if (streaming) stream_pose(0.35);  // after Stage, before adoption
-    };
-    scene_owner.alter_begin = [&](auto &input) {
-      if (scenario == 1) input.parent_authority.parent_claim.intent.owner_epoch = RequestOwnerEpoch("foreign-manager");
-      if (scenario == 2) input.expected_predecessor_publication.durable_public_pointer_content_digest = ContentDigest(std::string(kDigestOne));
-      if (scenario == 3) ++input.expected_snapshot_identity.revision.revision_id;
-    };
-    scene_owner.after_begin = [&] {
-      if (scenario == 4) kernel_fence.throw_next_status = true;
-      if (scenario == 5) publication_store.fail_next_read = true;
-    };
-    scene_owner.after_complete = [&] { if (scenario == 6) kernel_fence.throw_next_status = true; };
-    kernel_fence.allow_prepublication_status = true;
-    AlwaysIdleMaintenanceGate maintenance_gate;
-    ManagerPlannedMaintenanceCoordinator planned_maintenance(active_plan_source, maintenance_gate);
-    int authored_scene_reads = 0;
-    ManagerNamedApplyCoordinator coordinator(
-        journal, active_plan_source, *package.bundle_source, *package.artifact_source,
-        publication_store, scene_owner, nullptr, kernel_fence, cell_admission,
-        runtime_composition, runtime_ports, runtime_ports, planned_maintenance,
-        RuntimeEpoch("manager-runtime.original"), "linux",
-        {std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)},
-        [] { return 1'000U; }, [] { return ApplyId("apply.original-bring-up"); },
-        [&](const auto &, const auto &) {
-          ++authored_scene_reads;
-          return std::vector<core::AddObjectRequestDTO>{};
-        });
-    ManagerNamedApplyRequestDTO request{
-        prototype.request_context, package.bundle->value().deployment_artifact_id,
-        package.bundle->value().deployment_revision,
-        predecessor.request.candidate_retained_bundle_id,
-        predecessor.request.candidate_graph_revision, package.bundle->retained_bundle_id(),
-        prototype.prepared_activation, cell_admission.GetAuthoringAdmission().admission_generation, std::nullopt};
-    int original_source_calls = 0;
-    const ManagerNamedApplyCoordinator::OriginalBringUpPlanSource original =
-        [&](const ManagerApplyIntentDTO &intent, const deployment::RetainedBundle &old,
-            const deployment::RetainedBundle &candidate, const ManagerActiveRuntimePlanDTO &active) {
-          ++original_source_calls;
-          EXPECT_EQ(old.retained_bundle_id(), predecessor.request.candidate_retained_bundle_id);
-          EXPECT_EQ(candidate.retained_bundle_id(), package.bundle->retained_bundle_id());
-          EXPECT_EQ(active.active_publication, predecessor);
-          const auto &graph = candidate.value().cell_graph;
-          const auto &component = graph.controllable_components.front();
-          const core::ProjectionRevisionDTO target{
-              candidate.retained_bundle_id(), graph.graph_revision,
-              intent.expected_active_projection_revision.scene_revision};
-          core::ComponentLifecycleIntentDTO child_intent{
-              {core::RequestId("child.original"), intent.request_context.request_owner_epoch,
-               "Apply", std::nullopt},
-              component.controllable_component_id, core::ComponentLifecycleIntentKindDTO::kPrepare,
-              intent.expected_active_projection_revision.graph_revision,
-              core::ComponentLifecycleGeneration(initial ? 0U : 1U), {}, std::nullopt, {},
-              *intent.expected_admission_generation};
-          child_intent.apply_generation_selection = ApplyComponentGenerationSelectionDTO{
-              initial ? std::nullopt : std::optional(ComponentLifecycleGeneration(1U)),
-              ComponentLifecycleGeneration(initial ? 1U : 2U), initial ? 0U : 1U, std::nullopt};
-          for (const auto &desired : candidate.value().desired_control_configurations) {
-            std::vector<core::ExpectedControlBindingRevisionDTO> bindings;
-            for (const auto &route : desired.binding_routes)
-              bindings.push_back({route.control_binding_id, route.control_binding_revision,
-                                  route.control_route_id});
-            const core::ExpectedActiveControlConfigurationDTO absent{
-                core::ExpectedActiveControlConfigurationPresenceDTO::kAbsent,
-                std::nullopt, std::nullopt};
-            const core::ExpectedControlDomainRevisionDTO domain{
-                desired.control_domain_id, desired.control_domain_revision,
-                desired.controller_topology_id, desired.topology_revision, absent, bindings};
-            child_intent.expected_control_domains.push_back(domain);
-          }
-          const auto digest = core::ContentDigest(deployment::sha256_digest(candidate.canonical_bytes()));
-          ManagerApplyBringUpChildRequestDTO child{
-              child_intent, target, digest, candidate.canonical_bytes().size(),
-              graph.control_bindings.front().provider_runtime_unit_id,
-              RuntimeEpoch("process-epoch-1"), RuntimeEpoch("manager-runtime.original")};
-          const ManagerApplyPrivateMaterializationDTO materialization{
-              target.scene_revision.content_hash, intent.apply_id, intent.apply_generation,
-              target, digest, candidate.canonical_bytes().size()};
-          const core::ActiveBundlePublicationRequestDTO publication{
-              core::NamedApplyPublicationTransactionDTO{intent.apply_id, intent.apply_generation},
-              target, target.retained_bundle_id, target.graph_revision,
-              predecessor.publication_generation,
-              ComputeManagerApplyPrivateMaterializationDigest(materialization)};
-          ManagerApplyBringUpPlanDTO plan{
-              intent.apply_id, intent.apply_generation, ComputeManagerApplyIntentDigest(intent),
-              {}, {child}, publication, predecessor.durable_public_pointer_content_digest};
-          for (const auto &row : graph.controllable_components)
-            plan.configured_components.push_back(row.controllable_component_id);
-          std::sort(plan.configured_components.begin(), plan.configured_components.end());
-          return plan;
-        };
-
-    ASSERT_EQ(package.bundle->value().cell_graph.controllable_components.size(), 1U);
-    bool holding = false;
-    bool terminal = false;
-    runtime_composition.child_submit = [&](const auto &child) {
-      EXPECT_TRUE(journal.ReadBringUpChildProof(child.parent_authority.parent.owner.apply_id,
-          child.parent_authority.parent.owner.apply_generation, child.intent.controllable_component_id,
-          ManagerApplyBringUpChildPhase::kAccepted));
-      if (scenario == 7) return Result<ManagerApplyComponentBringUpResultDTO>::Err(
-          {"uncertain_send", "reply lost after send", {}});
-      return Result<ManagerApplyComponentBringUpResultDTO>::Ok(
-          {child, InitialApplyChildResult(child, *package.bundle, 1, initial ? nullptr : previous.bundle.get())});
-    };
-    runtime_composition.child_read = [&](const auto &child) {
-      const int stage = runtime_composition.child_submit_calls == 0 ? 0 : (terminal ? 3 : holding ? 2 : 1);
-      return Result<ManagerApplyComponentBringUpResultDTO>::Ok(
-          {child, InitialApplyChildResult(child, *package.bundle, stage, initial ? nullptr : previous.bundle.get())});
-    };
-    const auto accepted = coordinator.AcceptOrReplay(request, original);
-    ASSERT_EQ(accepted.state, ManagerNamedApplyResultState::kPending);
-    const auto plan = journal.ReadBringUpPlan(accepted.apply_id, accepted.apply_generation);
-    ASSERT_TRUE(plan);
-    const auto component = plan->plan.children.front().intent.controllable_component_id;
-    auto first = coordinator.RecoverIncompleteApply();
-    ASSERT_TRUE(first);
-    if (scenario >= 9 && !streaming) {
-      ASSERT_EQ(first->state, ManagerNamedApplyResultState::kUnknownEffect);
-      ASSERT_TRUE(first->terminal_outcome && first->terminal_outcome->failure);
-      EXPECT_EQ(first->terminal_outcome->failure->failure_code, "scene_product_projection_staging_failed");
-      EXPECT_EQ(first->terminal_outcome->failure->phase, ManagerApplyPhase::kRuntimeConverged);
-      EXPECT_EQ(first->terminal_outcome->failure->effect_disposition, ManagerApplyEffectDisposition::kUnknown);
-      EXPECT_EQ(scene_owner.stage_calls, 0);
-      EXPECT_EQ(scene_owner.stage_read_calls, 0);
-      EXPECT_EQ(scene_owner.begin_calls, 0);
-      EXPECT_EQ(runtime_composition.calls, 0);
-      EXPECT_EQ(runtime_composition.child_submit_calls, 0);
-      EXPECT_EQ(kernel_fence.status_calls, 0);
-      EXPECT_EQ(kernel_fence.release_calls, 0);
-      EXPECT_TRUE(kernel_fence.installed_configurations.empty());
-      EXPECT_FALSE(cell_admission.last_release);
-      EXPECT_FALSE(actual_scene.ReadMaintenanceInitialization({accepted.apply_id, accepted.apply_generation}));
-      const auto before_replay = kernel_fence.reconcile_calls;
-      const auto replay = coordinator.AcceptOrReplay(request, original);
-      EXPECT_EQ(replay.state, ManagerNamedApplyResultState::kUnknownEffect);
-      EXPECT_EQ(kernel_fence.reconcile_calls, before_replay);
-      EXPECT_FALSE(coordinator.RecoverIncompleteApply());
-      EXPECT_EQ(original_source_calls, 1);
-      continue;
-    }
-    ::testing::Message first_progress;
-    if (scene_owner.stage_calls != 1) {
-      const auto observed = journal.ReadStatus(accepted.apply_id, accepted.apply_generation);
-      first_progress << "first.state=" << static_cast<int>(first->state)
-                     << ", replayed=" << first->request_replayed
-                     << ", source_calls=" << original_source_calls
-                     << ", fence_acquire=" << kernel_fence.acquire_calls
-                     << ", fence_status=" << kernel_fence.status_calls
-                     << ", runtime_observe=" << runtime_ports.observe_calls
-                     << ", runtime_ensure=" << runtime_ports.ensure_calls
-                     << ", runtime_progress=" << runtime_ports.progress_calls;
-      if (first->terminal_outcome && first->terminal_outcome->failure) {
-        const auto &failure = *first->terminal_outcome->failure;
-        first_progress << ", returned_failure=" << failure.failure_code
-                       << ": " << failure.failure_message
-                       << ", returned_phase=" << ToString(failure.phase)
-                       << ", returned_effect=" << ToString(failure.effect_disposition);
-      }
-      if (observed) {
-        first_progress << ", retained_phase=" << ToString(DeriveManagerApplyProgress(*observed).phase)
-                       << ", retained_fence=" << observed->fence_acceptance.has_value()
-                       << ", retained_runtime_intent=" << observed->runtime_convergence_intent.has_value()
-                       << ", retained_staged=" << observed->latest_runtime_staged_ready.has_value()
-                       << ", retained_child_proofs=" << observed->bring_up_child_proofs.size()
-                       << ", retained_publication=" << observed->publication_receipt.has_value();
-        if (observed->terminal_outcome && observed->terminal_outcome->terminal_outcome.failure) {
-          const auto &failure = *observed->terminal_outcome->terminal_outcome.failure;
-          first_progress << ", retained_failure=" << failure.failure_code
-                         << ": " << failure.failure_message
-                         << ", retained_effect=" << ToString(failure.effect_disposition)
-                         << ", retained_intent=" << failure.intent_digest.value();
-        }
-      } else {
-        first_progress << ", retained_status=absent";
-      }
-      const auto head = publication_store.ReadActiveBundlePublication(predecessor.publication_generation);
-      if (head.ok()) {
-        first_progress << ", publication_generation=" << head.value().publication_generation.value()
-                       << ", publication_bundle=" << head.value().request.candidate_retained_bundle_id.value()
-                       << ", publication_pointer=" << head.value().durable_public_pointer_content_digest.value();
-      } else {
-        first_progress << ", publication_error=" << head.error().code
-                       << ": " << head.error().message;
-      }
-      // Preserve the failed fixture's main databases and WAL files before its
-      // scoped cleanup. The synchronous producer is idle at this observation.
-      const auto evidence = state_root.path().parent_path() /
-          (state_root.path().filename().string() + "-original-linked-stage-failure");
-      std::error_code copy_error;
-      std::filesystem::copy(state_root.path(), evidence,
-                            std::filesystem::copy_options::recursive, copy_error);
-      first_progress << ", fixture_evidence=" << evidence.string()
-                     << ", fixture_copy_error=" << copy_error.message();
-    }
-    ASSERT_EQ(scene_owner.stage_calls, 1) << first_progress.GetString();
-    if (scenario == 8) {
-      ASSERT_EQ(first->state, ManagerNamedApplyResultState::kPending);
-      EXPECT_EQ(runtime_composition.calls, 0);
-      EXPECT_EQ(runtime_composition.child_submit_calls, 0);
-      EXPECT_EQ(scene_owner.begin_calls, 0);
-      EXPECT_FALSE(actual_scene.ReadMaintenanceInitialization({accepted.apply_id, accepted.apply_generation}));
-      for (const auto &projection : resolver.clients) {
-        if (projection->pending_target) projection->CompletePendingRebuild();
-      }
-      first = coordinator.RecoverIncompleteApply();
-      ASSERT_TRUE(first);
-      EXPECT_EQ(scene_owner.stage_calls, 1);
-      EXPECT_EQ(scene_owner.stage_read_calls, 1);
-    }
-    ASSERT_EQ(runtime_composition.child_submit_calls, 1);
-    EXPECT_TRUE(journal.ReadBringUpChildProof(accepted.apply_id, accepted.apply_generation, component,
-                                            ManagerApplyBringUpChildPhase::kAccepted));
-    EXPECT_FALSE(journal.ReadBringUpChildProof(accepted.apply_id, accepted.apply_generation, component,
-                                             ManagerApplyBringUpChildPhase::kHolding));
-    EXPECT_EQ(publication_store.publish_calls, 0);
-    EXPECT_EQ(kernel_fence.release_calls, 0);
-    EXPECT_FALSE(cell_admission.last_release && cell_admission.last_release->owner_role == CellAdmissionOwnerRoleDTO::kManager);
-    ASSERT_EQ(runtime_composition.phases.size(), 1U);
-    EXPECT_EQ(runtime_composition.phases.front(), ManagerSelectedRuntimeCompositionPhase::kPrepare);
-    ASSERT_TRUE(runtime_composition.last_request);
-    const auto &host_request = *runtime_composition.last_request;
-    EXPECT_EQ(host_request.candidate_projection_revision, plan->plan.expected_publication.candidate_projection_revision);
-    EXPECT_EQ(host_request.authoritative_scene_snapshot_digest,
-              preserved->revision.content_hash);
-    EXPECT_EQ(host_request.predecessor_projection_revision.scene_revision, preserved->revision);
-    EXPECT_EQ(host_request.expected_predecessor_publication_generation,
-              *plan->plan.expected_publication.expected_previous_publication_generation);
-    EXPECT_EQ(host_request.expected_predecessor_public_pointer_digest, plan->plan.predecessor_public_pointer_digest);
-    EXPECT_EQ(host_request.retained_bundle_canonical_content_digest,
-              ContentDigest(deployment::sha256_digest(package.bundle->canonical_bytes())));
-    EXPECT_EQ(host_request.retained_bundle_canonical_byte_size, package.bundle->canonical_bytes().size());
-    const ManagerApplyPrivateMaterializationDTO expected_materialization{
-        host_request.authoritative_scene_snapshot_digest, accepted.apply_id, accepted.apply_generation,
-        host_request.candidate_projection_revision, host_request.retained_bundle_canonical_content_digest,
-        host_request.retained_bundle_canonical_byte_size};
-    EXPECT_EQ(ComputeManagerApplyPrivateMaterializationDigest(expected_materialization),
-              plan->plan.expected_publication.private_materialization_content_digest);
-    const auto retained = journal.ReadStatus(accepted.apply_id, accepted.apply_generation);
-    ASSERT_TRUE(retained && retained->fence_acceptance && retained->latest_runtime_staged_ready);
-    EXPECT_EQ(host_request.configuration_fence_id, retained->fence_acceptance->accepted_fence.configuration_fence_id);
-    EXPECT_EQ(host_request.configuration_fence_generation,
-              retained->fence_acceptance->accepted_fence.configuration_fence_generation);
-    EXPECT_EQ(host_request.configuration_fence_scope, retained->fence_acceptance->accepted_fence.captured_scope);
-    EXPECT_EQ(host_request.runtime_epoch, retained->latest_runtime_staged_ready->staged_ready.runtime_units.front().runtime_epoch);
-    EXPECT_EQ(host_request.manager_runtime_epoch, RuntimeEpoch("manager-runtime.original"));
-    EXPECT_EQ(scene_owner.ordinary_begin_calls, 0);
-    EXPECT_EQ(scene_owner.ordinary_install_calls, 0);
-    EXPECT_FALSE(scene_owner.ReadMaintenanceInitialization({accepted.apply_id, accepted.apply_generation}));
-    EXPECT_FALSE(retained->private_materialization);
-    EXPECT_FALSE(retained->publication_receipt);
-    if (scenario == 7) {
-      ASSERT_EQ(first->state, ManagerNamedApplyResultState::kUnknownEffect);
-      ASSERT_TRUE(first->terminal_outcome && first->terminal_outcome->failure);
-      EXPECT_EQ(first->terminal_outcome->failure->failure_code, "apply_component_bring_up_failed");
-      EXPECT_EQ(runtime_composition.child_submit_calls, 1);
-      EXPECT_EQ(scene_owner.begin_calls, 0);
-      EXPECT_EQ(kernel_fence.release_calls, 0);
-      const auto calls = runtime_composition.calls;
-      EXPECT_FALSE(coordinator.RecoverIncompleteApply());
-      EXPECT_TRUE(coordinator.AcceptOrReplay(request, original).request_replayed);
-      EXPECT_EQ(runtime_composition.calls, calls);
-      EXPECT_EQ(runtime_composition.child_submit_calls, 1);
-      continue;
-    }
-    const auto actual_accepted_proof = journal.ReadBringUpChildProof(
-        accepted.apply_id, accepted.apply_generation, component, ManagerApplyBringUpChildPhase::kAccepted);
-    ASSERT_TRUE(actual_accepted_proof && actual_accepted_proof->proof.result.status);
-    const auto &actual_parent_claim = actual_accepted_proof->proof.result.status->apply_bring_up->parent_authority.parent_claim;
-    const auto held = cell_admission.GetCellAdmissionRecoveryReceipt(
-        {actual_parent_claim.intent, actual_parent_claim, std::nullopt});
-    ASSERT_TRUE(held.ok() && held.value().matched_claim);
-    const LogicalSceneSnapshotIdentityDTO actual_snapshot{
-        retained->intent.intent.expected_active_projection_revision.scene_revision, journal.cell_id()};
-    ManagerSelectedRuntimeCompositionCoordinator original_preparer(
-        journal, scene_owner, runtime_composition, RuntimeEpoch("manager-runtime.original"));
-    const auto host_calls = runtime_composition.calls;
-    auto foreign_snapshot = actual_snapshot;
-    ++foreign_snapshot.revision.revision_id;
-    EXPECT_THROW(static_cast<void>(original_preparer.PrepareOriginalApplyComponentBringUp(
-                     *plan, foreign_snapshot, *held.value().matched_claim, *package.bundle)),
-                 ManagerSelectedRuntimeCompositionCoordinatorError);
-    auto foreign_plan = *plan;
-    foreign_plan.plan_digest = ContentDigest(std::string(kDigestTwo));
-    EXPECT_THROW(static_cast<void>(original_preparer.PrepareOriginalApplyComponentBringUp(
-                     foreign_plan, actual_snapshot, *held.value().matched_claim, *package.bundle)),
-                 ManagerSelectedRuntimeCompositionCoordinatorError);
-    // The preparer checks claim shape and intent; the parent coordinator
-    // checks that the exact claim is held before invoking it.
-    auto invalid_claim = *held.value().matched_claim;
-    invalid_claim.claim_generation = CellAdmissionClaimGeneration(0U);
-    EXPECT_THROW(static_cast<void>(original_preparer.PrepareOriginalApplyComponentBringUp(
-                     *plan, actual_snapshot, invalid_claim, *package.bundle)),
-                 ManagerSelectedRuntimeCompositionCoordinatorError);
-    EXPECT_THROW(static_cast<void>(original_preparer.PrepareOriginalApplyComponentBringUp(
-                     *plan, actual_snapshot, *held.value().matched_claim, *previous.bundle)),
-                 ManagerSelectedRuntimeCompositionCoordinatorError);
-    EXPECT_EQ(runtime_composition.calls, host_calls);
-    EXPECT_EQ(scene_owner.ordinary_begin_calls, 0);
-    EXPECT_EQ(scene_owner.ordinary_install_calls, 0);
-    ASSERT_EQ(first->state, ManagerNamedApplyResultState::kPending);
-    {
-      ManagerNamedApplyCoordinator replacement_before_scene(
-          journal, active_plan_source, *package.bundle_source, *package.artifact_source,
-          publication_store, scene_owner, nullptr, kernel_fence, cell_admission,
-          runtime_composition, runtime_ports, runtime_ports, planned_maintenance,
-          RuntimeEpoch("manager-runtime.replaced"), "linux",
-          {std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)},
-          [] { return 1'000U; }, [] { return ApplyId("must-not-be-minted"); },
-          [&](const auto &, const auto &) { ++authored_scene_reads; return std::vector<AddObjectRequestDTO>{}; });
-      const auto prior_calls = runtime_composition.calls;
-      const auto observed_pending = replacement_before_scene.RecoverIncompleteApply();
-      ASSERT_TRUE(observed_pending);
-      EXPECT_EQ(observed_pending->state, ManagerNamedApplyResultState::kPending);
-      EXPECT_EQ(runtime_composition.calls, prior_calls);
-      EXPECT_EQ(runtime_composition.child_submit_calls, 1);
-      EXPECT_EQ(scene_owner.begin_calls, 0);
-      EXPECT_EQ(scene_owner.complete_calls, 0);
-      EXPECT_EQ(kernel_fence.release_calls, 0);
-    }
-    holding = true;
-    const auto progressed = coordinator.RecoverIncompleteApply();
-    ASSERT_TRUE(progressed);
-    EXPECT_TRUE(journal.ReadBringUpChildProof(accepted.apply_id, accepted.apply_generation, component,
-                                            ManagerApplyBringUpChildPhase::kHolding));
-    EXPECT_EQ(scene_owner.begin_calls, 1);
-    EXPECT_EQ(scene_owner.ordinary_begin_calls, 0);
-    EXPECT_EQ(scene_owner.ordinary_install_calls, 0);
-    EXPECT_EQ(scene_owner.ordinary_complete_calls, 0);
-    const auto observed_snapshot = actual_scene.ReadActiveSnapshot();
-    ASSERT_TRUE(observed_snapshot);
-    EXPECT_EQ(scene::EncodeLogicalSceneSnapshot(*observed_snapshot->shared()), preserved_bytes);
-    EXPECT_EQ(actual_scene.CurrentRequestOwnerEpoch(), original_scene_owner);
-    if (scenario >= 1 && scenario <= 6) {
-      ASSERT_EQ(progressed->state, ManagerNamedApplyResultState::kUnknownEffect);
-      ASSERT_TRUE(progressed->terminal_outcome && progressed->terminal_outcome->failure);
-      EXPECT_EQ(progressed->terminal_outcome->failure->failure_code,
-                scenario == 6 ? "apply_component_bring_up_settlement_failed" : "scene_product_adoption_failed");
-      EXPECT_EQ(publication_store.publish_calls, scenario == 6 ? 1 : 0);
-      EXPECT_EQ(scene_owner.complete_calls, scenario == 6 ? 1 : 0);
-      EXPECT_EQ(kernel_fence.release_calls, 0);
-      EXPECT_FALSE(cell_admission.last_release && cell_admission.last_release->owner_role == CellAdmissionOwnerRoleDTO::kManager);
-      EXPECT_EQ(runtime_composition.phases.size(), scenario == 6 ? 2U : 1U);
-      EXPECT_EQ(scene_owner.ReadMaintenanceInitialization({accepted.apply_id, accepted.apply_generation}).has_value(), scenario >= 4);
-    } else {
-      ASSERT_EQ(progressed->state, ManagerNamedApplyResultState::kPending)
-          << (progressed->terminal_outcome && progressed->terminal_outcome->failure
-                  ? progressed->terminal_outcome->failure->failure_code + ": " +
-                        progressed->terminal_outcome->failure->failure_message
-                  : std::string("no failure"));
-      EXPECT_EQ(publication_store.publish_calls, 1);
-      EXPECT_EQ(scene_owner.complete_calls, 1);
-      ASSERT_TRUE(journal.ReadPublicationReceipt(accepted.apply_id, accepted.apply_generation));
-      EXPECT_FALSE(journal.ReadBringUpChildProof(accepted.apply_id, accepted.apply_generation, component,
-                                               ManagerApplyBringUpChildPhase::kTerminal));
-      EXPECT_EQ(kernel_fence.release_calls, 0);
-      EXPECT_EQ(runtime_composition.phases.size(), 2U);
-      const auto before_terminal = actual_scene.VerifyIntegrity();
-      terminal = true;
-      const auto settled = coordinator.RecoverIncompleteApply();
-      ASSERT_TRUE(settled);
-      ASSERT_EQ(settled->state, ManagerNamedApplyResultState::kSucceeded);
-      EXPECT_TRUE(journal.ReadBringUpChildProof(accepted.apply_id, accepted.apply_generation, component,
-                                              ManagerApplyBringUpChildPhase::kTerminal));
-      EXPECT_EQ(runtime_composition.phases.size(), 3U);
-      EXPECT_EQ(runtime_composition.phases.back(), ManagerSelectedRuntimeCompositionPhase::kFinalize);
-      EXPECT_EQ(scene_owner.complete_calls, 1);
-      EXPECT_EQ(kernel_fence.release_calls, 1);
-      ASSERT_TRUE(cell_admission.last_release);
-      EXPECT_EQ(cell_admission.last_release->owner_role, CellAdmissionOwnerRoleDTO::kManager);
-      EXPECT_EQ(scene::EncodeLogicalSceneSnapshot(*actual_scene.LogicalSnapshot()), preserved_bytes);
-      const auto after_terminal = actual_scene.VerifyIntegrity();
-      EXPECT_EQ(after_terminal.transaction_intent_count, before_terminal.transaction_intent_count);
-      EXPECT_EQ(after_terminal.projection_result_count, before_terminal.projection_result_count);
-      // Begin/Complete never rebuild: only the explicit Stage may do so.
-      EXPECT_EQ(scene_owner.stage_calls, 1);
-    }
-    EXPECT_EQ(runtime_composition.child_submit_calls, 1);
-    EXPECT_EQ(original_source_calls, 1);
-    EXPECT_EQ(scene_owner.stage_calls, 1);
-    const auto composition_calls = runtime_composition.calls;
-    const auto scene_begin_calls = scene_owner.begin_calls;
-    const auto scene_complete_calls = scene_owner.complete_calls;
-    const auto releases = kernel_fence.release_calls;
-    const auto publishes = publication_store.publish_calls;
-    ManagerNamedApplyCoordinator replaced(
-        journal, active_plan_source, *package.bundle_source, *package.artifact_source,
-        publication_store, scene_owner, nullptr, kernel_fence, cell_admission,
-        runtime_composition, runtime_ports, runtime_ports, planned_maintenance,
-        RuntimeEpoch("manager-runtime.replaced"), "linux",
-        {std::string(deployment::ros2_control_execution_runtime_contract::kLaunchEnvironmentContract)},
-        [] { return 1'000U; }, [] { return ApplyId("must-not-be-minted"); },
-        [&](const auto &, const auto &) { ++authored_scene_reads; return std::vector<AddObjectRequestDTO>{}; });
-    const auto observed = replaced.AcceptOrReplay(request,
-        [](const auto &, const auto &, const auto &, const auto &) -> ManagerApplyBringUpPlanDTO {
-          throw std::logic_error("replacement reconstructed original plan callback");
-        });
-    EXPECT_TRUE(observed.request_replayed);
-    EXPECT_EQ(observed.state, (scenario <= 0 || scenario == 8 || streaming)
-                                  ? ManagerNamedApplyResultState::kSucceeded
-                                  : ManagerNamedApplyResultState::kUnknownEffect);
-    static_cast<void>(replaced.RecoverIncompleteApply());
-    EXPECT_EQ(runtime_composition.calls, composition_calls);
-    EXPECT_EQ(runtime_composition.child_submit_calls, 1);
-    EXPECT_EQ(scene_owner.begin_calls, scene_begin_calls);
-    EXPECT_EQ(scene_owner.complete_calls, scene_complete_calls);
-    EXPECT_EQ(kernel_fence.release_calls, releases);
-    EXPECT_EQ(publication_store.publish_calls, publishes);
-    EXPECT_EQ(authored_scene_reads, 0);
-    scene::LogicalSceneOwner reopened_scene(scene_path, admission, publication_store,
-        *package.bundle_source, resolver, cell_admission);
-    const auto reopened_snapshot = reopened_scene.ReadActiveSnapshot();
-    ASSERT_TRUE(reopened_snapshot);
-    EXPECT_EQ(scene::EncodeLogicalSceneSnapshot(*reopened_snapshot->shared()), preserved_bytes);
-    EXPECT_EQ(reopened_scene.CurrentRequestOwnerEpoch(), original_scene_owner);
-  }
-}
-
 
 // `streaming` commits pose-only updates after the request and before Begin;
 // Apply binds identity only and adopts the latest Scene.
@@ -4784,8 +3473,9 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response, const in
     ScopedPackageRoot package_root;
     ScopedPackageRoot state_root;
     auto empty = MaterializeRosRuntimePackage(package_root.path(), true);
-    auto previous = MaterializeRosRuntimePackage(package_root.path(), false, deployment::test::kLite6ArmTargetId, kDigestOne);
-    auto package = MaterializeRosRuntimePackage(package_root.path(), false, deployment::test::kLite6ArmTargetId, kDigestTwo);
+    // The two products differ by the arm's initial joint position.
+    auto previous = MaterializeRosRuntimePackage(package_root.path(), false, deployment::test::kLite6ArmTargetId, kDigestOne, {}, 0.1);
+    auto package = MaterializeRosRuntimePackage(package_root.path(), false, deployment::test::kLite6ArmTargetId, kDigestTwo, {}, 0.2);
     const auto prototype = ApplyIntent(*package.bundle);
     ASSERT_NE(previous.bundle->retained_bundle_id(), package.bundle->retained_bundle_id());
     ASSERT_FALSE(package.bundle->value().cell_graph.controllable_components.empty());
@@ -4892,7 +3582,7 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response, const in
     ASSERT_EQ(installed_graph.control_bindings.front().provider_runtime_unit_id,
               kernel_fence.original_execution_host->runtime_unit_id);
     const auto installed_identity =
-        deployment::derive_component_runtime_identity(*previous.bundle, component);
+        deployment::derive_component_runtime_identity(*previous.bundle, deployment::SiteFacts{}, component);
     ASSERT_TRUE(installed_identity.has_value());
     const ManagerComponentProcessInventoryRequestDTO installed_scope{
         predecessor.request.candidate_projection_revision,
@@ -4910,10 +3600,21 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response, const in
     // the original host and this component occurrence are already present.
     // Their installed identity comes from the previous sealed product.
     runtime_ports.ReplaceProcess("process-epoch-1");
+    // eligibility 4: the component reads Active but its launch process group
+    // is drained (gone); every other case has a live process.
     const std::vector<ManagerComponentProcessOccurrenceDTO> installed_processes{
-        {component, "fixture-original-configuration-component", 42,
-         ProcessPresenceState::kPresent, core::ControllerLaunchCleanupState::kNotRequested,
-         std::nullopt, installed_identity}};
+        eligibility == 4
+            ? ManagerComponentProcessOccurrenceDTO{
+                  component, "fixture-original-configuration-component", 42,
+                  ProcessPresenceState::kAbsent, core::ControllerLaunchCleanupState::kDrained,
+                  core::ControllerLaunchGroupDrainReceipt{
+                      42, component.value(), "fixture-original-configuration-component",
+                      "2026-11-01T00:00:00Z"},
+                  installed_identity}
+            : ManagerComponentProcessOccurrenceDTO{
+                  component, "fixture-original-configuration-component", 42,
+                  ProcessPresenceState::kPresent, core::ControllerLaunchCleanupState::kNotRequested,
+                  std::nullopt, installed_identity}};
     ASSERT_TRUE((ManagerComponentProcessInventoryResultDTO{
         installed_scope, installed_processes, std::nullopt}).valid());
     runtime_composition.installed_processes =
@@ -4928,7 +3629,9 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response, const in
               {request, installed_processes, std::nullopt, eligibility == 3
                   ? std::vector<ManagerComponentLifecycleObservationDTO>{}
                   : std::vector<ManagerComponentLifecycleObservationDTO>{{component, ComponentLifecycleGeneration(3U),
-                      eligibility == 0 ? ComponentLifecycleStateDTO::kDisabled : ComponentLifecycleStateDTO::kActive}}});
+                      eligibility == 0 ? ComponentLifecycleStateDTO::kDisabled
+                      : eligibility == 5 ? ComponentLifecycleStateDTO::kFaulted
+                                         : ComponentLifecycleStateDTO::kActive}}});
         };
     for (const auto &desired : previous.bundle->value().desired_control_configurations) {
       kernel_fence.predecessor_configurations.push_back({
@@ -4955,7 +3658,7 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response, const in
       EXPECT_TRUE(kernel_fence.installed_configurations.empty());
       EXPECT_EQ(kernel_fence.status_calls, 0);
       EXPECT_GT(kernel_fence.reconcile_calls, 0);
-      for (const auto &binding : input.native_runtime_bindings) {
+      for (const auto &binding : input.execution_host_bindings) {
         auto projection = std::make_shared<AdoptionProjection>(binding);
         projection->accept_next_rebuild = true;
         resolver.clients.push_back(std::move(projection));
@@ -4965,31 +3668,22 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response, const in
     scene_owner.after_configuration_stage = [&] {
       if (lose_stage_response) throw std::runtime_error("lost original configuration Stage response");
     };
-    runtime_composition.installed = [&](const auto &input) {
-      if (input.phase == ManagerSelectedRuntimeCompositionPhase::kPrepare) {
-        events.push_back("Prepare");
-        EXPECT_FALSE(actual_scene.ReadMaintenanceInitialization({input.apply_id, input.apply_generation}));
-        for (const auto &domain : input.configuration_fence_scope.domains) {
-          if (domain.candidate_control_domain_revision) {
-            kernel_fence.installed_configurations.push_back({
-                domain.control_domain_id,
-                ActiveControlConfigurationId("installed." + domain.control_domain_id.value()),
-                ActiveControlConfigurationGeneration(1U)});
-          }
+    // The one host Apply (CONTRACTS §15) runs before Scene Begin and
+    // publication; the host installs the candidate routes under the fence.
+    runtime_composition.installed = [&](const HostApplyRequest &input) {
+      events.push_back("HostApply");
+      EXPECT_FALSE(actual_scene.ReadMaintenanceInitialization({input.apply.apply_id, input.apply.apply_generation}));
+      EXPECT_EQ(publication_store.publish_calls, 0);
+      const auto fence = journal.ReadFenceAcceptance(input.apply.apply_id, input.apply.apply_generation);
+      ASSERT_TRUE(fence);
+      for (const auto &domain : fence->accepted_fence.captured_scope.domains) {
+        if (domain.candidate_control_domain_revision) {
+          kernel_fence.installed_configurations.push_back({
+              domain.control_domain_id,
+              ActiveControlConfigurationId("installed." + domain.control_domain_id.value()),
+              ActiveControlConfigurationGeneration(1U)});
         }
-      } else {
-        events.push_back("Finalize");
-        EXPECT_EQ(publication_store.publish_calls, 0);
       }
-    };
-    // This checkpoint deliberately stops before Q105 context exchange. The
-    // test Host reports pending verification after actual Scene completion.
-    runtime_composition.pending = [&](const auto &input) {
-      const auto completed = actual_scene.ReadMaintenanceInitialization({input.apply_id, input.apply_generation});
-      const bool pending = input.phase == ManagerSelectedRuntimeCompositionPhase::kFinalize && completed &&
-          completed->state == ProjectionMaintenanceInitializationState::kCompleted;
-      if (pending) events.push_back("postpublication-verification");
-      return pending;
     };
     AlwaysIdleMaintenanceGate maintenance_gate;
     ManagerPlannedMaintenanceCoordinator planned_maintenance(active_plan_source, maintenance_gate);
@@ -5025,7 +3719,6 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response, const in
     const auto stored = journal.ReadIntent(accepted.apply_id, accepted.apply_generation);
     ASSERT_TRUE(stored);
     EXPECT_EQ(stored->intent_digest, ComputeManagerApplyIntentDigest(stored->intent));
-    EXPECT_FALSE(journal.ReadBringUpPlan(accepted.apply_id, accepted.apply_generation));
     const auto first = coordinator.RecoverIncompleteApply();
     ASSERT_TRUE(first);
     const auto failure_detail = first->terminal_outcome && first->terminal_outcome->failure
@@ -5033,14 +3726,24 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response, const in
               first->terminal_outcome->failure->failure_message
         : std::string("no terminal failure");
     SCOPED_TRACE(failure_detail);
-    if (eligibility != 0) {
+    if (eligibility == 4) {
+      // CONTRACTS §11: a component whose process is gone is replaced without a
+      // clean Disable; the Apply passes the refusal and acquires its fence.
+      EXPECT_FALSE(first->terminal_outcome && first->terminal_outcome->failure &&
+                   first->terminal_outcome->failure->failure_code ==
+                       "apply_requires_inactive_component");
+      EXPECT_TRUE(journal.ReadFenceAttempt(accepted.apply_id, accepted.apply_generation));
+      return;
+    }
+    if (eligibility >= 1 && eligibility <= 3) {
       ASSERT_TRUE(first->terminal_outcome && first->terminal_outcome->failure);
       const bool expected_active = eligibility != 3;
-      EXPECT_EQ(first->state, expected_active ? ManagerNamedApplyResultState::kFailed : ManagerNamedApplyResultState::kUnknownEffect);
+      // Both stop before any fence attempt: a known pre-effect failure that
+      // releases the admission claim (core rule 3).
+      EXPECT_EQ(first->state, ManagerNamedApplyResultState::kFailed);
       EXPECT_EQ(first->terminal_outcome->failure->failure_code,
           expected_active ? "apply_requires_inactive_component" : "apply_fence_evidence_failed");
-      EXPECT_EQ(first->terminal_outcome->failure->effect_disposition,
-          expected_active ? ManagerApplyEffectDisposition::kKnown : ManagerApplyEffectDisposition::kUnknown);
+      EXPECT_EQ(first->terminal_outcome->failure->effect_disposition, ManagerApplyEffectDisposition::kKnown);
       EXPECT_EQ(kernel_fence.acquire_calls, 0);
       EXPECT_FALSE(journal.ReadFenceAttempt(accepted.apply_id, accepted.apply_generation));
       EXPECT_EQ(runtime_ports.ensure_calls, 0);
@@ -5048,7 +3751,8 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response, const in
       EXPECT_EQ(scene_owner.stage_calls, 0);
       EXPECT_EQ(scene_owner.begin_calls, 0);
       EXPECT_EQ(publication_store.publish_calls, 0);
-      EXPECT_EQ(cell_admission.release_calls, initial_release_calls + (expected_active ? 1 : 0));
+      EXPECT_EQ(cell_admission.release_calls, initial_release_calls + 1);
+      EXPECT_TRUE(cell_admission.GetAuthoringAdmission().authoring_allowed);
       EXPECT_EQ(scene::EncodeLogicalSceneSnapshot(*actual_scene.LogicalSnapshot()), preserved_bytes);
       if (parent) {
         EXPECT_EQ(stored->intent.parent_authoring_claim, parent);
@@ -5086,10 +3790,21 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response, const in
       ASSERT_GT(completed_jobs, 0U);
       const auto progressed = coordinator.RecoverIncompleteApply();
       ASSERT_TRUE(progressed);
-      ASSERT_EQ(progressed->state, ManagerNamedApplyResultState::kPending);
-      EXPECT_FALSE(progressed->terminal_outcome);
-      EXPECT_EQ(events, std::vector<std::string>({"Stage", "Read", "Prepare", "Begin", "Finalize",
-                                                "Complete", "postpublication-verification"}));
+      const auto progressed_detail = progressed->terminal_outcome && progressed->terminal_outcome->failure
+          ? progressed->terminal_outcome->failure->failure_code + ": " +
+                progressed->terminal_outcome->failure->failure_message
+          : std::string("no terminal failure");
+      SCOPED_TRACE(progressed_detail);
+      // No Finalize or post-publication exchange: the Apply completes.
+      ASSERT_EQ(progressed->state, ManagerNamedApplyResultState::kSucceeded);
+      EXPECT_TRUE(progressed->terminal_outcome);
+      EXPECT_EQ(events, std::vector<std::string>({"Stage", "Read", "HostApply", "Begin", "Complete"}));
+      EXPECT_EQ(runtime_composition.calls, 1);
+      ASSERT_TRUE(runtime_composition.last_request);
+      EXPECT_EQ(runtime_composition.last_request->components,
+                std::vector<ControllableComponentId>({component}));
+      EXPECT_TRUE(runtime_composition.last_request->retained_components.empty());
+      EXPECT_TRUE(runtime_composition.last_request->removed_components.empty());
       EXPECT_EQ(scene_owner.stage_calls, 1);
       EXPECT_EQ(scene_owner.stage_read_calls, 1);
       EXPECT_EQ(scene_owner.begin_calls, 1);
@@ -5115,26 +3830,25 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response, const in
           publication->publication.publication_receipt.request.candidate_projection_revision));
       EXPECT_EQ(actual_scene.CurrentProjectionRevision().scene_revision,
                 completed->target_projection_revision.scene_revision);
-      EXPECT_EQ(runtime_composition.phases, std::vector<ManagerSelectedRuntimeCompositionPhase>({
-          ManagerSelectedRuntimeCompositionPhase::kPrepare, ManagerSelectedRuntimeCompositionPhase::kFinalize,
-          ManagerSelectedRuntimeCompositionPhase::kFinalize}));
     }
     const auto status = journal.ReadStatus(accepted.apply_id, accepted.apply_generation);
     ASSERT_TRUE(status);
-    EXPECT_FALSE(status->bring_up_plan);
-    EXPECT_TRUE(status->bring_up_child_proofs.empty());
-    EXPECT_EQ(runtime_composition.child_submit_calls, 0);
-    EXPECT_EQ(runtime_composition.child_read_calls, 0);
     EXPECT_EQ(scene_owner.ordinary_begin_calls, 0);
     EXPECT_EQ(scene_owner.ordinary_install_calls, 0);
     EXPECT_EQ(scene_owner.ordinary_complete_calls, 0);
-    EXPECT_EQ(kernel_fence.release_calls, 0);
-    EXPECT_FALSE(cell_admission.last_release);
     EXPECT_EQ(authored_scene_reads, 0);
     const auto snapshot = actual_scene.ReadActiveSnapshot();
     ASSERT_TRUE(snapshot);
     EXPECT_EQ(scene::EncodeLogicalSceneSnapshot(*snapshot->shared()), preserved_bytes);
     EXPECT_EQ(actual_scene.CurrentRequestOwnerEpoch(), original_scene_owner);
+    if (!lose_stage_response) {
+      // The successful Apply released its fence and settled its claim.
+      EXPECT_EQ(kernel_fence.release_calls, 1);
+      EXPECT_TRUE(cell_admission.last_release);
+      return;
+    }
+    EXPECT_EQ(kernel_fence.release_calls, 0);
+    EXPECT_FALSE(cell_admission.last_release);
     const auto held_claim = cell_admission.GetCellAdmissionRecoveryReceipt({
         {CellAdmissionClaimKindDTO::kManagerApply, CellAdmissionOwnerRoleDTO::kManager,
          stored->intent.request_context.request_owner_epoch, stored->intent.apply_id.value(),
@@ -5157,17 +3871,8 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response, const in
         [&](const auto &, const auto &) { ++authored_scene_reads; return std::vector<AddObjectRequestDTO>{}; });
     const auto replay = replacement.AcceptOrReplay(request);
     EXPECT_TRUE(replay.request_replayed);
-    EXPECT_EQ(replay.state, lose_stage_response ? ManagerNamedApplyResultState::kUnknownEffect
-                                             : ManagerNamedApplyResultState::kPending);
-    const auto recovered = replacement.RecoverIncompleteApply();
-    if (lose_stage_response) {
-      EXPECT_FALSE(recovered);
-    } else {
-      ASSERT_TRUE(recovered);
-      EXPECT_EQ(recovered->state, ManagerNamedApplyResultState::kUnknownEffect);
-      ASSERT_TRUE(recovered->terminal_outcome && recovered->terminal_outcome->failure);
-      EXPECT_EQ(recovered->terminal_outcome->failure->failure_code, "planned_maintenance_interrupted");
-    }
+    EXPECT_EQ(replay.state, ManagerNamedApplyResultState::kUnknownEffect);
+    EXPECT_FALSE(replacement.RecoverIncompleteApply());
     EXPECT_EQ(events, prior_events);
     EXPECT_EQ(runtime_composition.calls, prior_composition_calls);
     EXPECT_EQ(kernel_fence.reconcile_calls, prior_reconcile_calls);
@@ -5183,7 +3888,7 @@ void ExerciseOriginalConfigurationScene(const bool lose_stage_response, const in
 }
 
 TEST(ManagerNamedApplyCoordinator,
-     OriginalConfigurationApplyPreservesActualSceneWithoutChildrenAndRetainsPendingExchange) {
+     OriginalConfigurationApplyPreservesActualSceneAndCompletesWithOneHostApply) {
   ExerciseOriginalConfigurationScene(false);
 }
 
@@ -5209,7 +3914,7 @@ namespace {
   const auto &binding = gripper == bindings.end() ? bindings.front() : *gripper;
   return {binding.controllable_component_id, {}, 0, ProcessPresenceState::kAbsent,
           ControllerLaunchCleanupState::kNotRequested, std::nullopt,
-          deployment::derive_component_runtime_identity(bundle, binding.controllable_component_id),
+          deployment::derive_component_runtime_identity(bundle, deployment::SiteFacts{}, binding.controllable_component_id),
           ManagerComponentProcessOwnerKindDTO::kPneumaticNoneLocal,
           ManagerPneumaticNoneProcessOwnerDTO{binding.command_target_id, binding.control_binding_id,
                                              binding.control_binding_revision}};
@@ -5233,13 +3938,13 @@ TEST(ManagerNamedApplyCoordinator, NoneProcessOwnerRequiresExactImmutablePneumat
   const auto exact = NoneInventoryOccurrence(*none.bundle);
   ASSERT_TRUE(request.valid());
   ASSERT_TRUE(exact.valid());
-  ASSERT_TRUE(ValidateManagerPneumaticNoneProcessOwner(*none.bundle, request, exact).ok());
+  ASSERT_TRUE(ValidateManagerPneumaticNoneProcessOwner(*none.bundle, {}, request, exact).ok());
   EXPECT_TRUE(exact.launch_identity.empty());
   EXPECT_EQ(exact.leader_pid, 0);
   EXPECT_EQ(exact.process_presence, ProcessPresenceState::kAbsent);
   EXPECT_FALSE(exact.receipt);
   const auto reject = [&](auto row) {
-    EXPECT_FALSE(ValidateManagerPneumaticNoneProcessOwner(*none.bundle, request, row).ok());
+    EXPECT_FALSE(ValidateManagerPneumaticNoneProcessOwner(*none.bundle, {}, request, row).ok());
   };
   auto foreign = exact;
   foreign.installed_runtime_identity = ContentDigest(std::string(kDigestOne));
@@ -5260,7 +3965,7 @@ TEST(ManagerNamedApplyCoordinator, NoneProcessOwnerRequiresExactImmutablePneumat
   auto foreign_source = request;
   foreign_source.runtime_unit_id = RuntimeUnitId("foreign-runtime");
   ASSERT_TRUE(foreign_source.valid());
-  EXPECT_FALSE(ValidateManagerPneumaticNoneProcessOwner(*none.bundle, foreign_source, exact).ok());
+  EXPECT_FALSE(ValidateManagerPneumaticNoneProcessOwner(*none.bundle, {}, foreign_source, exact).ok());
   const auto commanded = MaterializeNoneInventoryPackage(root.path(), "commanded");
   const auto position = MaterializeNoneInventoryPackage(root.path(), "commanded", "position_commanded");
   // Each negative first matches its own real sealed runtime identity and graph:
@@ -5269,28 +3974,18 @@ TEST(ManagerNamedApplyCoordinator, NoneProcessOwnerRequiresExactImmutablePneumat
     const auto physical_row = NoneInventoryOccurrence(*package->bundle);
     ASSERT_TRUE(physical_row.valid());
     EXPECT_FALSE(ValidateManagerPneumaticNoneProcessOwner(
-        *package->bundle, NoneInventoryRequest(*package->bundle), physical_row).ok());
+        *package->bundle, {}, NoneInventoryRequest(*package->bundle), physical_row).ok());
   }
-  const auto arm_and_none = MaterializeNoneInventoryPackage(root.path(), "none", "pneumatic", false, true);
-  const auto mixed_row = NoneInventoryOccurrence(*arm_and_none.bundle);
-  ASSERT_TRUE(mixed_row.valid());
-  const auto mixed_config = deployment::ros2_control_execution_runtime_contract::require_component_configuration(
-      *arm_and_none.bundle, NoneInventoryRequest(*arm_and_none.bundle).runtime_unit_id,
-      mixed_row.controllable_component_id);
-  ASSERT_FALSE(mixed_config.motion_target_limits.empty());
-  ASSERT_EQ(mixed_config.gripper_target_configurations.front().output_mode, GripperOutputMode::kNone);
-  EXPECT_FALSE(ValidateManagerPneumaticNoneProcessOwner(
-      *arm_and_none.bundle, NoneInventoryRequest(*arm_and_none.bundle), mixed_row).ok());
   const auto arm = MaterializeRosRuntimePackage(root.path());
   auto arm_row = NoneInventoryOccurrence(*arm.bundle);
   ASSERT_TRUE(arm_row.valid());
   EXPECT_FALSE(ValidateManagerPneumaticNoneProcessOwner(
-      *arm.bundle, NoneInventoryRequest(*arm.bundle), arm_row).ok());
+      *arm.bundle, {}, NoneInventoryRequest(*arm.bundle), arm_row).ok());
 }
 
 TEST(ManagerNamedApplyCoordinator, NoneFeedbackAliasRequiresItsExactVerifiedCommandOwner) {
   ScopedPackageRoot root;
-  const auto package = MaterializeNoneInventoryPackage(root.path(), "none", "pneumatic", false, false, true);
+  const auto package = MaterializeNoneInventoryPackage(root.path(), "none", "pneumatic", false, true);
   const auto row = NoneInventoryOccurrence(*package.bundle);
   const auto request = NoneInventoryRequest(*package.bundle);
   const auto &bindings = package.bundle->value().cell_graph.control_bindings;
@@ -5309,7 +4004,7 @@ TEST(ManagerNamedApplyCoordinator, NoneFeedbackAliasRequiresItsExactVerifiedComm
   EXPECT_EQ(command->provider_manifest_revision, feedback->provider_manifest_revision);
   EXPECT_EQ(command->provider_runtime_unit_id, feedback->provider_runtime_unit_id);
   ASSERT_TRUE(row.valid());
-  const auto validated = ValidateManagerPneumaticNoneProcessOwner(*package.bundle, request, row);
+  const auto validated = ValidateManagerPneumaticNoneProcessOwner(*package.bundle, {}, request, row);
   ASSERT_TRUE(validated.ok()) << validated.error().message;
   EXPECT_EQ(row.process_presence, ProcessPresenceState::kAbsent);
   EXPECT_EQ(row.leader_pid, 0);
@@ -5321,15 +4016,15 @@ TEST(ManagerNamedApplyCoordinator, NoneFeedbackAliasRequiresItsExactVerifiedComm
   forged.pneumatic_none_owner->control_binding_id = feedback->control_binding_id;
   forged.pneumatic_none_owner->control_binding_revision = feedback->control_binding_revision;
   ASSERT_TRUE(forged.valid());
-  EXPECT_FALSE(ValidateManagerPneumaticNoneProcessOwner(*package.bundle, request, forged).ok());
+  EXPECT_FALSE(ValidateManagerPneumaticNoneProcessOwner(*package.bundle, {}, request, forged).ok());
   forged = row;
   forged.pneumatic_none_owner->control_binding_revision = feedback->control_binding_revision;
   ASSERT_TRUE(forged.valid());
-  EXPECT_FALSE(ValidateManagerPneumaticNoneProcessOwner(*package.bundle, request, forged).ok());
+  EXPECT_FALSE(ValidateManagerPneumaticNoneProcessOwner(*package.bundle, {}, request, forged).ok());
   forged = row;
   forged.pneumatic_none_owner->command_target_id = CommandTargetId("foreign-progress-target");
   ASSERT_TRUE(forged.valid());
-  EXPECT_FALSE(ValidateManagerPneumaticNoneProcessOwner(*package.bundle, request, forged).ok());
+  EXPECT_FALSE(ValidateManagerPneumaticNoneProcessOwner(*package.bundle, {}, request, forged).ok());
 }
 
 TEST(ManagerNamedApplyCoordinator, NoneInstalledOwnerRetainReplaceRemoveUsesExactFenceWithoutChildProcessEffects) {
@@ -5338,18 +4033,18 @@ TEST(ManagerNamedApplyCoordinator, NoneInstalledOwnerRetainReplaceRemoveUsesExac
     ScopedPackageRoot root;
     ScopedPackageRoot state;
     const bool feedback_alias = variant == 3;
-    auto previous = MaterializeNoneInventoryPackage(root.path(), "none", "pneumatic", false, false, feedback_alias);
+    auto previous = MaterializeNoneInventoryPackage(root.path(), "none", "pneumatic", false, feedback_alias);
     auto candidate = (variant == 0 || feedback_alias)
-        ? MaterializeNoneInventoryPackage(root.path(), "none", "pneumatic", false, false, feedback_alias)
+        ? MaterializeNoneInventoryPackage(root.path(), "none", "pneumatic", false, feedback_alias)
         : MaterializeNoneInventoryPackage(root.path(), variant == 1 ? "commanded" : "none", "pneumatic", variant == 2);
     const auto row = NoneInventoryOccurrence(*previous.bundle);
     const auto inventory = NoneInventoryRequest(*previous.bundle);
-    ASSERT_TRUE(ValidateManagerPneumaticNoneProcessOwner(*previous.bundle, inventory, row).ok());
-    const auto delta = deployment::derive_apply_component_delta(*previous.bundle, *candidate.bundle);
+    ASSERT_TRUE(ValidateManagerPneumaticNoneProcessOwner(*previous.bundle, {}, inventory, row).ok());
+    const auto delta = deployment::derive_apply_component_delta(*previous.bundle, *candidate.bundle, deployment::SiteFacts{});
     ASSERT_EQ(delta.components.size(), 1U);
     EXPECT_EQ(delta.components.front().disposition, (variant == 0 || feedback_alias) ? deployment::ApplyComponentDisposition::kRetain
         : variant == 1 ? deployment::ApplyComponentDisposition::kReplace : deployment::ApplyComponentDisposition::kRemove);
-    const auto continuity = VerifyNativeExecutionHostContinuity(
+    const auto continuity = VerifyExecutionHostContinuity(
         *previous.bundle, *candidate.bundle, *candidate.artifact_source);
     ASSERT_TRUE(continuity.ok()) << continuity.error().message;
     const auto predecessor = PredecessorPublication(ApplyIntent(*previous.bundle));
@@ -5427,8 +4122,6 @@ TEST(ManagerNamedApplyCoordinator, NoneInstalledOwnerRetainReplaceRemoveUsesExac
     EXPECT_EQ(runtime.stop_calls, 0);
     EXPECT_EQ(composition.component_stop_calls, 0);
     EXPECT_EQ(composition.component_stop_read_calls, 0);
-    EXPECT_EQ(composition.child_submit_calls, 0);
-    EXPECT_EQ(composition.child_read_calls, 0);
     EXPECT_EQ(composition.calls, 0);
     EXPECT_EQ(scene_owner.begin_calls, 0);
     EXPECT_EQ(publication.publish_calls, 0);
@@ -5447,7 +4140,7 @@ TEST(ManagerNamedApplyCoordinator, NoneInventoryForeignEpochOrBindingStopsBefore
     const auto package = MaterializeNoneInventoryPackage(root.path());
     const auto inventory = NoneInventoryRequest(*package.bundle);
     const auto exact = NoneInventoryOccurrence(*package.bundle);
-    ASSERT_TRUE(ValidateManagerPneumaticNoneProcessOwner(*package.bundle, inventory, exact).ok());
+    ASSERT_TRUE(ValidateManagerPneumaticNoneProcessOwner(*package.bundle, {}, inventory, exact).ok());
     const auto predecessor = PredecessorPublication(ApplyIntent(*package.bundle));
     SqliteManagerApplyJournal journal(state.path() / "foreign-none.sqlite3", package.bundle->value().cell_graph.cell_id);
     SqliteManagerApplyJournal reader(state.path() / "foreign-none.sqlite3", journal.cell_id());
@@ -5493,8 +4186,12 @@ TEST(ManagerNamedApplyCoordinator, NoneInventoryForeignEpochOrBindingStopsBefore
     ASSERT_EQ(coordinator.AcceptOrReplay(request).state, ManagerNamedApplyResultState::kPending);
     const auto result = coordinator.RecoverIncompleteApply();
     ASSERT_TRUE(result && result->terminal_outcome && result->terminal_outcome->failure);
-    EXPECT_EQ(result->state, ManagerNamedApplyResultState::kUnknownEffect);
+    // Before a fence attempt nothing changed: known pre-effect, claim released.
+    EXPECT_EQ(result->state, ManagerNamedApplyResultState::kFailed);
     EXPECT_EQ(result->terminal_outcome->failure->failure_code, "apply_fence_evidence_failed");
+    EXPECT_EQ(result->terminal_outcome->failure->effect_disposition, ManagerApplyEffectDisposition::kKnown);
+    EXPECT_EQ(admission.release_calls, 1);
+    EXPECT_TRUE(admission.GetAuthoringAdmission().authoring_allowed);
     EXPECT_EQ(fence.acquire_calls, 0);
     EXPECT_EQ(runtime.ensure_calls, 0);
     EXPECT_EQ(composition.component_stop_calls, 0);
@@ -5512,6 +4209,14 @@ TEST(ManagerNamedApplyCoordinator, ActiveChangedComponentRefusesBeforeFenceScene
 
 TEST(ManagerNamedApplyCoordinator, MissingChangedComponentLifecycleIsNotClaimedAsKnownActiveRefusal) {
   ExerciseOriginalConfigurationScene(false, 3);
+}
+
+TEST(ManagerNamedApplyCoordinator, DeadActiveChangedComponentIsReplacedWithoutDisable) {
+  ExerciseOriginalConfigurationScene(false, 4);
+}
+
+TEST(ManagerNamedApplyCoordinator, FaultedChangedComponentIsReplacedWithoutDisable) {
+  ExerciseOriginalConfigurationScene(false, 5);
 }
 
 } // namespace manyforge::component_manager

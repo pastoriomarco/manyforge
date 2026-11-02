@@ -76,7 +76,8 @@
         "program_runner",
         "execution_owner",
         "execution_target",
-        "stop_capability"
+        "stop_capability",
+        "component:robot-a"
       ],
       "detail": "Execute / Control prerequisites are current",
       "generation": null,
@@ -112,16 +113,15 @@
     },
     {
       "contributor_ids": [],
-      "detail": "required runtime contract is present and converged",
-      "generation": 7,
-      "id": "runtime_unit:robot.native",
-      "label": "robot.native",
-      "owner_epoch": "native.epoch.1",
-      "owner_id": "robot.native",
-      "reason_code": "runtime_unit_converging",
+      "detail": "enabled",
+      "generation": null,
+      "id": "component:robot-a",
+      "label": "robot-a",
+      "owner_epoch": null,
+      "owner_id": "robot-a",
+      "reason_code": null,
       "required": true,
       "required_for": [
-        "Plan / Preview",
         "Execute / Control"
       ],
       "scope": "component",
@@ -311,7 +311,7 @@
   ],
   "maintenance_operation": null,
   "overview_revision": "sha256:0000000000000000000000000000000000000000000000000000000000000001",
-  "profile_label": "manyforge.native_execution_runtime",
+  "profile_label": "manyforge.ros2_control_execution_runtime",
   "readiness": "ready",
   "schema_version": "manyforge.component_overview.v2",
   "summary_label": "Application surfaces ready",

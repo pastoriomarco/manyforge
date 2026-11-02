@@ -38,6 +38,7 @@ ExecuteRequestDTO make_cartesian_request() {
   CartesianPathDTO path;
   path.waypoints = {make_pose(0.0, 0.0, 0.0), make_pose(0.1, 0.0, 0.0),
                     make_pose(0.2, 0.0, 0.0)};
+  path.blend_radii_m = {0.0, 0.0, 0.0};
   request.motion = std::move(path);
   return request;
 }
@@ -364,18 +365,23 @@ TEST(TrajectoryCacheIntentTest, CanonicalModelBindingChangesIdentity) {
   }
 }
 
-TEST(TrajectoryCacheIntentTest, TargetModeReferenceAndProfileChangeIdentity) {
+TEST(TrajectoryCacheIntentTest, TargetModeReferenceAndPlannerChangeIdentity) {
   auto baseline = make_cartesian_request();
   auto relative = baseline;
   relative.target_mode = MotionTargetModeDTO::kRelative;
   relative.target_reference =
       ReferenceDTO(ReferenceDTO::Type::kFrameRole, "fixture");
-  auto balanced = baseline;
-  balanced.planning_profile = PlanningProfileDTO::kBalanced;
+  auto best_of_n = baseline;
+  best_of_n.planner.optimize = PlannerOptimizeDTO::kBestOfN;
+  auto coarse = baseline;
+  coarse.planner.collision_check_step_rad = 0.1;
 
   const auto baseline_identity = trajectory_cache_intent_identity(baseline);
   EXPECT_NE(baseline_identity, trajectory_cache_intent_identity(relative));
-  EXPECT_NE(baseline_identity, trajectory_cache_intent_identity(balanced));
+  EXPECT_NE(baseline_identity, trajectory_cache_intent_identity(best_of_n));
+  EXPECT_NE(baseline_identity, trajectory_cache_intent_identity(coarse));
+  EXPECT_NE(trajectory_cache_intent_identity(best_of_n),
+            trajectory_cache_intent_identity(coarse));
 }
 
 TEST(TrajectoryCacheIntentTest,
@@ -406,16 +412,19 @@ TEST(TrajectoryCacheIntentTest, DynamicsAndCartesianOptionsChangeIdentity) {
           limit});
   auto slower_cartesian = baseline;
   slower_cartesian.speed_profile.max_tcp_linear_speed_mps = 0.05;
-  auto tighter_blend = baseline;
-  std::get<CartesianPathDTO>(tighter_blend.motion).max_blend_deviation_rad =
-      0.005;
+  auto rounded_corner = baseline;
+  std::get<CartesianPathDTO>(rounded_corner.motion).blend_radii_m[1] = 0.005;
+  auto time_optimal = baseline;
+  std::get<CartesianPathDTO>(time_optimal.motion).speed_mode =
+      CartesianSpeedModeDTO::kTimeOptimal;
 
   const auto baseline_identity = trajectory_cache_intent_identity(baseline);
   EXPECT_NE(baseline_identity, trajectory_cache_intent_identity(capped));
   EXPECT_NE(baseline_identity,
             trajectory_cache_intent_identity(slower_cartesian));
   EXPECT_NE(baseline_identity,
-            trajectory_cache_intent_identity(tighter_blend));
+            trajectory_cache_intent_identity(rounded_corner));
+  EXPECT_NE(baseline_identity, trajectory_cache_intent_identity(time_optimal));
 }
 
 TEST(TrajectoryCacheIntentTest,

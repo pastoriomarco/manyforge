@@ -1,19 +1,22 @@
 #include "manyforge_deployment/apply_affected_scope.hpp"
 #include <manyforge_deployment/execution_runtime_contract.hpp>
-#include <manyforge_core/io_provider_lifecycle_catalog.hpp>
 #include <manyforge_deployment/io_signal_catalog.hpp>
+#include <manyforge_deployment/ros2_control_execution_runtime_contract.hpp>
 
 #include "apply_affected_scope_internal.hpp"
-#include "native_execution_runtime_unit_internal.hpp"
 #include <manyforge_deployment/apply_component_delta.hpp>
+#include <manyforge_deployment/component_spec.hpp>
 
 #include <algorithm>
+#include <array>
 #include <map>
 #include <set>
 #include <string>
+#include <string_view>
 #include <type_traits>
 #include <utility>
 #include <variant>
+#include <vector>
 
 namespace manyforge::deployment {
 namespace {
@@ -134,63 +137,82 @@ void MarkComponent(const core::CellGraphDTO &graph,
   }
 }
 
-// DX-753: preserve compiled per-component Apply scope during the multi-unit discussion.
-using NativeComponentConfigurations =
-    std::map<core::ControllableComponentId,
-             execution_runtime_contract::Configuration>;
+// The execution host carries the union of its components' settings: these
+// tables hold one component's rows each (the same tables
+// `component_configuration_projection` selects per component); everything
+// else in its configuration is shared by every hosted component.
+constexpr std::array<std::string_view, 12> kHostComponentRowTables{
+    "controller_profiles", "motion_target_limits", "default_fault_stop_profiles",
+    "gripper_target_configurations", "io_signals", "io_provider_devices",
+    "pose_sources", "ai_models", "component_streams",
+    "lifecycle_command_timeouts", "machines", "sensors"};
 
-struct NativeHostConfigurations final {
-  execution_runtime_contract::Configuration shared;
-  NativeComponentConfigurations components;
+struct HostConfigurations final {
+  core::JsonObjectDTO shared;
+  std::map<core::ControllableComponentId, core::JsonObjectDTO> components;
+  // CONTRACTS §16: a machine owner's members (their identity includes it).
+  std::map<core::ControllableComponentId, std::set<core::ControllableComponentId>>
+      members;
 };
 
-[[nodiscard]] NativeHostConfigurations
-NativeConfigurations(const core::CellGraphDTO &graph,
-                     const core::RuntimeUnitDTO &unit) {
-  // Sealed inputs already passed bundle/schema verification. Decode once per
-  // host, then use the same ownership/coordinate selection as construction
-  // and retained component identity.
-  const auto configuration =
-      detail::decode_native_execution_runtime_configuration(
-          unit.configuration, graph, unit.runtime_unit_id);
-  NativeHostConfigurations result{configuration, {}};
-  result.shared.initial_joint_positions_rad.clear();
-  result.shared.motion_target_limits.clear();
-  result.shared.direct_control_joint_limits.clear();
-  result.shared.gripper_target_configurations.clear();
-  for (const auto &component : graph.controllable_components) {
-    if (std::find(component.runtime_unit_ids.begin(),
-                  component.runtime_unit_ids.end(), unit.runtime_unit_id) !=
-        component.runtime_unit_ids.end()) {
-      result.components.emplace(
-          component.controllable_component_id,
-          detail::select_native_component_configuration(
-              configuration, graph, unit.runtime_unit_id,
-              component.controllable_component_id));
+[[nodiscard]] const std::string *StringMember(const core::JsonObjectDTO &row,
+                                              std::string_view name) {
+  const auto found = row.find(name);
+  return found == row.end() ? nullptr : std::get_if<std::string>(&found->second.value);
+}
+
+[[nodiscard]] HostConfigurations HostConfigurationsOf(const core::RuntimeUnitDTO &unit) {
+  HostConfigurations result{unit.configuration, {}, {}};
+  for (const auto table : kHostComponentRowTables) {
+    const auto found = result.shared.find(table);
+    if (found == result.shared.end()) continue;
+    if (const auto *rows = std::get_if<core::JsonValueDTO::Array>(&found->second.value)) {
+      for (const auto &item : *rows) {
+        const auto *row = std::get_if<core::JsonObjectDTO>(&item.value);
+        const auto *component = row ? StringMember(*row, "controllable_component_id") : nullptr;
+        if (component == nullptr) Fail("execution host row has no component owner");
+        const core::ControllableComponentId id(*component);
+        auto &own = std::get<core::JsonValueDTO::Array>(
+            result.components[id]
+                .try_emplace(std::string(table), core::JsonValueDTO{core::JsonValueDTO::Array{}})
+                .first->second.value);
+        own.push_back(item);
+        if (const auto *owner = StringMember(*row, "owner_component_id"))
+          result.members[core::ControllableComponentId(*owner)].insert(id);
+      }
     }
+    result.shared.erase(found);
   }
   return result;
 }
 
-[[nodiscard]] bool MarkNativeConfigurationChanges(
+/// Marks the hosted components whose own rows differ (and a changed machine
+/// owner's members); returns whether the shared settings changed.
+[[nodiscard]] bool MarkHostConfigurationChanges(
     const core::CellGraphDTO &old_graph, const core::RuntimeUnitDTO &old_unit,
     const core::CellGraphDTO &new_graph, const core::RuntimeUnitDTO &new_unit,
     std::set<core::ResourceId> &resources) {
-  const auto old_configurations = NativeConfigurations(old_graph, old_unit);
-  const auto new_configurations = NativeConfigurations(new_graph, new_unit);
-  for (const auto &[component, configuration] : old_configurations.components) {
-    const auto found = new_configurations.components.find(component);
-    if (found == new_configurations.components.end() ||
-        found->second != configuration) {
-      MarkComponent(old_graph, component, resources);
-      MarkComponent(new_graph, component, resources);
-    }
-  }
-  for (const auto &[component, configuration] : new_configurations.components) {
-    static_cast<void>(configuration);
-    if (!old_configurations.components.contains(component)) {
-      MarkComponent(new_graph, component, resources);
-    }
+  const auto old_configurations = HostConfigurationsOf(old_unit);
+  const auto new_configurations = HostConfigurationsOf(new_unit);
+  const auto mark = [&](const core::ControllableComponentId &component) {
+    MarkComponent(old_graph, component, resources);
+    MarkComponent(new_graph, component, resources);
+  };
+  std::set<core::ControllableComponentId> ids;
+  for (const auto *configurations : {&old_configurations, &new_configurations})
+    for (const auto &[component, rows] : configurations->components) ids.insert(component);
+  for (const auto &component : ids) {
+    const auto old_rows = old_configurations.components.find(component);
+    const auto new_rows = new_configurations.components.find(component);
+    if (old_rows != old_configurations.components.end() &&
+        new_rows != new_configurations.components.end() &&
+        old_rows->second == new_rows->second)
+      continue;
+    mark(component);
+    for (const auto *configurations : {&old_configurations, &new_configurations})
+      if (const auto members = configurations->members.find(component);
+          members != configurations->members.end())
+        for (const auto &member : members->second) mark(member);
   }
   return old_configurations.shared != new_configurations.shared;
 }
@@ -352,9 +374,9 @@ ProviderSources(const core::RetainedBundleDTO &bundle) {
     // CP9 pose sources and AI models: members are stream ids, no I/O signal
     // or output.
     if (provider->provider_manifest_id.value() ==
-            core::kPoseSourceLifecycleManifestId ||
+            kPoseSourceProviderManifestId ||
         provider->provider_manifest_id.value() ==
-            core::kAiModelLifecycleManifestId) {
+            kAiModelProviderManifestId) {
       result.emplace(domain.control_domain_id, std::move(source));
       continue;
     }
@@ -424,7 +446,9 @@ derive_apply_configuration_fence_scope_verified_values(
     const std::span<const core::ControllableComponentId>
         actual_restart_components,
     const std::span<const core::RetainedBundleDTO *const>
-        actual_terminal_products) {
+        actual_terminal_products,
+    const std::span<const core::ControllableComponentId>
+        construction_override_changes) {
   if (old_bundle.cell_graph.cell_id != new_bundle.cell_graph.cell_id) {
     Fail("Apply affected-scope bundles belong to different cells");
   }
@@ -549,33 +573,34 @@ derive_apply_configuration_fence_scope_verified_values(
           [](const core::RuntimeUnitDTO &runtime_unit) {
             return runtime_unit.runtime_unit_id;
           });
-  std::set<core::RuntimeUnitId> stable_native_hosts;
+  // A stable execution host (same profile and dependencies) fences only the
+  // components whose own settings changed; its shared settings, products and
+  // whole-unit changes keep the ordinary dependency closure.
+  std::set<core::RuntimeUnitId> stable_execution_hosts;
   const auto new_runtime_units = IndexBy<core::RuntimeUnitDTO, core::RuntimeUnitId>(
       new_graph.runtime_units,
       [](const auto &unit) { return unit.runtime_unit_id; });
   for (const auto &old_unit : old_graph.runtime_units) {
     const auto found = new_runtime_units.find(old_unit.runtime_unit_id);
     if (old_unit.runtime_profile_id.value() !=
-            native_execution_runtime_contract::kRuntimeProfileId ||
-        found == new_runtime_units.end()) {
+            ros2_control_execution_runtime_contract::kRuntimeProfileId ||
+        found == new_runtime_units.end())
       continue;
-    }
     const auto &new_unit = *found->second;
     if (old_unit.runtime_profile_id != new_unit.runtime_profile_id ||
         old_unit.runtime_profile_revision != new_unit.runtime_profile_revision ||
-        old_unit.dependency_runtime_unit_ids != new_unit.dependency_runtime_unit_ids) {
+        old_unit.dependency_runtime_unit_ids != new_unit.dependency_runtime_unit_ids)
       continue;
-    }
-    // A stable native host carries the union of controller settings. Only
-    // changed owners are affected by that union; shared settings remain in
-    // every selected configuration. Infrastructure products are handled below.
-    stable_native_hosts.insert(old_unit.runtime_unit_id);
-    if (!MarkNativeConfigurationChanges(old_graph, old_unit, new_graph, new_unit,
-                                        affected_resources)) {
+    stable_execution_hosts.insert(old_unit.runtime_unit_id);
+    if (!MarkHostConfigurationChanges(old_graph, old_unit, new_graph, new_unit,
+                                      affected_resources))
       affected_runtime_units.erase(old_unit.runtime_unit_id);
-    }
-    // Shared settings also affect runtime/domain/provider consumers of the
-    // host; retain ordinary dependency closure for those changes.
+  }
+  // N17 R4: an own construction override is spec `adapter` data, so its
+  // edit replaces that component (outside the host configuration rows).
+  for (const auto &component : construction_override_changes) {
+    MarkComponent(old_graph, component, affected_resources);
+    MarkComponent(new_graph, component, affected_resources);
   }
   const auto changed_runtime_products =
       ChangedIds<core::RetainedRuntimeUnitProductsDTO, core::RuntimeUnitId>(
@@ -593,14 +618,10 @@ derive_apply_configuration_fence_scope_verified_values(
           [](const core::RetainedRuntimeContractRequirementDTO &requirement) {
             return requirement.runtime_unit_id;
           });
-  for (const auto &unit : changed_runtime_contracts) {
-    // Native requirements are the verified aggregate of the installed
-    // bindings/providers, whose own changes are already included above.
-    // Generic runtimes retain whole-unit dependency closure.
-    if (!stable_native_hosts.contains(unit)) {
-      affected_runtime_units.insert(unit);
-    }
-  }
+  // The host's requirement is the union of its components' bindings and
+  // providers, whose own changes are already marked above.
+  for (const auto &unit : changed_runtime_contracts)
+    if (!stable_execution_hosts.contains(unit)) affected_runtime_units.insert(unit);
   ExpandRuntimeDependents(old_graph, affected_runtime_units);
   ExpandRuntimeDependents(new_graph, affected_runtime_units);
   MarkRuntimeUnitDependents(old_bundle, affected_runtime_units,
@@ -892,9 +913,18 @@ core::ConfigurationFenceScopeDTO derive_apply_configuration_fence_scope(
            "byte identity proof");
     sources.push_back(&product->value());
   }
+  std::set<core::ControllableComponentId> components;
+  for (const auto *bundle : {&predecessor, &candidate})
+    for (const auto &component : bundle->value().cell_graph.controllable_components)
+      components.insert(component.controllable_component_id);
+  std::vector<core::ControllableComponentId> override_changes;
+  for (const auto &component : components)
+    if (construction_stream_overrides(predecessor, component) !=
+        construction_stream_overrides(candidate, component))
+      override_changes.push_back(component);
   return detail::derive_apply_configuration_fence_scope_verified_values(
       predecessor.value(), candidate.value(), actual_restart_components,
-      sources);
+      sources, override_changes);
 }
 
 } // namespace manyforge::deployment

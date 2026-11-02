@@ -1,6 +1,8 @@
 #pragma once
 
 #include <manyforge_core/types/geometry.hpp>
+#include <manyforge_core/types/planner_settings.hpp>
+#include <manyforge_core/types/robot_defaults.generated.hpp>
 #include <manyforge_core/types/strong_id.hpp>
 #include <optional>
 #include <string>
@@ -16,14 +18,6 @@ namespace manyforge::core {
 enum class MotionTargetModeDTO {
   kAbsolute,
   kRelative,
-};
-
-/// Planner-neutral candidate-selection policy. Adapters map these semantics to
-/// native algorithms; requests never expose backend-specific flags.
-enum class PlanningProfileDTO {
-  kFirstFeasible,
-  kBalanced,
-  kQualityBounded,
 };
 
 /// Joint goal for motion planning (spec §4.1)
@@ -165,10 +159,52 @@ struct ReferenceDTO {
 }
 
 /// Cartesian path goal (spec §4.5)
+/// Cartesian timing (Program `cartesian_timing`, Deployment default).
 enum class CartesianSpeedModeDTO {
-  /// Bound Cartesian linear/angular speed and acceleration while tracing.
-  kBounded,
+  /// RoboPlan Bounded: accelerate, hold the TCP speed limit, decelerate per
+  /// smooth run; stops at corners sharper than its corner tolerance.
+  kConstantSpeed,
+  /// RoboPlan TimeOptimal: TOPP-RA within the joint limits, the TCP speed
+  /// limit held on its grid (RP-3).
+  kTimeOptimal,
 };
+
+[[nodiscard]] inline std::string_view cartesian_speed_mode_name(
+    CartesianSpeedModeDTO mode) noexcept {
+  return mode == CartesianSpeedModeDTO::kTimeOptimal ? "time_optimal" : "constant_speed";
+}
+
+[[nodiscard]] inline constexpr std::optional<CartesianSpeedModeDTO> parse_cartesian_speed_mode(
+    std::string_view name) noexcept {
+  if (name == "constant_speed") return CartesianSpeedModeDTO::kConstantSpeed;
+  if (name == "time_optimal") return CartesianSpeedModeDTO::kTimeOptimal;
+  return std::nullopt;
+}
+
+/// The Deployment `cartesian_timing` default (manyforge_core/resources/robot_defaults.tsv).
+inline constexpr CartesianSpeedModeDTO kDefaultCartesianTiming =
+    parse_cartesian_speed_mode(kDefaultCartesianTimingName).value();
+
+/// Joint-space timing of joint and pose goals (Deployment `motion_timing`
+/// per robot, N12 / RP-3b). Cartesian paths follow `cartesian_timing`.
+enum class MotionTimingDTO {
+  /// TOPP-RA within the joint limits, then one uniform stretch until the
+  /// active TCP stays at 0.98 of its speed limit at the samples (M8).
+  kSmooth,
+  /// RP-3: the TCP speed limit held at 0.98 inside TOPP-RA on its grid.
+  kFast,
+};
+
+[[nodiscard]] inline constexpr std::optional<MotionTimingDTO> parse_motion_timing(
+    std::string_view name) noexcept {
+  if (name == "smooth") return MotionTimingDTO::kSmooth;
+  if (name == "fast") return MotionTimingDTO::kFast;
+  return std::nullopt;
+}
+
+/// The Deployment `motion_timing` default (manyforge_core/resources/robot_defaults.tsv).
+inline constexpr MotionTimingDTO kDefaultMotionTiming =
+    parse_motion_timing(kDefaultMotionTimingName).value();
 
 enum class CartesianFallbackPolicyDTO {
   /// The selected backend must implement the full Cartesian-path contract.
@@ -183,14 +219,18 @@ struct CartesianPathDTO {
   std::vector<Pose3DTO> waypoints;  // each expressed in base_frame
   double max_translation_step_m = 0.005;
   double max_rotation_step_rad = 0.05;
-  CartesianSpeedModeDTO speed_mode = CartesianSpeedModeDTO::kBounded;
+  /// Absent: the Deployment's `cartesian_timing`.
+  std::optional<CartesianSpeedModeDTO> speed_mode{};
   double max_angular_speed_rad_s = 0.5;
   double max_linear_acceleration_mps2 = 0.5;
   double max_angular_acceleration_rad_s2 = 2.5;
   CartesianFallbackPolicyDTO fallback_policy = CartesianFallbackPolicyDTO::kFailClosed;
-  /// Maximum joint-path corner deviation admitted while smoothing the
-  /// Cartesian tracker output. Zero preserves the unsmoothed polyline.
-  double max_blend_deviation_rad = 0.01;
+  /// Corner blend radius (m) per waypoint, empty (every corner exact) or one
+  /// entry per waypoint: the corner
+  /// at an interior waypoint is rounded by an arc starting and ending this far
+  /// from it (clamped to half of each adjacent segment). 0 keeps the exact
+  /// corner. The first and last entries are unused.
+  std::vector<double> blend_radii_m{};
   friend bool operator==(const CartesianPathDTO&, const CartesianPathDTO&) = default;
 };
 

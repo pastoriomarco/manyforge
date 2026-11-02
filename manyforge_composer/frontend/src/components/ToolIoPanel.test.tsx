@@ -12,24 +12,30 @@ import {
   type SystemSignalProjection,
 } from '../api/parsers/ioSignals';
 import type { ProgramBindingDocument } from '../types/api';
+import type { CellState, ComponentState, SignalSample } from '../types/components';
 import { reactPropsHost } from '../test/reactPropsHost';
-import { acknowledgedUncertainOutputs, uncertainOutputs } from '../utils/uncertainOutputs';
+import type { HeadlessStateSource } from '../hooks/useHeadlessState';
 import {
   ToolIoPanel,
   ToolIoPanelView,
-  toolIoSignalKey,
+  motionExecuting,
+  type OutputWriteState,
+  type ToolIoPanelViewProps,
   type ToolIoSignal,
+  toolIoSignalKey,
 } from './ToolIoPanel';
 
 const api = vi.hoisted(() => ({
   readIoSignal: vi.fn(),
   setMockIoInput: vi.fn(),
+  setOutput: vi.fn(),
   getWorkspace: vi.fn(),
 }));
 
 vi.mock('../api/client', () => ({
   api: {
     execution: { readIoSignal: api.readIoSignal, setMockIoInput: api.setMockIoInput },
+    io: { setOutput: api.setOutput },
     deploymentWorkspace: { get: api.getWorkspace },
   },
 }));
@@ -55,6 +61,13 @@ function signal(patch: Partial<ToolIoSignal> = {}): ToolIoSignal {
   };
 }
 
+const valve = signal({ resourceRoleId: 'valve', signalName: 'valve', direction: 'output',
+  declared: { profile: 'ros_bool', sourceId: 'valve_src', topic: '/valve', liveness: 'periodic' } });
+
+function sample(signalId: string, patch: Partial<SignalSample> = {}): SignalSample {
+  return { signal_id: signalId, value: true, source: 'device', age_ns: 12_000_000, fresh: true, ...patch };
+}
+
 function receipt(patch: Partial<MockIoInputReceipt> = {}): MockIoInputReceipt {
   return {
     reading: reading({ value: true }), modelValue: true,
@@ -63,23 +76,15 @@ function receipt(patch: Partial<MockIoInputReceipt> = {}): MockIoInputReceipt {
   };
 }
 
-function view(
-  signals: ToolIoSignal[],
-  readings: Array<IoSignalReading | null>,
-  extra: Array<Partial<{ receipt: MockIoInputReceipt; lastSourceEpoch: string }>> = [],
-) {
+function view(patch: Partial<ToolIoPanelViewProps> = {}) {
   return renderToStaticMarkup(
-    <ToolIoPanelView
-      unavailableReason={null}
-      signals={signals}
-      states={Object.fromEntries(signals.map((item, index) => [
-        toolIoSignalKey(item), { reading: readings[index], error: null, sending: false, ...extra[index] },
-      ]))}
-      sourcesNotice={null}
-      onSetMock={() => undefined}
-    />,
+    <ToolIoPanelView unavailableReason={null} signals={[]} samples={new Map()} latched={false}
+      writes={{}} mocks={{}} sourcesNotice={null}
+      onSetOutput={() => undefined} onSetMock={() => undefined} {...patch} />,
   );
 }
+
+const samplesOf = (...rows: SignalSample[]) => new Map(rows.map((row) => [row.signal_id, row]));
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -93,144 +98,128 @@ describe('ToolIoPanelView', () => {
       signalName: 'carried_object_lost.gripper', sourceKind: 'system_carried_object',
       direction: 'input', valueType: 'bool', level: true,
     };
-    const html = renderToStaticMarkup(
-      <ToolIoPanelView unavailableReason={null} signals={[]} systemSignals={[systemSignal]} states={{}}
-        sourcesNotice={null} onSetMock={() => undefined} />,
-    );
+    const html = view({ systemSignals: [systemSignal] });
     expect(html).toContain('aria-label="System signals"');
     expect(html).toContain('data-system-signal="carried_object_lost.gripper"');
-    expect(html).toContain('data-system-source-kind="system_carried_object"');
     expect(html).toContain('data-system-signal-level="true">true</strong>');
-    expect(html).toContain('<small>Level</small>');
     expect(html).toContain('gripper · input · system');
-    expect(html).toContain('Read only');
     expect(html).not.toContain('<button');
-    expect(html).not.toContain('Setting a Mock input simulates');
   });
 
-  it('hides retained bound and system rows when the panel is unavailable', () => {
-    const bound = signal();
-    const systemSignal: SystemSignalProjection = {
-      controllableComponentId: 'robot', commandTargetId: 'gripper',
-      signalName: 'carried_object_lost.gripper', sourceKind: 'system_carried_object',
-      direction: 'input', valueType: 'bool', level: true,
-    };
-    const html = renderToStaticMarkup(
-      <ToolIoPanelView unavailableReason="Tool and I/O signals require the configured headless runtime."
-        signals={[bound]} systemSignals={[systemSignal]}
-        states={{ [toolIoSignalKey(bound)]: { reading: reading(), error: null, sending: false } }}
-        sourcesNotice={null} onSetMock={() => undefined} />,
-    );
+  it('hides bound and system rows when the panel is unavailable', () => {
+    const html = view({ unavailableReason: 'Tool and I/O signals require the configured headless runtime.',
+      signals: [signal()] });
     expect(html).toContain('Tool and I/O signals require the configured headless runtime.');
     expect(html).not.toContain('data-io-signal=');
-    expect(html).not.toContain('data-system-signal=');
     expect(html).not.toContain('<button');
   });
 
-  it('shows a fresh Mock reading with an enabled explicit toggle', () => {
-    const html = view([signal()], [reading()]);
-    expect(html).toContain('data-io-quality="fresh"');
-    expect(html).toContain('status-pill status-pill-connected');
-    expect(html).toContain('12 ms');
-    expect(html).toContain('Mock · station_mock');
-    expect(html).not.toContain('Auto-answer');
-    expect(html).toMatch(/<button type="button" aria-label="Set part_present false">/);
+  it('shows each pushed sample with its value, source and age', () => {
+    const html = view({
+      signals: [signal(), valve],
+      samples: samplesOf(sample('station/part_present', { value: false, source: 'device', age_ns: 12_000_000 }),
+        sample('station/valve', { source: 'outside', age_ns: 2_500_000_000 })),
+    });
+    expect(html).toContain('data-io-signal="part_present" data-io-fresh="true"');
+    expect(html).toContain('data-io-value="true">off');
+    expect(html).toContain('data-io-source="device">device');
+    expect(html).toContain('data-io-age="true">12 ms');
+    expect(html).toContain('data-io-source="outside"><span class="status-pill status-pill-danger">outside');
+    expect(html).toContain('data-io-age="true">2.5 s');
+    expect(html).toContain('Declared source: ROS Bool topic · valve_src · /valve');
   });
 
-  it.each(['stale', 'unavailable', 'missing', 'invalid'] as const)(
-    'never presents a %s reading as current', (quality) => {
-      const html = view([signal()], [reading({
-        quality, value: quality === 'stale' ? false : null, receiptAgeNs: null,
-        ...(quality === 'unavailable' ? { sourceEpoch: null } : {}),
-      })]);
-      expect(html).toContain(`data-io-quality="${quality}"`);
-      expect(html).toContain('status-pill status-pill-danger');
-      expect(html).toContain(quality === 'stale' ? 'false (last reported)' : '>—<');
-      if (quality === 'unavailable') expect(html).toContain('disabled=""');
-    },
-  );
-
-  it('distinguishes a delivered toggle, a kept model on a Disabled source and a delivery failure', () => {
-    const unavailable = reading({ quality: 'unavailable', value: null, sourceEpoch: null, sourceSequence: null, receiptAgeNs: null });
-    const delivered = view([signal()], [reading({ value: true })], [{ receipt: receipt() }]);
-    expect(delivered).toContain('data-io-receipt="delivered"');
-    expect(delivered).toContain('Model set to true; delivered as record 10 of station_mock.');
-
-    const disabled = view([signal()], [unavailable], [{
-      receipt: receipt({ reading: unavailable, publishedCursor: null }), lastSourceEpoch: '3',
-    }]);
-    expect(disabled).toContain('data-io-receipt="not_delivered"');
-    expect(disabled).toContain('inline-message severity-info');
-    expect(disabled).not.toContain('role="alert"');
-    expect(disabled).toContain('data-io-quality="unavailable"');
-    // The accepted model is the current value: the next toggle is the opposite, still allowed.
-    expect(disabled).toMatch(/<button type="button" aria-label="Set part_present false">/);
-
-    const failed = view([signal()], [unavailable], [{
-      receipt: receipt({ reading: unavailable, publishedCursor: null,
-        publicationError: { code: 'io_ingress_full', message: 'ingress full' } }),
-      lastSourceEpoch: '3',
-    }]);
-    expect(failed).toContain('data-io-receipt="publication_error"');
-    expect(failed).toContain('inline-message severity-warning');
-    expect(failed).toContain('io_ingress_full: ingress full');
-    expect(failed).not.toContain('role="alert"');
+  it('marks a stale sample, a last write and a missing sample', () => {
+    const stale = view({ signals: [valve], samples: samplesOf(sample('station/valve', { fresh: false, source: 'last_write' })) });
+    expect(stale).toContain('on (stale)');
+    expect(stale).toContain('last write');
+    expect(view({ signals: [valve] })).toContain('no sample');
+    expect(view({ signals: [valve], samples: null })).toContain('unavailable');
   });
 
-  it('disables the toggle for a real source and shows outputs as not implemented', () => {
-    const ros = signal({
-      resourceRoleId: 'door', signalName: 'door',
-      declared: { profile: 'ros_bool', sourceId: 'door_topic', topic: '/cell/door', liveness: 'periodic' },
-    });
-    const valve = signal({ resourceRoleId: 'valve', signalName: 'valve', direction: 'output' });
-    const mock = signal({ resourceRoleId: 'manual', signalName: 'manual' });
-    const html = view([ros, valve, mock], [reading({ sourceId: 'door_topic', liveness: { mode: 'periodic', warning: null } }), null, reading()]);
-    expect(html).toContain('ROS Bool topic · door_topic · /cell/door');
-    expect(html).toMatch(/disabled="" title="Only Mock inputs can be set; this is a real source."/);
-    expect(html).toContain('Output: not implemented');
-    // The retired Mock auto-answer (contracts 132/133) is no longer shown.
-    expect(html).not.toContain('Auto-answer');
-    expect(html).toContain('data-io-liveness="periodic"');
-    expect(html).not.toContain('Liveness unproven');
+  it('nests the changed outside mark under its output', () => {
+    const changed = view({ signals: [valve], samples: samplesOf(sample('station/valve'),
+      sample('station/valve.changed_outside', { value: true, source: 'device' })) });
+    expect(changed).toContain('data-io-changed-outside="true"');
+    expect(changed).toContain('→ changed outside');
+    expect(changed).toContain('changed outside ManyForge');
+    const clear = view({ signals: [valve], samples: samplesOf(sample('station/valve'),
+      sample('station/valve.changed_outside', { value: false })) });
+    expect(clear).toContain('data-io-changed-outside="false"');
+    expect(clear).toContain('no outside change');
+    expect(view({ signals: [valve], samples: samplesOf(sample('station/valve')) })).not.toContain('changed outside');
   });
 
-  it('shows geometric contact as a periodic read-only input', () => {
-    const contact = signal({
-      resourceRoleId: 'part_contact', signalName: 'part_contact',
-      declared: {
-        profile: 'geometric_contact', sourceId: 'part_contact_geometry', topic: null,
-        liveness: 'periodic',
-      },
-    });
-    const html = view([contact], [reading({
-      signalName: 'part_contact', sourceId: 'part_contact_geometry', value: false,
-      liveness: { mode: 'periodic', warning: null },
-    })]);
-    expect(html).toContain('Geometric contact · part_contact_geometry');
-    expect(html).toContain('data-io-liveness="periodic"');
-    expect(html).toMatch(/disabled="" title="Only Mock inputs can be set; this is a real source."/);
+  it('offers output writes, disabled during a latch with the reason', () => {
+    const open = view({ signals: [valve], samples: samplesOf(sample('station/valve')) });
+    expect(open).toContain('aria-label="Write valve on"');
+    expect(open).toContain('aria-label="Write valve off"');
+    expect(open).not.toContain('disabled=""');
+    const latched = view({ signals: [valve], samples: samplesOf(sample('station/valve')), latched: true });
+    expect(latched).toMatch(/disabled="" title="Cell latched: a component needs attention" aria-label="Write valve on"/);
+    expect(latched).toContain('Outputs: Cell latched: a component needs attention');
   });
 
-  it('shows the owner-projected liveness and a change-only warning (SX-2194)', () => {
-    const door = signal({
-      resourceRoleId: 'door', signalName: 'door',
-      declared: { profile: 'ros_bool', sourceId: 'door_topic', topic: '/cell/door', liveness: 'periodic' },
+  it('disables output writes only while motion executes (§7)', () => {
+    const executing = view({ signals: [valve], samples: samplesOf(sample('station/valve')), motionExecuting: true });
+    expect(executing).toMatch(/disabled="" title="Motion is executing[^"]*" aria-label="Write valve on"/);
+    expect(executing).toContain('Outputs: Motion is executing');
+    const arms = new Set(['robot', 'gripper']);
+    const state = (component_id: string, activity: 'busy' | 'idle') =>
+      ({ component_id, activity }) as ComponentState;
+    expect(motionExecuting([state('robot', 'idle'), state('gripper', 'busy')], arms)).toBe(true);
+    expect(motionExecuting([state('robot', 'idle')], arms)).toBe(false);
+    // An I/O component's own write, a sensor or an owner being busy is no motion.
+    expect(motionExecuting([state('station_io', 'busy'), state('lite6', 'busy')], arms)).toBe(false);
+    expect(motionExecuting(null, arms)).toBe(false);
+  });
+
+  it('shows a controller-owned output read-only', () => {
+    const html = view({ signals: [valve], samples: samplesOf(sample('station/valve', { controller_owned: true })) });
+    expect(html).toContain('data-io-controller-owned');
+    expect(html).not.toContain('Write valve');
+  });
+
+  it('shows the write outcome: accepted, unknown, failed or refused', () => {
+    const key = toolIoSignalKey(valve);
+    const outcome = (write: OutputWriteState) => view({ signals: [valve], writes: { [key]: write } });
+    expect(outcome({ value: true, sending: false, result: { outcome: 'succeeded' }, error: null }))
+      .toContain('Written: on.');
+    expect(outcome({ value: false, sending: false, result: { outcome: 'unknown' }, error: null }))
+      .toContain('Write off: no response, the outcome is unknown. It is not resent.');
+    expect(outcome({ value: true, sending: false, error: null,
+      result: { outcome: 'failed', error: { code: 'not_a_catalog_code', message: 'refused by the device' } } }))
+      .toContain('Write on failed: refused by the device');
+    expect(outcome({ value: true, sending: false, result: null, error: 'Cell latched' }))
+      .toContain('data-io-write="refused">Cell latched');
+    expect(outcome({ value: true, sending: true, result: null, error: null }))
+      .toMatch(/disabled="" title="A write is in flight."/);
+  });
+
+  it('offers the Mock toggle for Mock inputs only, with its receipt', () => {
+    const real = signal({ resourceRoleId: 'door', signalName: 'door',
+      declared: { profile: 'ros_bool', sourceId: 'door_src', topic: '/door', liveness: 'periodic' } });
+    const html = view({
+      signals: [signal(), real],
+      samples: samplesOf(sample('station/part_present', { value: true })),
+      mocks: { [toolIoSignalKey(signal())]: { sending: false, error: null,
+        receipt: receipt({ publishedCursor: null }) } },
     });
-    // The owner's descriptor projection wins over the Draft declaration.
-    const html = view([door], [reading({ liveness: { mode: 'change_only', warning: 'liveness_unproven' } })]);
-    expect(html).toContain('data-io-liveness="change_only"');
-    expect(html).toContain('Liveness unproven');
-    expect(html).toContain('cannot prove it is alive between changes');
-    // Before the first reading the declared mode shows.
-    const gpio = signal({
-      resourceRoleId: 'grip', signalName: 'grip',
-      declared: { profile: 'ros2_control_gpio', sourceId: 'gpio', topic: '/gpio', liveness: 'periodic' },
-    });
-    const pending = view([gpio], [null]);
-    expect(pending).toContain('data-io-liveness="periodic"');
-    expect(pending).toContain('Freshness depends on the driver reporting read errors');
+    expect(html).toContain('aria-label="Set part_present false"');
+    expect(html).not.toContain('aria-label="Set door');
+    expect(html).toContain('data-io-receipt="not_delivered"');
   });
 });
+
+function cellSource(state: CellState) {
+  return {
+    subscribeGlobalRules: () => () => undefined,
+    getGlobalRules: () => null,
+    getGlobalRulesCurrent: () => true,
+    subscribeCellState: () => () => undefined,
+    getCellState: () => state,
+  } as unknown as HeadlessStateSource;
+}
 
 describe('ToolIoPanel', () => {
   const binding = {
@@ -241,126 +230,89 @@ describe('ToolIoPanel', () => {
       signal_role_bindings: [
         { resource_role_id: 'part_present', signal_name: 'part_present', value_type: 'bool',
           direction: 'input', transition_capability: 'sampled_only', signal_descriptor_digest: REVISION },
-        { resource_role_id: 'door', signal_name: 'door', value_type: 'bool',
-          direction: 'input', transition_capability: 'sampled_only', signal_descriptor_digest: REVISION },
+        { resource_role_id: 'valve', signal_name: 'valve', value_type: 'bool',
+          direction: 'output', transition_capability: 'sampled_only', signal_descriptor_digest: REVISION },
       ],
     }],
   } as unknown as ProgramBindingDocument;
-  const row = (resource: string, provider: Record<string, unknown>, extra: Record<string, unknown>) => ({
+  const row = (resource: string, direction: string, provider: Record<string, unknown>, extra: Record<string, unknown>) => ({
     controllable_component_id: 'station', command_target_id: 'io', resource_role_id: resource,
-    signal_name: resource, source_id: `${resource}_source`, value_type: 'bool', direction: 'input',
+    signal_name: resource, source_id: `${resource}_source`, value_type: 'bool', direction,
     transition_capability: 'sampled_only', provider, ...extra,
   });
+  const cell: CellState = {
+    components: null, readiness: null, latch: { latched: false, causes: [] },
+    io: [sample('station/part_present', { value: false }), sample('station/valve', { value: false })],
+  };
 
-  it('does not query generated system signals as bound I/O inputs', async () => {
-    api.getWorkspace.mockResolvedValue({
-      draft: { deploymentRevision: null, document: null },
-      managerApplied: { deploymentRevision: REVISION },
-      binding: null,
-    });
-    const { host } = reactPropsHost();
-    const { createRoot } = await import('react-dom/client');
-    const root = createRoot(host as unknown as Element);
-    try {
-      await act(async () => {
-        root.render(<ToolIoPanel enabled ownerEpoch="owner.1" retainedBundleId="bundle.1"
-          systemSignals={[{
-            controllableComponentId: 'robot', commandTargetId: 'gripper',
-            signalName: 'carried_object_lost.gripper', sourceKind: 'system_carried_object',
-            direction: 'input', valueType: 'bool', level: true,
-          }]} pollIntervalMs={60_000} />);
-      });
-      await act(async () => { await Promise.resolve(); });
-      expect(api.readIoSignal).not.toHaveBeenCalled();
-      expect(api.setMockIoInput).not.toHaveBeenCalled();
-    } finally {
-      await act(() => root.unmount());
-    }
-  });
-
-  it('polls only the bound inputs and sets the Mock input to the explicit opposite value', async () => {
+  async function mount(state: CellState) {
     api.getWorkspace.mockResolvedValue({
       draft: {
         deploymentRevision: REVISION,
         document: { graph: { runtime_units: [{ configuration: { io_signals: [
-          row('part_present', { profile: 'mock' }, { update_mode: 'change_only', freshness: { mode: 'provider_validity' } }),
-          row('door', { profile: 'ros_bool', topic: '/door' }, {
-            update_mode: 'sampled', freshness: { mode: 'sample_age', maximum_age_ns: 1_000_000 } }),
+          row('part_present', 'input', { profile: 'mock' }, { update_mode: 'change_only', freshness: { mode: 'provider_validity' } }),
+          row('valve', 'output', { profile: 'ros_bool', topic: '/valve' }, {}),
         ] } }] } },
       },
       managerApplied: { deploymentRevision: REVISION },
       binding,
     });
-    api.readIoSignal.mockImplementation(async (selector: { resourceRoleId: string }) => reading({
-      signalName: selector.resourceRoleId, value: false,
-    }));
-    api.setMockIoInput.mockResolvedValue(receipt({
-      reading: reading({ quality: 'unavailable', value: null, sourceEpoch: null, sourceSequence: null, receiptAgeNs: null }),
-      publishedCursor: null,
-    }));
     const { host, find } = reactPropsHost();
     const { createRoot } = await import('react-dom/client');
     const root = createRoot(host as unknown as Element);
+    await act(async () => {
+      root.render(<ToolIoPanel enabled ownerEpoch="owner.1" retainedBundleId="bundle.1"
+        controlSource={cellSource(state)} />);
+    });
+    await act(async () => { await Promise.resolve(); });
+    return { root, find };
+  }
+
+  it('reads nothing on its own and writes an output once', async () => {
+    api.setOutput.mockResolvedValue({ outcome: 'unknown' });
+    const { root, find } = await mount(cell);
     try {
-      await act(async () => {
-        root.render(<ToolIoPanel enabled ownerEpoch="owner.1" retainedBundleId="bundle.1"
-          pollIntervalMs={60_000} />);
-      });
-      await act(async () => { await Promise.resolve(); });
-      expect(api.readIoSignal).toHaveBeenCalledTimes(2);
-      expect(api.readIoSignal).toHaveBeenCalledWith({
-        ownerEpoch: 'owner.1', programBindingId: BINDING_ID, targetRoleId: 'station', resourceRoleId: 'part_present',
-      }, expect.anything());
-      const door = find((props) => props['aria-label'] === 'Set door true');
-      expect(door.disabled).toBe(true);
-      const mock = find((props) => props['aria-label'] === 'Set part_present true');
-      expect(mock.disabled).toBe(false);
-      await act(async () => { mock.onClick?.(); });
+      expect(api.readIoSignal).not.toHaveBeenCalled();
+      const write = find((props) => props['aria-label'] === 'Write valve on');
+      expect(write.disabled).toBe(false);
+      await act(async () => { write.onClick?.(); });
+      expect(api.setOutput).toHaveBeenCalledExactlyOnceWith('station/valve', true);
+      expect(find((props) => props['data-io-write'] === 'unknown')).toBeTruthy();
+    } finally {
+      await act(() => root.unmount());
+    }
+  });
+
+  it('disables writes while the cell is latched', async () => {
+    const { root, find } = await mount({ ...cell, latch: { latched: true, causes: [] } });
+    try {
+      expect(find((props) => props['aria-label'] === 'Write valve on').disabled).toBe(true);
+    } finally {
+      await act(() => root.unmount());
+    }
+  });
+
+  it('sets a Mock input with the source epoch it reads just before', async () => {
+    api.readIoSignal.mockResolvedValue(reading({ value: false }));
+    api.setMockIoInput.mockResolvedValue(receipt());
+    const { root, find } = await mount(cell);
+    try {
+      await act(async () => { find((props) => props['aria-label'] === 'Set part_present true').onClick?.(); });
       expect(api.setMockIoInput).toHaveBeenCalledExactlyOnceWith({
         ownerEpoch: 'owner.1', programBindingId: BINDING_ID, targetRoleId: 'station', resourceRoleId: 'part_present',
       }, '3', true);
-      // A Disabled source: the model is accepted, no failure, and the next
-      // toggle still uses the last reported epoch.
-      expect(find((props) => props['data-io-receipt'] === 'not_delivered')).toBeTruthy();
-      const again = find((props) => props['aria-label'] === 'Set part_present false');
-      expect(again.disabled).toBe(false);
-      await act(async () => { again.onClick?.(); });
-      expect(api.setMockIoInput).toHaveBeenLastCalledWith(expect.anything(), '3', false);
+      expect(find((props) => props['data-io-receipt'] === 'delivered')).toBeTruthy();
     } finally {
       await act(() => root.unmount());
     }
   });
 
-  it('reads the owner projection rows and does not simulate when the Draft differs from Applied', async () => {
-    api.getWorkspace.mockResolvedValue({
-      draft: { deploymentRevision: null, document: null },
-      managerApplied: { deploymentRevision: REVISION },
-      binding: null,
-    });
-    api.readIoSignal.mockResolvedValue(reading({ value: false }));
-    const { host, find } = reactPropsHost();
-    const { createRoot } = await import('react-dom/client');
-    const root = createRoot(host as unknown as Element);
-    try {
-      await act(async () => {
-        root.render(<ToolIoPanel enabled ownerEpoch="owner.1" retainedBundleId="bundle.1"
-          ioSignalBindings={ioSignalBindingsFromProgramBinding(binding)} pollIntervalMs={60_000} />);
-      });
-      await act(async () => { await Promise.resolve(); });
-      expect(api.readIoSignal).toHaveBeenCalledTimes(2);
-      expect(find((props) => props['aria-label'] === 'Set part_present true').disabled).toBe(true);
-      expect(api.setMockIoInput).not.toHaveBeenCalled();
-    } finally {
-      await act(() => root.unmount());
-    }
-  });
-
-  it('shows why nothing is read before the owner or a bound signal exists', () => {
+  it('shows why nothing is shown before the owner or a bound signal exists', () => {
     expect(renderToStaticMarkup(<ToolIoPanel enabled ownerEpoch={null} retainedBundleId="bundle.1" />))
       .toContain('Waiting for the execution owner');
     expect(renderToStaticMarkup(<ToolIoPanel enabled ownerEpoch="owner.1" retainedBundleId="bundle.1" />))
       .toContain('No applied Program binding');
-    expect(api.readIoSignal).not.toHaveBeenCalled();
+    expect(ioSignalBindingsFromProgramBinding(binding)).toHaveLength(1);
   });
 });
 
@@ -498,16 +450,6 @@ describe('ioSignalBindingsAt', () => {
       signalRoleBindings: [{ resourceRoleId: 'a', signalDescriptorDigest: REVISION }, { resourceRoleId: 'b' }] });
   });
 
-  it('accepts the sealed direct output command metadata only for an output', () => {
-    const output = { ...signalRow('valve'), direction: 'output' };
-    const command = { program_id: 'direct-io', program_revision: REVISION, program_run_id: 'direct-control-io-owner', component_role_id: 'io-role',
-      capability_id: 'io.gpio.set_output', command_schema_id: 'io.write', command_schema_revision: REVISION };
-    const result = ioSignalBindingsAt([{ ...row('a', 'io', [output]), output_command: command }], 'rows');
-    expect(result[0].outputCommand).toMatchObject({ programId: 'direct-io', componentRoleId: 'io-role', capabilityId: 'io.gpio.set_output' });
-    expect(() => ioSignalBindingsAt([{ ...row('a', 'io', [signalRow('valve')]), output_command: command }], 'rows')).toThrow();
-    expect(() => ioSignalBindingsAt([{ ...row('a', 'io', [output]), output_command: { ...command, program_id: '' } }], 'rows')).toThrow();
-  });
-
   it.each([
     ['an empty array', []],
     ['an unordered array', [row('b', 'io'), row('a', 'io')]],
@@ -534,7 +476,7 @@ describe('execution targets io_signal_bindings', () => {
   const control = {
     api_version: 'manyforge.execution_command_response.v1', command: 'control_state', ok: true, identity,
     control_state: {
-      cell_stop_action: { available: false, expected_stop_generation: 1, fault: null, latest_terminal: null,
+      cell_stop_action: { available: false, expected_stop_generation: 1, latest_terminal: null,
         unavailable_reason: 'No motion target.' },
       manual_operations: [], observed_targets: [], runtime_scale_control: null,
       schema_version: 'manyforge.execution_control_state.v6',
@@ -592,41 +534,15 @@ describe('execution targets io_signal_bindings', () => {
     expect(() => ioSignalBindingsAt([{ ...rows[0], signal_sources: [{ resource_role_id: 1, source_kind: 'mock' }] }], 'rows'))
       .toThrow();
   });
-
-  it('restores an uncertain manual output from the owner snapshot for targeted Reset', async () => {
-    const { parseExecutionControlStatus } = await import('../api/parsers/execution');
-    const row = { ...rows[0], signal_role_bindings: [{ ...rows[0].signal_role_bindings[0], direction: 'output' }],
-      output_command: { program_id: 'direct-io', program_revision: REVISION, program_run_id: 'direct-control-io-owner',
-        component_role_id: 'io-role', capability_id: 'io.gpio.set_output', command_schema_id: 'io.write', command_schema_revision: REVISION } };
-    const operation = { program_run_id: 'direct-control-io-owner', program_binding_id: BINDING_ID,
-      operation_id: 'valve-op', operation_revision: 2, state: 'intervention_required',
-      participants: [{ progress: 0, terminal_error: { message: 'acceptance unknown' },
-        controllable_component_id: 'station', command_target_id: 'io', output_evidence: 'acceptance_unknown' }],
-      active_stop_id: null, active_stop_generation: null };
-    const state = { ...control, control_state: { ...control.control_state,
-      manual_operations: [{ operation, resident: true }] } };
-    const recovered = parseExecutionControlStatus(targets({ io_signal_bindings: [row] }), state);
-    const uncertain = uncertainOutputs(recovered.manualOperations);
-    expect(uncertain).toEqual([{ operationId: 'valve-op', operationRevision: 2, label: 'station · io (valve-op)' }]);
-    expect(acknowledgedUncertainOutputs('valve-op', uncertain))
-      .toEqual([{ operation_id: 'valve-op', operation_revision: 2 }]);
-    expect(() => parseExecutionControlStatus(targets({ io_signal_bindings: [row] }), {
-      ...state, control_state: { ...state.control_state, manual_operations: [{
-        operation: { ...operation, program_binding_id: `sha256:${'f'.repeat(64)}` }, resident: true,
-      }] },
-    })).toThrow(/direct I\/O bindings/);
-  });
 });
 
 describe('global rule status section', () => {
-  const view = (globalRules?: Parameters<typeof ToolIoPanelView>[0]['globalRules']) => renderToStaticMarkup(
-    <ToolIoPanelView unavailableReason={null} signals={[]} states={{}} sourcesNotice={null}
-      onSetMock={() => undefined} globalRules={globalRules} />,
-  );
+  const rulesView = (globalRules?: ToolIoPanelViewProps['globalRules']) => view({ globalRules });
 
   it('shows each rule state beside the signals', () => {
-    const html = view([
-      { ruleId: 'door', state: 'latched', keys: [] },
+    const html = rulesView([
+      { ruleId: 'door', state: 'tripped', keys: [] },
+      { ruleId: 'off', state: 'inactive', keys: [] },
       { ruleId: 'unknown_rule', state: 'unknown', keys: [], unavailableReason: {
         code: 'motion_interrupt_arm_failed', message: 'Notify rule cannot watch its signals',
         details: { reason: 'io_rule_source_unavailable', source: 'door' },
@@ -634,10 +550,11 @@ describe('global rule status section', () => {
       { ruleId: 'light', state: 'pending', keys: [] },
       { ruleId: 'part', state: 'waiting_for_program', keys: ['part_ready'] },
     ]);
-    expect(html).toContain('data-global-rule="door" data-global-rule-state="latched"');
+    expect(html).toContain('data-global-rule="door" data-global-rule-state="tripped"');
+    expect(html).toContain('data-global-rule="off" data-global-rule-state="inactive"');
     expect(html).toContain('data-global-rule="unknown_rule" data-global-rule-state="unknown"');
-    expect(html).toContain('latched (see its recovery notice)');
-    expect(html).toContain("can&#x27;t watch (motion blocked)");
+    expect(html).toContain('>inactive<');
+    expect(html).toContain("can&#x27;t watch (its scope is held)");
     expect(html).toContain("Interrupt rule unknown_rule can&#x27;t watch its signals: Interrupt rule source unavailable");
     expect(html).toContain('<summary>Details</summary>');
     expect(html).toContain('io_rule_source_unavailable');
@@ -648,13 +565,10 @@ describe('global rule status section', () => {
 
   it('never shows a retained clear as live while the control state is not current', () => {
     const rules = [{ ruleId: 'door', state: 'clear' as const, keys: [] }];
-    const live = view(rules);
+    const live = rulesView(rules);
     expect(live).toContain('status-pill status-pill-connected');
     expect(live).toContain('data-global-rule-current="true"');
-    const retained = renderToStaticMarkup(
-      <ToolIoPanelView unavailableReason={null} signals={[]} states={{}} sourcesNotice={null}
-        onSetMock={() => undefined} globalRules={rules} globalRulesCurrent={false} />,
-    );
+    const retained = view({ globalRules: rules, globalRulesCurrent: false });
     expect(retained).not.toContain('status-pill-connected');
     expect(retained).toContain('data-global-rule-current="false"');
     expect(retained).toContain('last known: clear (not current)');
@@ -662,21 +576,21 @@ describe('global rule status section', () => {
   });
 
   it('shows unknown instead of retaining a prior clear state', () => {
-    const html = view([{
+    const html = rulesView([{
       ruleId: 'door', state: 'unknown', keys: [], unavailableReason: {
         code: 'motion_interrupt_arm_failed', message: 'Notify rule cannot watch its signals',
         details: { reason: 'io_rule_source_unavailable' },
       },
     }]);
     expect(html).toContain('data-global-rule="door" data-global-rule-state="unknown"');
-    expect(html).toContain("can&#x27;t watch (motion blocked)");
+    expect(html).toContain("can&#x27;t watch (its scope is held)");
     expect(html).toContain("Interrupt rule door can&#x27;t watch its signals: Interrupt rule source unavailable");
     expect(html).not.toContain('last known: clear');
   });
 
   it('says unknown, and hides the section with no rules or no control source', () => {
-    expect(view(null)).toContain('Global rule states are not known yet.');
-    expect(view([])).not.toContain('Global rules');
-    expect(view(undefined)).not.toContain('Global rules');
+    expect(rulesView(null)).toContain('Global rule states are not known yet.');
+    expect(rulesView([])).not.toContain('Global rules');
+    expect(rulesView(undefined)).not.toContain('Global rules');
   });
 });

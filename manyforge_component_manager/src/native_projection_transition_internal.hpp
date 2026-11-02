@@ -16,7 +16,7 @@ namespace manyforge::component_manager::detail {
 /// Derive only the candidate native set for fresh Scene initialization. No
 /// predecessor union, disposition, retirement or handoff row is created.
 [[nodiscard]] std::vector<
-    manyforge::core::ProjectionNativeRuntimeBindingDTO>
+    manyforge::core::ProjectionExecutionHostBindingDTO>
 DeriveCandidateNativeProjectionBindings(
     const manyforge::core::RetainedBundleDTO &candidate,
     const ManagerApplyRuntimeStagedReadyDTO &candidate_staged_ready);

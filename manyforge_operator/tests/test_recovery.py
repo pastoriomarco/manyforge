@@ -74,7 +74,7 @@ def test_status_reconciles_a_dead_recorded_child_to_degraded(
     _write_record(
         launcher,
         status,
-        {"profile": "native", "processes": {"headless": _mechanical_process()}},
+        {"profile": "standard", "processes": {"headless": _mechanical_process()}},
     )
 
     observed = launcher.status()
@@ -92,7 +92,7 @@ def test_repeated_status_and_stop_preserve_a_proven_stopped_record(
     status = status_factory(
         configuration_factory(), state=LaunchInstanceState.STOPPED, with_resources=False
     )
-    _write_record(launcher, status, {"profile": "native", "processes": {}})
+    _write_record(launcher, status, {"profile": "standard", "processes": {}})
 
     assert launcher.status().state is LaunchInstanceState.STOPPED
     assert launcher.status().state is LaunchInstanceState.STOPPED
@@ -110,7 +110,7 @@ def test_status_rejects_a_present_process_over_a_stopped_record(
     _write_record(
         launcher,
         status,
-        {"profile": "native", "processes": {"headless": _mechanical_process()}},
+        {"profile": "standard", "processes": {"headless": _mechanical_process()}},
     )
     monkeypatch.setattr(
         "manyforge_operator.orchestrator._process_is_authenticated",
@@ -135,7 +135,7 @@ def test_start_conflicts_with_a_present_process_over_stopped_record(
     _write_record(
         launcher,
         status,
-        {"profile": "native", "processes": {"headless": _mechanical_process()}},
+        {"profile": "standard", "processes": {"headless": _mechanical_process()}},
     )
     monkeypatch.setattr(
         "manyforge_operator.orchestrator._configuration",
@@ -160,12 +160,12 @@ def test_failed_cleanup_after_start_failure_is_degraded(
     starting = status_factory(
         configuration, state=LaunchInstanceState.STARTING, with_resources=False
     )
-    _write_record(launcher, starting, {"profile": "native", "processes": {}})
+    _write_record(launcher, starting, {"profile": "standard", "processes": {}})
     monkeypatch.setattr(launcher, "_cleanup_authenticated", lambda: False)
 
     failure = FailureRecord(
         reason_code="readiness_timeout",
-        component_id="native",
+        component_id="launcher",
         detail="owner did not become ready",
         occurred_at_unix_ns=1,
     )

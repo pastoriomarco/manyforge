@@ -25,8 +25,6 @@ void register_interrupt_bindings(py::module_& module) {
       .value("kJtcCancelDecelerateOnCancel",
              MotionInterruptStopCommandSource::kJtcCancelDecelerateOnCancel)
       .value("kJtcCancelUnprofiledHold", MotionInterruptStopCommandSource::kJtcCancelUnprofiledHold)
-      .value("kNativeSimulatedStop", MotionInterruptStopCommandSource::kNativeSimulatedStop)
-      .value("kNativeSimulatedPathRamp", MotionInterruptStopCommandSource::kNativeSimulatedPathRamp)
       .value("kRobotNativeStop", MotionInterruptStopCommandSource::kRobotNativeStop)
       .value("kDiagnosticOther", MotionInterruptStopCommandSource::kDiagnosticOther);
 

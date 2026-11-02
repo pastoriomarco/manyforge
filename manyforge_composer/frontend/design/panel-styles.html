@@ -302,9 +302,9 @@ const PANELS = [
     ]},
     { title: 'Execution timing', items: [ { t: 'field', label: 'Control groups', value: 'robot_group' } ]},
     { title: 'Motion defaults', items: [
-      { t: 'note', text: 'Portable defaults. Velocity, acceleration and TCP speed are ceilings; Cartesian nodes may override tolerance and blend. The live Velocity control scales moves without changing these values.' },
+      { t: 'note', text: 'Portable defaults. Velocity, acceleration and TCP speed are ceilings; Cartesian nodes may override tolerance and corner blend radius. The live Velocity control scales moves without changing these values.' },
       { t: 'sub', text: 'Bound to nodes' },
-      { t: 'facts', rows: [['velocity_scale','4 of 4'],['acceleration_scale','4 of 4'],['translation_tol_m','4 of 4'],['max_blend_deviation_rad','0 of 0']] },
+      { t: 'facts', rows: [['velocity_scale','4 of 4'],['acceleration_scale','4 of 4'],['translation_tol_m','4 of 4'],['blend_radius_m','0 of 0']] },
       { t: 'fields', n: 2, fields: [['Velocity scale','0.35'],['Acceleration scale','0.5']] },
     ]},
     { title: 'Tree editor', tag: 'Installation', items: [
@@ -313,7 +313,7 @@ const PANELS = [
   ]},
   { id: 'params', title: 'Nodes · Params', icons: ['‹'], width: 280, sections: [
     { title: 'Parameters', action: 'New', items: [ { t: 'list', rows: [
-      ['acceleration_scale','float64','4'],['max_blend_deviation_rad','float64','0'],['max_tcp_linear_speed_mps','float64','4'],['translation_tol_m','float64','4'],['velocity_scale','float64','4']] } ]},
+      ['acceleration_scale','float64','4'],['blend_radius_m','float64','0'],['max_tcp_linear_speed_mps','float64','4'],['translation_tol_m','float64','4'],['velocity_scale','float64','4']] } ]},
     { title: 'Namespaces', action: 'New', items: [ { t: 'empty', text: 'No namespaces' } ]},
     { title: 'Blackboard keys', action: 'New', items: [ { t: 'empty', text: 'No keys' } ]},
   ]},
@@ -365,7 +365,7 @@ const PANELS = [
   { id: 'selected-object', title: 'Selected object', icons: ['□','⌄','×'], width: 400, sections: [
     { title: 'Object', items: [
       { t: 'field', label: 'Scene object', value: 'Select a current scene object', kind: 'select' },
-      { t: 'field', label: 'Source', value: '/workspace/examples/ur5e_lite6_wall_grouped.scenario/scene/separation_wall.stl' },
+      { t: 'field', label: 'Source', value: '/workspace/examples/mock_dual_arm_shared_group.scenario/scene/separation_wall.stl' },
       { t: 'note', text: 'Select an owner-issued scene object.', warn: 1 },
     ]},
     { title: 'Move', items: [
@@ -394,8 +394,8 @@ const PANELS = [
     ]},
     { title: 'Component overview', items: [
       { t: 'status', rows: [['Headless owner connected','Observe, plan and execute scopes are current for the active composition.','connected']] },
-      { t: 'chips', items: ['manyforge.native_execution_runtime','owner-issued scoped facts','0 acknowledgement required','0 active acknowledged','Scenario ur5e_lite6_wall_grouped','Deployment sha256:bc048d50…','Program sha256:025cfeb3…'] },
-      { t: 'status', rows: [['Observe / Render','Prerequisites are current · required','healthy'],['Plan / Preview','Prerequisites are current · required','healthy'],['Execute / Control','Prerequisites are current · required','healthy'],['Manager','Active graph and runtime units converged · generation 2','healthy'],['robot_cell.native_execution','Runtime contract present and converged · generation 1','healthy']] },
+      { t: 'chips', items: ['manyforge.ros2_control_execution_runtime','owner-issued scoped facts','0 acknowledgement required','0 active acknowledged','Scenario ur5e_lite6_wall_grouped','Deployment sha256:bc048d50…','Program sha256:025cfeb3…'] },
+      { t: 'status', rows: [['Observe / Render','Prerequisites are current · required','healthy'],['Plan / Preview','Prerequisites are current · required','healthy'],['Execute / Control','Prerequisites are current · required','healthy'],['Manager','Active graph and runtime units converged · generation 2','healthy'],['robot_cell.ros2_control_execution','Runtime contract present and converged · generation 1','healthy']] },
       { t: 'buttons', items: ['Runtime details and history'] },
     ]},
     { title: 'Program binding', meta: 'no exact match', collapsed: 1, items: [] },

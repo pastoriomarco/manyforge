@@ -146,14 +146,16 @@ struct ExecutionKernelConfig {
   // environment body; pairs the collision policy allows to touch (static,
   // touch-link, support-contact and the active contact-grasp pairs) and
   // self pairs keep 0. A motion's `clearance_m` replaces it for that move.
-  // The runtime monitor and lookahead keep 0. 0 (the default) disables it.
+  // The runtime monitor and lookahead keep 0. Default 0.1 mm; 0 disables it.
   double collision_clearance_m = kDefaultCollisionClearanceM;
-  // Joint-space step between collision-checked configurations when
-  // validating the executed curve, in (0, kMaxCollisionCheckStepRad] rad
-  // (Deployment `collision_check_step_rad`). The host gives the planner the
-  // same value as its `collision_check_step_size`; a retry attempt plans and
-  // is validated at min(step, 0.01) (collision_check_step_for_attempt).
-  double collision_check_step_rad = kDefaultCollisionCheckStepRad;
+
+  // Whether a fresh plan without an active contact policy gets the
+  // pre-dispatch waypoint check (ManyForge's collision engine on every timed
+  // waypoint) like a cached trajectory or a contact-policy move; a failing
+  // plan is replanned within the authoritative-validation attempts. Off: the
+  // planner's own checks stand for it (Deployment
+  // `collision_check_fresh_plans`).
+  bool collision_check_fresh_plans = kDefaultCollisionCheckFreshPlans;
   int validation_collision_min_waypoints_for_parallel = 8;
 
   // Deployment-configured RRT planning budget ceiling. Per-request
@@ -355,6 +357,17 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   /// there is no authoritative collision policy.
   void set_collision_validation_policy_snapshot(std::optional<CollisionPolicySnapshot> snapshot);
 
+  /// Replace the cell collision clearance (Deployment `collision_clearance_m`,
+  /// cell context): a retained component takes the new value at Apply. A
+  /// move already validated keeps its margins. Throws std::invalid_argument
+  /// outside [0, kMaxCollisionClearanceM].
+  void set_collision_clearance_m(double clearance_m);
+
+  /// Replace the fresh-plan pre-dispatch check setting (Deployment
+  /// `collision_check_fresh_plans`, cell context): a retained component takes
+  /// the new value at Apply; a move already validated keeps its evidence.
+  void set_collision_check_fresh_plans(bool enabled) noexcept;
+
   /// Install role-owned collision resources. Production composition roots should
   /// use this once while constructing a private Kernel. Retained Kernel
   /// replacements require the exact held Apply-fence API below. The bootstrap
@@ -385,12 +398,6 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   [[nodiscard]] Result<CollisionPipelineResourceReadbackDTO>
   collision_resource_set_readback() const;
 
-  /// Optional pose-source / per-state retry configuration for the
-  /// CollisionValidationCoordinator. Has no effect until a policy snapshot is
-  /// installed via set_collision_validation_policy_snapshot.
-  void set_collision_validation_retry_config(PoseSourceRetryConfig retry,
-                                             std::int64_t per_state_timeout_ns = 0);
-
   /// Check whether a non-dispatch validation surface may run against the
   /// current collision resources. Preview callers use this before direct
   /// planner/context work so they defer loudly instead of borrowing a runtime
@@ -413,16 +420,6 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
 
   /// Get current metrics snapshot.
   MetricsSnapshot get_metrics() const;
-
-  /// Configure where the in-process flight ring is dumped when the kernel
-  /// dies fail-closed (empty = stderr). Startup wiring, not a hot path.
-  void set_flight_recorder_directory(std::string directory);
-
-  /// Best-effort JSONL dump of the flight ring (the fail-closed teardown
-  /// paths call this automatically; exposed for bindings, diagnostics, and
-  /// tests). Returns the written path, or empty when the dump went to
-  /// stderr.
-  std::string dump_flight_record(const char* reason) noexcept;
 
  private:
   struct PreparedMotionSession;
@@ -513,6 +510,9 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
     TrajectoryDTO collision_trajectory;
     ParallelValidationTelemetry telemetry;
     std::size_t dynamically_discovered_start_contact_count = 0;
+    // True when planning's collision check stands for this trajectory and no
+    // pre-dispatch collision pass ran.
+    bool collision_checked_by_planning = false;
   };
 
   Result<CollisionValidationSuccess> validate_trajectory(
@@ -522,7 +522,7 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
       bool* conclusive_collision_failure = nullptr,
       std::shared_ptr<CollisionCancellationToken> validation_cancellation = {},
       const MovingReplacementInputDTO* replacement = nullptr,
-      std::uint32_t planning_attempt_index = 0U);
+      bool collision_checked_by_planning = false);
 
   /// Shared computation only. The caller owns planner serialization, the
   /// deadline/cancellation registration, projection lifetime and admission.
@@ -641,7 +641,6 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   KernelRecoveryAssessmentDTO refresh_recovery_assessment_locked(const char* trigger);
   KernelRecoveryAssessmentDTO publish_recovery_assessment_locked(RecoveryAuthorityCapture capture,
                                                                  const char* trigger);
-  void try_refresh_recovery_assessment(const char* trigger);
   void schedule_recovery_assessment_refresh(const char* trigger) noexcept;
   std::uint64_t begin_operator_stop_owner_generation(std::uint64_t execution_id);
   std::uint64_t operator_stop_owner_generation_for_execution(std::uint64_t execution_id) const;
@@ -715,7 +714,6 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   };
 
   void finish_execute_worker();
-  void notify_execution_waiters();
   bool retire_execute_worker(std::unique_lock<std::mutex>& lifecycle_lock,
                              bool containment_already_certified = false);
 
@@ -778,6 +776,11 @@ class ExecutionKernel : public IResolvedParticipantExecutionEngine,
   IScheduler& scheduler_;
   TrajectoryCache& cache_;
   ExecutionKernelConfig config_;
+  // config_.collision_clearance_m as last set (set_collision_clearance_m).
+  std::atomic<double> collision_clearance_m_;
+  // config_.collision_check_fresh_plans as last set
+  // (set_collision_check_fresh_plans).
+  std::atomic<bool> collision_check_fresh_plans_;
 
   ExecutionStateMachine sm_;
 

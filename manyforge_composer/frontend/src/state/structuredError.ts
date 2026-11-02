@@ -35,10 +35,6 @@ function quoted(value: string): string {
   return `'${value}'`;
 }
 
-const DETAIL_LABELS: Readonly<Record<string, string>> = {
-  latch_id: 'Latch',
-};
-
 function detailValue(value: string | number | boolean | null): string {
   if (value === null) return 'none';
   if (typeof value === 'boolean') return value ? 'yes' : 'no';
@@ -96,15 +92,11 @@ export function structuredErrorRows(
     // A null path or reference is part of this row, not a separate detail.
     shown.add('path').add('source_reference').add('input_problem');
   }
-  // Operator-alarm attention refusals carry both gating memberships.
-  for (const [key, label] of [
-    ['interlock_alarms', 'Alarm interlocks'],
-    ['unacknowledged_alarms', 'Unacknowledged alarms'],
-  ] as const) {
-    const membership = text(key);
-    if (membership === null) continue;
-    const conditions = refusalMembershipConditionIds(membership);
-    if (conditions.length > 0) rows.push({ label, value: conditions.join(', ') });
+  // Operator-alarm attention refusals carry the gating interlocks.
+  const interlocks = text('interlock_alarms');
+  if (interlocks !== null) {
+    const conditions = refusalMembershipConditionIds(interlocks);
+    if (conditions.length > 0) rows.push({ label: 'Alarm interlocks', value: conditions.join(', ') });
   }
   const requiredAction = text('required_action');
   if (requiredAction !== null) {
@@ -114,7 +106,7 @@ export function structuredErrorRows(
   // is shown under its own key.
   for (const key of Object.keys(details ?? {}).sort()) {
     if (shown.has(key)) continue;
-    const label = DETAIL_LABELS[key] ?? humanizeReasonCode(key);
+    const label = humanizeReasonCode(key);
     rows.push({
       label: label.charAt(0).toUpperCase() + label.slice(1),
       value: detailValue(details![key]),

@@ -31,7 +31,6 @@
 #include "embedded_empty_runtime_configuration_schema.hpp"
 #include "embedded_model_asset_schema.hpp"
 #include "embedded_motion_controlled_stop_provider_contract_schema.hpp"
-#include "embedded_native_execution_runtime_configuration_schema.hpp"
 #include "embedded_provider_manifest_schema.hpp"
 #include "embedded_ros2_control_execution_runtime_configuration_schema.hpp"
 #include "embedded_io_provider_component_configuration_schema.hpp"
@@ -1580,32 +1579,15 @@ void validate_root_api_version(const SchemaNode &authored,
                                const ConstDefinitionMap &definitions,
                                std::string_view schema_id) {
   const auto &root = resolve_node(authored, definitions);
-  const bool api_union =
-      root.kind == NodeKind::kTaggedUnion && root.tag_field == "api_version";
-  std::vector<std::pair<const SchemaNode *, std::string_view>> roots;
+  std::vector<const SchemaNode *> roots;
   if (root.kind == NodeKind::kTaggedUnion) {
-    if (api_union &&
-        std::none_of(root.alternatives.begin(), root.alternatives.end(),
-                     [&](const auto &alternative) {
-                       return alternative.tag_value == schema_id;
-                     })) {
-      throw ClosedSchemaError(
-          "root api_version tagged union must include its schema_id family");
-    }
     for (const auto &alternative : root.alternatives) {
-      if (api_union && (alternative.tag_value.size() > 128U ||
-                        !is_api_version(alternative.tag_value))) {
-        throw ClosedSchemaError("root api_version tagged-union tags must be "
-                                "versioned ManyForge APIs");
-      }
-      roots.emplace_back(&resolve_node(*alternative.value_schema, definitions),
-                         api_union ? std::string_view(alternative.tag_value)
-                                   : schema_id);
+      roots.push_back(&resolve_node(*alternative.value_schema, definitions));
     }
   } else {
-    roots.emplace_back(&root, schema_id);
+    roots.push_back(&root);
   }
-  for (const auto &[branch, expected_api] : roots) {
+  for (const auto *branch : roots) {
     if (branch->kind != NodeKind::kObject) {
       throw ClosedSchemaError("root definition and every root tagged-union "
                               "branch must resolve to object");
@@ -1623,12 +1605,9 @@ void validate_root_api_version(const SchemaNode &authored,
         api_schema.scalar_type != ScalarType::kString ||
         enumeration == nullptr || enumeration->values.size() != 1U ||
         !scalar_equal(enumeration->values.front(),
-                      CanonicalValue(std::string(expected_api)))) {
-      throw ClosedSchemaError(
-          api_union ? "root api_version must be a required single-value string "
-                      "enum matching its tag"
-                    : "root api_version must be a required single-value string "
-                      "enum equal to schema_id");
+                      CanonicalValue(std::string(schema_id)))) {
+      throw ClosedSchemaError("root api_version must be a required single-value "
+                              "string enum equal to schema_id");
     }
   }
 }
@@ -1979,7 +1958,7 @@ BuildQualifiedClosedSchemaRegistry::BuildQualifiedClosedSchemaRegistry() {
        "catalog/manyforge.stop_evidence_policy.v2.yaml",
        detail::kEmbeddedStopEvidencePolicySchema},
   }};
-  const std::array<QualifiedValueSchemaSource, 7U> qualified_value_sources{{
+  const std::array<QualifiedValueSchemaSource, 6U> qualified_value_sources{{
       {"value/manyforge.value_schema.provider_contract.empty.v1.yaml",
        detail::kEmbeddedEmptyProviderContractSchema},
       {"value/"
@@ -1988,8 +1967,6 @@ BuildQualifiedClosedSchemaRegistry::BuildQualifiedClosedSchemaRegistry() {
        detail::kEmbeddedMotionControlledStopProviderContractSchema},
       {"value/manyforge.value_schema.runtime.empty.v1.yaml",
        detail::kEmbeddedEmptyRuntimeConfigurationSchema},
-      {"value/manyforge.value_schema.runtime.native_execution.v1.yaml",
-       detail::kEmbeddedNativeExecutionRuntimeConfigurationSchema},
       {"value/"
        "manyforge.value_schema.runtime.ros2_control_execution.v1.yaml",
        detail::kEmbeddedRos2ControlExecutionRuntimeConfigurationSchema},

@@ -9,8 +9,8 @@ import { ComponentStreamsSection } from './ComponentStreamsSection';
 afterEach(() => vi.unstubAllGlobals());
 
 const robotStreams = [
-  { budget_ns: 1_000_000_000, controllable_component_id: 'robot', recovery: 'ack', severity: 'fault', stream_id: 'gripper_feedback' },
-  { budget_ns: 250_000_000, controllable_component_id: 'robot', recovery: 'auto', severity: 'warning', stream_id: 'measured_joints' },
+  { budget_ns: 1_000_000_000, controllable_component_id: 'robot', stream_id: 'gripper_feedback' },
+  { budget_ns: 250_000_000, controllable_component_id: 'robot', stream_id: 'measured_joints' },
 ];
 
 const partLink = [{ scene_resource_id: 'part', source_id: 'camera', apply_policy: 'before_planning',
@@ -49,15 +49,13 @@ async function mount(controller: DeploymentWorkspaceController) {
   const { createRoot } = await import('react-dom/client');
   const root = createRoot(host as unknown as Element);
   await act(() => root.render(<ComponentStreamsSection controller={controller} />));
-  const control = (label: string, kind: 'budget' | 'severity' | 'recovery', component = 'robot') => find(
-    (props) => props['aria-label'] === `${label} ${kind} override for ${component}`);
-  const commitBudget = async (label: string, text: string) => {
-    await act(() => control(label, 'budget').onChange?.({ target: { value: text } }));
-    await act(() => (control(label, 'budget').onBlur as () => void)());
+  const control = (label: string, component = 'robot') => find(
+    (props) => props['aria-label'] === `${label} budget override for ${component}`);
+  const commitBudget = async (label: string, text: string, component = 'robot') => {
+    await act(() => control(label, component).onChange?.({ target: { value: text } }));
+    await act(() => (control(label, component).onBlur as () => void)());
   };
-  const select = (label: string, kind: 'severity' | 'recovery', value: string, component = 'robot') => act(
-    () => control(label, kind, component).onChange?.({ target: { value } }));
-  return { find, control, commitBudget, select, unmount: () => act(() => root.unmount()) };
+  return { find, control, commitBudget, unmount: () => act(() => root.unmount()) };
 }
 
 const policies = (streams?: JsonValue[]) => ({
@@ -66,111 +64,54 @@ const policies = (streams?: JsonValue[]) => ({
 });
 
 describe('ComponentStreamsSection', () => {
-  it('lists every component with its declared streams and defaults', () => {
+  it('lists every component with its declared streams and budget defaults', () => {
     const markup = renderToStaticMarkup(<ComponentStreamsSection controller={controllerWith()} />);
-    expect(markup).toContain('Measured joints');
-    expect(markup).toContain('Default: 250 ms · warning · auto');
-    expect(markup).toContain('Gripper feedback');
-    expect(markup).toContain('Default: 1000 ms · fault · ack');
+    expect(markup).toContain('<legend>Measured joints</legend>');
+    expect(markup).toContain('Default: 250 ms');
+    expect(markup).toContain('<legend>Gripper feedback</legend>');
     expect(markup).toContain('placeholder="1000 ms (default)"');
-    expect(markup).toContain('Default (warning)');
-    expect(markup).toContain('Pose robot / viewer.measured_robot');
-    expect(markup).toContain('Pose part');
-    expect(markup).toContain('Default: 5000 ms · warning · auto');
+    expect(markup).toContain('<legend>Pose robot / viewer.measured_robot</legend>');
+    expect(markup).toContain('<legend>Pose part</legend>');
+    expect(markup).toContain('Default: 5000 ms');
     expect(markup).toMatch(/<strong>io<\/strong><\/header><p class="muted">No streams declared<\/p>/);
-    expect(markup).toContain('Model endpoint');
-    expect(markup).toContain('Default: 10000 ms · warning · auto');
+    expect(markup).toContain('<legend>Model endpoint</legend>');
+    expect(markup).toContain('Default: 10000 ms');
+    expect(markup).not.toContain('severity');
+    expect(markup).not.toContain('Recovery');
+    // CONTRACTS §7: what a stale stream means is the component kind's.
+    expect(markup).toContain('own stream going stale is a fault');
+    expect(markup).toContain('In a simulator lane');
   });
 
   it('sets and clears a budget override in ns', async () => {
-    const controller = controllerWith();
+    const own = { controllable_component_id: 'robot', stream_id: 'gripper_feedback', budget_ns: 1_500_000_000 };
+    const controller = controllerWith([own]);
     const mounted = await mount(controller);
     try {
-      expect(mounted.control('Measured joints', 'budget').value).toBe('');
+      expect(mounted.control('Gripper feedback').value).toBe('1500');
       await mounted.commitBudget('Measured joints', '500');
-      expect(controller.mutate).toHaveBeenCalledExactlyOnceWith(['policies'], 'set', policies([
-        { controllable_component_id: 'robot', stream_id: 'measured_joints', budget_ns: 500_000_000 },
+      expect(controller.mutate).toHaveBeenLastCalledWith(['policies'], 'set', policies([
+        own, { controllable_component_id: 'robot', stream_id: 'measured_joints', budget_ns: 500_000_000 },
       ]));
-    } finally { await mounted.unmount(); }
-  });
-
-  it('keeps other rows and fields, removes an emptied row and the empty table', async () => {
-    const other = { controllable_component_id: 'camera', stream_id: 'poses/part', severity: 'blocking' };
-    const own = { controllable_component_id: 'robot', stream_id: 'gripper_feedback', budget_ns: 1_500_000_000, severity: 'blocking' };
-    const controller = controllerWith([other, own]);
-    const mounted = await mount(controller);
-    try {
-      expect(mounted.control('Gripper feedback', 'budget').value).toBe('1500');
-      expect(mounted.control('Gripper feedback', 'severity').value).toBe('blocking');
       await mounted.commitBudget('Gripper feedback', '');
-      expect(controller.mutate).toHaveBeenLastCalledWith(['policies'], 'set', policies([
-        other, { controllable_component_id: 'robot', stream_id: 'gripper_feedback', severity: 'blocking' },
-      ]));
-      await mounted.select('Gripper feedback', 'recovery', 'ack');
-      expect(controller.mutate).toHaveBeenLastCalledWith(['policies'], 'set', policies([
-        other, { ...own, recovery: 'ack' },
-      ]));
-      await mounted.select('Pose part', 'severity', '', 'camera');
-      // The camera override is identity-only after clearing: removed.
-      expect(controller.mutate).toHaveBeenLastCalledWith(['policies'], 'set', policies([own]));
+      // The emptied row and then the empty table go.
+      expect(controller.mutate).toHaveBeenLastCalledWith(['policies'], 'set', policies());
     } finally { await mounted.unmount(); }
   });
 
-  it('deletes the table when the last override is cleared', async () => {
-    const controller = controllerWith([
-      { controllable_component_id: 'robot', stream_id: 'measured_joints', severity: 'fault' },
-    ]);
-    const mounted = await mount(controller);
-    try {
-      await mounted.select('Measured joints', 'severity', '');
-      expect(controller.mutate).toHaveBeenCalledExactlyOnceWith(['policies'], 'set', policies());
-    } finally { await mounted.unmount(); }
-  });
+  const undeclaredStream = { controllable_component_id: 'robot', stream_id: 'old_stream', budget_ns: 1_500_000_000 };
 
-  it('writes fault with auto recovery like any other override', async () => {
-    const controller = controllerWith([
-      { controllable_component_id: 'robot', stream_id: 'measured_joints', recovery: 'auto' },
-    ]);
-    const mounted = await mount(controller);
-    try {
-      await mounted.select('Measured joints', 'severity', 'fault');
-      expect(controller.mutate).toHaveBeenCalledExactlyOnceWith(['policies'], 'set', policies([
-        { controllable_component_id: 'robot', stream_id: 'measured_joints', recovery: 'auto', severity: 'fault' },
-      ]));
-    } finally { await mounted.unmount(); }
-  });
-
-  const absentComponent = { controllable_component_id: 'gone', stream_id: 'measured_joints', severity: 'blocking' };
-  const undeclaredStream = { controllable_component_id: 'robot', stream_id: 'old_stream', budget_ns: 1_500_000_000, recovery: 'ack' };
-  const declared = { controllable_component_id: 'robot', stream_id: 'measured_joints', severity: 'fault' };
-
-  it('shows override rows without a declared stream', () => {
-    const markup = renderToStaticMarkup(<ComponentStreamsSection controller={controllerWith([
-      absentComponent, declared, undeclaredStream,
-    ])} />);
+  it('shows and removes override rows without a declared stream', async () => {
+    const markup = renderToStaticMarkup(<ComponentStreamsSection controller={controllerWith([undeclaredStream])} />);
     expect(markup).toContain('Overrides without a declared stream');
-    expect(markup).toContain('gone · measured_joints: severity blocking');
-    expect(markup).toContain('robot · old_stream: budget 1500 ms · recovery ack');
-    expect(markup).not.toContain('robot · measured_joints');
-  });
-
-  it('removes an orphan override row, and the empty table with the last one', async () => {
-    const controller = controllerWith([absentComponent, declared, undeclaredStream]);
+    expect(markup).toContain('robot · old_stream: budget 1500 ms');
+    const controller = controllerWith([undeclaredStream]);
     const mounted = await mount(controller);
     try {
       await act(() => mounted.find(
         (props) => props['aria-label'] === 'Remove old_stream override for robot').onClick?.());
-      expect(controller.mutate).toHaveBeenLastCalledWith(['policies'], 'set', policies([
-        absentComponent, declared,
-      ]));
+      expect(controller.mutate).toHaveBeenCalledExactlyOnceWith(['policies'], 'set', policies());
     } finally { await mounted.unmount(); }
-    const last = controllerWith([absentComponent]);
-    const lastMounted = await mount(last);
-    try {
-      await act(() => lastMounted.find(
-        (props) => props['aria-label'] === 'Remove measured_joints override for gone').onClick?.());
-      expect(last.mutate).toHaveBeenCalledExactlyOnceWith(['policies'], 'set', policies());
-    } finally { await lastMounted.unmount(); }
   });
 
   it.each(['0', '-5'])('rejects non-positive budget %s before mutation', async (text) => {
@@ -182,15 +123,31 @@ describe('ComponentStreamsSection', () => {
     } finally { await mounted.unmount(); }
   });
 
-  it('leaves an owner rejection to the yellow notice row, with no inline alert', async () => {
-    const controller = controllerWith(undefined, null);
+  it('offers the Inputs stream of an I/O device with ROS inputs, off by default', async () => {
+    const ioSignal = (component: string, profile: string) => ({
+      controllable_component_id: component, direction: 'input', signal_name: 'ready',
+      provider: { profile, topic: `/${component}/ready` } });
+    const controller = {
+      workspace: { draft: { document: { api_version: 'manyforge.deployment_intent.v2', components: [
+        { component_id: 'plc', configuration: { runtime_kind: 'io_provider',
+          runtime_configuration: { io_signals: [ioSignal('plc', 'ros_bool')] } } },
+        { component_id: 'station', configuration: { runtime_kind: 'io_provider',
+          runtime_configuration: { io_signals: [ioSignal('station', 'mock')] } } },
+      ], policies: {} } } },
+      mutationAvailable: true, busy: false, loading: false,
+      mutate: vi.fn().mockResolvedValue({}),
+    } as unknown as DeploymentWorkspaceController;
+    const markup = renderToStaticMarkup(<ComponentStreamsSection controller={controller} />);
+    expect(markup).toContain('<legend>Inputs</legend>');
+    expect(markup).toContain('Default: off');
+    expect(markup).toContain('placeholder="off (default)"');
+    // Mock inputs have no sender: no Inputs stream.
+    expect(markup).toMatch(/<strong>station<\/strong><\/header><p class="muted">No streams declared<\/p>/);
     const mounted = await mount(controller);
     try {
-      await mounted.select('Measured joints', 'recovery', 'ack');
-      // Let the owner's refusal settle.
-      await act(() => new Promise((resolve) => { setTimeout(resolve, 0); }));
-      expect(controller.mutate).toHaveBeenCalledOnce();
-      expect(() => mounted.find((props) => props.role === 'alert')).toThrow();
+      await mounted.commitBudget('Inputs', '2000', 'plc');
+      expect(controller.mutate).toHaveBeenLastCalledWith(['policies'], 'set', { component_streams: [
+        { controllable_component_id: 'plc', stream_id: 'inputs', budget_ns: 2_000_000_000 }] });
     } finally { await mounted.unmount(); }
   });
 
@@ -204,6 +161,6 @@ describe('ComponentStreamsSection', () => {
     const markup = renderToStaticMarkup(<ComponentStreamsSection controller={controller} />);
     expect(markup).toContain('<strong>tool</strong></header><p class="muted">No streams declared</p>');
     expect(markup).toContain('<strong>robot</strong>');
-    expect(markup).toContain('Measured joints');
+    expect(markup).toContain('<legend>Measured joints</legend>');
   });
 });

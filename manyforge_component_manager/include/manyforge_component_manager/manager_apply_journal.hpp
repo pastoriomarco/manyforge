@@ -7,9 +7,7 @@
 #include <manyforge_component_manager/runtime_convergence.hpp>
 #include <manyforge_component_manager/selected_bundle_transition.hpp>
 #include <manyforge_component_manager/selected_runtime_composition.hpp>
-#include <manyforge_core/ports/icclc_journal.hpp>
 #include <manyforge_core/ports/ioperation_journal.hpp>
-#include <manyforge_core/sqlite_cclc_journal.hpp>
 #include <manyforge_core/types/cell_admission.hpp>
 #include <manyforge_core/types/configuration_fence.hpp>
 #include <manyforge_core/types/projection_common.hpp>
@@ -27,8 +25,8 @@
 namespace manyforge::component_manager {
 
 inline constexpr std::string_view kManagerApplyJournalSchemaId =
-    "manyforge.internal.component-manager.apply-journal.h1a.v20";
-inline constexpr std::int64_t kManagerApplyJournalSchemaVersion = 20;
+    "manyforge.internal.component-manager.apply-journal.h1a.v22";
+inline constexpr std::int64_t kManagerApplyJournalSchemaVersion = 22;
 inline constexpr std::int64_t kManagerApplyJournalSqliteApplicationId =
     1296450128;
 inline constexpr std::size_t kMaximumManagerApplyIntents = 256U;
@@ -170,75 +168,6 @@ struct ManagerApplyIntentWriteResult final {
   bool inserted;
 };
 
-/// Original per-component input captured before any configured bring-up
-/// effect. This value carries no parent permission or fabricated owner facts.
-struct ManagerApplyBringUpChildRequestDTO final {
-  manyforge::core::ComponentLifecycleIntentDTO intent;
-  manyforge::core::ProjectionRevisionDTO candidate_projection_revision;
-  manyforge::core::ContentDigest candidate_retained_bundle_digest;
-  std::uint64_t candidate_retained_bundle_bytes{};
-  manyforge::core::RuntimeUnitId runtime_unit_id;
-  manyforge::core::RuntimeEpoch runtime_epoch;
-  manyforge::core::RuntimeEpoch manager_runtime_epoch;
-
-  [[nodiscard]] bool valid() const noexcept;
-  friend bool operator==(const ManagerApplyBringUpChildRequestDTO &,
-                         const ManagerApplyBringUpChildRequestDTO &) = default;
-};
-
-/// Complete immutable configured set and the ordered subset requiring work.
-/// The separately sealed plan is bookkeeping; only a positively verified live
-/// ApplyComponentBringUpAuthorityDTO can delegate the parent's permission.
-struct ManagerApplyBringUpPlanDTO final {
-  manyforge::core::ApplyId apply_id;
-  manyforge::core::ApplyGeneration apply_generation;
-  manyforge::core::ContentDigest parent_intent_digest;
-  std::vector<manyforge::core::ControllableComponentId> configured_components;
-  std::vector<ManagerApplyBringUpChildRequestDTO> children;
-  manyforge::core::ActiveBundlePublicationRequestDTO expected_publication;
-  manyforge::core::ContentDigest predecessor_public_pointer_digest;
-
-  [[nodiscard]] bool valid() const noexcept;
-  friend bool operator==(const ManagerApplyBringUpPlanDTO &,
-                         const ManagerApplyBringUpPlanDTO &) = default;
-};
-
-struct PersistedManagerApplyBringUpPlan final {
-  ManagerApplyBringUpPlanDTO plan;
-  manyforge::core::ContentDigest plan_digest;
-  friend bool operator==(const PersistedManagerApplyBringUpPlan &,
-                         const PersistedManagerApplyBringUpPlan &) = default;
-};
-
-struct ManagerApplyBringUpIntentWriteResult final {
-  PersistedManagerApplyIntent intent;
-  PersistedManagerApplyBringUpPlan plan;
-  bool inserted;
-};
-
-enum class ManagerApplyBringUpChildPhase { kAccepted, kHolding, kTerminal };
-
-/// One owner-minted observation at a durable child milestone. Reads and shape
-/// checks grant no continuation, installation, or publication permission.
-struct ManagerApplyBringUpChildProofDTO final {
-  manyforge::core::ApplyId apply_id;
-  manyforge::core::ApplyGeneration apply_generation;
-  manyforge::core::ContentDigest plan_digest;
-  manyforge::core::ControllableComponentId controllable_component_id;
-  ManagerApplyBringUpChildPhase phase;
-  manyforge::core::CCLCLifecycleRequestResultDTO result;
-};
-
-struct PersistedManagerApplyBringUpChildProof final {
-  ManagerApplyBringUpChildProofDTO proof;
-  manyforge::core::ContentDigest proof_digest;
-};
-
-struct ManagerApplyBringUpChildProofWriteResult final {
-  PersistedManagerApplyBringUpChildProof record;
-  bool inserted;
-};
-
 /// Mechanical helpers reuse the journal's existing encoders; no receipt or
 /// authority is minted by computing an immutable input's content digest.
 [[nodiscard]] manyforge::core::ContentDigest
@@ -246,8 +175,6 @@ ComputeManagerApplyIntentDigest(const ManagerApplyIntentDTO &intent);
 [[nodiscard]] manyforge::core::ContentDigest
 ComputeManagerApplyPrivateMaterializationDigest(
     const ManagerApplyPrivateMaterializationDTO &materialization);
-[[nodiscard]] manyforge::core::ContentDigest
-ComputeManagerApplyBringUpPlanDigest(const ManagerApplyBringUpPlanDTO &plan);
 
 /// Immutable whole-Apply admission scope and per-component decision, both
 /// derived from sealed bundles and persisted together before any effect.
@@ -440,13 +367,17 @@ struct PersistedManagerApplyStatus final {
   std::optional<PersistedManagerApplyFenceReleaseIntent> fence_release_intent;
   std::optional<PersistedManagerApplyFenceReleased> fence_released;
   std::optional<PersistedManagerApplyTerminalOutcome> terminal_outcome;
-  std::optional<PersistedManagerApplyBringUpPlan> bring_up_plan;
-  std::vector<PersistedManagerApplyBringUpChildProof> bring_up_child_proofs;
 };
 
 /// Whether the recorded failure is in the currently supported before-effect
 /// scope. This is advisory; the owner must recheck its held fence and claim.
 [[nodiscard]] bool FailedApplyAcknowledgementEligible(
+    const PersistedManagerApplyStatus &status) noexcept;
+
+/// Whether New may release this failed Apply's held fence and claim: any
+/// failure (before effect or not) that still holds its accepted fence and
+/// published nothing (N7, CONTRACTS §15). The owner rechecks the Kernel.
+[[nodiscard]] bool FailedApplyNewReleaseEligible(
     const PersistedManagerApplyStatus &status) noexcept;
 
 /// Last real progress for one Apply generation: the deepest durably reached
@@ -481,11 +412,15 @@ struct ManagerApplyJournalIntegrityReport final {
   std::int64_t fence_release_intent_count;
   std::int64_t fence_released_count;
   std::int64_t terminal_outcome_count;
-  std::int64_t bring_up_plan_count;
-  std::int64_t bring_up_child_proof_count;
 };
 
-/// Durable append-only owner of bounded named-Apply ordering evidence.
+/// Durable owner of bounded named-Apply ordering evidence.
+///
+/// Records are immutable once written. The inventory is bounded by eviction,
+/// not refusal: inserting an intent into a full inventory first deletes, in
+/// the same transaction, the oldest Apply that no owner can still need, with
+/// every row it owns (see `EvictOneApplyLocked`). Only when every retained
+/// Apply is still needed does the insert fail with a limit error.
 ///
 /// Exact duplicate writes replay the original record. One public
 /// `(request_owner_epoch, request_id)` identifies exactly one immutable Apply
@@ -530,26 +465,6 @@ public:
 
   [[nodiscard]] ManagerApplyIntentWriteResult
   EnsureIntent(const ManagerApplyIntentDTO &intent);
-  /// Insert parent and complete chosen plan in the same transaction. A plan
-  /// cannot be retrofitted to an ordinary accepted parent.
-  [[nodiscard]] ManagerApplyBringUpIntentWriteResult
-  EnsureBringUpIntent(const ManagerApplyIntentDTO &intent,
-                      const ManagerApplyBringUpPlanDTO &plan);
-  [[nodiscard]] std::optional<PersistedManagerApplyBringUpPlan>
-  ReadBringUpPlan(const manyforge::core::ApplyId &apply_id,
-                  manyforge::core::ApplyGeneration apply_generation) const;
-  [[nodiscard]] std::optional<PersistedManagerApplyBringUpPlan>
-  ReadBringUpPlanByRequest(
-      const manyforge::core::RequestOwnerEpoch &request_owner_epoch,
-      const manyforge::core::RequestId &request_id) const;
-  [[nodiscard]] ManagerApplyBringUpChildProofWriteResult
-  EnsureBringUpChildProof(const ManagerApplyBringUpChildProofDTO &proof);
-  [[nodiscard]] std::optional<PersistedManagerApplyBringUpChildProof>
-  ReadBringUpChildProof(
-      const manyforge::core::ApplyId &apply_id,
-      manyforge::core::ApplyGeneration apply_generation,
-      const manyforge::core::ControllableComponentId &component,
-      ManagerApplyBringUpChildPhase phase) const;
   [[nodiscard]] std::optional<PersistedManagerApplyIntent>
   ReadIntent(const manyforge::core::ApplyId &apply_id,
              manyforge::core::ApplyGeneration apply_generation) const;
@@ -683,16 +598,7 @@ private:
       const std::filesystem::path &, const manyforge::core::CellId &,
       const manyforge::core::NamedApplyPublicationTransactionDTO &);
   friend manyforge::core::Result<PersistedManagerApplyStatus>
-  ReadNativeApplyParentStatusReadOnly(
-      const std::filesystem::path &, const manyforge::core::CellId &,
-      const manyforge::core::NativeApplyPlanDTO &,
-      const manyforge::deployment::RetainedBundle &);
-  friend manyforge::core::Result<PersistedManagerApplyStatus>
-  ReadManagerApplyBringUpStatusReadOnly(
-      const std::filesystem::path &, const manyforge::core::CellId &,
-      const manyforge::core::ApplyComponentBringUpReferenceDTO &);
-  friend manyforge::core::Result<PersistedManagerApplyStatus>
-  ReadManagerApplyBringUpStatusReadOnly(
+  ReadManagerApplyStatusByClaimIntentReadOnly(
       const std::filesystem::path &, const manyforge::core::CellId &,
       const manyforge::core::CellAdmissionClaimIntentDTO &);
   friend manyforge::core::Result<PersistedManagerApplyStatus>
@@ -702,11 +608,6 @@ private:
       const manyforge::core::CellAdmissionClaimDTO &);
   friend manyforge::core::Result<void>
   ValidateManagerApplyCellAdmissionSettlementReadOnly(
-      const std::filesystem::path &, const manyforge::core::CellId &,
-      const manyforge::core::CellAdmissionClaimDTO &,
-      const manyforge::core::CellAdmissionClaimReleaseDTO &);
-  friend manyforge::core::Result<void>
-  ValidateManagerApplyBringUpCellAdmissionSettlementReadOnly(
       const std::filesystem::path &, const manyforge::core::CellId &,
       const manyforge::core::CellAdmissionClaimDTO &,
       const manyforge::core::CellAdmissionClaimReleaseDTO &);
@@ -757,22 +658,12 @@ ReadManagerApplyStatusReadOnly(
     const manyforge::core::CellId &cell_id,
     const manyforge::core::NamedApplyPublicationTransactionDTO &apply);
 
-/// Read one exact sealed parent and its existing phase records without opening
-/// a mutable journal owner. These retained values are observation-only: the
-/// original live Manager/host must independently prove current authority.
+/// Resolve retained parent data from the exact original direct Manager acquire
+/// intent; its intent digest must match. Unavailable, corrupt or conflicting
+/// reads are errors. No acquired claim identity or current effect authority is
+/// inferred.
 [[nodiscard]] manyforge::core::Result<PersistedManagerApplyStatus>
-ReadManagerApplyBringUpStatusReadOnly(
-    const std::filesystem::path &database_path,
-    const manyforge::core::CellId &cell_id,
-    const manyforge::core::ApplyComponentBringUpReferenceDTO &parent);
-
-/// Resolve retained parent data from the exact original acquire intent. The
-/// full ordinary intent digest or linked plan digest must match. Only a
-/// successful read with no bring-up plan identifies the ordinary shape;
-/// unavailable/corrupt/conflicting reads never mean ordinary absence. No
-/// acquired claim identity or current effect authority is inferred.
-[[nodiscard]] manyforge::core::Result<PersistedManagerApplyStatus>
-ReadManagerApplyBringUpStatusReadOnly(
+ReadManagerApplyStatusByClaimIntentReadOnly(
     const std::filesystem::path &database_path,
     const manyforge::core::CellId &cell_id,
     const manyforge::core::CellAdmissionClaimIntentDTO &parent_claim_intent);
@@ -787,41 +678,6 @@ ReadManagerApplyConfigurationStatusReadOnly(
     const manyforge::core::CellId &cell_id,
     const manyforge::core::NamedApplyPublicationTransactionDTO &apply,
     const manyforge::core::CellAdmissionClaimDTO &actual_parent_claim);
-
-/// Read exact retained parent data for a captured native plan and sealed
-/// candidate. This grants no authority; the caller queries the original claim
-/// through the existing Kernel recovery port after this snapshot has closed.
-[[nodiscard]] manyforge::core::Result<PersistedManagerApplyStatus>
-ReadNativeApplyParentStatusReadOnly(
-    const std::filesystem::path &database_path,
-    const manyforge::core::CellId &cell_id,
-    const manyforge::core::NativeApplyPlanDTO &native_plan,
-    const manyforge::deployment::RetainedBundle &verified_candidate);
-
-/// Observe only the exact original Prepare catch before installation. A
-/// matching result ends the additional native early-plan classifier; it grants
-/// no effect continuation, adoption, settlement or claim/fence release. The
-/// caller supplies its captured full native plan and an independently verified
-/// candidate, and obtains the actual HeldExact parent receipt outside SQL.
-[[nodiscard]] manyforge::core::Result<std::optional<PersistedManagerApplyStatus>>
-ReadNativeApplyPreparationFailureReadOnly(
-    const std::filesystem::path &database_path,
-    const manyforge::core::CellId &cell_id,
-    const manyforge::core::NativeApplyPlanDTO &native_plan,
-    const manyforge::deployment::RetainedBundle &verified_candidate,
-    const manyforge::core::CellAdmissionClaimDTO &parent_claim,
-    const manyforge::core::CellAdmissionRecoveryReceiptQueryDTO &claim_query,
-    const manyforge::core::CellAdmissionRecoveryReceiptDTO &claim_receipt);
-
-/// Selected Apply settlement is proven against its separately sealed plan,
-/// actual child terminal proofs and publication/fence release. The ordinary
-/// direct-Apply validator deliberately excludes every linked parent.
-[[nodiscard]] manyforge::core::Result<void>
-ValidateManagerApplyBringUpCellAdmissionSettlementReadOnly(
-    const std::filesystem::path &database_path,
-    const manyforge::core::CellId &cell_id,
-    const manyforge::core::CellAdmissionClaimDTO &claim,
-    const manyforge::core::CellAdmissionClaimReleaseDTO &release);
 
 /// Authorize one Composer owner-epoch rotation without a Composer journal.
 /// A short local claim absent from the Manager journal is proven to have no

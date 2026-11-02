@@ -9,13 +9,13 @@
   "members": {
     "assignment.yaml": "sha256:64aa514af212149a52874df49f129f07e863c8f6c42764c532a923fe80d61ba7",
     "deployment.yaml": "sha256:ebd6ea8ea48b577f1fabfad65e80cd7957c1ea1effd3fc8f23d908ea51212e88",
-    "program.yaml": "sha256:d32a10f39b52bdaa6cf0539a6c75c4ebd3aa16f3c560a631e7137d1e0ed5222f"
+    "program.yaml": "sha256:16b65964eefa9ba4f7fe9e2f6db5d37d7fa7eea2b748fe9cbe8968451de62bfc"
   },
   "name": "Untitled",
   "saved_status": {
-    "checked_content_digest": "sha256:d167e7ee0b2b090dfb7787da4ffb05d3db748537bb048fcadab181b5f176cb1c",
+    "checked_content_digest": "sha256:2ad42eb2b3d2b9383a24648b8338d49f7af2d21f74b4edb16739a3baebb38470",
     "last_known_status": "incomplete",
-    "manyforge_version": "0.1.0"
+    "manyforge_version": "0.2.0"
   },
   "scenario_id": "Untitled",
   "source_snapshot": {

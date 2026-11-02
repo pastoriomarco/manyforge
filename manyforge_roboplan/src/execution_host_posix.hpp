@@ -59,8 +59,11 @@ void HandleStopSignal(int);
 
 void Require(bool condition, std::string detail);
 
-[[nodiscard]] std::filesystem::path
-ExistingDirectory(std::filesystem::path path, std::string_view label);
+/// Largest response one send carries atomically on this connected
+/// SOCK_SEQPACKET client. Raises the client's send buffer toward
+/// kMaximumResponseBytes first: an accepted socket does not inherit the
+/// listener's, and the kernel caps it at twice net.core.wmem_max.
+[[nodiscard]] std::size_t AtomicResponseCapacity(int client);
 
 [[nodiscard]] std::filesystem::path
 ExistingPrivateDirectory(std::filesystem::path path,
@@ -97,8 +100,6 @@ ReceiveManagedRuntimePacket(const int fd);
 ExchangeManagerCommand(const std::filesystem::path &manager_run_root,
                        CanonicalValue command,
                        const std::stop_token stop_token = {});
-
-[[nodiscard]] HostConfig ParseArguments(int argc, char **argv);
 
 void InstallSignalHandlers();
 } // namespace manyforge::roboplan_backend::host_detail

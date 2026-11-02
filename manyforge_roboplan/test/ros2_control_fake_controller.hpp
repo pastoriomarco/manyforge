@@ -37,14 +37,20 @@
 #include <utility>
 #include <vector>
 
+#include <unistd.h>
+
 namespace manyforge::ros2_control_execution::fake_controller {
 
 using FollowJointTrajectory = control_msgs::action::FollowJointTrajectory;
 using ServerGoal = rclcpp_action::ServerGoalHandle<FollowJointTrajectory>;
 
+/// Unique across the processes of a parallel ctest run, which share one ROS
+/// domain: exact endpoint-count waits would otherwise match another test's
+/// identically named topics.
 [[nodiscard]] inline std::string unique_suffix() {
   static std::atomic<std::uint64_t> next{1U};
-  return std::to_string(next.fetch_add(1U, std::memory_order_relaxed));
+  return std::to_string(::getpid()) + "_" +
+         std::to_string(next.fetch_add(1U, std::memory_order_relaxed));
 }
 
 /// One ROS context, node and spinning executor owned by a test peer.
@@ -357,19 +363,26 @@ public:
               return std::find(names.begin(), names.end(), reset_writer_) !=
                      names.end();
             };
+            if (writer_activation_refused_ &&
+                contains_writer(request->activate_controllers)) {
+              response->ok = false;
+              return;
+            }
             if (contains_writer(request->activate_controllers))
               writer_active_ = true;
             if (contains_writer(request->deactivate_controllers))
               writer_active_ = false;
           }
-          // A listed broadcaster switches like the stock manager's strict
-          // request: activating an active one is refused.
+          // A listed broadcaster switches like the stock manager: a strict
+          // request activating an active one is refused; a best-effort one
+          // leaves it as is.
           constexpr const char *broadcaster = "joint_state_broadcaster";
           if (std::find(request->activate_controllers.begin(),
                         request->activate_controllers.end(),
                         broadcaster) != request->activate_controllers.end()) {
             if (broadcaster_active_) {
-              response->ok = false;
+              response->ok = request->strictness !=
+                             controller_manager_msgs::srv::SwitchController::Request::STRICT;
               return;
             }
             broadcaster_listed_ = true;
@@ -592,6 +605,8 @@ public:
 
   [[nodiscard]] std::size_t switch_requests() const { return switch_requests_.load(); }
   [[nodiscard]] bool writer_active() const { return writer_active_.load(); }
+  /// The stock manager refusing a switch that activates the writer.
+  void SetWriterActivationRefused(bool refused) { writer_activation_refused_ = refused; }
   [[nodiscard]] std::vector<std::vector<double>> reset_commands() const {
     std::lock_guard lock(reset_mutex_);
     return reset_commands_;
@@ -643,6 +658,7 @@ private:
   std::atomic<bool> reply_waiting_{false};
   std::string reset_writer_;
   std::atomic<bool> writer_active_{false};
+  std::atomic<bool> writer_activation_refused_{false};
   mutable std::mutex reset_mutex_;
   std::vector<std::vector<double>> reset_commands_;
   std::vector<std::pair<std::vector<std::string>, std::vector<std::string>>>

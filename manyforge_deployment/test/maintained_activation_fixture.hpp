@@ -11,6 +11,7 @@
 #include <vector>
 
 #include <manyforge_deployment/content_identity.hpp>
+#include <manyforge_deployment/retained_bundle.hpp>
 #include <manyforge_deployment/verified_retained_bundle.hpp>
 
 #include "activation_component_profile_internal.hpp"
@@ -83,7 +84,7 @@ MaterializeMaintainedInterruptDeployment(
     const std::filesystem::path &package_root,
     const CanonicalValue &configuration,
     const std::filesystem::path &scenario_relative_path =
-        "examples/lite6_pick_and_place.scenario",
+        "examples/mock_lite6_pick_and_place.scenario",
     void (*authored_mapper)(CanonicalValue::Object &) = nullptr) {
   using namespace maintained_activation_fixture_detail;
   const std::filesystem::path workspace(MANYFORGE_WORKSPACE_ROOT);
@@ -222,6 +223,6 @@ MaterializeMaintainedLite6WithUnmountedTool(
   return MaterializeMaintainedInterruptDeployment(
       package_root,
       parse_strict_json_model_yaml(R"({"interrupt_rules":[]})").root(),
-      "examples/lite6_pick_and_place.scenario", separate_tool);
+      "examples/mock_lite6_pick_and_place.scenario", separate_tool);
 }
 } // namespace manyforge::deployment::test

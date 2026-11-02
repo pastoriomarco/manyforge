@@ -1,6 +1,6 @@
 api_version: manyforge.program.v2
 program_id: ur5e_lite6_wall_grouped
-program_revision: sha256:e48069b0437e5e0a9400db6d97fe8e33ae58526428df46d11542f330c0b53a9c
+program_revision: sha256:5c21a3f2dff3205f807c8cc7c89cd29401a1152f2efc095df032a817c3aec8ba
 program_profile: composable-cell-v1
 name: ur5e_lite6_wall_grouped
 description: Two independent joint trajectories in the UR5e + Lite6 wall cell, in one shared control group
@@ -44,9 +44,6 @@ target_roles:
     - capability_id: planning.motion.pose_goal
       parameters: {}
       disposition: required
-    - capability_id: planning.profile.balanced
-      parameters: {}
-      disposition: required
     - capability_id: planning.trajectory.time_parameterized
       parameters: {}
       disposition: required
@@ -77,9 +74,6 @@ target_roles:
       parameters: {}
       disposition: required
     - capability_id: planning.motion.pose_goal
-      parameters: {}
-      disposition: required
-    - capability_id: planning.profile.balanced
       parameters: {}
       disposition: required
     - capability_id: planning.trajectory.time_parameterized
@@ -146,12 +140,12 @@ parameters:
     min_exclusive: 0.0
     max_inclusive: 1.0
   description: Acceleration scale shared by the two planned motions.
-- parameter_id: max_blend_deviation_rad
+- parameter_id: blend_radius_m
   type: float64
-  default: 0.01
+  default: 0.0
   constraints:
     min_inclusive: 0.0
-  description: Default maximum Cartesian blend deviation.
+  description: Default Cartesian corner blend radius (m); 0 keeps exact corners.
 - parameter_id: max_tcp_linear_speed_mps
   type: float64
   default: 0.15

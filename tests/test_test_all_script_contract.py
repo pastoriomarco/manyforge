@@ -174,7 +174,6 @@ def test_roboplan_suite_qualifies_only_the_retained_product_consumer() -> None:
     for target in (
         "manyforge_ros2_control_execution_host",
         "manyforge_ros2_control_execution_host_pick_place_planning_fixture",
-        "manyforge_ros2_control_execution_host_admission_fixture",
         "manyforge_ros2_control_execution_host_projection_fixture",
         "manyforge_roboplan_candidate_worker",
     ):
@@ -240,7 +239,8 @@ def test_headless_selector_builds_ros_producer_closure_before_headless(
         target.write_text(source)
     for relative in (
         "manyforge_roboplan/CMakeLists.txt", "manyforge_ros2_control_execution/CMakeLists.txt",
-        "manyforge_cclc_msgs/package.xml", "manyforge_ros_bringup/package.xml",
+        "manyforge_xarm_control/CMakeLists.txt", "manyforge_isaac_adapter/CMakeLists.txt",
+        "manyforge_ros_bringup/package.xml",
     ):
         target = workspace / relative
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -257,7 +257,6 @@ def test_headless_selector_builds_ros_producer_closure_before_headless(
         '    printf \'producer-targets:%s\\n\' "$*" >> "$FAKE_LOG"\n'
         "    for output in \\\n"
             "      manyforge_ros2_control_execution_host \\\n"
-            "      manyforge_ros2_control_execution_host_admission_fixture \\\n"
             "      manyforge_ros2_control_execution_host_pick_place_planning_fixture \\\n"
             "      manyforge_roboplan_candidate_worker; do\n"
         '      : > "$root/$output"\n'
@@ -386,7 +385,6 @@ def test_headless_selector_builds_ros_producer_closure_before_headless(
     for target in (
         "manyforge_ros2_control_execution_host",
         "manyforge_ros2_control_execution_host_pick_place_planning_fixture",
-        "manyforge_ros2_control_execution_host_admission_fixture",
         "manyforge_ros2_control_execution_host_projection_fixture",
         "manyforge_roboplan_candidate_worker",
     ):
@@ -565,12 +563,12 @@ def test_i9_ros2_control_builder_selects_only_current_runtime_products() -> None
     assert "MANYFORGE_BUILD_ROS2_CONTROL_RUNTIME=ON" in source
     assert "manyforge_ros2_control_execution_host" in source
     assert "manyforge_roboplan_candidate_worker" in source
-    assert "manyforge_cclc_msgs" in source
+    assert "manyforge_cclc_msgs" not in source
     assert "manyforge_ros_bringup" in source
     assert "--symlink-install" in source
     for forbidden in (
         "isaac_demo_supervisor",
-        "manyforge_native_execution_host",
+        "manyforge_execution_host",
         "composer",
         "docker ",
     ):
@@ -593,10 +591,7 @@ def test_ros_images_build_the_selected_picknik_source(name: str) -> None:
         )
 
 
-@pytest.mark.parametrize("relative", (
-    "scripts/ros/build-ros2-control-runtime.sh",
-    "scripts/ros/launch-isaac-topic-based-control.sh",
-))
+@pytest.mark.parametrize("relative", ("scripts/ros/build-ros2-control-runtime.sh",))
 @pytest.mark.parametrize("selected", ("correct", "wrong", "missing"))
 def test_isaac_upstream_source_marker_is_required_before_selection(
     relative: str, selected: str, tmp_path: Path,
@@ -625,10 +620,7 @@ def test_isaac_upstream_source_marker_is_required_before_selection(
 
 
 
-@pytest.mark.parametrize("relative", (
-    "scripts/ros/build-ros2-control-runtime.sh",
-    "scripts/ros/launch-isaac-topic-based-control.sh",
-))
+@pytest.mark.parametrize("relative", ("scripts/ros/build-ros2-control-runtime.sh",))
 @pytest.mark.parametrize("selected", ("correct", "stale", "missing"))
 def test_isaac_selected_topic_plugin_cannot_be_shadowed(
     relative: str, selected: str, tmp_path: Path,
@@ -657,47 +649,6 @@ def test_isaac_selected_topic_plugin_cannot_be_shadowed(
     assert completed.returncode == {"correct": 0, "stale": 2, "missing": 1}[selected]
     if selected == "stale":
         assert "actual prefix=" + prefix in completed.stderr
-
-
-def test_i9_isaac_launcher_enforces_the_recorded_topology_and_owner_split() -> None:
-    source = (_REPO_ROOT / "scripts/ros/launch-isaac-topic-based-control.sh").read_text(
-        encoding="utf-8"
-    )
-    topology_source = (_REPO_ROOT / "config/ros/isaac_i9.env.sh").read_text(encoding="utf-8")
-
-    assert "manyforge_fail_composable_cell_runtime_unavailable" not in source
-    assert 'source "${WORKSPACE}/config/ros/isaac_i9.env.sh"' in source
-    assert "ROS_DOMAIN_ID:-0" in topology_source
-    assert "RMW_IMPLEMENTATION:-rmw_fastrtps_cpp" in topology_source
-    assert "ROS_AUTOMATIC_DISCOVERY_RANGE:-LOCALHOST" in topology_source
-    assert "ROS_STATIC_PEERS:-192.168.1.132;192.168.1.68" in topology_source
-    for stale_override in (
-        "FASTRTPS_DEFAULT_PROFILES_FILE",
-        "FASTDDS_DEFAULT_PROFILES_FILE",
-        "ROS_DISCOVERY_SERVER",
-        "ROS_SUPER_CLIENT",
-        "CYCLONEDDS_URI",
-    ):
-        assert stale_override in topology_source
-    assert "build-ros2-control-runtime.sh" in source
-    assert "isaac_topic_based_control.launch.py" in source
-    # Attach-only startup does not own or launch the user's Isaac process.
-    assert "simulation_interfaces" not in source
-    assert "runtime_namespace:=${runtime_namespace}" in source
-    assert "command_gate_owner_namespace" not in source
-    # The pose observer is a Deployment component's supervised process.
-    assert "manager_run_root:=" not in source
-    assert "pose_observer_site_config" not in source
-    assert "MANYFORGE_MANAGER_STATE_ROOT" not in source
-    assert "MANYFORGE_ISAAC_COMPONENT_ID" in source
-    for forbidden in (
-        "isaac_demo_supervisor",
-        "program_path:=",
-        "deployment_path:=",
-        "composer_url:=",
-        "docker ",
-    ):
-        assert forbidden not in source
 
 
 def test_i9_topology_input_clears_stale_dds_overrides_and_is_role_free() -> None:
@@ -752,7 +703,6 @@ def test_i9_topology_input_clears_stale_dds_overrides_and_is_role_free() -> None
         "integration",
         "qualification",
         "qualification-all",
-        "qualification-native",
         "qualification-soak",
     ),
 )

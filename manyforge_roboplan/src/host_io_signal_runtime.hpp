@@ -51,11 +51,34 @@ public:
          std::shared_ptr<core::IScheduler> scheduler,
          std::size_t compiled_blackboard_key_capacity = 0U,
          std::vector<deployment::RetainedIoSignalConfiguration> system_rows =
-             {}) {
+             {},
+         std::vector<deployment::RetainedIoSignalConfiguration> adapter_rows = {}) {
     Require(clock && scheduler &&
-                (!sources.empty() || !system_rows.empty() ||
+                (!sources.empty() || !system_rows.empty() || !adapter_rows.empty() ||
                  compiled_blackboard_key_capacity > 0U),
             "I/O installation has no compiled source/time authority");
+    // A machine's I/O member signals (CONTRACTS §16, profile
+    // `component_adapter`): one in-process source per signal
+    // (`<member>.<signal>`), fed by the family's I/O update sink; no driver.
+    // Mock outputs (`mock_output`) are in-process sources too: each accepted
+    // write is published back as their sample (CONTRACTS §7, D2).
+    std::map<core::InterruptSourceId,
+             std::vector<deployment::RetainedIoSignalConfiguration>>
+        adapter_sources;
+    for (const auto &row : adapter_rows) {
+      // An output row has no ingress queue: its source holds its latest
+      // sample only.
+      Require((row.provider.profile == deployment::kComponentAdapterIoProfile ||
+               (row.provider.profile == "mock_output" &&
+                row.descriptor.direction == core::IoSignalDirection::kOutput)) &&
+                  !sources.contains(row.descriptor.source_id),
+              "adapter signal source is not one exact in-process source");
+      auto &rows = adapter_sources[row.descriptor.source_id];
+      Require(rows.empty() || rows.front().descriptor.signal_id.controllable_component_id ==
+                                  row.descriptor.signal_id.controllable_component_id,
+              "adapter signal source spans several components");
+      rows.push_back(row);
+    }
     // Compiled system signals: one in-process source with no driver or
     // lifecycle; the host owns it (contract §2).
     std::optional<core::InterruptSourceId> system_source;
@@ -70,7 +93,7 @@ public:
     Require(sources.size() < std::numeric_limits<std::size_t>::max(),
             "I/O source capacity arithmetic overflow");
     core::IoSignalLimitsDTO limits{
-        sources.size() + (system_source ? 1U : 0U) +
+        sources.size() + adapter_sources.size() + (system_source ? 1U : 0U) +
             (compiled_blackboard_key_capacity > 0U ? 1U : 0U),
         0U,
         compiled_blackboard_key_capacity > 0U ? 64U : 0U,
@@ -111,11 +134,27 @@ public:
       for (const auto &row : system_rows)
         catalog.signals.push_back(row.descriptor);
     }
+    for (const auto &[source, rows] : adapter_sources) {
+      Require(!system_source || *system_source != source,
+              "adapter signal source repeats the system source");
+      const auto depth = std::max<std::size_t>(rows.front().provider.ingress_depth, 1U);
+      drain_budget += depth + 1U;
+      limits.records_per_source = std::max(limits.records_per_source, depth);
+      limits.records_per_source_overrides.emplace(source, depth);
+      for (const auto &row : rows)
+        catalog.signals.push_back(row.descriptor);
+    }
     Require(catalog.signals.size() <= std::numeric_limits<std::size_t>::max() -
                                           compiled_blackboard_key_capacity,
             "I/O key capacity arithmetic overflow");
+    // Each core-held `<output>.changed_outside` signal has its own core
+    // source (CONTRACTS §7) and counts against both bounds.
+    const auto changed_outside = static_cast<std::size_t>(
+        std::count_if(catalog.signals.begin(), catalog.signals.end(),
+                      [](const auto &descriptor) { return core::HoldsChangedOutside(descriptor); }));
+    limits.maximum_sources += changed_outside;
     limits.maximum_signals =
-        catalog.signals.size() + compiled_blackboard_key_capacity;
+        catalog.signals.size() + changed_outside + compiled_blackboard_key_capacity;
     auto made =
         core::IoSignalSubsystem::Create(std::move(catalog), limits, *clock);
     Require(made.ok(), "sealed I/O signal catalog cannot be installed");
@@ -159,13 +198,29 @@ public:
               "system signal source incarnation cannot be installed");
       result->incarnations_.emplace(*system_source, *system_incarnation);
     }
+    for (const auto &[source, rows] : adapter_sources) {
+      const auto incarnation =
+          core::IoSourceIncarnation(content_identity::framed_sha256(
+              "manyforge.host-io-source", "manyforge.host-io-source.v1",
+              CanonicalValue(CanonicalValue::Object{
+                  {"owner_epoch", CanonicalValue(owner.value())},
+                  {"generation", CanonicalValue(std::to_string(generation))},
+                  {"source_id", CanonicalValue(source.value())}})));
+      Require(signals->InstallSource(source, incarnation, std::nullopt).ok(),
+              "adapter signal source incarnation cannot be installed");
+      result->incarnations_.emplace(source, incarnation);
+      result->adapter_sources_.emplace(source, AdapterSource{source, incarnation, 0U});
+      for (const auto &row : rows)
+        result->adapter_signal_sources_.emplace(row.descriptor.signal_id, source);
+    }
     std::shared_ptr<IngressWake> wake;
-    if (!sources.empty() || system_source) {
+    if (!sources.empty() || system_source || !adapter_sources.empty()) {
       auto ingress = core::IoSignalIngress::Create(signals);
       Require(ingress.ok(), "sealed I/O ingress cannot be installed");
       result->ingress_ =
           std::shared_ptr<core::IoSignalIngress>(std::move(ingress.value()));
       wake = std::make_shared<IngressWake>(result->ingress_, result);
+      result->adapter_ingress_ = wake;
     }
     if (system_source) {
       MockBooleanInputSource source{*system_source, *system_incarnation, {}};
@@ -220,6 +275,15 @@ public:
     return driver_inputs_;
   }
 
+  /// A Mock output whose accepted writes are published as its sample with
+  /// source `manyforge_write` (CONTRACTS §7, D2).
+  void AddMockOutput(std::shared_ptr<MockBooleanOutputProvider> output,
+                     const core::IoSignalId &signal) {
+    Require(!started_ && output && adapter_signal_sources_.contains(signal),
+            "Mock output has no installed in-process source");
+    MockEchoChannel &channel = MockChannel(std::move(output));
+    channel.written.push_back(signal);
+  }
   void AddMockEcho(std::shared_ptr<MockBooleanOutputProvider> output,
                    const core::IoSignalId &signal, core::Duration delay) {
     Require(!started_ && output && mock_inputs_.contains(signal) && delay >= 0,
@@ -227,12 +291,7 @@ public:
     for (const auto &channel : mock_echoes_)
       for (const auto &target : channel.targets)
         Require(target.signal != signal, "Mock input repeats an echo source");
-    const auto found = std::find_if(mock_echoes_.begin(), mock_echoes_.end(),
-        [&](const auto &channel) { return channel.output == output; });
-    if (found == mock_echoes_.end())
-      mock_echoes_.push_back({std::move(output), {{signal, delay, 0U, {}}}});
-    else
-      found->targets.push_back({signal, delay, 0U, {}});
+    MockChannel(std::move(output)).targets.push_back({signal, delay, 0U, {}});
   }
   std::function<void()>
   cancellation_hook(const std::shared_ptr<IoProviderDriverRecord> &driver) {
@@ -255,8 +314,7 @@ public:
   }
   using InputLifecycleProcessor = std::function<core::Result<void>(
       const std::shared_ptr<core::IIoSignalService> &,
-      std::span<const core::InterruptSourceId>,
-      const core::LifecycleTransactionId &, bool)>;
+      std::span<const core::InterruptSourceId>, bool)>;
   IoProviderDriverRecord::InputLifecycleHook
   input_lifecycle_hook(const std::shared_ptr<IoProviderDriverRecord> &driver) {
     std::vector<core::InterruptSourceId> sources;
@@ -265,7 +323,6 @@ public:
       for (const auto &input : found->second)
         sources.push_back(input.rows.front().descriptor.source_id);
     return [weak = weak_from_this(), sources = std::move(sources)](
-               const core::LifecycleTransactionId &transaction,
                bool disabled) -> core::Result<void> {
       const auto self = weak.lock();
       if (!self)
@@ -288,7 +345,7 @@ public:
         processor = self->input_lifecycle_processor_;
       }
       // A staged, not-yet-Applied service has no armed Kernel catalog.
-      return processor ? processor(self, sources, transaction, disabled)
+      return processor ? processor(self, sources, disabled)
                        : core::Result<void>::Ok();
     };
   }
@@ -381,6 +438,7 @@ public:
   void RequestRuleEvidenceProcessing() {
     std::lock_guard lock(mutex_);
     ScheduleRuleEvidenceLocked(clock_->now());
+    ScheduleSampleExpiryLocked();
   }
   void DetachRuleEvidenceProcessor() noexcept {
     std::lock_guard lock(mutex_);
@@ -1037,8 +1095,10 @@ public:
     for (std::size_t i = 0; i < mock_echoes_.size(); ++i)
       mock_echoes_[i].output->SetModelObserver(
           [weak = weak_from_this(), i](bool value, core::TimePoint written_at) {
-            if (auto self = weak.lock())
+            if (auto self = weak.lock()) {
+              self->PublishMockWrite(i, value, written_at);
               self->ScheduleMockEcho(i, value, written_at);
+            }
           });
     // The system source has no DriverRecord: its levels outlive compositions
     // in the host store. Starting (also as an Apply candidate) only replays
@@ -1112,6 +1172,35 @@ public:
     if (!changed.ok())
       return changed.error();
     return changed.value().publication_error;
+  }
+
+  /// CONTRACTS §6 I/O update sink: one acquisition of an adapter family's
+  /// component, stamped at receipt by the family. Updates of a component
+  /// whose signals this catalog doesn't hold are not this runtime's.
+  void PublishAdapterUpdates(const std::string &component_id,
+                             const std::vector<core::IoSignalUpdateDTO> &updates,
+                             const std::int64_t received_at_ns) {
+    // One acquisition per source of the updated signals; an update outside
+    // this catalog is not this runtime's.
+    std::map<core::InterruptSourceId, core::IoSourceAcquisitionDTO> acquisitions;
+    {
+      std::lock_guard lock(mutex_);
+      if (!active_) return;
+      for (const auto &update : updates) {
+        if (update.signal_id.controllable_component_id.value() != component_id) continue;
+        const auto signal = adapter_signal_sources_.find(update.signal_id);
+        if (signal == adapter_signal_sources_.end()) continue;
+        auto &source = adapter_sources_.at(signal->second);
+        auto [acquisition, added] = acquisitions.try_emplace(
+            source.source_id, core::IoSourceAcquisitionDTO{source.source_id, source.incarnation,
+                                                           0U, received_at_ns, {}});
+        if (added) acquisition->second.source_sequence = ++source.sequence;
+        acquisition->second.updates.push_back(update);
+      }
+    }
+    // A refused frame records its own loss barrier in the ingress.
+    for (const auto &entry : acquisitions)
+      static_cast<void>(adapter_ingress_->TryEnqueue(entry.second));
   }
 
   core::Result<MockIoInputSetResult>
@@ -1218,6 +1307,10 @@ public:
         if (drain_handle_)
           scheduler_->cancel(*drain_handle_);
         drain_handle_.reset();
+        if (sample_expiry_handle_)
+          scheduler_->cancel(*sample_expiry_handle_);
+        sample_expiry_handle_.reset();
+        sample_expiry_deadline_.reset();
         // Keep replay results stable until in-flight starts have crossed the
         // same provider barriers. No new callback may publish while inactive.
         for (auto &[key, entry] : node_simulations_)
@@ -1257,7 +1350,36 @@ private:
   struct MockEchoChannel final {
     std::shared_ptr<MockBooleanOutputProvider> output;
     std::vector<MockEchoTarget> targets;
+    /// The channel's output signals, published back on each accepted write.
+    std::vector<core::IoSignalId> written{};
   };
+  MockEchoChannel &MockChannel(std::shared_ptr<MockBooleanOutputProvider> output) {
+    const auto found = std::find_if(mock_echoes_.begin(), mock_echoes_.end(),
+        [&](const auto &channel) { return channel.output == output; });
+    if (found != mock_echoes_.end()) return *found;
+    return mock_echoes_.emplace_back(MockEchoChannel{std::move(output), {}, {}});
+  }
+  /// One accepted Mock write: its value is the sample of every output of the
+  /// channel, source `manyforge_write`. Called under the output's model lock.
+  void PublishMockWrite(std::size_t channel, bool value, core::TimePoint written_at) {
+    std::map<core::InterruptSourceId, core::IoSourceAcquisitionDTO> acquisitions;
+    {
+      std::lock_guard lock(mutex_);
+      if (!active_ || channel >= mock_echoes_.size()) return;
+      for (const auto &signal : mock_echoes_[channel].written) {
+        auto &source = adapter_sources_.at(adapter_signal_sources_.at(signal));
+        auto [acquisition, added] = acquisitions.try_emplace(
+            source.source_id, core::IoSourceAcquisitionDTO{source.source_id, source.incarnation,
+                                                           0U, written_at, {}});
+        if (added) acquisition->second.source_sequence = ++source.sequence;
+        acquisition->second.updates.push_back({signal, core::IoSampleValidity::kValid, value,
+                                               std::nullopt,
+                                               core::IoSignalSampleSource::kManyforgeWrite});
+      }
+    }
+    for (const auto &entry : acquisitions)
+      static_cast<void>(adapter_ingress_->TryEnqueue(entry.second));
+  }
   void ScheduleMockEcho(std::size_t channel, bool value,
                         core::TimePoint written_at) {
     std::lock_guard lock(mutex_);
@@ -1545,6 +1667,31 @@ private:
           }
         }, core::SchedulerPriority::RuntimeSafety);
   }
+  // A fresh sample turns stale with no new acquisition: refresh the published
+  // samples at that moment so the event stream sends the change (CONTRACTS
+  // §7). One deadline at a time, the earliest; no periodic re-read.
+  void ScheduleSampleExpiryLocked() {
+    if (!active_)
+      return;
+    const auto next = signals_->NextSampleExpiry();
+    if (!next || (sample_expiry_handle_ && sample_expiry_deadline_ &&
+                  *sample_expiry_deadline_ <= *next))
+      return;
+    if (sample_expiry_handle_) scheduler_->cancel(*sample_expiry_handle_);
+    sample_expiry_deadline_ = *next;
+    sample_expiry_handle_ = scheduler_->schedule(
+        *next, [weak = weak_from_this(), deadline = *next] {
+          const auto self = weak.lock();
+          if (!self) return;
+          std::lock_guard lock(self->mutex_);
+          if (self->sample_expiry_deadline_ != deadline) return;
+          self->sample_expiry_handle_.reset();
+          self->sample_expiry_deadline_.reset();
+          if (!self->active_) return;
+          self->signals_->RefreshSamples();
+          self->ScheduleSampleExpiryLocked();
+        }, core::SchedulerPriority::Monitoring);
+  }
   std::shared_ptr<core::IClock> clock_;
   std::shared_ptr<core::IScheduler> scheduler_;
   std::shared_ptr<core::IoSignalSubsystem> signals_;
@@ -1557,6 +1704,16 @@ private:
   std::map<core::IoSignalId, MockInput> mock_inputs_;
   std::vector<core::IoSignalId> system_signals_;
   std::unique_ptr<MockBooleanInputProvider> system_provider_;
+  struct AdapterSource final {
+    core::InterruptSourceId source_id;
+    core::IoSourceIncarnation incarnation;
+    std::uint64_t sequence{};
+  };
+  /// Adapter-fed sources, the source of each of their signals, and the
+  /// ingress they publish to.
+  std::map<core::InterruptSourceId, AdapterSource> adapter_sources_;
+  std::map<core::IoSignalId, core::InterruptSourceId> adapter_signal_sources_;
+  std::shared_ptr<core::IIoSignalIngress> adapter_ingress_;
   std::vector<MockEchoChannel> mock_echoes_;
   mutable std::mutex mock_delivery_mutex_;
   mutable std::mutex mutex_;
@@ -1567,6 +1724,8 @@ private:
   InputLifecycleProcessor input_lifecycle_processor_;
   std::optional<core::ScheduleHandle> rule_evidence_handle_;
   std::optional<core::TimePoint> rule_evidence_deadline_;
+  std::optional<core::ScheduleHandle> sample_expiry_handle_;
+  std::optional<core::TimePoint> sample_expiry_deadline_;
   std::map<core::IoSignalId, std::string> input_profiles_;
   std::map<NodeSimulationKey, NodeSimulation> node_simulations_;
   // Actual accepted Run clock notification, never inferred from missing packets

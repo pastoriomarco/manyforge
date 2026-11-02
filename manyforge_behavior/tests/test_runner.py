@@ -226,6 +226,31 @@ def test_runner_submits_unit_tagged_gripper_command_to_selected_target() -> None
     assert "group_id" not in repr(transport.submitted)
 
 
+def test_runner_passes_wait_for_duration_as_a_bool_caller_option() -> None:
+    transport = RecordingTransport()
+    runner = OrchestratorRunner(KernelClient(transport), _applied_binding())
+
+    runner.submit_gripper_position(
+        request_id="request-gripper-1",
+        program_run_id="run-1",
+        component_role_id="robot",
+        target_role_id="gripper",
+        node_instance_id="root/gripper[0]",
+        node_attempt_id="run-1/gripper[0]/attempt-1",
+        position_kind="linear_m",
+        position=0.004,
+        command_duration_s=0.25,
+        wait_for_duration=True,
+        completion_timeout_s=2.0,
+    )
+
+    assert transport.submitted is not None
+    assert transport.submitted["participants"][0]["payload"]["caller_options"] == [
+        {"option_id": "command_duration_s", "value_s": 0.25},
+        {"option_id": "wait_for_duration", "value_bool": True},
+    ]
+
+
 def test_runner_stop_is_attributed_fenced_and_exactly_replayable() -> None:
     transport = RecordingTransport()
     runner = OrchestratorRunner(KernelClient(transport), _applied_binding())

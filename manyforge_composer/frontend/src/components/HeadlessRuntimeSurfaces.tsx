@@ -30,7 +30,6 @@ import type {
 } from './ExecutionHistoryPanel';
 import { FailureCapturePanel } from './FailureCapturePanel';
 import { useOperationalErrorMirror } from '../state/operationalErrors';
-import { activeMotionInterlocks, motionGatingAlarms } from '../state/operatorAlarmMotionAttention';
 import {
   alarmActionErrorMessage as actionErrorMessage,
   useExactAlarmAcknowledgement,
@@ -40,25 +39,29 @@ import { OverlayPanel } from './OverlayPanel';
 import { NoticeActions, NoticeItem, NotificationRail } from './WorkbenchNotifications';
 
 
+/** The state label (plan, "Presentation of problems"): Active or Resolved. */
 function lifecycleLabel(alarm: OperatorAlarmRecord): string {
   switch (alarm.lifecycleState) {
     case 'active_unacknowledged':
-      return 'Active · Acknowledgement required';
+      return 'Active';
     case 'active_acknowledged':
-      return alarm.acknowledgementRequired
-        ? 'Active · Acknowledged'
-        : 'Active · No acknowledgement required';
+      return 'Active · Acknowledged';
     case 'returned_unacknowledged':
-      return 'Resolved · Acknowledgement required';
+      return 'Resolved';
     case 'returned_acknowledged':
       return 'Resolved · Acknowledged';
   }
 }
 
+/** Colour means severity: red for an error, yellow for a warning. */
 function alarmSeverity(priority: AlarmPriority): OperatorAlarmView['severity'] {
   if (priority === 'critical') return 'critical';
   if (priority === 'high') return 'error';
   return 'warning';
+}
+
+function isErrorAlarm(alarm: OperatorAlarmRecord): boolean {
+  return alarmSeverity(alarm.priority) !== 'warning';
 }
 
 export function attentionAlarmsNewestFirst(
@@ -73,16 +76,7 @@ export function attentionAlarmsNewestFirst(
       || left.conditionId.localeCompare(right.conditionId));
 }
 
-/** An active condition interlock gates motion until its cause clears;
- * acknowledgement cannot release it (spec 530 §4.2). */
-export function motionInterlockMessage(alarm: OperatorAlarmRecord): string | null {
-  return alarm.active && alarm.requiresMotionAttention && !alarm.acknowledgementRequired
-    ? `Motion blocked by an active interlock: ${alarm.title}; resolve its cause. Acknowledgement does not release it`
-    : null;
-}
-
 export function operatorAlarmView(alarm: OperatorAlarmRecord): OperatorAlarmView {
-  const interlock = motionInterlockMessage(alarm);
   return {
     conditionId: alarm.conditionId,
     activationId: alarm.activationId,
@@ -93,9 +87,7 @@ export function operatorAlarmView(alarm: OperatorAlarmRecord): OperatorAlarmView
     severity: alarmSeverity(alarm.priority),
     title: alarm.title,
     message: alarm.message,
-    operatorResponse: interlock === null
-      ? alarm.operatorResponse
-      : `${interlock}. ${alarm.operatorResponse}`,
+    operatorResponse: alarm.operatorResponse,
     details: {
       ...alarm.details,
       alarm_class: alarm.alarmClass,
@@ -193,39 +185,31 @@ export function partitionRepresentedAlarms(
 }
 
 /**
- * The alarms of the red row: those that gate motion now (spec 530 §10.1),
- * unacknowledged ones newest first, then active interlocks. Alarms that gate
- * nothing are warnings.
+ * The alarms of the red row: unacknowledged errors, newest first. An error
+ * stays red, Active or Resolved, until the operator acknowledges it; then it
+ * goes to History. Acknowledgement never gates anything.
  */
-export function blockingAlarms(
+export function errorAlarms(
   alarms: OperatorAlarmSnapshot | null | undefined,
 ): OperatorAlarmRecord[] {
-  return [
-    ...attentionAlarmsNewestFirst(motionGatingAlarms(alarms)),
-    ...activeMotionInterlocks(alarms),
-  ];
+  return attentionAlarmsNewestFirst(alarms?.alarms ?? []).filter(isErrorAlarm);
 }
 
-/**
- * What red "Acknowledge all" acknowledges: the unacknowledged gating alarms
- * only, each by its exact revision. The owner's bulk request must name every
- * unacknowledged alarm, warnings included, so each is acknowledged exactly.
- */
+/** What red "Acknowledge all" acknowledges: the red row's alarms, each by its exact revision. */
 export function redAcknowledgementMembers(
   alarms: OperatorAlarmSnapshot | null | undefined,
 ): AlarmMembership[] {
-  return attentionAlarmsNewestFirst(motionGatingAlarms(alarms)).map(
+  return errorAlarms(alarms).map(
     ({ conditionId, activationId, recordRevision }) => ({ conditionId, activationId, recordRevision }),
   );
 }
 
-/** Unacknowledged alarms that gate nothing: warnings, newest first. */
-export function nonBlockingAttentionAlarms(
+/** Unacknowledged warnings (yellow), newest first. */
+export function warningAlarms(
   alarms: OperatorAlarmSnapshot | null | undefined,
 ): OperatorAlarmRecord[] {
-  const gating = new Set(motionGatingAlarms(alarms));
   return attentionAlarmsNewestFirst(alarms?.alarms ?? [])
-    .filter((alarm) => !gating.has(alarm));
+    .filter((alarm) => !isErrorAlarm(alarm));
 }
 
 /**
@@ -236,12 +220,8 @@ export function runtimeErrorItemCount(
   alarms: OperatorAlarmSnapshot | null | undefined,
   conditions: readonly WorkbenchNotice[],
 ): number {
-  const representedAlarmCount = [...partitionRepresentedAlarms(
-    blockingAlarms(alarms),
-    conditions,
-  ).represented.values()].reduce((count, records) => count + records.length, 0);
-  return Math.max(0, (alarms?.motionAttentionMembership.length ?? 0) - representedAlarmCount)
-    + conditions.length;
+  const { standalone } = partitionRepresentedAlarms(errorAlarms(alarms), conditions);
+  return standalone.length + conditions.length;
 }
 
 export function runtimeAttentionSummary(
@@ -353,9 +333,8 @@ export function HeadlessRuntimeSurfacesView({
   });
   const standing = snapshot?.alarms.alarms.filter((alarm) =>
     alarm.lifecycleState === 'active_acknowledged') ?? [];
-  // Only what blocks motion now: unacknowledged gating alarms (Acknowledge)
-  // and active interlocks (resolve the cause; never acknowledged).
-  const shownAlarms = useMemo(() => blockingAlarms(snapshot?.alarms), [snapshot]);
+  // The red row: unacknowledged errors, Active or Resolved.
+  const shownAlarms = useMemo(() => errorAlarms(snapshot?.alarms), [snapshot]);
   const acknowledgeable = (alarm: OperatorAlarmRecord) => alarm.lifecycleState !== 'active_acknowledged';
   const attentionCount = shownAlarms.filter(acknowledgeable).length;
   // Conditions are counted and shown but never enter acknowledgement. An

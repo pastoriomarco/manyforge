@@ -20,8 +20,10 @@ for installation, supported entrypoints and operation.
 ### Install and start the available runtime
 
 The current checkout runs as a source-built **development workbench** with
-three lanes: Mock, Isaac Sim (attach-only) and Real (Lite 6). There is no
-packaged installer, and physical execution is not yet qualified. Do not infer
+three lanes, all ros2_control with the stock joint trajectory controller:
+Mock, Isaac (a separately running Isaac Sim; the workbench never starts it)
+and Real (UFACTORY xArm-family robots; Lite 6 measured on hardware). There is
+no packaged installer, and physical execution is not qualified. Do not infer
 physical authorization from a green UI.
 
 Read [the workbench runbook](docs/operations/DEVELOPMENT_WORKBENCH.md) first.
@@ -41,7 +43,7 @@ git clone --branch dev https://github.com/pastoriomarco/manyforge.git
 cd manyforge
 ./scripts/compose-dev.sh build
 ./scripts/compose-dev.sh start \
-  --project examples/lite6_pick_and_place.scenario
+  --project examples/mock_lite6_pick_and_place.scenario
 ```
 
 `build` prepares pinned dependencies and builds the full ROS Lyrical image
@@ -55,7 +57,7 @@ it does not run tests or qualify a release. Subsequent starts reuse the cache:
 
 ```bash
 ./scripts/compose-dev.sh start
-./scripts/compose-dev.sh start --project examples/lite6_pick_and_place.scenario
+./scripts/compose-dev.sh start --project examples/mock_lite6_pick_and_place.scenario
 ./scripts/compose-dev.sh status
 ```
 
@@ -63,11 +65,44 @@ Open **http://localhost:3000**. Check reported scenario, active configuration an
 convergence, not just whether the page loads. Do not start a second stack to
 work around an unhealthy one.
 
+On a Jetson, `build` selects NVIDIA's `noble-jetpack` package suite by itself
+(`NVIDIA_ISAAC_ROS_RELEASE_SUITE` overrides it).
+
+### Configure
+
+- **Site settings** (machine facts, never in a Scenario): a JSON file
+  `{"schema":"manyforge.site.v1","device_addresses":{"lite6_main":"192.168.1.31"}}`,
+  optionally with `project_folders` (absolute host paths). Export its absolute
+  path as `MANYFORGE_DEV_SITE_SETTINGS` before `start`; it is read only at
+  start. A Real machine's card names the `device_addresses` key
+  (`configuration.device_address_ref`), never the address.
+- **ROS/DDS**: `ROS_DOMAIN_ID` (default 0) must match Isaac Sim and other ROS
+  machines; leave `ROS_AUTOMATIC_DISCOVERY_RANGE` unset or `SUBNET` to reach
+  them on the LAN (`LOCALHOST` isolates a test machine unless
+  `ROS_STATIC_PEERS` lists the hosts). A running container keeps the values it
+  was started with.
+- **Deployment**: each component has a `lane` (`mock`, `isaac`, `real`); a
+  UFACTORY robot is a machine whose owner carries the lane and address, with
+  members (`arm`, `controller_io`, `tool_io`) that can be deactivated
+  (`active: false`) but not removed.
+- The full variable list is in the
+  [workbench guide](docs/operations/DEVELOPMENT_WORKBENCH.md#environment-variables).
+
 ### Operate, diagnose and shut down
 
-- Use Composer's Program, Scene and Deployment workspaces. Apply changes runtime
-  configuration; Save persists artifacts. Inspect status and any confirmation
-  before proceeding. Motion requires separate explicit authorization and readiness.
+- Use Composer's Program, Scene, Components and Deployment workspaces. Apply
+  changes runtime configuration; Save persists artifacts. **New** empties the
+  cell; **Load** is New then Apply, and leaves components prepared. Prepare /
+  Enable (or **Activate and execute**) bring components up; **Execute** starts
+  the Program held, and **Run** starts each motion group. On a real xArm the
+  motors switch on only at the arm's Enable. Inspect status and any
+  confirmation before proceeding. Motion requires separate explicit
+  authorization and readiness.
+- Component states, the cell latch and Execute readiness: `GET /api/components`,
+  `GET /api/cell/latch`, `GET /api/program/readiness` on Composer (9020).
+  A C2 error after an e-stop is normal: Recover the machine once the e-stop is
+  released (with authorization). On Isaac, "Simulation not playing" never
+  blocks Execute; new motion is refused until the simulation plays.
 - Runtime/history exposes failures; Robot Control is for addressed manual commands.
   A stale/disconnected viewer is not evidence of current robot pose. Stop issuing
   new motion requests and inspect owner status when observation is uncertain.
@@ -104,8 +139,8 @@ scenario switching; do not automatically restart/reapply to hide a fault.
   [architecture map](docs/reference/ARCHITECTURE.md).
 - Observe owner-issued status. A lost response is not proof that a command
   failed; do not repeat effects or infer physical rest from a receipt.
-- Do not start motion, Apply, Reset, clear faults or overwrite artifacts without
-  authorization. Never bypass admission, Stop or recovery prerequisites.
+- Do not start motion, Apply, Load, New, Reset, Enable, Recover, clear faults or
+  overwrite artifacts without authorization. Never bypass admission, Stop or recovery prerequisites.
 - [scripts/templates/AGENTS.md](scripts/templates/AGENTS.md) is a shipped
   runtime-agent template, not repository development guidance.
   Material under `agent-skills/` is not a current tool contract.

@@ -245,12 +245,7 @@ template <class Id>
       value);
 }
 
-[[nodiscard]] CanonicalValue command_value(const CapabilityCommandValueDTO& value) {
-  if (const auto* output = std::get_if<IoSignalWriteCommandValueDTO>(&value))
-    return CanonicalValue(CanonicalValue::Object{{"io_signal_write", CanonicalValue(CanonicalValue::Object{
-        {"resource_role_id", CanonicalValue(output->resource_role_id.value())},
-        {"value", CanonicalValue(output->value)}})}});
-  const auto& command = std::get<GripperPositionCommandValueDTO>(value);
+[[nodiscard]] CanonicalValue command_value(const GripperPositionCommandValueDTO& command) {
   CanonicalValue::Object fields{{"position", position_value(command.position)}};
   if (command.max_effort) fields.emplace_back("max_effort", effort_value(*command.max_effort));
   return CanonicalValue(
@@ -260,9 +255,13 @@ template <class Id>
 [[nodiscard]] CanonicalValue capability_payload_value(const PreparedCapabilityCommandDTO& value) {
   CanonicalValue::Array options;
   for (const auto& row : value.validated_options) {
-    options.emplace_back(
-        CanonicalValue::Object{{"option_id", CanonicalValue(row.option_id.value())},
-                               {"value_s", CanonicalValue(row.value_s)}});
+    CanonicalValue::Object option{{"option_id", CanonicalValue(row.option_id.value())}};
+    if (const auto* value_s = std::get_if<double>(&row.value)) {
+      option.emplace_back("value_s", CanonicalValue(*value_s));
+    } else {
+      option.emplace_back("value_bool", CanonicalValue(std::get<bool>(row.value)));
+    }
+    options.emplace_back(std::move(option));
   }
   CanonicalValue::Array resources;
   for (const auto& row : value.resource_bindings) {
@@ -429,97 +428,12 @@ template <class Id>
   return CanonicalValue(std::move(fields));
 }
 
-[[nodiscard]] CanonicalValue output_policy_value(const IoOutputCompletionPolicyDTO& policy) {
-  if (!policy.locally_valid()) fail("prepared_output_policy_invalid");
-  if (const auto* budget = policy.source_ack_budget()) {
-    return CanonicalValue(
-        CanonicalValue::Object{{"kind", CanonicalValue("source_ack_budget")},
-                               {"timeout_ns", CanonicalValue(std::to_string(budget->timeout_ns))}});
-  }
-  if (policy.submitted_only())
-    return CanonicalValue(CanonicalValue::Object{{"kind", CanonicalValue("submitted_only")}});
-  return CanonicalValue(CanonicalValue::Object{{"kind", CanonicalValue("immediate")}});
-}
-
-[[nodiscard]] CanonicalValue output_participant_value(const PreparedOperationParticipantDTO& value,
-                                                      bool include_digest) {
-  const auto* authority = value.provider();
-  const auto* payload = std::get_if<PreparedIoOutputCommandDTO>(&value.payload);
-  const auto* identity = value.binding_identity.provider();
-  if (!authority || !payload || !identity) fail("prepared_output_authority_required");
-  const auto& provider = authority->lifecycle_provider;
-  CanonicalValue::Object fields{
-      {"api_version", CanonicalValue(std::string(kPreparedOperationParticipantApiVersion))},
-      {"operation_id", CanonicalValue(value.operation_id.value())},
-      {"operation_revision", CanonicalValue(static_cast<double>(value.operation_revision.value()))},
-      {"participant_id", CanonicalValue(value.participant_id.value())},
-      {"program_id", CanonicalValue(value.program_id.value())},
-      {"program_revision", CanonicalValue(value.program_revision.value())},
-      {"program_binding_id", CanonicalValue(value.program_binding_id.value())},
-      {"program_run_id", CanonicalValue(value.program_run_id.value())},
-      {"retained_bundle_id", CanonicalValue(value.retained_bundle_id.value())},
-      {"graph_revision", CanonicalValue(value.graph_revision.value())},
-      {"controllable_component_id", CanonicalValue(value.controllable_component_id.value())},
-      {"component_lifecycle_generation",
-       CanonicalValue(static_cast<double>(value.component_lifecycle_generation.value()))},
-      {"component_type_id", CanonicalValue(value.component_type_id.value())},
-      {"component_type_revision", CanonicalValue(value.component_type_revision.value())},
-      {"command_target_id", CanonicalValue(value.command_target_id.value())},
-      {"capability_id", CanonicalValue(value.capability_id.value())},
-      {"capability_definition_revision",
-       CanonicalValue(value.capability_definition_revision.value())},
-      {"control_domain_id", CanonicalValue(value.binding_identity.control_domain_id.value())},
-      {"control_domain_revision",
-       CanonicalValue(value.binding_identity.control_domain_revision.value())},
-      {"capability_provider", capability_provider_value(authority->capability_provider)},
-      {"lifecycle_provider",
-       CanonicalValue(CanonicalValue::Object{
-           {"control_domain_id", CanonicalValue(provider.control_domain_id.value())},
-           {"control_domain_revision", CanonicalValue(provider.control_domain_revision.value())},
-           {"provider_instance_id", CanonicalValue(provider.provider_instance_id.value())},
-           {"provider_manifest_id", CanonicalValue(provider.provider_manifest_id.value())},
-           {"provider_manifest_revision",
-            CanonicalValue(provider.provider_manifest_revision.value())},
-           {"provider_runtime_unit_id", CanonicalValue(provider.provider_runtime_unit_id.value())},
-           {"provider_runtime_epoch", CanonicalValue(provider.provider_runtime_epoch.value())},
-           {"lifecycle_plan_catalog_digest",
-            CanonicalValue(provider.lifecycle_plan_catalog_digest.value())}})},
-      {"signal_configuration_digest",
-       CanonicalValue(authority->signal_configuration_digest.value())},
-      {"resources", id_array(value.resources)},
-      {"runtime_unit_epochs", epochs_value(value.runtime_unit_epochs)},
-      {"payload",
-       CanonicalValue(CanonicalValue::Object{
-           {"io_signal_write",
-            CanonicalValue(CanonicalValue::Object{
-                {"command_schema_id", CanonicalValue(payload->command_schema_id.value())},
-                {"command_schema_revision",
-                 CanonicalValue(payload->command_schema_revision.value())},
-                {"resource_role_id",
-                 CanonicalValue(payload->command_value.resource_role_id.value())},
-                {"value", CanonicalValue(payload->command_value.value)},
-                {"signal_id",
-                 CanonicalValue(CanonicalValue::Object{
-                     {"controllable_component_id", CanonicalValue(payload->signal_id.controllable_component_id.value())},
-                     {"name", CanonicalValue(payload->signal_id.name)}})},
-                {"output_resource", CanonicalValue(payload->output_resource.value())},
-                {"signal_descriptor_digest",
-                 CanonicalValue(payload->signal_descriptor_digest.value())},
-                {"completion_policy", output_policy_value(payload->completion_policy)}})}})}};
-  if (include_digest)
-    fields.emplace_back("prepared_contract_digest",
-                        CanonicalValue(value.prepared_contract_digest.value()));
-  return CanonicalValue(std::move(fields));
-}
-
 [[nodiscard]] CanonicalValue participant_value(const PreparedOperationParticipantDTO& value,
                                                const ResolvedStopBasePlanDTO& base,
                                                std::span<const RuntimeResourceBindingDTO> resources,
                                                std::span<const HardStopResourceLimitDTO> defaults,
                                                MotionInterruptNodeCategory node_category,
                                                bool include_digest) {
-  if (value.provider() || !value.binding_identity.controller())
-    fail("prepared_controller_authority_required");
   CanonicalValue::Object fields{
       {"api_version", CanonicalValue(std::string(kPreparedOperationParticipantApiVersion))},
       {"operation_id", CanonicalValue(value.operation_id.value())},
@@ -544,8 +458,8 @@ template <class Id>
       {"frame_bindings", frame_bindings_value(value.frame_bindings)},
       {"control_domain_id", CanonicalValue(value.binding_identity.control_domain_id.value())},
       {"control_domain_revision", CanonicalValue(value.binding_identity.control_domain_revision.value())},
-      {"control_binding_id", CanonicalValue(value.binding_identity.controller()->control_binding_id.value())},
-      {"control_binding_revision", CanonicalValue(value.binding_identity.controller()->control_binding_revision.value())},
+      {"control_binding_id", CanonicalValue(value.binding_identity.controller.control_binding_id.value())},
+      {"control_binding_revision", CanonicalValue(value.binding_identity.controller.control_binding_revision.value())},
       {"control_interface_contract_id",
        CanonicalValue(value.controller().control_interface_contract_id.value())},
       {"control_interface_revision", CanonicalValue(value.controller().control_interface_revision.value())},
@@ -663,7 +577,11 @@ void validate_command_payload(const PreparedCapabilityCommandDTO& command,
                   [&](const auto& row) {
                     return std::none_of(
                         schema.caller_options.begin(), schema.caller_options.end(),
-                        [&](const auto& declared) { return declared.option_id == row.option_id; });
+                        [&](const auto& declared) {
+                          return declared.option_id == row.option_id &&
+                                 std::holds_alternative<bool>(row.value) ==
+                                     (declared.value_kind == CommandCallerOptionValueKind::kBool);
+                        });
                   }) ||
       std::any_of(
           schema.caller_options.begin(), schema.caller_options.end(), [&](const auto& declared) {
@@ -674,9 +592,7 @@ void validate_command_payload(const PreparedCapabilityCommandDTO& command,
           })) {
     fail("capability_command_schema_projection_invalid");
   }
-  if (!std::holds_alternative<GripperPositionCommandValueDTO>(command.command_value))
-    fail("capability_command_gripper_value_required");
-  const auto& gripper = std::get<GripperPositionCommandValueDTO>(command.command_value);
+  const auto& gripper = command.command_value;
   const auto position_kind = coordinate_kind(gripper.position);
   if (!std::isfinite(std::visit(
           [](const auto& x) {
@@ -714,7 +630,9 @@ void validate_command_payload(const PreparedCapabilityCommandDTO& command,
                          }) != command.validated_options.end() ||
       std::any_of(
           command.validated_options.begin(), command.validated_options.end(), [](const auto& row) {
-            return row.option_id.empty() || !std::isfinite(row.value_s) || row.value_s < 0.0;
+            const auto* value_s = std::get_if<double>(&row.value);
+            return row.option_id.empty() ||
+                   (value_s != nullptr && (!std::isfinite(*value_s) || *value_s < 0.0));
           }))
     fail("capability_command_options_invalid");
   const auto sorted_resources =
@@ -856,8 +774,8 @@ void validate_motion_payload(const PreparedMotionExecutionDTO& motion,
           enclosing.capability_definition_revision ||
       motion.plan_request.control_domain_id != enclosing.binding_identity.control_domain_id ||
       motion.plan_request.control_domain_revision != enclosing.binding_identity.control_domain_revision ||
-      motion.plan_request.control_binding_id != enclosing.binding_identity.controller()->control_binding_id ||
-      motion.plan_request.control_binding_revision != enclosing.binding_identity.controller()->control_binding_revision ||
+      motion.plan_request.control_binding_id != enclosing.binding_identity.controller.control_binding_id ||
+      motion.plan_request.control_binding_revision != enclosing.binding_identity.controller.control_binding_revision ||
       motion.plan_request.control_interface_contract_id !=
           enclosing.controller().control_interface_contract_id ||
       motion.plan_request.control_interface_revision != enclosing.controller().control_interface_revision ||
@@ -898,9 +816,7 @@ void validate_motion_payload(const PreparedMotionExecutionDTO& motion,
         trajectory_metrics->cartesian_fidelity_metrics->requested_translation_tolerance_m !=
             motion.plan_request.tolerances.translation_tol_m ||
         trajectory_metrics->cartesian_fidelity_metrics->requested_rotation_tolerance_rad !=
-            motion.plan_request.tolerances.rotation_tol_rad ||
-        trajectory_metrics->cartesian_fidelity_metrics->requested_max_blend_deviation_rad !=
-            cartesian_path->max_blend_deviation_rad)) ||
+            motion.plan_request.tolerances.rotation_tol_rad)) ||
       !std::isfinite(trajectory_metrics->trajectory_duration_s) ||
       trajectory_metrics->trajectory_duration_s !=
           motion.trajectory.waypoints.back().time_from_start_s ||
@@ -1001,137 +917,6 @@ void validate_motion_payload(const PreparedMotionExecutionDTO& motion,
 
 }  // namespace
 
-Result<PreparedOperationParticipantDTO> MakePreparedIoOutputParticipant(
-    const OperationId& operation_id, OperationRevision operation_revision,
-    const OperationParticipantId& participant_id, const ProgramRunId& program_run_id,
-    const CapabilityCommandIntentDTO& command, const RuntimeParticipantBinding& sealed_binding) {
-  const auto& binding = sealed_binding.value();
-  const auto* value = std::get_if<IoSignalWriteCommandValueDTO>(&command.command_value);
-  if (!value || command.completion_timeout_s || !command.caller_options.empty() ||
-      !binding.io_output_binding || !binding.io_output_binding->signal.output_resource ||
-      !binding.capability_provider_path)
-    return rejected<PreparedOperationParticipantDTO>("prepared_output_contract_invalid");
-  const auto identity = runtime_participant_binding_identity(binding);
-  if (!identity.ok()) return Result<PreparedOperationParticipantDTO>::Err(identity.error());
-  const auto& output = *binding.io_output_binding;
-  PreparedOperationParticipantDTO candidate{
-      ContentDigest(""),
-      operation_id,
-      operation_revision,
-      participant_id,
-      binding.program_id,
-      binding.program_revision,
-      binding.program_binding_id,
-      program_run_id,
-      binding.retained_bundle_id,
-      binding.graph_revision,
-      binding.controllable_component_id,
-      output.component_lifecycle_generation,
-      binding.component_type_id,
-      binding.component_type_revision,
-      binding.command_target_id,
-      binding.capability_id,
-      binding.capability_definition_revision,
-      {},
-      {},
-      identity.value(),
-      {*output.signal.output_resource},
-      binding.runtime_unit_epochs,
-      PreparedIoOutputCommandDTO{command.command_schema_id, command.command_schema_revision, *value,
-                                 output.signal.signal_id, *output.signal.output_resource,
-                                 output.signal_descriptor_digest, output.completion_policy},
-      PreparedProviderExecutionAuthorityDTO{output.provider, output.signal_configuration_digest,
-                                            provider_from(*binding.capability_provider_path)}};
-  return MakePreparedIoOutputParticipant(std::move(candidate), sealed_binding);
-}
-
-Result<PreparedOperationParticipantDTO> MakePreparedIoOutputParticipant(
-    PreparedOperationParticipantDTO candidate, const RuntimeParticipantBinding& sealed_binding) {
-  try {
-    const auto& binding = sealed_binding.value();
-    const auto* output = binding.io_output_binding ? &*binding.io_output_binding : nullptr;
-    auto* command = std::get_if<PreparedIoOutputCommandDTO>(&candidate.payload);
-    const auto schema = builtin_io_signal_write_command_schema();
-    require_portable(candidate.operation_id.value(), "operation_id_invalid");
-    require_portable(candidate.participant_id.value(), "participant_id_invalid");
-    require_portable(candidate.program_run_id.value(), "program_run_id_invalid");
-    if (!candidate.operation_revision.nonzero() ||
-        static_cast<double>(candidate.operation_revision.value()) > kMaximumSafeInteger ||
-        !output || !binding.capability_provider_path || !binding.command_schema || !command ||
-        *binding.command_schema !=
-            ProgramCommandSchemaRefDTO{schema.command_schema_id, schema.command_schema_revision} ||
-        command->command_schema_id != schema.command_schema_id ||
-        command->command_schema_revision != schema.command_schema_revision ||
-        command->command_value.resource_role_id != output->resource_role_id ||
-        !command->completion_policy.locally_valid() ||
-        command->completion_policy != output->completion_policy || !output->signal.output_resource)
-      fail("prepared_output_contract_invalid");
-    const auto identity = runtime_participant_binding_identity(binding);
-    if (!identity.ok()) return Result<PreparedOperationParticipantDTO>::Err(identity.error());
-    candidate.program_id = binding.program_id;
-    candidate.program_revision = binding.program_revision;
-    candidate.program_binding_id = binding.program_binding_id;
-    candidate.retained_bundle_id = binding.retained_bundle_id;
-    candidate.graph_revision = binding.graph_revision;
-    candidate.controllable_component_id = binding.controllable_component_id;
-    candidate.component_lifecycle_generation = output->component_lifecycle_generation;
-    candidate.component_type_id = binding.component_type_id;
-    candidate.component_type_revision = binding.component_type_revision;
-    candidate.command_target_id = binding.command_target_id;
-    candidate.capability_id = binding.capability_id;
-    candidate.capability_definition_revision = binding.capability_definition_revision;
-    candidate.motion_endpoint.reset();
-    candidate.model_bindings.clear();
-    candidate.frame_bindings.clear();
-    candidate.binding_identity = identity.value();
-    candidate.resources = {*output->signal.output_resource};
-    candidate.runtime_unit_epochs = binding.runtime_unit_epochs;
-    candidate.execution_authority =
-        PreparedProviderExecutionAuthorityDTO{output->provider, output->signal_configuration_digest,
-                                              provider_from(*binding.capability_provider_path)};
-    command->signal_id = output->signal.signal_id;
-    command->output_resource = *output->signal.output_resource;
-    command->signal_descriptor_digest = output->signal_descriptor_digest;
-    candidate.prepared_contract_digest = ContentDigest(content_identity::framed_sha256(
-        kPreparedOperationParticipantIdentityDomain, kPreparedOperationParticipantApiVersion,
-        output_participant_value(candidate, false)));
-    if (content_identity::canonical_json(output_participant_value(candidate, true)).size() >
-        content_identity::kMaximumCanonicalJsonBytes)
-      fail("canonical_byte_bound_exceeded");
-    return Result<PreparedOperationParticipantDTO>::Ok(std::move(candidate));
-  } catch (const std::exception& error) {
-    return rejected<PreparedOperationParticipantDTO>(error.what());
-  }
-}
-
-Result<void> VerifyPreparedIoOutputParticipant(const PreparedOperationParticipantDTO& value,
-                                               const RuntimeParticipantBinding& binding) {
-  const auto rebuilt = MakePreparedIoOutputParticipant(value, binding);
-  if (!rebuilt.ok()) return Result<void>::Err(rebuilt.error());
-  try {
-    if (value.motion_endpoint || !value.model_bindings.empty() || !value.frame_bindings.empty() ||
-        value.binding_identity != rebuilt.value().binding_identity ||
-        content_identity::canonical_json(output_participant_value(value, true)) !=
-            content_identity::canonical_json(output_participant_value(rebuilt.value(), true)))
-      fail("prepared_output_referent_mismatch");
-    return Result<void>::Ok();
-  } catch (const std::exception& error) {
-    return rejected<void>(error.what());
-  }
-}
-
-Result<std::string> EncodePreparedIoOutputParticipant(const PreparedOperationParticipantDTO& value,
-                                                      const RuntimeParticipantBinding& binding) {
-  const auto verified = VerifyPreparedIoOutputParticipant(value, binding);
-  if (!verified.ok()) return Result<std::string>::Err(verified.error());
-  try {
-    return Result<std::string>::Ok(
-        content_identity::canonical_json(output_participant_value(value, true)));
-  } catch (const std::exception& error) {
-    return rejected<std::string>(error.what());
-  }
-}
-
 Result<PreparedOperationParticipantDTO> MakePreparedOperationParticipant(
     PreparedOperationParticipantDTO candidate, const RuntimeParticipantBinding& sealed_binding,
     const RuntimeParticipantStopReadiness& sealed_readiness,
@@ -1140,7 +925,6 @@ Result<PreparedOperationParticipantDTO> MakePreparedOperationParticipant(
   try {
     const auto& binding = sealed_binding.value();
     const auto& readiness = sealed_readiness.value();
-    if (candidate.provider()) fail("prepared_controller_authority_required");
     if (!binding.control_path) fail("control_path_required");
     const auto& path = *binding.control_path;
     require_portable(candidate.operation_id.value(), "operation_id_invalid");

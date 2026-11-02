@@ -118,3 +118,12 @@ ul.inline-message {
   font-size: var(--mf-font-size-068);
   line-height: 1.45;
 }
+
+/* A Program run's end reason (CONTRACTS §9): colour is severity only. */
+.run-end.tone-warning {
+  color: var(--mf-text-warning-79);
+}
+
+.run-end.tone-error {
+  color: var(--mf-text-danger-73);
+}

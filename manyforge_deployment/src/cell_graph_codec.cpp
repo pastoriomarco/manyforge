@@ -34,6 +34,7 @@ using core::CapabilityId;
 using core::CellGraphDTO;
 using core::CellId;
 using core::CommandTargetId;
+using core::ComponentAttachmentCollisionExclusionDTO;
 using core::ComponentAttachmentEdgeDTO;
 using core::ComponentAttachmentEndpointDTO;
 using core::ComponentAttachmentId;
@@ -885,18 +886,48 @@ parse_runtime_scale_route_qualifications(const CanonicalValue& value,
                                             child_path(path, "attachment_interface_id"))};
 }
 
+[[nodiscard]] std::vector<ComponentAttachmentCollisionExclusionDTO> parse_collision_exclusions(
+    const CanonicalValue& value, std::string_view path) {
+  const auto& array = require_array(value, path);
+  if (array.empty()) {
+    fail(path, "collision_exclusions is non-empty or omitted");
+  }
+  std::vector<ComponentAttachmentCollisionExclusionDTO> result;
+  result.reserve(array.size());
+  for (std::size_t index = 0; index < array.size(); ++index) {
+    const std::string item_path = index_path(path, index);
+    const auto& object = require_object(array[index], item_path);
+    require_exact_fields(object, {"child_link", "parent_link"}, item_path);
+    ComponentAttachmentCollisionExclusionDTO pair{
+        require_string(require_member(object, "child_link", item_path),
+                       child_path(item_path, "child_link")),
+        require_string(require_member(object, "parent_link", item_path),
+                       child_path(item_path, "parent_link"))};
+    if (pair.child_link.empty() || pair.parent_link.empty()) {
+      fail(item_path, "link names are non-empty");
+    }
+    result.push_back(std::move(pair));
+  }
+  std::sort(result.begin(), result.end());
+  if (std::adjacent_find(result.begin(), result.end()) != result.end()) {
+    fail(path, "duplicate collision exclusion pair");
+  }
+  return result;
+}
+
 [[nodiscard]] ComponentAttachmentEdgeDTO parse_component_attachment(const CanonicalValue& value,
                                                                     std::string_view path) {
   const auto& object = require_object(value, path);
   require_fields(object,
                  {"component_attachment_id", "component_attachment_revision", "parent",
                   "child", "child_interface_pose_in_parent_interface"},
-                 {"primary"}, path);
+                 {"primary", "collision_exclusions"}, path);
   // B5: `primary` is written only when true.
   const CanonicalValue* primary = find_member(object, "primary");
   if (primary != nullptr && !(primary->is_bool() && primary->as_bool())) {
     fail(child_path(path, "primary"), "primary is true or omitted");
   }
+  const CanonicalValue* exclusions = find_member(object, "collision_exclusions");
   return ComponentAttachmentEdgeDTO{
       parse_identity<ComponentAttachmentId>(require_member(object, "component_attachment_id", path),
                                             child_path(path, "component_attachment_id")),
@@ -907,7 +938,10 @@ parse_runtime_scale_route_qualifications(const CanonicalValue& value,
       parse_attachment_endpoint(require_member(object, "child", path), child_path(path, "child")),
       parse_placement_pose(require_member(object, "child_interface_pose_in_parent_interface", path),
                            child_path(path, "child_interface_pose_in_parent_interface")),
-      primary != nullptr};
+      primary != nullptr,
+      exclusions == nullptr
+          ? std::vector<ComponentAttachmentCollisionExclusionDTO>{}
+          : parse_collision_exclusions(*exclusions, child_path(path, "collision_exclusions"))};
 }
 
 template <typename Record, typename Parser, typename Key>
@@ -1205,6 +1239,17 @@ template <typename StrongType>
       {"child_interface_pose_in_parent_interface",
        placement_pose_value(record.child_interface_pose_in_parent_interface)}};
   if (record.primary) object.emplace_back("primary", CanonicalValue(true));
+  if (!record.collision_exclusions.empty()) {
+    auto pairs = record.collision_exclusions;
+    std::sort(pairs.begin(), pairs.end());
+    CanonicalValue::Array array;
+    array.reserve(pairs.size());
+    for (const auto& pair : pairs) {
+      array.emplace_back(CanonicalValue::Object{{"child_link", CanonicalValue(pair.child_link)},
+                                                {"parent_link", CanonicalValue(pair.parent_link)}});
+    }
+    object.emplace_back("collision_exclusions", CanonicalValue(std::move(array)));
+  }
   return CanonicalValue(std::move(object));
 }
 

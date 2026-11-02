@@ -3,14 +3,14 @@ import { describe, expect, it, vi } from 'vitest';
 import type { ResetApplyPlan, ResetApplySequence } from '../state/resetApply';
 import { resetApplyNotice } from './useResetApply';
 
-const plan = { correlationId: 'corr-1', document: 'deployment' } as unknown as ResetApplyPlan;
+const plan = { correlationId: 'corr-1', document: 'program' } as unknown as ResetApplyPlan;
 
 describe('Reset-then-Apply Activity notice', () => {
   it('reports a completed Apply as a finished result without Dismiss', () => {
     const notice = resetApplyNotice(
       { plan, phase: { kind: 'applied', apply: null } } as ResetApplySequence, vi.fn(),
     );
-    expect(notice).toMatchObject({ severity: 'info', busy: false, title: 'Deployment Applied after Reset' });
+    expect(notice).toMatchObject({ severity: 'info', busy: false, title: 'Program Applied after Reset' });
     expect(notice.actions).toBeUndefined();
   });
 

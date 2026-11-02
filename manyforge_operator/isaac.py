@@ -574,7 +574,7 @@ class IsaacLauncher:
         ]
         if operation == "start":
             args = [
-                *global_args, "start", "--profile", "native",
+                *global_args, "start", "--profile", "standard",
                 "--source-root", remote.source_root,
                 "--manager-executable", remote.manager_executable,
                 "--install-root", remote.install_root,
@@ -945,7 +945,7 @@ class IsaacLauncher:
             if remote_status is None:
                 reason = "runtime_host_unavailable"
             elif not native_ready:
-                reason = "native_runtime_unready"
+                reason = "execution_host_unready"
             elif not all_ready:
                 reason = "isaac_readiness_unavailable"
             failure = FailureRecord(reason_code=reason, component_id="isaac", detail="split Isaac launch did not prove all owned resources and owner readiness ready", occurred_at_unix_ns=_safe_unix_timestamp())

@@ -457,10 +457,10 @@ Result<RuntimeScaleControlStatusDTO> ResourceAddressedExecutionKernel::runtime_s
         return runtime_route_configuration_publication_required_.contains(
                    member.control_domain_id) ||
                (route != runtime_route_configuration_readbacks_.end() &&
-                (route->second.provider() != nullptr || !route->second.controller().operation_admission_open ||
-                 route->second.controller().active_configuration.active_control_configuration_id !=
+                (!route->second.operation_admission_open ||
+                 route->second.active_configuration.active_control_configuration_id !=
                      member.active_control_configuration_id ||
-                 route->second.controller().active_configuration.active_control_configuration_generation !=
+                 route->second.active_configuration.active_control_configuration_generation !=
                      member.active_control_configuration_generation));
       });
   if (route_closed) {
@@ -589,10 +589,14 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
     // A retained receipt is observation of the original decision, not fresh
     // motion admission. Keep it readable while Stop/fault fences reject every
     // request absent from the replay ledger.
-    if (motion_admission_closed_) {
+    if (motion_admission_closed_locked()) {
       return reject<OperationAcceptedDTO>(
-          "new motion admission is closed by an active emergency Stop or fault",
+          "new motion admission is closed until the execution host restarts",
           "motion_admission_closed", ErrorCode::kInvalidStateTransition);
+    }
+    // R1: a cell latch refuses every node command, manual motion and manual I/O.
+    if (auto refusal = cell_latch_refusal_locked()) {
+      return Result<OperationAcceptedDTO>::Err(std::move(*refusal));
     }
     if (emergency_stop_reserve_.find(intent.request_context.request_id.value()).has_value()) {
       return Result<OperationAcceptedDTO>::Err(
@@ -657,9 +661,9 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
   auto resolved = resolve_registration(intent, 0U);
   {
     std::lock_guard state_lock(state_mutex_);
-    if (motion_admission_closed_)
+    if (motion_admission_closed_locked())
       return reject<OperationAcceptedDTO>(
-          "new motion admission is closed by an active emergency Stop or fault",
+          "new motion admission is closed until the execution host restarts",
           "motion_admission_closed", ErrorCode::kInvalidStateTransition);
   }
   if (!resolved.ok()) {
@@ -708,38 +712,33 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
   }
 
   const auto& binding = resolved.value().binding.value();
-  const bool io_output = binding.io_output_binding.has_value();
-  if (!io_output && !binding.control_path.has_value()) {
+  if (!binding.control_path.has_value()) {
     return reject<OperationAcceptedDTO>("resolved participant has no active control path",
                                         "runtime_participant_control_path_missing",
                                         ErrorCode::kMissingReference);
   }
-  const auto* control = binding.control_path ? &*binding.control_path : nullptr;
-  if (!io_output) {
-    if (runtime_route_configuration_publication_required_.contains(control->control_domain_id)) {
-      return reject<OperationAcceptedDTO>(
-          "runtime route configuration has not been published after reconfiguration",
-          "runtime_route_publication_required", ErrorCode::kInvalidStateTransition);
-    }
-    const auto route_readback =
-        runtime_route_configuration_readbacks_.find(control->control_domain_id);
-    if (route_readback != runtime_route_configuration_readbacks_.end() &&
-        (route_readback->second.provider() != nullptr ||
-         !route_readback->second.controller().operation_admission_open ||
-         route_readback->second.controller().active_configuration.active_control_configuration_id !=
-             control->active_control_configuration_id ||
-         route_readback->second.controller()
-                 .active_configuration.active_control_configuration_generation !=
-             control->active_control_configuration_generation)) {
-      return reject<OperationAcceptedDTO>("runtime route configuration is unreconciled or stale",
-                                          "runtime_route_configuration_not_ready",
-                                          ErrorCode::kInvalidStateTransition);
-    }
+  const auto* control = &*binding.control_path;
+  if (runtime_route_configuration_publication_required_.contains(control->control_domain_id)) {
+    return reject<OperationAcceptedDTO>(
+        "runtime route configuration has not been published after reconfiguration",
+        "runtime_route_publication_required", ErrorCode::kInvalidStateTransition);
+  }
+  const auto route_readback =
+      runtime_route_configuration_readbacks_.find(control->control_domain_id);
+  if (route_readback != runtime_route_configuration_readbacks_.end() &&
+      (!route_readback->second.operation_admission_open ||
+       route_readback->second.active_configuration.active_control_configuration_id !=
+           control->active_control_configuration_id ||
+       route_readback->second.active_configuration.active_control_configuration_generation !=
+           control->active_control_configuration_generation)) {
+    return reject<OperationAcceptedDTO>("runtime route configuration is unreconciled or stale",
+                                        "runtime_route_configuration_not_ready",
+                                        ErrorCode::kInvalidStateTransition);
   }
   if (auto refusal = component_command_refusal_locked(resolved.value()); refusal.has_value()) {
     return Result<OperationAcceptedDTO>::Err(std::move(*refusal));
   }
-  if (!io_output && !resolved.value().stop_readiness.has_value()) {
+  if (!resolved.value().stop_readiness.has_value()) {
     return reject<OperationAcceptedDTO>("resolved participant has no verified Stop readiness",
                                         "runtime_participant_stop_readiness_missing",
                                         ErrorCode::kMissingReference);
@@ -749,7 +748,6 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
   for (const auto& resource : binding.resources) {
     resources.push_back(resource.resource_id);
   }
-  if (io_output) resources.push_back(*binding.io_output_binding->signal.output_resource);
   const auto exact_identity = runtime_participant_binding_identity(binding);
   if (!exact_identity.ok()) return Result<OperationAcceptedDTO>::Err(exact_identity.error());
   const auto operation_id = OperationId("operation." + config_.request_owner_epoch.value() + "." +
@@ -803,13 +801,9 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
         ContentDigest(digest),
         current.admission_generation,
         {std::move(claim_resources),
-         io_output
-             ? std::vector<CellAdmissionConfigurationScopeDTO>{}
-             : std::vector<
-                   CellAdmissionConfigurationScopeDTO>{{control->control_domain_id,
-                                                         control->active_control_configuration_id,
-                                                         control
-                                                             ->active_control_configuration_generation}}},
+         std::vector<CellAdmissionConfigurationScopeDTO>{
+             {control->control_domain_id, control->active_control_configuration_id,
+              control->active_control_configuration_generation}}},
         std::nullopt,
         std::nullopt};
     if (manual_handover) {
@@ -865,22 +859,19 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
                                         "runtime_participant_prepared_engine_missing",
                                         ErrorCode::kMissingReference);
   }
-  ResourceSlotOwnerDTO slot_owner =
-      io_output ? ResourceSlotOwnerDTO{operation_id, operation_revision, participant_id,
-                                       exact_identity.value()}
-                : ResourceSlotOwnerDTO{operation_id,
-                                       operation_revision,
-                                       participant_id,
-                                       control->control_domain_id,
-                                       control->control_domain_revision,
-                                       control->control_binding_id,
-                                       control->control_binding_revision,
-                                       control->controller_topology_id,
-                                       control->topology_revision,
-                                       control->control_route_id,
-                                       control->active_control_configuration_id,
-                                       control->active_control_configuration_generation,
-                                       control->containment_granularity};
+  ResourceSlotOwnerDTO slot_owner{operation_id,
+                                  operation_revision,
+                                  participant_id,
+                                  control->control_domain_id,
+                                  control->control_domain_revision,
+                                  control->control_binding_id,
+                                  control->control_binding_revision,
+                                  control->controller_topology_id,
+                                  control->topology_revision,
+                                  control->control_route_id,
+                                  control->active_control_configuration_id,
+                                  control->active_control_configuration_generation,
+                                  control->containment_granularity};
   std::optional<ExecuteRequestDTO> motion_request;
   std::optional<double> requested_tcp_linear_speed_mps;
   std::optional<GripperCommandRequestDTO> command_request;
@@ -901,7 +892,7 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
     }
     motion_request = std::move(built.value());
     motion_request->trajectory_relative_timeout = resolved.value().intrinsic_direct_control;
-  } else if (!io_output) {
+  } else {
     const auto& command = std::get<CapabilityCommandIntentDTO>(intent.participants.front().payload);
     auto built = build_command_request(
         command, binding, engine->gripper_actuation_kind(binding.command_target_id.value()),
@@ -967,7 +958,7 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
 
   std::optional<PreparedParticipantStopPlanDTO> ordinary_stop_plan;
   std::optional<PreparedParticipantStopPlanDTO> fault_stop_plan;
-  if (!io_output) {
+  {
     PreparedParticipantStopPlanContextDTO stop_context{
         operation_id,
         operation_revision,
@@ -1017,17 +1008,11 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
 
   std::optional<PreparedOperationParticipantDTO> prepared_command_product;
   if (payload_kind == OperationParticipantPayloadKind::kCapabilityCommand) {
-    auto made =
-        io_output
-            ? build_prepared_io_output_participant(
-                  intent, std::get<CapabilityCommandIntentDTO>(intent.participants.front().payload),
-                  resolved.value().binding, operation_id, operation_revision, participant_id)
-            : build_prepared_capability_command_participant(
-                  intent, std::get<CapabilityCommandIntentDTO>(intent.participants.front().payload),
-                  resolved.value().binding, *resolved.value().stop_readiness,
-                  resolved.value().retained_default_stop_limits,
-                  resolved.value().stop_node_category, operation_id, operation_revision,
-                  participant_id, *ordinary_stop_plan);
+    auto made = build_prepared_capability_command_participant(
+        intent, std::get<CapabilityCommandIntentDTO>(intent.participants.front().payload),
+        resolved.value().binding, *resolved.value().stop_readiness,
+        resolved.value().retained_default_stop_limits, resolved.value().stop_node_category,
+        operation_id, operation_revision, participant_id, *ordinary_stop_plan);
     if (!made.ok()) {
       return Result<OperationAcceptedDTO>::Err(made.error());
     }
@@ -1142,7 +1127,7 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
     if (auto refusal = component_command_refusal_locked(resolved.value())) {
       return Result<OperationAcceptedDTO>::Err(std::move(*refusal));
     }
-    if (motion_admission_closed_) {
+    if (motion_admission_closed_locked()) {
       return reject<OperationAcceptedDTO>(
           "new motion admission closed while the operation was being prepared",
           "motion_admission_closed", ErrorCode::kInvalidStateTransition);
@@ -1261,8 +1246,6 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
       return reject<OperationAcceptedDTO>("operation identity is already resident",
                                           "operation_id_conflict", ErrorCode::kInvariantViolation);
     }
-    // Item 37: a new operation ends the operator's Force close arm.
-    force_close_stop_generation_.reset();
     protected_operation_ids = durable_operation_retention_ids_locked();
   }
 
@@ -1408,15 +1391,13 @@ Result<OperationAcceptedDTO> ResourceAddressedExecutionKernel::execute(
       dispatch_result = advance_prepared_motion(operation_id, engine);
     }
   } else {
-    ResolvedPreparedCapabilityCommandExecutionRequestDTO prepare_request =
-        io_output ? output_preparation_request(retained_command_product, resolved.value().binding)
-                  : ResolvedPreparedCapabilityCommandExecutionRequestDTO{
-                        retained_command_product,
-                        resolved.value().binding,
-                        *resolved.value().stop_readiness,
-                        resolved.value().retained_default_stop_limits,
-                        resolved.value().stop_node_category,
-                        *command_request};
+    ResolvedPreparedCapabilityCommandExecutionRequestDTO prepare_request{
+        retained_command_product,
+        resolved.value().binding,
+        *resolved.value().stop_readiness,
+        resolved.value().retained_default_stop_limits,
+        resolved.value().stop_node_category,
+        *command_request};
     auto prepared_execution = resolved.value().prepared_motion_engine->PrepareCapabilityCommand(
         std::move(prepare_request));
     if (!prepared_execution.ok()) {
@@ -1570,9 +1551,9 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
     auto resolved = resolve_registration(intent, index);
     {
       std::lock_guard state_lock(state_mutex_);
-      if (motion_admission_closed_)
+      if (motion_admission_closed_locked())
         return reject<OperationAcceptedDTO>(
-            "new motion admission is closed by an active emergency Stop or fault",
+            "new motion admission is closed until the execution host restarts",
             "motion_admission_closed", ErrorCode::kInvalidStateTransition);
     }
     if (!resolved.ok()) {
@@ -1585,8 +1566,7 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
           "direct_control_coordination_unsupported", ErrorCode::kInvalidRequest);
     }
     if (registration.engine == nullptr || registration.prepared_motion_engine == nullptr ||
-        (!registration.binding.value().io_output_binding &&
-         registration.stop_execution_port == nullptr)) {
+        registration.stop_execution_port == nullptr) {
       return reject<OperationAcceptedDTO>(
           "coordinated motion participant lacks its prepared or Stop execution port",
           "coordinated_participant_execution_port_missing", ErrorCode::kMissingReference);
@@ -1600,8 +1580,7 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
         std::holds_alternative<MotionParticipantIntentDTO>(intent.participants[index].payload)
             ? OperationParticipantPayloadKind::kMotion
             : OperationParticipantPayloadKind::kCapabilityCommand;
-    if ((!registration.binding.value().io_output_binding &&
-         !registration.stop_readiness.has_value()) ||
+    if (!registration.stop_readiness.has_value() ||
         (payload_kind == OperationParticipantPayloadKind::kMotion &&
          !registration.participant_policy.has_value())) {
       return reject<OperationAcceptedDTO>(
@@ -1609,34 +1588,28 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
           "coordinated_participant_authority_missing", ErrorCode::kMissingReference);
     }
     const auto& binding = registration.binding.value();
-    const bool io_output = binding.io_output_binding.has_value();
-    if (!io_output && !binding.control_path.has_value()) {
+    if (!binding.control_path.has_value()) {
       return reject<OperationAcceptedDTO>("resolved participant has no active control path",
                                           "runtime_participant_control_path_missing",
                                           ErrorCode::kMissingReference);
     }
-    const auto* control = binding.control_path ? &*binding.control_path : nullptr;
-    if (!io_output) {
-      if (runtime_route_configuration_publication_required_.contains(control->control_domain_id)) {
-        return reject<OperationAcceptedDTO>(
-            "runtime route configuration has not been published after reconfiguration",
-            "runtime_route_publication_required", ErrorCode::kInvalidStateTransition);
-      }
-      const auto route_readback =
-          runtime_route_configuration_readbacks_.find(control->control_domain_id);
-      if (route_readback != runtime_route_configuration_readbacks_.end() &&
-          (route_readback->second.provider() != nullptr ||
-           !route_readback->second.controller().operation_admission_open ||
-           route_readback->second.controller()
-                   .active_configuration.active_control_configuration_id !=
-               control->active_control_configuration_id ||
-           route_readback->second.controller()
-                   .active_configuration.active_control_configuration_generation !=
-               control->active_control_configuration_generation)) {
-        return reject<OperationAcceptedDTO>("runtime route configuration is unreconciled or stale",
-                                            "runtime_route_configuration_not_ready",
-                                            ErrorCode::kInvalidStateTransition);
-      }
+    const auto* control = &*binding.control_path;
+    if (runtime_route_configuration_publication_required_.contains(control->control_domain_id)) {
+      return reject<OperationAcceptedDTO>(
+          "runtime route configuration has not been published after reconfiguration",
+          "runtime_route_publication_required", ErrorCode::kInvalidStateTransition);
+    }
+    const auto route_readback =
+        runtime_route_configuration_readbacks_.find(control->control_domain_id);
+    if (route_readback != runtime_route_configuration_readbacks_.end() &&
+        (!route_readback->second.operation_admission_open ||
+         route_readback->second.active_configuration.active_control_configuration_id !=
+             control->active_control_configuration_id ||
+         route_readback->second.active_configuration.active_control_configuration_generation !=
+             control->active_control_configuration_generation)) {
+      return reject<OperationAcceptedDTO>("runtime route configuration is unreconciled or stale",
+                                          "runtime_route_configuration_not_ready",
+                                          ErrorCode::kInvalidStateTransition);
     }
     if (auto refusal = component_command_refusal_locked(registration); refusal.has_value()) {
       return Result<OperationAcceptedDTO>::Err(std::move(*refusal));
@@ -1651,15 +1624,6 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
                                             ErrorCode::kInvalidRequest);
       }
       resources.push_back(resource.resource_id);
-    }
-
-    if (io_output) {
-      const auto& resource = *binding.io_output_binding->signal.output_resource;
-      if (!selected_resources.insert(resource).second)
-        return reject<OperationAcceptedDTO>(
-            "coordinated output channels alias the same actual resource",
-            "coordinated_participant_resource_overlap", ErrorCode::kInvalidRequest);
-      resources.push_back(resource);
     }
     const auto exact_identity = runtime_participant_binding_identity(binding);
     if (!exact_identity.ok()) return Result<OperationAcceptedDTO>::Err(exact_identity.error());
@@ -1691,7 +1655,7 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
         return Result<OperationAcceptedDTO>::Err(request.error());
       }
       motion_request = std::move(request.value());
-    } else if (!io_output) {
+    } else {
       auto request = build_command_request(
           std::get<CapabilityCommandIntentDTO>(participant_intent.payload), binding,
           registration.engine->gripper_actuation_kind(binding.command_target_id.value()),
@@ -1709,14 +1673,7 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
     std::shared_ptr<const PreparedParticipantStopPlanDTO> retained_stop_plan;
     std::shared_ptr<const PreparedParticipantStopPlanDTO> retained_fault_stop_plan;
     std::shared_ptr<const PreparedOperationParticipantDTO> prepared_command_product;
-    if (io_output) {
-      auto prepared = build_prepared_io_output_participant(
-          intent, std::get<CapabilityCommandIntentDTO>(participant_intent.payload),
-          registration.binding, operation_id, operation_revision, participant_id);
-      if (!prepared.ok()) return Result<OperationAcceptedDTO>::Err(prepared.error());
-      prepared_command_product =
-          std::make_shared<const PreparedOperationParticipantDTO>(std::move(prepared.value()));
-    } else {
+    {
       PreparedParticipantStopPlanContextDTO stop_context{
           operation_id,
           operation_revision,
@@ -1776,22 +1733,19 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
             "operation_admission_capacity_unavailable", ErrorCode::kInternalError);
       }
     }
-    ResourceSlotOwnerDTO slot_owner =
-        io_output ? ResourceSlotOwnerDTO{operation_id, operation_revision, participant_id,
-                                         exact_identity.value()}
-                  : ResourceSlotOwnerDTO{operation_id,
-                                         operation_revision,
-                                         participant_id,
-                                         control->control_domain_id,
-                                         control->control_domain_revision,
-                                         control->control_binding_id,
-                                         control->control_binding_revision,
-                                         control->controller_topology_id,
-                                         control->topology_revision,
-                                         control->control_route_id,
-                                         control->active_control_configuration_id,
-                                         control->active_control_configuration_generation,
-                                         control->containment_granularity};
+    ResourceSlotOwnerDTO slot_owner{operation_id,
+                                    operation_revision,
+                                    participant_id,
+                                    control->control_domain_id,
+                                    control->control_domain_revision,
+                                    control->control_binding_id,
+                                    control->control_binding_revision,
+                                    control->controller_topology_id,
+                                    control->topology_revision,
+                                    control->control_route_id,
+                                    control->active_control_configuration_id,
+                                    control->active_control_configuration_generation,
+                                    control->containment_granularity};
     ResourceSlotReservationOwnerDTO reservation{slot_owner, resources};
     assignments.push_back(OperationParticipantAssignmentDTO{index, participant_id});
     participant_states.push_back(OperationParticipantStateDTO{
@@ -1933,7 +1887,7 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
         return Result<OperationAcceptedDTO>::Err(std::move(*refusal));
       }
     }
-    if (motion_admission_closed_) {
+    if (motion_admission_closed_locked()) {
       return reject<OperationAcceptedDTO>(
           "new motion admission closed while the operation was being prepared",
           "motion_admission_closed", ErrorCode::kInvalidStateTransition);
@@ -2055,8 +2009,6 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
       return reject<OperationAcceptedDTO>("operation identity is already resident",
                                           "operation_id_conflict", ErrorCode::kInvariantViolation);
     }
-    // Item 37: a new operation ends the operator's Force close arm.
-    force_close_stop_generation_.reset();
     ++next_operation_id_;
     protected_operation_ids = durable_operation_retention_ids_locked();
   }
@@ -2118,7 +2070,6 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
                               ? nullptr
                               : operation->participant_for(admission.registration.engine);
       if (participant == nullptr) {
-        motion_admission_closed_ = true;
         return Result<OperationAcceptedDTO>::Ok(accepted);
       }
       if (participant->stop_owns_reconciliation() || participant->stop_cancelled_pre_dispatch ||
@@ -2158,14 +2109,11 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
         return admission.registration.prepared_motion_engine->PrepareMotion(authority);
       }
       return admission.registration.prepared_motion_engine->PrepareCapabilityCommand(
-          admission.registration.binding.value().io_output_binding
-              ? output_preparation_request(admission.prepared_command_product,
-                                           admission.registration.binding)
-              : ResolvedPreparedCapabilityCommandExecutionRequestDTO{
-                    admission.prepared_command_product, admission.registration.binding,
-                    *admission.registration.stop_readiness,
-                    admission.registration.retained_default_stop_limits,
-                    admission.registration.stop_node_category, *admission.command_request});
+          ResolvedPreparedCapabilityCommandExecutionRequestDTO{
+              admission.prepared_command_product, admission.registration.binding,
+              *admission.registration.stop_readiness,
+              admission.registration.retained_default_stop_limits,
+              admission.registration.stop_node_category, *admission.command_request});
     }();
     if (!prepared.ok()) {
       {
@@ -2236,9 +2184,7 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
                          candidate->stop_id == operation->state.active_stop_id &&
                          candidate->stop_generation == *operation->state.active_stop_generation;
                 });
-            if (transaction == stop_transactions_.end()) {
-              motion_admission_closed_ = true;
-            } else if (!(*transaction)->terminal) {
+            if (transaction != stop_transactions_.end() && !(*transaction)->terminal) {
               stop_wakeup = (*transaction)->token;
               stop_control_executor_->ArmDeadline(*stop_wakeup, clock_.now());
             }
@@ -2284,12 +2230,10 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
                               ? nullptr
                               : operation->participant_for(admission.registration.engine);
       if (participant == nullptr) {
-        motion_admission_closed_ = true;
         return Result<OperationAcceptedDTO>::Ok(accepted);
       }
       participant->prepare_in_flight = false;
       if (!cancelled.ok()) {
-        motion_admission_closed_ = true;
         participant->last_subordinate_error = cancelled.error();
         for (auto& row : operation->state.participants) {
           if (row.participant_id == participant->slot_owner.participant_id) {
@@ -2312,12 +2256,8 @@ ResourceAddressedExecutionKernel::execute_coordinated_motion_after_preflight(
       return Result<OperationAcceptedDTO>::Ok(accepted);
     }
     if (preparation_orphaned) {
-      const auto cancelled = cancel_prepared_participant(
-          *admission.registration.prepared_motion_engine, admission.payload_kind, prepared.value());
-      if (!cancelled.ok()) {
-        std::lock_guard state_lock(state_mutex_);
-        motion_admission_closed_ = true;
-      }
+      static_cast<void>(cancel_prepared_participant(
+          *admission.registration.prepared_motion_engine, admission.payload_kind, prepared.value()));
       return Result<OperationAcceptedDTO>::Ok(accepted);
     }
     if (!admitted.ok()) {
@@ -2358,18 +2298,6 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
     OperationParticipantPayloadKind payload_kind{OperationParticipantPayloadKind::kMotion};
     std::string command_target;
     std::uint64_t subordinate_generation{};
-    std::optional<IoOutputResetAuthorityDTO> output_reset_authority{};
-  };
-  struct UnknownOutputReset final {
-    OperationParticipantId participant_id;
-    RuntimeParticipantBindingDTO binding;
-    IoOutputCommandIdentityDTO command;
-    std::optional<IoOutputLocalResynchronizationProofDTO> proof{};
-  };
-  std::vector<UnknownOutputReset> unknown_outputs;
-  const auto unknown_output = [](const auto& participant, const auto& state) {
-    return participant.binding.value().io_output_binding && state.terminal_fact &&
-           state.terminal_fact->effect == ParticipantEffectKnowledge::kEffectUncertain;
   };
   if (operation_control_request_field_error(request).has_value()) {
     return reject<OperationControlAcceptedDTO>("operation control request is malformed",
@@ -2382,99 +2310,7 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
               "stale_request_owner_epoch"));
   }
 
-  // An explicit operator acknowledgement is distinct from automatic cleanup
-  // and from the Program control node's private execution permission.
-  if (request.acknowledged_uncertain_outputs &&
-      (control != OperationControlKind::kReset || automatic_manual_retirement ||
-       request.execution_scope)) {
-    return reject<OperationControlAcceptedDTO>(
-        "uncertain output acknowledgement is only valid for explicit operator Reset",
-        "io_output_uncertainty_acknowledgement_not_allowed", ErrorCode::kInvalidRequest);
-  }
-  // Capture the original prepared occurrence, then consult existing durable
-  // CCLC history outside Kernel state. An exact retained replay needs no new
-  // lifecycle proof and is decided by the original replay ledger below.
-  {
-    std::lock_guard state_lock(state_mutex_);
-    const bool retained_request = std::any_of(
-        control_replay_ledger_.begin(), control_replay_ledger_.end(), [&](const auto& entry) {
-          return entry.request.request_context.request_id == request.request_context.request_id;
-        });
-    const auto* operation = find_active_operation_locked(request.operation_id);
-    if (!retained_request && control == OperationControlKind::kReset && operation &&
-        operation->state.operation_revision == request.expected_operation_revision &&
-        request.acknowledged_uncertain_outputs &&
-        *request.acknowledged_uncertain_outputs ==
-            std::vector<UncertainOutputAcknowledgementDTO>{
-                {request.operation_id, request.expected_operation_revision}}) {
-      for (std::size_t i = 0U; i < operation->participants.size(); ++i) {
-        const auto& participant = operation->participants[i];
-        const auto& state = operation->state.participants[i];
-        if (!unknown_output(participant, state)) continue;
-        if (!participant.prepared_participant || !participant.prepared_participant->provider() ||
-            !participant.prepared_dispatch_released || participant.subordinate_id == 0U ||
-            state.output_evidence != IoOutputEvidence::kAcceptanceUnknown) {
-          return reject<OperationControlAcceptedDTO>(
-              "unknown output has no exact original prepared occurrence",
-              "io_output_reset_identity_unavailable");
-        }
-        const auto& prepared = *participant.prepared_participant;
-        unknown_outputs.push_back(UnknownOutputReset{
-            state.participant_id, participant.binding.value(),
-            IoOutputCommandIdentityDTO{
-                {prepared.operation_id, prepared.operation_revision, prepared.participant_id,
-                 state.command_id, state.command_generation},
-                prepared.prepared_contract_digest,
-                prepared.component_lifecycle_generation,
-                prepared.provider()->lifecycle_provider}});
-      }
-    }
-  }
-  for (auto& output : unknown_outputs) {
-    if (!config_.io_output_local_resynchronization_source)
-      return reject<OperationControlAcceptedDTO>(
-          "output Reset requires completed local Disable then Enable proof",
-          "io_output_local_resynchronization_unavailable");
-    auto proof = config_.io_output_local_resynchronization_source(output.binding);
-    if (!proof.ok()) return Result<OperationControlAcceptedDTO>::Err(proof.error());
-    const auto& value = proof.value();
-    if (value.retained_bundle_id != output.binding.retained_bundle_id ||
-        value.graph_revision != output.binding.graph_revision ||
-        value.controllable_component_id != output.binding.controllable_component_id ||
-        value.provider != output.command.provider || value.disable_transaction_id.empty() ||
-        value.enable_transaction_id.empty() ||
-        value.disable_transaction_id == value.enable_transaction_id ||
-        value.disabled_generation <= output.command.component_lifecycle_generation ||
-        value.enabled_generation <= value.disabled_generation)
-      return reject<OperationControlAcceptedDTO>(
-          "output Reset lacks exact completed local Disable then Enable proof",
-          "io_output_local_resynchronization_not_proved");
-    output.proof = std::move(proof).value();
-  }
   OperationCommitGuard commit(*this, request.operation_id);
-  {
-    std::lock_guard state_lock(state_mutex_);
-    // Another caller may have admitted this exact request during proof I/O.
-    // Its retained receipt remains readable regardless of later lifecycle work.
-    if (std::any_of(
-            control_replay_ledger_.begin(), control_replay_ledger_.end(), [&](const auto& entry) {
-              return entry.request.request_context.request_id == request.request_context.request_id;
-            }))
-      unknown_outputs.clear();
-  }
-  // Follow the existing operation-commit -> admission -> state order. The
-  // actual driver proof is rechecked below; a later Disable cannot slip
-  // between that check and durable acceptance.
-  std::unique_lock<std::recursive_mutex> output_reset_admission(*admission_mutex_, std::defer_lock);
-  if (!unknown_outputs.empty()) {
-    output_reset_admission.lock();
-    if (cell_admission_owner_->held_claim(CellAdmissionClaimKindDTO::kComponentLifecycle) ||
-        !config_.operation_admission_gate ||
-        config_.operation_admission_gate->has_held_configuration_fences())
-      return reject<OperationControlAcceptedDTO>(
-          "output Reset cannot overtake lifecycle or configuration admission",
-          "io_output_reset_admission_held");
-  }
   std::vector<ControlTarget> targets;
   bool reset_already_terminal = false;
   bool no_effect_preparation_retirement = false;
@@ -2570,68 +2406,6 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
     // Like Stop, control resolves to the operation's current revision; the
     // caller's expected revision is informational.
     const auto current_revision = active_operation->state.operation_revision;
-    const auto unknown_count = static_cast<std::size_t>(std::count_if(
-        active_operation->state.participants.begin(), active_operation->state.participants.end(),
-        [&](const auto& state) {
-          const auto participant =
-              std::find_if(active_operation->participants.begin(),
-                           active_operation->participants.end(), [&](const auto& row) {
-                             return row.slot_owner.participant_id == state.participant_id;
-                           });
-          return participant != active_operation->participants.end() &&
-                 unknown_output(*participant, state);
-        }));
-    if (unknown_count != 0U) {
-      const std::vector<UncertainOutputAcknowledgementDTO> required{
-          {request.operation_id, current_revision}};
-      if (control != OperationControlKind::kReset || automatic_manual_retirement ||
-          !request.acknowledged_uncertain_outputs ||
-          *request.acknowledged_uncertain_outputs != required ||
-          unknown_outputs.size() != unknown_count) {
-        auto refusal = error(std::string(to_string(ErrorCode::kInvalidStateTransition)),
-                             "operator Reset must explicitly acknowledge the targeted unknown "
-                             "output and remaining remote queued-write risk",
-                             "io_output_explicit_uncertainty_acknowledgement_required");
-        refusal.details.emplace("operation_id", request.operation_id.value());
-        refusal.details.emplace("operation_revision", std::to_string(current_revision.value()));
-        return Result<OperationControlAcceptedDTO>::Err(std::move(refusal));
-      }
-      for (const auto& output : unknown_outputs) {
-        const auto participant =
-            std::find_if(active_operation->participants.begin(),
-                         active_operation->participants.end(), [&](const auto& row) {
-                           return row.slot_owner.participant_id == output.participant_id;
-                         });
-        const auto row =
-            runtime_route_configuration_readbacks_.find(output.command.provider.control_domain_id);
-        const auto* current =
-            row == runtime_route_configuration_readbacks_.end() ? nullptr : row->second.provider();
-        const auto readiness =
-            component_command_readiness_.find(output.binding.controllable_component_id);
-        if (!output_reset_admission.owns_lock() || !output.proof ||
-            participant == active_operation->participants.end() ||
-            participant->binding.value() != output.binding || !participant->prepared_participant ||
-            participant->prepared_participant->prepared_contract_digest !=
-                output.command.prepared_contract_digest ||
-            !current || !current->locally_valid() || !current->operation_admission_open ||
-            current->driver_source_sequence == 0U || current->driver_observation_generation == 0U ||
-            current->retained_bundle_id != output.proof->retained_bundle_id ||
-            current->graph_revision != output.proof->graph_revision ||
-            current->provider_occurrence != output.proof->provider ||
-            current->component_lifecycle_generation != output.proof->enabled_generation ||
-            readiness == component_command_readiness_.end() ||
-            !readiness->second.command_eligible ||
-            readiness->second.component_lifecycle_generation != output.proof->enabled_generation)
-          return reject<OperationControlAcceptedDTO>(
-              "output Reset local resynchronization proof is no longer current",
-              "io_output_local_resynchronization_stale");
-      }
-    } else if (request.acknowledged_uncertain_outputs &&
-               !request.acknowledged_uncertain_outputs->empty()) {
-      return reject<OperationControlAcceptedDTO>(
-          "Reset acknowledgement names an output outside the targeted unknown operation",
-          "io_output_uncertainty_acknowledgement_target_mismatch", ErrorCode::kInvalidRequest);
-    }
     if (!control_admissible(control, active_operation->state.state) &&
         !(control == OperationControlKind::kAcknowledgeCompleted &&
           active_operation->pneumatic_final_failure())) {
@@ -2703,11 +2477,10 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
       const auto& participant_state = active_operation->state.participants[index];
       if (control == OperationControlKind::kAcknowledgeCompleted &&
           (participant.payload_kind == OperationParticipantPayloadKind::kMotion ||
-           participant.finishes_current_gripper_transaction() || participant.binding.value().io_output_binding)) {
+           participant.finishes_current_gripper_transaction())) {
         targets.push_back(ControlTarget{participant_state.participant_id,
                                         participant.engine,
-                                        (participant.finishes_current_gripper_transaction() ||
-                                         participant.binding.value().io_output_binding)
+                                        participant.finishes_current_gripper_transaction()
                                             ? participant.preparation_id : participant.subordinate_id,
                                         participant.payload_kind,
                                         participant.binding.value().command_target_id.value(),
@@ -2724,15 +2497,6 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
                                         participant.payload_kind,
                                         participant.binding.value().command_target_id.value(),
                                         participant.subordinate_generation});
-      }
-    }
-    for (auto& target : targets) {
-      const auto output = std::find_if(
-          unknown_outputs.begin(), unknown_outputs.end(),
-          [&](const auto& row) { return row.participant_id == target.participant_id; });
-      if (output != unknown_outputs.end()) {
-        target.output_reset_authority = IoOutputResetAuthorityDTO{
-            output->command, request.request_context.request_id, current_revision, *output->proof};
       }
     }
     if (no_effect_preparation_retirement && !targets.empty())
@@ -2799,14 +2563,12 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
                                        return entry.accepted.request_id == accepted.request_id;
                                      });
     if (replay == control_replay_ledger_.end()) {
-      motion_admission_closed_ = true;
       return Result<OperationControlAcceptedDTO>::Ok(accepted);
     }
     replay->durable = true;
     auto* active_operation = find_active_operation_locked(request.operation_id);
     if (active_operation == nullptr || !active_operation->pending_control.has_value() ||
         active_operation->pending_control->accepted != accepted) {
-      motion_admission_closed_ = true;
       return Result<OperationControlAcceptedDTO>::Ok(accepted);
     }
     active_operation->pending_control->durable = true;
@@ -2832,7 +2594,6 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
           settle_without_effect = targets.empty();
         }
       } else {
-        motion_admission_closed_ = true;
         active_operation->pending_control.reset();
         defer_effects_to_stop = true;
       }
@@ -2840,7 +2601,6 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
       auto owner_rows =
           retained_owner_rows(active_operation->participants, resource_slots_->coherent_snapshot());
       if (!owner_rows.ok()) {
-        motion_admission_closed_ = true;
         active_operation->pending_control.reset();
         return Result<OperationControlAcceptedDTO>::Ok(accepted);
       }
@@ -2850,7 +2610,6 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
               : resource_slots_->revise_owner_batch(owner_rows.value(),
                                                     accepted.operation_revision_after_acceptance);
       if (!revised.ok()) {
-        motion_admission_closed_ = true;
         active_operation->state.state = OperationStateKind::kInterventionRequired;
         active_operation->state.updated_at_ns = clock_.now();
         active_operation->pending_control.reset();
@@ -2863,7 +2622,6 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
               return candidate.slot_owner.participant_id == revised_owner.participant_id;
             });
         if (participant == active_operation->participants.end()) {
-          motion_admission_closed_ = true;
           continue;
         }
         participant->slot_owner = revised_owner;
@@ -2896,24 +2654,19 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
   }
 
   commit.release();
-  if (output_reset_admission.owns_lock()) output_reset_admission.unlock();
   if (defer_effects_to_stop) {
     return Result<OperationControlAcceptedDTO>::Ok(accepted);
   }
 
   if (settle_without_effect) {
     std::lock_guard state_lock(state_mutex_);
-    auto settled = settle_control_operation_locked(request.operation_id, control);
-    if (!settled.ok()) {
-      motion_admission_closed_ = true;
-    }
+    (void)settle_control_operation_locked(request.operation_id, control);
     return Result<OperationControlAcceptedDTO>::Ok(accepted);
   }
   if (reset_stop.has_value()) {
     auto stopped = accept_stop(EmergencyStopProjectedIntentDTO{std::move(*reset_stop)});
     if (!stopped.ok()) {
       std::lock_guard state_lock(state_mutex_);
-      motion_admission_closed_ = true;
       auto* operation = find_active_operation_locked(request.operation_id);
       if (operation != nullptr) {
         operation->state.state = OperationStateKind::kInterventionRequired;
@@ -2928,16 +2681,9 @@ Result<OperationControlAcceptedDTO> ResourceAddressedExecutionKernel::apply_cont
     auto started = operation_control_executor_->TryStart(OperationControlEffectRequest{
         target.engine, request.operation_id, target.participant_id,
         accepted.operation_revision_after_acceptance, control, target.subordinate_id,
-        target.payload_kind, target.command_target, target.subordinate_generation,
-        target.output_reset_authority});
+        target.payload_kind, target.command_target, target.subordinate_generation});
     if (started.status == OperationControlEffectStartStatus::kStarted) {
       continue;
-    }
-    {
-      std::lock_guard state_lock(state_mutex_);
-      // Capacity was checked before durable acceptance. Losing that handoff
-      // is an owner invariant failure, not a provider's scoped refusal.
-      motion_admission_closed_ = true;
     }
     CompleteOperationControlEffect(OperationControlEffectResult{
         request.operation_id, target.participant_id, accepted.operation_revision_after_acceptance,
@@ -2976,8 +2722,7 @@ void ResourceAddressedExecutionKernel::settle_completed_control_locked(
       pending.completed_effects == pending.expected_effects && !pending.first_failure.has_value() &&
       (pending.accepted.control == OperationControlKind::kReset ||
        pending.accepted.control == OperationControlKind::kAcknowledgeCompleted)) {
-    if (!settle_control_operation_locked(operation_id, pending.accepted.control).ok())
-      motion_admission_closed_ = true;
+    (void)settle_control_operation_locked(operation_id, pending.accepted.control);
   }
 }
 
@@ -3091,34 +2836,27 @@ Result<void> ResourceAddressedExecutionKernel::settle_control_operation_locked(
 
 Result<void> ResourceAddressedExecutionKernel::retire_operation_ownership_locked(
     const OperationId& operation_id, const bool clear_continuation,
-    const bool discard_node_continuations, const bool force) {
+    const bool discard_node_continuations) {
   auto* operation = find_active_operation_locked(operation_id);
   if (!operation)
     return reject<void>("operation retirement has no resident owner", "operation_not_resident",
                         ErrorCode::kMissingReference);
-  if (force) {
-    // Item 37: the operation's I/O rules and its takeovers' end with it.
-    static_cast<void>(retire_io_rules_locked(*operation));
-    for (auto* takeover : {&operation->pending_motion_takeover, &operation->next_motion_takeover})
-      if (!takeover->empty()) static_cast<void>(retire_io_rules_locked(*takeover->mapped()));
-  } else {
-    if (operation->has_pending_io_rule_response() ||
-        operation->takeover_advance_in_flight || !operation->pending_motion_takeover.empty() ||
-        !operation->next_motion_takeover.empty())
-      return reject<void>("accepted motion takeover ownership has not drained",
-                          "operation_effect_in_flight", ErrorCode::kInvalidStateTransition);
-    const auto rules_retired = retire_io_rules_locked(*operation);
-    if (!rules_retired.ok()) return rules_retired;
-    auto owner_rows =
-        retained_owner_rows(operation->participants, resource_slots_->coherent_snapshot());
-    if (!owner_rows.ok()) {
-      return Result<void>::Err(owner_rows.error());
-    }
-    if (!owner_rows.value().empty()) {
-      auto released = resource_slots_->release_batch(owner_rows.value());
-      if (!released.ok()) {
-        return released;
-      }
+  if (operation->has_pending_io_rule_response() ||
+      operation->takeover_advance_in_flight || !operation->pending_motion_takeover.empty() ||
+      !operation->next_motion_takeover.empty())
+    return reject<void>("accepted motion takeover ownership has not drained",
+                        "operation_effect_in_flight", ErrorCode::kInvalidStateTransition);
+  const auto rules_retired = retire_io_rules_locked(*operation);
+  if (!rules_retired.ok()) return rules_retired;
+  auto owner_rows =
+      retained_owner_rows(operation->participants, resource_slots_->coherent_snapshot());
+  if (!owner_rows.ok()) {
+    return Result<void>::Err(owner_rows.error());
+  }
+  if (!owner_rows.value().empty()) {
+    auto released = resource_slots_->release_batch(owner_rows.value());
+    if (!released.ok()) {
+      return released;
     }
   }
   operation->pending_control.reset();
@@ -3158,18 +2896,11 @@ void ResourceAddressedExecutionKernel::OperationControlEffectCompleted(
       // lane reusable before publishing free resources or retry eligibility.
       if (executor.Release(handle) != OperationControlEffectReleaseStatus::kReleased ||
           !taken.result.has_value()) {
-        std::lock_guard state_lock(state_mutex_);
-        motion_admission_closed_ = true;
         return;
       }
       CompleteOperationControlEffect(std::move(*taken.result));
-    } else if (taken.status != OperationControlEffectTakeStatus::kPending) {
-      std::lock_guard state_lock(state_mutex_);
-      motion_admission_closed_ = true;
     }
   } catch (...) {
-    std::lock_guard state_lock(state_mutex_);
-    motion_admission_closed_ = true;
   }
 }
 
@@ -3179,25 +2910,17 @@ OperationStateDTO ResourceAddressedExecutionKernel::publish_settlement_fault_loc
   // immutable physical Stop outcome. Reuse the existing operation revision
   // so delayed durable projections have a causal order even at equal clocks.
   auto owners = retained_owner_rows(operation.participants, resource_slots_->coherent_snapshot());
-  if (!owners.ok() || operation.state.operation_revision.value() >= kMaximumKernelJsonInteger) {
-    motion_admission_closed_ = true;
-  } else {
+  if (owners.ok() && operation.state.operation_revision.value() < kMaximumKernelJsonInteger) {
     const OperationRevision next(operation.state.operation_revision.value() + 1U);
     auto revised = owners.value().empty()
                        ? Result<std::vector<ResourceSlotOwnerDTO>>::Ok({})
                        : resource_slots_->revise_owner_batch(owners.value(), next);
-    if (!revised.ok()) {
-      motion_admission_closed_ = true;
-    } else {
+    if (revised.ok()) {
       for (const auto& owner : revised.value()) {
         const auto participant = std::find_if(
             operation.participants.begin(), operation.participants.end(),
             [&](const auto& row) { return row.slot_owner.participant_id == owner.participant_id; });
-        if (participant == operation.participants.end()) {
-          motion_admission_closed_ = true;
-        } else {
-          participant->slot_owner = owner;
-        }
+        if (participant != operation.participants.end()) participant->slot_owner = owner;
       }
       operation.state.operation_revision = next;
       if (operation.runtime_scale_status.has_value())
@@ -3231,7 +2954,6 @@ void ResourceAddressedExecutionKernel::CompleteOperationControlEffect(
           });
       if (participant == operation->participants.end() ||
           pending.completed_effects >= pending.expected_effects) {
-        motion_admission_closed_ = true;
         return;
       }
       if (!result.accepted) {
@@ -3282,16 +3004,11 @@ void ResourceAddressedExecutionKernel::CompleteOperationControlEffect(
           // state would let an automatic owner repeatedly retry settlement.
           settlement_failure = publish_settlement_fault_locked(*operation);
         } else {
-          auto settled = settle_control_operation_locked(result.operation_id, result.control);
-          if (!settled.ok()) {
-            motion_admission_closed_ = true;
-          }
+          (void)settle_control_operation_locked(result.operation_id, result.control);
         }
         return;
       } else if (!pending.first_failure.has_value()) {
-        if (!settle_control_operation_locked(result.operation_id, result.control).ok()) {
-          motion_admission_closed_ = true;
-        }
+        (void)settle_control_operation_locked(result.operation_id, result.control);
         return;
       } else if (!superseded_by_stop) {
         // This known operation retains its exact resource reservation until
@@ -3334,8 +3051,6 @@ void ResourceAddressedExecutionKernel::CompleteOperationControlEffect(
       }
     }
   } catch (...) {
-    std::lock_guard state_lock(state_mutex_);
-    motion_admission_closed_ = true;
   }
 }
 
@@ -3401,10 +3116,10 @@ ResourceAddressedExecutionKernel::get_manual_control_availability(
   const auto route = runtime_route_configuration_readbacks_.find(control.control_domain_id);
   if (runtime_route_configuration_publication_required_.contains(control.control_domain_id) ||
       (route != runtime_route_configuration_readbacks_.end() &&
-       (route->second.provider() != nullptr || !route->second.controller().operation_admission_open ||
-        route->second.controller().active_configuration.active_control_configuration_id !=
+       (!route->second.operation_admission_open ||
+        route->second.active_configuration.active_control_configuration_id !=
             control.active_control_configuration_id ||
-        route->second.controller().active_configuration.active_control_configuration_generation !=
+        route->second.active_configuration.active_control_configuration_generation !=
             control.active_control_configuration_generation)))
     return unavailable(
         {"runtime_route_configuration_not_ready", "target route is not current", {}});
@@ -3415,7 +3130,7 @@ ResourceAddressedExecutionKernel::get_manual_control_availability(
   for (const auto& resource : binding.resources) resources.push_back(resource.resource_id);
   std::sort(resources.begin(), resources.end());
   std::lock_guard state_lock(state_mutex_);
-  if (motion_admission_closed_ || motion_admission_unreconciled_)
+  if (motion_admission_closed_locked() || motion_admission_unreconciled_)
     return unavailable({"motion_admission_closed", "motion admission is closed", {}});
   if (handover) {
     const auto held = validate_manual_program_handover_locked(*handover);
@@ -3482,7 +3197,7 @@ ResourceAddressedExecutionKernel::resolve_manual_program_handover(
   std::optional<ResolvedManualProgramHandover> captured;
   {
     std::lock_guard lock(state_mutex_);
-    if (motion_admission_closed_ || motion_admission_unreconciled_) {
+    if (motion_admission_closed_locked() || motion_admission_unreconciled_) {
       return reject<std::optional<ResolvedManualProgramHandover>>(
           "motion admission is closed or unreconciled", "motion_admission_closed");
     }
@@ -3559,7 +3274,8 @@ Result<void> ResourceAddressedExecutionKernel::validate_manual_program_handover_
   const auto fence = std::find_if(
       program_run_stop_fences_.begin(), program_run_stop_fences_.end(),
       [&](const auto& item) { return item.program_run_id == result.capture.program_run_id; });
-  if (motion_admission_closed_ || motion_admission_unreconciled_ || !program_cycle_claim_run_ ||
+  if (motion_admission_closed_locked() || motion_admission_unreconciled_ ||
+      !program_cycle_claim_run_ ||
       program_cycle_claim_run_->claim_generation != result.capture.claim_generation ||
       !program_cycle_claim_run_->capture ||
       program_cycle_claim_run_->capture->table != result.capture.table ||
@@ -3779,7 +3495,7 @@ Result<void> ResourceAddressedExecutionKernel::register_program_run_capture(
 Result<void> ResourceAddressedExecutionKernel::validate_program_node_claim(
     const ProgramNodeAdmissionEvidenceDTO& evidence) const {
   std::lock_guard state_lock(state_mutex_);
-  if (motion_admission_closed_ || motion_admission_unreconciled_ ||
+  if (motion_admission_closed_locked() || motion_admission_unreconciled_ ||
       !program_cycle_claim_run_.has_value() || !program_cycle_claim_run_->capture.has_value() ||
       program_cycle_claim_run_->program_run_id != evidence.program_run_id ||
       program_cycle_claim_run_->program_runner_owner_epoch != evidence.program_runner_owner_epoch ||
@@ -4038,11 +3754,10 @@ Result<void> ResourceAddressedExecutionKernel::release_program_run_stop_fence(
     return reject<void>("Program-run Stop fence identity is invalid",
                         "program_run_stop_fence_identity_invalid", ErrorCode::kInvalidRequest);
   }
-  std::unique_lock admission_lock(*admission_mutex_, std::try_to_lock);
-  if (!admission_lock.owns_lock()) {
-    return reject<void>("ordinary admission is still in flight", "program_run_admission_in_flight",
-                        ErrorCode::kInvalidStateTransition);
-  }
+  // Wait for an in-flight ordinary admission (bounded, no Stop dependency):
+  // its child is then visible to the unsettled-child check below. Stop never
+  // takes this lock, so waiting here cannot delay it.
+  std::lock_guard admission_lock(*admission_mutex_);
   const auto parent = cell_admission_owner_->held_claim(CellAdmissionClaimKindDTO::kProgramCycle);
   if (parent.has_value() && parent->intent.owner_transaction_id == program_run_id.value() &&
       !cell_admission_owner_->unsettled_program_child_nodes(parent->claim_generation).empty()) {
@@ -4050,6 +3765,8 @@ Result<void> ResourceAddressedExecutionKernel::release_program_run_stop_fence(
                         ErrorCode::kInvalidStateTransition);
   }
   std::lock_guard state_lock(state_mutex_);
+  // R1: a cell latch refuses Program resume.
+  if (auto refusal = cell_latch_refusal_locked()) return Result<void>::Err(std::move(*refusal));
   const auto fence = std::find_if(program_run_stop_fences_.begin(), program_run_stop_fences_.end(),
                                   [&](const ProgramRunStopFence& candidate) {
                                     return candidate.program_run_id == program_run_id;
@@ -4159,6 +3876,7 @@ ProgramExecutionScopeStateDTO ResourceAddressedExecutionKernel::program_executio
       config_.request_owner_epoch, claim.program_runner_owner_epoch, claim.claim_generation,
       claim.program_run_id,        fence.selection_revision,         {},
       fence.pending_effects, program_selection_release_block_reason_locked(fence)};
+  if (fence.held_by_rule) result.stopped_by_rule_id = fence.held_by_rule->value();
   for (std::size_t index = 0U; index < fence.node_states.size(); ++index) {
     if (fence.node_states[index] != ProgramNodeHoldStateDTO::kRunning) {
       result.held_nodes.push_back({static_cast<std::uint32_t>(index), fence.node_states[index]});
@@ -4173,7 +3891,7 @@ ResourceAddressedExecutionKernel::program_selection_release_block_reason_locked(
   // Keep this order aligned with the atomic Run/Resume refusal below. The
   // scope projection is advisory; release_program_selection re-evaluates this
   // same predicate while holding the Kernel state lock before changing holds.
-  if (motion_admission_closed_)
+  if (motion_admission_closed_locked())
     return ProgramSelectionReleaseBlockReasonDTO::kCellMotionAdmissionClosed;
   if (motion_admission_unreconciled_)
     return ProgramSelectionReleaseBlockReasonDTO::kCellMotionAdmissionUnreconciled;
@@ -4206,293 +3924,297 @@ ResourceAddressedExecutionKernel::stop_program_selection(
   const auto accepted_at_ns = clock_.now();
   StopWorkHandoff handoff;
   const ScopeExit publish([&] { publish_stop_work(handoff); });
-  auto result = [&]() -> Result<ProgramExecutionSelectionAcceptedDTO> {
-    std::lock_guard state_lock(state_mutex_);
-    auto selection = resolve_program_selection_locked(request);
-    if (!selection.ok()) {
-      const MalformedStopIngressDTO malformed{
-          request.request_context.request_id, config_.request_owner_epoch, request.attribution,
-          "/api/execution/stops", "recognized_stop_payload_invalid"};
-      auto stopped = accept_stop_locked(EmergencyStopProjectedIntentDTO{std::monostate{}}, handoff,
-                                        accepted_at_ns, nullptr, &malformed);
-      if (!stopped.ok()) return Result<ProgramExecutionSelectionAcceptedDTO>::Err(stopped.error());
+  std::lock_guard state_lock(state_mutex_);
+  return stop_program_selection_locked(request, handoff, accepted_at_ns);
+}
+
+Result<ProgramExecutionSelectionAcceptedDTO>
+ResourceAddressedExecutionKernel::stop_program_selection_locked(
+    const ProgramExecutionSelectionRequestDTO& request, StopWorkHandoff& handoff,
+    const TimePoint accepted_at_ns) {
+  auto selection = resolve_program_selection_locked(request);
+  if (!selection.ok()) {
+    const MalformedStopIngressDTO malformed{
+        request.request_context.request_id, config_.request_owner_epoch, request.attribution,
+        "/api/execution/stops", "recognized_stop_payload_invalid"};
+    auto stopped = accept_stop_locked(EmergencyStopProjectedIntentDTO{std::monostate{}}, handoff,
+                                      accepted_at_ns, nullptr, &malformed);
+    if (!stopped.ok()) return Result<ProgramExecutionSelectionAcceptedDTO>::Err(stopped.error());
+    return Result<ProgramExecutionSelectionAcceptedDTO>::Ok(
+        {std::nullopt, {}, {}, std::move(stopped.value()), selection.error()});
+  }
+  auto fence =
+      std::find_if(program_run_stop_fences_.begin(), program_run_stop_fences_.end(),
+                   [&](const auto& row) { return row.program_run_id == request.program_run_id; });
+  // A resolved captured selection always has its fence installed. If that
+  // invariant is lost, recognized Stop must still contain through the
+  // existing conservative path rather than return before taking effect.
+  if (fence == program_run_stop_fences_.end()) {
+    const MalformedStopIngressDTO malformed{
+        request.request_context.request_id, config_.request_owner_epoch, request.attribution,
+        "/api/execution/stops", "recognized_stop_payload_invalid"};
+    auto stopped = accept_stop_locked(EmergencyStopProjectedIntentDTO{std::monostate{}}, handoff,
+                                      accepted_at_ns, nullptr, &malformed);
+    if (!stopped.ok()) return Result<ProgramExecutionSelectionAcceptedDTO>::Err(stopped.error());
+    return Result<ProgramExecutionSelectionAcceptedDTO>::Ok(
+        {std::nullopt,
+         {},
+         {},
+         std::move(stopped.value()),
+         error("program_selection_owner_missing", "Program selection owner is missing",
+               "program_selection_owner_missing")});
+  }
+  const auto& table = *program_cycle_claim_run_->capture->table;
+  const auto replay = std::find_if(
+      stop_replay_ledger_.begin(), stop_replay_ledger_.end(),
+      [&](const auto& row) { return row.request_id() == request.request_context.request_id; });
+  if (replay != stop_replay_ledger_.end() ||
+      ordinary_request_id_retained_locked(request.request_context.request_id) ||
+      emergency_stop_reserve_.find(request.request_context.request_id.value()).has_value()) {
+    const auto* prior = replay == stop_replay_ledger_.end()
+                            ? nullptr
+                            : std::get_if<ProgramExecutionSelectionRequestDTO>(&replay->intent);
+    if (prior != nullptr && *prior == request) {
+      const auto& receipt = std::get<StopReplayEntry::SelectionReceipt>(replay->accepted);
       return Result<ProgramExecutionSelectionAcceptedDTO>::Ok(
-          {std::nullopt, {}, {}, std::move(stopped.value()), selection.error()});
+          {program_execution_scope_locked(*fence), selection.value(),
+           receipt.widened_node_indices, receipt.fresh_containment, std::nullopt,
+           RequestReplayStatusDTO::kReplayedExact});
     }
-    auto fence =
-        std::find_if(program_run_stop_fences_.begin(), program_run_stop_fences_.end(),
-                     [&](const auto& row) { return row.program_run_id == request.program_run_id; });
-    // A resolved captured selection always has its fence installed. If that
-    // invariant is lost, recognized Stop must still contain through the
-    // existing conservative path rather than return before taking effect.
-    if (fence == program_run_stop_fences_.end()) {
-      const MalformedStopIngressDTO malformed{
-          request.request_context.request_id, config_.request_owner_epoch, request.attribution,
-          "/api/execution/stops", "recognized_stop_payload_invalid"};
-      auto stopped = accept_stop_locked(EmergencyStopProjectedIntentDTO{std::monostate{}}, handoff,
-                                        accepted_at_ns, nullptr, &malformed);
-      if (!stopped.ok()) return Result<ProgramExecutionSelectionAcceptedDTO>::Err(stopped.error());
-      return Result<ProgramExecutionSelectionAcceptedDTO>::Ok(
-          {std::nullopt,
-           {},
-           {},
-           std::move(stopped.value()),
-           error("program_selection_owner_missing", "Program selection owner is missing",
-                 "program_selection_owner_missing")});
+    const MalformedStopIngressDTO malformed{
+        request.request_context.request_id, config_.request_owner_epoch, request.attribution,
+        "/api/execution/stops", "recognized_stop_payload_invalid"};
+    auto stopped = accept_stop_locked(EmergencyStopProjectedIntentDTO{std::monostate{}}, handoff,
+                                      accepted_at_ns, nullptr, &malformed);
+    if (!stopped.ok()) return Result<ProgramExecutionSelectionAcceptedDTO>::Err(stopped.error());
+    return Result<ProgramExecutionSelectionAcceptedDTO>::Ok(
+        {program_execution_scope_locked(*fence),
+         selection.value(),
+         {},
+         std::move(stopped.value()),
+         error("request_id_conflict",
+               "Program Stop identity was reused with a different selection",
+               "request_id_conflict")});
+  }
+  // Exact retained retries above are read-only even at the counter limit.
+  // New Stop cannot be refused for exhausted selection bookkeeping: use
+  // existing cell-wide containment, whose admission closure also fences any
+  // late Execute. Resume already refuses this exhausted revision.
+  if (fence->selection_revision >= kMaximumKernelJsonInteger) {
+    const MalformedStopIngressDTO malformed{
+        request.request_context.request_id, config_.request_owner_epoch, request.attribution,
+        "/api/execution/stops", "recognized_stop_payload_invalid"};
+    auto stopped = accept_stop_locked(EmergencyStopProjectedIntentDTO{std::monostate{}}, handoff,
+                                      accepted_at_ns, nullptr, &malformed);
+    if (!stopped.ok()) return Result<ProgramExecutionSelectionAcceptedDTO>::Err(stopped.error());
+    return Result<ProgramExecutionSelectionAcceptedDTO>::Ok(
+        {program_execution_scope_locked(*fence),
+         selection.value(),
+         {},
+         std::move(stopped.value()),
+         error("program_selection_revision_exhausted", "Program selection revision is exhausted",
+               "program_selection_revision_exhausted")});
+  }
+  std::vector<bool> selected(table.nodes.size(), false);
+  for (const auto index : selection.value()) selected[index] = true;
+  const auto node_index = [&](const ProgramNodeExecutionScopeDTO& scope) {
+    const auto node =
+        std::lower_bound(table.nodes.begin(), table.nodes.end(), scope.node_instance_id,
+                         [](const auto& row, const auto& id) { return row.instance_id < id; });
+    return static_cast<std::size_t>(node - table.nodes.begin());
+  };
+  const auto intersects = [&](const auto& operation) {
+    if (operation.manual_handover &&
+        operation.manual_handover->capture.program_run_id == request.program_run_id) {
+      if (std::find(request.group_ids.begin(), request.group_ids.end(), "all") !=
+          request.group_ids.end())
+        return true;
+      return std::any_of(
+          operation.manual_handover->producer_node_indices.begin(),
+          operation.manual_handover->producer_node_indices.end(),
+          [&](const auto index) { return index < selected.size() && selected[index]; });
     }
-    const auto& table = *program_cycle_claim_run_->capture->table;
-    const auto replay = std::find_if(
-        stop_replay_ledger_.begin(), stop_replay_ledger_.end(),
-        [&](const auto& row) { return row.request_id() == request.request_context.request_id; });
-    if (replay != stop_replay_ledger_.end() ||
-        ordinary_request_id_retained_locked(request.request_context.request_id) ||
-        emergency_stop_reserve_.find(request.request_context.request_id.value()).has_value()) {
-      const auto* prior = replay == stop_replay_ledger_.end()
-                              ? nullptr
-                              : std::get_if<ProgramExecutionSelectionRequestDTO>(&replay->intent);
-      if (prior != nullptr && *prior == request) {
-        const auto& receipt = std::get<StopReplayEntry::SelectionReceipt>(replay->accepted);
-        return Result<ProgramExecutionSelectionAcceptedDTO>::Ok(
-            {program_execution_scope_locked(*fence), selection.value(),
-             receipt.widened_node_indices, receipt.fresh_containment, std::nullopt,
-             RequestReplayStatusDTO::kReplayedExact});
-      }
-      const MalformedStopIngressDTO malformed{
-          request.request_context.request_id, config_.request_owner_epoch, request.attribution,
-          "/api/execution/stops", "recognized_stop_payload_invalid"};
-      auto stopped = accept_stop_locked(EmergencyStopProjectedIntentDTO{std::monostate{}}, handoff,
-                                        accepted_at_ns, nullptr, &malformed);
-      if (!stopped.ok()) return Result<ProgramExecutionSelectionAcceptedDTO>::Err(stopped.error());
-      return Result<ProgramExecutionSelectionAcceptedDTO>::Ok(
-          {program_execution_scope_locked(*fence),
-           selection.value(),
-           {},
-           std::move(stopped.value()),
-           error("request_id_conflict",
-                 "Program Stop identity was reused with a different selection",
-                 "request_id_conflict")});
-    }
-    // Exact retained retries above are read-only even at the counter limit.
-    // New Stop cannot be refused for exhausted selection bookkeeping: use
-    // existing cell-wide containment, whose admission closure also fences any
-    // late Execute. Resume already refuses this exhausted revision.
-    if (fence->selection_revision >= kMaximumKernelJsonInteger) {
-      const MalformedStopIngressDTO malformed{
-          request.request_context.request_id, config_.request_owner_epoch, request.attribution,
-          "/api/execution/stops", "recognized_stop_payload_invalid"};
-      auto stopped = accept_stop_locked(EmergencyStopProjectedIntentDTO{std::monostate{}}, handoff,
-                                        accepted_at_ns, nullptr, &malformed);
-      if (!stopped.ok()) return Result<ProgramExecutionSelectionAcceptedDTO>::Err(stopped.error());
-      return Result<ProgramExecutionSelectionAcceptedDTO>::Ok(
-          {program_execution_scope_locked(*fence),
-           selection.value(),
-           {},
-           std::move(stopped.value()),
-           error("program_selection_revision_exhausted", "Program selection revision is exhausted",
-                 "program_selection_revision_exhausted")});
-    }
-    std::vector<bool> selected(table.nodes.size(), false);
-    for (const auto index : selection.value()) selected[index] = true;
-    const auto node_index = [&](const ProgramNodeExecutionScopeDTO& scope) {
-      const auto node =
-          std::lower_bound(table.nodes.begin(), table.nodes.end(), scope.node_instance_id,
-                           [](const auto& row, const auto& id) { return row.instance_id < id; });
-      return static_cast<std::size_t>(node - table.nodes.begin());
-    };
-    const auto intersects = [&](const auto& operation) {
-      if (operation.manual_handover &&
-          operation.manual_handover->capture.program_run_id == request.program_run_id) {
-        if (std::find(request.group_ids.begin(), request.group_ids.end(), "all") !=
-            request.group_ids.end())
-          return true;
-        return std::any_of(
-            operation.manual_handover->producer_node_indices.begin(),
-            operation.manual_handover->producer_node_indices.end(),
-            [&](const auto index) { return index < selected.size() && selected[index]; });
-      }
-      return std::any_of(operation.intent.participants.begin(),
-                         operation.intent.participants.end(), [&](const auto& row) {
-                           return row.execution_scope.has_value() &&
-                                  node_index(*row.execution_scope) < selected.size() &&
-                                  selected[node_index(*row.execution_scope)];
-                         });
-    };
-    // Coordinated work is indivisible. A node can own several effects, so
-    // retain the closure, not just the first operation encountered.
-    bool widened = true;
-    while (widened) {
-      widened = false;
-      for (const auto& [id, operation] : active_operations_) {
-        if (operation->state.program_run_id != request.program_run_id ||
-            operation->intent.coordination_policy != OperationCoordinationPolicy::kCoordinatedAll)
-          continue;
-        const auto& participants = operation->intent.participants;
-        if (!intersects(*operation)) continue;
-        for (const auto& row : participants) {
-          if (!row.execution_scope.has_value()) continue;
-          const auto index = node_index(*row.execution_scope);
-          if (index < selected.size() && !selected[index]) {
-            selected[index] = true;
-            widened = true;
-          }
-        }
-      }
-    }
-    ProgramExecutionSelectionAcceptedDTO accepted{
-        std::nullopt, selection.value(), {}, std::nullopt};
-    for (std::size_t index = 0U; index < selected.size(); ++index) {
-      if (!selected[index]) continue;
-      if (!std::binary_search(selection.value().begin(), selection.value().end(), index))
-        accepted.widened_node_indices.push_back(static_cast<std::uint32_t>(index));
-      if (fence->node_states[index] == ProgramNodeHoldStateDTO::kRunning)
-        fence->node_states[index] = ProgramNodeHoldStateDTO::kHeld;
-    }
-    ++fence->selection_revision;
-    fence_held_prepared_program_commands_locked(request.program_run_id);
-    // The held state is now authoritative, under the same lock used by final
-    // Execute. No late admission can cross the following physical capture.
-    std::vector<StopOperationTargetDTO> fresh;
-    for (const auto& [id, operation] : active_operations_) {
-      if (operation->state.program_run_id != request.program_run_id &&
-          (!operation->manual_handover ||
-           operation->manual_handover->capture.program_run_id != request.program_run_id))
-        continue;
-      if (!intersects(*operation) ||
-          (terminal(operation->state.state) && !operation->containment_effect_uncertain()))
-        continue;
-      const bool already_contained = std::any_of(
-          stop_transactions_.begin(), stop_transactions_.end(), [&](const auto& transaction) {
-            if (transaction == nullptr || !transaction->active || transaction->terminal ||
-                transaction->stop_id != operation->state.active_stop_id ||
-                transaction->stop_generation != operation->state.active_stop_generation ||
-                !std::binary_search(transaction->operations.begin(), transaction->operations.end(),
-                                    id))
-              return false;
-            return std::all_of(operation->participants.begin(), operation->participants.end(),
-                               [&](const auto& participant) {
-                                 return transaction->participant_ids.empty() ||
-                                        std::binary_search(transaction->participant_ids.begin(),
-                                                           transaction->participant_ids.end(),
-                                                           participant.slot_owner.participant_id) ||
-                                        (operation->intent.coordination_policy ==
-                                             OperationCoordinationPolicy::kCoordinatedAll &&
-                                         !participant.prepared_dispatch_released);
-                               });
-          });
-      if (!already_contained)
-        fresh.push_back({id, operation->state.operation_revision,
-                         operation->state.active_stop_generation.value_or(StopGeneration(0U))});
-    }
-    if (!fresh.empty()) {
-      auto stopped = accept_stop_locked(EmergencyStopProjectedIntentDTO{StopIntentDTO{
-                                            request.request_context, std::move(fresh),
-                                            "Program node selection", request.attribution}},
-                                        handoff, accepted_at_ns);
-      if (!stopped.ok()) return Result<ProgramExecutionSelectionAcceptedDTO>::Err(stopped.error());
-      accepted.fresh_containment = std::move(stopped.value());
-      if (accepted.fresh_containment->resolution_disposition ==
-          StopResolutionDispositionDTO::kPromotedToFull) {
-        for (std::size_t index = 0U; index < selected.size(); ++index) {
-          if (!selected[index])
-            accepted.widened_node_indices.push_back(static_cast<std::uint32_t>(index));
-          selected[index] = true;
-          if (fence->node_states[index] == ProgramNodeHoldStateDTO::kRunning)
-            fence->node_states[index] = ProgramNodeHoldStateDTO::kHeld;
-        }
-        std::sort(accepted.widened_node_indices.begin(), accepted.widened_node_indices.end());
-      }
-    }
-    // Adopt exact current Stop ownership; never resubmit an already covered
-    // operation and never use history absence as evidence of rest.
+    return std::any_of(operation.intent.participants.begin(),
+                       operation.intent.participants.end(), [&](const auto& row) {
+                         return row.execution_scope.has_value() &&
+                                node_index(*row.execution_scope) < selected.size() &&
+                                selected[node_index(*row.execution_scope)];
+                       });
+  };
+  // Coordinated work is indivisible. A node can own several effects, so
+  // retain the closure, not just the first operation encountered.
+  bool widened = true;
+  while (widened) {
+    widened = false;
     for (const auto& [id, operation] : active_operations_) {
       if (operation->state.program_run_id != request.program_run_id ||
-          !operation->state.active_stop_id.has_value() ||
-          !operation->state.active_stop_generation.has_value())
+          operation->intent.coordination_policy != OperationCoordinationPolicy::kCoordinatedAll)
         continue;
-      const auto& stop_id = *operation->state.active_stop_id;
-      const auto generation = *operation->state.active_stop_generation;
-      const auto resident =
-          std::find_if(stop_transactions_.begin(), stop_transactions_.end(), [&](const auto& row) {
-            return row != nullptr && row->active && row->stop_id == stop_id &&
-                   row->stop_generation == generation;
-          });
-      const auto terminal_stop = operation->terminal_stop_result();
-      for (const auto& participant : operation->state.participants) {
-        if (!participant.execution_scope.has_value()) continue;
-        {
-          const auto* origin = &*participant.execution_scope;
-          const auto index = node_index(*origin);
-          if (index >= selected.size() || !selected[index]) continue;
-          if (terminal_stop.has_value()) {
-            const auto disposition = *terminal_stop;
-            if (disposition != StopCertificateResultDTO::kSucceededNominal &&
-                disposition != StopCertificateResultDTO::kSucceededEscalated)
-              fence->node_states[index] = ProgramNodeHoldStateDTO::kFaulted;
-            continue;
-          }
-          const auto live_participant = std::find_if(
-              operation->participants.begin(), operation->participants.end(), [&](const auto& row) {
-                return row.slot_owner.participant_id == participant.participant_id;
-              });
-          if (live_participant != operation->participants.end() &&
-              live_participant->non_motion_transaction()) continue;
-          const bool never_released_peer = live_participant != operation->participants.end() &&
-                                           operation->intent.coordination_policy ==
-                                               OperationCoordinationPolicy::kCoordinatedAll &&
-                                           !live_participant->prepared_dispatch_released;
-          const bool covered =
-              resident != stop_transactions_.end() && !(*resident)->terminal &&
-              (std::binary_search((*resident)->operations.begin(), (*resident)->operations.end(),
-                                  id)) &&
-              ((*resident)->participant_ids.empty() ||
-               std::binary_search((*resident)->participant_ids.begin(),
-                                  (*resident)->participant_ids.end(), participant.participant_id) ||
-               never_released_peer);
-          if (!covered) {
-            // Neither exact settlement nor an active containing Stop is known.
-            fence->node_states[index] = ProgramNodeHoldStateDTO::kFaulted;
-            continue;
-          }
-          const auto retained = std::find_if(
-              fence->pending_effects.begin(), fence->pending_effects.end(), [&](const auto& row) {
-                return row.node_index == index && row.operation_id == id &&
-                       row.participant_id == participant.participant_id && row.stop_id == stop_id &&
-                       row.stop_generation == generation;
-              });
-          if (retained == fence->pending_effects.end()) {
-            fence->pending_effects.push_back({static_cast<std::uint32_t>(index), id,
-                                              participant.participant_id, origin->node_attempt_id,
-                                              stop_id, generation});
-          }
-          if (fence->node_states[index] != ProgramNodeHoldStateDTO::kFaulted)
-            fence->node_states[index] = ProgramNodeHoldStateDTO::kStopping;
+      const auto& participants = operation->intent.participants;
+      if (!intersects(*operation)) continue;
+      for (const auto& row : participants) {
+        if (!row.execution_scope.has_value()) continue;
+        const auto index = node_index(*row.execution_scope);
+        if (index < selected.size() && !selected[index]) {
+          selected[index] = true;
+          widened = true;
         }
       }
     }
-    std::sort(fence->pending_effects.begin(), fence->pending_effects.end(),
-              [](const auto& a, const auto& b) {
-                return std::tie(a.node_index, a.operation_id, a.participant_id) <
-                       std::tie(b.node_index, b.operation_id, b.participant_id);
-              });
-    // Reuse the same bounded Stop receipt ledger for physical and selection
-    // requests; never retain an entire copied scope snapshot per request.
-    StopReplayEntry receipt{request,
-                            StopReplayEntry::SelectionReceipt{accepted.widened_node_indices,
-                                                              accepted.fresh_containment}};
-    const auto physical_receipt = std::find_if(
-        stop_replay_ledger_.begin(), stop_replay_ledger_.end(),
-        [&](const auto& row) { return row.request_id() == request.request_context.request_id; });
-    if (physical_receipt != stop_replay_ledger_.end())
-      *physical_receipt = std::move(receipt);
-    else {
-      if (stop_replay_ledger_.size() >= config_.request_replay_capacity)
-        stop_replay_ledger_.erase(stop_replay_ledger_.begin());
-      stop_replay_ledger_.push_back(std::move(receipt));
+  }
+  ProgramExecutionSelectionAcceptedDTO accepted{
+      std::nullopt, selection.value(), {}, std::nullopt};
+  for (std::size_t index = 0U; index < selected.size(); ++index) {
+    if (!selected[index]) continue;
+    if (!std::binary_search(selection.value().begin(), selection.value().end(), index))
+      accepted.widened_node_indices.push_back(static_cast<std::uint32_t>(index));
+    if (fence->node_states[index] == ProgramNodeHoldStateDTO::kRunning)
+      fence->node_states[index] = ProgramNodeHoldStateDTO::kHeld;
+  }
+  ++fence->selection_revision;
+  fence_held_prepared_program_commands_locked(request.program_run_id);
+  // The held state is now authoritative, under the same lock used by final
+  // Execute. No late admission can cross the following physical capture.
+  std::vector<StopOperationTargetDTO> fresh;
+  for (const auto& [id, operation] : active_operations_) {
+    if (operation->state.program_run_id != request.program_run_id &&
+        (!operation->manual_handover ||
+         operation->manual_handover->capture.program_run_id != request.program_run_id))
+      continue;
+    if (!intersects(*operation) ||
+        (terminal(operation->state.state) && !operation->containment_effect_uncertain()))
+      continue;
+    const bool already_contained = std::any_of(
+        stop_transactions_.begin(), stop_transactions_.end(), [&](const auto& transaction) {
+          if (transaction == nullptr || !transaction->active || transaction->terminal ||
+              transaction->stop_id != operation->state.active_stop_id ||
+              transaction->stop_generation != operation->state.active_stop_generation ||
+              !std::binary_search(transaction->operations.begin(), transaction->operations.end(),
+                                  id))
+            return false;
+          return std::all_of(operation->participants.begin(), operation->participants.end(),
+                             [&](const auto& participant) {
+                               return transaction->participant_ids.empty() ||
+                                      std::binary_search(transaction->participant_ids.begin(),
+                                                         transaction->participant_ids.end(),
+                                                         participant.slot_owner.participant_id) ||
+                                      (operation->intent.coordination_policy ==
+                                           OperationCoordinationPolicy::kCoordinatedAll &&
+                                       !participant.prepared_dispatch_released);
+                             });
+        });
+    if (!already_contained)
+      fresh.push_back({id, operation->state.operation_revision,
+                       operation->state.active_stop_generation.value_or(StopGeneration(0U))});
+  }
+  if (!fresh.empty()) {
+    auto stopped = accept_stop_locked(EmergencyStopProjectedIntentDTO{StopIntentDTO{
+                                          request.request_context, std::move(fresh),
+                                          "Program node selection", request.attribution}},
+                                      handoff, accepted_at_ns);
+    if (!stopped.ok()) return Result<ProgramExecutionSelectionAcceptedDTO>::Err(stopped.error());
+    accepted.fresh_containment = std::move(stopped.value());
+    if (accepted.fresh_containment->resolution_disposition ==
+        StopResolutionDispositionDTO::kPromotedToFull) {
+      for (std::size_t index = 0U; index < selected.size(); ++index) {
+        if (!selected[index])
+          accepted.widened_node_indices.push_back(static_cast<std::uint32_t>(index));
+        selected[index] = true;
+        if (fence->node_states[index] == ProgramNodeHoldStateDTO::kRunning)
+          fence->node_states[index] = ProgramNodeHoldStateDTO::kHeld;
+      }
+      std::sort(accepted.widened_node_indices.begin(), accepted.widened_node_indices.end());
     }
-    accepted.state = program_execution_scope_locked(*fence);
-    return Result<ProgramExecutionSelectionAcceptedDTO>::Ok(std::move(accepted));
-  }();
-  return result;
+  }
+  // Adopt exact current Stop ownership; never resubmit an already covered
+  // operation and never use history absence as evidence of rest.
+  for (const auto& [id, operation] : active_operations_) {
+    if (operation->state.program_run_id != request.program_run_id ||
+        !operation->state.active_stop_id.has_value() ||
+        !operation->state.active_stop_generation.has_value())
+      continue;
+    const auto& stop_id = *operation->state.active_stop_id;
+    const auto generation = *operation->state.active_stop_generation;
+    const auto resident =
+        std::find_if(stop_transactions_.begin(), stop_transactions_.end(), [&](const auto& row) {
+          return row != nullptr && row->active && row->stop_id == stop_id &&
+                 row->stop_generation == generation;
+        });
+    const auto terminal_stop = operation->terminal_stop_result();
+    for (const auto& participant : operation->state.participants) {
+      if (!participant.execution_scope.has_value()) continue;
+      {
+        const auto* origin = &*participant.execution_scope;
+        const auto index = node_index(*origin);
+        if (index >= selected.size() || !selected[index]) continue;
+        if (terminal_stop.has_value()) {
+          const auto disposition = *terminal_stop;
+          if (disposition != StopCertificateResultDTO::kSucceededNominal &&
+              disposition != StopCertificateResultDTO::kSucceededEscalated)
+            fence->node_states[index] = ProgramNodeHoldStateDTO::kFaulted;
+          continue;
+        }
+        const auto live_participant = std::find_if(
+            operation->participants.begin(), operation->participants.end(), [&](const auto& row) {
+              return row.slot_owner.participant_id == participant.participant_id;
+            });
+        if (live_participant != operation->participants.end() &&
+            live_participant->non_motion_transaction()) continue;
+        const bool never_released_peer = live_participant != operation->participants.end() &&
+                                         operation->intent.coordination_policy ==
+                                             OperationCoordinationPolicy::kCoordinatedAll &&
+                                         !live_participant->prepared_dispatch_released;
+        const bool covered =
+            resident != stop_transactions_.end() && !(*resident)->terminal &&
+            (std::binary_search((*resident)->operations.begin(), (*resident)->operations.end(),
+                                id)) &&
+            ((*resident)->participant_ids.empty() ||
+             std::binary_search((*resident)->participant_ids.begin(),
+                                (*resident)->participant_ids.end(), participant.participant_id) ||
+             never_released_peer);
+        if (!covered) {
+          // Neither exact settlement nor an active containing Stop is known.
+          fence->node_states[index] = ProgramNodeHoldStateDTO::kFaulted;
+          continue;
+        }
+        const auto retained = std::find_if(
+            fence->pending_effects.begin(), fence->pending_effects.end(), [&](const auto& row) {
+              return row.node_index == index && row.operation_id == id &&
+                     row.participant_id == participant.participant_id && row.stop_id == stop_id &&
+                     row.stop_generation == generation;
+            });
+        if (retained == fence->pending_effects.end()) {
+          fence->pending_effects.push_back({static_cast<std::uint32_t>(index), id,
+                                            participant.participant_id, origin->node_attempt_id,
+                                            stop_id, generation});
+        }
+        if (fence->node_states[index] != ProgramNodeHoldStateDTO::kFaulted)
+          fence->node_states[index] = ProgramNodeHoldStateDTO::kStopping;
+      }
+    }
+  }
+  std::sort(fence->pending_effects.begin(), fence->pending_effects.end(),
+            [](const auto& a, const auto& b) {
+              return std::tie(a.node_index, a.operation_id, a.participant_id) <
+                     std::tie(b.node_index, b.operation_id, b.participant_id);
+            });
+  // Reuse the same bounded Stop receipt ledger for physical and selection
+  // requests; never retain an entire copied scope snapshot per request.
+  StopReplayEntry receipt{request,
+                          StopReplayEntry::SelectionReceipt{accepted.widened_node_indices,
+                                                            accepted.fresh_containment}};
+  const auto physical_receipt = std::find_if(
+      stop_replay_ledger_.begin(), stop_replay_ledger_.end(),
+      [&](const auto& row) { return row.request_id() == request.request_context.request_id; });
+  if (physical_receipt != stop_replay_ledger_.end())
+    *physical_receipt = std::move(receipt);
+  else {
+    if (stop_replay_ledger_.size() >= config_.request_replay_capacity)
+      stop_replay_ledger_.erase(stop_replay_ledger_.begin());
+    stop_replay_ledger_.push_back(std::move(receipt));
+  }
+  accepted.state = program_execution_scope_locked(*fence);
+  return Result<ProgramExecutionSelectionAcceptedDTO>::Ok(std::move(accepted));
 }
 
 void ResourceAddressedExecutionKernel::reduce_program_selection_stop_locked(
@@ -4541,17 +4263,26 @@ Result<ProgramExecutionScopeStateDTO> ResourceAddressedExecutionKernel::start_pr
 Result<ProgramExecutionScopeStateDTO> ResourceAddressedExecutionKernel::release_program_selection(
     const ProgramExecutionSelectionRequestDTO& request,
     const std::uint64_t expected_selection_revision) {
-  std::unique_lock admission_lock(*admission_mutex_, std::try_to_lock);
-  if (!admission_lock.owns_lock()) {
-    return reject<ProgramExecutionScopeStateDTO>("ordinary admission is still in flight",
-                                                 "program_run_admission_in_flight",
-                                                 ErrorCode::kInvalidStateTransition);
-  }
+  // Run/Resume waits for an in-flight ordinary admission instead of refusing
+  // a timing collision: the admitted child is then visible to the snapshot
+  // below. Same admission -> state order as Execute; Stop never takes it.
+  std::lock_guard admission_lock(*admission_mutex_);
   // Snapshot under ordinary ordering, before taking Stop's state lock. No
   // receipt/journal I/O or ledger lock is added to that critical section.
   const auto child_nodes =
       cell_admission_owner_->unsettled_program_child_nodes(request.claim_generation);
   std::lock_guard state_lock(state_mutex_);
+  // R1: a cell latch refuses Program run and resume.
+  if (auto refusal = cell_latch_refusal_locked())
+    return Result<ProgramExecutionScopeStateDTO>::Err(std::move(*refusal));
+  // §8: Resume waits while a rule holds the Program's scope (`rule_holds`
+  // with its `rule_id`), here as in readiness.
+  if (program_cycle_claim_run_ && program_cycle_claim_run_->capture)
+    for (const auto& registration : registrations_)
+      if (registration.binding.value().program_binding_id ==
+          program_cycle_claim_run_->capture->program_binding_id)
+        if (auto hold = global_io_rule_command_refusal_locked(registration.binding.value()))
+          return Result<ProgramExecutionScopeStateDTO>::Err(std::move(*hold));
   auto selection = resolve_program_selection_locked(request, true);
   if (!selection.ok()) return Result<ProgramExecutionScopeStateDTO>::Err(selection.error());
   auto fence =
@@ -4654,6 +4385,7 @@ Result<ProgramExecutionScopeStateDTO> ResourceAddressedExecutionKernel::release_
   for (const auto index : selection.value())
     fence->node_states[index] = ProgramNodeHoldStateDTO::kRunning;
   ++fence->selection_revision;
+  fence->held_by_rule.reset();
   return Result<ProgramExecutionScopeStateDTO>::Ok(program_execution_scope_locked(*fence));
 }
 
@@ -4909,12 +4641,10 @@ Result<RuntimeScaleAcceptedDTO> ResourceAddressedExecutionKernel::set_runtime_sc
                                                   reason);
   };
   for (const auto& target : effect_targets) {
-    bool outcome_unknown = false;
     const auto commanded = [&]() -> Result<ResolvedRuntimeScaleAcceptedDTO> {
       try {
         return target.engine->set_runtime_scale(target.command);
       } catch (...) {
-        outcome_unknown = true;
         return Result<ResolvedRuntimeScaleAcceptedDTO>::Err(
             error(std::string(to_string(ErrorCode::kInvariantViolation)),
                   "participant runtime-scale outcome is unknown",
@@ -4922,10 +4652,6 @@ Result<RuntimeScaleAcceptedDTO> ResourceAddressedExecutionKernel::set_runtime_sc
       }
     }();
     if (!commanded.ok()) {
-      if (outcome_unknown) {
-        std::lock_guard state_lock(state_mutex_);
-        motion_admission_closed_ = true;
-      }
       mark_failed(target.engine, commanded.error(), "runtime_scale_effect_rejected");
       continue;
     }

@@ -13,9 +13,9 @@ import { DeploymentCompositionPanel } from './components/DeploymentCompositionPa
 import { deploymentDocumentHeader } from './components/DeploymentDocumentControls';
 import {
   HeadlessRuntimeSurfaces,
-  blockingAlarms,
-  nonBlockingAttentionAlarms,
+  errorAlarms,
   runtimeErrorItemCount,
+  warningAlarms,
 } from './components/HeadlessRuntimeSurfaces';
 import {
   RuntimeAttentionAutoOpen,
@@ -27,11 +27,12 @@ import { ScenarioDocumentCommands } from './components/ScenarioDocumentCommands'
 import { OverlayPanel } from './components/OverlayPanel';
 import { PaneDivider } from './components/PaneDivider';
 import { ProgramWorkspace } from './components/ProgramWorkspace';
-import { runtimeStatusPresentation } from './components/runtimeStatus';
+import { componentsTabStatus, runtimeStatusPresentation } from './components/runtimeStatus';
 import { SceneAuthoringWorkspace } from './components/SceneAuthoringWorkspace';
 import { WorkbenchNotificationStack } from './components/WorkbenchNotifications';
 import { useExactAlarmAcknowledgement } from './hooks/useExactAlarmAcknowledgement';
 import {
+  useCellState,
   useHeadlessStateSource,
   useShellHeadlessState,
 } from './hooks/useHeadlessState';
@@ -43,19 +44,14 @@ import type { ComponentManagerTab } from './utils/componentManager';
 import { useManagerApplyStatus } from './hooks/useManagerApplyStatus';
 import { activationFailureNotice } from './state/activationNotices';
 import { isaacJointStreamNotices } from './state/isaacJointStreamNotices';
-import { isMotionWaitRefusal, setMotionWaitSourceDescriber } from './state/motionWaitRefusal';
-import { declaredIoInputSourceTexts } from './utils/ioSignalConfiguration';
 import { useProgramRuntime } from './hooks/useProgramRuntime';
-import { useProgramWorkspace, type ScenarioReplacementIdentity } from './hooks/useProgramWorkspace';
+import { useProgramWorkspace } from './hooks/useProgramWorkspace';
 import { useRobotControl } from './hooks/useRobotControl';
 import { robotControlHasActiveOperation } from './state/robotControl';
 import { useHeldNodePreview } from './hooks/useHeldNodePreview';
 import { useResetApply } from './hooks/useResetApply';
 import { useAppliedSettlementRefresh } from './hooks/useAppliedSettlementRefresh';
 import { appliedCartesianDefaults } from './state/robotControl';
-import { closeScenario as closeCurrentScenario, closeErrorCode, forceCloseScenario, sceneClearDescription, type ClosePreparationInputs } from './state/scenarioClose';
-import { useCCLC, waitForObservation } from './hooks/useCCLC';
-import type { ManagerActiveProjection } from './types/api';
 import {
   managerActivationSettlementKey,
   nodeEnvironmentRefreshKey,
@@ -69,7 +65,8 @@ import {
 } from './state/nodeEnvironmentRefresh';
 import { useStructuralResource } from './state/structuralResource';
 import { deriveProgramMotionConfiguration, programBlackboardKeys } from './utils/programAuthoring';
-import { globalRuleIds } from './utils/interruptAuthoring';
+import { changedOutsideOutputs, globalRuleIds } from './utils/interruptAuthoring';
+import { isRuleHoldsRefusal } from './state/commandRefusal';
 import {
   CARRIED_OBJECT_LOST_RESOURCE_ROLE,
   draftCarriedObjectLostSignals,
@@ -434,12 +431,18 @@ export default function App() {
   ]);
   // Composer settings problems appear as workbench notices.
   useComposerSettingsNotices();
+  // Bumped by Reset reaching Idle and by Scenario New: clears every warning.
+  const [warningClearEpoch, setWarningClearEpoch] = useState(0);
   // A successful Load/New clears a refused-startup notice in the backend;
   // health is read once per page, so read it again then.
+  const onScenarioActivated = useCallback((kind: 'new' | 'load') => {
+    retryHealth();
+    if (kind === 'new') setWarningClearEpoch((epoch) => epoch + 1);
+  }, [retryHealth]);
   const programController = useProgramWorkspace(
     headlessSnapshot,
     authoringWorkspace,
-    retryHealth,
+    onScenarioActivated,
   );
   // Draft / Saved / Applied of both documents, shown in every workspace.
   const programStates = programDocumentStates(programController.state.workspace);
@@ -447,17 +450,6 @@ export default function App() {
   // system keys (schema04 §3; T2 resolves them against the Applied Program).
   const programDraftAuthoring = programController.state.workspace?.draft.authoring ?? null;
   const deploymentDraftDocument = deploymentController.workspace?.draft.document ?? null;
-  // A motion wait labels its missing signal's source id with the declared
-  // source (ROS topic, xArm pin, ...) only while the Deployment Draft is the
-  // Applied one and declares that same source id for the signal.
-  useEffect(() => {
-    const workspace = deploymentController.workspace;
-    const revision = workspace?.draft.deploymentRevision ?? null;
-    const sources = revision !== null && revision === workspace?.managerApplied.deploymentRevision
-      ? declaredIoInputSourceTexts(workspace.draft.document) : null;
-    setMotionWaitSourceDescriber(sources === null ? null
-      : (componentId, signalName, sourceId) => sources.get(JSON.stringify([componentId, signalName, sourceId])) ?? null);
-  }, [deploymentController.workspace]);
   const draftSystemSignals = useMemo(
     () => draftCarriedObjectLostSignals(deploymentDraftDocument),
     [deploymentDraftDocument],
@@ -473,33 +465,14 @@ export default function App() {
     : (programDraftAuthoring.scene ?? []).map((resource) => resource.scene_resource_id)),
   [programDraftAuthoring]);
   const deploymentStates = deploymentDocumentStates(deploymentController.workspace);
-  const configuredComponentIds = useMemo(() => (
-    deploymentController.workspace?.managerApplied.activationOrder?.componentIds ?? []
-  ), [deploymentController.workspace?.managerApplied.activationOrder]);
-  const cclc = useCCLC(headlessEnabled,
-    headlessSnapshot?.authoringAdmission.admissionGeneration ?? null, appliedDeploymentIdentity?.componentIds);
-  const { controllableComponentId: cclcComponentId, setControllableComponentId: selectCCLCComponent, refresh: refreshCCLC } = cclc;
-  useOperationalErrorMirror({
-    source: 'composer.cclc',
-    title: 'Component lifecycle or route command failed',
-    message: cclc.error,
-    onDismiss: cclc.dismissError,
-  });
-  useEffect(() => {
-    if (appliedDeploymentIdentity === null) return;
-    const next = configuredComponentIds.includes(cclcComponentId) ? cclcComponentId : configuredComponentIds[0] ?? '';
-    if (next !== cclcComponentId) selectCCLCComponent(next);
-  }, [appliedDeploymentIdentity, cclcComponentId, configuredComponentIds, selectCCLCComponent]);
-  useEffect(() => {
-    if (headlessEnabled && configuredComponentIds.includes(cclcComponentId)) void refreshCCLC();
-  }, [cclcComponentId, configuredComponentIds, headlessEnabled, refreshCCLC]);
+  const cellState = useCellState(headlessStateSource);
+  const changedOutside = useMemo(() => changedOutsideOutputs(cellState.io), [cellState.io]);
   const programRuntime = useProgramRuntime(
     headlessEnabled,
     headlessSnapshot,
     programController.state.workspace,
     headlessStateSource,
     deploymentUnapplied(deploymentController.workspace),
-    cclc,
   );
   // Manual motion uses Applied defaults; Draft changes wait for Apply.
   const appliedProgram = programRuntime.state.applied;
@@ -512,7 +485,6 @@ export default function App() {
       const configuration = deriveProgramMotionConfiguration(program, catalog.data.entries);
       return configuration.available ? {
         translationToleranceM: configuration.configuration.values.translation_tol_m,
-        maxBlendDeviationRad: configuration.configuration.values.max_blend_deviation_rad,
       } : null;
     };
     return appliedCartesianDefaults(appliedProgram === null
@@ -578,12 +550,12 @@ export default function App() {
     message: programController.state.error,
     onDismiss: programController.clearFeedback,
   });
-  // A motion-admission wait (contract 75) refused a past command: like any
-  // refusal it is a warning until acknowledged, titled as the wait it is.
+  // A global rule holding its scope (`rule_holds`, CONTRACTS §8) refused a
+  // past command: like any refusal it is a warning until acknowledged.
   useOperationalErrorMirror({
     source: 'composer.program_runtime',
-    title: isMotionWaitRefusal(programRuntime.state.errorRefusal)
-      ? 'Motion waiting' : 'Program Run, Stop, or Reset failed',
+    title: isRuleHoldsRefusal(programRuntime.state.errorRefusal)
+      ? 'Held by a global rule' : 'Program Run, Stop, or Reset failed',
     message: programRuntime.state.error,
     onDismiss: programRuntime.dismissError,
   });
@@ -597,8 +569,8 @@ export default function App() {
   const robotOperationalError = robotControl.state.errorLocal ? null : robotControl.state.error;
   useOperationalErrorMirror({
     source: 'composer.robot_control',
-    title: isMotionWaitRefusal(robotControl.state.errorRefusal)
-      ? 'Motion waiting' : 'Robot control request failed',
+    title: isRuleHoldsRefusal(robotControl.state.errorRefusal)
+      ? 'Held by a global rule' : 'Robot control request failed',
     message: robotOperationalError,
     onDismiss: robotControl.dismissError,
   });
@@ -677,88 +649,9 @@ export default function App() {
   // The failed-Apply notice hidden here on positive evidence that nothing is
   // held: a refusal before the fence, or a re-read showing no failed Apply.
   const [dismissedActivationNotice, setDismissedActivationNotice] = useState<string | null>(null);
-  const closeAbort = useRef<AbortController | null>(null);
-  const [scenarioCloseProgress, setScenarioCloseProgress] = useState<string | null>(null);
-  const [sceneClearFailure, setSceneClearFailure] = useState<{ code: string; message: string } | null>(null);
-  // Bumped by Reset reaching Idle and by Scenario Close: clears every warning.
-  const [warningClearEpoch, setWarningClearEpoch] = useState(0);
-  useEffect(() => () => closeAbort.current?.abort(), []);
-  const latestProgramRuntime = useRef(programRuntime);
-  latestProgramRuntime.current = programRuntime;
-  // SX-679 (maintainer): Close and Recover cell exclude each other in the GUI;
-  // Headless also refuses Close's retirement while a press runs.
-  const latestRobotControl = useRef(robotControl);
-  latestRobotControl.current = robotControl;
-  const [closeRunning, setCloseRunning] = useState(false);
-  const { setCellRecoverBlockedReason } = robotControl;
-  useEffect(() => {
-    setCellRecoverBlockedReason(closeRunning
-      ? 'Scenario Close is in progress; Recover cell waits until it ends.' : null);
-  }, [closeRunning, setCellRecoverBlockedReason]);
-  const runClose = useCallback(async (force: boolean, expected: ManagerActiveProjection, confirmed?: ScenarioReplacementIdentity, callerSignal?: AbortSignal) => {
-    if (closeAbort.current !== null) throw new Error('Scenario Close is already in progress.');
-    const abort = new AbortController();
-    closeAbort.current = abort;
-    setCloseRunning(true);
-    setSceneClearFailure(null);
-    const abortFromCaller = () => abort.abort(callerSignal?.reason);
-    callerSignal?.addEventListener('abort', abortFromCaller, { once: true });
-    if (callerSignal?.aborted) abortFromCaller();
-    try {
-      let lastAdmissionGeneration = headlessStateSource.getLatestSnapshot()?.authoringAdmission.admissionGeneration;
-      const readCloseSnapshot = () => {
-        const latest = headlessStateSource.getLatestSnapshot();
-        if (latest === null) throw new Error('Control source is unavailable; Close is unresolved.');
-        lastAdmissionGeneration = latest.authoringAdmission.admissionGeneration;
-        return latest;
-      };
-      const preparation: ClosePreparationInputs | undefined = confirmed === undefined ? undefined : { confirmed,
-        reset: (options) => latestProgramRuntime.current.reset(options),
-        // Close detaches with the latest attachment and Scene revisions; the
-        // shell snapshot does not follow pose-only Scene commits.
-        readResetSnapshot: () => ({
-          ...headlessStateSource.getShellSnapshot(), snapshot: headlessStateSource.getLatestSnapshot(),
-        }),
-        readSnapshot: readCloseSnapshot,
-      };
-      // Item 37: Force close is the operator's explicit action after a refused Close.
-      const closed = await (force ? forceCloseScenario : closeCurrentScenario)({ expected, signal: abort.signal,
-        preparation,
-        admissionGeneration: () => {
-          lastAdmissionGeneration = headlessStateSource.getLatestSnapshot()?.authoringAdmission.admissionGeneration
-            ?? lastAdmissionGeneration;
-          if (lastAdmissionGeneration === undefined)
-            throw new Error('Control source is unavailable; Close is unresolved.');
-          return lastAdmissionGeneration;
-        },
-        waitForObservation: (signal) => waitForObservation(signal),
-        trackApply: setTrackedApply, progress: setScenarioCloseProgress,
-        sceneClearNotice: (_apply, error) => {
-          setSceneClearFailure({ code: closeErrorCode(error) ?? 'scene_clear_unknown', message: error.message });
-        },
-        cellRecoverRunning: () => latestRobotControl.current.stopFaultRecoveryPending,
-      });
-      if (closed !== null) setWarningClearEpoch((epoch) => epoch + 1);
-      return closed;
-    } catch (error) {
-      const code = closeErrorCode(error);
-      if (code?.startsWith('scene_clear_')) setSceneClearFailure({ code, message: error instanceof Error ? error.message : code });
-      throw error;
-    } finally {
-      callerSignal?.removeEventListener('abort', abortFromCaller);
-      closeAbort.current = null; setScenarioCloseProgress(null); setCloseRunning(false);
-    }
-  }, [headlessStateSource]);
-  const closeCurrent = useCallback((expected: ManagerActiveProjection, confirmed?: ScenarioReplacementIdentity,
-    callerSignal?: AbortSignal) => runClose(false, expected, confirmed, callerSignal), [runClose]);
-  const forceCloseCurrent = useCallback((expected: ManagerActiveProjection, confirmed?: ScenarioReplacementIdentity,
-    callerSignal?: AbortSignal) => runClose(true, expected, confirmed, callerSignal), [runClose]);
   useEffect(() => {
     if (programController.acceptedApply !== null) setTrackedApply(programController.acceptedApply);
   }, [programController.acceptedApply]);
-  useEffect(() => {
-    if (deploymentController.acceptedApply !== null) setTrackedApply(deploymentController.acceptedApply);
-  }, [deploymentController.acceptedApply]);
   useEffect(() => {
     if (authoringWorkspace.correlatedApply !== null) setTrackedApply(authoringWorkspace.correlatedApply);
   }, [authoringWorkspace.correlatedApply]);
@@ -945,85 +838,10 @@ export default function App() {
   const authoringCause = headlessEnabled
     ? authoringUnavailableCause(authoringWorkspace.published, headlessSnapshot)
     : null;
-  // New's accepted Scenario Apply may clear after Manager activation completes.
-  const [newSceneClearNotice, setNewSceneClearNotice] = useState<WorkbenchNotice | null>(null);
-  const newSceneClearApply = programController.newSceneClearApply;
-  useEffect(() => {
-    if (newSceneClearApply == null) return;
-    const abort = new AbortController();
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    let sawPublication = false;
-    const deadline = performance.now() + 10_000;
-    const noticeDeadline = setTimeout(() => {
-      setNewSceneClearNotice({ id: 'scene.clear.unknown', severity: 'error', domain: 'activation',
-        title: 'Scene clearing outcome unknown', message: 'Scene clear outcome unknown; check the Scene.' });
-      programController.clearNewSceneClearApply?.(newSceneClearApply);
-    }, 10_000);
-    const poll = async () => {
-      try {
-        const status = await api.programs.sceneClearStatus(abort.signal);
-        if (abort.signal.aborted) return;
-        if (status !== null && status.applyId === newSceneClearApply.applyId
-          && status.applyGeneration === newSceneClearApply.applyGeneration && status.state !== 'pending') {
-          // DX-3270: the newer New clear describes the final Scene and replaces
-          // a timed-out Close's notice when its own terminal result arrives.
-          if (programController.newSceneClearApply?.applyId === status.applyId
-            && programController.newSceneClearApply.applyGeneration === status.applyGeneration
-            && status.state !== 'superseded') {
-            setSceneClearFailure(null);
-          }
-          if (status.state !== 'unknown') clearTimeout(noticeDeadline);
-          if (status.state === 'succeeded' || status.state === 'superseded') {
-            setNewSceneClearNotice(null);
-          }
-          else {
-            setNewSceneClearNotice({ id: `scene.clear.${status.state}`, severity: 'error', domain: 'activation',
-              title: 'Scene clearing failed', message: sceneClearDescription(status) });
-          }
-          programController.clearNewSceneClearApply?.(newSceneClearApply);
-          return;
-        }
-        const activation = await api.manager.applyStatus(newSceneClearApply.applyId, newSceneClearApply.applyGeneration, abort.signal);
-        if (abort.signal.aborted) return;
-        if (activation.state === 'failed' || activation.state === 'unknown_effect') {
-          clearTimeout(noticeDeadline);
-          setNewSceneClearNotice(null);
-          programController.clearNewSceneClearApply?.(newSceneClearApply);
-          return;
-        }
-        if (activation.state === 'succeeded') {
-          const current = await api.manager.status(abort.signal);
-          const transaction = current.status.active.publication.transaction;
-          const same = transaction !== null && typeof transaction === 'object' && !Array.isArray(transaction)
-            && transaction.kind === 'named_apply' && transaction.apply_id === newSceneClearApply.applyId
-            && transaction.apply_generation === newSceneClearApply.applyGeneration;
-          if (current.source.available && current.source.freshness === 'fresh') {
-            if (same) sawPublication = true;
-            else if (sawPublication) { clearTimeout(noticeDeadline); setNewSceneClearNotice(null); programController.clearNewSceneClearApply?.(newSceneClearApply); return; }
-          }
-        }
-        setNewSceneClearNotice(performance.now() >= deadline
-          ? { id: 'scene.clear.unknown', severity: 'error', domain: 'activation', title: 'Scene clearing outcome unknown',
-            message: 'Scene clear outcome unknown; check the Scene.' }
-          : { id: 'scene.clear.pending', severity: 'info', domain: 'activation',
-            title: 'Clearing the Scene', message: 'Waiting for Scene clearing to finish.', busy: true });
-        timer = setTimeout(poll, 250);
-      } catch {
-        if (!abort.signal.aborted) setNewSceneClearNotice({ id: 'scene.clear.unknown', severity: 'error', domain: 'activation',
-          title: 'Scene clearing outcome unknown', message: 'Scene clear outcome unknown; check the Scene.' });
-        if (!abort.signal.aborted) programController.clearNewSceneClearApply?.(newSceneClearApply);
-      }
-    };
-    void poll();
-    return () => { abort.abort(); clearTimeout(noticeDeadline); if (timer !== undefined) clearTimeout(timer); };
-  }, [newSceneClearApply, programController.clearNewSceneClearApply]);
   const [resetReloadRequest, setResetReloadRequest] = useState(0);
   const initialSceneFailure = headlessSnapshot?.runtime.initialSceneFailure ?? null;
   const operationNotices = useMemo<WorkbenchNotice[]>(() => {
     const notices: WorkbenchNotice[] = [
-      ...(newSceneClearNotice === null ? [] : [{ ...newSceneClearNotice,
-        ...(newSceneClearNotice.severity === 'error' ? { actions: [{ id: 'dismiss', label: 'Dismiss',
-          run: () => setNewSceneClearNotice(null) }] } : {}) }]),
       ...requiredComponentFaultNotices(headlessSnapshot),
       ...authoringContainmentNotices(headlessSnapshot),
       ...isaacJointStreamNotices(headlessSnapshot?.runtime.sections.sceneRuntime ?? null),
@@ -1033,15 +851,6 @@ export default function App() {
       setResetReloadRequest((value) => value + 1);
     });
     if (sceneNotice !== null) notices.push(sceneNotice);
-    if (scenarioCloseProgress !== null) notices.push({
-      id: 'scenario.close', severity: 'info', domain: 'activation', title: 'Scenario Close in progress',
-      message: scenarioCloseProgress, busy: true,
-    });
-    if (sceneClearFailure !== null) notices.push({
-      id: `scene.clear.${sceneClearFailure.code}`, severity: 'error', domain: 'activation',
-      title: 'Scene clearing failed', message: sceneClearFailure.message,
-      actions: [{ id: 'dismiss', label: 'Dismiss', run: () => setSceneClearFailure(null) }],
-    });
     const label = pendingProgramAction === null
       ? undefined
       : PROGRAM_ACTION_LABELS[pendingProgramAction];
@@ -1099,10 +908,7 @@ export default function App() {
     return notices;
   }, [
     authoringCause,
-    scenarioCloseProgress,
-    sceneClearFailure,
     initialSceneFailure,
-    newSceneClearNotice,
     authoringWorkspace.unavailableReason,
     controlNotices.length,
     deploymentController.applying,
@@ -1224,7 +1030,7 @@ export default function App() {
     [classifiedNotices],
   );
   // Warnings that block nothing stay until acknowledged here (per browser
-  // session), or until Reset or Scenario Close.
+  // session), or until Reset or Scenario New.
   const [acknowledgedWarnings, setAcknowledgedWarnings] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
@@ -1270,12 +1076,11 @@ export default function App() {
     message: alarmAcknowledgement.error,
     onDismiss: () => setAlarmAcknowledgementError(null),
   });
-  // Unacknowledged alarms that gate nothing are warnings with the server's
-  // exact acknowledgement.
+  // Unacknowledged warning alarms (yellow) with the server's exact acknowledgement.
   const alarmWarnings = useMemo(() => {
     const alarms = headlessSnapshot?.alarms;
     return alarms === undefined ? [] : alarmWarningNotices(
-      nonBlockingAttentionAlarms(alarms),
+      warningAlarms(alarms),
       alarmAcknowledgement.busyActivation,
       (alarm) => { void acknowledgeAlarm([alarm], alarms.ownerEpoch); },
     );
@@ -1305,7 +1110,7 @@ export default function App() {
     ...errorConditions.map((condition) => ({
       identity: `condition:${condition.id}`,
     })),
-    ...blockingAlarms(headlessSnapshot?.alarms).map((alarm) => ({
+    ...errorAlarms(headlessSnapshot?.alarms).map((alarm) => ({
       identity: `backend:${alarm.activationId}`,
     })),
   ], [errorConditions, headlessSnapshot]);
@@ -1499,18 +1304,15 @@ export default function App() {
   const deploymentTitle = programInvalidEdit
     ? `Review or discard the invalid Program field edit first. Component status: ${deploymentStatus.accessibleLabel}. ${deploymentStatus.detail}`
     : `${deploymentStatus.accessibleLabel}. ${deploymentStatus.detail}`;
+  const componentsStatus = componentsTabStatus(cellState);
   // New/Save/Save as/Load act on the whole Scenario in every workspace.
   const scenarioCommands = (
     <ScenarioDocumentCommands
       controller={programController}
       deploymentDirty={deploymentController.workspace?.draft.differsFromSaved === true}
       localInvalidEdit={programInvalidEdit}
-      closeScenario={closeCurrent}
-      forceCloseScenario={forceCloseCurrent}
-      closeUnavailableReason={robotControl.stopFaultRecoveryPending
-        ? 'Recover cell is in progress; wait for it to finish or abort it.' : null}
-      closeProgress={scenarioCloseProgress}
       motionActive={documentMotionActive}
+      cellComponents={cellState.components?.map((component) => component.component_id) ?? null}
     />
   );
   // Discard/Revert/Apply act on the whole Scenario in every workspace too.
@@ -1521,8 +1323,6 @@ export default function App() {
       runtime={programRuntime}
       resetApply={resetApply}
       localInvalidEdit={programInvalidEdit}
-      cclc={cclc}
-      authoringAdmissionGeneration={headlessSnapshot?.authoringAdmission.admissionGeneration ?? null}
     />
   );
 
@@ -1558,12 +1358,15 @@ export default function App() {
           <button
             type="button"
             data-workspace="components"
-            className={activeWorkspace === 'components' ? 'active' : ''}
+            className={`components-status-button readiness-${componentsStatus.readiness}${
+              activeWorkspace === 'components' ? ' active' : ''
+            }`}
             aria-pressed={activeWorkspace === 'components'}
+            aria-label={`Components · ${componentsStatus.summary}`}
             disabled={programInvalidEdit}
             title={programInvalidEdit
-              ? 'Review or discard the invalid Program field edit first.'
-              : 'Each component: status, settings, frames and I/O.'}
+              ? `Review or discard the invalid Program field edit first. ${componentsStatus.summary}`
+              : componentsStatus.summary}
             onClick={() => setActiveWorkspace('components')}
           >
             Components
@@ -1672,6 +1475,7 @@ export default function App() {
               sourceModel={sourceModel}
               deploymentWorkspace={deploymentController.workspace}
               systemSignalChoices={systemSignalChoices}
+              changedOutsideOutputs={changedOutside}
               systemSignalsNeedApply={systemSignalsNeedApply}
               programRoleAssignment={authoringWorkspace.project?.programRoleAssignment ?? null}
               motionDescriptors={robotControl.motionTargets.map(
@@ -1705,9 +1509,7 @@ export default function App() {
               <ComponentsWorkspace
                 enabled={headlessEnabled}
                 controller={deploymentController}
-                cclc={cclc}
-                lifecycleIds={configuredComponentIds}
-                snapshot={headlessSnapshot}
+                cellState={cellState}
                 catalog={componentCatalog}
                 sourceModel={sourceModel}
                 motionDescriptors={robotControl.motionTargets.map(
@@ -1747,6 +1549,7 @@ export default function App() {
                 executionGroupIds={appliedExecutionGroupIds}
                 systemSignalChoices={systemSignalChoices}
                 systemSignalsNeedApply={systemSignalsNeedApply}
+                changedOutsideOutputs={changedOutside}
                 maintenanceStatus={activation}
                 programComponentRoles={programDraftAuthoring?.component_roles ?? null}
                 programRoleAssignment={authoringWorkspace.project?.programRoleAssignment ?? null}
@@ -1770,6 +1573,7 @@ export default function App() {
                     headlessSnapshot?.alarms.activeAcknowledgedCount ?? 0,
                   clientErrorCount: clientErrors.length,
                   error: headlessState.error,
+                  cellState,
                   onReconnect: () => {
                     headlessState.reconnect();
                     if (structuralMode === null) retryHealth();

@@ -114,7 +114,7 @@ def test_status_reads_the_backend_derived_scenario_without_reducing_it_again(
     response = {
         "schema_version": "manyforge.current_scenario.v1",
         "ready": True,
-        "current_scenario": {"scenario_id": "lite6_pick_and_place"},
+        "current_scenario": {"scenario_id": "mock_lite6_pick_and_place"},
         "unavailable_reasons": [],
     }
 
@@ -138,7 +138,7 @@ def test_status_reads_the_backend_derived_scenario_without_reducing_it_again(
     monkeypatch.setattr(dev_workbench, "HeadlessHttpClient", _Client)
 
     status = dev_workbench.query_status(
-        scenario_id="lite6_pick_and_place", composer_port=9020
+        scenario_id="mock_lite6_pick_and_place", composer_port=9020
     )
 
     assert status["current_scenario"] == response["current_scenario"]
@@ -174,7 +174,7 @@ def test_status_rejects_a_different_requested_scenario(monkeypatch: Any) -> None
     monkeypatch.setattr(dev_workbench, "HeadlessHttpClient", _Client)
 
     status = dev_workbench.query_status(
-        scenario_id="lite6_pick_and_place", composer_port=9020
+        scenario_id="mock_lite6_pick_and_place", composer_port=9020
     )
 
     assert status["ready"] is False
@@ -353,11 +353,11 @@ def test_launcher_uses_optional_project_selection_not_catalog_ids() -> None:
 def test_workbench_parser_allows_empty_or_project_startup() -> None:
     empty = dev_workbench._parser().parse_args(["serve"])
     selected = dev_workbench._parser().parse_args(
-        ["serve", "--project", "examples/lite6_pick_and_place.scenario"]
+        ["serve", "--project", "examples/mock_lite6_pick_and_place.scenario"]
     )
 
     assert empty.project is None
-    assert selected.project == "examples/lite6_pick_and_place.scenario"
+    assert selected.project == "examples/mock_lite6_pick_and_place.scenario"
     assert not hasattr(empty, "ros2_control")
     with pytest.raises(SystemExit):
         dev_workbench._parser().parse_args(["serve", "--ros2-control"])
@@ -423,7 +423,7 @@ def test_no_project_ros_start_selects_repository_empty_with_original_identity(
     class PreparedStartup(Exception):
         pass
 
-    def spawn(name: str, command: tuple[str, ...]) -> None:
+    def spawn(name: str, command: tuple[str, ...], **_kwargs) -> None:
         commands[name] = command
         if name == "Manager":
             raise PreparedStartup
@@ -476,7 +476,6 @@ def test_process_stack_stages_only_selected_host_without_starting_services(
 
     host = "manyforge_ros2_control_execution_host"
     selected_environment = "MANYFORGE_ROS2_CONTROL_EXECUTION_HOST"
-    monkeypatch.delenv("MANYFORGE_NATIVE_EXECUTION_HOST", raising=False)
     monkeypatch.delenv("MANYFORGE_ROS2_CONTROL_EXECUTION_HOST", raising=False)
     sources = {}
     for name in ("manyforge_manager_daemon", "manyforge_roboplan_candidate_worker", host):
@@ -565,10 +564,10 @@ def test_ros_start_guard_admits_model_free_components_beside_ros2_control(
 
 def test_ros_bootstrap_captures_io_provider_scenario() -> None:
     captured, source = dev_workbench._capture_ros_bootstrap_project(
-        str(REPOSITORY_ROOT / "examples/lite6_pneumatic_real.scenario"),
+        str(REPOSITORY_ROOT / "examples/real_lite6_pneumatic_pick_and_place.scenario"),
         allowed_root=REPOSITORY_ROOT / "examples",
     )
-    assert source.endswith("/examples/lite6_pneumatic_real.scenario")
+    assert source.endswith("/examples/real_lite6_pneumatic_pick_and_place.scenario")
     assert sorted(
         component["configuration"]["runtime_kind"]
         for component in captured["deployment"]["components"]
@@ -582,10 +581,10 @@ def test_ros_bootstrap_captures_authored_program_and_uses_production_preparer(
     from manyforge_headless_api import activation_preparer
 
     captured, source = dev_workbench._capture_ros_bootstrap_project(
-        str(REPOSITORY_ROOT / "examples/isaac-ur10e-light-scene.scenario"),
+        str(REPOSITORY_ROOT / "examples/sim_ur10e_pick_and_place.scenario"),
         allowed_root=REPOSITORY_ROOT / "examples",
     )
-    assert source.endswith("/examples/isaac-ur10e-light-scene.scenario")
+    assert source.endswith("/examples/sim_ur10e_pick_and_place.scenario")
     assert captured["program"]["api_version"] == "manyforge.program.v2"
     assert captured["model_source_closure"]["components"]
     assert sorted(
@@ -738,8 +737,10 @@ def test_ros_build_stages_current_products_and_imports_overlay_before_spawn(
     for target in targets:
         assert (installed / target.name).read_bytes() == target.name.encode()
         assert os.access(installed / target.name, os.X_OK)
-    assert not (installed / "manyforge_native_execution_host").exists()
-    assert parent_environment["AMENT_PREFIX_PATH"] == "/current/overlay"
+    assert not (installed / "manyforge_execution_host").exists()
+    # The adapter families' index prefix comes first (CONTRACTS §6).
+    ament_prefix = f"{ros_build / 'ament_cmake_index'}{os.pathsep}/current/overlay"
+    assert parent_environment["AMENT_PREFIX_PATH"] == ament_prefix
     assert parent_environment["ROS_STATIC_PEERS"] == "orin;laptop"
 
     spawned: list[dict[str, str]] = []
@@ -752,7 +753,7 @@ def test_ros_build_stages_current_products_and_imports_overlay_before_spawn(
         composer_port=3, frontend_port=4, ros2_control=True,
     )
     workbench._spawn("Manager", ("manager",))
-    assert spawned[0]["AMENT_PREFIX_PATH"] == "/current/overlay"
+    assert spawned[0]["AMENT_PREFIX_PATH"] == ament_prefix
     assert spawned[0]["RMW_IMPLEMENTATION"] == "rmw_fastrtps_cpp"
 
 
@@ -818,7 +819,7 @@ def test_workbench_selects_a_project_only_through_the_composer_loader() -> None:
         frontend_port=4,
     )
     selected = dev_workbench.Workbench(
-        project_path="/workspace/examples/lite6_pick_and_place.scenario",
+        project_path="/workspace/examples/mock_lite6_pick_and_place.scenario",
         headless_port=1,
         runner_port=2,
         composer_port=3,
@@ -989,7 +990,10 @@ def test_g_owner_start(tmp_path, monkeypatch):
     commands = []
     bridge_environments: list[dict[str, str]] = []
     socket_owner = socket.socket(socket.AF_UNIX)
-    def spawn(name, command):
+    manager_environments: list[dict[str, str] | None] = []
+    def spawn(name, command, environment=None):
+        if name == "Manager":
+            manager_environments.append(environment)
         logs = tmp_path / "state/current/execution-run/ros" / f"1-{session_started_ns}"
         assert os.environ["ROS_LOG_DIR"] == str(logs)
         assert logs.is_dir()
@@ -1026,7 +1030,7 @@ def test_g_owner_start(tmp_path, monkeypatch):
             return {"source": {"available": True, "freshness": "fresh", "known_gaps": []},
                     "status": {"manager_ready": True}}
         def manager_diff(self):
-            pytest.fail("G must not wait for Apply/CCLC convergence")
+            pytest.fail("G must not wait for Apply convergence")
         def program_cycle_status(self):
             pytest.fail("G READY must not wait for Program containment")
         def authoring_admission(self):
@@ -1048,6 +1052,8 @@ def test_g_owner_start(tmp_path, monkeypatch):
     (bridge_environment,) = bridge_environments
     assert bridge_environment["MANYFORGE_HEADLESS_API_URL"] == "http://127.0.0.1:9010"
     assert bridge_environment["MANYFORGE_COMPOSER_URL"] == "http://127.0.0.1:9000"
+    # The execution host (and a point-cloud source's process) inherit it.
+    assert manager_environments == [{"MANYFORGE_COMPOSER_URL": "http://127.0.0.1:9000"}]
     assert bridge_environment["MANYFORGE_ASSISTANT_BRIDGE_PORT"] == "8100"
     assert bridge_environment["MANYFORGE_ASSISTANT_AUDIT_LOG"] == str(
         tmp_path / "state/current/assistant-bridge/audit.jsonl"
@@ -1090,7 +1096,7 @@ def test_restored_terminal_cycle_starts_vite_without_reset_or_authoring_admissio
         headless_port=9010, runner_port=9011, composer_port=9020, frontend_port=3000)
     monkeypatch.setattr(workbench, "_simulation_control_arguments", lambda: ())
     spawned: list[str] = []
-    def spawn(name, _command):
+    def spawn(name, _command, **_kwargs):
         spawned.append(name)
         workbench.processes.append((name, SimpleNamespace(poll=lambda: None)))
     monkeypatch.setattr(workbench, "_spawn", spawn)

@@ -21,9 +21,6 @@ struct PlannerCapabilityProfile {
   bool joint_goal = false;
   bool pose_goal = false;
   bool cartesian_path = false;
-  bool profile_first_feasible = false;
-  bool profile_balanced = false;
-  bool profile_quality_bounded = false;
   bool single_shot_ik = false;
 };
 
@@ -32,7 +29,7 @@ struct PlannerConformanceCase {
   PlanRequestDTO request;
 };
 
-/// Builds the mandatory 3 motion x 3 portable-profile matrix. Requests must
+/// Builds the mandatory one-case-per-motion matrix. Requests must
 /// already contain absolute, authority-resolved motion payloads; target mode
 /// and references deliberately do not cross IPlannerBackend.
 std::vector<PlannerConformanceCase> make_portable_planner_matrix(

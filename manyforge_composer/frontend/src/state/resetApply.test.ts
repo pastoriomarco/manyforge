@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  deploymentApplyResetsRun,
   nextResetApplyStep,
   resetApplyContext,
   resetApplyPhaseText,
@@ -22,7 +23,7 @@ function plan(patch: Partial<ResetApplyPlan> = {}): ResetApplyPlan {
     draftRevision: 3,
     draftContentRevision: digest('f'),
     appliedRevision: digest('a'),
-    activationScope: null,
+    scope: null,
     ...patch,
   };
 }
@@ -50,8 +51,6 @@ function facts(patch: Partial<ResetApplyFacts> = {}): ResetApplyFacts {
     draft: { draftId: 'draft-1', draftRevision: 3 },
     appliedRevision: digest('a'),
     activation: null,
-    activationScope: null,
-    correlatedApply: null,
     ...patch,
   };
 }
@@ -128,11 +127,6 @@ describe('Apply after Reset sequence', () => {
     }))).toMatchObject({ phase: { kind: 'failed', stage: 'apply' } });
     expect(nextResetApplyStep({ ...applying, phase: { ...applying.phase, sent: true } as never },
       facts({ cycle: idle, applyAvailable: true }))).toEqual({ kind: 'wait' });
-    // A Deployment with no compiled Applied revision is not waited for.
-    expect(nextResetApplyStep(
-      { plan: plan({ document: 'deployment', appliedRevision: null }), phase: applying.phase },
-      facts({ cycle: idle, applyAvailable: true, appliedRevision: null }),
-    )).toEqual({ kind: 'send_apply' });
   });
 
   it('rechecks the settled Reset identity while waiting and immediately before Apply', () => {
@@ -161,42 +155,6 @@ describe('Apply after Reset sequence', () => {
     expect(nextResetApplyStep(applying, facts({ cycle: null, applyAvailable: true }))).toEqual({ kind: 'wait' });
   });
 
-  it('refuses a Deployment Apply whose confirmed activation scope changed', () => {
-    const scope = {
-      deploymentDraftId: 'deployment-draft-1', deploymentDraftRevision: 2, deploymentRevision: digest('e'),
-      programDraftId: 'draft-1', programDraftRevision: 3, programRevision: digest('f'),
-      sourceDocumentDigest: digest('s'), programRoleAssignment: { component_roles: [], target_roles: [] },
-    };
-    const applying: ResetApplySequence = {
-      plan: plan({ document: 'deployment', activationScope: scope, draftId: 'deployment-draft-1', draftRevision: 2 }),
-      phase: { kind: 'applying', reset, idle: { cycleGeneration: 8 }, sent: false },
-    };
-    const ready = { cycle: idle, applyAvailable: true, draft: { draftId: 'deployment-draft-1', draftRevision: 2 } };
-    expect(nextResetApplyStep(applying, facts({
-      ...ready, activationScope: { ...scope, programRoleAssignment: { target_roles: [], component_roles: [] } },
-    }))).toEqual({ kind: 'send_apply' });
-    for (const changed of [
-      { ...scope, programDraftRevision: 4 },
-      { ...scope, programRevision: digest('9') },
-      { ...scope, sourceDocumentDigest: digest('8') },
-      { ...scope, programRoleAssignment: { component_roles: [{ role: 'arm' }], target_roles: [] } },
-      { ...scope, deploymentRevision: digest('7') },
-    ]) {
-      expect(nextResetApplyStep(applying, facts({ ...ready, activationScope: changed })))
-        .toMatchObject({ phase: { kind: 'failed', stage: 'apply', message: expect.stringContaining('Draft changed after confirmation; review again') } });
-    }
-    expect(nextResetApplyStep(applying, facts({ ...ready, activationScope: null })))
-      .toMatchObject({ phase: { kind: 'failed', stage: 'apply' } });
-  });
-
-  it('follows the Apply the operator confirmed after a disruptive impact, by correlation', () => {
-    const apply = { applyId: 'apply-2', applyGeneration: 4 };
-    const handed: ResetApplySequence = { plan: plan({ document: 'deployment' }), phase: { kind: 'confirmation_required' } };
-    expect(nextResetApplyStep(handed, facts())).toEqual({ kind: 'wait' });
-    expect(nextResetApplyStep(handed, facts({ correlatedApply: apply })))
-      .toEqual({ kind: 'phase', phase: { kind: 'awaiting_apply', apply } });
-  });
-
   it('follows its exact activation and never claims success early', () => {
     const apply = { applyId: 'apply-1', applyGeneration: 3 };
     const awaitingApply: ResetApplySequence = { plan: plan(), phase: { kind: 'awaiting_apply', apply } };
@@ -220,5 +178,18 @@ describe('Apply after Reset sequence', () => {
         },
       },
     }))).toMatchObject({ phase: { kind: 'failed', stage: 'apply', unknown: true, apply } });
+  });
+});
+
+describe('Deployment Reset and Apply (AUD-4)', () => {
+  const snapshot = (state: string) => ({ programCycle: { state } }) as never;
+  it('resets only a stopped or held run; the server Apply resets a finished one itself', () => {
+    expect(deploymentApplyResetsRun(null)).toBe(false);
+    expect(deploymentApplyResetsRun(snapshot('idle_after_reset'))).toBe(false);
+    expect(deploymentApplyResetsRun(snapshot('terminal_awaiting_reset'))).toBe(false);
+    expect(deploymentApplyResetsRun(snapshot('running'))).toBe(true);
+  });
+  it('records the Deployment document in the Apply context', () => {
+    expect(resetApplyContext(plan({ document: 'deployment', scope: { r: 1 } })).document).toBe('deployment');
   });
 });

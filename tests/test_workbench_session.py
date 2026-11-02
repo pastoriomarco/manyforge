@@ -18,7 +18,7 @@ SECOND = "b" * 32
 THIRD = "c" * 32
 JOURNALS = (
     "program-cycle.sqlite3", "logical-scene.sqlite3", "manager/journal.sqlite3",
-    "execution-state/cclc-journal.sqlite3", "execution-state/operation-journal.sqlite3",
+    "execution-state/operation-journal.sqlite3",
 )
 
 
@@ -87,7 +87,7 @@ def test_fresh_selection_contains_only_marker_and_history_is_stable(tmp_path):
     assert report["archive_relative_path"] == "previous-sessions/" + FIRST
     assert report["history_coverage"] == "not_imported"
     assert "Up to five previous sessions are normally kept" in report["message"]
-    assert set(report["journal_families"]) == {"program_cycle", "scene", "manager", "cclc", "kernel_operation"}
+    assert set(report["journal_families"]) == {"program_cycle", "scene", "manager", "kernel_operation"}
 
 
 def test_old_report_text_keeps_an_interrupted_session_selection_recoverable(tmp_path, monkeypatch):
@@ -543,28 +543,6 @@ def test_classifier_reads_kernel_journal_version_from_its_metadata(tmp_path, ver
     assert "kernel_operation" not in unresolved
 
 
-@pytest.mark.parametrize("version,known", [(21, True), (19, True), (22, True), (0, False)])
-def test_classifier_reads_cclc_journal_version_from_its_metadata(tmp_path, version, known):
-    path = tmp_path / "execution-state/cclc-journal.sqlite3"
-    path.parent.mkdir(parents=True)
-    # Columns read by the cclc predicates; all exist in the v21 owner DDL.
-    with closing(sqlite3.connect(path)) as database, database:
-        database.executescript("""
-            CREATE TABLE lifecycle_transactions(transaction_sequence INTEGER PRIMARY KEY, terminal INTEGER NOT NULL);
-            CREATE TABLE route_selection_transactions(transaction_sequence INTEGER PRIMARY KEY, terminal INTEGER NOT NULL);
-            CREATE TABLE cclc_effect_attempts(attempt_sequence INTEGER PRIMARY KEY, completed_attempt_blob BLOB);
-            CREATE TABLE cclc_route_effect_attempts(attempt_sequence INTEGER PRIMARY KEY, completed_attempt_blob BLOB);
-            CREATE TABLE cclc_lifecycle_cell_claims(claim_sequence INTEGER PRIMARY KEY, release_receipt_recorded INTEGER NOT NULL);
-            CREATE TABLE cclc_native_apply_reservations(reservation_id TEXT PRIMARY KEY);
-            CREATE TABLE cclc_component_incidents(incident_id TEXT PRIMARY KEY, acknowledged INTEGER);
-        """)
-        database.execute(f"PRAGMA application_id={0x4D464C4A}")
-        database.execute(f"PRAGMA user_version={version}")
-    _, unknown, unresolved = sessions._effect_observations(tmp_path)
-    assert ("cclc" not in unknown) is known
-    assert "cclc" not in unresolved
-
-
 @pytest.mark.parametrize("version,known", [(19, True), (20, True), (0, False)])
 def test_classifier_reads_manager_apply_journal_version_from_its_metadata(tmp_path, version, known):
     # The Manager owners' own resource DDL, including their SQLite identity.
@@ -583,27 +561,12 @@ def test_classifier_reads_manager_apply_journal_version_from_its_metadata(tmp_pa
 
 
 def test_classifier_never_reports_a_family_unknown_for_a_newer_schema_version(tmp_path):
-    # Tiny archive with the cclc metadata of a schema version the classifier
-    # has never seen: the version comes from the journal itself, so a clean
-    # journal of that family is classified by its rows, not marked unknown.
-    path = tmp_path / "execution-state/cclc-journal.sqlite3"
-    path.parent.mkdir(parents=True)
-    with closing(sqlite3.connect(path)) as database, database:
-        database.executescript("""
-            CREATE TABLE lifecycle_transactions(transaction_sequence INTEGER PRIMARY KEY, terminal INTEGER NOT NULL);
-            CREATE TABLE route_selection_transactions(transaction_sequence INTEGER PRIMARY KEY, terminal INTEGER NOT NULL);
-            CREATE TABLE cclc_effect_attempts(attempt_sequence INTEGER PRIMARY KEY, completed_attempt_blob BLOB);
-            CREATE TABLE cclc_route_effect_attempts(attempt_sequence INTEGER PRIMARY KEY, completed_attempt_blob BLOB);
-            CREATE TABLE cclc_lifecycle_cell_claims(claim_sequence INTEGER PRIMARY KEY, release_receipt_recorded INTEGER NOT NULL);
-            CREATE TABLE cclc_native_apply_reservations(reservation_id TEXT PRIMARY KEY);
-            CREATE TABLE cclc_component_incidents(incident_id TEXT PRIMARY KEY, acknowledged INTEGER);
-            INSERT INTO cclc_component_incidents VALUES('incident.1', 1);
-        """)
-        database.execute(f"PRAGMA application_id={0x4D464C4A}")
-        database.execute("PRAGMA user_version=99")
+    # A journal of a schema version the classifier has never seen: the version
+    # comes from the journal itself, so a clean journal of that family is
+    # classified by its rows, not marked unknown.
     kernel_archive(tmp_path, 17, "cleared")
     with closing(sqlite3.connect(tmp_path / "execution-state/operation-journal.sqlite3")) as database:
         database.execute("PRAGMA user_version=99")
     _, unknown, unresolved = sessions._effect_observations(tmp_path)
-    assert "cclc" not in unknown and "kernel_operation" not in unknown
-    assert "cclc" not in unresolved and "kernel_operation" not in unresolved
+    assert "kernel_operation" not in unknown
+    assert "kernel_operation" not in unresolved

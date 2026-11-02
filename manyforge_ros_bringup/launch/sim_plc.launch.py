@@ -4,6 +4,19 @@ ros2 launch manyforge_ros_bringup sim_plc.launch.py device:=<device_id> config_d
 
 The node reads its own optional ``<config_dir>/<device_id>.yaml``; this launch
 only names it and keeps its discovery on the local host.
+
+As an I/O provider it follows the observed-value contract (CONTRACTS §7) like
+a real ROS PLC, with nothing simulator-specific:
+
+- ManyForge outputs are the PLC inputs ``in_<i>`` (SetBool). The PLC has no
+  read-back of them, so the component declares ``io_manual_write`` without
+  ``io_output_readback``. Their samples are ``source: last_write``: the last
+  accepted write. A write without a response is ``unknown`` and is never
+  resent.
+- ManyForge inputs are the PLC outputs ``out_<i>`` (Bool topics). They are
+  sampled with ``source: device`` and their age.
+- ``ready`` is the device's stream. When it goes stale, the I/O component is
+  in ``fault_stream_stale``.
 """
 
 from __future__ import annotations

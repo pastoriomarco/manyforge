@@ -53,7 +53,7 @@ describe('operational error lifecycle', () => {
     expect(acknowledged.sequence).toBe(3);
   });
 
-  it('clears every message at Reset or Scenario Close', () => {
+  it('clears every message at Reset or Scenario New', () => {
     const state = report(
       report(initialOperationalErrorState(), 'composer.a', 'acknowledgement_required'),
       'composer.b', 'acknowledgement_required',

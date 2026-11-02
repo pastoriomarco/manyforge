@@ -79,7 +79,8 @@ for required in \
     "${CMAKE_SOURCE}/CMakeLists.txt" \
     "${WORKSPACE}/manyforge_roboplan/CMakeLists.txt" \
     "${WORKSPACE}/manyforge_ros2_control_execution/CMakeLists.txt" \
-    "${WORKSPACE}/manyforge_cclc_msgs/package.xml" \
+    "${WORKSPACE}/manyforge_xarm_control/CMakeLists.txt" \
+    "${WORKSPACE}/manyforge_isaac_adapter/CMakeLists.txt" \
     "${WORKSPACE}/manyforge_ros_bringup/package.xml"; do
     if [[ ! -f "${required}" ]]; then
         printf 'I9 ros2_control source is incomplete: %s\n' "${required}" >&2
@@ -183,10 +184,9 @@ export CMAKE_PREFIX_PATH=${MANYFORGE_ROS_CMAKE_PREFIX_PATH}
 unset BOOST_ROOT BOOST_INCLUDEDIR BOOST_LIBRARYDIR
 
 ROS_OVERLAY_BASE_PATHS=(
-    "${WORKSPACE}/manyforge_cclc_msgs"
     "${WORKSPACE}/manyforge_ros_bringup"
 )
-ROS_OVERLAY_PACKAGES=(manyforge_cclc_msgs manyforge_ros_bringup)
+ROS_OVERLAY_PACKAGES=(manyforge_ros_bringup)
 if [[ "${MANYFORGE_ROS2_CONTROL_BUILD_TESTING:-OFF}" == ON ]]; then
     ROS_OVERLAY_BASE_PATHS=(
         "${WORKSPACE}/manyforge_perception_interfaces"
@@ -211,8 +211,7 @@ for target in "${BUILD_TARGETS[@]}"; do
             test -x "${ROBOPLAN_BUILD}/manyforge_roboplan_candidate_worker"
             ;;
         manyforge_ros2_control_execution_host|manyforge_roboplan_candidate_worker|\
-        manyforge_ros2_control_execution_host_pick_place_planning_fixture|\
-        manyforge_ros2_control_execution_host_admission_fixture)
+        manyforge_ros2_control_execution_host_pick_place_planning_fixture)
             test -x "${ROBOPLAN_BUILD}/${target}"
             ;;
         manyforge_ros2_control_execution_host_projection_fixture)

@@ -3,7 +3,7 @@
 `/ws/control` is ManyForge's low-latency command and authoritative-status
 session for the first-party UI and compatible external clients. Composer
 proxies this session to Headless; it does not own Program, operation, Stop, or
-Reset semantics. Program Runner and the native execution owners remain the
+Reset semantics. Program Runner and the execution host remain the
 authorities.
 
 The public browser endpoint is Composer. Headless exposes the same protocol on
@@ -26,7 +26,7 @@ session.
 | Maximum client-message rate | 64 messages/s per session |
 | Maximum complete snapshot size | 16 MiB |
 | Maximum node-progress publication rate | 20 Hz, newest value only |
-| Maximum manual-operation progress publication rate | 5 Hz, newest value only |
+| Maximum manual-operation progress publication rate | 10 Hz, newest value only |
 | History summary page | at most 32 rows; exact payload is detail-only |
 
 Integer transport sequences and monotonic timestamps are positive decimal
@@ -42,14 +42,37 @@ applies the same rule to each Draft edit, and the browser only reads it.
 The optional shell fact `operation_progress` is a complete latest-only list
 of executing single-participant manual operations (at most 4096 rows). Each
 row has exactly `owner_epoch`, `operation_id`, `operation_revision` and
-`progress` (finite, 0–1). The native `events` response supplies this list from
-resident in-memory operations, separately from its durable `event_page`:
-progress-only samples do not append journal records. Headless coalesces changes
+`progress` (finite, 0–1). The execution host's event stream supplies this list
+from resident in-memory operations (re-read every 100 ms while one executes),
+separately from its durable event rows: progress-only samples do not append
+journal records. Headless coalesces changes
 on its existing event-pump wake; no extra polling connection or cold-state
 rebuild is involved. An empty list clears prior samples. The browser applies
 samples only to an executing operation with matching owner, ID and revision;
 lifecycle, Stop and terminal state always take precedence. Unchanged
 progress produces no control publication.
+
+## Cell facts
+
+Besides `runtime`, `alarms`, `component_overview`, `authoring_admission`,
+`held_run_draft_edit_allowed`, `execution_targets`, `execution_control_state`
+and `program_cycle`, every owner `snapshot` carries the component model's
+facts as shell keys. Each value is complete (every component, every signal),
+and a `delta` carries a key again whenever its value changes; age fields
+(`age_ns`, `observed_at_ns`) alone don't cause a delta. While the execution
+host's component model can't be read, each of the four keys below is `null`
+(unavailable), never its last value.
+
+| Shell key | Value | Same value over REST |
+|---|---|---|
+| `component_state` | list of every `ComponentState` (`component_id`, `owner_id`, `role`, `lifecycle`, `fault`, `reason`, `activity`, `streams`, `capabilities`, `action`, `last_action`, `details`, `observed_at_ns`), in cell order | `GET /api/components` |
+| `cell_latch` | `{latched, causes[]: {component_id, kind, fault?}}` | `GET /api/cell/latch` |
+| `io_signals` | list of every `SignalSample` (`signal_id`, `value`, `source`, `age_ns`, `fresh`, `controller_owned`) | `GET /api/io` |
+| `run_readiness` | `{can_execute, can_resume, motion_clear, blocked_reasons[]}` | `GET /api/program/readiness` |
+| `global_rules` | list of `{rule_id, state, keys, unavailable_reason?}` per global interrupt rule; `null` until the rule catalogue is known | — |
+
+`global_rules` comes from the execution host's event stream, like
+`operation_progress`, and changes publish on the same wake.
 
 ## Two independent states
 
@@ -176,7 +199,7 @@ top-level fact delta marked `complete: false`; the browser replaces only the
 facts present in that delta. Execution targets are immutable within their exact
 execution owner/product identity, so control-only changes reuse the last
 validated target instead of retransmitting it. A target change still carries
-the control state from the same native capture, and the browser rejects any
+the control state from the same execution-host capture, and the browser rejects any
 identity mismatch. The per-session `state_applied` credit keeps at most one
 delivered but unconsumed owner state and one newest pending replacement end to
 end, including
@@ -212,7 +235,7 @@ current state and exact resource scope.
   a no-effect success after proven rest. Repeated Reset joins the exact reset
   already in progress.
 - Reset accepted during motion publishes backend-owned `resetting`, invokes
-  native controlled stopping, waits for certified settlement, restores the
+  the execution host's controlled stop, waits for certified settlement, restores the
   authoritative initial scene, and publishes Idle only after completion.
 - The browser mirrors backend lifecycle and `allowed_commands`; it never
   invents Idle, Starting, Running, Stopping, Resetting, terminal, recovery, or
@@ -253,7 +276,7 @@ episode after the activation is durable; a later unmatched resolution is a
 diagnostic no-op and can never close or degrade control. There is no lifetime
 incident counter.
 Runtime History lists compact summary rows and loads an exact event payload
-only when a sequenced row is selected. The native Historian builds that summary
+only when a sequenced row is selected. The C++ Historian builds that summary
 outside the Python control loop, and Composer relays its bounded JSON without a
 second parse/encode cycle.
 

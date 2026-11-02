@@ -1,6 +1,6 @@
 /**
  * The warning row: everything that blocks nothing. Each item stays until the
- * operator acknowledges it, or until Reset or Scenario Close clears it.
+ * operator acknowledges it, or until Reset or Scenario New clears it.
  * Composer-side warnings are acknowledged locally (per browser session);
  * alarms through the owner's exact acknowledgement. Red stays for what blocks
  * now (see `HeadlessRuntimeSurfaces`).

@@ -7,7 +7,6 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
-#include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
 #include <manyforge_core/types/catalog.hpp>
 #include <manyforge_deployment/artifact_codec.hpp>
 #include <manyforge_deployment/build_manifest.hpp>
@@ -48,6 +47,7 @@
 #include <string_view>
 #include <tuple>
 #include <utility>
+#include <type_traits>
 #include <variant>
 #include <vector>
 
@@ -121,108 +121,12 @@ namespace deployment = manyforge::deployment;
   return true;
 }
 
-struct Options final {
-  std::filesystem::path workspace_root;
-  std::optional<std::filesystem::path> package_root;
-  std::map<std::string, std::filesystem::path, std::less<>> prepared_roots;
-};
-
+/// One Deployment to materialize: its source key and whether it selects the
+/// ROS execution runtime.
 struct Scenario final {
-  std::string_view source;
-  /// The robot's model family (its model asset id).
-  std::string_view family_id;
-  bool assistant_enabled;
+  std::string source;
   bool ros2_control_execution;
-  std::string_view isaac_profile;
-  /// Q63-Q66: the offline mock controller profile replacing the native
-  /// simulated executor (empty for Isaac).
-  std::string_view mock_profile;
-  /// Merge 6: the family of the tool mounted on the robot's `flange` (empty
-  /// without a tool). Its lane and rows come from its maintained profile.
-  std::string_view tool_family_id{};
 };
-
-constexpr auto kScenarios = std::to_array<Scenario>({
-    {"examples/assistant_modes_scene_authoring.deployment.yaml", "ur10e", true,
-     true, "", "ur10e", "robotiq_2f_140"},
-    {"examples/isaac_lite6_lite_gripper_pick_and_place.deployment.yaml",
-     "lite6", false, true, "lite6", "", "lite_gripper"},
-    {"examples/isaac_manipulator_scene_light_assistant.deployment.yaml",
-     "ur10e", true, true, "ur10e", "", "robotiq_2f_140"},
-    {"examples/isaac_manipulator_scene_light_ros2_control.deployment.yaml",
-     "ur10e", false, true, "ur10e", "", "robotiq_2f_140"},
-    {"examples/"
-     "isaac_manipulator_scene_light_ros2_control_collision.deployment.yaml",
-     "ur10e", false, true, "ur10e", "", "robotiq_2f_140"},
-    {"examples/lite6_lite_gripper_pick_and_place.deployment.yaml", "lite6",
-     false, true, "", "lite6", "lite_gripper"},
-    {"examples/pick_and_place.deployment.yaml", "ur5_roboplan", false, true,
-     "", "ur5_roboplan"},
-    {"examples/pick_and_place_ur10e_robotiq.deployment.yaml", "ur10e", false,
-     true, "", "ur10e", "robotiq_2f_140"},
-    {"examples/semantic_shape_pick.deployment.yaml", "ur5e", true, true, "",
-     "ur5e", "robotiq_2f_85"},
-    {"examples/trocar_lite6_foundationpose_pick.deployment.yaml", "lite6",
-     false, true, "lite6", "", "lite_gripper"},
-    {"examples/vision_guided_bin_pick.deployment.yaml", "ur5e", true, true, "",
-     "ur5e", "robotiq_2f_85"},
-    {"examples/vision_guided_pose_pick.deployment.yaml", "ur5_roboplan", true,
-     true, "", "ur5_roboplan"},
-});
-
-constexpr std::array<Scenario, 1U> kComposedScenarios{{
-    {"examples/ur5e_lite6_wall.deployment.yaml", "", false, true, "",
-     "mixed"},
-}};
-
-[[nodiscard]] Options parse_options(int argc, char **argv) {
-  if (argc < 3 || std::string_view(argv[1]) != "--check") {
-    throw std::invalid_argument(
-        "usage: manyforge_maintained_deployment_occurrences "
-        "--check "
-        "--workspace-root <manyforge-root> "
-        "[--package-root <empty-output-directory>] "
-        "--prepared <family-id>=<directory> [--prepared ...]");
-  }
-  Options result;
-  for (int index = 2; index < argc;) {
-    const std::string_view option(argv[index]);
-    if (index + 1 >= argc) {
-      throw std::invalid_argument(
-          "maintained qualification option has no value");
-    }
-    const std::string value(argv[index + 1]);
-    if (option == "--workspace-root" && result.workspace_root.empty()) {
-      result.workspace_root = value;
-      index += 2;
-      continue;
-    }
-    if (option == "--package-root" && !result.package_root.has_value()) {
-      result.package_root = value;
-      index += 2;
-      continue;
-    }
-    if (option == "--prepared") {
-      const auto separator = value.find('=');
-      if (separator != std::string::npos && separator != 0U &&
-          separator + 1U != value.size() &&
-          result.prepared_roots
-              .emplace(value.substr(0U, separator),
-                       value.substr(separator + 1U))
-              .second) {
-        index += 2;
-        continue;
-      }
-    }
-    throw std::invalid_argument(
-        "invalid or repeated maintained qualification option");
-  }
-  if (result.workspace_root.empty() || result.prepared_roots.empty()) {
-    throw std::invalid_argument("maintained qualification requires one "
-                                "workspace root and prepared families");
-  }
-  return result;
-}
 
 [[nodiscard]] std::string
 read_bounded_plain_file(const std::filesystem::path &path,
@@ -279,17 +183,6 @@ require_array(const deployment::CanonicalValue &value, std::string_view label) {
   return *array;
 }
 
-[[nodiscard]] const deployment::CanonicalValue::Object &
-require_object(const deployment::CanonicalValue &value,
-               std::string_view label) {
-  const auto *object =
-      std::get_if<deployment::CanonicalValue::Object>(&value.storage());
-  if (object == nullptr) {
-    throw std::invalid_argument(std::string(label) + " must be an object");
-  }
-  return *object;
-}
-
 [[nodiscard]] const std::string &
 require_text(const deployment::CanonicalValue &value, std::string_view label) {
   const auto *text = std::get_if<std::string>(&value.storage());
@@ -297,30 +190,6 @@ require_text(const deployment::CanonicalValue &value, std::string_view label) {
     throw std::invalid_argument(std::string(label) + " must be non-empty text");
   }
   return *text;
-}
-
-[[nodiscard]] std::uint64_t
-require_size(const deployment::CanonicalValue &value, std::string_view label) {
-  const auto *number = std::get_if<double>(&value.storage());
-  if (number == nullptr || *number < 0.0 ||
-      *number > static_cast<double>(deployment::kMaxModelSourceClosureBytes) ||
-      *number != static_cast<double>(static_cast<std::uint64_t>(*number))) {
-    throw std::invalid_argument(std::string(label) +
-                                " must be a bounded integer");
-  }
-  return static_cast<std::uint64_t>(*number);
-}
-
-[[nodiscard]] std::filesystem::path
-require_relative_path(std::string_view text, std::string_view label) {
-  const std::filesystem::path path(text);
-  if (text.empty() || path.is_absolute() || path != path.lexically_normal() ||
-      std::find(path.begin(), path.end(), std::filesystem::path("..")) !=
-          path.end()) {
-    throw std::invalid_argument(std::string(label) +
-                                " must be a normalized root-local path");
-  }
-  return path;
 }
 
 class ExactCompilerInputSource final
@@ -521,112 +390,6 @@ struct MemoryPreparationStores final {
   MemoryRetainedBundleRepository bundles;
 };
 
-struct FamilySource final {
-  std::string family_id;
-  std::string model_asset_id;
-  std::filesystem::path catalog_source;
-  std::filesystem::path urdf_source;
-  std::filesystem::path srdf_source;
-  std::filesystem::path resource_root;
-  std::filesystem::path prepared_root;
-};
-
-[[nodiscard]] std::vector<FamilySource> load_families(const Options &options) {
-  const auto root = deployment::parse_strict_json_model_yaml(read_file(
-      options.workspace_root / "manyforge_deployment/resources/maintained/"
-                               "maintained_deployment_sources.v1.json"));
-  const auto &rows = require_array(
-      require_member(root.root(), "model_families", "maintained description"),
-      "maintained description.model_families");
-  std::vector<FamilySource> result;
-  for (const auto &row : rows) {
-    const std::string family_id =
-        require_text(require_member(row, "model_family_id", "model family"),
-                     "model family.model_family_id");
-    const auto prepared = options.prepared_roots.find(family_id);
-    if (prepared == options.prepared_roots.end() ||
-        !prepared->second.is_absolute() ||
-        std::filesystem::is_symlink(prepared->second) ||
-        !std::filesystem::is_directory(prepared->second)) {
-      throw std::invalid_argument("model family has no exact prepared root: " +
-                                  family_id);
-    }
-    const auto &source = require_member(row, "source", "model family");
-    const auto rooted = [&](std::string_view field) {
-      return options.workspace_root /
-             require_relative_path(
-                 require_text(
-                     require_member(source, field, "model family.source"),
-                     std::string("model family.source.") + std::string(field)),
-                 std::string("model family.source.") + std::string(field));
-    };
-    result.push_back(FamilySource{
-        family_id,
-        require_text(require_member(row, "model_asset_id", "model family"),
-                     "model family.model_asset_id"),
-        options.workspace_root /
-            require_relative_path(
-                require_text(
-                    require_member(row, "catalog_source", "model family"),
-                    "model family.catalog_source"),
-                "model family.catalog_source"),
-        rooted("urdf_path"),
-        rooted("srdf_path"),
-        rooted("resource_root"),
-        prepared->second.lexically_normal(),
-    });
-  }
-  if (result.size() != options.prepared_roots.size()) {
-    throw std::invalid_argument(
-        "prepared family set differs from the maintained description");
-  }
-  return result;
-}
-
-class TemporaryPackage final {
-public:
-  explicit TemporaryPackage(
-      const std::optional<std::filesystem::path> &requested_root) {
-    if (requested_root.has_value()) {
-      path_ = std::filesystem::canonical(*requested_root);
-      if (!std::filesystem::is_directory(path_) ||
-          std::filesystem::is_symlink(path_) ||
-          !std::filesystem::is_empty(path_)) {
-        throw std::invalid_argument(
-            "requested N6-a3 package root must be one empty plain directory");
-      }
-      remove_on_destruction_ = false;
-      return;
-    }
-    std::array<char, 64U> pattern{};
-    const std::string seed = "/tmp/manyforge-n6-a3-XXXXXX";
-    std::copy(seed.begin(), seed.end(), pattern.begin());
-    char *created = ::mkdtemp(pattern.data());
-    if (created == nullptr) {
-      throw std::runtime_error("cannot create N6-a3 temporary package");
-    }
-    path_ = created;
-  }
-
-  ~TemporaryPackage() {
-    if (!remove_on_destruction_) {
-      return;
-    }
-    std::error_code ignored;
-    (void)std::filesystem::remove_all(path_, ignored);
-  }
-  TemporaryPackage(const TemporaryPackage &) = delete;
-  TemporaryPackage &operator=(const TemporaryPackage &) = delete;
-
-  [[nodiscard]] const std::filesystem::path &path() const noexcept {
-    return path_;
-  }
-
-private:
-  std::filesystem::path path_;
-  bool remove_on_destruction_{true};
-};
-
 [[nodiscard]] const std::string &
 require_string_member(const deployment::CanonicalValue &root,
                       std::string_view name) {
@@ -714,7 +477,7 @@ struct ScenarioProduct final {
 };
 
 void verify_gripper_resource_semantics(
-    const Scenario &scenario, const core::CellGraphDTO &graph,
+    const core::CellGraphDTO &graph,
     const deployment::VerifiedRetainedModelMap &model_map) {
   if (graph.controllable_components.empty()) {
     throw std::logic_error(
@@ -739,18 +502,6 @@ void verify_gripper_resource_semantics(
   // Genuine qualified provider-only components have no physical gripper fact.
   if (physical_components == 0U)
     return;
-  // DX783: the maintained arm-only family has no gripper target. Its Programs
-  // requiring one must fail the normal role/capability selection, not acquire
-  // a component-local placeholder that could be mistaken for a physical tool.
-  if (scenario.family_id == std::string_view("ur5_roboplan")) {
-    if (std::any_of(model_map.control_bindings().begin(),
-                    model_map.control_bindings().end(), [](const auto &binding) {
-          return binding.command_target_id.value() == "gripper";
-        })) {
-      throw std::logic_error("maintained arm-only deployment has a gripper target");
-    }
-    return;
-  }
   // Merge 6: a split robot has no gripper (its mounted tool owns it, or it
   // has none). Every component that owns a gripper target proves its finger
   // resource.
@@ -797,61 +548,21 @@ void verify_gripper_resource_semantics(
 materialize_scenarios(const std::filesystem::path &root,
                       const QualifiedCatalogClosure &catalog,
                       const ExactCompilerInputSource &input_source,
-                      const std::filesystem::path &package_root,
-                      std::span<const Scenario> scenarios = kScenarios,
-                      const deployment::CanonicalValue *deployment_override =
-                          nullptr,
-                      const bool publish_canonical_empty = true,
-                      MemoryPreparationStores *memory_stores = nullptr) {
-  if (deployment_override != nullptr && scenarios.size() != 1U) {
+                      std::span<const Scenario> scenarios,
+                      const deployment::CanonicalValue &deployment_value,
+                      const bool publish_canonical_empty,
+                      MemoryPreparationStores &stores) {
+  if (scenarios.size() != 1U) {
     throw std::invalid_argument(
-        "one candidate Deployment override requires one Scenario");
+        "one candidate Deployment requires one Scenario");
   }
   const std::string overlay_bytes = read_file(
       root / "manyforge_deployment/resources/maintained/site_overlays/"
              "manyforge_local_examples.site_overlay.json");
-  std::unique_ptr<deployment::FilesystemBuildManifestRepository>
-      filesystem_manifests;
-  std::unique_ptr<deployment::FilesystemCatalogArtifactStore>
-      filesystem_catalogs;
-  std::unique_ptr<deployment::FilesystemRawArtifactStore> filesystem_raw;
-  std::unique_ptr<deployment::FilesystemRetainedBundleRepository>
-      filesystem_bundles;
-  if (memory_stores == nullptr) {
-    filesystem_manifests =
-        std::make_unique<deployment::FilesystemBuildManifestRepository>(
-            package_root);
-    filesystem_catalogs =
-        std::make_unique<deployment::FilesystemCatalogArtifactStore>(
-            package_root);
-    filesystem_raw =
-        std::make_unique<deployment::FilesystemRawArtifactStore>(package_root);
-    filesystem_bundles =
-        std::make_unique<deployment::FilesystemRetainedBundleRepository>(
-            package_root);
-  }
-  deployment::IBuildManifestRepository &manifest_repository =
-      memory_stores != nullptr
-          ? static_cast<deployment::IBuildManifestRepository &>(
-                memory_stores->manifests)
-          : static_cast<deployment::IBuildManifestRepository &>(
-                *filesystem_manifests);
-  deployment::ICatalogArtifactStore &catalog_store =
-      memory_stores != nullptr
-          ? static_cast<deployment::ICatalogArtifactStore &>(
-                memory_stores->catalogs)
-          : static_cast<deployment::ICatalogArtifactStore &>(
-                *filesystem_catalogs);
-  deployment::IRawArtifactStore &raw_store =
-      memory_stores != nullptr
-          ? static_cast<deployment::IRawArtifactStore &>(memory_stores->raw)
-          : static_cast<deployment::IRawArtifactStore &>(*filesystem_raw);
-  deployment::IRetainedBundleRepository &bundle_repository =
-      memory_stores != nullptr
-          ? static_cast<deployment::IRetainedBundleRepository &>(
-                memory_stores->bundles)
-          : static_cast<deployment::IRetainedBundleRepository &>(
-                *filesystem_bundles);
+  deployment::IBuildManifestRepository &manifest_repository = stores.manifests;
+  deployment::ICatalogArtifactStore &catalog_store = stores.catalogs;
+  deployment::IRawArtifactStore &raw_store = stores.raw;
+  deployment::IRetainedBundleRepository &bundle_repository = stores.bundles;
   std::map<std::string, ScenarioProduct, std::less<>> result;
 
   for (const auto &scenario : scenarios) {
@@ -874,9 +585,7 @@ materialize_scenarios(const std::filesystem::path &root,
     }
     const auto verified = deployment::verify_deployment_artifact_revision(
         deployment::parse_strict_json_model_yaml(
-            deployment_override != nullptr
-                ? deployment::canonical_json(*deployment_override)
-                : read_file(root / scenario.source)),
+            deployment::canonical_json(deployment_value)),
         envelope_profiles);
     std::set<CatalogKey> selected_records;
     for (const auto &reference : verified.catalog_records()) {
@@ -1056,20 +765,14 @@ materialize_scenarios(const std::filesystem::path &root,
       }
       const deployment::RetainedModelMapQuery map_query{
           bundle->retained_bundle_id(), product.product_id};
-      if (memory_stores != nullptr) {
-        const auto &artifact = product.artifact_refs.front();
-        const auto bytes = memory_stores->raw.get_verified(
-            artifact.content_addressed_store_key, artifact.content_digest,
-            artifact.byte_size);
-        if (bytes.has_value()) {
-          model_map = deployment::detail::
-              RetainedModelMapVerificationAuthority::verify(*bundle, map_query,
-                                                            *bytes);
-        }
-      } else {
-        const deployment::FilesystemVerifiedRetainedModelMapSource map_source(
-            package_root);
-        model_map = map_source.get_verified(map_query);
+      const auto &artifact = product.artifact_refs.front();
+      const auto bytes = stores.raw.get_verified(
+          artifact.content_addressed_store_key, artifact.content_digest,
+          artifact.byte_size);
+      if (bytes.has_value()) {
+        model_map = deployment::detail::
+            RetainedModelMapVerificationAuthority::verify(*bundle, map_query,
+                                                          *bytes);
       }
       if (!model_map.has_value()) {
         throw std::logic_error(
@@ -1130,24 +833,12 @@ materialize_scenarios(const std::filesystem::path &root,
           deployment::cell_scoped_canonical_empty_admission_filename(
               verified.cell_id());
       canonical_empty_bundle = empty_bundle;
-      if (memory_stores == nullptr) {
-        const auto admission =
-            deployment::detail::publish_cell_scoped_canonical_empty_admission(
-                package_root, admission_filename, *empty_bundle);
-        if (admission.cell_id() != verified.cell_id() ||
-            admission.retained_bundle_id() !=
-                empty_bundle->retained_bundle_id()) {
-          throw std::logic_error(
-              "cell-scoped canonical predecessor did not reload exactly");
-        }
-      }
     }
     // A cell without components has no gripper to prove; its empty map is
     // only the Program-binding model map.
     if (model_map.has_value() &&
         !verified.graph().graph().controllable_components.empty()) {
-      verify_gripper_resource_semantics(scenario, verified.graph().graph(),
-                                        *model_map);
+      verify_gripper_resource_semantics(verified.graph().graph(), *model_map);
     }
     if (!result
              .emplace(
@@ -1163,386 +854,6 @@ materialize_scenarios(const std::filesystem::path &root,
     }
   }
   return result;
-}
-
-struct StoredProgramBinding final {
-  std::string deployment_source;
-  core::ProgramBindingId program_binding_id;
-  core::ProgramId program_id;
-  core::ProgramRevision program_revision;
-};
-
-void verify_resolved_program_binding(
-    const deployment::ProgramBinding &binding,
-    const deployment::RetainedBundle &bundle,
-    const deployment::VerifiedRetainedModelMap &model_map) {
-  if (binding.value().component_role_bindings.empty() ||
-      binding.value().target_role_bindings.empty()) {
-    throw std::logic_error(
-        "maintained Program Binding has an empty role closure");
-  }
-  for (const auto &component : binding.value().component_role_bindings) {
-    if (component.model_role_bindings.empty()) {
-      throw std::logic_error(
-          "maintained Program Binding loses its model-role resolution");
-    }
-  }
-  for (const auto &target : binding.value().target_role_bindings) {
-    // A target role may require no frame role (for example a gripper role
-    // used only through gripper commands, after the TCP migration drops its
-    // unused `tcp` requirement); its frame family is then legitimately empty.
-    if (target.resource_role_bindings.empty() ||
-        target.collision_body_role_bindings.empty() ||
-        target.capability_bindings.empty()) {
-      throw std::logic_error(
-          "maintained Program Binding loses a target resolution family");
-    }
-    for (const auto &resource : target.resource_role_bindings) {
-      if (resource.resource_ids.empty() ||
-          resource.resource_ids.size() !=
-              resource.compiled_resource_names.size() ||
-          std::any_of(resource.compiled_resource_names.begin(),
-                      resource.compiled_resource_names.end(),
-                      [](const auto &value) { return value.empty(); })) {
-        throw std::logic_error(
-            "maintained Program Binding has an incomplete resource mapping");
-      }
-    }
-    for (const auto &frame : target.frame_role_bindings) {
-      if (frame.compiled_frame_name.empty()) {
-        throw std::logic_error(
-            "maintained Program Binding has an empty compiled frame");
-      }
-    }
-    for (const auto &body : target.collision_body_role_bindings) {
-      if (body.compiled_collision_body_names.empty()) {
-        throw std::logic_error(
-            "maintained Program Binding has an empty collision-body mapping");
-      }
-    }
-
-    bool resolved_control_coordinates = false;
-    for (const auto &capability : target.capability_bindings) {
-      const auto resolved = deployment::resolve_runtime_program_target(
-          binding, target.target_role_id, capability.capability_id, bundle,
-          model_map);
-      if (resolved.program_binding_id() != binding.program_binding_id() ||
-          resolved.component().controllable_component_id !=
-              target.controllable_component_id ||
-          resolved.model_target().command_target_id !=
-              target.command_target_id ||
-          resolved.capability() != capability) {
-        throw std::logic_error(
-            "runtime Program resolver changed an exact retained selection");
-      }
-      if (capability.control_binding.has_value()) {
-        if (!resolved.control_binding().has_value() ||
-            !resolved.control_domain().has_value() ||
-            !resolved.desired_control_configuration().has_value() ||
-            !resolved.desired_route().has_value() ||
-            !resolved.coordinate_map().has_value()) {
-          throw std::logic_error(
-              "control-backed Program capability has no complete runtime path");
-        }
-        for (const auto &resource : resolved.coordinate_map()->resources) {
-          if (std::any_of(resource.coordinates.begin(),
-                          resource.coordinates.end(), [](const auto &row) {
-                            return row.source_joint_name.empty() ||
-                                   row.compiled_joint_name.empty();
-                          })) {
-            throw std::logic_error(
-                "runtime Program path has an incomplete source-joint map");
-          }
-        }
-        resolved_control_coordinates = true;
-      } else if (resolved.control_binding().has_value() ||
-                 resolved.control_domain().has_value() ||
-                 resolved.desired_route().has_value() ||
-                 resolved.coordinate_map().has_value()) {
-        throw std::logic_error(
-            "provider-only Program capability acquired a control path");
-      }
-      if (capability.capability_provider_binding.has_value() !=
-          resolved.capability_provider_binding().has_value()) {
-        throw std::logic_error(
-            "Program capability provider resolution changed disposition");
-      }
-    }
-    if (!resolved_control_coordinates) {
-      throw std::logic_error(
-          "maintained Program target has no exact control-coordinate path");
-    }
-  }
-}
-
-struct MaintainedScenarioInput final {
-  std::string scenario_id;
-  std::filesystem::path source;
-  deployment::CanonicalValue deployment;
-  deployment::CanonicalValue program;
-  core::ProgramRoleAssignmentDTO assignment;
-};
-
-[[nodiscard]] deployment::CanonicalValue program_from_authoring_draft(
-    const deployment::CanonicalValue &draft) {
-  const auto &draft_object = require_object(draft, "Scenario.program_draft");
-  const auto &forest = require_array(
-      require_member(draft, "forest", "Scenario.program_draft"),
-      "Scenario.program_draft.forest");
-  if (forest.size() != 1U) {
-    throw std::invalid_argument(
-        "maintained Scenario Program draft must contain one tree");
-  }
-  deployment::CanonicalValue::Object program;
-  for (const auto &[name, value] : draft_object) {
-    if (name != "schema_version" && name != "forest" && name != "positions") {
-      program.emplace_back(name, value);
-    }
-  }
-  program.emplace_back("program_revision", deployment::CanonicalValue(
-                                               "sha256:" + std::string(64U, '0')));
-  program.emplace_back("tree", forest.front());
-  const deployment::CanonicalValue placeholder(program);
-  const auto revision = deployment::detail::compute_content_identity(
-      placeholder, deployment::detail::ContentIdentitySpec{
-                  .identity_domain = "program-revision",
-                  .api_version = std::string(core::kProgramApiVersion),
-                  .own_field = "program_revision",
-              });
-  deployment::CanonicalValue::Object identified;
-  identified.reserve(program.size());
-  for (const auto &[name, value] : program) {
-    if (name == "program_revision") {
-      identified.emplace_back(name, deployment::CanonicalValue(revision));
-    } else {
-      identified.emplace_back(name, value);
-    }
-  }
-  return deployment::CanonicalValue(std::move(identified));
-}
-
-// The maintained Scenario set: the described Program/Scenario assignments plus
-// the generated UI6-I dual-robot fixtures. Each listed project must be present;
-// other folders under examples/ (for example the editable workbench Scenario)
-// are ordinary user projects and are never maintained qualification inputs.
-constexpr auto kMaintainedScenarioIds = std::to_array<std::string_view>({
-    "isaac-lite6-pick-place",
-    "isaac-lite6-trocar-foundationpose",
-    "isaac-ur10e-light-scene",
-    "isaac-ur10e-light-scene-assistant",
-    "isaac-ur10e-light-scene-collision",
-    "lite6_pick_and_place",
-    "ur10e_assistant_scene_authoring",
-    "ur10e_pick_and_place",
-    "ur5_pick_and_place",
-    "ur5_pick_and_place_minimal",
-    "ur5_semantic_shape_pick",
-    "ur5_vision_guided_bin_pick",
-    "ur5_vision_guided_pose_pick",
-    "ur5e_lite6_wall_grouped",
-    "ur5e_lite6_wall_isolation",
-});
-
-[[nodiscard]] std::vector<MaintainedScenarioInput>
-load_maintained_scenario_inputs(const std::filesystem::path &root) {
-  std::vector<MaintainedScenarioInput> result;
-  const auto examples = root / "examples";
-  for (const auto scenario_id : kMaintainedScenarioIds) {
-    const std::filesystem::directory_entry entry(
-        examples / (std::string(scenario_id) + ".scenario"));
-    if (!entry.is_directory() || entry.is_symlink()) {
-      throw std::invalid_argument(
-          "maintained Scenario project is missing: " + entry.path().string());
-    }
-    const auto manifest_path = entry.path() / "scenario.yaml";
-    const auto manifest = deployment::parse_strict_json_model_yaml(
-        read_file(manifest_path));
-    const auto &document = manifest.root();
-    if (require_text(require_member(document, "api_version", "Scenario project"),
-                     "Scenario project.api_version") !=
-        "manyforge.scenario.project.v2") {
-      throw std::invalid_argument(
-          "maintained Scenario project has the wrong API version");
-    }
-    const auto &members = require_member(document, "members", "Scenario project");
-    const auto read_member = [&](const std::string_view name) {
-      const auto path = entry.path() / name;
-      const auto bytes = read_file(path);
-      const auto expected = require_text(
-          require_member(members, name, "Scenario project members"),
-          "Scenario project member digest");
-      if (deployment::sha256_digest(bytes) != expected) {
-        throw std::invalid_argument(
-            "maintained Scenario project member differs from its manifest: " +
-            path.string());
-      }
-      return deployment::parse_strict_json_model_yaml(bytes).root();
-    };
-    const auto deployment_value = read_member("deployment.yaml");
-    const auto program_draft = read_member("program.yaml");
-    const auto assignment_value = read_member("assignment.yaml");
-    core::ProgramRoleAssignmentDTO assignment;
-    for (const auto &row : require_array(
-             require_member(assignment_value, "component_roles", "assignment"),
-             "assignment.component_roles")) {
-      assignment.component_roles.push_back(
-          {core::ComponentRoleId(require_text(
-               require_member(row, "component_role_id", "component role"),
-               "component_role_id")),
-           core::ControllableComponentId(require_text(
-               require_member(row, "controllable_component_id", "component role"),
-               "controllable_component_id"))});
-    }
-    for (const auto &row : require_array(
-             require_member(assignment_value, "target_roles", "assignment"),
-             "assignment.target_roles")) {
-      assignment.target_roles.push_back(
-          {core::TargetRoleId(require_text(
-               require_member(row, "target_role_id", "target role"),
-               "target_role_id")),
-           core::CommandTargetId(require_text(
-               require_member(row, "command_target_id", "target role"),
-               "command_target_id"))});
-    }
-    const auto declared_id =
-        require_text(require_member(document, "scenario_id", "Scenario"),
-                     "Scenario.scenario_id");
-    if (declared_id != scenario_id) {
-      throw std::invalid_argument(
-          "maintained Scenario project declares another Scenario ID: " +
-          manifest_path.string());
-    }
-    result.push_back(MaintainedScenarioInput{
-        declared_id,
-        entry.path(),
-        deployment_value,
-        program_from_authoring_draft(program_draft),
-        std::move(assignment),
-    });
-  }
-  std::ranges::sort(result, {}, &MaintainedScenarioInput::scenario_id);
-  return result;
-}
-
-[[nodiscard]] std::vector<StoredProgramBinding> verify_program_bindings(
-    const std::filesystem::path &root,
-    const std::map<std::string, ScenarioProduct, std::less<>> &products,
-    const std::filesystem::path &package_root) {
-  const auto rows = load_maintained_scenario_inputs(root);
-
-  deployment::FilesystemCatalogArtifactStore catalog_store(package_root);
-  std::vector<StoredProgramBinding> stored;
-  stored.reserve(rows.size());
-  std::set<std::string, std::less<>> binding_ids;
-  std::set<std::string, std::less<>> program_revisions;
-  std::map<std::string, std::set<std::string, std::less<>>, std::less<>>
-      program_bundles;
-  {
-    deployment::FilesystemProgramRepository program_repository(package_root);
-    deployment::FilesystemProgramBindingRepository repository(package_root);
-    for (const auto &row : rows) {
-      const auto deployment_id = require_text(
-          require_member(row.deployment, "deployment_artifact_id", "Deployment"),
-          "Deployment.deployment_artifact_id");
-      const auto product = std::find_if(
-          products.begin(), products.end(), [&](const auto &candidate) {
-            return candidate.second.deployment_artifact_id.value() == deployment_id;
-          });
-      if (product == products.end()) {
-        throw std::invalid_argument(
-            "Scenario has no exact materialized Deployment");
-      }
-      const auto &context = product->second;
-      if (!context.model_map.has_value()) {
-        throw std::logic_error(
-            "maintained Program binding requires an exact model map");
-      }
-      const std::string canonical_program =
-          deployment::canonical_json(row.program);
-      const auto contract = deployment::verify_program_binding_contract(
-          canonical_program, *context.bundle);
-      (void)program_repository.put_if_absent(contract, *context.bundle);
-
-      const auto binding = deployment::compile_program_binding(
-          *contract, row.assignment, *context.bundle, *context.model_map,
-          catalog_store);
-      verify_resolved_program_binding(*binding, *context.bundle,
-                                      *context.model_map);
-      if (!repository.put_if_absent(binding, *context.bundle,
-                                    *context.model_map)) {
-        throw std::logic_error(
-            "maintained Program Binding identity is unexpectedly duplicated");
-      }
-      binding_ids.insert(binding->program_binding_id().value());
-      program_revisions.insert(binding->value().program_revision.value());
-      program_bundles[binding->value().program_revision.value()].insert(
-          binding->value().retained_bundle_id.value());
-      stored.push_back(StoredProgramBinding{
-          product->first, binding->program_binding_id(),
-          binding->value().program_id, binding->value().program_revision});
-    }
-    if (repository.size() != rows.size()) {
-      throw std::logic_error(
-          "durable maintained Program-Binding repository has the wrong size");
-    }
-    if (program_repository.size() != program_revisions.size()) {
-      throw std::logic_error(
-          "durable maintained Program repository has the wrong size");
-    }
-  }
-
-  deployment::FilesystemProgramRepository program_reopened(package_root);
-  deployment::FilesystemProgramBindingRepository reopened(package_root);
-  for (const auto &record : stored) {
-    const auto product = products.find(record.deployment_source);
-    if (product == products.end()) {
-      throw std::logic_error(
-          "stored Program Binding lost its deployment context");
-    }
-    if (!product->second.model_map.has_value()) {
-      throw std::logic_error(
-          "maintained Program Binding lost its exact model map");
-    }
-    const auto binding = reopened.get_verified(record.program_binding_id,
-                                               *product->second.bundle,
-                                               *product->second.model_map);
-    if (binding == nullptr ||
-        binding->value().program_id != record.program_id ||
-        binding->value().program_revision != record.program_revision) {
-      throw std::logic_error(
-          "durable maintained Program Binding did not reload exactly");
-    }
-    const auto program = program_reopened.get_verified(
-        record.program_id, record.program_revision, *product->second.bundle);
-    if (program == nullptr ||
-        program->value().program_id != record.program_id ||
-        program->value().program_revision != record.program_revision) {
-      throw std::logic_error(
-          "durable maintained Program did not reload exactly");
-    }
-    verify_resolved_program_binding(*binding, *product->second.bundle,
-                                    *product->second.model_map);
-  }
-  // The obligation is that the same verified Program is reusable across two
-  // retained products. Ordinary source/catalog edits must not require another
-  // hard-coded aggregate content hash in this construction check.
-  const auto reused_bundle_count = [&](const std::string_view program_id) {
-    const auto record =
-        std::find_if(stored.begin(), stored.end(), [&](const auto &candidate) {
-          return candidate.program_id.value() == program_id;
-        });
-    return record == stored.end()
-               ? 0U
-               : program_bundles.at(record->program_revision.value()).size();
-  };
-  if (binding_ids.size() != rows.size() || reopened.size() != rows.size() ||
-      program_reopened.size() != program_revisions.size() ||
-      reused_bundle_count("pick_and_place_ur10e_robotiq_demo") != 2U ||
-      reused_bundle_count("isaac_manipulator_scene_light") != 2U) {
-    throw std::logic_error(
-        "maintained Program-Binding set loses its Program reuse closure");
-  }
-  return stored;
 }
 
 template <typename Record>
@@ -1596,15 +907,10 @@ void insert_reference(QualifiedCatalogClosure &closure,
 [[nodiscard]] QualifiedCatalogClosure
 qualify_catalog(const std::filesystem::path &root,
                 ExactCompilerInputSource &input_source,
-                const std::vector<FamilySource> &families,
                 std::vector<deployment::detail::ActivationPreparedModel>
-                    prepared_models = {}) {
-  // A runtime-only Deployment has no model inputs. Component/model cardinality
-  // is checked by the authored compiler; the two input forms cannot be mixed.
-  if (!families.empty() && !prepared_models.empty()) {
-    throw std::invalid_argument(
-        "catalog qualification cannot mix model input forms");
-  }
+                    prepared_models) {
+  // A runtime-only Deployment has no model inputs; component/model
+  // cardinality is checked by the authored compiler.
   const auto catalog_root =
       root / "manyforge_deployment/resources/maintained/catalog";
   QualifiedCatalogClosure result;
@@ -1714,11 +1020,7 @@ qualify_catalog(const std::filesystem::path &root,
     insert_reference(result, reference);
   }
 
-  bool found_xarm_arm_lifecycle_manifest = false;
-  bool found_xarm_gripper_lifecycle_manifest = false;
   bool found_ros2_control_lifecycle_manifest = false;
-  bool found_xarm_ros2_control_lifecycle_manifest = false;
-  bool found_xarm_ros2_control_gripper_lifecycle_manifest = false;
   // The lifecycle providers below must each be present once with their Stop
   // contract roles. Their offer lists are not counted: the compiler refuses a
   // capability binding no selected provider offers, and extra offers are
@@ -1738,69 +1040,9 @@ qualify_catalog(const std::filesystem::path &root,
                                   role_id;
                          });
     };
-    if (manifest.value().provider_manifest_id.value() == "xarm_arm_provider") {
-      if (found_xarm_arm_lifecycle_manifest ||
-          !manifest.value().lifecycle_plan_catalog.has_value() ||
-          manifest.value()
-                  .lifecycle_plan_catalog->catalog_api_version.value() !=
-              core::kBrandLifecyclePlanCatalogApiVersion ||
-          !has_contract_role("software_hard_stop") ||
-          !has_contract_role("stop_contract")) {
-        throw std::logic_error(
-            "maintained xArm arm lifecycle provider manifest is not exact");
-      }
-      found_xarm_arm_lifecycle_manifest = true;
-    } else if (manifest.value().provider_manifest_id.value() ==
-               "xarm_gripper_provider") {
-      if (found_xarm_gripper_lifecycle_manifest ||
-          !manifest.value().lifecycle_plan_catalog.has_value() ||
-          manifest.value()
-                  .lifecycle_plan_catalog->catalog_api_version.value() !=
-              core::kBrandLifecyclePlanCatalogApiVersion ||
-          !has_contract_role("software_hard_stop")) {
-        throw std::logic_error("maintained xArm gripper lifecycle provider "
-                               "manifest is not exact");
-      }
-      found_xarm_gripper_lifecycle_manifest = true;
-    } else if (manifest.value().provider_manifest_id.value() ==
-               "manyforge.provider.ros2_control.xarm") {
-      // R7 package 4: the Real xArm arm's provider has the shared provider's
-      // offers and contracts; only its lifecycle catalog differs.
-      if (found_xarm_ros2_control_lifecycle_manifest ||
-          !manifest.value().lifecycle_plan_catalog.has_value() ||
-          manifest.value()
-                  .lifecycle_plan_catalog->catalog_api_version.value() !=
-              core::kBrandLifecyclePlanCatalogApiVersion ||
-          !has_contract_role("gripper_logical_cancel") ||
-          !has_contract_role("software_hard_stop") ||
-          !has_contract_role("stop_contract")) {
-        throw std::logic_error(
-            "maintained Real xArm ROS control provider manifest is not exact");
-      }
-      found_xarm_ros2_control_lifecycle_manifest = true;
-    } else if (manifest.value().provider_manifest_id.value() ==
-               "manyforge.provider.ros2_control.xarm.gripper") {
-      // A Real xArm gripper domain's provider: the shared provider's offers
-      // and contracts; only its lifecycle catalog (Recover target) differs.
-      if (found_xarm_ros2_control_gripper_lifecycle_manifest ||
-          !manifest.value().lifecycle_plan_catalog.has_value() ||
-          manifest.value()
-                  .lifecycle_plan_catalog->catalog_api_version.value() !=
-              core::kBrandLifecyclePlanCatalogApiVersion ||
-          !has_contract_role("gripper_logical_cancel") ||
-          !has_contract_role("software_hard_stop") ||
-          !has_contract_role("stop_contract")) {
-        throw std::logic_error("maintained Real xArm gripper ROS control "
-                               "provider manifest is not exact");
-      }
-      found_xarm_ros2_control_gripper_lifecycle_manifest = true;
-    } else if (manifest.value().provider_manifest_id.value() ==
-               "manyforge.provider.ros2_control") {
+    if (manifest.value().provider_manifest_id.value() ==
+        "manyforge.provider.ros2_control") {
       if (found_ros2_control_lifecycle_manifest ||
-          !manifest.value().lifecycle_plan_catalog.has_value() ||
-          manifest.value()
-                  .lifecycle_plan_catalog->catalog_api_version.value() !=
-              core::kBrandLifecyclePlanCatalogApiVersion ||
           !has_contract_role("gripper_logical_cancel") ||
           !has_contract_role("software_hard_stop") ||
           !has_contract_role("stop_contract")) {
@@ -1814,11 +1056,7 @@ qualify_catalog(const std::filesystem::path &root,
                      reference.content_digest, bytes);
     insert_reference(result, reference);
   }
-  if (!found_xarm_arm_lifecycle_manifest ||
-      !found_xarm_gripper_lifecycle_manifest ||
-      !found_ros2_control_lifecycle_manifest ||
-      !found_xarm_ros2_control_lifecycle_manifest ||
-      !found_xarm_ros2_control_gripper_lifecycle_manifest) {
+  if (!found_ros2_control_lifecycle_manifest) {
     throw std::logic_error(
         "maintained lifecycle provider manifest closure is missing");
   }
@@ -1848,8 +1086,7 @@ qualify_catalog(const std::filesystem::path &root,
     insert_reference(result, reference);
   }
 
-  for (const std::string_view name : {"gripper.command_position.v1.yaml",
-                                      "io.signal_write_boolean.v1.yaml"}) {
+  for (const std::string_view name : {"gripper.command_position.v1.yaml"}) {
     const std::filesystem::path command_path =
         root / "manyforge_deployment/resources/catalog" / name;
     const std::string command_bytes = read_file(command_path);
@@ -1865,97 +1102,6 @@ qualify_catalog(const std::filesystem::path &root,
   }
 
   result.contracts = contracts;
-  for (const auto &family : families) {
-    const std::string bytes = read_file(family.catalog_source);
-    const auto reference =
-        make_reference<core::ModelAssetCatalogRecordRefDTO>(bytes);
-    const auto qualified = deployment::resolve_and_qualify_model_asset(
-        reference, reference.content_addressed_store_key, bytes);
-    input_source.add(reference.content_addressed_store_key,
-                     reference.content_digest, bytes);
-    insert_reference(result, reference);
-
-    const std::string manifest_bytes =
-        read_file(family.prepared_root / "preparation-manifest.json");
-    const auto manifest =
-        deployment::parse_strict_json_model_yaml(manifest_bytes).root();
-    if (deployment::canonical_json(manifest) != manifest_bytes) {
-      throw std::invalid_argument(
-          "structural preparation receipt is not canonical");
-    }
-    const auto &prepared =
-        require_member(manifest, "prepared_source", "preparation receipt");
-    const std::string &urdf_uri = require_text(
-        require_member(prepared, "urdf_logical_uri", "prepared source"),
-        "prepared source.urdf_logical_uri");
-    const std::string &srdf_uri = require_text(
-        require_member(prepared, "srdf_logical_uri", "prepared source"),
-        "prepared source.srdf_logical_uri");
-    std::map<std::string, std::filesystem::path, std::less<>> paths{
-        {urdf_uri, family.prepared_root / "model.urdf"},
-        {srdf_uri, family.prepared_root / "model.srdf"},
-    };
-    for (const auto &rewrite :
-         require_array(require_member(manifest, "resource_rewrites",
-                                      "preparation receipt"),
-                       "preparation receipt.resource_rewrites")) {
-      const std::string &uri =
-          require_text(require_member(rewrite, "asset_uri", "resource rewrite"),
-                       "resource rewrite.asset_uri");
-      const auto relative = require_relative_path(
-          require_text(
-              require_member(rewrite, "relative_path", "resource rewrite"),
-              "resource rewrite.relative_path"),
-          "resource rewrite.relative_path");
-      if (!paths.emplace(uri, family.resource_root / relative).second) {
-        throw std::invalid_argument(
-            "structural preparation repeats an artifact URI");
-      }
-    }
-
-    std::vector<deployment::ResolvedModelSourceArtifactCandidate> candidates;
-    const auto &artifacts =
-        require_array(require_member(prepared, "artifacts", "prepared source"),
-                      "prepared source.artifacts");
-    candidates.reserve(artifacts.size());
-    for (const auto &artifact : artifacts) {
-      const std::string &uri = require_text(
-          require_member(artifact, "logical_uri", "prepared artifact"),
-          "prepared artifact.logical_uri");
-      const std::string &digest = require_text(
-          require_member(artifact, "content_digest", "prepared artifact"),
-          "prepared artifact.content_digest");
-      const auto path = paths.find(uri);
-      if (path == paths.end()) {
-        throw std::invalid_argument(
-            "prepared artifact has no exact source path");
-      }
-      const std::string artifact_bytes = read_file(path->second);
-      if (artifact_bytes.size() !=
-              require_size(
-                  require_member(artifact, "byte_size", "prepared artifact"),
-                  "prepared artifact.byte_size") ||
-          deployment::sha256_digest(artifact_bytes) != digest) {
-        throw std::invalid_argument(
-            "prepared artifact differs from its receipt");
-      }
-      const core::ContentAddressedStoreKey key("sha256/" + digest.substr(7U));
-      input_source.add(key, core::ContentDigest(digest), artifact_bytes);
-      candidates.push_back({uri, key, artifact_bytes});
-    }
-    if (candidates.size() != paths.size()) {
-      throw std::invalid_argument(
-          "prepared source path/declaration sets differ");
-    }
-    auto verified = deployment::verify_model_source_closure(
-        qualified, std::move(candidates));
-    auto preparation =
-        deployment::verify_build_qualified_structural_model_preparation(
-            manifest_bytes, read_file(family.urdf_source),
-            read_file(family.srdf_source), verified);
-    result.model_assets.push_back(std::move(verified));
-    result.structural_preparations.push_back(std::move(preparation));
-  }
   std::set<std::pair<std::string, std::string>> prepared_model_identities;
   for (auto &model : prepared_models) {
     const auto identity = std::pair{
@@ -1990,835 +1136,6 @@ qualify_catalog(const std::filesystem::path &root,
   return result;
 }
 
-void verify_scenarios(const std::filesystem::path &root,
-                      const QualifiedCatalogClosure &catalog) {
-  // Current maintained source authority, independently pinned before any
-  // generated output is inspected. This is a source-byte guard, not an
-  // artifact/schema revision or a hash derived from the output under test.
-  const std::string description_bytes = read_file(
-      root / "manyforge_deployment/resources/maintained/"
-             "maintained_deployment_sources.v1.json");
-  if (deployment::sha256_digest(description_bytes) !=
-      "sha256:"
-      "fe7a9f9c4fd516442f6f55ad2bccd073b181042beacde67a44004ef8145a7f42") {
-    throw std::invalid_argument(
-        "maintained runtime input source differs from its qualified source pin");
-  }
-  const auto description =
-      deployment::parse_strict_json_model_yaml(description_bytes);
-  const std::string assistant_source_bytes = read_file(
-      root / "manyforge_deployment/resources/maintained/"
-             "maintained_assistant_profiles.v1.json");
-  if (deployment::sha256_digest(assistant_source_bytes) !=
-      "sha256:dd4cf88073b87c6afa1952516eaac892066f84404fbf73e65bf8352ac5744170") {
-    throw std::invalid_argument("maintained assistant source differs from its source pin");
-  }
-  const auto assistant_source =
-      deployment::parse_strict_json_model_yaml(assistant_source_bytes);
-  const auto unique = [](const auto &values, const auto &predicate) -> const auto & {
-    const auto found = std::find_if(values.begin(), values.end(), predicate);
-    if (found == values.end() ||
-        std::find_if(std::next(found), values.end(), predicate) != values.end()) {
-      throw std::invalid_argument("maintained source selection is not unique");
-    }
-    return *found;
-  };
-  const std::string overlay_bytes = read_file(
-      root / "manyforge_deployment/resources/maintained/site_overlays/"
-             "manyforge_local_examples.site_overlay.json");
-  std::map<std::string, std::pair<std::string, std::string>, std::less<>>
-      family_identities;
-  std::map<std::string, std::string, std::less<>> family_models;
-  for (const auto &scenario : kScenarios) {
-    const std::string bytes = read_file(root / scenario.source);
-    if (!scenario.ros2_control_execution) {
-      throw std::logic_error(
-          "scenario cannot select its exact deployment runtime profile");
-    }
-    const std::string expected_runtime_profile_id =
-        "manyforge.ros2_control_execution_runtime";
-    std::vector<deployment::QualifiedRuntimeProfile> envelope_profiles;
-    std::copy_if(
-        catalog.runtime_profiles.begin(), catalog.runtime_profiles.end(),
-        std::back_inserter(envelope_profiles), [&](const auto &profile) {
-          return profile.value().runtime_profile_id.value() ==
-                 expected_runtime_profile_id;
-        });
-    if (envelope_profiles.size() != 1U) {
-      throw std::logic_error(
-          "scenario cannot select its exact deployment runtime profile");
-    }
-    const auto verified = deployment::verify_deployment_artifact_revision(
-        deployment::parse_strict_json_model_yaml(bytes), envelope_profiles);
-    if (verified.assistant_settings().enabled() != scenario.assistant_enabled) {
-      throw std::invalid_argument(
-          "maintained scenario has the wrong assistant disposition: " +
-          std::string(scenario.source));
-    }
-    const auto &applicability = verified.applicability_inputs().value();
-    if (scenario.assistant_enabled) {
-      if (!applicability.site_overlay_ref.has_value()) {
-        throw std::invalid_argument(
-            "assistant scenario has no exact site-overlay reference: " +
-            std::string(scenario.source));
-      }
-      const auto projection =
-          deployment::resolve_and_verify_site_overlay_artifact_projection(
-              *applicability.site_overlay_ref, overlay_bytes);
-      const auto selected = deployment::select_site_overlay_for_deployment(
-          applicability.site_overlay_ref, applicability.external_resources,
-          &projection);
-      if (!selected.has_selection()) {
-        throw std::logic_error(
-            "assistant scenario did not retain its selected site overlay");
-      }
-    } else {
-      const auto selected = deployment::select_site_overlay_for_deployment(
-          applicability.site_overlay_ref, applicability.external_resources,
-          nullptr);
-      if (selected.has_selection()) {
-        throw std::logic_error(
-            "non-assistant scenario unexpectedly selected a site overlay");
-      }
-    }
-    // Expected membership comes from independent pinned source and qualified
-    // catalog inputs, never from the generated Deployment under verification.
-    const auto &graph = verified.graph().graph();
-    const bool has_tool = !scenario.tool_family_id.empty();
-    const std::size_t physical_count = has_tool ? 2U : 1U;
-    if (graph.controllable_components.size() != physical_count ||
-        graph.model_instances.size() != physical_count ||
-        graph.component_attachments.size() != physical_count - 1U ||
-        graph.runtime_units.size() != 1U) {
-      throw std::invalid_argument("maintained scenario has an incomplete "
-                                  "component/runtime/capability closure: " +
-                                  std::string(scenario.source));
-    }
-    const auto &runtime = graph.runtime_units.front();
-    if (runtime.runtime_profile_id.value() != expected_runtime_profile_id) {
-      throw std::invalid_argument(
-          "maintained scenario selects the wrong exact runtime product: " +
-          std::string(scenario.source));
-    }
-    // Select the current authored source independently of the generated
-    // Deployment being verified. Preserve every raw gripper field, rebinding
-    // only the occurrence exactly as the maintained generator does.
-    const deployment::CanonicalValue *source_deployment = nullptr;
-    for (const auto &row : require_array(
-             require_member(description.root(), "deployments", "maintained source"),
-             "maintained source.deployments")) {
-      if (require_text(require_member(row, "deployment_source", "source Deployment"),
-                       "source Deployment.deployment_source") == scenario.source) {
-        if (source_deployment != nullptr) {
-          throw std::invalid_argument("maintained source repeats a Deployment");
-        }
-        source_deployment = &row;
-      }
-    }
-    if (source_deployment == nullptr) {
-      throw std::invalid_argument("maintained source omits a Deployment");
-    }
-    const auto &source_profile_id = require_text(
-        require_member(*source_deployment, "runtime_restoration_profile_id",
-                       "source Deployment"), "source Deployment profile");
-    // Components are identified by the independent source occurrences, never
-    // by their order in the generated graph.
-    const auto &component_id = require_text(
-        require_member(*source_deployment, "component_occurrence_id",
-                       "source Deployment"), "source occurrence");
-    const auto *source_tool = source_deployment->find_object_member("tool");
-    if (require_text(require_member(*source_deployment, "model_family_id",
-                                   "source Deployment"), "source family") !=
-            scenario.family_id ||
-        (source_tool != nullptr) != has_tool ||
-        (has_tool &&
-         require_text(require_member(*source_tool, "model_family_id", "source tool"),
-                      "source tool family") != scenario.tool_family_id)) {
-      throw std::invalid_argument("maintained source has a foreign family or occurrence");
-    }
-    const std::string tool_id =
-        has_tool ? require_text(require_member(*source_tool, "component_occurrence_id",
-                                               "source tool"), "source tool occurrence")
-                 : std::string{};
-    const auto graph_component = [&](std::string_view id) -> const core::ControllableComponentDTO & {
-      const auto found = std::find_if(
-          graph.controllable_components.begin(), graph.controllable_components.end(),
-          [&](const auto &row) { return row.controllable_component_id.value() == id; });
-      if (found == graph.controllable_components.end()) {
-        throw std::invalid_argument("maintained source has a foreign family or occurrence");
-      }
-      return *found;
-    };
-    static_cast<void>(graph_component(component_id));
-    if (has_tool) {
-      static_cast<void>(graph_component(tool_id));
-      // One flange->mount edge, identified by the tool, at identity.
-      const auto &edge = graph.component_attachments.front();
-      if (edge.component_attachment_id.value() != tool_id ||
-          edge.parent.controllable_component_id.value() != component_id ||
-          edge.parent.attachment_interface_id.value() != "flange" ||
-          edge.child.controllable_component_id.value() != tool_id ||
-          edge.child.attachment_interface_id.value() != "mount" ||
-          edge.child_interface_pose_in_parent_interface != core::PlacementPoseDTO{}) {
-        throw std::invalid_argument("maintained tool is not mounted on its robot's flange: " +
-                                    std::string(scenario.source));
-      }
-    }
-    const auto find_profile = [&](std::string_view profile_id,
-                                  std::string_view family_id) -> const deployment::CanonicalValue & {
-      const deployment::CanonicalValue *selected = nullptr;
-      for (const auto &row : require_array(
-               require_member(description.root(), "runtime_restoration_profiles",
-                              "maintained source"), "source runtime profiles")) {
-        if (require_text(require_member(row, "runtime_restoration_profile_id",
-                                       "source profile"), "source profile ID") ==
-            profile_id) {
-          if (selected != nullptr) {
-            throw std::invalid_argument("maintained source repeats a runtime profile");
-          }
-          selected = &row;
-        }
-      }
-      if (selected == nullptr ||
-          require_text(require_member(*selected, "model_family_id",
-                                     "source profile"), "source profile family") !=
-              family_id) {
-        throw std::invalid_argument("maintained source has no exact runtime profile");
-      }
-      return *selected;
-    };
-    const auto *source_profile = &find_profile(source_profile_id, scenario.family_id);
-    const auto &source_runtime = require_member(
-        *source_profile, "ros2_control_runtime", "source profile");
-    // The gripper rows and lane of the mounted tool come from its own profile.
-    const auto &gripper_runtime =
-        has_tool ? require_member(
-                       find_profile(require_text(require_member(*source_tool,
-                                                                "runtime_restoration_profile_id",
-                                                                "source tool"),
-                                                 "source tool profile"),
-                                    scenario.tool_family_id),
-                       "ros2_control_runtime", "source tool profile")
-                 : source_runtime;
-    const std::string &gripper_owner = has_tool ? tool_id : component_id;
-    const auto &source_family = unique(
-        require_array(require_member(description.root(), "model_families",
-                                     "maintained source"), "source families"),
-        [&](const auto &row) {
-          return require_text(require_member(row, "model_family_id", "source family"),
-                              "source family ID") == scenario.family_id;
-        });
-    bool has_gripper = false;
-    for (const auto &role : require_array(
-             require_member(require_member(source_family, "semantics", "source family"),
-                            "resource_role_bindings", "source semantics"),
-             "source resource roles")) {
-      if (require_text(require_member(role, "resource_role_id", "source role"),
-                       "source role ID") == "fingers") {
-        has_gripper = !require_array(require_member(role, "source_joint_names",
-                                                   "source fingers"),
-                                     "source finger joints").empty();
-      }
-    }
-    if (has_gripper && has_tool) {
-      throw std::invalid_argument("maintained tool needs an arm-only robot: " +
-                                  std::string(scenario.source));
-    }
-    const auto component_type = [&](std::string_view family) -> const core::ComponentTypeDTO & {
-      return unique(catalog.component_types, [&](const auto &row) {
-        return row.value().component_type_id.value() ==
-               std::string(family) + ".fixed_scale.component";
-      }).value();
-    };
-    const auto definition = [&](std::string_view id) -> const core::CapabilityDefinitionDTO & {
-      return unique(catalog.capabilities, [&](const auto &row) {
-        return row.value().capability_id.value() == id;
-      }).value();
-    };
-    const auto manifest = [&](std::string_view id) -> const core::ProviderManifestDTO & {
-      return unique(catalog.provider_manifests, [&](const auto &row) {
-        return row.value().provider_manifest_id.value() == id;
-      }).value();
-    };
-    std::set<CatalogKey> expected_catalog;
-    const auto select = [&](core::CatalogRecordKind kind, std::string_view id) {
-      const auto &record = unique(catalog.records, [&](const auto &entry) {
-        return core::catalog_record_kind(entry.second) == kind &&
-               core::catalog_record_id_value(entry.second) == id;
-      });
-      expected_catalog.insert(record.first);
-    };
-    using BindingKey = std::tuple<std::string, std::string, std::string>;
-    std::set<BindingKey> expected_control, expected_providers;
-    std::set<std::string> expected_facilities;
-    // The robot's and the mounted tool's component types, each with the
-    // targets its source model resources imply.
-    const auto expect_component = [&](const std::string &owner, std::string_view family,
-                                      const std::set<std::string> &source_targets) {
-      const auto &selected_component = component_type(family);
-      std::set<std::string> expected_targets;
-      for (const auto &target : selected_component.command_targets) {
-        const auto &target_id = target.command_target_id.value();
-        expected_targets.insert(target_id);
-        for (const auto &capability : target.capabilities) {
-          const auto &id = capability.capability_id.value();
-          const auto &qualified = definition(id);
-          if (qualified.scope != core::CapabilityScope::kTargetBinding ||
-              qualified.capability_definition_revision != capability.capability_definition_revision) {
-            throw std::invalid_argument("maintained source has an inexact target capability");
-          }
-          select(core::CatalogRecordKind::kCapabilityDefinition, id);
-          expected_facilities.insert(id);
-          const BindingKey key{owner, target_id, id};
-          if (qualified.provider_binding_kind == core::CapabilityProviderBindingKind::kControlBinding) {
-            expected_control.insert(key);
-          } else {
-            expected_providers.insert(key);
-          }
-        }
-        select(core::CatalogRecordKind::kControlInterfaceContract,
-               "manyforge.ros2_control_" + target_id + "_position");
-        select(core::CatalogRecordKind::kControllerTopology,
-               "manyforge.ros2_control_" + target_id + "_direct");
-      }
-      if (expected_targets != source_targets) {
-        throw std::invalid_argument("maintained component targets differ from source resources");
-      }
-      select(core::CatalogRecordKind::kComponentType, selected_component.component_type_id.value());
-      select(core::CatalogRecordKind::kModelAsset, family);
-    };
-    expect_component(component_id, scenario.family_id,
-                     has_gripper ? std::set<std::string>{"arm", "gripper"}
-                                 : std::set<std::string>{"arm"});
-    if (has_tool)
-      expect_component(tool_id, scenario.tool_family_id, {"gripper"});
-    for (const auto &offer : manifest("manyforge.provider.logical_scene").offered_capabilities) {
-      const auto &id = offer.capability_id.value();
-      const auto &qualified = definition(id);
-      if (qualified.scope != core::CapabilityScope::kCellGlobal ||
-          qualified.provider_binding_kind != core::CapabilityProviderBindingKind::kCapabilityProviderBinding ||
-          qualified.capability_definition_revision != offer.capability_definition_revision) {
-        throw std::invalid_argument("maintained logical-scene offer is not exact");
-      }
-      select(core::CatalogRecordKind::kCapabilityDefinition, id);
-      expected_facilities.insert(id);
-      expected_providers.emplace(
-          "", require_text(require_member(*source_deployment, "cell_id",
-                                          "source Deployment"), "source cell ID"), id);
-    }
-    for (const auto &offer : manifest("manyforge.provider.ros2_control").offered_capabilities) {
-      if (definition(offer.capability_id.value()).scope == core::CapabilityScope::kControlDomain) {
-        select(core::CatalogRecordKind::kCapabilityDefinition, offer.capability_id.value());
-      }
-    }
-    select(core::CatalogRecordKind::kRuntimeProfile, expected_runtime_profile_id);
-    select(core::CatalogRecordKind::kProviderManifest, "manyforge.provider.ros2_control");
-    select(core::CatalogRecordKind::kProviderManifest, "manyforge.provider.logical_scene");
-    select(core::CatalogRecordKind::kStopEvidencePolicy, "manyforge.arm_motion_controlled_stop");
-    if (has_gripper || has_tool) {
-      select(core::CatalogRecordKind::kCommandSchema, "gripper.command_position");
-      const auto &grippers = require_array(require_member(gripper_runtime,
-          "gripper_target_configurations", "source runtime"), "source grippers");
-      if (grippers.size() != 1U) {
-        throw std::invalid_argument("maintained source must have one exact gripper row");
-      }
-      const auto &kind = require_text(require_member(grippers.front(), "actuation_kind",
-                                                     "source gripper"), "source actuation");
-      if (kind != "pneumatic" && kind != "position_commanded") {
-        throw std::invalid_argument("maintained source has an invalid gripper actuation");
-      }
-      select(core::CatalogRecordKind::kStopEvidencePolicy,
-             kind == "pneumatic" ? "manyforge.gripper_logical_cancellation"
-                                 : "manyforge.gripper_position_cancellation");
-    }
-    const auto &assistant_id = require_member(*source_deployment, "assistant_profile_id",
-                                              "source Deployment");
-    if (assistant_id.is_null() == scenario.assistant_enabled) {
-      throw std::invalid_argument("maintained assistant disposition differs from source");
-    }
-    if (!assistant_id.is_null()) {
-      const auto &profile = unique(require_array(require_member(assistant_source.root(),
-          "profiles", "assistant source"), "assistant source profiles"), [&](const auto &row) {
-        return require_text(require_member(row, "profile_id", "assistant profile"),
-                            "assistant profile ID") == require_text(assistant_id, "source assistant ID");
-      });
-      if (!require_array(require_member(profile, "model_endpoints", "assistant profile"),
-                         "assistant model endpoints").empty()) {
-        select(core::CatalogRecordKind::kCapabilityDefinition, "assistant.model.invoke");
-        select(core::CatalogRecordKind::kProviderManifest, "manyforge.provider.model_endpoint");
-      }
-      if (!require_member(profile, "provider_alias", "assistant profile").is_null()) {
-        select(core::CatalogRecordKind::kCapabilityDefinition, "assistant.bridge.request");
-        select(core::CatalogRecordKind::kProviderManifest, "manyforge.provider.assistant_bridge");
-      }
-    }
-    // Independently qualified selected declarations require every exact
-    // capability definition, including reusable ROS offers on arm-only cells.
-    // Keep this separate from actual target/binding/facility projections.
-    const auto selected_declarations = expected_catalog;
-    const auto select_dependencies = [&](const auto &dependencies) {
-      for (const auto &dependency : dependencies) {
-        const auto &id = dependency.capability_id.value();
-        if (definition(id).capability_definition_revision !=
-            dependency.capability_definition_revision) {
-          throw std::invalid_argument("selected catalog capability dependency is not exact");
-        }
-        select(core::CatalogRecordKind::kCapabilityDefinition, id);
-      }
-    };
-    for (const auto &key : selected_declarations) {
-      const auto &reference = catalog.records.at(key);
-      const auto &id = core::catalog_record_id_value(reference);
-      if (core::catalog_record_kind(reference) == core::CatalogRecordKind::kProviderManifest) {
-        select_dependencies(manifest(id).offered_capabilities);
-      } else if (core::catalog_record_kind(reference) == core::CatalogRecordKind::kCommandSchema) {
-        const auto &schema = unique(catalog.command_schemas, [&](const auto &row) {
-          return row.value().command_schema_id.value() == id;
-        });
-        select_dependencies(schema.value().compatible_capabilities);
-      }
-    }
-    std::set<CatalogKey> actual_catalog;
-    for (const auto &reference : verified.catalog_records()) {
-      actual_catalog.insert(catalog_key(reference));
-    }
-    if (actual_catalog != expected_catalog) {
-      throw std::invalid_argument("maintained scenario has the wrong exact catalog closure: " +
-                                  std::string(scenario.source));
-    }
-    for (const auto &reference : verified.catalog_records()) {
-      const auto expected = catalog.records.find(catalog_key(reference));
-      if (expected == catalog.records.end() || expected->second != reference) {
-        throw std::invalid_argument(
-            "maintained scenario selects an unqualified catalog referent: " +
-            std::string(scenario.source) + " (kind " +
-            std::to_string(static_cast<std::uint8_t>(
-                core::catalog_record_kind(reference))) +
-            ", id " + core::catalog_record_id_value(reference) + ", revision " +
-            core::catalog_record_revision_value(reference) + ")");
-      }
-    }
-
-    std::set<BindingKey> actual_control, actual_providers;
-    for (const auto &binding : graph.control_bindings) {
-      if (!actual_control.emplace(binding.controllable_component_id.value(),
-                                  binding.command_target_id.value(),
-                                  binding.capability_id.value()).second) {
-        throw std::invalid_argument("maintained control capability repeats a target");
-      }
-    }
-    for (const auto &binding : applicability.capability_provider_bindings) {
-      BindingKey key;
-      if (const auto *target = std::get_if<core::TargetBindingCapabilityProviderTargetDTO>(&binding.target);
-          binding.scope == core::CapabilityScope::kTargetBinding && target != nullptr) {
-        key = {target->controllable_component_id.value(), target->command_target_id.value(),
-               binding.capability_id.value()};
-      } else if (const auto *cell = std::get_if<core::CellGlobalCapabilityProviderTargetDTO>(&binding.target);
-                 binding.scope == core::CapabilityScope::kCellGlobal && cell != nullptr) {
-        key = {"", cell->cell_id.value(), binding.capability_id.value()};
-      } else {
-        throw std::invalid_argument("maintained provider capability has a foreign target scope");
-      }
-      if (!actual_providers.insert(std::move(key)).second) {
-        throw std::invalid_argument("maintained provider capability repeats a target");
-      }
-    }
-    if (actual_control != expected_control || actual_providers != expected_providers) {
-      throw std::invalid_argument("maintained scenario has an incomplete component/runtime/capability closure: " +
-                                  std::string(scenario.source));
-    }
-    core::JsonValueDTO::Array initial_positions;
-    if (scenario.ros2_control_execution &&
-        scenario.isaac_profile == std::string_view("ur10e")) {
-      initial_positions = {
-          core::JsonValueDTO{2.63422544},   core::JsonValueDTO{-0.875980752},
-          core::JsonValueDTO{1.551074106},  core::JsonValueDTO{-2.29231544},
-          core::JsonValueDTO{-1.560498884}, core::JsonValueDTO{-2.038544566}};
-    } else if (scenario.family_id == std::string_view("lite6")) {
-      initial_positions = {core::JsonValueDTO{0.0},  core::JsonValueDTO{0.0},
-                           core::JsonValueDTO{1.57}, core::JsonValueDTO{0.0},
-                           core::JsonValueDTO{0.0},  core::JsonValueDTO{0.0}};
-    } else {
-      initial_positions = {core::JsonValueDTO{0.0},   core::JsonValueDTO{-1.57},
-                           core::JsonValueDTO{1.57},  core::JsonValueDTO{-1.57},
-                           core::JsonValueDTO{-1.57}, core::JsonValueDTO{0.0}};
-    }
-    const bool mesh_heavy_isaac_runtime =
-        scenario.source ==
-            std::string_view("examples/isaac_manipulator_scene_light_"
-                             "assistant.deployment.yaml") ||
-        scenario.source ==
-            std::string_view("examples/isaac_manipulator_scene_light_"
-                             "ros2_control.deployment.yaml") ||
-        scenario.source ==
-            std::string_view("examples/isaac_manipulator_scene_light_"
-                             "ros2_control_collision.deployment.yaml");
-    const bool assistant_isaac_runtime =
-        scenario.source ==
-        std::string_view("examples/isaac_manipulator_scene_light_"
-                         "assistant.deployment.yaml");
-    core::JsonObjectDTO expected_runtime_configuration{
-        {"collision_monitor_period_ms",
-         core::JsonValueDTO{mesh_heavy_isaac_runtime ? 100.0 : 50.0}},
-        {"execution_tick_hz", core::JsonValueDTO{100.0}},
-        {"initial_joint_positions_rad",
-         core::JsonValueDTO{std::move(initial_positions)}},
-        {"planner_rng_seed", core::JsonValueDTO{12345.0}},
-    };
-    const auto motion_targets =
-        runtime.configuration.find("motion_target_limits");
-    const auto *motion_target_rows =
-        motion_targets == runtime.configuration.end()
-            ? nullptr
-            : std::get_if<core::JsonValueDTO::Array>(
-                  &motion_targets->second.value);
-    const auto *motion_target =
-        motion_target_rows == nullptr || motion_target_rows->size() != 1U
-            ? nullptr
-            : std::get_if<core::JsonObjectDTO>(
-                  &motion_target_rows->front().value);
-    const auto speed =
-        motion_target == nullptr
-            ? core::JsonObjectDTO::const_iterator{}
-            : motion_target->find("maximum_tcp_linear_speed_mps");
-    const auto *expected_target_speed_limit =
-        motion_target == nullptr || speed == motion_target->end()
-            ? nullptr
-            : std::get_if<double>(&speed->second.value);
-    if (expected_target_speed_limit == nullptr ||
-        !std::isfinite(*expected_target_speed_limit) ||
-        *expected_target_speed_limit <= 0.0) {
-      throw std::invalid_argument(
-          "maintained scenario has no valid Deployment TCP speed limit: " +
-          std::string(scenario.source));
-    }
-    core::JsonObjectDTO expected_motion_target{
-        {"command_target_id", core::JsonValueDTO{std::string("arm")}},
-        {"controllable_component_id", core::JsonValueDTO{component_id}},
-        {"maximum_tcp_linear_speed_mps",
-         core::JsonValueDTO{*expected_target_speed_limit}},
-        // Maintained Deployments keep the materialized default.
-        {"tcp_speed_check",
-         core::JsonValueDTO{std::string("active_tcp_and_flange")}}};
-      expected_runtime_configuration.emplace(
-          "motion_target_limits",
-          core::JsonValueDTO{core::JsonValueDTO::Array{
-              core::JsonValueDTO{std::move(expected_motion_target)}}});
-    const auto &actual_units = require_array(
-        require_member(verified.normalized_authored_graph(), "runtime_units",
-                       "verified graph"), "verified graph.runtime_units");
-    const auto &actual_configuration = require_member(
-        actual_units.front(), "configuration", "verified runtime unit");
-    const auto *source_grippers =
-        gripper_runtime.find_object_member("gripper_target_configurations");
-    const auto *actual_grippers =
-        actual_configuration.find_object_member("gripper_target_configurations");
-    const auto decoded_grippers =
-        runtime.configuration.find("gripper_target_configurations");
-    if ((source_grippers == nullptr) != (actual_grippers == nullptr) ||
-        (source_grippers == nullptr) !=
-            (decoded_grippers == runtime.configuration.end())) {
-      throw std::invalid_argument("maintained gripper source presence differs");
-    }
-    if (source_grippers != nullptr) {
-      deployment::CanonicalValue::Array expected_grippers;
-      for (const auto &row : require_array(*source_grippers, "source gripper rows")) {
-        deployment::CanonicalValue::Object rebound;
-        static_cast<void>(require_member(row, "controllable_component_id",
-                                         "source gripper row"));
-        for (const auto &[name, value] : require_object(row, "source gripper row")) {
-          rebound.emplace_back(name, name == "controllable_component_id"
-                                         ? deployment::CanonicalValue(gripper_owner)
-                                         : value);
-        }
-        expected_grippers.emplace_back(std::move(rebound));
-      }
-      if (*actual_grippers != deployment::CanonicalValue(std::move(expected_grippers))) {
-        throw std::invalid_argument("maintained gripper row differs from its exact source");
-      }
-      const auto *rows = std::get_if<core::JsonValueDTO::Array>(
-          &decoded_grippers->second.value);
-      if (rows == nullptr) {
-        throw std::invalid_argument("maintained gripper rows are not an array");
-      }
-      static_cast<void>(
-          deployment::detail::decode_ros2_control_execution_gripper_target_configurations(
-              *rows));
-    }
-    // CP9: the stream defaults are rebound exactly as the gripper rows, the
-    // robot's and the mounted tool's each to its own component.
-    {
-      std::vector<std::pair<std::string, deployment::CanonicalValue>> keyed_streams;
-      const auto rebind_streams = [&](const deployment::CanonicalValue &runtime,
-                                      const std::string &owner) {
-        for (const auto &row : require_array(
-                 require_member(runtime, "component_streams", "source runtime"),
-                 "source stream rows")) {
-          deployment::CanonicalValue::Object rebound;
-          for (const auto &[name, value] : require_object(row, "source stream row")) {
-            rebound.emplace_back(name, name == "controllable_component_id"
-                                           ? deployment::CanonicalValue(owner)
-                                           : value);
-          }
-          keyed_streams.emplace_back(
-              owner + '\0' + require_text(require_member(row, "stream_id", "source stream row"),
-                                          "source stream ID"),
-              deployment::CanonicalValue(std::move(rebound)));
-        }
-      };
-      rebind_streams(source_runtime, component_id);
-      if (has_tool) rebind_streams(gripper_runtime, tool_id);
-      std::sort(keyed_streams.begin(), keyed_streams.end(),
-                [](const auto &left, const auto &right) { return left.first < right.first; });
-      deployment::CanonicalValue::Array expected_streams;
-      for (auto &[unused, row] : keyed_streams) {
-        static_cast<void>(unused);
-        expected_streams.push_back(std::move(row));
-      }
-      if (require_member(actual_configuration, "component_streams",
-                         "verified runtime configuration") !=
-          deployment::CanonicalValue(std::move(expected_streams))) {
-        throw std::invalid_argument("maintained stream defaults differ from their exact source");
-      }
-    }
-    if (scenario.ros2_control_execution) {
-      // Q68: each component's own controller profile row. A mounted tool's
-      // lane is its own profile's selector (none for a lane-free tool, D4).
-      std::map<std::string, core::JsonValueDTO, std::less<>> profile_rows;
-      profile_rows.emplace(
-          component_id,
-          core::JsonValueDTO{core::JsonObjectDTO{
-              {"controllable_component_id", core::JsonValueDTO{component_id}},
-              {"frame_prefix", core::JsonValueDTO{std::string{}}},
-              {scenario.mock_profile.empty() ? "isaac_profile" : "mock_profile",
-               core::JsonValueDTO{std::string(scenario.mock_profile.empty()
-                                                  ? scenario.isaac_profile
-                                                  : scenario.mock_profile)}}}});
-      for (const std::string_view selector : {std::string_view("isaac_profile"),
-                                              std::string_view("mock_profile")}) {
-        const auto *lane = has_tool ? gripper_runtime.find_object_member(selector) : nullptr;
-        if (lane == nullptr) continue;
-        profile_rows.emplace(
-            tool_id,
-            core::JsonValueDTO{core::JsonObjectDTO{
-                {"controllable_component_id", core::JsonValueDTO{tool_id}},
-                {"frame_prefix", core::JsonValueDTO{std::string{}}},
-                {std::string(selector),
-                 core::JsonValueDTO{require_text(*lane, "source tool lane")}}}});
-      }
-      core::JsonValueDTO::Array controller_profiles;
-      for (auto &[unused, row] : profile_rows) {
-        static_cast<void>(unused);
-        controller_profiles.push_back(std::move(row));
-      }
-      expected_runtime_configuration.emplace(
-          "controller_profiles", core::JsonValueDTO{std::move(controller_profiles)});
-      // Q37: main's authored `default_fault_stop_profile`, read directly.
-      // The offline mock profiles carry the native profiles' authored values
-      // unchanged: the UR10e assistant and UR5 profiles name
-      // `default_fault_spring_back` without backend confirmation.
-      const bool lite6 = scenario.family_id == std::string_view("lite6");
-      const bool legacy_default_fault =
-          scenario.source == std::string_view("examples/assistant_modes_scene_"
-                                              "authoring.deployment.yaml") ||
-          scenario.family_id == std::string_view("ur5_roboplan");
-      const auto &source_fault_profile = require_member(
-          require_member(*source_profile, "stop_profiles", "source profile"),
-          "default_fault_stop_profile", "source Stop profiles");
-      const auto &fault_mode = require_text(
-          require_member(source_fault_profile, "stop_mode", "source fault profile"),
-          "source fault Stop mode");
-      if (fault_mode != "spring_back_hold" && fault_mode != "spring_back_fast") {
-        throw std::invalid_argument("maintained fault Stop mode is not qualified");
-      }
-      const std::string fault_profile_id =
-          fault_mode == "spring_back_fast" ? "fault_spring_back_fast"
-          : legacy_default_fault          ? "default_fault_spring_back"
-                                          : "fault_spring_back_hold";
-      if (require_text(require_member(source_fault_profile, "profile_id",
-                                      "source fault profile"),
-                       "source fault profile ID") != fault_profile_id) {
-        throw std::invalid_argument("maintained fault Stop identity differs from its mode");
-      }
-      // Merge 6: the split arm profiles list arm joints only.
-      std::vector<std::string_view> fault_joints;
-      if (lite6) {
-        fault_joints = {"joint1", "joint2", "joint3",
-                        "joint4", "joint5", "joint6"};
-      } else {
-        fault_joints = {"elbow_joint",   "shoulder_lift_joint",
-                        "shoulder_pan_joint", "wrist_1_joint",
-                        "wrist_2_joint", "wrist_3_joint"};
-      }
-      core::JsonValueDTO::Array limits;
-      for (const std::string_view joint : fault_joints) {
-        limits.push_back(core::JsonValueDTO{core::JsonObjectDTO{
-            {"max_deceleration_rad_s2", core::JsonValueDTO{10.0}},
-            {"source_joint_name", core::JsonValueDTO{std::string(joint)}}}});
-      }
-      core::JsonObjectDTO fault_row{
-          {"command_target_id", core::JsonValueDTO{std::string("arm")}},
-          {"controllable_component_id", core::JsonValueDTO{component_id}},
-          {"deceleration_time_s", core::JsonValueDTO{1.0}},
-          {"per_joint_max_deceleration_rad_s2",
-           core::JsonValueDTO{std::move(limits)}},
-          {"profile_id",
-           core::JsonValueDTO{fault_profile_id}},
-          {"stop_mode", core::JsonValueDTO{fault_mode}}};
-      if (!legacy_default_fault) {
-        fault_row.emplace("require_backend_confirmation",
-                          core::JsonValueDTO{true});
-      }
-      expected_runtime_configuration.emplace(
-          "default_fault_stop_profiles",
-          core::JsonValueDTO{core::JsonValueDTO::Array{
-              core::JsonValueDTO{std::move(fault_row)}}});
-    }
-    if (mesh_heavy_isaac_runtime) {
-      expected_runtime_configuration.emplace(
-          "runtime_collision_immediate_query_budget_ms",
-          core::JsonValueDTO{75.0});
-      expected_runtime_configuration.emplace(
-          "runtime_collision_lookahead_cycle_budget_ms",
-          core::JsonValueDTO{350.0});
-      expected_runtime_configuration.emplace(
-          "runtime_collision_lookahead_max_samples", core::JsonValueDTO{32.0});
-      expected_runtime_configuration.emplace(
-          "runtime_collision_lookahead_query_budget_ms",
-          core::JsonValueDTO{75.0});
-      expected_runtime_configuration.emplace("runtime_collision_lookahead_s",
-                                             core::JsonValueDTO{2.0});
-      expected_runtime_configuration.emplace(
-          "runtime_collision_lookahead_workers", core::JsonValueDTO{4.0});
-      expected_runtime_configuration.emplace(
-          "runtime_dynamic_body_max_age_cap_ms",
-          core::JsonValueDTO{assistant_isaac_runtime ? 1500.0 : 1000.0});
-      expected_runtime_configuration.emplace("validation_collision_workers",
-                                             core::JsonValueDTO{4.0});
-    }
-    // The complete gripper and stream members were proved separately against independently
-    // pinned source above; retain the exact comparison for every other field.
-    auto remaining_runtime_configuration = runtime.configuration;
-    remaining_runtime_configuration.erase("gripper_target_configurations");
-    remaining_runtime_configuration.erase("component_streams");
-    if (remaining_runtime_configuration != expected_runtime_configuration) {
-      throw std::invalid_argument(
-          "maintained scenario loses its exact historical runtime inputs: " +
-          std::string(scenario.source));
-    }
-
-    std::set<std::string> historical_capabilities;
-    // One physical ROS provider occurrence per component (robot, tool).
-    std::map<core::ControllableComponentId, core::ProviderInstanceId>
-        ros2_control_provider_instances;
-    for (const auto &binding : graph.control_bindings) {
-      historical_capabilities.insert(binding.capability_id.value());
-      if (scenario.ros2_control_execution) {
-        if (binding.state_authority_class !=
-                core::StateAuthorityClass::kCommanded ||
-            binding.provider_manifest_id.value() !=
-                "manyforge.provider.ros2_control" ||
-            binding.provider_runtime_unit_id != runtime.runtime_unit_id) {
-          throw std::invalid_argument(
-              "Isaac scenario loses its commanded ROS control binding: " +
-              std::string(scenario.source));
-        }
-        const auto [instance, inserted] = ros2_control_provider_instances.emplace(
-            binding.controllable_component_id, binding.provider_instance_id);
-        if (!inserted && instance->second != binding.provider_instance_id) {
-          throw std::invalid_argument(
-              "Isaac scenario splits one physical ROS provider occurrence");
-        }
-      }
-    }
-    for (const auto &binding : applicability.capability_provider_bindings) {
-      if (!binding.capability_id.value().starts_with("assistant.")) {
-        historical_capabilities.insert(binding.capability_id.value());
-      }
-      if (binding.scope == core::CapabilityScope::kCellGlobal) {
-        if (binding.endpoint_bindings.size() != 1U) {
-          throw std::invalid_argument("cell-global capability does not have "
-                                      "one logical-scene endpoint: " +
-                                      binding.capability_id.value());
-        }
-        const auto &endpoint = binding.endpoint_bindings.front();
-        if (endpoint.endpoint_role_id.value() != "logical_scene_services" ||
-            endpoint.source_kind !=
-                core::CapabilityEndpointSourceKind::kRuntimeUnit ||
-            !std::holds_alternative<core::RuntimeUnitId>(endpoint.source_id) ||
-            std::get<core::RuntimeUnitId>(endpoint.source_id) !=
-                runtime.runtime_unit_id ||
-            endpoint.source_endpoint_role_id.value() !=
-                "logical_scene_services") {
-          throw std::invalid_argument("cell-global capability does not select "
-                                      "the logical-scene boundary: " +
-                                      binding.capability_id.value());
-        }
-      } else if (const auto *target = std::get_if<
-                     core::TargetBindingCapabilityProviderTargetDTO>(&binding.target);
-                 scenario.ros2_control_execution &&
-                 binding.provider_manifest_id.value() ==
-                     "manyforge.provider.ros2_control" &&
-                 (target == nullptr ||
-                  !ros2_control_provider_instances.contains(
-                      target->controllable_component_id) ||
-                  binding.provider_instance_id !=
-                      ros2_control_provider_instances.at(
-                          target->controllable_component_id))) {
-        throw std::invalid_argument(
-            "Isaac planning capability does not join its physical ROS "
-            "provider occurrence");
-      }
-    }
-    const bool has_operation_scale =
-        historical_capabilities.erase(
-            "execution.runtime_scale.operation_scoped") == 1U;
-    if (historical_capabilities != expected_facilities || has_operation_scale) {
-      throw std::invalid_argument(
-          "maintained scenario does not retain its exact source facilities: " +
-          std::string(scenario.source));
-    }
-    // Each component (robot, mounted tool) selects its family's one shared
-    // component type and model.
-    const auto record_family = [&](const std::string &owner, std::string_view family) {
-      const auto &component = graph_component(owner);
-      const auto model = std::find_if(
-          graph.model_instances.begin(), graph.model_instances.end(),
-          [&](const auto &row) {
-            return component.model_role_bindings.size() == 1U &&
-                   row.model_instance_id ==
-                       component.model_role_bindings.front().model_instance_id;
-          });
-      const std::string expected_component_id =
-          std::string(family) + ".fixed_scale.component";
-      if (model == graph.model_instances.end() ||
-          component.component_type_id.value() != expected_component_id ||
-          model->model_asset_id.value() != family) {
-        throw std::invalid_argument(
-            "maintained scenario selects the wrong shared family closure: " +
-            std::string(scenario.source));
-      }
-      const auto identity = std::pair{component.component_type_revision.value(),
-                                      model->model_revision.value()};
-      const auto [position, inserted] =
-          family_identities.emplace(expected_component_id, identity);
-      if (!inserted && position->second != identity) {
-        throw std::invalid_argument(
-            "same-profile scenarios select different component/model revisions");
-      }
-      const auto [model_position, model_inserted] = family_models.emplace(
-          std::string(family), model->model_revision.value());
-      if (!model_inserted &&
-          model_position->second != model->model_revision.value()) {
-        throw std::invalid_argument(
-            "same-family profiles select different models");
-      }
-    };
-    record_family(component_id, scenario.family_id);
-    if (has_tool) record_family(tool_id, scenario.tool_family_id);
-  }
-}
-
 } // namespace
 
 namespace manyforge::deployment::detail {
@@ -2830,11 +1147,10 @@ PreparedActivationMaterialization materialize_prepared_activation(
     const core::CellId &runtime_cell_id,
     const std::vector<ActivationComponentProfile> &component_profiles,
     const bool prepare_canonical_empty) {
-  Options options;
-  options.workspace_root = std::filesystem::canonical(capability_root);
+  const auto workspace_root = std::filesystem::canonical(capability_root);
 
   ExactCompilerInputSource input_source;
-  auto catalog = qualify_catalog(options.workspace_root, input_source, {},
+  auto catalog = qualify_catalog(workspace_root, input_source,
                                  prepared_models);
   auto io_types = prepare_activation_io_types(intent, component_profiles,
                                               catalog.capabilities);
@@ -2846,8 +1162,16 @@ PreparedActivationMaterialization materialize_prepared_activation(
   for (auto &prepared : prepare_activation_ai_model_types(
            intent, component_profiles, catalog.capabilities))
     io_types.push_back(std::move(prepared));
+  // Machine owners (CONTRACTS §16): a derived type without targets.
+  for (auto &prepared :
+       prepare_activation_machine_types(intent, component_profiles))
+    io_types.push_back(std::move(prepared));
+  // Sensors: a derived type without targets, as a machine owner.
+  for (auto &prepared :
+       prepare_activation_sensor_types(intent, component_profiles))
+    io_types.push_back(std::move(prepared));
   const auto assistant_profile =
-      resolve_activation_assistant_profile(options.workspace_root, intent);
+      resolve_activation_assistant_profile(workspace_root, intent);
   for (const auto &prepared : io_types) {
     const auto &reference = prepared.type.reference();
     input_source.add(reference.content_addressed_store_key,
@@ -2888,32 +1212,18 @@ PreparedActivationMaterialization materialize_prepared_activation(
   const std::string runtime_profile_id = require_text(
       require_member(runtime_units.front(), "runtime_profile_id", "runtime unit"),
       "runtime unit.runtime_profile_id");
-  const auto &model_instances = require_array(
-      require_member(graph, "model_instances", "Deployment.graph"),
-      "Deployment.graph.model_instances");
-  const std::string family_id = model_instances.empty()
-                                    ? std::string{}
-                                    : require_text(
-                                          require_member(model_instances.front(),
-                                                         "model_asset_id",
-                                                         "model instance"),
-                                          "model instance.model_asset_id");
   const std::string source_key = "captured.deployment";
   const Scenario scenario{
       source_key,
-      family_id,
-      false,
       runtime_profile_id == "manyforge.ros2_control_execution_runtime",
-      "",
-      "",
   };
   const std::array<Scenario, 1U> selected{scenario};
   MemoryPreparationStores stores;
   std::map<std::string, ScenarioProduct, std::less<>> products;
   try {
-    products = materialize_scenarios(
-        options.workspace_root, catalog, input_source,
-        {}, selected, &compiled, prepare_canonical_empty, &stores);
+    products = materialize_scenarios(workspace_root, catalog, input_source,
+                                     selected, compiled,
+                                     prepare_canonical_empty, stores);
   } catch (const std::bad_alloc &) {
     throw std::runtime_error(
         "activation Deployment materialization exhausted memory");
@@ -2948,46 +1258,6 @@ PreparedActivationMaterialization materialize_prepared_activation(
       std::move(raw_artifacts),
       std::move(catalog_artifacts),
   };
-}
-
-} // namespace manyforge::deployment::detail
-
-namespace manyforge::deployment::detail {
-
-int run_maintained_example_qualification(int argc, char **argv) {
-  try {
-    Options options = parse_options(argc, argv);
-    options.workspace_root = std::filesystem::canonical(options.workspace_root);
-    for (auto &[family_id, prepared_root] : options.prepared_roots) {
-      static_cast<void>(family_id);
-      prepared_root = std::filesystem::canonical(prepared_root);
-    }
-    const auto &root = options.workspace_root;
-    const auto families = load_families(options);
-    ExactCompilerInputSource input_source;
-    const QualifiedCatalogClosure catalog =
-        qualify_catalog(root, input_source, families);
-    verify_scenarios(root, catalog);
-    TemporaryPackage package(options.package_root);
-    auto products =
-        materialize_scenarios(root, catalog, input_source, package.path());
-    auto composed_products = materialize_scenarios(
-        root, catalog, input_source, package.path(), kComposedScenarios);
-    products.merge(composed_products);
-    if (!composed_products.empty()) {
-      throw std::logic_error("composed scenario product source is duplicated");
-    }
-    const auto bindings =
-        verify_program_bindings(root, products, package.path());
-    std::cout << products.size() << " deployments and " << bindings.size()
-              << " durable Program Bindings in self-contained scenario "
-                 "documents validated\n";
-    return 0;
-  } catch (const std::exception &error) {
-    std::cerr << "manyforge_maintained_deployment_occurrences: " << error.what()
-              << '\n';
-    return 2;
-  }
 }
 
 } // namespace manyforge::deployment::detail

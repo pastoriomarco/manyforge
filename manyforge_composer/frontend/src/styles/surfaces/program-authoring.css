@@ -1609,11 +1609,3 @@
   font-size: var(--mf-font-size-062);
 }
 
-.uncertain-output-confirmation {
-  display: grid;
-  gap: 0.35rem;
-  margin: 0.4rem 0;
-  padding: 0.45rem;
-  border: 1px solid var(--mf-border-neutral-23);
-  border-radius: var(--mf-radius-sm);
-}

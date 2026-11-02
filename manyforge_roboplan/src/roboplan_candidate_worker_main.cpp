@@ -362,18 +362,7 @@ void add_geometry(roboplan::Scene& scene,
     }
   }
   for (const auto& geometry : model.geometries) {
-    const auto frame_id = scene->getFrameId(geometry.compiled_parent_frame);
-    if (!frame_id.has_value() ||
-        frame_id.value() >= scene->getModel().frames.size()) {
-      fail("resolved scene geometry has no exact compiled parent frame");
-    }
-    // RoboPlan records GeometryObject::placement in the selected frame's
-    // parent-joint coordinates even though its API accepts a frame name.
-    // Retained ManyForge poses are relative to that named frame, so preserve
-    // the semantic frame by applying its fixed parent-joint transform here.
-    Eigen::Matrix4d pose = scene->getModel().frames[frame_id.value()]
-                               .placement.toHomogeneousMatrix() *
-                           transform(geometry.pose_in_parent);
+    Eigen::Matrix4d pose = transform(geometry.pose_in_parent);
     const auto result = scene->updateGeometryPlacement(
         geometry.native_geometry_name, geometry.compiled_parent_frame, pose);
     if (!result.has_value()) {
@@ -417,6 +406,26 @@ void apply_pair_margins(roboplan::Scene& scene,
     fail("could not apply clearance margins: " + result.error());
   }
   applied = margins;
+}
+
+// Sets one request's contact-policy pairs on the worker scene: the previous
+// request's pairs become active again and these are skipped. Only active flags
+// change, so the pair order and the clearance margins stay as they are.
+void apply_contact_pairs(
+    roboplan::Scene& scene,
+    const std::vector<std::pair<std::string, std::string>>& pairs,
+    std::vector<std::pair<std::string, std::string>>& applied) {
+  if (pairs == applied) {
+    return;
+  }
+  auto result = scene.setCollisionPairsActive(applied, true);
+  if (result.has_value()) {
+    result = scene.setCollisionPairsActive(pairs, false);
+  }
+  if (!result.has_value()) {
+    fail("could not apply contact-policy pairs: " + result.error());
+  }
+  applied = pairs;
 }
 
 void constrain_process(pid_t expected_parent) {
@@ -472,6 +481,7 @@ int run_worker(int descriptor) {
   RoboPlanCandidateComputer computer(scene, std::move(input.binding),
                                      input.candidate_config);
   std::vector<RoboPlanPairMarginDTO> applied_margins;
+  std::vector<std::pair<std::string, std::string>> applied_contact_pairs;
   send_frame(descriptor, MessageType::kReady, {});
 
   for (;;) {
@@ -482,6 +492,8 @@ int run_worker(int descriptor) {
         auto candidate =
             worker_protocol::decode_candidate_request(request.payload, &planning_deadline_ns);
         apply_pair_margins(*scene, candidate.collision_pair_margins, applied_margins);
+        apply_contact_pairs(*scene, candidate.contact_allowed_pairs,
+                            applied_contact_pairs);
         RoboPlanCandidateControl control;
         if (planning_deadline_ns) {
           const auto deadline = std::chrono::steady_clock::time_point(
@@ -542,6 +554,8 @@ int run_worker(int descriptor) {
       case MessageType::kIk: {
         auto candidate = worker_protocol::decode_ik_request(request.payload);
         apply_pair_margins(*scene, {}, applied_margins);
+        apply_contact_pairs(*scene, candidate.contact_allowed_pairs,
+                            applied_contact_pairs);
         auto result = computer.solve_ik(
             candidate.goal, candidate.base_frame, candidate.tcp_frame,
             candidate.seed_state, candidate.timeout_s);

@@ -509,11 +509,12 @@ TEST(KernelCellAdmissionSqlite, AcquireAndReleaseCrashWindowsRehydrateExactTruth
   TemporaryDirectory temporary;
   const auto database = temporary.path() / std::string(kOperationJournalFilename);
   auto claim = Claim();
-  claim.intent.claim_kind = CellAdmissionClaimKindDTO::kComponentLifecycle;
-  claim.intent.owner_role = CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner;
-  claim.intent.owner_epoch = RequestOwnerEpoch("cclc.owner.1");
-  claim.intent.owner_transaction_id = "lifecycle.1";
-  claim.intent.request_id = RequestId("lifecycle.request.1");
+  // An effect claim (authoring and Apply claims never block an owner close).
+  claim.intent.claim_kind = CellAdmissionClaimKindDTO::kAuthoredScene;
+  claim.intent.owner_role = CellAdmissionOwnerRoleDTO::kAuthoredSceneOwner;
+  claim.intent.owner_epoch = RequestOwnerEpoch("scene.owner.1");
+  claim.intent.owner_transaction_id = "scene.1";
+  claim.intent.request_id = RequestId("scene.request.1");
   {
     SqliteOperationJournal journal(database, CellId("cell.1"));
     ASSERT_TRUE(
@@ -585,11 +586,11 @@ TEST(KernelCellAdmissionSqlite, UncleanKernelReplacementAllowsProvenEmptyLifecyc
         EmptyLivenessSet());
     ASSERT_TRUE(owner.UpdateCellAdmissionReadiness(Ready()).ok());
     auto intent = Claim().intent;
-    intent.claim_kind = CellAdmissionClaimKindDTO::kComponentLifecycle;
-    intent.owner_role = CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner;
-    intent.owner_epoch = RequestOwnerEpoch("cclc.owner.1");
-    intent.owner_transaction_id = "lifecycle.1";
-    intent.request_id = RequestId("lifecycle.request.1");
+    intent.claim_kind = CellAdmissionClaimKindDTO::kAuthoringMutation;
+    intent.owner_role = CellAdmissionOwnerRoleDTO::kAuthoringOwner;
+    intent.owner_epoch = RequestOwnerEpoch("authoring.owner.1");
+    intent.owner_transaction_id = "authoring.1";
+    intent.request_id = RequestId("authoring.request.1");
     intent.expected_admission_generation = owner.GetAuthoringAdmission().admission_generation;
     auto acquired = owner.AcquireCellAdmissionClaim(intent);
     ASSERT_TRUE(acquired.ok());
@@ -614,7 +615,7 @@ TEST(KernelCellAdmissionSqlite, UncleanKernelReplacementAllowsProvenEmptyLifecyc
   const CellAdmissionReconcileDTO reconcile{
       RequestOwnerEpoch("kernel.2"),
       {},
-      {{CellAdmissionOwnerRoleDTO::kComponentLifecycleOwner, RequestOwnerEpoch("cclc.owner.2")}},
+      {{CellAdmissionOwnerRoleDTO::kAuthoringOwner, RequestOwnerEpoch("authoring.owner.2")}},
       Digest('c')};
   const auto rotated = owner.ReconcileCellAdmissionClaims(reconcile);
   ASSERT_TRUE(rotated.ok()) << rotated.error().code << ": " << rotated.error().message;

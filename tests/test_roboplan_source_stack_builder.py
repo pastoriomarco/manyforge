@@ -38,14 +38,20 @@ def test_native_and_ros_images_use_the_checked_manyforge_builder() -> None:
         assert "COPY scripts/ci/build-roboplan-source-closure.sh" in source
         assert "COPY scripts/ci/verify-external-source-closure.py" in source
         assert "COPY .docker/proxsuite/ /tmp/proxsuite/" in source
+        assert "COPY .docker/jrl-cmakemodules/ /tmp/jrl-cmakemodules/" in source
         assert "COPY .docker/toppra/ /tmp/toppra/" in source
+        assert "COPY .docker/nanoflann/ /tmp/nanoflann/" in source
+        assert "-DFETCHCONTENT_SOURCE_DIR_NANOFLANN=/tmp/nanoflann" in source
         assert (
             "COPY verification/composable_cell_e1/external_delta_ledger.v1.json"
             in source
         )
         assert "bash /tmp/build-roboplan-source-closure.sh" in source
-        assert "/tmp/proxsuite /tmp/toppra /tmp/roboplan" in source
-        assert "ROBOPLAN_SOURCE_ID=roboplan_0_7_0_ua1_foundation" in source
+        assert (
+            "/tmp/proxsuite /tmp/jrl-cmakemodules /tmp/toppra /tmp/nanoflann /tmp/roboplan"
+            in source
+        )
+        assert "ROBOPLAN_SOURCE_ID=roboplan_0_8_0_foundation" in source
         assert "ROBOPLAN_ALLOW_DEVELOPMENT_SOURCE" in source
         assert "-DFETCHCONTENT_FULLY_DISCONNECTED=ON" in source
         assert "-DBUILD_PYTHON_BINDINGS=OFF" in source
@@ -62,11 +68,13 @@ def test_native_and_ros_images_use_the_checked_manyforge_builder() -> None:
     )
 
     setup = (_REPO_ROOT / "scripts/setup-docker.sh").read_text(encoding="utf-8")
-    assert "099dfa5ccd80b191eb3d6da9f4795f808a63913f" in setup
-    assert "b93d7778ffc3299d84b5cb0851022a29bf24a596" in setup
+    assert "2a6b447e648b1a3337f10cbab995cda0c0a71d55" in setup
+    assert "6ae71b84730bf30453d70764073d186f5fe7ad69" in setup
+    assert "984234828e97557b82d30262ffa3a851b6be2383" in setup
     assert "8121e9af72f5aa589b515aa15e0dc408344c3220" in setup
-    assert '"$PROXSUITE_DIR" cmake-module' in setup
-    assert "roboplan_0_7_0_ua1_foundation" in setup
+    assert "18f4edf753e813644a7a12711a86139777a8ef00" in setup
+    assert "submodule update" not in setup
+    assert "roboplan_0_8_0_foundation" in setup
 
 
 def _fake_cmake(path: Path) -> None:
@@ -169,8 +177,9 @@ def _verification_environment(tmp_path: Path) -> dict[str, str]:
         "ROBOPLAN_SOURCE_VERIFIER": str(verifier),
         "ROBOPLAN_SOURCE_ID": "fixture_roboplan",
         "PROXSUITE_SOURCE_ID": "fixture_proxsuite",
-        "PROXSUITE_CMAKE_MODULE_SOURCE_ID": "fixture_cmake_module",
+        "JRL_CMAKEMODULES_SOURCE_ID": "fixture_jrl_cmakemodules",
         "TOPPRA_SOURCE_ID": "fixture_toppra",
+        "NANOFLANN_SOURCE_ID": "fixture_nanoflann",
         "E1_FAKE_VERIFIER_LOG": str(tmp_path / "verifier.jsonl"),
     }
 
@@ -281,14 +290,19 @@ def test_builder_owns_arguments_and_prefixes_each_fresh_install(
 def test_closure_builder_materializes_exact_dependencies_without_fetch_fallback(
     tmp_path: Path,
 ) -> None:
-    proxsuite = tmp_path / "proxsuite-v0.7.3"
+    proxsuite = tmp_path / "proxsuite-v0.8.2"
+    jrl_cmakemodules = tmp_path / "jrl-cmakemodules-v2.3.0"
     toppra = tmp_path / "toppra-v0.6.10"
-    roboplan = tmp_path / "roboplan-v0.7.0"
+    nanoflann = tmp_path / "nanoflann-2.0.1"
+    roboplan = tmp_path / "roboplan-v0.8.0"
     proxsuite.mkdir()
-    (proxsuite / "cmake-module").mkdir()
     (proxsuite / "CMakeLists.txt").write_text("project(proxsuite)\n", encoding="utf-8")
+    jrl_cmakemodules.mkdir()
     (toppra / "cpp").mkdir(parents=True)
     (toppra / "cpp/CMakeLists.txt").write_text("project(toppra)\n", encoding="utf-8")
+    (nanoflann / "include").mkdir(parents=True)
+    (nanoflann / "include/nanoflann.hpp").write_text("// fixture\n", encoding="utf-8")
+    sources = [str(proxsuite), str(jrl_cmakemodules), str(toppra), str(nanoflann), str(roboplan)]
     for project in _PROJECTS:
         project_root = roboplan / project
         project_root.mkdir(parents=True)
@@ -320,9 +334,7 @@ def test_closure_builder_materializes_exact_dependencies_without_fetch_fallback(
         [
             "bash",
             str(_CLOSURE_SCRIPT),
-            str(proxsuite),
-            str(toppra),
-            str(roboplan),
+            *sources,
             "-DBUILD_TESTING=OFF",
             "-DE1_SENTINEL=ON",
         ],
@@ -352,8 +364,9 @@ def test_closure_builder_materializes_exact_dependencies_without_fetch_fallback(
         ]
         for source_id, root in (
             ("fixture_proxsuite", proxsuite),
-            ("fixture_cmake_module", proxsuite / "cmake-module"),
+            ("fixture_jrl_cmakemodules", jrl_cmakemodules),
             ("fixture_toppra", toppra),
+            ("fixture_nanoflann", nanoflann),
             ("fixture_roboplan", roboplan),
             ("fixture_roboplan", roboplan),
         )
@@ -365,9 +378,11 @@ def test_closure_builder_materializes_exact_dependencies_without_fetch_fallback(
         str(build / "proxsuite"),
         "-DCMAKE_BUILD_TYPE=Release",
         f"-DCMAKE_INSTALL_PREFIX={install / 'proxsuite'}",
+        f"-DJRL_CMAKEMODULES_SOURCE_DIR={jrl_cmakemodules}",
         "-DBUILD_TESTING=OFF",
         "-DBUILD_PYTHON_INTERFACE=OFF",
         "-DBUILD_WITH_VECTORIZATION_SUPPORT=OFF",
+        "-DPROXSUITE_BUILD_WITH_SERIALIZATION=OFF",
         "-DFETCHCONTENT_FULLY_DISCONNECTED=ON",
         "-DFETCHCONTENT_UPDATES_DISCONNECTED=ON",
     ]
@@ -393,6 +408,9 @@ def test_closure_builder_materializes_exact_dependencies_without_fetch_fallback(
     for row in roboplan_configures:
         assert "-DFETCHCONTENT_FULLY_DISCONNECTED=ON" in row["argv"]
         assert "-DFETCHCONTENT_UPDATES_DISCONNECTED=ON" in row["argv"]
+        assert f"-DFETCHCONTENT_SOURCE_DIR_NANOFLANN={nanoflann}" in row["argv"]
+        assert "-DCMAKE_DISABLE_FIND_PACKAGE_nanoflann=ON" in row["argv"]
+        assert "-DCMAKE_DISABLE_FIND_PACKAGE_tl-expected=ON" in row["argv"]
         prefixes = row["cmake_prefix_path"].split(":")
         assert str(install / "toppra") in prefixes
         assert str(install / "proxsuite") in prefixes
@@ -413,9 +431,7 @@ def test_closure_builder_materializes_exact_dependencies_without_fetch_fallback(
         [
             "bash",
             str(_CLOSURE_SCRIPT),
-            str(proxsuite),
-            str(toppra),
-            str(roboplan),
+            *sources,
             "-DBUILD_TESTING=OFF",
         ],
         check=True,
@@ -440,8 +456,9 @@ def test_closure_builder_materializes_exact_dependencies_without_fetch_fallback(
         ]
         for source_id, root in (
             ("fixture_proxsuite", proxsuite),
-            ("fixture_cmake_module", proxsuite / "cmake-module"),
+            ("fixture_jrl_cmakemodules", jrl_cmakemodules),
             ("fixture_toppra", toppra),
+            ("fixture_nanoflann", nanoflann),
         )
     ]
     assert "development source" in completed.stderr
@@ -456,9 +473,7 @@ def test_closure_builder_materializes_exact_dependencies_without_fetch_fallback(
         [
             "bash",
             str(_CLOSURE_SCRIPT),
-            str(proxsuite),
-            str(toppra),
-            str(roboplan),
+            *sources,
             "-DBUILD_TESTING=OFF",
         ],
         check=False,

@@ -32,7 +32,7 @@ LogicalSceneOwner::ActiveProjectionHealth() const {
                                            state.accepted->target};
   }();
 
-  const auto bindings = ActiveNativeRuntimeBindings(state);
+  const auto bindings = ActiveExecutionHostBindings(state);
   std::vector<core::ProjectionHealthDTO> health;
   health.reserve(bindings.size());
   std::optional<ErrorDTO> aggregate_error;
@@ -228,7 +228,7 @@ core::Result<core::Pose3DTO> LogicalSceneOwner::GetObjectPose(
 
   std::vector<RequiredSceneProjection> projections;
   try {
-    const auto bindings = ActiveNativeRuntimeBindings(state);
+    const auto bindings = ActiveExecutionHostBindings(state);
     projections.reserve(bindings.size());
     for (const auto &binding : bindings) {
       auto projection =

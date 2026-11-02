@@ -79,17 +79,18 @@ the Program runner itself, so a key declared `read` still receives its
 - A stored value that the applied Program no longer accepts (for example a
   pose outside a narrowed `allowed_frames`) is dropped with a notice when the
   run starts, and the run still starts from `initial:`.
-- If the runner missed an Apply, the values are kept and the page shows an
-  "Apply not observed" fault so the cause can be found and fixed.
+- If the runner missed an Apply, the values are kept and the page shows the
+  fault "Applied Program not seen by stored values"
+  (`applied_program_not_observed`) so the cause can be found and fixed.
 - A Reset with **Reload initial scene** also resets every persistent key,
   whatever its access, to `initial:` (or empty). Its confirmation lists the
   stored values it resets (current value → new value), and each reset is
   recorded in the stored-value edits with that Reset. If they cannot be
   reset, the Reset fails by name before the Scene is reloaded and the stored
   values stay; Reset again to retry. The keys are reset before the Scene
-  reloads: if the Scene reload then fails, Reset again to finish it (if you
-  Close instead, the keys stay reset although the Scene was not reloaded). A Reset
-  without that option keeps them.
+  reloads: if the Scene reload then fails, Reset again to finish it (after New
+  or Load instead, the keys stay reset although the Scene was not reloaded).
+  A Reset without that option keeps them.
 - A persistent key cannot be a computed key.
 
 ## 5. Computed keys
@@ -153,7 +154,8 @@ then on.
 
 The system writes three families of read-only keys: `node_outcome.<node>`
 (each motion node's last outcome, `none` until it ends in this Run),
-`interrupt_state.<rule_id>` (each Deployment global rule's current state) and
+`interrupt_state.<rule_id>` (each Deployment global rule's state: `inactive`,
+`clear` or `tripped`; no value while the rule can't watch its signals) and
 `active_tcp.<target_role>` (the [Active TCP](TCPS.md#the-active-tcp) of the
 robot bound to that role, as a `tcp_entry`). You never declare or write
 these keys, and no key, namespace or Program parameter may use the names

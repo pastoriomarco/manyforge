@@ -24,7 +24,7 @@
 #include "manyforge_deployment/verified_retained_bundle.hpp"
 #include "manyforge_deployment/site_overlay_resolution.hpp"
 #include "mf1_name_internal.hpp"
-#include "native_execution_runtime_unit_internal.hpp"
+#include "execution_host_unit_internal.hpp"
 #include "ros2_control_execution_runtime_unit_internal.hpp"
 
 namespace manyforge::deployment {
@@ -3227,14 +3227,6 @@ ApplicabilityQualifiedCellIr qualify_cell_applicability(
         commissioning_evidence_refs,
     const QualifiedSelectedSiteOverlay &selected_site_overlay,
     std::span<const QualifiedContactPolicy> contact_policies) {
-  if (const auto &configuration = deployment_inputs.normalized_policies();
-      configuration) {
-    for (const std::string_view name :
-         {"interrupt_sources", "interrupt_policies"})
-      if (const auto *rows = configuration->find_object_member(name);
-          rows && !rows->as_array().empty())
-        fail("legacy_interrupt_policy_runtime_unsupported");
-  }
   const QualifiedAssistantSettings assistant_settings =
       qualify_assistant_settings(deployment_inputs.assistant_settings());
   const auto indexes = build_qualified_indexes(

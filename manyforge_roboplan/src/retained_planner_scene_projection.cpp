@@ -77,7 +77,7 @@ bool projection_construction_test_operation_selected(
 
 void projection_construction_test_boundary(
     const std::string_view operation,
-    const core::ProjectionNativeRuntimeBindingDTO &binding) {
+    const core::ProjectionExecutionHostBindingDTO &binding) {
   const char *const root =
       std::getenv("MANYFORGE_NATIVE_PROJECTION_TEST_CONTROL_DIR");
   if (root == nullptr || *root == '\0') {
@@ -141,15 +141,15 @@ void projection_construction_test_boundary(
 RetainedPlannerSceneProjection::RetainedPlannerSceneProjection(
     RetainedCollisionWorldProjector projector,
     core::RetainedProductDTO planning_collision_model,
-    core::ProjectionNativeRuntimeBindingDTO native_runtime_binding,
+    core::ProjectionExecutionHostBindingDTO execution_host_binding,
     RetainedPlannerSceneProjectionConfig config, Clock clock,
     std::shared_ptr<const RetainedSceneFrameResolver> frame_resolver)
     : projector_(std::move(projector)),
       planning_collision_model_(std::move(planning_collision_model)),
       frame_resolver_(std::move(frame_resolver)),
-      native_runtime_binding_(std::move(native_runtime_binding)),
+      execution_host_binding_(std::move(execution_host_binding)),
       config_(std::move(config)), clock_(std::move(clock)),
-      health_{native_runtime_binding_,
+      health_{execution_host_binding_,
               1U,
               core::ProjectionHealthState::kUninitialized,
               std::nullopt,
@@ -243,7 +243,7 @@ core::Result<std::shared_ptr<RetainedPlannerSceneProjection>>
 RetainedPlannerSceneProjection::CreateUninitialized(
     RetainedCollisionWorldProjector projector,
     core::RetainedProductDTO planning_collision_model,
-    core::ProjectionNativeRuntimeBindingDTO native_runtime_binding,
+    core::ProjectionExecutionHostBindingDTO execution_host_binding,
     RetainedPlannerSceneProjectionConfig config, Clock clock,
     std::shared_ptr<const RetainedSceneFrameResolver> frame_resolver) {
   if (planning_collision_model.product_kind !=
@@ -251,7 +251,7 @@ RetainedPlannerSceneProjection::CreateUninitialized(
       planning_collision_model.product_id.empty() ||
       planning_collision_model.product_contract_id.empty() ||
       planning_collision_model.product_contract_revision.empty() ||
-      !native_runtime_binding.valid() || config.publisher_id.empty() ||
+      !execution_host_binding.valid() || config.publisher_id.empty() ||
       config.transaction_replay_capacity == 0U ||
       config.transaction_replay_capacity > 4096U || !clock) {
     return projection_error<std::shared_ptr<RetainedPlannerSceneProjection>>(
@@ -264,7 +264,7 @@ RetainedPlannerSceneProjection::CreateUninitialized(
         std::shared_ptr<RetainedPlannerSceneProjection>(
             new RetainedPlannerSceneProjection(
                 std::move(projector), std::move(planning_collision_model),
-                std::move(native_runtime_binding), std::move(config),
+                std::move(execution_host_binding), std::move(config),
                 std::move(clock), std::move(frame_resolver))));
   } catch (const std::exception &exception) {
     return projection_error<std::shared_ptr<RetainedPlannerSceneProjection>>(
@@ -278,13 +278,13 @@ core::Result<std::shared_ptr<RetainedPlannerSceneProjection>>
 RetainedPlannerSceneProjection::CreateInitialized(
     RetainedCollisionWorldProjector projector,
     core::RetainedProductDTO planning_collision_model,
-    core::ProjectionNativeRuntimeBindingDTO native_runtime_binding,
+    core::ProjectionExecutionHostBindingDTO execution_host_binding,
     core::LogicalSceneSnapshotDTO initial_scene,
     RetainedPlannerSceneProjectionConfig config, Clock clock,
     std::shared_ptr<const RetainedSceneFrameResolver> frame_resolver) {
   auto result = CreateUninitialized(
       std::move(projector), std::move(planning_collision_model),
-      std::move(native_runtime_binding), std::move(config), std::move(clock),
+      std::move(execution_host_binding), std::move(config), std::move(clock),
       std::move(frame_resolver));
   if (!result.ok()) {
     return result;
@@ -311,7 +311,7 @@ RetainedPlannerSceneProjection::CreateInitialized(
       std::move(initial_scene));
   projection->logical_snapshot_ = std::move(snapshot);
   projection->health_ = {
-      projection->native_runtime_binding_,
+      projection->execution_host_binding_,
       2U,
       core::ProjectionHealthState::kHealthy,
       revision,
@@ -700,7 +700,7 @@ RetainedPlannerSceneProjection::RebuildProjectionLocked(
                                 std::move(message), std::move(reason)));
   };
   if (!request.valid() ||
-      request.expected_native_runtime_binding != native_runtime_binding_ ||
+      request.expected_execution_host_binding != execution_host_binding_ ||
       request.planning_collision_model != planning_collision_model_ ||
       request.target_projection_revision.retained_bundle_id !=
           projector_.model_map().retained_bundle_id ||
@@ -813,7 +813,7 @@ RetainedPlannerSceneProjection::RebuildProjectionLocked(
       construction_context == RebuildConstructionContext::kBootstrap
           ? "bootstrap_rebuild"
           : "rebuild",
-      native_runtime_binding_);
+      execution_host_binding_);
 #endif
   auto rebuilt = BuildPublisher(projector_, *request.logical_scene);
   if (!rebuilt.ok()) {
@@ -860,7 +860,7 @@ RetainedPlannerSceneProjection::RebuildBootstrapProjection(
     const core::NativeProjectionBootstrapRebuildDTO &request) {
   std::lock_guard lock(mutex_);
   if (!request.valid() ||
-      request.native_runtime_binding != native_runtime_binding_ ||
+      request.execution_host_binding != execution_host_binding_ ||
       request.planning_collision_model != planning_collision_model_) {
     throw std::invalid_argument(
         "native bootstrap rebuild request is invalid for this runtime");
@@ -869,7 +869,7 @@ RetainedPlannerSceneProjection::RebuildBootstrapProjection(
       HealthyAt(request.canonical_empty_target) && logical_snapshot_ &&
       *logical_snapshot_ == *request.initialized_logical_scene.shared();
   const core::NativeProjectionRebuildDTO rebuild{
-      request.native_runtime_binding,
+      request.execution_host_binding,
       request.canonical_empty_target,
       request.planning_collision_model,
       request.initialized_logical_scene.shared(),
@@ -886,7 +886,7 @@ RetainedPlannerSceneProjection::RebuildBootstrapProjection(
     core::NativeProjectionBootstrapRebuildResultDTO success{
         request.bootstrap_id,
         request.bootstrap_generation,
-        request.native_runtime_binding,
+        request.execution_host_binding,
         request.canonical_empty_target,
         request.planning_collision_model,
         request.initialized_logical_scene,
@@ -908,7 +908,7 @@ RetainedPlannerSceneProjection::RebuildBootstrapProjection(
   core::NativeProjectionBootstrapRebuildResultDTO failed{
       request.bootstrap_id,
       request.bootstrap_generation,
-      request.native_runtime_binding,
+      request.execution_host_binding,
       request.canonical_empty_target,
       request.planning_collision_model,
       request.initialized_logical_scene,
@@ -936,7 +936,7 @@ RetainedPlannerSceneProjection::BootstrapProjectionStatus(
     const core::NativeProjectionBootstrapStatusQueryDTO &query) const {
   std::lock_guard lock(mutex_);
   if (!query.valid() ||
-      query.native_runtime_binding != native_runtime_binding_) {
+      query.execution_host_binding != execution_host_binding_) {
     throw std::invalid_argument(
         "native bootstrap status query does not match this runtime binding");
   }
@@ -948,7 +948,7 @@ RetainedPlannerSceneProjection::BootstrapProjectionStatus(
     core::NativeProjectionBootstrapStatusDTO rebuilt{
         query.bootstrap_id,
         query.bootstrap_generation,
-        query.native_runtime_binding,
+        query.execution_host_binding,
         query.canonical_empty_target,
         core::NativeProjectionBootstrapStatusState::kRebuilt,
         query.canonical_empty_target,
@@ -969,7 +969,7 @@ RetainedPlannerSceneProjection::BootstrapProjectionStatus(
     core::NativeProjectionBootstrapStatusDTO absent{
         query.bootstrap_id,
         query.bootstrap_generation,
-        query.native_runtime_binding,
+        query.execution_host_binding,
         query.canonical_empty_target,
         core::NativeProjectionBootstrapStatusState::kAbsent,
         std::nullopt,
@@ -989,7 +989,7 @@ RetainedPlannerSceneProjection::BootstrapProjectionStatus(
     core::NativeProjectionBootstrapStatusDTO rebuilding{
         query.bootstrap_id,
         query.bootstrap_generation,
-        query.native_runtime_binding,
+        query.execution_host_binding,
         query.canonical_empty_target,
         core::NativeProjectionBootstrapStatusState::kRebuilding,
         std::nullopt,
@@ -1017,7 +1017,7 @@ RetainedPlannerSceneProjection::BootstrapProjectionStatus(
   core::NativeProjectionBootstrapStatusDTO failed{
       query.bootstrap_id,
       query.bootstrap_generation,
-      query.native_runtime_binding,
+      query.execution_host_binding,
       query.canonical_empty_target,
       core::NativeProjectionBootstrapStatusState::kFailedProjectionUncertain,
       std::nullopt,

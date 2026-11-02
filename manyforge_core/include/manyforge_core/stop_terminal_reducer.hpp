@@ -150,7 +150,6 @@ struct StopInterruptCorrelationDTO final {
   InterruptSourceId interrupt_source_id;
   InterruptPolicyId interrupt_policy_id;
   MotionInterruptScopeId motion_interrupt_scope_id;
-  std::optional<InterruptLatchId> interrupt_latch_id;
 
   friend bool operator==(const StopInterruptCorrelationDTO&,
                          const StopInterruptCorrelationDTO&) = default;
@@ -212,8 +211,6 @@ struct StopCertificateDTO final {
   std::vector<StopScopeEntryKeyDTO> unsettled;
   std::vector<StopScopeEntryKeyDTO> failed;
   std::optional<StopInterruptCorrelationDTO> interrupt_correlation;
-  std::optional<StopFaultLatchId> fault_latch_id;
-  std::optional<StopFaultLatchGeneration> fault_latch_generation;
   std::int64_t completed_at_ns{};
   std::optional<ErrorDTO> terminal_error;
   /// Scope entries whose hard stop was the intended Stop: requested directly
@@ -242,8 +239,6 @@ struct StopTerminalReductionInputDTO final {
   std::vector<StopScopeEntryDTO> newly_captured_scope_entries;
   std::vector<StopAttemptedStageResultDTO> newly_completed_stage_results;
   std::optional<StopInterruptCorrelationDTO> interrupt_correlation;
-  std::optional<StopFaultLatchId> fault_latch_id;
-  std::optional<StopFaultLatchGeneration> fault_latch_generation;
   std::int64_t completed_at_ns{};
   std::optional<ErrorDTO> terminal_error;
   /// This Stop's own entries whose hard stop was the intended Stop.

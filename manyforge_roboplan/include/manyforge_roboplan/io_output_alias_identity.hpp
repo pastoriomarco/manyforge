@@ -1,6 +1,7 @@
 #pragma once
 
-#include <manyforge_core/types/io_output.hpp>
+#include <manyforge_core/types/io_signal.hpp>
+#include <manyforge_core/types/lifecycle_provider_occurrence.hpp>
 #include <memory>
 #include <vector>
 

@@ -3,8 +3,6 @@ import type {
   AuthoringWorkspaceProjectFacts,
   AuthoringWorkspaceSnapshot,
   CurrentScenarioResponse,
-  DeploymentCandidateOperationResponse,
-  DeploymentCandidatePreparation,
   DeploymentWorkspaceResponse,
   ProgramDraftProjection,
   ProgramFormulaReferences,
@@ -19,7 +17,6 @@ import type {
   ScenarioDocumentDisplayStatus,
   ScenarioDocumentExportResponse,
   ScenarioDocumentIndexResponse,
-  ScenarioDocumentLoadResponse,
   ScenarioDocumentSaveResponse,
 } from '../../types/api';
 import type { AuthoringWorkspaceContainment, AuthoringWorkspaceIdentity } from '../../types/headless';
@@ -27,7 +24,6 @@ import { parseProgramBindingTransport, ProgramBindingTransportError } from '../p
 import {
   StructuralContractError,
   allowedKeysAt,
-  arrayAt,
   booleanAt,
   boundedArrayAt,
   digestAt,
@@ -37,7 +33,6 @@ import {
   jsonRecordAt,
   nonEmptyStringAt,
   nullableStringAt,
-  numberAt,
   objectAt,
   positiveIntegerAt,
   projectPathAt,
@@ -698,93 +693,6 @@ export function parseScenarioDocumentSaveResponse(
   };
 }
 
-export function parseScenarioDocumentLoadResponse(
-  value: unknown,
-): ScenarioDocumentLoadResponse {
-  const path = 'scenarioDocumentLoad';
-  const record = objectAt(value, path);
-  exactKeysAt(
-    record,
-    ['activation', 'authoringWorkspace', 'diagnostics', 'incomplete', 'path', 'scenario_id', 'source_diagnostics', 'status', 'workspace'],
-    path,
-  );
-  const status = stringAt(record.status, `${path}.status`);
-  if (status !== 'accepted' && status !== 'applied') {
-    return fail(`${path}.status`, 'accepted or applied');
-  }
-  const activation = jsonRecordAt(record.activation, `${path}.activation`);
-  const activationStatus = stringAt(
-    activation.status,
-    `${path}.activation.status`,
-  );
-  if (activationStatus !== status) {
-    return fail(
-      `${path}.activation.status`,
-      `to match Scenario Load status ${status}`,
-    );
-  }
-  const common = {
-    path: stringAt(record.path, `${path}.path`),
-    scenarioId: stringAt(record.scenario_id, `${path}.scenario_id`),
-    incomplete: booleanAt(record.incomplete, `${path}.incomplete`),
-    diagnostics: arrayAt(record.diagnostics, `${path}.diagnostics`).map(
-      (diagnostic, index) => parseProgramAuthoringDiagnostic(
-        diagnostic,
-        `${path}.diagnostics[${index}]`,
-      ),
-    ),
-    sourceDiagnostics: arrayAt(record.source_diagnostics, `${path}.source_diagnostics`).map(
-      (diagnostic, index) => {
-        const diagnosticPath = `${path}.source_diagnostics[${index}]`;
-        const selected = objectAt(diagnostic, diagnosticPath);
-        exactKeysAt(selected, ['code', 'message', 'source_id'], diagnosticPath);
-        const code = stringAt(selected.code, `${diagnosticPath}.code`);
-        if (code !== 'scenario_source_changed' && code !== 'edited_outside_manyforge') {
-          return fail(`${diagnosticPath}.code`, 'scenario_source_changed or edited_outside_manyforge');
-        }
-        return {
-          code,
-          sourceId: stringAt(selected.source_id, `${diagnosticPath}.source_id`),
-          message: stringAt(selected.message, `${diagnosticPath}.message`),
-        } as const;
-      },
-    ),
-    workspace: parseProgramWorkspaceResponse(record.workspace),
-    authoringWorkspace: parseAuthoringWorkspaceSnapshot(
-      record.authoringWorkspace,
-    ),
-  };
-  if (status === 'accepted') {
-    return {
-      ...common,
-      status,
-      activation: {
-        ...activation,
-        status,
-        apply_id: nonEmptyStringAt(
-          activation.apply_id,
-          `${path}.activation.apply_id`,
-        ),
-        apply_generation: positiveIntegerAt(
-          activation.apply_generation,
-          `${path}.activation.apply_generation`,
-        ),
-      },
-    };
-  }
-  if (activation.apply_id !== null) {
-    return fail(
-      `${path}.activation.apply_id`,
-      'null when the Scenario is already Applied',
-    );
-  }
-  return {
-    ...common,
-    status,
-    activation: { ...activation, status, apply_id: null },
-  };
-}
-
 export function parseScenarioDocumentExportResponse(
   value: unknown,
 ): ScenarioDocumentExportResponse {
@@ -1079,174 +987,6 @@ export function parseDeploymentWorkspaceResponse(
       record.unavailableReasons,
       `${path}.unavailableReasons`,
     ),
-  };
-}
-
-export function parseDeploymentCandidateOperationResponse(
-  value: unknown,
-): DeploymentCandidateOperationResponse {
-  const path = 'deploymentCandidateOperation';
-  const record = objectAt(value, path);
-  exactKeysAt(record, ['schemaVersion', 'workspace', 'result'], path);
-  const schemaVersion = stringAt(record.schemaVersion, `${path}.schemaVersion`);
-  if (schemaVersion !== 'manyforge.composer_deployment_candidate_operation.v1') {
-    return fail(
-      `${path}.schemaVersion`,
-      'manyforge.composer_deployment_candidate_operation.v1',
-    );
-  }
-  const workspace = parseDeploymentWorkspaceResponse(record.workspace);
-  const resultRecord = objectAt(record.result, `${path}.result`);
-  allowedKeysAt(resultRecord, [
-    'status', 'confirmation_token', 'prepared_activation', 'candidate_preview',
-    'manager_apply',
-  ], ['preparation', 'phases_ms', 'apply_id', 'apply_generation'], `${path}.result`);
-  const status = stringAt(resultRecord.status, `${path}.result.status`);
-  if (
-    status !== 'previewed'
-    && status !== 'confirmation_required'
-    && status !== 'accepted'
-    && status !== 'applied'
-  ) {
-    return fail(
-      `${path}.result.status`,
-      'previewed, confirmation_required, accepted, or applied',
-    );
-  }
-  const confirmationToken = resultRecord.confirmation_token === null
-    ? null
-    : digestAt(
-      resultRecord.confirmation_token,
-      `${path}.result.confirmation_token`,
-    );
-  if ((status === 'confirmation_required') !== (confirmationToken !== null)) {
-    return fail(
-      `${path}.result.confirmation_token`,
-      'a token exactly when confirmation is required',
-    );
-  }
-  if (status === 'confirmation_required'
-    && (resultRecord.preparation === undefined
-      || resultRecord.preparation === null)) {
-    return fail(
-      `${path}.result.preparation`,
-      'the prepared request identity for a required confirmation',
-    );
-  }
-  let preparation: DeploymentCandidatePreparation | null = null;
-  if (resultRecord.preparation !== undefined
-    && resultRecord.preparation !== null) {
-    const preparationRecord = objectAt(
-      resultRecord.preparation,
-      `${path}.result.preparation`,
-    );
-    exactKeysAt(preparationRecord, ['request_owner_epoch', 'request_id'],
-      `${path}.result.preparation`);
-    preparation = {
-      requestOwnerEpoch: stringAt(
-        preparationRecord.request_owner_epoch,
-        `${path}.result.preparation.request_owner_epoch`,
-      ),
-      requestId: stringAt(
-        preparationRecord.request_id,
-        `${path}.result.preparation.request_id`,
-      ),
-    };
-  }
-  if (status !== 'confirmation_required' && preparation !== null) {
-    return fail(
-      `${path}.result.preparation`,
-      'null unless confirmation is required',
-    );
-  }
-  const preparedActivation = parsePreparedActivationInput(
-    resultRecord.prepared_activation,
-    `${path}.result.prepared_activation`,
-  );
-  // An authored (intent) Draft has no compiled revision of its own: the request's
-  // Draft fence already pinned it, so only a compiled Draft must match exactly.
-  if (
-    workspace.draft.deploymentArtifactId !== preparedActivation.deploymentArtifactId
-    || (workspace.draft.deploymentRevision !== null
-      && workspace.draft.deploymentRevision !== preparedActivation.deploymentRevision)
-  ) {
-    return fail(`${path}.workspace`, 'the exact compiled Deployment Draft');
-  }
-  const candidatePreview = resultRecord.candidate_preview === null
-    ? null
-    : parseManagerDeploymentCandidatePreviewResponse(
-      resultRecord.candidate_preview,
-    );
-  const managerApply = resultRecord.manager_apply === null
-    ? null
-    : parseManagerApplyResponse(resultRecord.manager_apply);
-  const phaseKeys = [
-    'preparation_ms', 'preview_ms', 'confirmation_validation_ms',
-  ] as const;
-  const phasesRecord = resultRecord.phases_ms === undefined
-    ? {}
-    : objectAt(resultRecord.phases_ms, `${path}.result.phases_ms`);
-  allowedKeysAt(phasesRecord, [], phaseKeys, `${path}.result.phases_ms`);
-  const phasesMs: Record<string, number> = {};
-  for (const [phase, value] of Object.entries(phasesRecord)) {
-    const duration = numberAt(value, `${path}.result.phases_ms.${phase}`);
-    if (duration < 0) return fail(
-      `${path}.result.phases_ms.${phase}`,
-      'a non-negative finite duration',
-    );
-    phasesMs[phase] = duration;
-  }
-  const applyId = resultRecord.apply_id === undefined
-    ? null
-    : nullableStringAt(resultRecord.apply_id, `${path}.result.apply_id`);
-  // An accepted Apply names its exact Manager operation, as the Program
-  // Apply reply does; no other status carries an Apply generation.
-  if (status === 'accepted') {
-    if (managerApply === null || applyId !== managerApply.applyId
-      || positiveIntegerAt(resultRecord.apply_generation, `${path}.result.apply_generation`)
-        !== managerApply.applyGeneration) {
-      return fail(`${path}.result`, 'the exact accepted Manager operation');
-    }
-  } else if (resultRecord.apply_generation !== undefined) {
-    return fail(`${path}.result.apply_generation`, 'absent unless the Apply was accepted');
-  }
-  if (
-    candidatePreview !== null
-    && (
-      candidatePreview.candidateReceipt.deployment_artifact_id
-        !== preparedActivation.deploymentArtifactId
-      || candidatePreview.candidateReceipt.deployment_revision
-        !== preparedActivation.deploymentRevision
-      || candidatePreview.candidateReceipt.candidate_retained_bundle_id
-        !== preparedActivation.retainedBundleId
-      || candidatePreview.candidateReceipt.candidate_graph_revision
-        !== preparedActivation.graphRevision
-      || candidatePreview.candidateReceipt.prepared_activation_id
-        !== preparedActivation.preparedActivationId
-    )
-  ) {
-    return fail(`${path}.result.candidate_preview`, 'the compiled candidate');
-  }
-  if (
-    status === 'applied'
-    && workspace.managerApplied.deploymentRevision
-      !== preparedActivation.deploymentRevision
-  ) {
-    return fail(`${path}.workspace.managerApplied`, 'the applied candidate');
-  }
-  return {
-    schemaVersion,
-    workspace,
-    result: {
-      status,
-      confirmationToken,
-      preparation,
-      preparedActivation,
-      candidatePreview,
-      managerApply,
-      phasesMs,
-      applyId,
-    },
   };
 }
 

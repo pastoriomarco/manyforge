@@ -82,7 +82,7 @@ function output(patch: Partial<IoSignalOutputDraft>): IoSignalRow {
     draft: {
       componentId: 'station', targetId: 'io', resourceRoleId: 'clamp', signalName: 'clamp',
       sourceId: 'clamp_service', profile: 'ros_set_bool', service: '/cell/clamp/set', channel: '',
-      pin: '0', topic: '', group: '', interfaceName: '', robotComponentId: '', bank: 'tool', ...patch,
+      topic: '', group: '', interfaceName: '', ...patch,
     },
   };
 }
@@ -99,32 +99,7 @@ function input(patch: Partial<IoSignalInputDraft>): IoSignalRow {
 }
 
 describe('io_signals configuration', () => {
-  it('round-trips xArm bank signals and checks their physical pin ranges', () => {
-    const selected = [
-      input({ profile: 'xarm_digital', robotComponentId: 'lite6_robot', bank: 'tool',
-        pin: '1', maximumAgeMs: '250', sourceId: 'tool_input' }),
-      output({ profile: 'xarm_digital', robotComponentId: 'lite6_robot', bank: 'tool',
-        pin: '4', sourceId: 'tool_output' }),
-    ];
-    expect(validateIoSignalRows(selected)).toBeNull();
-    const values = ioSignalRowsValue(selected);
-    expect(values[0]).toMatchObject({ freshness: { mode: 'sample_age', maximum_age_ns: 250_000_000 },
-      provider: { profile: 'xarm_digital', robot_component_id: 'lite6_robot', bank: 'tool', pin: 1 } });
-    expect(values[1]).toMatchObject({ provider: { profile: 'xarm_digital', robot_component_id: 'lite6_robot', bank: 'tool', pin: 4 } });
-    expect(ioSignalRowsValue(ioSignalRows({ io_signals: values }))).toEqual(values);
-    expect(validateIoSignalRows([input({ profile: 'xarm_digital', robotComponentId: 'lite6_robot',
-      bank: 'tool', pin: '2', maximumAgeMs: '250' })])).toContain('input pin');
-    expect(validateIoSignalRows([output({ profile: 'xarm_digital', robotComponentId: 'lite6_robot',
-      bank: 'tool', pin: '5' })])).toContain('output pin');
-    expect(ioDeviceHasAcknowledgedOutput({ io_signals: values })).toBe(true);
-  });
-
-  it('requires one xArm source per bank and validates a Mock echo output', () => {
-    const xarm = (sourceId: string, name: string) => input({ profile: 'xarm_digital',
-      robotComponentId: 'lite6_robot', bank: 'controller', maximumAgeMs: '250', sourceId,
-      signalName: name, resourceRoleId: name });
-    expect(validateIoSignalRows([xarm('first', 'a'), xarm('second', 'b')]))
-      .toContain('must share one I/O source');
+  it('validates a Mock echo output', () => {
     const valve = output({ profile: 'mock_output', channel: 'valve', sourceId: 'valve_source' });
     const echoed = input({ echoEnabled: true, echoOutputSignalName: 'clamp', echoDelayMs: '50' });
     expect(validateIoSignalRows([echoed])).toContain('must name a Mock output');
@@ -137,7 +112,7 @@ describe('io_signals configuration', () => {
   it('round-trips authored rows exactly and keeps outputs verbatim', () => {
     const rows = ioSignalRows({ io_signals: [mockRow, rosRow, outputRow] as JsonValue[] });
     expect(rows.map((row) => row.kind)).toEqual(['input', 'input', 'preserved']);
-    expect(rows[2]).toMatchObject({ kind: 'preserved', reason: expect.stringContaining('not a ROS SetBool, UR set_io, ros2_control GPIO or Mock output shape') });
+    expect(rows[2]).toMatchObject({ kind: 'preserved', reason: expect.stringContaining('not a ROS SetBool, ros2_control GPIO or Mock output shape') });
     expect(validateIoSignalRows(rows)).toBeNull();
     expect(ioSignalRowsValue(rows)).toEqual([mockRow, rosRow, outputRow]);
   });
@@ -304,29 +279,30 @@ describe('io_signals configuration', () => {
     }
   });
 
-  it('round-trips UR io_states and ros2_control GPIO inputs (periodic, exact addresses)', () => {
-    const ur = { ...rosRow, resource_role_id: 'di3', signal_name: 'di3', source_id: 'ur_io',
-      provider: { profile: 'ur_io_states', topic: '/io_and_status_controller/io_states', pin: 17 } };
+  it('round-trips ros2_control GPIO inputs (periodic, exact addresses) and preserves the deleted UR profiles', () => {
     const gpio = { ...rosRow, resource_role_id: 'grip', signal_name: 'grip', source_id: 'gpio',
       provider: { profile: 'ros2_control_gpio', topic: '/gpio_controller/gpio_states', group: 'flange vacuum', interface_name: ' state ' } };
-    const rows = ioSignalRows({ io_signals: [ur, gpio] as JsonValue[] });
-    expect(rows.map((row) => row.kind)).toEqual(['input', 'input']);
+    const rows = ioSignalRows({ io_signals: [gpio] as JsonValue[] });
+    expect(rows.map((row) => row.kind)).toEqual(['input']);
     expect(validateIoSignalRows(rows)).toBeNull();
-    expect(ioSignalRowsValue(rows)).toEqual([ur, gpio]);
-    expect(rows.map((row) => (row.kind === 'input' ? inputLivenessMode(row.draft) : null))).toEqual(['periodic', 'periodic']);
-    expect(ioSignalRows({ io_signals: [{ ...ur, provider: { ...ur.provider, liveness: { mode: 'periodic' } } }] as JsonValue[] })[0].kind)
-      .toBe('preserved');
+    expect(ioSignalRowsValue(rows)).toEqual([gpio]);
+    expect(rows.map((row) => (row.kind === 'input' ? inputLivenessMode(row.draft) : null))).toEqual(['periodic']);
+    // The UR profiles are gone: such rows are not authored, only kept verbatim.
+    const ur = { ...rosRow, resource_role_id: 'di3', signal_name: 'di3', source_id: 'ur_io',
+      provider: { profile: 'ur_io_states', topic: '/io_and_status_controller/io_states', pin: 17 } };
+    const urOut = { ...setBoolRow, provider: { profile: 'ur_set_io', service: '/io_and_status_controller/set_io', pin: 0 } };
+    expect(ioSignalRows({ io_signals: [ur, urOut] as JsonValue[] }).map((row) => row.kind))
+      .toEqual(['preserved', 'preserved']);
+    expect(rowInputLiveness(ur as Record<string, JsonValue>)).toBeNull();
   });
 
-  it('round-trips UR set_io and ros2_control GPIO outputs', () => {
-    const urOut = { ...setBoolRow, provider: { profile: 'ur_set_io', service: '/io_and_status_controller/set_io', pin: 0 } };
+  it('round-trips ros2_control GPIO outputs', () => {
     const gpioOut = { ...setBoolRow, resource_role_id: 'lamp', signal_name: 'lamp', source_id: 'gpio_cmd',
       provider: { profile: 'ros2_control_gpio', topic: '/gpio_controller/commands', group: 'flange', interface_name: 'lamp' } };
-    const rows = ioSignalRows({ io_signals: [urOut, gpioOut] as JsonValue[] });
-    expect(rows.map((row) => row.kind)).toEqual(['output', 'output']);
+    const rows = ioSignalRows({ io_signals: [gpioOut] as JsonValue[] });
+    expect(rows.map((row) => row.kind)).toEqual(['output']);
     expect(validateIoSignalRows(rows)).toBeNull();
-    expect(ioSignalRowsValue(rows)).toEqual([urOut, gpioOut]);
-    expect(validateIoSignalRows([output({ profile: 'ur_set_io', pin: '18' })])).toContain('UR pin');
+    expect(ioSignalRowsValue(rows)).toEqual([gpioOut]);
     expect(validateIoSignalRows([output({ profile: 'ros2_control_gpio', topic: 'gpio', group: 'g', interfaceName: 'i' })])).toContain('absolute');
     expect(validateIoSignalRows([output({ profile: 'ros2_control_gpio', topic: '/gpio', group: '', interfaceName: 'i' })])).toContain('GPIO group');
     expect(validateIoSignalRows([output({ profile: 'ros2_control_gpio', topic: '/gpio', group: 'g', interfaceName: 'a\0' })])).toContain('NUL');
@@ -337,16 +313,15 @@ describe('io_signals configuration', () => {
     expect(rowInputLiveness(rosRow as Record<string, JsonValue>)).toBe('periodic');
     expect(rowInputLiveness({ ...rosRow, provider: { profile: 'ros_bool', topic: '/t', liveness: { mode: 'change_only' } } } as Record<string, JsonValue>))
       .toBe('change_only');
-    expect(rowInputLiveness({ ...rosRow, provider: { profile: 'ur_io_states', topic: '/t', pin: 1 } } as Record<string, JsonValue>)).toBe('periodic');
     expect(rowInputLiveness({ ...rosRow, provider: { profile: 'ros_bool', topic: '/t' } } as Record<string, JsonValue>)).toBeNull();
     expect(rowInputLiveness(setBoolRow as Record<string, JsonValue>)).toBeNull();
   });
 
-  it('keeps an R7-deferred xArm controller input verbatim', () => {
-    const xarm = { ...rosRow, provider: { profile: 'xarm_controller_input', topic: '/xarm/io', input_bit: 3 } };
-    const rows = ioSignalRows({ io_signals: [xarm] as JsonValue[] });
-    expect(rows[0]).toMatchObject({ kind: 'preserved', reason: expect.stringContaining('R7') });
-    expect(ioSignalRowsValue(rows)).toEqual([xarm]);
+  it('keeps an input row of an unknown shape verbatim', () => {
+    const unknown = { ...rosRow, provider: { profile: 'future_input', topic: '/future/io', input_bit: 3 } };
+    const rows = ioSignalRows({ io_signals: [unknown] as JsonValue[] });
+    expect(rows[0]).toMatchObject({ kind: 'preserved', reason: expect.stringContaining('Not an executable boolean signal shape') });
+    expect(ioSignalRowsValue(rows)).toEqual([unknown]);
   });
 
   it.each([
@@ -360,10 +335,7 @@ describe('io_signals configuration', () => {
     [{ profile: 'ros_bool', topic: ' ', maximumAgeMs: '10' }, 'topic'],
     [{ profile: 'ros_bool', topic: '/t', maximumAgeMs: '0' }, 'maximum sample age'],
     [{ profile: 'ros_bool', topic: '/t', maximumAgeMs: '' }, 'maximum sample age'],
-    [{ profile: 'ur_io_states', topic: '/t', maximumAgeMs: '1', pin: '18' }, 'UR pin'],
-    [{ profile: 'ur_io_states', topic: '/t', maximumAgeMs: '1', pin: '-1' }, 'UR pin'],
-    [{ profile: 'ur_io_states', topic: 'io_states', maximumAgeMs: '1' }, 'absolute'],
-    [{ profile: 'ur_io_states', topic: '/t', maximumAgeMs: '' }, 'maximum sample age'],
+    [{ profile: 'ros2_control_gpio', topic: 'gpio_states', group: 'g', interfaceName: 'i', maximumAgeMs: '1' }, 'absolute'],
     [{ profile: 'ros2_control_gpio', topic: '/t', group: '', interfaceName: 'i', maximumAgeMs: '1' }, 'GPIO group'],
     [{ profile: 'ros2_control_gpio', topic: '/t', group: 'g', interfaceName: '', maximumAgeMs: '1' }, 'GPIO interface name'],
     [{ profile: 'ros2_control_gpio', topic: '/t', group: 'g', interfaceName: 'i', maximumAgeMs: '0' }, 'maximum sample age'],
@@ -376,7 +348,7 @@ describe('io_signals configuration', () => {
     expect(validateIoSignalRows([input({ profile: 'ros_bool', topic: '/t', maximumAgeMs: '0.000001' })])).toBeNull();
     // A change-only ROS Bool has no sample age to validate.
     expect(validateIoSignalRows([input({ profile: 'ros_bool', topic: '/t', liveness: 'change_only', maximumAgeMs: '' })])).toBeNull();
-    expect(validateIoSignalRows([input({ profile: 'ur_io_states', topic: '/t', pin: '17', maximumAgeMs: '1' })])).toBeNull();
+    expect(validateIoSignalRows([input({ profile: 'ros2_control_gpio', topic: '/t', group: 'g', interfaceName: 'i', maximumAgeMs: '1' })])).toBeNull();
     // Rows sharing a source agree on its liveness too.
     expect(validateIoSignalRows([
       input({ profile: 'ros_bool', topic: '/a', maximumAgeMs: '1', sourceId: 'bus' }),
@@ -503,16 +475,12 @@ describe('I/O device component', () => {
     expect(validateIoDeviceDraft(draft(), [])).toContain('signal name');
   });
 
-  it('requires at least one own signal and refuses xArm inputs on an I/O device', () => {
+  it('requires at least one own signal on an I/O device', () => {
     expect(validateIoSignalRows([], 'station')).toContain('at least one signal');
     expect(validateIoSignalRows([input({})], 'station')).toBeNull();
     expect(validateIoSignalRows([input({ componentId: 'arm' })], 'station')).toContain('must belong to station');
-    const xarmRaw: IoSignalRow = { kind: 'preserved', reason: '', raw: { controllable_component_id: 'station', provider: { profile: 'xarm_controller_input' } } };
-    expect(validateIoSignalRows([xarmRaw], 'station')).toContain('xArm');
-    // An arm's existing preserved row is kept as is.
-    expect(validateIoSignalRows([xarmRaw])).toBeNull();
-    // Contract 84: robot-hosted UR and ros2_control GPIO signals live on the device.
-    expect(validateIoSignalRows([input({ profile: 'ur_io_states', topic: '/ur/io_states', pin: '2', maximumAgeMs: '50' })], 'station')).toBeNull();
+    // Contract 84: ros2_control GPIO signals live on the device.
+    expect(validateIoSignalRows([input({ profile: 'ros2_control_gpio', topic: '/gpio/states', group: 'g', interfaceName: 'i', maximumAgeMs: '50' })], 'station')).toBeNull();
   });
 
   it('creates a device whose first signal is an output', () => {
@@ -543,7 +511,7 @@ describe('I/O device component', () => {
     });
     const output = (profile: string) => ({ io_signals: [{ direction: 'output', provider: { profile } }] });
     expect(ioDeviceHasAcknowledgedOutput(output('ros_set_bool'))).toBe(true);
-    expect(ioDeviceHasAcknowledgedOutput(output('ur_set_io'))).toBe(true);
+    expect(ioDeviceHasAcknowledgedOutput(output('ur_set_io'))).toBe(false);
     expect(ioDeviceHasAcknowledgedOutput(output('mock_output'))).toBe(false);
     // ros2_control GPIO outputs are submitted-only: no acknowledgement budget.
     expect(ioDeviceHasAcknowledgedOutput(output('ros2_control_gpio'))).toBe(false);
@@ -561,12 +529,10 @@ describe('ioInputSourceText', () => {
   it('says where a declared input comes from', () => {
     const input = newIoSignalInput('cell_io');
     expect(ioInputSourceText({ ...input, profile: 'ros_bool', topic: '/cell/door' })).toBe('ROS topic /cell/door');
-    expect(ioInputSourceText({ ...input, profile: 'xarm_digital', robotComponentId: 'lite6', bank: 'controller', pin: '3' }))
-      .toBe('xArm lite6 controller digital input pin 3');
     expect(ioInputSourceText({ ...input, profile: 'geometric_contact', robotComponentId: 'lite6',
       targetSceneResourceId: 'workpiece' })).toBe('geometric contact for lite6 with workpiece');
-    expect(ioInputSourceText({ ...input, profile: 'ur_io_states', topic: '/io_states', pin: '2' }))
-      .toBe('ROS topic /io_states, pin 2');
+    expect(ioInputSourceText({ ...input, profile: 'ros2_control_gpio', topic: '/gpio', group: 'g', interfaceName: 'i' }))
+      .toBe('ROS topic /gpio, GPIO g/i');
     expect(ioInputSourceText(input)).toBe('Mock input');
   });
 });

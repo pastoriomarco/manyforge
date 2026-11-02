@@ -56,7 +56,7 @@ def make_source(*, dirty: bool = False) -> SourceIdentityV1:
 
 def make_configuration(
     *,
-    profile: LaunchProfile = LaunchProfile.NATIVE,
+    profile: LaunchProfile = LaunchProfile.STANDARD,
     artifact_kind: ArtifactKind = ArtifactKind.CONTAINER_IMAGE,
 ) -> LaunchConfiguration:
     source = make_source()

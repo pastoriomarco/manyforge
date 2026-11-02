@@ -38,7 +38,7 @@ struct RoboPlanSceneInput final {
   std::vector<RoboPlanJointLimitInput> joint_limits;
 };
 
-/// Builds a RoboPlan 0.7 Scene in the required order:
+/// Builds a RoboPlan 0.8 Scene in the required order:
 /// description, explicit retained limits, then SRDF semantics.
 ///
 /// Throws std::runtime_error on incomplete, duplicate, foreign, malformed, or

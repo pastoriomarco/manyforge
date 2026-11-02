@@ -4,14 +4,14 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   HeadlessRuntimeSurfacesView,
   attentionAlarmsNewestFirst,
+  errorAlarms,
   historianEventView,
-  motionInterlockMessage,
   operatorAlarmView,
-  nonBlockingAttentionAlarms,
   partitionRepresentedAlarms,
   redAcknowledgementMembers,
   runtimeAttentionSummary,
   runtimeErrorItemCount,
+  warningAlarms,
 } from './HeadlessRuntimeSurfaces';
 import type {
   ComposerHeadlessState,
@@ -92,12 +92,12 @@ describe('headless Composer presentation adapters', () => {
 
     const view = operatorAlarmView(alarm);
 
-    expect(view.lifecycleLabel).toBe('Resolved · Acknowledgement required');
+    expect(view.lifecycleLabel).toBe('Resolved');
     expect(view.severity).toBe('critical');
     expect(view.details.occurrence_count).toBe(2);
   });
 
-  it('labels an active condition interlock as needing no acknowledgement', () => {
+  it('labels the state Active or Resolved and never adds a motion-gating message', () => {
     const alarm: OperatorAlarmRecord = {
       conditionId: 'condition-scope',
       activationId: 'activation-scope',
@@ -120,25 +120,15 @@ describe('headless Composer presentation adapters', () => {
       details: {},
     };
 
-    expect(operatorAlarmView(alarm).lifecycleLabel)
-      .toBe('Active · No acknowledgement required');
-    expect(operatorAlarmView(alarm).operatorResponse).toBe(
-      'Motion blocked by an active interlock: Fault alarm scope unavailable; '
-        + 'resolve its cause. Acknowledgement does not release it. '
-        + 'Resolve the refused faults.',
-    );
-    const acknowledgementGated = { ...alarm, acknowledgementRequired: true };
-    expect(operatorAlarmView(acknowledgementGated).lifecycleLabel)
-      .toBe('Active · Acknowledged');
-    expect(motionInterlockMessage(acknowledgementGated)).toBeNull();
-    expect(operatorAlarmView(acknowledgementGated).operatorResponse)
-      .toBe('Resolve the refused faults.');
-    const returned = {
-      ...alarm,
-      lifecycleState: 'returned_acknowledged' as const,
-      active: false,
-    };
-    expect(motionInterlockMessage(returned)).toBeNull();
+    expect(operatorAlarmView(alarm).lifecycleLabel).toBe('Active · Acknowledged');
+    expect(operatorAlarmView(alarm).operatorResponse).toBe('Resolve the refused faults.');
+    expect(operatorAlarmView({ ...alarm, lifecycleState: 'active_unacknowledged' }).lifecycleLabel)
+      .toBe('Active');
+    expect(operatorAlarmView({ ...alarm, lifecycleState: 'returned_acknowledged', active: false })
+      .lifecycleLabel).toBe('Resolved · Acknowledged');
+    // Colour is severity: high/critical are red errors, the rest yellow warnings.
+    expect(operatorAlarmView(alarm).severity).toBe('error');
+    expect(operatorAlarmView({ ...alarm, priority: 'medium' }).severity).toBe('warning');
   });
 
   it('selects attention panels by newest activation rather than server priority', () => {
@@ -250,7 +240,7 @@ describe('headless Composer presentation adapters', () => {
         overviewRevision: `sha256:${'a'.repeat(64)}`,
         readiness: 'ready',
         summaryLabel: 'Application surfaces ready',
-        profileLabel: 'native',
+        profileLabel: 'standard',
         authorityLabel: 'owner-issued scoped facts',
         userMessage: 'Current.',
         capabilities: [],
@@ -454,8 +444,9 @@ describe('headless Composer presentation adapters', () => {
       error: null, transportStatus: 'connected' as const, transportError: null,
       semanticStatus: 'current' as const, semanticReason: null, reconnect,
     };
-    // A non-gating alarm blocks nothing: a warning, never in the red row.
-    expect(nonBlockingAttentionAlarms(previousState.snapshot.alarms)).toEqual([previousAlarm]);
+    // A warning (yellow) is never in the red row.
+    expect(warningAlarms(previousState.snapshot.alarms)).toEqual([previousAlarm]);
+    expect(errorAlarms(previousState.snapshot.alarms)).toEqual([]);
     expect(runtimeErrorItemCount(previousState.snapshot.alarms, [])).toBe(0);
     const previous = renderToStaticMarkup(createElement(HeadlessRuntimeSurfacesView, {
       enabled: true, headlessState: previousState, expanded: false,
@@ -503,58 +494,21 @@ describe('headless Composer presentation adapters', () => {
     expect(alone).not.toContain('workbench-notice-alarms');
     expect(alone).toContain('<summary>RoboPlan could not resolve the pose goal · Program operation failed · node unreachable_hold');
 
-    // An active interlock gates motion without acknowledgement: it is shown
-    // red in the row and counted in the badge, with no Acknowledge.
-    const interlock: OperatorAlarmRecord = {
-      ...attentionAlarm,
-      conditionId: 'condition-scope',
-      activationId: 'activation-scope',
-      definitionId: 'manyforge.runtime.alarm_scope_unavailable',
-      lifecycleState: 'active_acknowledged',
-      acknowledged: true,
-      title: 'Fault alarm scope unavailable',
-      acknowledgementRequired: false,
-      requiresMotionAttention: true,
+    // An error stays red until acknowledged, Active or Resolved; once
+    // acknowledged it leaves the red row (History keeps it). Acknowledgement
+    // never gates anything.
+    const resolved = { ...attentionAlarm, lifecycleState: 'returned_unacknowledged' as const, active: false };
+    expect(errorAlarms({ ...snapshot.alarms, alarms: [resolved] })).toEqual([resolved]);
+    const acknowledged: OperatorAlarmRecord = {
+      ...attentionAlarm, lifecycleState: 'active_acknowledged', acknowledged: true,
     };
-    const interlockAlarms = {
-      ...snapshot.alarms,
-      alarms: [interlock],
-      unacknowledgedCount: 0,
-      unacknowledgedMembership: [],
-      motionAttentionMembership: [{
-        conditionId: interlock.conditionId,
-        activationId: interlock.activationId,
-        recordRevision: interlock.recordRevision,
-        lifecycleState: interlock.lifecycleState,
-        definitionId: interlock.definitionId,
-        subject: interlock.subject,
-      }],
-    };
-    expect(runtimeErrorItemCount(interlockAlarms, [])).toBe(1);
-    // Red "Acknowledge all" names only unacknowledged gating alarms, by
-    // exact revision; interlocks and non-gating warnings stay out.
-    expect(redAcknowledgementMembers(interlockAlarms)).toEqual([]);
+    const acknowledgedAlarms = { ...snapshot.alarms, alarms: [acknowledged] };
+    expect(errorAlarms(acknowledgedAlarms)).toEqual([]);
+    expect(runtimeErrorItemCount(acknowledgedAlarms, [])).toBe(0);
+    // Red "Acknowledge all" names exactly the red row's alarms, by exact revision.
     expect(redAcknowledgementMembers({
       ...snapshot.alarms,
-      alarms: [attentionAlarm, { ...previousAlarm, activationId: 'activation-previous' }, interlock],
-      motionAttentionMembership: [...snapshot.alarms.motionAttentionMembership,
-        ...interlockAlarms.motionAttentionMembership],
+      alarms: [attentionAlarm, { ...previousAlarm, activationId: 'activation-previous' }, acknowledged],
     })).toEqual([{ conditionId: 'condition-attention', activationId: 'activation-attention', recordRevision: 3 }]);
-    expect(runtimeErrorItemCount({ ...interlockAlarms, motionAttentionMembership: [] }, []))
-      .toBe(0);
-    const interlockState = { ...previousState, snapshot: { ...snapshot, alarms: interlockAlarms } };
-    const interlockRow = renderToStaticMarkup(createElement(HeadlessRuntimeSurfacesView, {
-      enabled: true, headlessState: interlockState, expanded: false,
-    }));
-    expect(interlockRow).toContain('has-attention attention-error');
-    expect(interlockRow).toContain('>Errors<');
-    expect(interlockRow).toContain('Fault alarm scope unavailable');
-    expect(interlockRow).not.toMatch(/>(Acknowledge|Acknowledge all)</);
-    const interlockDetail = renderToStaticMarkup(createElement(HeadlessRuntimeSurfacesView, {
-      enabled: true, headlessState: interlockState, expanded: true,
-    }));
-    expect(interlockDetail).toContain('Attention 1');
-    expect(interlockDetail).toContain('Acknowledgement does not release it');
-    expect(interlockDetail).not.toContain('Acknowledge alarm');
   });
 });

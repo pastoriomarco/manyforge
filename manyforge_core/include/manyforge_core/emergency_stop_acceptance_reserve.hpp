@@ -170,7 +170,7 @@ class EmergencyStopAcceptanceReserve final {
       std::string_view request_id) const noexcept;
 
   /// Zero every resident record for this Stop only after the Kernel has
-  /// committed its immutable terminal certificate/fault/surveillance handoff.
+  /// committed its immutable terminal certificate handoff.
   /// Projection failure deliberately does not prevent reuse.
   [[nodiscard]] std::size_t release_after_terminal_handoff(std::string_view stop_id) noexcept;
 

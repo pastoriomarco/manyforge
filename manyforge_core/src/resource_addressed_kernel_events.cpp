@@ -246,7 +246,7 @@ Result<void> ResourceAddressedExecutionKernel::fail_pre_dispatch(
       if (transaction != stop_transactions_.end()) {
         stop_control_executor_->ArmDeadline((*transaction)->token, clock_.now());
         stop_control_executor_->Publish((*transaction)->token);
-      } else motion_admission_closed_ = true;
+      }
     }
     return FailureRoute::kDone;
   };
@@ -280,7 +280,6 @@ Result<void> ResourceAddressedExecutionKernel::fail_pre_dispatch(
         std::any_of(
             operation->participants.begin(), operation->participants.end(),
             [](const auto& participant) { return participant.prepared_dispatch_released; })) {
-      motion_admission_closed_ = true;
       return reject<void>("pre-dispatch failure raced the coordinated dispatch barrier",
                           "coordinated_pre_dispatch_barrier_race", ErrorCode::kInvariantViolation);
     }
@@ -344,7 +343,6 @@ Result<void> ResourceAddressedExecutionKernel::fail_pre_dispatch(
     return discard_uncommitted_ordinary_preparations(operation_id, failing_engine, failure);
   }
   if (cancellation_failure.has_value()) {
-    motion_admission_closed_ = true;
     for (auto& row : operation->state.participants) {
       if (row.state == OperationStateKind::kCancelledPreDispatch) {
         row.state = OperationStateKind::kInterventionRequired;
@@ -367,7 +365,6 @@ Result<void> ResourceAddressedExecutionKernel::fail_pre_dispatch(
       : admission_refusal              ? "admission_refused_before_dispatch"
                                        : "coordinated_prepare_failed_before_dispatch");
   if (!durable.ok()) {
-    motion_admission_closed_ = true;
     return Result<void>::Err(durable.error());
   }
   if (!durable.value()) return Result<void>::Ok();
@@ -388,7 +385,6 @@ Result<void> ResourceAddressedExecutionKernel::fail_pre_dispatch(
             });
   const auto released = resource_slots_->release_batch(reservation_rows);
   if (!released.ok()) {
-    motion_admission_closed_ = true;
     return released;
   }
   for (auto& participant : operation->participants) {
@@ -570,7 +566,6 @@ void ResourceAddressedExecutionKernel::settle_deferred_capability_stop(
   }
   if (!failure.has_value()) return;
   std::lock_guard state_lock(state_mutex_);
-  motion_admission_closed_ = true;
   auto* operation = find_active_operation_locked(operation_id);
   auto* participant =
       operation == nullptr ? nullptr : operation->participant_for(participant_engine);
@@ -581,7 +576,6 @@ void ResourceAddressedExecutionKernel::settle_deferred_pre_dispatch_cancellation
   struct ReturnedCancellation final {
     OperationId operation_id;
     IResolvedParticipantExecutionEngine* engine{};
-    IResolvedPreparedParticipantExecutionEngine* prepared_engine{};
     AddressedParticipantStopSettlementRequestDTO request;
     OperationStateKind state{OperationStateKind::kStopped};
     std::optional<ErrorDTO> error;
@@ -599,7 +593,6 @@ void ResourceAddressedExecutionKernel::settle_deferred_pre_dispatch_cancellation
           }
           deferred->settlement_in_flight = true;
           returned.push_back(ReturnedCancellation{operation_id, participant.engine,
-                                                  participant.prepared_motion_engine,
                                                   deferred->request, *deferred->returned_state,
                                                   deferred->returned_error});
         }
@@ -607,33 +600,16 @@ void ResourceAddressedExecutionKernel::settle_deferred_pre_dispatch_cancellation
     }
     for (auto& cancellation : returned) {
       std::optional<ErrorDTO> failure;
-      bool preparation_failed = false;
       if (cancellation.state == OperationStateKind::kStopped) {
         // The same exact settlement the Stop would have requested had the
-        // cancellation already returned; a failed settlement fails closed.
+        // cancellation already returned.
         settle_deferred_capability_stop(cancellation.operation_id, cancellation.engine,
                                         cancellation.engine, cancellation.request);
       } else {
-        // As the synchronous path: only the prepared owner's exact snapshot
-        // proves an already-failed, never-dispatched preparation; anything
-        // else is a failed cancellation.
         failure = cancellation.error.value_or(
             error(std::string(to_string(ErrorCode::kExecutionAborted)),
                   "prepared participant failed while settling pre-dispatch cancellation",
                   "prepared_cancel_terminal_failed"));
-        if (cancellation.prepared_engine != nullptr) {
-          try {
-            const auto execution_id = cancellation.request.execution_id;
-            const auto snapshot = cancellation.prepared_engine->ObservePreparedMotion(execution_id);
-            preparation_failed =
-                snapshot.ok() && snapshot.value().execution_id == execution_id &&
-                snapshot.value().state ==
-                    ResolvedPreparedMotionExecutionStateDTO::kPreparationFailed &&
-                !snapshot.value().last_dispatched_participant;
-          } catch (...) {
-            preparation_failed = false;
-          }
-        }
       }
       std::lock_guard state_lock(state_mutex_);
       auto* operation = find_active_operation_locked(cancellation.operation_id);
@@ -642,18 +618,14 @@ void ResourceAddressedExecutionKernel::settle_deferred_pre_dispatch_cancellation
       if (participant == nullptr || !participant->deferred_cancel_settlement.has_value() ||
           participant->deferred_cancel_settlement->request.execution_id !=
               cancellation.request.execution_id) {
-        motion_admission_closed_ = true;
         continue;
       }
       if (failure.has_value()) {
         participant->last_subordinate_error = std::move(failure);
-        if (!preparation_failed) motion_admission_closed_ = true;
       }
       participant->deferred_cancel_settlement.reset();
     }
   } catch (...) {
-    std::lock_guard state_lock(state_mutex_);
-    motion_admission_closed_ = true;
   }
 }
 
@@ -729,9 +701,7 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
                    candidate->stop_id == operation->state.active_stop_id &&
                    candidate->stop_generation == *operation->state.active_stop_generation;
           });
-      if (transaction == stop_transactions_.end()) {
-        motion_admission_closed_ = true;
-      } else {
+      if (transaction != stop_transactions_.end()) {
         stop_wakeup = (*transaction)->token;
         stop_control_executor_->ArmDeadline(*stop_wakeup, clock_.now());
       }
@@ -884,40 +854,17 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
           }
         }
 
-        if (global_io_rule_catalog_) {
+        // R1: interrupt evaluation is paused while the cell is latched.
+        if (global_io_rule_catalog_ && !cell_latched_locked()) {
           const auto evaluated = global_io_rule_service_->EvaluateRules();
           if (!evaluated.ok()) return evaluated;
           const auto qualified = arm_pending_global_io_rules_locked();
           if (!qualified.ok()) return qualified;
           for (const auto& candidate : operation->participants) {
-            auto refusal = global_io_rule_command_refusal_locked(candidate.binding.value(), operation);
-            if (refusal && (refusal->details.at("reason") == "global_interrupt_latched" ||
-                            refusal->details.at("reason") == "global_interrupt_gated")) {
-              const auto& rule_id = refusal->details.at("rule_id");
-              const auto notify = std::find_if(global_io_rule_catalog_->rules.begin(),
-                  global_io_rule_catalog_->rules.end(), [&](const auto& rule) {
-                    return rule.notify_on_trip && rule.policy_id.value() == rule_id;
-                  });
-              const bool notify_gate = notify != global_io_rule_catalog_->rules.end();
-              if (notify_gate) {
-                const auto index = static_cast<std::size_t>(notify - global_io_rule_catalog_->rules.begin());
-                const auto response = process_global_io_rule_evidence_locked(
-                    io_stop_handoff, nullptr, {}, index);
-                if (!response.ok()) {
-                  motion_admission_closed_ = true;
-                  return response;
-                }
-                refusal = global_io_rule_command_refusal_locked(candidate.binding.value(), operation);
-                if (!refusal) continue;
-              }
+            if (const auto refusal =
+                    global_io_rule_command_refusal_locked(candidate.binding.value(), operation)) {
               state_lock.unlock();
               commit.release();
-              if (notify_gate) {
-                publish_stop_work(io_stop_handoff);
-                io_stop_handoff = {};
-                const auto processed = ProcessIoRuleEvidence();
-                if (!processed.ok()) return processed;
-              }
               return fail_pre_dispatch(operation_id, nullptr, *refusal);
             }
           }
@@ -926,7 +873,6 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
         if (!armed.ok()) {
           const auto retired = retire_io_rules_locked(*operation);
           if (!retired.ok()) {
-            motion_admission_closed_ = true;
             return retired;
           }
           state_lock.unlock();
@@ -937,26 +883,13 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
         if (response.ok() && !io_stop_handoff.control && !io_stop_handoff.projection)
           response = process_global_io_rule_evidence_locked(io_stop_handoff, &operation_id);
         if (!response.ok()) {
-          motion_admission_closed_ = true;
           return response;
         }
         if (operation->state.active_stop_id) return Result<void>::Ok();
         for (const auto& candidate : operation->participants) {
           if (const auto refusal = global_io_rule_command_refusal_locked(candidate.binding.value(), operation)) {
-            const auto rule_id = refusal->details.find("rule_id");
-            const bool notify_refusal = rule_id != refusal->details.end() &&
-                std::any_of(global_io_rule_catalog_->rules.begin(), global_io_rule_catalog_->rules.end(),
-                    [&](const auto& rule) {
-                      return rule.notify_on_trip && rule.policy_id.value() == rule_id->second;
-                    });
             state_lock.unlock();
             commit.release();
-            if (notify_refusal) {
-              publish_stop_work(io_stop_handoff);
-              io_stop_handoff = {};
-              const auto processed = ProcessIoRuleEvidence();
-              if (!processed.ok()) return processed;
-            }
             return fail_pre_dispatch(operation_id, nullptr, *refusal);
           }
         }
@@ -970,7 +903,6 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
                           return prepared.participant_id ==
                                  current.participant_id;
                         })) {
-          motion_admission_closed_ = true;
           return reject<void>(
               "prepared rule outcomes lost their exact participant rows",
               "io_rule_participant_state_mismatch",
@@ -1003,7 +935,6 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
         for (auto& candidate : operation->participants) {
           if (!candidate.prepared_participant.has_value() ||
               candidate.prepared_motion_engine == nullptr || candidate.subordinate_id == 0U) {
-            motion_admission_closed_ = true;
             return reject<void>("complete prepared barrier lost one participant product",
                                 "coordinated_prepared_product_missing",
                                 ErrorCode::kInvariantViolation);
@@ -1014,7 +945,6 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
                              return row.participant_id == candidate.slot_owner.participant_id;
                            });
           if (public_row == operation->state.participants.end()) {
-            motion_admission_closed_ = true;
             return reject<void>("complete prepared barrier lost one public participant row",
                                 "operation_participant_state_missing",
                                 ErrorCode::kInvariantViolation);
@@ -1057,7 +987,6 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
           settle_completed_control_locked(operation_id);
         } else {
           participant->last_subordinate_error = cancelled.error();
-          motion_admission_closed_ = true;
         }
       }
     }
@@ -1076,7 +1005,6 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
     std::optional<AddressedParticipantStopSettlementRequestDTO> deferred_settlement;
     IResolvedParticipantExecutionEngine* deferred_settlement_engine{};
     bool cancelled_before_provider = false;
-    bool notify_refusal = false;
     std::optional<ErrorDTO> global_dispatch_refusal;
     {
       std::lock_guard state_lock(state_mutex_);
@@ -1087,29 +1015,14 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
         continue;
       }
       if (participant->stop_owns_reconciliation()) continue;
-      if (global_io_rule_catalog_) {
+      // R1: interrupt evaluation is paused while the cell is latched.
+      if (global_io_rule_catalog_ && !cell_latched_locked()) {
         const auto evaluated = global_io_rule_service_->EvaluateRules();
         if (!evaluated.ok()) return evaluated;
         const auto qualified = arm_pending_global_io_rules_locked();
         if (!qualified.ok()) return qualified;
         global_dispatch_refusal = global_io_rule_command_refusal_locked(participant->binding.value(), operation);
-        const bool already_latched = global_dispatch_refusal &&
-            (global_dispatch_refusal->details.at("reason") == "global_interrupt_latched" ||
-             global_dispatch_refusal->details.at("reason") == "global_interrupt_gated");
-        const auto notify = already_latched ? std::find_if(
-            global_io_rule_catalog_->rules.begin(), global_io_rule_catalog_->rules.end(),
-            [&](const auto& rule) {
-              return rule.notify_on_trip &&
-                     rule.policy_id.value() == global_dispatch_refusal->details.at("rule_id");
-            }) : global_io_rule_catalog_->rules.end();
-        if (notify != global_io_rule_catalog_->rules.end()) {
-          const auto index = static_cast<std::size_t>(notify - global_io_rule_catalog_->rules.begin());
-          const auto response = process_global_io_rule_evidence_locked(
-              io_stop_handoff, nullptr, {}, index);
-          if (!response.ok()) return response;
-          global_dispatch_refusal =
-              global_io_rule_command_refusal_locked(participant->binding.value(), operation);
-        } else if (!already_latched) {
+        if (!global_dispatch_refusal) {
           auto response = process_io_rule_evidence_locked(io_stop_handoff, &operation_id);
           if (response.ok() && !io_stop_handoff.control && !io_stop_handoff.projection)
             response = process_global_io_rule_evidence_locked(io_stop_handoff, &operation_id);
@@ -1118,14 +1031,6 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
           global_dispatch_refusal = global_io_rule_command_refusal_locked(participant->binding.value(), operation);
         }
       }
-      if (global_dispatch_refusal && global_io_rule_catalog_) {
-        const auto rule_id = global_dispatch_refusal->details.find("rule_id");
-        notify_refusal = rule_id != global_dispatch_refusal->details.end() &&
-            std::any_of(global_io_rule_catalog_->rules.begin(), global_io_rule_catalog_->rules.end(),
-                [&](const auto& rule) {
-                  return rule.notify_on_trip && rule.policy_id.value() == rule_id->second;
-                });
-      }
       if (!global_dispatch_refusal) {
         fence_held_prepared_program_commands_locked(operation->state.program_run_id);
         cancelled_before_provider = participant->non_motion_transaction() &&
@@ -1133,20 +1038,13 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
         const bool handover_stale =
             operation->manual_handover &&
             !validate_manual_program_handover_locked(*operation->manual_handover).ok();
-        const auto* current_registration = registration_for(participant->binding);
-        const auto provider_refusal = participant->binding.value().io_output_binding
-            ? (current_registration ? component_command_refusal_locked(*current_registration)
-                                    : std::optional(error("missing_reference", "Output registration retired",
-                                                          "io_output_registration_missing")))
-            : std::nullopt;
-        const bool admission_closed = motion_admission_closed_ || provider_refusal.has_value();
+        const bool admission_closed = motion_admission_closed_locked();
         if ((admission_closed || handover_stale) && participant->non_motion_transaction()) {
           participant->stop_cancelled_pre_dispatch = true;
           participant->last_subordinate_error = error(
               std::string(to_string(ErrorCode::kExecutionRejected)),
               "prepared command lost final dispatch admission",
               handover_stale ? "manual_handover_scope_stale" : "motion_admission_closed");
-          if (provider_refusal) participant->last_subordinate_error = provider_refusal;
           cancelled_before_provider = true;
         } else if (admission_closed || handover_stale) {
           // Reuse exact Stop settlement for an admitted operation whose final
@@ -1167,14 +1065,6 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
       }
     }
 
-    if (notify_refusal) {
-      // Another rule may have consumed the first bounded Stop handoff. Publish
-      // it, then drain outstanding notify containment before refusing dispatch.
-      publish_stop_work(io_stop_handoff);
-      io_stop_handoff = {};
-      const auto processed = ProcessIoRuleEvidence();
-      if (!processed.ok()) return processed;
-    }
     if (global_dispatch_refusal)
       return fail_pre_dispatch(operation_id, dispatch_target.engine, *global_dispatch_refusal);
     if (admission_stop.has_value()) {
@@ -1396,7 +1286,6 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
                            return row.participant_id == candidate.slot_owner.participant_id;
                          });
         if (state_row == operation->state.participants.end()) {
-          motion_admission_closed_ = true;
           continue;
         }
         if (attempted) {
@@ -1430,12 +1319,8 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
         std::vector<StopOperationTargetDTO>{
             StopOperationTargetDTO{operation_id, current_revision, StopGeneration(0U)}},
         std::string("operation_partial_dispatch")};
-    auto stopped =
-        accept_stop(EmergencyStopProjectedIntentDTO{std::move(containment)}, &partial_scope);
-    if (!stopped.ok()) {
-      std::lock_guard state_lock(state_mutex_);
-      motion_admission_closed_ = true;
-    }
+    static_cast<void>(
+        accept_stop(EmergencyStopProjectedIntentDTO{std::move(containment)}, &partial_scope));
 
     if (!undispatched_participants.empty()) {
       std::lock_guard state_lock(state_mutex_);
@@ -1462,10 +1347,8 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
                          "operation_participant_state_missing", ErrorCode::kInvariantViolation);
       auto released = terminalized.ok() ? resource_slots_->release_batch(undispatched_rows)
                                         : Result<void>::Err(terminalized.error());
-      if (!released.ok()) {
-        motion_admission_closed_ = true;
-      } else if (auto* operation = find_active_operation_locked(operation_id);
-                 operation != nullptr) {
+      if (auto* operation = find_active_operation_locked(operation_id);
+          released.ok() && operation != nullptr) {
         for (auto& candidate : operation->participants) {
           if (std::find(attempted_participants.begin(), attempted_participants.end(),
                         candidate.slot_owner.participant_id) == attempted_participants.end()) {
@@ -1475,12 +1358,8 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
       }
     }
     for (const auto& cancellation : cancellations) {
-      if (!cancel_prepared_participant(*cancellation.prepared_engine, cancellation.payload_kind,
-                                       cancellation.preparation_id)
-               .ok()) {
-        std::lock_guard state_lock(state_mutex_);
-        motion_admission_closed_ = true;
-      }
+      static_cast<void>(cancel_prepared_participant(
+          *cancellation.prepared_engine, cancellation.payload_kind, cancellation.preparation_id));
     }
     {
       std::lock_guard state_lock(state_mutex_);
@@ -1491,7 +1370,6 @@ Result<void> ResourceAddressedExecutionKernel::release_prepared_dispatch_barrier
     }
     if (!partial_state.has_value()) {
       std::lock_guard state_lock(state_mutex_);
-      motion_admission_closed_ = true;
       return Result<void>::Ok();
     }
     const auto durable = attempt_journal_write([&] {
@@ -1661,10 +1539,11 @@ Result<void> ResourceAddressedExecutionKernel::advance_prepared_capability_comma
     if (coordinated) {
       return fail_pre_dispatch(operation_id, target->engine, failure);
     }
-    if (cancelled && (target->binding.value().io_output_binding ||
-                      (target->readiness &&
-                       target->readiness->value().resolved_stop_base_plan.gripper_actuation_kind ==
-                           GripperActuationKind::kPneumatic))) {
+    const bool pneumatic =
+        target->readiness &&
+        target->readiness->value().resolved_stop_base_plan.gripper_actuation_kind ==
+            GripperActuationKind::kPneumatic;
+    if (cancelled && pneumatic) {
       const auto proof =
           confirm_prepared_command_no_effect(operation_id, target->engine, target->preparation_id);
       if (!proof.ok()) return Result<void>::Ok();
@@ -1672,30 +1551,22 @@ Result<void> ResourceAddressedExecutionKernel::advance_prepared_capability_comma
     }
     return apply_subordinate_state(
         operation_id, target->engine, target->preparation_id,
-        cancelled ? ((target->binding.value().io_output_binding ||
-                      (target->readiness &&
-                       target->readiness->value().resolved_stop_base_plan.gripper_actuation_kind ==
-                           GripperActuationKind::kPneumatic))
-                         ? OperationStateKind::kCancelledPreDispatch
-                         : OperationStateKind::kStopped)
+        cancelled ? (pneumatic ? OperationStateKind::kCancelledPreDispatch
+                               : OperationStateKind::kStopped)
                   : OperationStateKind::kInterventionRequired,
         0.0, cancelled ? std::optional<ErrorDTO>{} : std::optional(failure));
   }
   if (snapshot.value().state != ResolvedPreparedCapabilityCommandStateDTO::kPrepared ||
-      !snapshot.value().participant ||
-      (target->binding.value().io_output_binding
-           ? snapshot.value().backend_prepare_result.has_value()
-           : !snapshot.value().backend_prepare_result.has_value())) {
+      !snapshot.value().participant || !snapshot.value().backend_prepare_result.has_value()) {
     release_claim();
     return reject<void>("prepared command observation has an invalid shape",
                         "prepared_command_observation_invalid", ErrorCode::kInvariantViolation);
   }
-  const bool output = target->binding.value().io_output_binding.has_value();
-  if (!output && (snapshot.value().participant->controller().ordinary_stop_plan !=
-                      *target->ordinary_stop_plan ||
-                  prepare_participant_result_field_error(*snapshot.value().backend_prepare_result,
-                                                         *snapshot.value().participant)
-                      .has_value())) {
+  if (snapshot.value().participant->controller().ordinary_stop_plan !=
+          *target->ordinary_stop_plan ||
+      prepare_participant_result_field_error(*snapshot.value().backend_prepare_result,
+                                             *snapshot.value().participant)
+          .has_value()) {
     release_claim();
     return reject<void>("prepared command differs from owner authority",
                         "prepared_command_product_mismatch", ErrorCode::kInvariantViolation);
@@ -1726,16 +1597,11 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
   OperationCommitGuard commit(*this, operation_id);
   std::optional<std::uint64_t> sampled_command_generation;
   std::optional<std::string> sampled_command_target;
-  std::optional<IoOutputEvidence> sampled_output_evidence;
   if (observe_current_motion) {
     // Callbacks and polling share this observation path under one writer gate.
     OperationParticipantPayloadKind payload_kind;
     std::uint64_t expected_generation{};
     std::string command_target;
-    bool io_output = false;
-    IResolvedPreparedParticipantExecutionEngine* output_engine = nullptr;
-    std::uint64_t preparation_id{};
-    std::optional<IoOutputCommandIdentityDTO> expected_output_identity;
     {
       std::lock_guard state_lock(state_mutex_);
       const auto* operation = find_active_operation_locked(operation_id);
@@ -1748,47 +1614,8 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
       payload_kind = participant->payload_kind;
       expected_generation = participant->subordinate_generation;
       command_target = participant->binding.value().command_target_id.value();
-      io_output = participant->binding.value().io_output_binding.has_value();
-      output_engine = participant->prepared_motion_engine;
-      preparation_id = participant->preparation_id;
-      if (io_output && participant->prepared_participant &&
-          participant->prepared_participant->provider()) {
-        const auto& prepared = *participant->prepared_participant;
-        const auto public_row = std::find_if(
-            operation->state.participants.begin(), operation->state.participants.end(),
-            [&](const auto& row) { return row.participant_id == prepared.participant_id; });
-        if (public_row != operation->state.participants.end())
-          expected_output_identity = IoOutputCommandIdentityDTO{
-              {prepared.operation_id, prepared.operation_revision, prepared.participant_id,
-               public_row->command_id, public_row->command_generation},
-              prepared.prepared_contract_digest,
-              prepared.component_lifecycle_generation,
-              prepared.provider()->lifecycle_provider};
-      }
     }
-    if (io_output) {
-      if (!output_engine)
-        return reject<void>("output has no prepared observation owner",
-                            "io_output_observer_missing", ErrorCode::kInvariantViolation);
-      const auto snapshot = output_engine->ObservePreparedCapabilityCommand(preparation_id);
-      if (!snapshot.ok()) return Result<void>::Err(snapshot.error());
-      if (snapshot.value().preparation_id != preparation_id ||
-          !snapshot.value().output_observation || !snapshot.value().output_execution_status ||
-          !expected_output_identity ||
-          snapshot.value().output_observation->identity != *expected_output_identity ||
-          snapshot.value().output_execution_status->execution_id != subordinate_id)
-        return reject<void>("output observation differs from its committed session",
-                            "io_output_observation_identity_mismatch",
-                            ErrorCode::kInvariantViolation);
-      const auto& current = *snapshot.value().output_execution_status;
-      sampled_command_generation = expected_generation;
-      sampled_command_target = command_target;
-      sampled_output_evidence = snapshot.value().output_observation->evidence;
-      terminal_fact = current.fact;
-      state = participant_operation_state(current);
-      progress = current.progress;
-      terminal_error = participant_fact_error(current);
-    } else if (payload_kind == OperationParticipantPayloadKind::kCapabilityCommand) {
+    if (payload_kind == OperationParticipantPayloadKind::kCapabilityCommand) {
       terminal_fact.reset();
       const auto current = engine->get_gripper_status(command_target);
       if (current.gripper_id != command_target ||
@@ -1967,9 +1794,7 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
        (participant.terminal_error->code == terminal_error->code &&
         participant.terminal_error->message == terminal_error->message &&
         participant.terminal_error->details == terminal_error->details));
-  const bool same_output_evidence =
-      !sampled_output_evidence || participant.output_evidence == sampled_output_evidence;
-  if (!slot_changed && participant.state == state && same_terminal_fact && same_output_evidence &&
+  if (!slot_changed && participant.state == state && same_terminal_fact &&
       (!terminal(state) || same_terminal_error)) {
     // Progress is current presentation, not a durable lifecycle transition.
     // Retain the latest scalar without writing a full operation snapshot on
@@ -1987,7 +1812,6 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
       [&](const auto& candidate) {
         return candidate.participant_id == active_participant->slot_owner.participant_id;
       });
-  if (sampled_output_evidence) observed_participant.output_evidence = sampled_output_evidence;
   if (terminal(state) &&
       (!active_participant->io_rule_registrations.empty() ||
        std::any_of(participant_iterator->io_rule_outcomes.begin(),
@@ -1995,7 +1819,6 @@ Result<void> ResourceAddressedExecutionKernel::apply_subordinate_state(
                    [](const auto& outcome) { return !outcome.terminal_cause; }))) {
     const auto retired = retire_participant_io_rules_locked(*active_participant);
     if (!retired.ok()) {
-      motion_admission_closed_ = true;
       return retired;
     }
     observed_participant.io_rule_outcomes = participant_iterator->io_rule_outcomes;
@@ -2233,11 +2056,7 @@ void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecu
       stop_control_executor_->Publish(*escalation_wakeup);
     }
     if (containment.has_value()) {
-      auto stopped = accept_stop(EmergencyStopProjectedIntentDTO{std::move(*containment)});
-      if (!stopped.ok()) {
-        std::lock_guard state_lock(state_mutex_);
-        motion_admission_closed_ = true;
-      }
+      static_cast<void>(accept_stop(EmergencyStopProjectedIntentDTO{std::move(*containment)}));
     }
     return;
   }
@@ -2277,11 +2096,7 @@ void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecu
       }
     }
     if (hold_stop.has_value()) {
-      auto stopped = accept_stop(EmergencyStopProjectedIntentDTO{std::move(*hold_stop)});
-      if (!stopped.ok()) {
-        std::lock_guard state_lock(state_mutex_);
-        motion_admission_closed_ = true;
-      }
+      static_cast<void>(accept_stop(EmergencyStopProjectedIntentDTO{std::move(*hold_stop)}));
     }
     return;
   }
@@ -2339,11 +2154,7 @@ void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecu
       }
     }
     if (containment.has_value()) {
-      auto stopped = accept_stop(EmergencyStopProjectedIntentDTO{std::move(*containment)});
-      if (!stopped.ok()) {
-        std::lock_guard state_lock(state_mutex_);
-        motion_admission_closed_ = true;
-      }
+      static_cast<void>(accept_stop(EmergencyStopProjectedIntentDTO{std::move(*containment)}));
     }
     if (operation_id.has_value()) {
       (void)advance_prepared_motion(*operation_id, engine);
@@ -2421,9 +2232,7 @@ void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecu
                    candidate->stop_id == operation->state.active_stop_id &&
                    candidate->stop_generation == *operation->state.active_stop_generation;
           });
-      if (transaction == stop_transactions_.end()) {
-        motion_admission_closed_ = true;
-      } else {
+      if (transaction != stop_transactions_.end()) {
         stop_wakeup = (*transaction)->token;
         const auto* participant = operation->participant_for(engine);
         if (participant != nullptr) {
@@ -2436,11 +2245,6 @@ void ResourceAddressedExecutionKernel::on_engine_event(IResolvedParticipantExecu
           aggregate_stop_owns_terminal = participant->stop_owns_reconciliation();
           if (work != (*transaction)->participants.end()) {
             observe_prepared_cancellation_terminal(*work, event.execution_id, state, event.error);
-            // Only a never-dispatched participant's failed cancellation closes
-            // admission. A dispatched participant's retained stage error is an
-            // escalation: operation-scoped, the cell stays admissible (Q29).
-            if (work->cancelled_pre_dispatch && work->terminal_error.has_value())
-              motion_admission_closed_ = true;
           }
         }
         stop_control_executor_->ArmDeadline(*stop_wakeup, clock_.now());
@@ -2650,184 +2454,6 @@ std::vector<ResourceSlotSnapshotDTO> ResourceAddressedExecutionKernel::resource_
 
 ResourceSlotTableSnapshotDTO ResourceAddressedExecutionKernel::resource_table_snapshot() const {
   return resource_slots_->coherent_snapshot();
-}
-
-Result<OrphanResourceReconciliationResultDTO>
-ResourceAddressedExecutionKernel::reconcile_orphaned_resources(
-    const OrphanResourceReconciliationFactsDTO& facts) {
-  if (orphan_resource_reconciliation_facts_field_error(facts).has_value()) {
-    return reject<OrphanResourceReconciliationResultDTO>(
-        "orphan-resource reconciliation facts are invalid",
-        "orphan_resource_reconciliation_facts_invalid", ErrorCode::kInvalidRequest);
-  }
-
-  std::lock_guard submit_lock(submission_mutex_);
-  std::lock_guard state_lock(state_mutex_);
-  if (facts.request_owner_epoch != config_.request_owner_epoch ||
-      facts.cell_id != config_.cell_id || !stop_retained_bundle_id_.has_value() ||
-      !stop_graph_revision_.has_value() || facts.retained_bundle_id != *stop_retained_bundle_id_ ||
-      facts.graph_revision != *stop_graph_revision_) {
-    return reject<OrphanResourceReconciliationResultDTO>(
-        "orphan-resource reconciliation crosses current Kernel identity",
-        "orphan_resource_reconciliation_identity_mismatch", ErrorCode::kInvalidStateTransition);
-  }
-
-  const auto snapshot = resource_slots_->coherent_snapshot();
-  if (snapshot.operation_resource_generation != facts.expected_operation_resource_generation) {
-    return reject<OrphanResourceReconciliationResultDTO>(
-        "orphan-resource reconciliation names a stale slot generation",
-        "orphan_resource_reconciliation_generation_stale", ErrorCode::kInvalidStateTransition);
-  }
-  const auto configurations = resource_slots_->admission_snapshot({}).active_control_configurations;
-  const auto now_ns = clock_.now();
-  if (now_ns < facts.assessed_at_ns) {
-    return reject<OrphanResourceReconciliationResultDTO>(
-        "orphan-resource reconciliation was assessed in the future",
-        "orphan_resource_reconciliation_time_invalid", ErrorCode::kInvalidRequest);
-  }
-  const auto elapsed_ns = now_ns - facts.assessed_at_ns;
-  std::vector<ResourceId> resources;
-  resources.reserve(facts.resources.size());
-  for (const auto& fact : facts.resources) {
-    const auto slot = std::lower_bound(
-        snapshot.slots.begin(), snapshot.slots.end(), fact.resource_id,
-        [](const auto& row, const ResourceId& resource) { return row.resource_id < resource; });
-    if (slot == snapshot.slots.end() || slot->resource_id != fact.resource_id ||
-        slot->state != ResourceSlotState::kUnreconciledExternalOrOrphanGoal ||
-        slot->owner.has_value() || !fact.settlement.source_age_ns.has_value() ||
-        !fact.settlement.freshness_budget_ns.has_value() ||
-        elapsed_ns > *fact.settlement.freshness_budget_ns - *fact.settlement.source_age_ns) {
-      return reject<OrphanResourceReconciliationResultDTO>(
-          "orphan-resource reconciliation is stale or does not name a current orphan row",
-          "orphan_resource_reconciliation_scope_or_freshness_changed",
-          ErrorCode::kInvalidStateTransition);
-    }
-
-    const ActiveControlConfigurationDTO* active_configuration = nullptr;
-    const auto readback = runtime_route_configuration_readbacks_.find(fact.control_domain_id);
-    const bool has_domain_readback = readback != runtime_route_configuration_readbacks_.end();
-    if (has_domain_readback && readback->second.provider() == nullptr &&
-        readback->second.controller().active_configuration.active_control_configuration_id ==
-            fact.active_control_configuration_id &&
-        readback->second.controller().active_configuration.active_control_configuration_generation ==
-            fact.active_control_configuration_generation &&
-        readback->second.controller().active_configuration.state ==
-            ActiveControlConfigurationStateDTO::kReconciled) {
-      active_configuration = &readback->second.controller().active_configuration;
-    }
-    const std::vector<DesiredControlBindingRouteDTO>* retained_binding_routes = nullptr;
-    if (!has_domain_readback) {
-      for (const auto& registration : registrations_) {
-        if (!registration.stop_readiness.has_value()) {
-          continue;
-        }
-        const auto& readiness = registration.stop_readiness->value();
-        const auto& expected = readiness.expected_controller_domain;
-        const auto& plan = readiness.resolved_stop_base_plan;
-        if (expected.control_domain_id == fact.control_domain_id &&
-            plan.active_control_configuration_id == fact.active_control_configuration_id &&
-            plan.active_control_configuration_generation ==
-                fact.active_control_configuration_generation) {
-          retained_binding_routes = &expected.desired_configuration.binding_routes;
-          break;
-        }
-      }
-    }
-
-    bool matched_source = false;
-    bool found_containing_registration = false;
-    for (const auto& registration : registrations_) {
-      const auto& binding = registration.binding.value();
-      const bool contains = std::any_of(
-          binding.resources.begin(), binding.resources.end(),
-          [&](const auto& resource) { return resource.resource_id == fact.resource_id; });
-      if (!contains) {
-        continue;
-      }
-      found_containing_registration = true;
-      if (!binding.control_path.has_value()) {
-        return reject<OrphanResourceReconciliationResultDTO>(
-            "orphan resource has no exact current control path",
-            "orphan_resource_reconciliation_binding_missing", ErrorCode::kInvariantViolation);
-      }
-      const auto& path = *binding.control_path;
-      const bool same_physical_owner =
-          binding.controllable_component_id == fact.controllable_component_id &&
-          binding.command_target_id == fact.command_target_id &&
-          path.control_domain_id == fact.control_domain_id &&
-          path.active_control_configuration_id == fact.active_control_configuration_id &&
-          path.active_control_configuration_generation ==
-              fact.active_control_configuration_generation &&
-          path.provider_runtime_unit_id == fact.provider_runtime_unit_id &&
-          path.provider_runtime_epoch == fact.provider_runtime_epoch &&
-          fact.settlement.source_epoch == std::optional<RuntimeEpoch>(path.provider_runtime_epoch);
-      if (!same_physical_owner) {
-        return reject<OrphanResourceReconciliationResultDTO>(
-            "orphan-resource reconciliation differs from a current binding",
-            "orphan_resource_reconciliation_binding_mismatch", ErrorCode::kInvalidStateTransition);
-      }
-
-      const auto route_matches = [&](const auto& routes) {
-        const auto route =
-            std::lower_bound(routes.begin(), routes.end(), path.control_binding_id,
-                             [](const auto& row, const ControlBindingId& binding_id) {
-                               return row.control_binding_id < binding_id;
-                             });
-        return route != routes.end() && route->control_binding_id == path.control_binding_id &&
-               route->control_binding_revision == path.control_binding_revision &&
-               route->control_route_id == path.control_route_id;
-      };
-      const bool current_route =
-          active_configuration != nullptr
-              ? route_matches(active_configuration->binding_routes)
-              : retained_binding_routes != nullptr && route_matches(*retained_binding_routes);
-      if (!current_route) {
-        return reject<OrphanResourceReconciliationResultDTO>(
-            "orphan-resource reconciliation differs from current binding-route truth",
-            "orphan_resource_reconciliation_configuration_mismatch",
-            ErrorCode::kInvalidStateTransition);
-      }
-      matched_source =
-          matched_source || (path.control_binding_id == fact.control_binding_id &&
-                             path.control_binding_revision == fact.control_binding_revision);
-    }
-    const auto configuration =
-        std::lower_bound(configurations.begin(), configurations.end(), fact.control_domain_id,
-                         [](const auto& row, const ControlDomainId& domain) {
-                           return row.control_domain_id < domain;
-                         });
-    if (!found_containing_registration || !matched_source ||
-        configuration == configurations.end() ||
-        configuration->control_domain_id != fact.control_domain_id ||
-        configuration->active_control_configuration_id != fact.active_control_configuration_id ||
-        configuration->active_control_configuration_generation !=
-            fact.active_control_configuration_generation) {
-      return reject<OrphanResourceReconciliationResultDTO>(
-          "orphan-resource reconciliation differs from current route truth",
-          "orphan_resource_reconciliation_configuration_mismatch",
-          ErrorCode::kInvalidStateTransition);
-    }
-    resources.push_back(fact.resource_id);
-  }
-
-  auto reconciled = resource_slots_->reconcile_unreconciled_external_or_orphan_goal(
-      facts.expected_operation_resource_generation, resources);
-  if (!reconciled.ok()) {
-    return Result<OrphanResourceReconciliationResultDTO>::Err(reconciled.error());
-  }
-  std::vector<ResourceId> remaining;
-  for (const auto& slot : resource_slots_->snapshot()) {
-    if (slot.state == ResourceSlotState::kUnreconciledExternalOrOrphanGoal) {
-      remaining.push_back(slot.resource_id);
-    }
-  }
-  motion_admission_unreconciled_ = !remaining.empty();
-  OrphanResourceReconciliationResultDTO result{std::move(resources), std::move(remaining),
-                                               reconciled.value()};
-  if (orphan_resource_reconciliation_result_field_error(result).has_value()) {
-    std::terminate();
-  }
-  return Result<OrphanResourceReconciliationResultDTO>::Ok(std::move(result));
 }
 
 }  // namespace manyforge::core

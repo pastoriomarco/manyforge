@@ -1,14 +1,13 @@
 #include "io_provider_lifecycle_product.hpp"
-#include <manyforge_core/types/component_incident.hpp>
-#include <manyforge_core/types/lifecycle_cause.hpp>
+#include <manyforge_roboplan/host_component_stream_health.hpp>
 #include <manyforge_roboplan/ros_mapped_boolean_input_provider.hpp>
-#include "xarm_digital_address.hpp"
 
 #include <algorithm>
 #include <limits>
 #include <set>
 #include <string_view>
 #include <tuple>
+#include <variant>
 #include <type_traits>
 
 namespace manyforge::roboplan_backend::host_detail {
@@ -33,64 +32,52 @@ bool same_rows(
   return true;
 }
 
-std::vector<core::LifecycleFactDTO> facts(bool resources, bool enabled,
-                                          bool fault, bool transport,
-                                          bool retired = false) {
-  const auto boolean = [](const char *id, bool value) {
-    return core::LifecycleFactDTO{
-        core::LifecycleFactId(id),
-        {core::LifecycleFactValueKindDTO::kBoolean, value, {}, {}}};
-  };
-  // Report the existing standard CCLC cause from actual local driver facts.
-  // Initial unavailability and an intentionally disabled connection are not
-  // faults. Retirement is ordinary teardown, even if cleanup has a diagnostic.
-  const auto cause = retired ? core::LifecycleBlockingCauseClassDTO::kNone
-                     : fault ? core::LifecycleBlockingCauseClassDTO::kFault
-                     : enabled && !transport
-                         ? core::LifecycleBlockingCauseClassDTO::kProviderLost
-                     : !resources || !transport
-                         ? core::LifecycleBlockingCauseClassDTO::kAvailability
-                         : core::LifecycleBlockingCauseClassDTO::kNone;
-  return {
-      boolean("io.driver.enabled", enabled),
-      boolean("io.driver.fault_present", fault),
-      boolean("io.driver.resources_ready", resources),
-      boolean("io.driver.transport_ready", transport),
-      {core::LifecycleFactId(std::string(core::kLifecycleBlockingCauseFactId)),
-       {core::LifecycleFactValueKindDTO::kToken,
-        {},
-        {},
-        std::string(core::to_string(cause))}}};
+core::ActionResult action_result(core::ActionOutcome outcome,
+                                 std::optional<core::ErrorDTO> error = std::nullopt) {
+  core::ActionResult result;
+  result.outcome = outcome;
+  if (error)
+    result.error = core::ActionError{std::move(error->code), std::move(error->message),
+                                     std::nullopt, std::nullopt};
+  return result;
+}
+
+core::ErrorDTO senders_gone() {
+  return {"io_device_senders_gone",
+          "Every sender of this I/O device's inputs has gone", {}};
+}
+
+core::ComponentStream stream_of(const core::StreamHealthDTO &health) {
+  return {health.stream_id,
+          health.state == core::StreamLivenessStateDTO::kLive    ? core::StreamFreshness::kFresh
+          : health.state == core::StreamLivenessStateDTO::kStale ? core::StreamFreshness::kStale
+                                                                  : core::StreamFreshness::kNone,
+          health.age_ns};
 }
 } // namespace
 
-struct IoProviderDriverRecord::State final {
-  State(core::ResolvedLifecycleControlDomainScopeDTO selected_domain,
+struct IoProviderDriverRecord::Driver final {
+  Driver(core::ResolvedLifecycleControlDomainScopeDTO selected_domain,
         core::ResolvedLifecycleProviderOccurrenceDTO selected_occurrence,
         core::ProviderManifestDTO selected_manifest,
-        core::BrandLifecyclePlanCatalogDTO selected_catalog,
         std::shared_ptr<core::IClock> selected_clock)
       : domain(std::move(selected_domain)),
         occurrence(std::move(selected_occurrence)),
-        manifest(std::move(selected_manifest)),
-        catalog(std::move(selected_catalog)), clock(std::move(selected_clock)) {
+        manifest(std::move(selected_manifest)), clock(std::move(selected_clock)) {
   }
   struct Input final {
     IoProviderInputSourceInstallation installation;
     std::variant<std::unique_ptr<MockBooleanInputProvider>,
                  std::unique_ptr<RosBooleanInputProvider>,
                  std::unique_ptr<RosMappedBooleanInputProvider>,
-                 std::unique_ptr<GeometricContactInputProvider>,
-                 std::unique_ptr<XArmDigitalInputProvider>>
+                 std::unique_ptr<GeometricContactInputProvider>>
         leaf;
   };
   core::ResolvedLifecycleControlDomainScopeDTO domain;
   core::ResolvedLifecycleProviderOccurrenceDTO occurrence;
   core::ProviderManifestDTO manifest;
-  core::BrandLifecyclePlanCatalogDTO catalog;
   std::shared_ptr<core::IClock> clock;
   mutable std::mutex mutex;
-  std::shared_ptr<RetainedExternallyManagedBrandLifecyclePort> port;
   std::vector<Input> inputs;
   std::vector<IoProviderOutputChannelInstallation> outputs;
   std::function<void()> cancel_pending;
@@ -103,11 +90,55 @@ struct IoProviderDriverRecord::State final {
   bool enabled{};
   bool retired{};
   std::optional<core::ErrorDTO> fault;
+  /// Outputs whose last write's outcome is unknown (CONTRACTS §7): the
+  /// component's activity is `unknown` until a later answered write to that
+  /// output, or a successful prepare or recover.
+  std::set<std::string> unknown_outputs;
   std::function<std::optional<core::ErrorDTO>()> process_fault_source;
   std::vector<std::unique_ptr<core::StreamRecorder>> observer_streams;
-  std::vector<core::LifecycleFactDTO> last_facts;
   std::optional<std::vector<IoProviderInputSourceInstallation>> last_rebind;
   std::optional<core::ErrorDTO> last_rebind_error;
+  /// IO-1: a ROS input topic had a publisher since install.
+  bool senders_seen{};
+  /// IO-1: every sender left while enabled; held until Recover or Disable.
+  bool senders_lost{};
+  /// IO-1: the optional `inputs` stream, shared with the ROS input leaves.
+  std::shared_ptr<core::StreamRecorder> inputs_stream;
+
+  // IO-1: the ROS input leaves (Mock and geometric inputs have no sender).
+  template <typename Visit> bool ForRosInputs(Visit &&visit) {
+    bool any = false;
+    for (auto &input : inputs)
+      std::visit(
+          [&](auto &leaf) {
+            using Leaf = std::decay_t<decltype(leaf)>;
+            if constexpr (std::is_same_v<Leaf, std::unique_ptr<RosBooleanInputProvider>> ||
+                          std::is_same_v<Leaf, std::unique_ptr<RosMappedBooleanInputProvider>>) {
+              any = true;
+              visit(input, *leaf);
+            }
+          },
+          input.leaf);
+    return any;
+  }
+
+  // IO-1: every ROS input topic has no publisher, after one had one since
+  // install. The graph's count per topic, so a leaf's resubscription
+  // (Enable) doesn't look like a lost sender.
+  bool SendersGone() {
+    bool present = false;
+    const bool ros = ForRosInputs([&](const Input &input, auto &) {
+      const auto &topic = input.installation.rows.front().provider.topic;
+      try {
+        present = present || input.installation.node->count_publishers(*topic) > 0U;
+      } catch (const std::exception &) {
+        // The ROS context is going away; TransportReady() reports it.
+        present = true;
+      }
+    });
+    senders_seen = senders_seen || present;
+    return ros && senders_seen && !present;
+  }
 
   // The supervised process's exit, never latched into `fault`: the
   // restarted process's source replaces it at the next Apply.
@@ -126,16 +157,6 @@ struct IoProviderDriverRecord::State final {
       reason.resize(end);
     }
     return fault;
-  }
-
-  std::optional<core::ErrorDTO> EffectiveFault() const {
-    return fault ? fault : ProcessFault();
-  }
-
-  core::ComponentLifecycleStateDTO EffectiveState(
-      const std::optional<core::ErrorDTO> &effective) const {
-    return effective && !fault ? core::ComponentLifecycleStateDTO::kFaulted
-                               : state;
   }
 
   bool TransportReady() const {
@@ -188,8 +209,6 @@ struct IoProviderDriverRecord::State final {
       if (!rows.empty())
         diagnostic.details.emplace("signal_name",
                                    rows.front().descriptor.signal_id.name);
-      if (!core::ComponentIncidentDiagnosticIsValid(diagnostic))
-        return std::nullopt;
       return diagnostic;
     };
     for (const auto &input : inputs)
@@ -211,15 +230,6 @@ struct IoProviderDriverRecord::State final {
       if (ready)
         continue;
       const auto *row = output.rows.empty() ? nullptr : &output.rows.front();
-      if (row && row->provider.profile == "xarm_digital" &&
-          row->provider.robot_component_id && row->provider.bank) {
-        const auto bank = *row->provider.bank == "tool"
-                              ? XArmDigitalBank::kTool
-                              : XArmDigitalBank::kController;
-        const auto service = XArmDigitalServiceName(
-            row->provider.robot_component_id->value(), bank, true);
-        return missing(output.rows, "service", service);
-      }
       const bool service = row && row->provider.service;
       return missing(output.rows, service ? "service" : "topic",
                      !row       ? std::nullopt
@@ -236,25 +246,6 @@ struct IoProviderDriverRecord::State final {
     return true;
   }
 
-  void CommitFacts() {
-    last_facts = facts(installed && !retired, enabled,
-                       EffectiveFault().has_value(), TransportReady(), retired);
-  }
-
-  core::Result<RetainedExternallyManagedDomainSnapshot> Snapshot() {
-    auto effective = EffectiveFault();
-    auto current = facts(installed && !retired, enabled, effective.has_value(),
-                         TransportReady(), retired);
-    if (current != last_facts) {
-      if (!Advance())
-        return core::Result<RetainedExternallyManagedDomainSnapshot>::Err(
-            error("driver_generation_exhausted"));
-      last_facts = current;
-    }
-    return core::Result<RetainedExternallyManagedDomainSnapshot>::Ok(
-        {generation, EffectiveState(effective), false, std::move(current),
-         std::move(effective), {}});
-  }
 
   bool Owns(const deployment::RetainedIoSignalConfiguration &row) const {
     return row.runtime_unit_id == occurrence.provider_runtime_unit_id &&
@@ -269,15 +260,13 @@ struct IoProviderDriverRecord::State final {
       return false;
     for (std::size_t i = 0; i < a.size(); ++i)
       if (!same_rows(a[i].rows, b[i].rows) || a[i].node != b[i].node ||
-          a[i].ingress != b[i].ingress || a[i].incarnation != b[i].incarnation ||
-          (!a[i].rows.empty() && a[i].rows.front().provider.profile == "xarm_digital" &&
-           a[i].scheduler != b[i].scheduler))
+          a[i].ingress != b[i].ingress || a[i].incarnation != b[i].incarnation)
         return false;
     return true;
   }
 };
 
-IoProviderDriverRecord::IoProviderDriverRecord(std::unique_ptr<State> state)
+IoProviderDriverRecord::IoProviderDriverRecord(std::unique_ptr<Driver> state)
     : state_(std::move(state)) {}
 IoProviderDriverRecord::~IoProviderDriverRecord() { Shutdown(); }
 
@@ -285,8 +274,7 @@ core::Result<std::shared_ptr<IoProviderDriverRecord>>
 IoProviderDriverRecord::Create(
     core::ResolvedLifecycleControlDomainScopeDTO domain,
     core::ResolvedLifecycleProviderOccurrenceDTO occurrence,
-    core::ProviderManifestDTO manifest, std::shared_ptr<core::IClock> clock,
-    core::Duration observation_freshness_ns, core::Duration poll_period_ns) {
+    core::ProviderManifestDTO manifest, std::shared_ptr<core::IClock> clock) {
   using Reply = core::Result<std::shared_ptr<IoProviderDriverRecord>>;
   const auto *provider = domain.provider();
   if (!domain.locally_valid() || !provider || !clock ||
@@ -294,47 +282,14 @@ IoProviderDriverRecord::Create(
           domain.control_domain_id, domain.control_domain_revision,
           provider->provider, provider->provider_runtime_epoch, occurrence))
     return Reply::Err(error("driver_occurrence_invalid"));
-  auto catalog = core::MakeIoProviderLifecycleCatalog(manifest);
-  if (!catalog.ok())
-    return Reply::Err(catalog.error());
-  if (catalog.value().catalog_digest !=
-          occurrence.lifecycle_plan_catalog_digest ||
-      manifest.provider_manifest_id != occurrence.provider_manifest_id ||
+  if (manifest.provider_manifest_id != occurrence.provider_manifest_id ||
       manifest.provider_manifest_revision !=
           occurrence.provider_manifest_revision)
-    return Reply::Err(error("driver_catalog_not_exact"));
-  auto state = std::make_unique<State>(
-      std::move(domain), std::move(occurrence), std::move(manifest),
-      std::move(catalog.value()), std::move(clock));
-  state->last_facts = facts(false, false, false, false);
-  auto record = std::shared_ptr<IoProviderDriverRecord>(
-      new IoProviderDriverRecord(std::move(state)));
-  std::weak_ptr<IoProviderDriverRecord> weak = record;
-  auto port =
-      RetainedExternallyManagedBrandLifecyclePort::CreateForProviderDomain(
-          record->domain().provider()->provider.controllable_component_id,
-          record->occurrence(), record->catalog(),
-          [weak, clock_pin = record->state_->clock](const auto &id, auto now) {
-            // The borrowed clock is used by the brand port before this source
-            // callback. Keep it alive even when only the port survives.
-            static_cast<void>(clock_pin);
-            if (auto driver = weak.lock())
-              return driver->ReadLifecycleSnapshot(id, now);
-            return core::Result<RetainedExternallyManagedDomainSnapshot>::Err(
-                error("driver_retired"));
-          },
-          *record->state_->clock, observation_freshness_ns, poll_period_ns,
-          [weak](const auto &intent, auto cancellation) {
-            if (auto driver = weak.lock())
-              return driver->Dispatch(intent, cancellation);
-            return RetainedExternallyManagedPrimitiveOutcome{
-                RetainedRos2ControlSwitchOutcome::kNotSent,
-                error("driver_retired")};
-          });
-  if (!port.ok())
-    return Reply::Err(port.error());
-  record->state_->port = std::move(port.value());
-  return Reply::Ok(std::move(record));
+    return Reply::Err(error("driver_manifest_not_exact"));
+  auto state = std::make_unique<Driver>(std::move(domain), std::move(occurrence),
+                                       std::move(manifest), std::move(clock));
+  return Reply::Ok(std::shared_ptr<IoProviderDriverRecord>(
+      new IoProviderDriverRecord(std::move(state))));
 }
 
 const core::ResolvedLifecycleControlDomainScopeDTO &
@@ -344,10 +299,6 @@ IoProviderDriverRecord::domain() const noexcept {
 const core::ResolvedLifecycleProviderOccurrenceDTO &
 IoProviderDriverRecord::occurrence() const noexcept {
   return state_->occurrence;
-}
-const core::BrandLifecyclePlanCatalogDTO &
-IoProviderDriverRecord::catalog() const noexcept {
-  return state_->catalog;
 }
 const core::ProviderManifestDTO &
 IoProviderDriverRecord::manifest() const noexcept {
@@ -372,18 +323,6 @@ std::uint64_t
 IoProviderDriverRecord::driver_observation_generation_locked() const noexcept {
   return state_->generation;
 }
-core::BrandLifecyclePortRegistrationDTO
-IoProviderDriverRecord::brand_registration() const {
-  std::weak_ptr<const IoProviderDriverRecord> weak = shared_from_this();
-  return {state_->occurrence, state_->port,
-          [weak, id = state_->domain.control_domain_id](auto now) {
-            if (auto driver = weak.lock())
-              return driver->ReadLifecycleHealth(id, now);
-            return core::Result<core::LifecycleDomainHealthDTO>::Err(
-                error("driver_retired"));
-          }};
-}
-
 core::Result<void> IoProviderDriverRecord::InstallResourcesLocked(
     std::vector<IoProviderInputSourceInstallation> inputs,
     std::vector<IoProviderOutputChannelInstallation> outputs,
@@ -426,8 +365,6 @@ core::Result<void> IoProviderDriverRecord::InstallResourcesLocked(
                      std::shared_ptr<MockBooleanOutputProvider>>(
                      output.provider)
            : (row.provider.profile == "ros_set_bool" ||
-              row.provider.profile == "ur_set_io" ||
-              row.provider.profile == "xarm_digital" ||
               row.provider.profile == "ros2_control_gpio")
                ? !std::holds_alternative<
                      std::shared_ptr<RosBooleanOutputProvider>>(output.provider)
@@ -440,7 +377,7 @@ core::Result<void> IoProviderDriverRecord::InstallResourcesLocked(
       std::vector<core::ResourceId>(resources.begin(), resources.end()) !=
           state_->domain.resource_ids())
     return Reply::Err(error("driver_resource_closure_not_exact"));
-  std::vector<State::Input> prepared_inputs;
+  std::vector<Driver::Input> prepared_inputs;
   prepared_inputs.reserve(inputs.size());
   for (auto &input : inputs) {
     const auto &first = input.rows.front();
@@ -486,51 +423,18 @@ core::Result<void> IoProviderDriverRecord::InstallResourcesLocked(
       if (!leaf.ok())
         return Reply::Err(leaf.error());
       prepared_inputs.push_back({std::move(input), std::move(leaf.value())});
-    } else if (first.provider.profile == "xarm_digital") {
-      if (!input.node || !input.scheduler || !first.provider.robot_component_id ||
-          !first.provider.bank)
-        return Reply::Err(error("driver_xarm_input_source_invalid"));
-      const auto bank = *first.provider.bank == "tool"
-                            ? XArmDigitalBank::kTool
-                            : XArmDigitalBank::kController;
-      std::vector<XArmDigitalInputSignal> signals;
-      for (const auto &row : input.rows) {
-        if (!row.provider.pin || row.provider.bank != first.provider.bank ||
-            row.provider.robot_component_id != first.provider.robot_component_id)
-          return Reply::Err(error("driver_xarm_input_source_invalid"));
-        signals.push_back({row.descriptor,
-                           static_cast<std::uint8_t>(*row.provider.pin)});
-      }
-      const auto service = XArmDigitalServiceName(
-          first.provider.robot_component_id->value(), bank, false);
-      auto leaf = XArmDigitalInputProvider::Create(
-          input.node, input.ingress, state_->clock, input.scheduler,
-          {first.descriptor.source_id, input.incarnation, service, bank,
-           std::move(signals)}, state_->generation);
-      if (!leaf.ok())
-        return Reply::Err(leaf.error());
-      prepared_inputs.push_back({std::move(input), std::move(leaf.value())});
-    } else if (first.provider.profile == "ur_io_states" ||
-               first.provider.profile == "ros2_control_gpio") {
+    } else if (first.provider.profile == "ros2_control_gpio") {
       if (!input.node || !first.provider.topic)
         return Reply::Err(error("driver_ros_mapped_source_invalid"));
       std::vector<RosMappedBooleanInputSignal> signals;
       signals.reserve(input.rows.size());
       for (const auto &row : input.rows) {
-        if (first.provider.profile == "ur_io_states") {
-          if (!row.provider.pin || *row.provider.pin > 17U)
-            return Reply::Err(error("driver_ur_input_pin_invalid"));
-          signals.push_back(
-              {row.descriptor, UrDigitalInputSelector{static_cast<std::uint8_t>(
-                                   *row.provider.pin)}});
-        } else {
-          if (!row.provider.group || !row.provider.interface_name)
-            return Reply::Err(error("driver_gpio_input_selector_absent"));
-          signals.push_back(
-              {row.descriptor,
-               RosGpioBooleanInputSelector{*row.provider.group,
-                                           *row.provider.interface_name}});
-        }
+        if (!row.provider.group || !row.provider.interface_name)
+          return Reply::Err(error("driver_gpio_input_selector_absent"));
+        signals.push_back(
+            {row.descriptor,
+             RosGpioBooleanInputSelector{*row.provider.group,
+                                         *row.provider.interface_name}});
       }
       auto leaf = RosMappedBooleanInputProvider::Create(
           input.node, input.ingress, *state_->clock,
@@ -552,7 +456,6 @@ core::Result<void> IoProviderDriverRecord::InstallResourcesLocked(
   state_->input_lifecycle = std::move(input_lifecycle);
   state_->input_acquisition = std::move(input_acquisition);
   state_->installed = true;
-  state_->CommitFacts();
   return Reply::Ok();
 }
 
@@ -589,9 +492,7 @@ core::Result<void> IoProviderDriverRecord::RebindInputsLocked(
   for (std::size_t i = 0; i < inputs.size(); ++i) {
     const auto &current = state_->inputs[i].installation;
     if (!same_rows(inputs[i].rows, current.rows) ||
-        inputs[i].node != current.node ||
-        (!current.rows.empty() && current.rows.front().provider.profile == "xarm_digital" &&
-         inputs[i].scheduler != current.scheduler) || !inputs[i].ingress ||
+        inputs[i].node != current.node || !inputs[i].ingress ||
         inputs[i].incarnation.empty())
       return Reply::Err(error("driver_rebind_membership_changed"));
     changed = changed || inputs[i].incarnation != current.incarnation;
@@ -639,8 +540,7 @@ core::Result<void> IoProviderDriverRecord::RebindInputsLocked(
       state_->last_rebind_error = rebound.error();
       state_->fault = rebound.error();
       state_->state = core::ComponentLifecycleStateDTO::kFaulted;
-      state_->CommitFacts();
-      return rebound;
+          return rebound;
     }
     state_->inputs[i].installation = inputs[i];
   }
@@ -650,97 +550,198 @@ core::Result<void> IoProviderDriverRecord::RebindInputsLocked(
   return Reply::Ok();
 }
 
-core::Result<RetainedExternallyManagedDomainSnapshot>
-IoProviderDriverRecord::ReadLifecycleSnapshot(
-    const core::ControlDomainId &domain, core::TimePoint now) {
+core::ComponentState IoProviderDriverRecord::State(const std::int64_t now_ns) const {
+  using Lifecycle = core::ComponentLifecycleStateDTO;
+  core::ComponentState state;
+  state.observed_at_ns = now_ns;
+  state.activity = core::ComponentActivity::kIdle;
+  const auto component = state_->domain.provider()->provider.controllable_component_id;
+  const auto healths = host_component_stream_health()->Read(component);
+  for (const auto &stream : healths)
+    state.streams.push_back(stream_of(stream));
   auto lock = AcquireDelivery();
-  if (domain != state_->domain.control_domain_id || now < 0)
-    return core::Result<RetainedExternallyManagedDomainSnapshot>::Err(
-        error("driver_domain_not_owned"));
-  return state_->Snapshot();
-}
-core::Result<core::LifecycleDomainHealthDTO>
-IoProviderDriverRecord::ReadLifecycleHealth(const core::ControlDomainId &domain,
-                                            core::TimePoint now) const {
-  auto lock = AcquireDelivery();
-  if (domain != state_->domain.control_domain_id || now < 0)
-    return core::Result<core::LifecycleDomainHealthDTO>::Err(
-        error("driver_domain_not_owned"));
-  const auto effective = state_->EffectiveFault();
-  return core::Result<core::LifecycleDomainHealthDTO>::Ok(
-      {state_->EffectiveState(effective),
-       facts(state_->installed && !state_->retired, state_->enabled,
-             effective.has_value(), state_->TransportReady(),
-             state_->retired),
-       effective ? effective : state_->TransportDiagnostic(), true});
+  const auto fault = [&](core::FaultCode code, const core::ErrorDTO &cause,
+                         core::FaultOperatorAction action) {
+    state.lifecycle = core::ComponentLifecycle::kFault;
+    state.fault = core::Fault{code,
+                              cause.message,
+                              action != core::FaultOperatorAction::kNone,
+                              action,
+                              std::nullopt,
+                              std::nullopt,
+                              {},
+                              now_ns};
+    return state;
+  };
+  if (state_->retired || !state_->installed) {
+    state.lifecycle = core::ComponentLifecycle::kNotPrepared;
+    return state;
+  }
+  if (const auto exited = state_->ProcessFault())
+    return fault(core::FaultCode::kProcessExited, *exited, core::FaultOperatorAction::kNone);
+  if (state_->fault)
+    return fault(core::FaultCode::kCommunication, *state_->fault,
+                 core::FaultOperatorAction::kRecover);
+  const bool transport = state_->TransportReady();
+  if (state_->enabled && !transport)
+    return fault(core::FaultCode::kCommunication,
+                 state_->TransportDiagnostic().value_or(
+                     error("driver_transport_lost")),
+                 core::FaultOperatorAction::kRecover);
+  if (!transport) {
+    const auto diagnostic =
+        state_->TransportDiagnostic().value_or(error("driver_transport_unavailable"));
+    state.lifecycle = core::ComponentLifecycle::kOffline;
+    state.reason = core::ComponentStateReason{diagnostic.code, diagnostic.message};
+    return state;
+  }
+  // IO-1: lost senders fault an enabled device until Recover; a device that
+  // isn't enabled is offline while they're gone (as a lost transport).
+  const bool gone = state_->SendersGone();
+  if (gone && state_->enabled) {
+    state_->senders_lost = true;
+    state_->state = Lifecycle::kFaulted;
+  }
+  if (state_->senders_lost)
+    return fault(core::FaultCode::kCommunication, senders_gone(),
+                 core::FaultOperatorAction::kRecover);
+  if (gone) {
+    state.lifecycle = core::ComponentLifecycle::kOffline;
+    state.reason = core::ComponentStateReason{senders_gone().code, senders_gone().message};
+    return state;
+  }
+  // CONTRACTS §7 (stream meaning by kind): only a `fault` stream going stale faults
+  // the component; a pose source's or AI model's (`warning`) stream only
+  // shows in `streams[].freshness`.
+  for (const auto &stream : healths)
+    if (stream.state == core::StreamLivenessStateDTO::kStale &&
+        stream.severity == core::StreamSeverityDTO::kFault)
+      return fault(core::FaultCode::kStreamStale,
+                   {"fault_stream_stale", "Stream " + stream.stream_id + " stopped reporting", {}},
+                   core::FaultOperatorAction::kNone);
+  if (!state_->unknown_outputs.empty())
+    state.activity = core::ComponentActivity::kUnknown;
+  state.lifecycle = state_->state == Lifecycle::kActive     ? core::ComponentLifecycle::kEnabled
+                    : state_->state == Lifecycle::kDeclared ? core::ComponentLifecycle::kNotPrepared
+                                                            : core::ComponentLifecycle::kPrepared;
+  return state;
 }
 
-RetainedExternallyManagedPrimitiveOutcome IoProviderDriverRecord::Dispatch(
-    const core::BrandLifecyclePrimitiveIntentDTO &intent,
-    std::stop_token cancellation) {
-  using Outcome = RetainedRos2ControlSwitchOutcome;
+std::vector<core::Capability> IoProviderDriverRecord::capabilities() const {
+  auto lock = AcquireDelivery();
+  if (state_->outputs.empty()) return {};
+  // Mock outputs report the written value back (CONTRACTS §7, D2).
+  if (std::any_of(state_->outputs.begin(), state_->outputs.end(), [](const auto &output) {
+        return std::holds_alternative<std::shared_ptr<MockBooleanOutputProvider>>(
+            output.provider);
+      }))
+    return {core::Capability::kIoManualWrite, core::Capability::kIoOutputReadback};
+  return {core::Capability::kIoManualWrite};
+}
+
+SetOutputResult IoProviderDriverRecord::SetOutput(const std::string_view signal_name,
+                                                 const std::variant<bool, double> value,
+                                                 const std::stop_token stop) {
+  const auto failed = [&](std::string code, std::string message) {
+    return SetOutputResult{core::ActionOutcome::kFailed,
+                           core::ActionError{std::move(code), std::move(message),
+                                             std::nullopt, std::nullopt}};
+  };
+  if (!std::holds_alternative<bool>(value))
+    return failed("io_signal_type_mismatch",
+                  std::string(signal_name) + " is a digital output; its value is true or false");
+  const core::IoSignalId signal{state_->domain.provider()->provider.controllable_component_id,
+                                std::string(signal_name)};
+  std::variant<std::shared_ptr<MockBooleanOutputProvider>,
+               std::shared_ptr<RosBooleanOutputProvider>>
+      provider;
+  bool found = false;
+  bool controller_owned = false;
+  {
+    auto lock = AcquireDelivery();
+    for (const auto &output : state_->outputs)
+      for (const auto &row : output.rows)
+        if (row.descriptor.signal_id == signal) {
+          provider = output.provider;
+          found = true;
+          controller_owned = row.descriptor.controller_owned;
+        }
+  }
+  if (!found)
+    return failed("io_signal_unknown",
+                  "'" + signal.name + "' is not an output of this component");
+  // CONTRACTS §7: a controller-owned output is refused before sending.
+  if (controller_owned)
+    return failed("io_output_controller_owned",
+                  signal.name + " is driven by the controller; ManyForge can't set it");
+  // The provider answers outside the delivery barrier (a service write waits).
+  const bool written = std::get<bool>(value);
+  const auto *mock = std::get_if<std::shared_ptr<MockBooleanOutputProvider>>(&provider);
+  auto result = mock != nullptr
+                    ? (*mock)->WriteOutput(signal, written)
+                    : std::get<std::shared_ptr<RosBooleanOutputProvider>>(provider)->WriteOutput(
+                          signal, written, stop);
+  // An unknown outcome leaves the component's activity unknown (CONTRACTS
+  // §7); an answered write to the same output ends it.
+  auto lock = AcquireDelivery();
+  if (result.outcome == core::ActionOutcome::kUnknown)
+    state_->unknown_outputs.insert(signal.name);
+  else
+    state_->unknown_outputs.erase(signal.name);
+  return result;
+}
+
+core::ActionResult IoProviderDriverRecord::Run(const core::ComponentAction action,
+                                               const std::stop_token stop) {
+  using Lifecycle = core::ComponentLifecycleStateDTO;
+  using Outcome = core::ActionOutcome;
   const auto refused = [](std::string reason) {
-    return RetainedExternallyManagedPrimitiveOutcome{Outcome::kNotSent,
-                                                     error(std::move(reason))};
+    return action_result(Outcome::kFailed, error(std::move(reason)));
   };
   auto lock = AcquireDelivery();
-  const auto observed = state_->Snapshot();
-  const auto &occurrence = state_->occurrence;
-  if (!observed.ok() || !intent.locally_valid() ||
-      cancellation.stop_requested() || state_->retired ||
-      intent.controllable_component_id !=
-          state_->domain.provider()->provider.controllable_component_id ||
-      intent.control_domain_id != occurrence.control_domain_id ||
-      intent.control_domain_revision != occurrence.control_domain_revision ||
-      intent.provider_instance_id != occurrence.provider_instance_id ||
-      intent.provider_manifest_id != occurrence.provider_manifest_id ||
-      intent.provider_manifest_revision !=
-          occurrence.provider_manifest_revision ||
-      intent.provider_runtime_unit_id != occurrence.provider_runtime_unit_id ||
-      intent.provider_runtime_epoch != occurrence.provider_runtime_epoch ||
-      intent.expected_observation_generation != state_->generation)
-    return refused("driver_primitive_stale_or_cancelled");
-  const auto &primitive = intent.lifecycle_primitive_id.value();
-  using Lifecycle = core::ComponentLifecycleStateDTO;
-  const bool prepare = primitive == "io.provider.prepare" &&
-                       (state_->state == Lifecycle::kDeclared ||
-                        state_->state == Lifecycle::kDisabled);
-  const bool enable = primitive == "io.provider.enable" &&
-                      state_->state == Lifecycle::kPrepared;
-  const bool disable = primitive == "io.provider.disable" &&
-                       (state_->state == Lifecycle::kPrepared ||
-                        state_->state == Lifecycle::kActive ||
-                        state_->state == Lifecycle::kDegraded);
-  const bool recover = primitive == "io.provider.recover" &&
-                       (state_->state == Lifecycle::kDegraded ||
-                        state_->state == Lifecycle::kFaulted);
-  if ((!prepare && !enable && !disable && !recover) || !state_->installed ||
-      (!disable && !state_->TransportReady()) ||
-      ((prepare || enable) && state_->fault) ||
-      ((prepare || enable || recover) && state_->ProcessFault()))
-    return refused("driver_primitive_precondition_changed");
+  if (stop.stop_requested())
+    return refused("driver_action_interrupted");
+  if (state_->retired || !state_->installed)
+    return refused("driver_resources_absent");
+  const bool prepare = action == core::ComponentAction::kPrepare;
+  const bool enable = action == core::ComponentAction::kEnable;
+  const bool disable = action == core::ComponentAction::kDisable;
+  const bool recover = action == core::ComponentAction::kRecover;
+  if (!prepare && !enable && !disable && !recover)
+    return refused("driver_action_unsupported");
+  // CONTRACTS §2: an already satisfied Enable succeeds at once.
+  if (enable && state_->state == Lifecycle::kActive)
+    return action_result(Outcome::kSucceeded);
+  if (enable && state_->state != Lifecycle::kPrepared && state_->state != Lifecycle::kDisabled)
+    return refused("driver_not_prepared");
+  if ((prepare || enable) && (state_->fault || state_->senders_lost))
+    return refused("driver_fault_present");
+  if (!disable && state_->ProcessFault())
+    return refused("driver_process_exited");
+  if (!disable && !state_->TransportReady())
+    return refused("driver_transport_unavailable");
+  if (!disable && state_->SendersGone())
+    return action_result(Outcome::kFailed, senders_gone());
   if (state_->generation == std::numeric_limits<std::uint64_t>::max())
     return refused("driver_generation_exhausted");
-  if ((enable || disable) && !state_->inputs.empty() &&
+  if ((enable || disable || recover) && !state_->inputs.empty() &&
       state_->input_lifecycle) {
-    const auto planned =
-        state_->input_lifecycle(intent.lifecycle_transaction_id, disable);
+    const auto planned = state_->input_lifecycle(!enable);
     if (!planned.ok()) {
       if (planned.error().details.contains("io_source_transition_effects")) {
         static_cast<void>(
             state_->Advance()); // Capacity was checked before the callback.
         state_->fault = planned.error();
         state_->state = Lifecycle::kFaulted;
-        state_->CommitFacts();
-        return {Outcome::kFailedEffectObserved, planned.error()};
       }
-      return {Outcome::kNotSent, planned.error()};
+      return action_result(Outcome::kFailed, planned.error());
     }
   }
   if (!state_->Advance())
     return refused("driver_generation_exhausted");
   if (state_->cancel_pending)
     state_->cancel_pending();
+  const auto &occurrence = state_->occurrence;
   std::optional<core::ErrorDTO> failure;
   std::vector<IoProviderInputAcquisitionBaseline> acquisition_baselines;
   for (auto &input : state_->inputs) {
@@ -809,16 +810,15 @@ RetainedExternallyManagedPrimitiveOutcome IoProviderDriverRecord::Dispatch(
   if (failure) {
     state_->fault = failure;
     state_->state = Lifecycle::kFaulted;
-    state_->CommitFacts();
-    return {Outcome::kFailedEffectObserved, failure};
+    return action_result(Outcome::kFailed, failure);
   }
   state_->enabled = enable;
   state_->fault.reset();
-  state_->state = enable    ? Lifecycle::kActive
-                  : disable ? Lifecycle::kDisabled
-                            : Lifecycle::kPrepared;
-  state_->CommitFacts();
-  return {Outcome::kSucceeded, std::nullopt};
+  state_->senders_lost = false;
+  if (prepare || recover)
+    state_->unknown_outputs.clear();
+  state_->state = enable ? Lifecycle::kActive : Lifecycle::kPrepared;
+  return action_result(Outcome::kSucceeded);
 }
 
 void IoProviderDriverRecord::SetSupervisedProcessFaultSource(
@@ -829,8 +829,31 @@ void IoProviderDriverRecord::SetSupervisedProcessFaultSource(
 
 bool IoProviderDriverRecord::stream_observer() const noexcept {
   const auto &id = state_->manifest.provider_manifest_id.value();
-  return id == core::kPoseSourceLifecycleManifestId ||
-         id == core::kAiModelLifecycleManifestId;
+  return id == kPoseSourceProviderManifestId || id == kAiModelProviderManifestId;
+}
+
+core::Result<void>
+IoProviderDriverRecord::SetInputsStreamLocked(const std::optional<std::int64_t> budget_ns) {
+  using Reply = core::Result<void>;
+  const bool ros = state_->ForRosInputs([](const auto &, auto &) {});
+  if (!budget_ns || !ros || state_->retired) {
+    state_->ForRosInputs([](const auto &, auto &leaf) { leaf.SetArrivalRecorder(nullptr); });
+    state_->inputs_stream.reset();
+    return Reply::Ok();
+  }
+  if (!state_->inputs_stream) {
+    // CONTRACTS §7: an I/O device's own stream going stale is its fault.
+    auto declared = host_component_stream_health()->Declare(
+        state_->domain.provider()->provider.controllable_component_id,
+        {std::string(kIoDeviceInputsStreamId), *budget_ns, core::StreamSeverityDTO::kFault,
+         core::StreamRecoveryDTO::kAuto, core::StreamTimestampSourceDTO::kArrival});
+    if (!declared.ok())
+      return Reply::Err(declared.error());
+    state_->inputs_stream = std::move(declared.value());
+  }
+  state_->ForRosInputs(
+      [&](const auto &, auto &leaf) { leaf.SetArrivalRecorder(state_->inputs_stream); });
+  return Reply::Ok();
 }
 
 core::Result<void> IoProviderDriverRecord::InstallObserverStreamsLocked(
@@ -851,7 +874,6 @@ core::Result<void> IoProviderDriverRecord::InstallObserverStreamsLocked(
     return Reply::Err(error("driver_generation_exhausted"));
   state_->observer_streams = std::move(streams);
   state_->installed = true;
-  state_->CommitFacts();
   return Reply::Ok();
 }
 
@@ -871,6 +893,9 @@ void IoProviderDriverRecord::Shutdown() {
     state_->fault = error("driver_generation_exhausted");
   for (auto &input : state_->inputs)
     std::visit([](auto &leaf) { leaf->Shutdown(); }, input.leaf);
+  // The retired leaves no longer hold the `inputs` stream (undeclared).
+  state_->ForRosInputs([](const auto &, auto &leaf) { leaf.SetArrivalRecorder(nullptr); });
+  state_->inputs_stream.reset();
   // Permanent retirement fences the exact occurrence independently of its
   // generation range. Other channel aliases and pending ACKs stay owned by
   // their existing lifecycle/session owners.
@@ -887,7 +912,6 @@ void IoProviderDriverRecord::Shutdown() {
   state_->observer_streams.clear();
   state_->enabled = false;
   state_->state = core::ComponentLifecycleStateDTO::kDisabled;
-  state_->CommitFacts();
 }
 
 } // namespace manyforge::roboplan_backend::host_detail

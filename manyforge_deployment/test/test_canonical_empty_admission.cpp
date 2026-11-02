@@ -140,49 +140,6 @@ TEST(CanonicalEmptyAdmission, RosBootstrapOwnsInfrastructureWithoutAScenario) {
             value.compiled_products.runtime_unit_products);
 }
 
-TEST(CanonicalEmptyAdmission, RosBootstrapRejectsNativeProfileBeforePublication) {
-  ScopedTrustedRoot root("ros-crossed-profile");
-  const core::CellId cell("ros_runtime_owned_cell");
-  // Author an unsupported native identity using the surviving qualified
-  // configuration schema. No native product factory or publication is used.
-  auto candidate = parse_strict_json_model_yaml(
-      detail::ros2_control_execution_runtime_profile_document()).root().as_object();
-  for (auto& [name, value] : candidate) {
-    if (name == "runtime_profile_id") {
-      value = CanonicalValue("manyforge.native_execution_runtime");
-    }
-  }
-  const auto* schema = build_qualified_closed_schema_registry()
-                           .find_catalog_schema_family(
-                               core::CatalogRecordKind::kRuntimeProfile);
-  ASSERT_NE(schema, nullptr);
-  ASSERT_NE(schema->compiled_schema(), nullptr);
-  const auto normalized = validate_and_normalize_unqualified_artifact_candidate(
-      *schema->compiled_schema(), parse_strict_json_model_yaml(
-          canonical_json(CanonicalValue(std::move(candidate)))));
-  const std::string revision = detail::compute_content_identity(
-      normalized.normalized_root(),
-      {detail::catalog_record_identity_domain("runtime_profile"),
-       "manyforge.runtime_profile.v1", "runtime_profile_revision"});
-  auto profile_members = normalized.normalized_root().as_object();
-  for (auto& [name, value] : profile_members) {
-    if (name == "runtime_profile_revision") {
-      value = CanonicalValue(revision);
-    }
-  }
-  const std::string native_candidate =
-      canonical_json(CanonicalValue(std::move(profile_members)));
-  try {
-    static_cast<void>(detail::generate_ros_empty_package(
-        root.path(), cell, native_candidate));
-    FAIL() << "ROS bootstrap must not substitute the native product";
-  } catch (const CanonicalEmptyAdmissionError &error) {
-    EXPECT_STREQ(error.what(), "ROS bootstrap requires the ROS execution profile");
-  }
-  EXPECT_FALSE(std::filesystem::exists(root.path() /
-      "canonical-empty-admission.ros_runtime_owned_cell.json"));
-}
-
 class ScopedRootSymlinkSubstitution final {
  public:
   explicit ScopedRootSymlinkSubstitution(

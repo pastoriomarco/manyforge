@@ -1,7 +1,7 @@
 # Copyright 2026 Marco Pastorio
 # SPDX-License-Identifier: Apache-2.0
 cmake_minimum_required(VERSION 3.14)
-project(manyforge_perception_interfaces VERSION 0.1.0)
+project(manyforge_perception_interfaces VERSION 0.2.0)
 
 find_package(ament_cmake REQUIRED)
 find_package(rosidl_default_generators REQUIRED)

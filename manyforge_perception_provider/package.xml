@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <package format="3">
   <name>manyforge_perception_provider</name>
-  <version>0.1.0</version>
+  <version>0.2.0</version>
   <description>Request-driven single-owner multi-instance pose provider.</description>
   <maintainer email="pastoriomarco@gmail.com">Marco Pastorio</maintainer>
   <license>Apache-2.0</license>
@@ -22,6 +22,7 @@
   <test_depend>ament_lint_auto</test_depend>
   <test_depend>ament_lint_common</test_depend>
   <test_depend>launch_testing_ament_cmake</test_depend>
+  <test_depend>ament_cmake_ros</test_depend>
   <test_depend>launch_testing_ros</test_depend>
   <test_depend>rclpy</test_depend>
   <test_depend>action_msgs</test_depend>

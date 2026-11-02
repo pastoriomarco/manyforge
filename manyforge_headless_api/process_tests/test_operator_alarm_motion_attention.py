@@ -1,9 +1,8 @@
-"""Kernel motion admission consults Headless operator-alarm attention.
+"""Headless operator-alarm attention publication on the real core and Kernel.
 
-Spec 450 §5.2 / spec 530 §11 in the composed process stack: an
-acknowledgement-gated alarm on a robot's resources refuses the Program Run
-that would move it until the operator acknowledges it, and the Kernel admits
-the same Run once the Headless publication reaches it.
+Spec 530 §11 publication timing in the composed process stack. Attention is
+published, never a gate: acknowledgement never gates work (Component model v2
+core rule 5).
 """
 
 from __future__ import annotations
@@ -34,7 +33,6 @@ from manyforge_headless_api.cell_admission import (
     MAXIMUM_RESPONSE_BYTES,
     CellAdmissionClient,
 )
-from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
 from manyforge_headless_api.execution import ExecutionCommandClient, ExecutionEventPump
 from manyforge_headless_api.native import HeadlessApiConfig, NativeHeadlessCore
 from manyforge_headless_api.process_tests.test_process_stack import (
@@ -49,247 +47,7 @@ from manyforge_headless_api.process_tests.test_process_stack import (
 from manyforge_headless_api.process_tests.test_ui6i_grouped_execution import (
     ADMISSION_FILENAME,
     CELL_ID,
-    GROUPED_SCENARIO,
-    _dual_robot_stack,
-    _kernel_attention_reconciled,
-    _load_scenario,
-    _reset_cycle,
-    _wait_kernel_attention_reconciled,
-    _wait_run_state,
-    _write_mixed_variants,
 )
-
-def _motion_start(
-    client: HeadlessHttpClient, started: dict[str, Any], request_id: str
-) -> dict[str, Any]:
-    """Return the owner's result, or its refusal as `{"refused": code, ...}`."""
-    program_run_id = started["capture"]["program_run_id"]
-    deadline = time.monotonic() + 10.0
-    while True:
-        cycle = client.program_cycle_status()
-        controls = cycle.get("runtime_controls")
-        selections = None if controls is None else controls.get("execution_selections")
-        if cycle.get("program_run_id") == program_run_id and isinstance(selections, dict):
-            break
-        if time.monotonic() >= deadline:
-            raise RuntimeError(f"motion controls were not published: {cycle!r}")
-        time.sleep(0.01)
-    try:
-        result = client.program_run_motion_start(
-            program_run_id,
-            {
-                "request_id": request_id,
-                "request_owner_epoch": "alarm.attention.process-test",
-                "source_label": "alarm_attention_process_test",
-                "correlation_id": request_id,
-                "program_run_id": program_run_id,
-                "expected_owner_epoch": cycle["program_runner_owner_epoch"],
-                "expected_run_revision": cycle["run"]["run_revision"],
-                "expected_selection_revision": selections["selection_revision"],
-                "reason": "operator motion Run",
-                "group_ids": ["all"],
-            },
-        )
-    except HeadlessClientError as error:
-        return {"refused": error.code, "details": error.details}
-    if result.get("ok") is False:
-        error = result.get("error") or {}
-        return {"refused": error.get("code"), "details": error.get("details") or {}}
-    return result
-
-
-def _start_run_once(
-    stack: ProcessStack, applied: dict[str, Any], digest: str, label: str
-) -> dict[str, Any]:
-    """Start a Program run under fresh request identities (cf. `_start_run`)."""
-    deadline = time.monotonic() + 30.0
-    attempt = 0
-    with HeadlessHttpClient(stack.composer_url, timeout_seconds=20.0) as composer:
-        while True:
-            attempt += 1
-            draft = composer.request("GET", "/api/program/draft")["program"]
-            try:
-                stack.wait_authoring_admission(expected_allowed=True)
-                return composer.program_run_start(
-                    {
-                        "request_id": f"alarm.attention.{label}.{attempt}",
-                        "request_owner_epoch": "alarm.attention.process-test",
-                        "source_label": "alarm_attention_process_test",
-                        "correlation_id": f"alarm.attention.{label}",
-                        "scenario_id": applied["scenario_id"],
-                        "source_document_digest": digest,
-                        "expected_applied_record_digest": applied["source"]["record_digest"],
-                        "draft_program_revision": draft["program_revision"],
-                    }
-                )
-            except HeadlessClientError as error:
-                # Reset releases the previous cycle claim asynchronously.
-                if error.status_code != 409 or time.monotonic() >= deadline:
-                    raise
-                time.sleep(0.1)
-
-
-def _gating_alarms(stack: ProcessStack) -> dict[str, Any]:
-    with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
-        return headless.alarms()
-
-
-def _acknowledge_all(stack: ProcessStack) -> int:
-    """Acknowledge every unacknowledged alarm; return the owner generation
-    that names the acknowledgement."""
-    with HeadlessHttpClient(stack.base_url, timeout_seconds=10.0) as headless:
-        for attempt in range(8):
-            snapshot = headless.alarms()
-            members = snapshot["unacknowledged_membership"]
-            if not members:
-                return snapshot["generation"]
-            try:
-                headless.acknowledge_all(
-                    {
-                        "request_id": f"alarm.attention.ack.{attempt}",
-                        "request_owner_epoch": snapshot["owner_epoch"],
-                        "source_label": "alarm_attention_process_test",
-                        "members": members,
-                        "expected_generation": snapshot["generation"],
-                        "confirmed": True,
-                    }
-                )
-                return headless.alarms(limit=0)["generation"]
-            except HeadlessClientError as error:
-                # A concurrent activation changed the exact membership.
-                if attempt == 7 or error.status_code != 409:
-                    raise
-    raise AssertionError("unreachable")
-
-
-#: Spec 530 §11 source currency R: Headless refreshes its alarm sources at
-#: most once per R, so the registry swap an Apply causes is seen within R.
-_SOURCE_REFRESH_PERIOD_SECONDS = 0.25
-#: One component-lifecycle read: the event pump's CCLC client is bounded to
-#: one short exchange (manyforge_headless_api.app: min(timeout, 1 s)).
-_CCLC_READ_SECONDS = 1.0
-#: The pump picks up a pending lifecycle observation on its next iteration
-#: (execution_event_poll_milliseconds, 100 ms by default).
-_PUMP_ITERATION_SECONDS = 0.1
-
-
-class _KernelAttentionWatch:
-    """Record when the Kernel first holds a reconciled projection of the
-    active configuration, polling from the moment the Apply succeeded."""
-
-    def __init__(self, stack: ProcessStack) -> None:
-        self._stack = stack
-        self.apply_succeeded_at: float | None = None
-        self.held_at: float | None = None
-        self.error: BaseException | None = None
-        self._thread: threading.Thread | None = None
-
-    def apply_succeeded(self) -> None:
-        self.apply_succeeded_at = time.monotonic()
-        self._thread = threading.Thread(target=self._run, name="kernel-attention-watch")
-        self._thread.start()
-
-    def _run(self) -> None:
-        deadline = time.monotonic() + 10.0
-        try:
-            with HeadlessHttpClient(self._stack.base_url, timeout_seconds=10.0) as headless:
-                while time.monotonic() < deadline:
-                    if _kernel_attention_reconciled(headless):
-                        self.held_at = time.monotonic()
-                        return
-                    time.sleep(0.01)
-        except BaseException as error:  # noqa: BLE001 - reported by join()
-            self.error = error
-
-    def join(self) -> float:
-        assert self._thread is not None, "the Apply never succeeded"
-        self._thread.join(timeout=15.0)
-        assert not self._thread.is_alive()
-        if self.error is not None:
-            raise self.error
-        assert self.held_at is not None and self.apply_succeeded_at is not None, (
-            "the Kernel never held a reconciled projection of the new configuration"
-        )
-        return self.held_at - self.apply_succeeded_at
-
-
-def test_program_run_is_refused_by_an_unacknowledged_alarm_until_acknowledged() -> None:
-    with _dual_robot_stack() as stack:
-        _load_scenario(stack, GROUPED_SCENARIO)
-        # The moved UR5e's Program goal is in collision with the wall, so its
-        # operation fails and raises an acknowledgement-gated execution alarm
-        # scoped to the UR5e's exact resources.
-        paths = _write_mixed_variants(stack, ("move",))
-        watch = _KernelAttentionWatch(stack)
-        applied, digest = _load_scenario(
-            stack,
-            "mixed_move",
-            scenario_path=paths["move"],
-            on_apply_succeeded=watch.apply_succeeded,
-        )
-        # Spec 530 §7.1/§11: the Apply is respected without polling. Its
-        # registry swap is seen by the next source refresh (R), the event pump
-        # reads the new configuration's lifecycle at once (one CCLC read on
-        # its next iteration) and the publisher delivers the reconciled
-        # projection within P + D.
-        apply_to_kernel = watch.join()
-        bound = (
-            _SOURCE_REFRESH_PERIOD_SECONDS
-            + PUBLICATION_PERIOD_SECONDS
-            + PUBLICATION_DEADLINE_SECONDS
-            + _CCLC_READ_SECONDS
-            + _PUMP_ITERATION_SECONDS
-        )
-        print(
-            f"\nApply succeeded -> Kernel holds reconciled attention: "
-            f"{apply_to_kernel * 1_000:.0f} ms (bound {bound * 1_000:.0f} ms)",
-            file=sys.stderr,
-        )
-        assert apply_to_kernel <= bound, apply_to_kernel
-        with HeadlessHttpClient(stack.composer_url, timeout_seconds=30.0) as client:
-            first = _start_run_once(stack, applied, digest, "first")
-            first_run = first["capture"]["program_run_id"]
-            # The Kernel holds the reconciled projection of the active
-            # configuration: it admits the first Run, with no refusal loop.
-            initial = _motion_start(client, first, "alarm.attention.first.run")
-            assert "refused" not in initial, initial
-            terminal = _wait_run_state(
-                client, first_run,
-                {"succeeded", "failed", "intervention_required", "stopped"},
-            )
-            assert terminal["state"] != "succeeded", terminal
-
-            deadline = time.monotonic() + 20.0
-            while True:
-                snapshot = _gating_alarms(stack)
-                if snapshot["unacknowledged_membership"]:
-                    break
-                assert time.monotonic() < deadline, snapshot
-                time.sleep(0.05)
-            assert snapshot["reconciled"] is True, snapshot
-            gating = snapshot["motion_attention_membership"]
-            assert gating, snapshot
-            assert all(row["lifecycle_state"] != "active_acknowledged" for row in gating)
-
-            _reset_cycle(client, first_run)
-            second = _start_run_once(stack, applied, digest, "second")
-            # The alarm still requires acknowledgement after Reset returned
-            # its condition: the Kernel refuses the Run that would move UR5e.
-            refused = _motion_start(client, second, "alarm.attention.refused.run")
-            assert refused.get("refused") == "unacknowledged_operator_alarms", refused
-            assert refused["details"]["interlock_alarms"] == "[]", refused
-            assert '"condition_id"' in refused["details"]["unacknowledged_alarms"], refused
-
-            acknowledged_generation = _acknowledge_all(stack)
-            # Headless republishes within P + D; once the Kernel holds the
-            # acknowledged generation it admits the same Run with no other
-            # change.
-            _wait_kernel_attention_reconciled(
-                stack, minimum_generation=acknowledged_generation
-            )
-            admitted = _motion_start(client, second, "alarm.attention.acknowledged.run")
-            assert "refused" not in admitted, admitted
-            assert not _gating_alarms(stack)["unacknowledged_membership"]
 
 
 # --- Real-path publication timing qualification (spec 530 §11) -------------
@@ -430,7 +188,7 @@ def _wait_for(predicate: Callable[[], bool], timeout_seconds: float, what: str) 
 
 @contextmanager
 def _native_host_stack() -> Iterator[ProcessStack]:
-    """Manager and the real native execution host, without a Headless API."""
+    """Manager and the real execution host, without a Headless API."""
     with TemporaryDirectory(prefix="mf-oaq-") as temporary_root:
         root = Path(temporary_root)
         bootstrap = root / "cell-bootstrap"
@@ -456,7 +214,7 @@ def _native_host_stack() -> Iterator[ProcessStack]:
                         return False
                     return True
 
-                _wait_for(host_ready, 60.0, "the native execution host")
+                _wait_for(host_ready, 60.0, "the execution host")
                 yield stack
             except BaseException:
                 stack.log.flush()

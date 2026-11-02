@@ -17,9 +17,7 @@ from manyforge_behavior.failure_details import (
 from manyforge_behavior.kernel_client import ExecutionState
 
 
-PROGRAM_MOTION_STOP_RECOVERY_CLASSES: Final = frozenset(
-    {"ordinary_operator_stop", "stop_fault_intervention"}
-)
+PROGRAM_MOTION_STOP_RECOVERY_CLASS: Final = "ordinary_operator_stop"
 
 
 class OwnerTaskState(Enum):
@@ -436,22 +434,6 @@ class OwnerInvocationHeldError(RuntimeError):
         if type(selection_revision) is not int or not 0 <= selection_revision <= 9_007_199_254_740_991:
             raise ValueError("held invocation requires an exact Stop selection revision")
         self.selection_revision = selection_revision
-
-
-class OwnerInvocationGatedError(RuntimeError):
-    """A gate rule (`on_trip: gate`) refused this motion before admission.
-
-    No effect was started. The refusal is transient (Rule 2): the condition
-    of global rule ``rule_id`` holds, and motion is allowed again once it
-    clears. ``refusal`` is the Kernel's own typed rejection, kept unchanged.
-    """
-
-    def __init__(self, rule_id: str, refusal: BaseException) -> None:
-        super().__init__(str(refusal) or f"global interrupt rule {rule_id} is active")
-        if not isinstance(rule_id, str) or not rule_id:
-            raise ValueError("a gated refusal names its rule")
-        self.rule_id = rule_id
-        self.refusal = refusal
 
 
 class OwnerInvocationRefusedByPriorityError(RuntimeError):
@@ -970,7 +952,7 @@ __all__ = [
     "ProgramRunContextPort",
     "ProgramInterventionPort",
     "ProgramInterventionSnapshot",
-    "PROGRAM_MOTION_STOP_RECOVERY_CLASSES",
+    "PROGRAM_MOTION_STOP_RECOVERY_CLASS",
     "ProgramRunPortContext",
     "OwnerNodeInputs",
     "describe_owner_failure",
@@ -986,7 +968,6 @@ __all__ = [
     "OwnerInvocationResult",
     "OwnerInvocationPendingError",
     "OwnerInvocationHeldError",
-    "OwnerInvocationGatedError",
     "OwnerInvocationRefusedByPriorityError",
     "OwnerTaskPort",
     "OwnerTaskObservationUnavailableError",

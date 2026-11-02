@@ -45,7 +45,7 @@ def test_motion_endpoint_refreshes_tcp_before_release(
         return snapshot
 
     monkeypatch.setattr(run.runtime, "_refresh_active_tcp", tcp)
-    monkeypatch.setattr(run.runtime, "_verify_selected_motion_feedback", lambda *_args: None)
+    monkeypatch.setattr(run.runtime, "_require_run_readiness", lambda *_args: None)
     monkeypatch.setattr(run.host, method, release)
     request = {
         "request_id": "control.request",
@@ -53,10 +53,11 @@ def test_motion_endpoint_refreshes_tcp_before_release(
         "source_label": "test",
         "program_run_id": _RUN,
         "expected_owner_epoch": run.runtime.owner_epoch,
-        "expected_run_revision": run.owner.read(_RUN).run_revision,
         "reason": "operator",
     }
-    if method != "resume_full_stop":
+    if method == "resume_full_stop":
+        request.update(expected_run_revision=run.owner.read(_RUN).run_revision)
+    else:
         request.update(expected_selection_revision=0, group_ids=["robot_group"])
     with TestClient(create_app(run.runtime)) as client:
         accepted = client.post(f"/api/program/runs/{_RUN}/{route}", json=request)

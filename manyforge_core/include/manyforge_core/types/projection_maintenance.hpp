@@ -39,7 +39,7 @@ struct ProjectionMaintenanceInitializationRequestDTO final {
   ApplyGeneration apply_generation;
   ProjectionRevisionDTO expected_active_projection_revision;
   RetainedBundleDTO candidate_retained_bundle;
-  std::vector<ProjectionNativeRuntimeBindingDTO> native_runtime_bindings;
+  std::vector<ProjectionExecutionHostBindingDTO> execution_host_bindings;
   /// Exact Program-authored baseline captured with the candidate. An empty
   /// vector deliberately replaces the old baseline with an empty one.
   std::vector<AddObjectRequestDTO> initial_scene_objects{};
@@ -51,18 +51,18 @@ struct ProjectionMaintenanceInitializationRequestDTO final {
         candidate_retained_bundle.cell_graph.graph_revision.empty() ||
         candidate_retained_bundle.cell_graph.cell_id.empty() ||
         !ValidInitialSceneObjects(initial_scene_objects) ||
-        !std::is_sorted(native_runtime_bindings.begin(),
-                        native_runtime_bindings.end(),
+        !std::is_sorted(execution_host_bindings.begin(),
+                        execution_host_bindings.end(),
                         CanonicalProjectionNativeBindingLess)) {
       return false;
     }
-    for (std::size_t index = 0U; index < native_runtime_bindings.size();
+    for (std::size_t index = 0U; index < execution_host_bindings.size();
          ++index) {
-      if (!native_runtime_bindings[index].valid() ||
+      if (!execution_host_bindings[index].valid() ||
           (index != 0U &&
            !CanonicalProjectionNativeBindingLess(
-               native_runtime_bindings[index - 1U],
-               native_runtime_bindings[index]))) {
+               execution_host_bindings[index - 1U],
+               execution_host_bindings[index]))) {
         return false;
       }
     }
@@ -92,7 +92,7 @@ struct ProjectionMaintenanceInitializationStatusDTO final {
   ProjectionRevisionDTO predecessor_projection_revision;
   ProjectionRevisionDTO target_projection_revision;
   LogicalSceneSnapshotIdentityDTO authoritative_snapshot_identity;
-  std::vector<ProjectionNativeRuntimeBindingDTO> native_runtime_bindings;
+  std::vector<ProjectionExecutionHostBindingDTO> execution_host_bindings;
   std::optional<ActiveBundlePublicationReceiptDTO> publication_receipt;
   std::optional<ErrorDTO> first_error;
   bool effects_unknown{};
@@ -108,18 +108,18 @@ struct ProjectionMaintenanceInitializationStatusDTO final {
         !authoritative_snapshot_identity.valid() ||
         target_projection_revision.scene_revision !=
             authoritative_snapshot_identity.revision ||
-        !std::is_sorted(native_runtime_bindings.begin(),
-                        native_runtime_bindings.end(),
+        !std::is_sorted(execution_host_bindings.begin(),
+                        execution_host_bindings.end(),
                         CanonicalProjectionNativeBindingLess)) {
       return false;
     }
-    for (std::size_t index = 0U; index < native_runtime_bindings.size();
+    for (std::size_t index = 0U; index < execution_host_bindings.size();
          ++index) {
-      if (!native_runtime_bindings[index].valid() ||
+      if (!execution_host_bindings[index].valid() ||
           (index != 0U &&
            !CanonicalProjectionNativeBindingLess(
-               native_runtime_bindings[index - 1U],
-               native_runtime_bindings[index]))) {
+               execution_host_bindings[index - 1U],
+               execution_host_bindings[index]))) {
         return false;
       }
     }

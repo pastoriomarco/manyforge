@@ -82,6 +82,53 @@ describe('schema-derived Program value editor', () => {
     expect(markup).toContain('Add row');
   });
 
+  it('shows each Cartesian waypoint corner blend radius, empty when the node value applies', () => {
+    const markup = renderToStaticMarkup(
+      <ProgramSchemaValueEditor
+        schema={{
+          type: 'array',
+          minItems: 1,
+          items: {
+            type: 'object',
+            properties: {
+              position_m: { type: 'array', items: { type: 'number' } },
+              orientation: { type: 'object', properties: { rpy_deg: { type: 'array' } } },
+              blend_radius_m: { type: 'number', minimum: 0 },
+            },
+            required: ['position_m', 'orientation'],
+          },
+        }}
+        value={[
+          { position_m: [0, 0, 0], orientation: { rpy_deg: [0, 0, 0] }, blend_radius_m: 0.02 },
+          { position_m: [0.1, 0, 0], orientation: { rpy_deg: [0, 0, 0] } },
+        ]}
+        disabled={false}
+        context={context}
+        path="path"
+        onCommit={vi.fn()}
+      />,
+    );
+    expect(markup).toMatch(/aria-label="Waypoint 1 corner blend radius \(m\)"[^>]*value="0.02"|value="0.02"[^>]*aria-label="Waypoint 1 corner blend radius \(m\)"/);
+    expect(markup).toContain('aria-label="Waypoint 2 corner blend radius (m)"');
+    expect(markup).toContain('placeholder="Node value"');
+  });
+
+  it('leaves an optional enum without a default unset', () => {
+    const markup = renderToStaticMarkup(
+      <ProgramSchemaValueEditor
+        schema={{ type: 'string', enum: ['constant_speed', 'time_optimal'] }}
+        value={undefined}
+        disabled={false}
+        context={{ ...context, parameterId: 'cartesian_timing' }}
+        path="cartesian_timing"
+        onCommit={vi.fn()}
+      />,
+    );
+    expect(markup).toMatch(/<option value=""[^>]*selected=""[^>]*>Select a value</);
+    expect(markup).toContain('constant_speed');
+    expect(markup).toContain('time_optimal');
+  });
+
   it('renders fixed numeric tuples and schema-valued maps without raw JSON', () => {
     const tuple = renderToStaticMarkup(
       <ProgramSchemaValueEditor

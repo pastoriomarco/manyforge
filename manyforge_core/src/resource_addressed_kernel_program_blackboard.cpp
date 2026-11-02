@@ -358,6 +358,17 @@ Result<void> ResourceAddressedExecutionKernel::InstallAppliedProgramBlackboardCo
 Result<IoProgramBlackboardAcknowledgementDTO>
 ResourceAddressedExecutionKernel::PublishProgramBlackboard(
     const IoProgramBlackboardPublicationDTO& publication) {
+  auto admitted = admit_program_blackboard_frame(publication);
+  // BBK-1: this frame's own evaluation (trip, Stop, release) runs before its
+  // ACK, as for set_rule_active; an evaluation failure surfaces on the host's
+  // next ProcessIoRuleEvidence.
+  if (admitted.ok()) (void)ProcessIoRuleEvidence();
+  return admitted;
+}
+
+Result<IoProgramBlackboardAcknowledgementDTO>
+ResourceAddressedExecutionKernel::admit_program_blackboard_frame(
+    const IoProgramBlackboardPublicationDTO& publication) {
   using Reply = Result<IoProgramBlackboardAcknowledgementDTO>;
   const auto trusted_received_at_ns = clock_.now();
   std::lock_guard submission_lock(submission_mutex_);

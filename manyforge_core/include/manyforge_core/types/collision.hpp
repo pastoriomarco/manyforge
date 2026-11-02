@@ -11,6 +11,7 @@
 
 #include <manyforge_core/types/configuration_fence.hpp>
 #include <manyforge_core/types/geometry.hpp>
+#include <manyforge_core/types/robot_defaults.generated.hpp>
 #include <manyforge_core/types/robot_state.hpp>
 
 namespace manyforge::core {
@@ -204,27 +205,26 @@ enum class CollisionDistanceRequestMode {
   return "unknown";
 }
 
-/// Collision settings defaults (Deployment `collision_clearance_m` and
-/// `collision_check_step_rad`; tune them here).
+/// Collision settings (Deployment `collision_clearance_m` and
+/// `collision_check_step_rad`; their defaults kDefaultCollisionClearanceM and
+/// kDefaultCollisionCheckStepRad are in manyforge_core/resources/robot_defaults.tsv).
 /// - Clearance: a validated or planned move keeps at least this from every
-///   body its collision policy does not allow it to touch. 0 (the default)
-///   disables it: contact-only checks. A motion's own `clearance_m` replaces
+///   body its collision policy does not allow it to touch; 1 mm by default
+///   (it also covers the executed spline's deviation from the planned chords).
+///   0 disables it: contact-only checks. A motion's own `clearance_m` replaces
 ///   it for that move, within [0, kMaxCollisionClearanceM].
 /// - Check step: the joint-space distance (Euclidean, as RoboPlan's
 ///   `collision_check_step_size`) between two collision-checked
-///   configurations, for the planner's first attempt and for pre-dispatch
-///   validation of the executed curve.
-inline constexpr double kDefaultCollisionClearanceM = 0.0;
+///   configurations of the planner's first attempt. Pre-dispatch validation
+///   checks the trajectory's own waypoints only.
 inline constexpr double kMaxCollisionClearanceM = 0.05;
-inline constexpr double kDefaultCollisionCheckStepRad = 0.05;
-inline constexpr double kMaxCollisionCheckStepRad = 0.2;
 inline constexpr double kCollisionRetryCheckStepRad = 0.01;
 
-/// The collision-check step of one planning attempt, used by the planner and
-/// by validation of that attempt's trajectory: the configured step on the
-/// first attempt, the finer of it and kCollisionRetryCheckStepRad on a retry
-/// (requested only after validation rejected a candidate; the same
-/// resolution could reproduce the same missed narrow contact).
+/// The planner's collision-check step for one planning attempt: the
+/// configured step on the first attempt, the finer of it and
+/// kCollisionRetryCheckStepRad on a retry (requested only after validation
+/// rejected a candidate; the same resolution could reproduce the same missed
+/// narrow contact).
 [[nodiscard]] inline constexpr double collision_check_step_for_attempt(
     const double configured_step_rad, const std::uint32_t planning_attempt_index) noexcept {
   return planning_attempt_index == 0U || configured_step_rad < kCollisionRetryCheckStepRad

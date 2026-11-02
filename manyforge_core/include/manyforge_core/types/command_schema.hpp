@@ -15,8 +15,6 @@
 namespace manyforge::core {
 
 inline constexpr std::string_view kCommandSchemaApiVersion = "manyforge.command_schema.v1";
-inline constexpr std::string_view kIoSignalWriteCommandSchemaApiVersion =
-    "manyforge.io_signal_write_command_schema.v1";
 inline constexpr std::size_t kMaxCommandSchemaCompatibleCapabilities = 64U;
 inline constexpr std::size_t kMaxCommandSchemaSelectors = 64U;
 inline constexpr std::size_t kMaxCommandSchemaCallerOptions = 64U;
@@ -32,7 +30,6 @@ struct CommandSchemaCompatibleCapabilityDTO final {
 
 enum class CommandValueContractKind : std::uint8_t {
   kGripperPosition = 0,
-  kIoSignalWrite = 1,
 };
 
 enum class CommandEffortLimitContract : std::uint8_t {
@@ -43,8 +40,6 @@ enum class CommandEffortLimitContract : std::uint8_t {
   switch (value) {
     case CommandValueContractKind::kGripperPosition:
       return "gripper_position";
-    case CommandValueContractKind::kIoSignalWrite:
-      return "io_signal_write";
   }
   return {};
 }
@@ -68,22 +63,19 @@ struct GripperPositionCommandValueContractDTO final {
                          const GripperPositionCommandValueContractDTO&) = default;
 };
 
-struct IoSignalWriteCommandValueContractDTO final {
-  friend bool operator==(IoSignalWriteCommandValueContractDTO,
-                         IoSignalWriteCommandValueContractDTO) = default;
-};
-
-using CommandValueContractDTO =
-    std::variant<GripperPositionCommandValueContractDTO, IoSignalWriteCommandValueContractDTO>;
+using CommandValueContractDTO = std::variant<GripperPositionCommandValueContractDTO>;
 
 enum class CommandCallerOptionValueKind : std::uint8_t {
   kNonnegativeDurationSeconds = 0,
+  kBool = 1,
 };
 
 [[nodiscard]] constexpr std::string_view to_string(CommandCallerOptionValueKind value) noexcept {
   switch (value) {
     case CommandCallerOptionValueKind::kNonnegativeDurationSeconds:
       return "nonnegative_duration_seconds";
+    case CommandCallerOptionValueKind::kBool:
+      return "bool";
   }
   return {};
 }
@@ -132,7 +124,7 @@ enum class CommandStopEvidenceRequirement : std::uint8_t {
   return {};
 }
 
-/// Typed payload of the closed gripper or boolean signal-write schema branch.
+/// Typed payload of the closed gripper schema.
 struct CommandSchemaDTO final {
   CommandSchemaId command_schema_id;
   CommandSchemaRevision command_schema_revision;
@@ -141,8 +133,8 @@ struct CommandSchemaDTO final {
   std::vector<ResourceRoleId> resource_role_selectors;
   std::vector<ChannelRoleId> channel_role_selectors;
   std::vector<CommandCallerOptionDTO> caller_options;
-  std::optional<CommandCompletionRule> completion_rule;
-  std::optional<CommandConfirmationRule> confirmation_rule;
+  CommandCompletionRule completion_rule{CommandCompletionRule::kGoalFencedTargetReached};
+  CommandConfirmationRule confirmation_rule{CommandConfirmationRule::kBindingFeedbackRequired};
   std::vector<CommandStopEvidenceRequirement> stop_evidence_requirements;
 
   friend bool operator==(const CommandSchemaDTO&, const CommandSchemaDTO&) = default;
@@ -150,7 +142,7 @@ struct CommandSchemaDTO final {
 
 inline constexpr std::string_view kGripperPositionCommandSchemaId = "gripper.command_position";
 inline constexpr std::string_view kGripperPositionCommandSchemaRevision =
-    "sha256:4808a6bec7d020cb66df2082325e1838471a2604deaddfd1afe31dae427140e9";
+    "sha256:b8e74c2c32f4bf438905efe148b7fbf6f452bb91c1bf83a30b0404a1c2533f08";
 
 /// Build-owned first I6 command family. Its semantic revision is pinned to
 /// the exact normalized catalog record shipped by manyforge_deployment.
@@ -173,33 +165,13 @@ inline constexpr std::string_view kGripperPositionCommandSchemaRevision =
       {},
       {},
       {CommandCallerOptionDTO{CommandOptionId("command_duration_s"),
-                              CommandCallerOptionValueKind::kNonnegativeDurationSeconds, false}},
+                              CommandCallerOptionValueKind::kNonnegativeDurationSeconds, false},
+       CommandCallerOptionDTO{CommandOptionId("wait_for_duration"),
+                              CommandCallerOptionValueKind::kBool, false}},
       CommandCompletionRule::kGoalFencedTargetReached,
       CommandConfirmationRule::kBindingFeedbackRequired,
       {CommandStopEvidenceRequirement::kCommandTerminal},
   };
-}
-
-inline constexpr std::string_view kIoSignalWriteCommandSchemaId = "io.signal_write_boolean";
-inline constexpr std::string_view kIoSignalWriteCommandSchemaRevision =
-    "sha256:2a0823f3255907443875c1428495eac7ab3945280477b95332f67fccd5ace9ea";
-
-[[nodiscard]] inline CommandSchemaDTO builtin_io_signal_write_command_schema() {
-  const auto* capability = find_builtin_capability_definition("io.gpio.set_output");
-  if (capability == nullptr) {
-    throw std::logic_error("build-owned output command capability is missing");
-  }
-  return {CommandSchemaId(std::string(kIoSignalWriteCommandSchemaId)),
-          CommandSchemaRevision(std::string(kIoSignalWriteCommandSchemaRevision)),
-          {{CapabilityId(std::string(capability->capability_id)),
-            CapabilityDefinitionRevision(std::string(capability->capability_definition_revision))}},
-          IoSignalWriteCommandValueContractDTO{},
-          {},
-          {},
-          {},
-          std::nullopt,
-          std::nullopt,
-          {}};
 }
 
 }  // namespace manyforge::core

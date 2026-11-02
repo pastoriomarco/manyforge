@@ -23,7 +23,7 @@
 #include <xarm_msgs/msg/robot_msg.hpp>
 
 #include <manyforge_core/time/iclock.hpp>
-#include <manyforge_xarm_control/xarm_brand_lifecycle_port.hpp>
+#include <manyforge_xarm_control/contract.hpp>
 
 namespace manyforge::xarm_control {
 
@@ -34,10 +34,10 @@ namespace manyforge::xarm_control {
 /// The production transport: one subscription to the driver's
 /// `robot_states` (standard `xarm_msgs/msg/RobotMsg`). It keeps the status
 /// fields of the latest report, stamped at receipt on the given clock; the
-/// joint angles are kept only for the Enable gate's agreement check and the
-/// pose is never read. Message callbacks run on the node's
+/// joint angles serve only the Enable gate and the pose is never read.
+/// Message callbacks run on the node's
 /// executor and hold only the shared report cache, never this object.
-class XArmRobotStatesTransport final : public IXArmBrandLifecycleTransport {
+class XArmRobotStatesTransport final : public IXArmStatusSource {
 public:
   /// `clock` outlives every callback of the subscription.
   XArmRobotStatesTransport(rclcpp::Node &node, std::string_view driver_namespace,

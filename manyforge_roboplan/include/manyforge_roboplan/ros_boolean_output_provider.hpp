@@ -14,10 +14,9 @@
 
 #pragma once
 
-#include <manyforge_core/ports/iio_output_provider.hpp>
-#include <manyforge_core/time/iclock.hpp>
+#include <manyforge_core/types/io_signal.hpp>
 #include <manyforge_roboplan/io_output_alias_identity.hpp>
-#include <manyforge_roboplan/xarm_digital_bank.hpp>
+#include <manyforge_roboplan/io_output_writer.hpp>
 #include <memory>
 #include <rclcpp/node.hpp>
 #include <variant>
@@ -35,76 +34,55 @@ struct RosBooleanOutputAlias final {
 struct RosSetBoolOutputAddress final {
   std::string service;
 };
-struct UrSetIoOutputAddress final {
-  std::string service;
-  std::uint8_t pin;
-};
-struct XArmSetDigitalOutputAddress final {
-  std::string service;
-  std::uint8_t pin;
-  XArmDigitalBank bank;
-};
 struct RosGpioOutputAddress final {
   std::string topic;
   std::string group;
   std::string interface_name;
 };
 using RosBooleanOutputAddress =
-    std::variant<RosSetBoolOutputAddress, UrSetIoOutputAddress,
-                 RosGpioOutputAddress, XArmSetDigitalOutputAddress>;
+    std::variant<RosSetBoolOutputAddress, RosGpioOutputAddress>;
 
 struct RosBooleanOutputChannel final {
   core::ResourceId resource_id;
   RosBooleanOutputAddress address;
   std::vector<RosBooleanOutputAlias> aliases;
   core::ActiveBundlePublicationGeneration active_publication_generation;
+  /// A SetBool service's answer bound: the device's authored
+  /// `output_source_ack_timeout_s` (CONTRACTS §7). Unused for GPIO, which
+  /// has no answer.
+  core::Duration ack_timeout_ns{};
 };
 
-/// One resolved SetBool/UR/xArm service or GPIO command topic on the existing
-/// host ROS context. Composition
-/// groups every channel alias into one provider; per-occurrence driver gates
-/// remain separate. There is no owned node, executor, thread, timer, resend,
-/// input publication or readback. SourceAccepted means a correlated true
-/// service response, never evidence that hardware changed state. GPIO publish
-/// completes with Submitted only; it has no acknowledgement or readback.
-///
-/// Kernel/session retains admission, CCLC generation, deadline/unknown outcome
-/// and post-retirement replay authority. This leaf has one bounded correlation.
-/// For xArm, return 0 is accepted delivery, not physical output readback;
-/// a nonzero return leaves the effect unknown.
-/// A service send requires an unexpired owner-issued absolute deadline; GPIO
-/// submission requires no deadline and never waits for acknowledgement.
-/// Retire removes local correlation only, never undoes a possible remote
-/// effect. Shutdown and quiesce the existing executor before releasing the
-/// injected clock; it must outlive callbacks already entering on the host
-/// executor.
-class RosBooleanOutputProvider final : public core::IIoOutputProvider {
+/// One resolved SetBool service or GPIO command topic on the existing host ROS
+/// context. Composition groups every channel alias into one provider;
+/// per-occurrence driver gates remain separate. There is no owned node,
+/// executor, thread, timer, resend, input publication or readback. A true
+/// service response is an accepted write, never evidence that hardware changed
+/// state; a GPIO publish has no acknowledgement or readback. Shutdown and
+/// quiesce the existing executor before releasing this provider.
+class RosBooleanOutputProvider final {
 public:
   /// Opaque shared transport/write-model of one actual ROS context+command
   /// topic. It owns no lifecycle/admission or command correlation authority.
   struct GpioTopic;
   [[nodiscard]] static core::Result<std::unique_ptr<RosBooleanOutputProvider>>
-  Create(rclcpp::Node::SharedPtr node, core::IClock &clock,
-         RosBooleanOutputChannel channel,
+  Create(rclcpp::Node::SharedPtr node, RosBooleanOutputChannel channel,
          std::shared_ptr<GpioTopic> gpio_topic = {});
   /// Actual retained topic pin only; null for acknowledged service outputs.
   [[nodiscard]] std::shared_ptr<GpioTopic> gpio_topic() const noexcept;
-  ~RosBooleanOutputProvider() override;
+  ~RosBooleanOutputProvider();
   RosBooleanOutputProvider(const RosBooleanOutputProvider &) = delete;
   RosBooleanOutputProvider &
   operator=(const RosBooleanOutputProvider &) = delete;
 
-  core::IoOutputEvidence StrongestOutputEvidence() const noexcept override;
-  core::Result<core::IoOutputObservationDTO>
-  SubmitOutput(const core::IoOutputWriteRequestDTO &request) override;
-  core::Result<core::IoOutputObservationDTO> ObserveOutputResult(
-      const core::IoOutputCommandIdentityDTO &identity) const override;
-  /// Exact session uncertainty excludes only this command from future GPIO
-  /// payloads; its retained transport evidence remains unchanged.
-  core::Result<void> ExcludeFromGroupModel(
-      const core::IoOutputCommandIdentityDTO &identity) override;
-  core::Result<void>
-  RetireOutput(const core::IoOutputCommandIdentityDTO &identity) override;
+  /// CONTRACTS §6, §7: the one write of one alias, behind its component's
+  /// output-writer interface: one send while the alias's occurrence is
+  /// enabled. A service
+  /// answer is the outcome; no answer within the channel's `ack_timeout_ns`,
+  /// or a Stop, is `unknown` (never resent). A GPIO publish has no answer: published is
+  /// succeeded.
+  [[nodiscard]] SetOutputResult WriteOutput(const core::IoSignalId &signal, bool value,
+                                            std::stop_token stop);
 
   /// Actual client connectivity / publisher resource only; no waiting,
   /// subscriber count guarantee or lifecycle-state inference.
@@ -120,7 +98,7 @@ public:
          std::uint64_t driver_observation_generation,
          const std::weak_ptr<const void> &actual_driver_owner);
   /// Final local owner teardown, independent of counter exhaustion. It fences
-  /// only this exact occurrence; pending correlated ACKs remain observable.
+  /// only this exact occurrence.
   core::Result<void> ShutdownOccurrence(
       const core::ResolvedLifecycleProviderOccurrenceDTO &provider,
       const std::weak_ptr<const void> &actual_driver_owner);

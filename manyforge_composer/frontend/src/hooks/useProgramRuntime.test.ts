@@ -4,7 +4,6 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import type {
   AppliedProgramSelection,
-  CurrentScenarioResponse,
   PersistentKeyValues,
   ProgramRuntimeControlProjection,
   ProgramRunStatus,
@@ -14,9 +13,7 @@ import type { ComposerHeadlessState } from '../types/headless';
 import {
   buildProgramResetRequest,
   buildProgramStartRequest,
-  bindExecuteIdentity,
   controlPendingAfterProjection,
-  executeIdentity,
   persistentValuesFence,
   programPendingAfterProjection,
   programRunProjectionKey,
@@ -25,8 +22,6 @@ import {
   programMotionStopSettled,
   programRuntimeWakeKey,
   programTerminalFailureMessage,
-  programResetReadinessMessage,
-  PROGRAM_RESET_READINESS_MESSAGE,
 } from './useProgramRuntime';
 
 afterEach(() => {
@@ -76,82 +71,6 @@ function admissionFixtures() {
 }
 
 describe('Program runtime idle selection', () => {
-  it('explains post-Reset readiness without enabling Run or labeling startup as Reset', () => {
-    const { applied, workspace, snapshot } = admissionFixtures();
-    const waiting = {
-      ...snapshot, authoringAdmission: { authoringAllowed: false, admissionGeneration: 32 },
-    };
-    expect(programResetReadinessMessage(waiting)).toBe(PROGRAM_RESET_READINESS_MESSAGE);
-    expect(buildProgramStartRequest(applied, true, null, waiting, workspace, 'operator', 'run')).toBeNull();
-    expect(programResetReadinessMessage(snapshot)).toBeNull();
-    expect(buildProgramStartRequest(applied, true, null, snapshot, workspace, 'operator', 'run')).not.toBeNull();
-    expect(programResetReadinessMessage(null)).toBeNull();
-    expect(programResetReadinessMessage({
-      ...waiting, programCycle: { ...waiting.programCycle, cycleGeneration: 1 },
-    })).toBeNull();
-    expect(programResetReadinessMessage({
-      ...waiting, programCycle: { ...waiting.programCycle, state: 'resetting' },
-    })).toBeNull();
-    expect(programResetReadinessMessage({
-      ...waiting, programCycle: { ...waiting.programCycle,
-        failure: { code: 'program_scene_preparation_failed', message: 'Scene convergence failed', details: {} } },
-    })).toBeNull();
-  });
-  it('binds only the GUI-owned Execute identity and treats empty reads as unknown', () => {
-    const { applied, workspace, snapshot } = admissionFixtures();
-    const scenario = {
-      schemaVersion: 'manyforge.current_scenario.v1', ready: true, unavailableReasons: [],
-      currentScenario: {
-        scenarioId: applied.scenarioId, sourceDocumentDigest: applied.sourceDocumentDigest,
-        deploymentArtifactId: 'deployment', deploymentRevision: 'deployment.revision',
-        retainedBundleId: 'bundle', graphRevision: 'graph', programId: 'program',
-        programRevision: applied.programRevision, programBindingId: 'binding',
-      },
-    } as CurrentScenarioResponse;
-    const confirmed = executeIdentity(true, applied, scenario, snapshot, workspace, false);
-    expect(bindExecuteIdentity(confirmed,
-      executeIdentity(true, null, null, null, null, false))).toEqual(confirmed);
-    const noScenario = { schemaVersion: 'manyforge.current_scenario.v1', ready: false,
-      unavailableReasons: ['scenario_not_ready'], currentScenario: null } as CurrentScenarioResponse;
-    const confirmedWithoutScenario = executeIdentity(true, applied, noScenario, snapshot, workspace, false);
-    expect(confirmedWithoutScenario.slice(1, 4)).toEqual([applied.recordDigest, undefined, undefined]);
-    expect(bindExecuteIdentity(confirmedWithoutScenario,
-      executeIdentity(true, null, noScenario, snapshot, workspace, false))).toEqual(confirmedWithoutScenario);
-    expect(bindExecuteIdentity(confirmedWithoutScenario,
-      executeIdentity(true, { ...applied, recordDigest: digest('d') }, noScenario, snapshot, workspace, false))).toBeNull();
-    const ownerOnlyChange = {
-      ...snapshot,
-      receiverEpoch: 'receiver.restarted',
-      authoringWorkspace: { ...snapshot.authoringWorkspace, workspaceEpoch: 'workspace.2', workspaceRevision: 99 },
-      programCycle: { ...snapshot.programCycle, programRunnerOwnerEpoch: 'runner.2', cycleClaimGeneration: 99 },
-    } as ComposerHeadlessState;
-    expect(bindExecuteIdentity(confirmed,
-      executeIdentity(true, { ...applied, sourceOwnerEpoch: 'applied.2', sourceGeneration: 99 },
-        scenario, ownerOnlyChange, workspace, false))).toEqual(confirmed);
-    expect(bindExecuteIdentity(confirmed,
-      executeIdentity(true, applied, scenario, snapshot,
-        { ...workspace, draft: { ...workspace.draft, draftRevision: workspace.draft.draftRevision + 1 } }, false))).toBeNull();
-    expect(bindExecuteIdentity(confirmed,
-      executeIdentity(true, applied, scenario, {
-        ...snapshot, authoringWorkspace: {
-          ...snapshot.authoringWorkspace,
-          deploymentDraftRevision: snapshot.authoringWorkspace.deploymentDraftRevision + 1,
-        },
-      }, workspace, false))).toBeNull();
-    expect(bindExecuteIdentity(confirmed,
-      executeIdentity(true, applied, scenario, {
-        ...snapshot, authoringWorkspace: {
-          ...snapshot.authoringWorkspace,
-          deploymentDraftId: 'deployment-draft-2',
-        },
-      }, workspace, false))).toBeNull();
-    expect(bindExecuteIdentity(confirmed,
-      executeIdentity(true, { ...applied, recordDigest: digest('d') }, scenario, snapshot, workspace, false))).toBeNull();
-    expect(bindExecuteIdentity(confirmed,
-      executeIdentity(true, applied, scenario, {
-        ...snapshot, programCycle: { ...snapshot.programCycle, cycleGeneration: snapshot.programCycle.cycleGeneration + 1 },
-      }, workspace, false))).toBeNull();
-  });
   it('uses semantic owner revisions instead of a fixed browser poll', () => {
     const source = readFileSync(new URL('./useProgramRuntime.ts', import.meta.url), 'utf8');
     expect(source).not.toContain('setInterval');
@@ -553,7 +472,7 @@ describe('Program command settlement', () => {
       ...settled,
       recoveryOffer: {
         ...settled.recoveryOffer,
-        recoveryClass: 'stop_fault_intervention',
+        recoveryClass: 'ordinary_operator_stop',
         status: 'reset_required',
       },
     } as unknown as NonNullable<
@@ -625,26 +544,10 @@ describe('Program command settlement', () => {
 });
 
 describe('Program runtime authority requests', () => {
-  it('waits for an unapplied Deployment Draft exactly like a Program Draft', () => {
-    const { applied, workspace, snapshot } = admissionFixtures();
+  it('names the Applied Program in the run request; readiness is the backend\'s', () => {
+    const { applied, workspace } = admissionFixtures();
     expect(buildProgramStartRequest(
-      applied, true, null, snapshot, workspace, 'owner', 'start', false,
-    )).not.toBeNull();
-    expect(buildProgramStartRequest(
-      applied, true, null, snapshot, workspace, 'owner', 'start', true,
-    )).toBeNull();
-    const programChanged = {
-      ...workspace, draft: { ...workspace.draft, programRevision: digest('d') },
-    } as typeof workspace;
-    expect(buildProgramStartRequest(
-      applied, true, null, snapshot, programChanged, 'owner', 'start', false,
-    )).toBeNull();
-  });
-
-  it('starts only from one complete Idle snapshot and carries exact fences', () => {
-    const { applied, workspace, snapshot } = admissionFixtures();
-    expect(buildProgramStartRequest(
-      applied, true, null, snapshot, workspace,
+      applied, workspace,
       'composer-program-owner.fixture', 'program-run-start.fixture',
     )).toEqual({
       request_id: 'program-run-start.fixture',
@@ -658,18 +561,10 @@ describe('Program runtime authority requests', () => {
     });
 
     expect(buildProgramStartRequest(
-      applied, true, null, null, workspace,
-      'composer-program-owner.fixture', 'program-run-start.fixture',
+      null, workspace, 'composer-program-owner.fixture', 'program-run-start.fixture',
     )).toBeNull();
     expect(buildProgramStartRequest(
-      applied, true, null,
-      { ...snapshot, programCycle: { ...snapshot.programCycle, state: 'running' } },
-      workspace, 'composer-program-owner.fixture', 'program-run-start.fixture',
-    )).toBeNull();
-    expect(buildProgramStartRequest(
-      applied, true, null, snapshot,
-      { ...workspace, draft: { ...workspace.draft, draftRevision: 6 } },
-      'composer-program-owner.fixture', 'program-run-start.fixture',
+      applied, null, 'composer-program-owner.fixture', 'program-run-start.fixture',
     )).toBeNull();
   });
 
@@ -729,23 +624,6 @@ describe('Program runtime authority requests', () => {
       settlement_evidence_digest: terminalReference,
       reload_initial_scene: false, reset_robot_position: false,
     });
-    // D6 (SX-324): a failed Close Reset continues with its retained
-    // keep_stop_fault; an ordinary call cannot drop it.
-    const retainedClose = {
-      ...terminalSnapshot,
-      programCycle: {
-        ...terminalSnapshot.programCycle,
-        state: 'recovery_required' as const,
-        currentCommandKind: 'program_reset' as const,
-        resetOptions: { reloadInitialScene: false, resetRobotPosition: false, keepStopFault: true },
-      },
-    };
-    expect(buildProgramResetRequest(retainedClose, 'composer-program-owner.fixture', 'reset.retry'))
-      .toMatchObject({ keep_stop_fault: true, reload_initial_scene: false, reset_robot_position: false });
-    expect(buildProgramResetRequest(terminalSnapshot, 'composer-program-owner.fixture', 'reset.close',
-      'reset.close', { keepStopFault: true })).toMatchObject({ keep_stop_fault: true });
-    expect(buildProgramResetRequest(terminalSnapshot, 'composer-program-owner.fixture', 'reset.plain'))
-      .not.toHaveProperty('keep_stop_fault');
     expect(buildProgramResetRequest(
       {
         ...terminalSnapshot,

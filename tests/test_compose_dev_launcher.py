@@ -5,7 +5,6 @@ import os
 import tempfile
 import re
 import subprocess
-import sqlite3
 from pathlib import Path
 
 import pytest
@@ -329,11 +328,11 @@ def test_plain_stop_reports_failed_stop_without_deleting(tmp_path: Path) -> None
 @pytest.mark.parametrize("selection", [[], ["--bootstrap-project", "examples/first.scenario"],
                                        ["--project", "examples/authored.scenario"]])
 @pytest.mark.parametrize("container_name", ["manyforge-development-workbench", "isolated-workbench"])
-@pytest.mark.parametrize("trace_enabled", [False, True])
+@pytest.mark.parametrize("traces_disabled", [False, True])
 @pytest.mark.parametrize("experiment_enabled", [False, True])
 def test_start_preserves_ros_topology_by_default_and_refuses_removed_flag(
     tmp_path: Path, explicit_ros_flag: bool, selection: list[str], container_name: str,
-    trace_enabled: bool, experiment_enabled: bool,
+    traces_disabled: bool, experiment_enabled: bool,
 ) -> None:
     environment = _fake_docker_environment(tmp_path)
     experiments = {
@@ -352,9 +351,14 @@ def test_start_preserves_ros_topology_by_default_and_refuses_removed_flag(
         environment.pop(name)
     if experiment_enabled:
         environment["MANYFORGE_AI_CHAT_TOKEN"] = "secret-token-value"
+    # Motion traces default to /tmp/manyforge-state/motion-traces; an empty value disables them.
     environment.pop("MANYFORGE_MOTION_TRACE_DIR", None)
-    if trace_enabled:
-        environment["MANYFORGE_MOTION_TRACE_DIR"] = "/tmp/manyforge-state/motion-traces"
+    if traces_disabled:
+        environment["MANYFORGE_MOTION_TRACE_DIR"] = ""
+    # Fast DDS defaults to UDP only in the workbench; an explicit value is kept.
+    environment.pop("FASTDDS_BUILTIN_TRANSPORTS", None)
+    if experiment_enabled:
+        environment["FASTDDS_BUILTIN_TRANSPORTS"] = "DEFAULT"
     workspace = tmp_path / "workspace"
     launcher = workspace / "scripts" / LAUNCHER.name
     launcher.parent.mkdir(parents=True)
@@ -368,7 +372,11 @@ printf '%s\\n' "$*" >> "$FAKE_DOCKER_CALLS"
 case "$1" in
   image) printf 'sha256:test\\n' ;;
   container) ;;
-  run) : > "$FAKE_DOCKER_STARTED"; printf 'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\n' ;;
+  run)
+    : > "$FAKE_DOCKER_STARTED"
+    printf '%s\\n' "${FASTDDS_BUILTIN_TRANSPORTS-unset}" > "$FAKE_DOCKER_STARTED.transports"
+    printf '%s\\n' "${MANYFORGE_MOTION_TRACE_DIR-unset}" > "$FAKE_DOCKER_STARTED.trace"
+    printf 'dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\\n' ;;
   inspect)
     [[ -e "$FAKE_DOCKER_STARTED" ]] || exit 1
     printf 'true\\n'
@@ -406,7 +414,8 @@ esac
     assert completed.returncode == 0, completed.stderr
     calls = Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
     command = next(call for call in calls if call.startswith("run "))
-    assert ("--env MANYFORGE_MOTION_TRACE_DIR" in command) is trace_enabled
+    # The launcher always exports the variable, so it is always forwarded by name.
+    assert "--env MANYFORGE_MOTION_TRACE_DIR" in command
     for name in experiments:
         assert (f"--env {name}" in command) is experiment_enabled
     assert ("--env MANYFORGE_AI_CHAT_TOKEN" in command) is experiment_enabled
@@ -426,6 +435,7 @@ esac
         (" " + " ".join(selection) if selection else "")
     )
     for name in ("ROS_DOMAIN_ID", "RMW_IMPLEMENTATION", "ROS_STATIC_PEERS",
+                 "FASTDDS_BUILTIN_TRANSPORTS",
                  "MANYFORGE_ROS2_CONTROL_BUILD_TESTING", "MANYFORGE_ROS_DEPENDENCY_SETUP_SCRIPTS"):
         assert f"--env {name}" in command
     assert f"--user {os.getuid()}:{os.getgid()}" in command
@@ -437,6 +447,10 @@ esac
         assert (cache_root / directory).stat().st_uid == os.getuid()
     assert "launch-isaac" not in command
     assert "ROS_STATIC_PEERS=orin;laptop" not in command
+    transports = Path(environment["FAKE_DOCKER_STARTED"] + ".transports").read_text().strip()
+    assert transports == ("DEFAULT" if experiment_enabled else "UDPv4")
+    trace_dir = Path(environment["FAKE_DOCKER_STARTED"] + ".trace").read_text().strip()
+    assert trace_dir == ("" if traces_disabled else "/tmp/manyforge-state/motion-traces")
 
 
 def test_developer_start_forwards_explicit_site_settings(tmp_path: Path) -> None:
@@ -740,12 +754,12 @@ def test_cold_start_requires_no_overlapping_live_bind_before_session_rotation(tm
 
 def test_plain_container_removal_keeps_live_durable_state_files(tmp_path: Path) -> None:
     state_root = tmp_path / "cache/runtime/manyforge-development-workbench"
-    journal = state_root / "execution-state/cclc-journal.sqlite3"
+    journal = state_root / "execution-state/operation-journal.sqlite3"
     journal.parent.mkdir(parents=True)
-    journal.write_bytes(b"existing durable incident evidence")
+    journal.write_bytes(b"existing durable evidence")
     completed, _ = _run_launcher(tmp_path, "stop")
     assert completed.returncode == 0
-    assert journal.read_bytes() == b"existing durable incident evidence"
+    assert journal.read_bytes() == b"existing durable evidence"
 
 
 @pytest.mark.parametrize("container_name", ["../foreign", "nested/name"])
@@ -1015,7 +1029,7 @@ def test_retained_cap_keeps_unknown_and_failed_legacy_exceptions(tmp_path, case)
     calls = Path(environment["FAKE_DOCKER_CALLS"]).read_text().splitlines()
     assert "rm "+"a"*64 not in calls
     assert "manually export" in completed.stderr
-    assert "unidentified stopped" in completed.stderr if case=="historical" else "sole open-incident journal" in completed.stderr
+    assert "unidentified stopped" in completed.stderr if case=="historical" else "its only console trace" in completed.stderr
 
 
 def test_older_default_root_retry_uses_aggregate_accounting_from_actual_mount(tmp_path):
@@ -1023,8 +1037,6 @@ def test_older_default_root_retry_uses_aggregate_accounting_from_actual_mount(tm
     current_root = tmp_path / "cache/runtime/manyforge-development-workbench"
     settings = _older_receipt(tmp_path, root=older_root)
     (current_root / "execution-state").mkdir(parents=True)
-    with sqlite3.connect(current_root / "execution-state/cclc-journal.sqlite3") as database:
-        database.execute("CREATE TABLE cclc_component_incidents(acknowledged INTEGER)")
     for stamp in ("20261010T000000Z", "20261011T000000Z"):
         capture = current_root / "evidence" / stamp
         capture.mkdir(parents=True)
@@ -1174,11 +1186,9 @@ def test_start_completes_mounted_stopped_predecessor_capture_and_preserves_durab
     fake = fake.replace('  run)\n    : > "$FAKE_DOCKER_STARTED"',
         '  run)\n    rm -f -- "$FAKE_DOCKER_STOPPED"\n    : > "$FAKE_DOCKER_STARTED"')
     docker.write_text(fake)
-    durable = root/'execution-state/cclc-journal.sqlite3'
+    durable = root/'execution-state/operation-journal.sqlite3'
     durable.parent.mkdir()
-    with sqlite3.connect(durable) as db:
-        db.execute('CREATE TABLE cclc_component_incidents(acknowledged INTEGER)')
-        db.execute('INSERT INTO cclc_component_incidents VALUES (0)')
+    durable.write_bytes(b'owner journal')
     before = durable.read_bytes()
     partial = root/'evidence'/('.mounted-'+'d'*64+'.partial')
     partial.mkdir(parents=True)
@@ -1197,7 +1207,7 @@ def test_start_completes_mounted_stopped_predecessor_capture_and_preserves_durab
     assert position('stop') < position('logs') < position('rm') < position('run')
     archived = list((root / "previous-sessions").iterdir())
     assert len(archived) == 1
-    archived_durable = archived[0] / "execution-state/cclc-journal.sqlite3"
+    archived_durable = archived[0] / "execution-state/operation-journal.sqlite3"
     assert archived_durable.read_bytes() == before and not partial.exists()
     assert not durable.exists()
     assert {p.name for p in (root / "current").iterdir()} == {"session.json"}

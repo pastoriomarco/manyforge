@@ -38,7 +38,7 @@ def test_process_commands_cover_the_complete_typed_runtime_boundary(
         install_root=matrix.PACKAGE,
     )
     commands = matrix._process_commands(  # noqa: SLF001
-        scenario_id="lite6_pick_and_place",
+        scenario_id="mock_lite6_pick_and_place",
         cell_id="cell.fixture",
         admission_filename="admission.json",
         api_port=9010,

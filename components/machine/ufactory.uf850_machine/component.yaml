@@ -1,0 +1,23 @@
+# Component descriptor (docs/authoring/ADDING_A_COMPONENT.md): the machine
+# (owner) and its member slots (plan, "Machines: owners and members"). The
+# owner holds the connection, the driver process, the controller error
+# register and power; its members are the arm and the I/O banks. One machine,
+# one lane: every member runs on the owner's lane.
+api_version: manyforge.component_package.v1
+kind: machine
+id: ufactory.uf850_machine
+version: 1.0.0
+title: UFACTORY UF850 (controller, arm, control-box I/O, tool I/O)
+license: BSD-3-Clause
+provenance:
+  source: https://github.com/pastoriomarco/xarm_ros2
+  notes: XARM_CONTROLLER_FACTS (manyforge_specs)
+default_owner_id: uf850             # the owner's id when added; members <owner_id>_<role>
+members:
+  - {role: arm, model: ufactory.uf850}
+  - {role: controller_io, model: ufactory.uf850_controller_io}
+  - {role: tool_io, model: ufactory.uf850_tool_io}
+lanes:                            # no mock/isaac row: the host's passive owner there.
+                                  # Every member may be deactivated, the arm included.
+  real: {adapter: xarm}           # manyforge_xarm_control/vendor/README.md; the owner
+                                  # runs the ros2_control process (the arm's description)

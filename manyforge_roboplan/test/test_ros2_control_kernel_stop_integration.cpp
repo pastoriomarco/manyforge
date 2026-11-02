@@ -27,7 +27,7 @@
 #include <manyforge_core/sqlite_operation_journal.hpp>
 #include <manyforge_core/types/controller_lifecycle.hpp>
 #include <manyforge_core/types/prepared_execution.hpp>
-#include <manyforge_roboplan/native_runtime_support.hpp>
+#include <manyforge_roboplan/execution_host_support.hpp>
 #include <manyforge_roboplan/retained_ros2_control_runtime_handle.hpp>
 #include <manyforge_ros2_control_execution/ros2_control_execution_backend.hpp>
 #include <manyforge_ros2_control_execution/ros2_transport_resources.hpp>
@@ -58,6 +58,11 @@ namespace {
 
 using namespace std::chrono_literals;
 namespace fake = manyforge::ros2_control_execution::fake_controller;
+
+/// A lifecycle command time no test step reaches.
+[[nodiscard]] MockResetPositionStepDeadline Soon() {
+  return std::chrono::steady_clock::now() + std::chrono::seconds(30);
+}
 using manyforge::ros2_control_execution::Ros2ControlExecutionBackend;
 
 class StateSink final : public core::IExecutionStateSink {
@@ -435,10 +440,10 @@ private:
 };
 
 // Test replacement for the planner/validator-backed ExecutionKernel only. The
-// prepared product is sealed with the Kernel's authority exactly as the
-// retained CCLC admission fake does; Prepare and Dispatch are the real
-// Core participant over the JTC adapter. Each prepared motion takes the next
-// execution ID (the participant's membership never revives a retired one).
+// prepared product is sealed with the Kernel's authority; Prepare and
+// Dispatch are the real Core participant over the JTC adapter. Each prepared
+// motion takes the next execution ID (the participant's membership never
+// revives a retired one).
 class Ros2ControlPreparedMotionEngine final
     : public core::IResolvedParticipantExecutionEngine,
       public core::IResolvedPreparedParticipantExecutionEngine {
@@ -750,9 +755,8 @@ private:
     }
   }
 
-  // Adapted from the retained native CCLC admission fake. The only semantic
-  // change is a trajectory long enough to remain active on the controller
-  // until the test stops it.
+  // Its trajectory is long enough to remain active on the controller until
+  // the test stops it.
   [[nodiscard]] static core::Result<core::PreparedOperationParticipantDTO>
   MakePreparedMotionParticipant(
       const core::ResolvedPreparedMotionExecutionRequestDTO &authority) {
@@ -835,7 +839,7 @@ private:
         request.motion,
         request.tolerances,
         request.speed_profile,
-        request.planning_profile,
+        request.planner,
         request.contact_policy_id.empty()
             ? std::nullopt
             : std::optional<std::string>{request.contact_policy_id},
@@ -1037,7 +1041,7 @@ MotionOperation(const core::RuntimeParticipantBinding &binding,
       core::SpeedProfileDTO{},
       core::TimeoutsDTO{},
       core::CacheMode::kDefault,
-      core::PlanningProfileDTO::kBalanced,
+      core::PlannerOverrideDTO{},
       core::MotionTargetModeDTO::kAbsolute,
       std::nullopt,
       std::nullopt,
@@ -1204,7 +1208,8 @@ void RunStopDuringActiveRos2ControlMotion(const StopKind kind) {
       "manyforge_kernel_ros2_control_stop_" + fake::unique_suffix(), "/", 3U, sink,
       "arm", clock);
   Ros2ControlExecutionBackend adapter(resources, clock, AdapterConfig(controller));
-  // CCLC activated this binding (the readiness the host feeds the adapter).
+  // The component's Enable activated this binding (the readiness the host
+  // feeds the adapter).
   adapter.ObserveReadiness({true, true, true, core::ExecutionBindingEpoch(1U)});
   auto port = std::make_shared<CompiledNamePort>(adapter);
   core::ObservedRobotStatePublication publication{
@@ -1378,8 +1383,7 @@ void RunStopDuringActiveRos2ControlMotion(const StopKind kind) {
 
     // 5. Terminal status and certificate name the ros2_control participant.
     EXPECT_EQ(status->state, core::StopStatusStateDTO::kSucceeded);
-    EXPECT_FALSE(status->fault_latch.has_value());
-    EXPECT_FALSE(kernel.get_stop_fault_latch().has_value());
+    EXPECT_FALSE(kernel.get_cell_latch().latched);
     EXPECT_TRUE(status->failed.empty());
     EXPECT_TRUE(status->unsettled.empty());
     const auto expected_key = core::StopScopeEntryKeyDTO{
@@ -1483,8 +1487,8 @@ void StopAndCertify(core::ResourceAddressedExecutionKernel &kernel,
 
 TEST(Ros2ControlKernelStopIntegrationTest,
      ReactivationRetiresTheOldAdapterAndDispatchesOnlyThroughTheNewEpoch) {
-  // Design §3.1 and the port contract: a controller reactivated through CCLC
-  // is a new binding epoch served by a new adapter instance; the old one is
+  // Design §3.1 and the port contract: a reactivated controller is a new
+  // binding epoch served by a new adapter instance; the old one is
   // shut down first and the participant is rebound before the switch.
   WallClock clock;
   SimpleScheduler scheduler;
@@ -1528,8 +1532,8 @@ TEST(Ros2ControlKernelStopIntegrationTest,
     const auto activity = handle->arm_activity();
     return activity.observed && activity.controller_loaded && activity.hardware_active;
   }));
-  ASSERT_EQ(handle->PrepareArmController().outcome, RetainedRos2ControlSwitchOutcome::kSucceeded);
-  ASSERT_EQ(handle->ActivateArmController({}).outcome,
+  ASSERT_EQ(handle->PrepareArmController({}, Soon()).outcome, RetainedRos2ControlSwitchOutcome::kSucceeded);
+  ASSERT_EQ(handle->ActivateArmController({}, Soon()).outcome,
             RetainedRos2ControlSwitchOutcome::kSucceeded);
   const auto first = handle->current_port();
   ASSERT_TRUE(fake::WaitUntil([&] {
@@ -1552,7 +1556,7 @@ TEST(Ros2ControlKernelStopIntegrationTest,
         core::ResourceAddressedExecutionKernelConfig{core::RequestOwnerEpoch(kOwnerEpoch),
                                                      cell_id, 16U});
 
-    // A goal running on epoch 1 when CCLC switches the controller off.
+    // A goal running on epoch 1 when Disable switches the controller off.
     core::TrajectoryDTO hold;
     hold.joint_names = {"joint_1"};
     hold.waypoints = {{0.0, {0.0}, {0.0}, {0.0}}, {8.0, {0.0}, {0.0}, {0.0}}};
@@ -1566,12 +1570,12 @@ TEST(Ros2ControlKernelStopIntegrationTest,
     // The pending goal's result stays outstanding across the rotation: a
     // callback still in flight on the old instance when it is retired.
     jtc.HoldResultOnDeactivate(true);
-    ASSERT_EQ(handle->DeactivateArmController({}).outcome,
+    ASSERT_EQ(handle->DeactivateArmController({}, Soon()).outcome,
               RetainedRos2ControlSwitchOutcome::kSucceeded);
     ASSERT_TRUE(fake::WaitUntil([&] { return !first->ReadReadiness().controller_active; }));
-    ASSERT_EQ(handle->PrepareArmController().outcome,
+    ASSERT_EQ(handle->PrepareArmController({}, Soon()).outcome,
               RetainedRos2ControlSwitchOutcome::kSucceeded);
-    ASSERT_EQ(handle->ActivateArmController({}).outcome,
+    ASSERT_EQ(handle->ActivateArmController({}, Soon()).outcome,
               RetainedRos2ControlSwitchOutcome::kSucceeded);
     const auto second = handle->current_port();
     ASSERT_NE(second, first);
@@ -1701,8 +1705,8 @@ TEST(Ros2ControlKernelStopIntegrationTest,
     const auto activity = handle->arm_activity();
     return activity.observed && activity.controller_loaded && activity.hardware_active;
   }));
-  ASSERT_EQ(handle->PrepareArmController().outcome, RetainedRos2ControlSwitchOutcome::kSucceeded);
-  ASSERT_EQ(handle->ActivateArmController({}).outcome,
+  ASSERT_EQ(handle->PrepareArmController({}, Soon()).outcome, RetainedRos2ControlSwitchOutcome::kSucceeded);
+  ASSERT_EQ(handle->ActivateArmController({}, Soon()).outcome,
             RetainedRos2ControlSwitchOutcome::kSucceeded);
   const HostEntityCounts one_set{1U, 1U, 1U, 1U};
   ASSERT_TRUE(fake::WaitUntil([&] { return HostEntities(*jtc.node(), controller) == one_set; }));
@@ -1710,12 +1714,12 @@ TEST(Ros2ControlKernelStopIntegrationTest,
   constexpr std::uint64_t kCycles = 20U;
   for (std::uint64_t cycle = 1U; cycle <= kCycles; ++cycle) {
     SCOPED_TRACE(cycle);
-    ASSERT_EQ(handle->DeactivateArmController({}).outcome,
+    ASSERT_EQ(handle->DeactivateArmController({}, Soon()).outcome,
               RetainedRos2ControlSwitchOutcome::kSucceeded);
     ASSERT_TRUE(fake::WaitUntil([&] { return !handle->arm_activity().controller_active; }));
-    ASSERT_EQ(handle->PrepareArmController().outcome,
+    ASSERT_EQ(handle->PrepareArmController({}, Soon()).outcome,
               RetainedRos2ControlSwitchOutcome::kSucceeded);
-    ASSERT_EQ(handle->ActivateArmController({}).outcome,
+    ASSERT_EQ(handle->ActivateArmController({}, Soon()).outcome,
               RetainedRos2ControlSwitchOutcome::kSucceeded);
     const auto port = handle->current_port();
     const core::ExecutionBindingEpoch epoch(cycle + 1U);

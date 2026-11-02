@@ -41,8 +41,8 @@
 #include <manyforge_roboplan/retained_collision_world_projector.hpp>
 #include <manyforge_roboplan/retained_collision_world_publisher.hpp>
 #include <manyforge_roboplan/retained_kinematic_state_projector.hpp>
-#include <manyforge_roboplan/retained_native_cell_runtime.hpp>
-#include <manyforge_roboplan/retained_native_runtime.hpp>
+#include <manyforge_roboplan/retained_cell_runtime.hpp>
+#include <manyforge_roboplan/retained_execution_host.hpp>
 #include <manyforge_roboplan/retained_observed_state_channel.hpp>
 #include <manyforge_roboplan/retained_planner_scene_projection.hpp>
 #include <manyforge_roboplan/retained_planning_model_stage.hpp>
@@ -70,32 +70,27 @@
 #include "host_io_signal_runtime.hpp"
 #include "host_io_output_channels.hpp"
 #include "io_provider_lifecycle_product.hpp"
-#include "maintained_activation_fixture.hpp"
 #include "pneumatic_program_fixture.hpp"
 #include "program_root_fixture.hpp"
 #include <manyforge_core/testing/addressed_request_fixtures.hpp>
 #include <manyforge_component_manager/active_bundle_publication_store.hpp>
-#include <manyforge_core/build_owned_lifecycle_plan_catalog_source.hpp>
 #include <manyforge_core/io_signal_ingress.hpp>
 #include <manyforge_core/prepared_operation_participant_codec.hpp>
-#include <manyforge_core/sqlite_cclc_journal.hpp>
-#include <manyforge_deployment/component_lifecycle_current_snapshot_source.hpp>
-#include <manyforge_core/component_lifecycle_plan_catalog_codec.hpp>
 #include <manyforge_roboplan/retained_ros2_control_backend_factory.hpp>
 #include <manyforge_roboplan/retained_execution_state_sink.hpp>
-#include <manyforge_roboplan/retained_ros2_control_lifecycle_product.hpp>
 #include <manyforge_ros2_control_execution/ros2_gripper_command_backend.hpp>
-#include "../src/retained_ros2_control_lifecycle_plans_internal.hpp"
 #endif
 
 #include "content_identity_internal.hpp"
+#include "gripper_only_retention_fixture.hpp"
 #include "lite6_retained_consumer_fixture.hpp"
+#include "maintained_activation_fixture.hpp"
 #include "io_retained_fixture.hpp"
 #include "managed_kernel_apply_fence_owner.hpp"
 #include "mf2_joint_name_internal.hpp"
 #include "product_backed_runtime_participant_resolver.hpp"
 #include "retained_bundle_internal.hpp"
-#include "retained_native_runtime_internal.hpp"
+#include "retained_execution_host_internal.hpp"
 
 namespace manyforge::roboplan_backend {
 namespace {
@@ -169,204 +164,6 @@ static_assert(!std::is_default_constructible_v<
               deployment::VerifiedRetainedProjectionInput>);
 static_assert(
     !std::is_aggregate_v<deployment::VerifiedRetainedProjectionInput>);
-
-struct SubscriptionObservationSnapshot final {
-  std::size_t active_subscriptions{};
-  std::size_t subscriptions{};
-  std::size_t unsubscriptions{};
-  std::size_t observer_destructions{};
-  std::size_t destructions_with_active_subscription{};
-  std::size_t peer_back_pointer_observations{};
-  std::size_t uncleared_peer_back_pointers{};
-};
-
-/// External observation state for joined-engine teardown. It owns neither an
-/// observer nor an underlying engine, so keeping this ledger after root reset
-/// cannot extend any production lifetime under test.
-class SubscriptionObservationLedger final {
-public:
-  void Subscribed(const std::string &observer,
-                  const std::uint64_t handle) {
-    std::lock_guard lock(mutex_);
-    if (!active_.emplace(observer, handle).second) {
-      throw std::logic_error(
-          "real participant returned a duplicate subscription handle");
-    }
-    ++subscriptions_;
-  }
-
-  void Unsubscribed(const std::string &observer,
-                    const std::uint64_t handle) {
-    std::lock_guard lock(mutex_);
-    if (active_.erase({observer, handle}) == 1U) {
-      ++unsubscriptions_;
-    }
-  }
-
-  void ObserverDestroyed(const std::string &observer,
-                         const bool observes_peer,
-                         const bool peer_back_pointers_cleared) {
-    std::lock_guard lock(mutex_);
-    ++observer_destructions_;
-    if (std::any_of(active_.begin(), active_.end(), [&](const auto &entry) {
-          return entry.first == observer;
-        })) {
-      ++destructions_with_active_subscription_;
-    }
-    if (observes_peer) {
-      ++peer_back_pointer_observations_;
-      if (!peer_back_pointers_cleared) {
-        ++uncleared_peer_back_pointers_;
-      }
-    }
-  }
-
-  [[nodiscard]] SubscriptionObservationSnapshot Snapshot() const {
-    std::lock_guard lock(mutex_);
-    return {active_.size(),
-            subscriptions_,
-            unsubscriptions_,
-            observer_destructions_,
-            destructions_with_active_subscription_,
-            peer_back_pointer_observations_,
-            uncleared_peer_back_pointers_};
-  }
-
-private:
-  mutable std::mutex mutex_;
-  std::set<std::pair<std::string, std::uint64_t>> active_;
-  std::size_t subscriptions_{};
-  std::size_t unsubscriptions_{};
-  std::size_t observer_destructions_{};
-  std::size_t destructions_with_active_subscription_{};
-  std::size_t peer_back_pointer_observations_{};
-  std::size_t uncleared_peer_back_pointers_{};
-};
-
-/// Runtime-owned observer that delegates to and owns one real participant
-/// engine. Only the non-owning addressed registration points at this wrapper;
-/// an aliasing participant_engine shared_ptr below makes the runtime itself the
-/// wrapper owner without changing the production runtime shape.
-class SubscriptionObservedParticipantEngine final
-    : public core::IResolvedParticipantExecutionEngine {
-public:
-  SubscriptionObservedParticipantEngine(
-      std::shared_ptr<core::IResolvedParticipantExecutionEngine> engine,
-      std::shared_ptr<SubscriptionObservationLedger> ledger,
-      std::string observer,
-      std::function<bool()> peer_back_pointers_cleared = {})
-      : engine_(std::move(engine)), ledger_(std::move(ledger)),
-        observer_(std::move(observer)),
-        peer_back_pointers_cleared_(
-            std::move(peer_back_pointers_cleared)) {
-    if (engine_ == nullptr || ledger_ == nullptr || observer_.empty()) {
-      throw std::invalid_argument("observed participant engine is absent");
-    }
-  }
-
-  ~SubscriptionObservedParticipantEngine() override {
-    ledger_->ObserverDestroyed(
-        observer_, static_cast<bool>(peer_back_pointers_cleared_),
-        !peer_back_pointers_cleared_ || peer_back_pointers_cleared_());
-  }
-
-  core::AddressedParticipantStopFenceDisposition
-  fence_addressed_participant_stop(
-      const std::uint64_t execution_id) noexcept override {
-    return engine_->fence_addressed_participant_stop(execution_id);
-  }
-  core::Result<core::AddressedParticipantStopSettlementDTO>
-  settle_addressed_participant_stop(
-      const core::AddressedParticipantStopSettlementRequestDTO &request)
-      override {
-    return Require()->settle_addressed_participant_stop(request);
-  }
-  core::ResetResultDTO reset_after_certified_containment(
-      const std::uint64_t execution_id,
-      std::optional<std::uint64_t> expected_epoch = std::nullopt) override {
-    return Require()->reset_after_certified_containment(execution_id,
-                                                        expected_epoch);
-  }
-  core::AcknowledgeCompletedResultDTO acknowledge_completed(
-      const std::uint64_t execution_id,
-      std::optional<std::uint64_t> expected_epoch = std::nullopt) override {
-    return Require()->acknowledge_completed(execution_id, expected_epoch);
-  }
-  core::Result<core::ResolvedRuntimeScaleAcceptedDTO> set_runtime_scale(
-      const core::ResolvedRuntimeScaleCommandDTO &command) override {
-    return Require()->set_runtime_scale(command);
-  }
-  core::Result<core::ResolvedRuntimeScaleStatusDTO> runtime_scale_status(
-      const core::OperationId &operation_id,
-      const core::ControlBindingId &control_binding_id) const override {
-    return Require()->runtime_scale_status(operation_id, control_binding_id);
-  }
-  core::GripperCommandResultDTO command_gripper(
-      const core::GripperCommandRequestDTO &request) override {
-    return Require()->command_gripper(request);
-  }
-  core::Result<void> validate_gripper_command(
-      const core::GripperCommandRequestDTO &request) const override {
-    return Require()->validate_gripper_command(request);
-  }
-  core::GripperCommandStatusDTO
-  get_gripper_status(const std::string &gripper_id) const override {
-    return Require()->get_gripper_status(gripper_id);
-  }
-  core::Result<std::uint64_t>
-  stop_gripper(const std::string &gripper_id,
-               const std::uint64_t expected_command_id,
-               const std::uint64_t expected_generation) override {
-    return Require()->stop_gripper(gripper_id, expected_command_id,
-                                   expected_generation);
-  }
-  core::Result<void>
-  reset_gripper(const std::string &gripper_id,
-                const std::uint64_t expected_command_id,
-                const std::uint64_t expected_generation) override {
-    return Require()->reset_gripper(gripper_id, expected_command_id,
-                                    expected_generation);
-  }
-  core::ExecutionStatus get_status() const override {
-    return Require()->get_status();
-  }
-  core::KernelRecoveryAssessmentDTO
-  get_recovery_assessment() const override {
-    return Require()->get_recovery_assessment();
-  }
-  core::KernelRecoveryActionResultDTO apply_recovery_action(
-      const core::KernelRecoveryActionRequestDTO &request) override {
-    return Require()->apply_recovery_action(request);
-  }
-
-  core::SubscriptionHandle
-  subscribe_events(core::EventCallback callback) override {
-    const auto engine = Require();
-    const auto handle = engine->subscribe_events(std::move(callback));
-    try {
-      ledger_->Subscribed(observer_, handle.id);
-    } catch (...) {
-      engine->unsubscribe_events(handle);
-      throw;
-    }
-    return handle;
-  }
-  void unsubscribe_events(const core::SubscriptionHandle handle) override {
-    Require()->unsubscribe_events(handle);
-    ledger_->Unsubscribed(observer_, handle.id);
-  }
-
-private:
-  [[nodiscard]] std::shared_ptr<core::IResolvedParticipantExecutionEngine>
-  Require() const {
-    return engine_;
-  }
-
-  std::shared_ptr<core::IResolvedParticipantExecutionEngine> engine_;
-  std::shared_ptr<SubscriptionObservationLedger> ledger_;
-  std::string observer_;
-  std::function<bool()> peer_back_pointers_cleared_;
-};
 
 [[nodiscard]] core::LogicalSceneSnapshotRoot
 make_projection_runtime_shadow_snapshot(const core::CellId &cell_id) {
@@ -1087,7 +884,7 @@ make_motion_operation(const core::RuntimeParticipantBinding &binding,
               core::SpeedProfileDTO{0.5, 0.5, std::nullopt},
               core::TimeoutsDTO{3.0, 5.0},
               core::CacheMode::kDefault,
-              core::PlanningProfileDTO::kFirstFeasible,
+              core::PlannerOverrideDTO{},
               core::MotionTargetModeDTO::kAbsolute,
               std::nullopt,
               std::nullopt,
@@ -1096,37 +893,6 @@ make_motion_operation(const core::RuntimeParticipantBinding &binding,
               std::nullopt,
               {},
               {}}}},
-      core::OperationCoordinationPolicy::kIndependent};
-}
-
-[[nodiscard]] core::OperationIntentDTO
-make_gripper_operation(const core::RuntimeParticipantBinding &binding,
-                       const core::RequestOwnerEpoch &owner_epoch) {
-  const auto &value = binding.value();
-  return core::OperationIntentDTO{
-      core::PublicRequestContextDTO{core::RequestId("request.native.gripper.1"),
-                                    owner_epoch, "retained_product_consumer",
-                                    std::nullopt},
-      value.program_id,
-      value.program_revision,
-      value.program_binding_id,
-      core::ProgramRunId("run.native.gripper.1"),
-      value.graph_revision,
-      value.retained_bundle_id,
-      std::nullopt,
-      {core::OperationParticipantIntentDTO{
-          value.component_role_id, value.target_role_id, value.capability_id,
-          std::nullopt,
-          core::CapabilityCommandIntentDTO{
-              core::CommandSchemaId(
-                  std::string(core::kGripperPositionCommandSchemaId)),
-              core::CommandSchemaRevision(
-                  std::string(core::kGripperPositionCommandSchemaRevision)),
-              core::GripperPositionCommandValueDTO{
-                  core::LinearPositionDTO{0.004}, std::nullopt},
-              1.0,
-              {core::CommandDurationOptionDTO{
-                  core::CommandOptionId("command_duration_s"), 0.0}}}}},
       core::OperationCoordinationPolicy::kIndependent};
 }
 
@@ -1598,8 +1364,7 @@ TEST(RetainedProductCrossConsumer,
   ASSERT_TRUE(std::filesystem::create_directory(package_root));
 
   const auto materialized = deployment::test::
-      materialize_lite6_ros2_control_arm_gripper_aggregate_retained_consumer_fixture(
-          package_root);
+      materialize_lite6_ros2_control_retained_consumer_fixture(package_root);
   ASSERT_NE(materialized.bundle, nullptr);
   ASSERT_EQ(
       materialized.bundle->value().compiled_products.symbol_role_maps.size(),
@@ -2144,432 +1909,6 @@ TEST(RetainedProductRoboPlanConsumer,
   EXPECT_TRUE(std::filesystem::is_empty(staging_parent));
 }
 
-TEST(RetainedProductCrossConsumer,
-     AggregateArmAndGripperStateProjectsExactUnitsMimicsAndFk) {
-  ScopedTemporaryRoot temporary;
-  const std::filesystem::path package_root =
-      temporary.path() / "retained-package";
-  const std::filesystem::path staging_parent =
-      temporary.path() / "private-stages";
-  const std::filesystem::path empty_ambient_root =
-      temporary.path() / "empty-ambient";
-  ASSERT_TRUE(std::filesystem::create_directory(package_root));
-  ASSERT_TRUE(std::filesystem::create_directory(staging_parent));
-  ASSERT_TRUE(std::filesystem::create_directory(empty_ambient_root));
-
-  const auto materialized = deployment::test::
-      materialize_lite6_ros2_control_arm_gripper_aggregate_retained_consumer_fixture(
-          package_root);
-  ASSERT_NE(materialized.bundle, nullptr);
-  const auto &products = materialized.bundle->value().compiled_products;
-  ASSERT_EQ(products.symbol_role_maps.size(), 1U);
-  const deployment::RetainedPlanningModelQuery planning_query{
-      materialized.bundle->retained_bundle_id(),
-      products.planning_collision_model.product_id};
-  const deployment::RetainedModelMapQuery map_query{
-      materialized.bundle->retained_bundle_id(),
-      products.symbol_role_maps.front().product_id};
-  const auto retained = load_lite6_planning_model(package_root, planning_query);
-  const auto model_map = load_lite6_model_map(package_root, map_query);
-
-  const core::ControllableComponentId component_id(
-      std::string(deployment::test::kLite6ControllableComponentId));
-  const core::CommandTargetId arm_target_id(
-      std::string(deployment::test::kLite6ArmTargetId));
-  const core::CommandTargetId gripper_target_id(
-      std::string(deployment::test::kLite6GripperTargetId));
-  const auto arm_binding = make_fixture_runtime_participant(
-      *materialized.bundle, model_map, component_id, arm_target_id);
-  const auto gripper_binding = make_fixture_runtime_participant(
-      *materialized.bundle, model_map, component_id, gripper_target_id);
-
-  auto stage =
-      RetainedPlanningModelStage::create_verified(retained, staging_parent);
-  ScopedCurrentDirectory no_ambient_lookup(empty_ambient_root);
-  auto scene = make_roboplan_scene(RoboPlanSceneInput{
-      "retained_lite6_state_projection", std::string(stage.loader_urdf_bytes()),
-      std::string(stage.srdf_bytes()), stage.package_paths(),
-      retained_joint_limit_rows(retained)});
-  auto scene_mutex = std::make_shared<std::mutex>();
-  auto projector = RetainedKinematicStateProjector::create_verified(
-      scene, scene_mutex, *materialized.bundle, model_map, retained,
-      std::vector<core::RuntimeParticipantBinding>{arm_binding,
-                                                   gripper_binding},
-      1'000'000'000);
-
-  const auto contexts = projector.query_contexts();
-  ASSERT_EQ(contexts.size(), 2U);
-  const auto arm_context =
-      std::find_if(contexts.begin(), contexts.end(), [&](const auto &context) {
-        return context.command_target_id == arm_target_id;
-      });
-  const auto gripper_context =
-      std::find_if(contexts.begin(), contexts.end(), [&](const auto &context) {
-        return context.command_target_id == gripper_target_id;
-      });
-  ASSERT_NE(arm_context, contexts.end());
-  ASSERT_NE(gripper_context, contexts.end());
-  ASSERT_EQ(arm_context->coordinate_kinds.size(), 6U);
-  EXPECT_TRUE(std::all_of(
-      arm_context->coordinate_kinds.begin(),
-      arm_context->coordinate_kinds.end(),
-      [](const auto kind) { return kind == core::CoordinateKind::kAngular; }));
-  ASSERT_EQ(gripper_context->coordinate_kinds.size(), 1U);
-  EXPECT_EQ(gripper_context->coordinate_kinds.front(),
-            core::CoordinateKind::kLinear);
-
-  const auto *arm_target = model_map.find_target(component_id, arm_target_id);
-  ASSERT_NE(arm_target, nullptr);
-  const auto arm_tcp = std::find_if(
-      arm_target->frames.begin(), arm_target->frames.end(),
-      [](const auto &frame) { return frame.frame_role_id.value() == "tcp"; });
-  ASSERT_NE(arm_tcp, arm_target->frames.end());
-  std::string arm_tcp_name;
-  std::visit(
-      [&](const auto &frame) {
-        if constexpr (requires { frame.compiled_frame_name; }) {
-          arm_tcp_name = frame.compiled_frame_name;
-        }
-      },
-      arm_tcp->frame);
-  ASSERT_FALSE(arm_tcp_name.empty());
-  const Eigen::Matrix4d zero_tcp =
-      scene->forwardKinematics(scene->getCurrentJointPositions(), arm_tcp_name,
-                               model_map.cell_frame().compiled_frame_name);
-
-  const std::vector<double> arm_positions{0.0, -0.785, 0.785, 0.0, 1.57, 0.0};
-  const auto arm_state =
-      make_fixture_state(*arm_context, arm_positions, 1U, 100);
-  const auto arm_result = projector.apply(arm_state, 100);
-  ASSERT_TRUE(arm_result.applied())
-      << (arm_result.error.has_value() ? arm_result.error->message : "");
-  const Eigen::Matrix4d moved_tcp =
-      scene->forwardKinematics(scene->getCurrentJointPositions(), arm_tcp_name,
-                               model_map.cell_frame().compiled_frame_name);
-  EXPECT_FALSE(moved_tcp.isApprox(zero_tcp, 1e-10));
-
-  const auto gripper_state =
-      make_fixture_state(*gripper_context, {0.004}, 1U, 110);
-  const auto gripper_result = projector.apply(gripper_state, 110);
-  ASSERT_TRUE(gripper_result.applied())
-      << (gripper_result.error.has_value() ? gripper_result.error->message
-                                           : "");
-  const Eigen::Matrix4d after_gripper_tcp =
-      scene->forwardKinematics(scene->getCurrentJointPositions(), arm_tcp_name,
-                               model_map.cell_frame().compiled_frame_name);
-  EXPECT_TRUE(after_gripper_tcp.isApprox(moved_tcp, 1e-12));
-
-  const auto arm_read = projector.current_state(
-      arm_context->control_binding_id, arm_context->control_binding_revision);
-  ASSERT_TRUE(arm_read.ok()) << arm_read.error().message;
-  EXPECT_EQ(arm_read.value().positions.size(), arm_positions.size());
-  for (std::size_t index = 0U; index < arm_positions.size(); ++index) {
-    const auto *angular = std::get_if<core::AngularPositionDTO>(
-        &arm_read.value().positions[index]);
-    ASSERT_NE(angular, nullptr);
-    EXPECT_NEAR(angular->value_rad, arm_positions[index], 1e-12);
-  }
-  const auto gripper_read =
-      projector.current_state(gripper_context->control_binding_id,
-                              gripper_context->control_binding_revision);
-  ASSERT_TRUE(gripper_read.ok()) << gripper_read.error().message;
-  ASSERT_EQ(gripper_read.value().positions.size(), 1U);
-  const auto *linear = std::get_if<core::LinearPositionDTO>(
-      &gripper_read.value().positions.front());
-  ASSERT_NE(linear, nullptr);
-  EXPECT_NEAR(linear->value_m, 0.004, 1e-12);
-
-  const auto coordinates = projector.model_coordinate_state();
-  ASSERT_TRUE(coordinates.ok()) << coordinates.error().message;
-  const std::string gripper_master =
-      compiled_symbol(model_map, deployment::OccurrenceSymbolKind::kJoint,
-                      "right_finger_joint");
-  const std::string gripper_follower = compiled_symbol(
-      model_map, deployment::OccurrenceSymbolKind::kJoint, "left_finger_joint");
-  for (const auto &name : {gripper_master, gripper_follower}) {
-    const auto found =
-        std::find_if(coordinates.value().begin(), coordinates.value().end(),
-                     [&](const auto &coordinate) {
-                       return coordinate.compiled_joint_name == name;
-                     });
-    ASSERT_NE(found, coordinates.value().end());
-    const auto *position =
-        std::get_if<core::LinearPositionDTO>(&found->position);
-    ASSERT_NE(position, nullptr);
-    EXPECT_NEAR(position->value_m, 0.004, 1e-12);
-  }
-
-  auto foreign = gripper_state;
-  foreign.control_binding_revision = arm_context->control_binding_revision;
-  const auto rejected = projector.apply(foreign, 120);
-  EXPECT_EQ(rejected.status, RetainedStateProjectionStatus::kRejected);
-  const auto unchanged =
-      projector.current_state(gripper_context->control_binding_id,
-                              gripper_context->control_binding_revision);
-  ASSERT_TRUE(unchanged.ok()) << unchanged.error().message;
-  EXPECT_EQ(unchanged.value(), gripper_read.value());
-}
-
-TEST(RetainedProductCrossConsumer,
-     PneumaticCommandedFeedbackAliasUsesConstructionOnlyAbsence) {
-  ScopedTemporaryRoot temporary;
-  const auto package_root = temporary.path() / "retained-package";
-  const auto staging_parent = temporary.path() / "private-stages";
-  ASSERT_TRUE(std::filesystem::create_directory(package_root));
-  ASSERT_TRUE(std::filesystem::create_directory(staging_parent));
-  const auto materialized = deployment::test::
-      materialize_lite6_retained_consumer_fixture_from(
-          package_root,
-          deployment::test::make_lite6_controllable_retention_fixture(
-              false, false, 1U, true, true, {}, false, true, "resource", true,
-              {}, {}, true, true, false, std::nullopt, false,
-              deployment::test::kLite6ArmTargetId, std::nullopt, std::nullopt,
-              {}, true, {}, "manyforge.provider.ros2_control", false, true,
-              nullptr, nullptr, false, false, "pneumatic", 0.8, "commanded"));
-  ASSERT_NE(materialized.bundle, nullptr);
-  const auto &bundle = *materialized.bundle;
-  const auto &products = bundle.value().compiled_products;
-  ASSERT_EQ(products.symbol_role_maps.size(), 1U);
-  const auto retained = load_lite6_planning_model(
-      package_root, {bundle.retained_bundle_id(),
-                     products.planning_collision_model.product_id});
-  const auto model_map = load_lite6_model_map(
-      package_root, {bundle.retained_bundle_id(),
-                     products.symbol_role_maps.front().product_id});
-  const core::ControllableComponentId component_id(
-      std::string(deployment::test::kLite6ControllableComponentId));
-  const core::CommandTargetId arm_target_id(
-      std::string(deployment::test::kLite6ArmTargetId));
-  const core::CommandTargetId gripper_target_id(
-      std::string(deployment::test::kLite6GripperTargetId));
-  const core::RuntimeEpoch epoch("pneumatic-alias-frame-epoch");
-  const auto arm = make_fixture_runtime_participant(
-      bundle, model_map, component_id, arm_target_id, std::nullopt,
-      std::nullopt, epoch);
-  const auto command = make_fixture_runtime_participant(
-      bundle, model_map, component_id, gripper_target_id, std::nullopt,
-      std::nullopt, epoch, core::CapabilityId("tool.gripper.command"));
-  const auto feedback = make_fixture_runtime_participant(
-      bundle, model_map, component_id, gripper_target_id, std::nullopt,
-      std::nullopt, epoch, core::CapabilityId("tool.gripper.feedback"));
-  ASSERT_TRUE(command.value().control_path.has_value());
-  ASSERT_TRUE(feedback.value().control_path.has_value());
-  const auto runtime_id = command.value().control_path->provider_runtime_unit_id;
-  EXPECT_EQ(feedback.value().control_path->provider_runtime_unit_id, runtime_id);
-  const auto configuration = deployment::ros2_control_execution_runtime_contract::
-      require_component_configuration(bundle, runtime_id, component_id);
-  const auto &configured = require_fixture_one(
-      configuration.gripper_target_configurations,
-      [&](const auto &row) {
-        return row.controllable_component_id == component_id &&
-               row.command_target_id == gripper_target_id;
-      }, "actual pneumatic command configuration");
-  ASSERT_EQ(configured.actuation_kind, "pneumatic");
-  ASSERT_EQ(configured.output_mode, core::GripperOutputMode::kCommanded);
-  const auto command_context = core::make_observed_state_query_context(command, 0);
-  const auto feedback_context = core::make_observed_state_query_context(feedback, 0);
-  ASSERT_TRUE(command_context.ok()) << command_context.error().message;
-  ASSERT_TRUE(feedback_context.ok()) << feedback_context.error().message;
-  ASSERT_NE(command_context.value().control_binding_id,
-            feedback_context.value().control_binding_id);
-  EXPECT_EQ(command_context.value().resources, feedback_context.value().resources);
-  EXPECT_EQ(command_context.value().joint_names, feedback_context.value().joint_names);
-  EXPECT_EQ(command_context.value().coordinate_kinds,
-            feedback_context.value().coordinate_kinds);
-  EXPECT_EQ(command_context.value().control_route_id,
-            feedback_context.value().control_route_id);
-
-  auto stage = RetainedPlanningModelStage::create_verified(retained, staging_parent);
-  auto scene = make_roboplan_scene(RoboPlanSceneInput{
-      "pneumatic_alias_frame_state", std::string(stage.loader_urdf_bytes()),
-      std::string(stage.srdf_bytes()), stage.package_paths(),
-      retained_joint_limit_rows(retained)});
-  auto projector = std::make_shared<RetainedKinematicStateProjector>(
-      RetainedKinematicStateProjector::create_verified(
-          scene, std::make_shared<std::mutex>(), bundle, model_map, retained,
-          std::vector<core::RuntimeParticipantBinding>{arm}, 0));
-  auto arm_channel = std::make_shared<RetainedObservedStateChannel>(
-      arm, projector, RetainedObservedStateChannelConfig{
-          core::ObservedStateSourceKind::kCommandedState,
-          "test/pneumatic-alias/actual-arm", 0, 1U});
-  ASSERT_TRUE(arm_channel->initialize_from_projection(10).applied());
-  const auto *arm_target = model_map.find_target(component_id, arm_target_id);
-  ASSERT_NE(arm_target, nullptr);
-  ASSERT_FALSE(arm_target->model_groups.empty());
-  auto collision_model = ManyForgeCollisionEngine::load_shared_model(
-      "pneumatic_alias_frame_state", stage.loader_urdf_path(), stage.srdf_path(),
-      stage.package_paths(), arm_target->model_groups.front().compiled_group_name);
-  const RetainedSceneFrameStateSourceInput arm_source{
-      arm_channel->query_context(), arm_channel->source_kind(),
-      std::shared_ptr<const core::IObservedStateProvider>(
-          arm_channel, arm_channel->addressed_publication())};
-  // No gripper channel, coordinate value or publication is supplied.
-  const RetainedSceneFrameStateSourceInput absence{
-      command_context.value(), core::ObservedStateSourceKind::kCommandedState,
-      nullptr, RetainedSceneFrameCoordinateAuthority::kUnavailablePneumatic};
-
-  // Reverse only traversal of genuine verified rows. All identities, retained
-  // paths and bundle checks still come from the same sealed model map.
-  struct ReversedMapTraversal final {
-    const deployment::VerifiedRetainedModelMap &verified;
-    std::vector<deployment::CompositionControlBindingCoordinateMap> rows;
-    const auto &query() const { return verified.query(); }
-    const auto &cell_frame() const { return verified.cell_frame(); }
-    const auto &targets() const { return verified.targets(); }
-    const auto &kinematic_index() const { return verified.kinematic_index(); }
-    const auto &control_bindings() const { return rows; }
-    void require_same_bundle_as(
-        const deployment::VerifiedRetainedPlanningModel &planning) const {
-      verified.require_same_bundle_as(planning);
-    }
-  } reversed{model_map, model_map.control_bindings()};
-  std::reverse(reversed.rows.begin(), reversed.rows.end());
-  const auto command_map = std::find_if(
-      reversed.rows.begin(), reversed.rows.end(), [&](const auto &row) {
-        return row.control_binding_id == command_context.value().control_binding_id;
-      });
-  const auto feedback_map = std::find_if(
-      reversed.rows.begin(), reversed.rows.end(), [&](const auto &row) {
-        return row.control_binding_id == feedback_context.value().control_binding_id;
-      });
-  ASSERT_NE(command_map, reversed.rows.end());
-  ASSERT_NE(feedback_map, reversed.rows.end());
-  ASSERT_LT(feedback_map, command_map);
-  const auto create = [&](const auto &traversal,
-                          std::vector<RetainedSceneFrameStateSourceInput> sources) {
-    return RetainedSceneFrameResolver::create_verified(
-        collision_model, bundle, traversal, retained, runtime_id, epoch,
-        std::move(sources));
-  };
-  auto resolver = create(model_map, {arm_source, absence});
-  auto reversed_resolver = create(reversed, {arm_source, absence});
-  ASSERT_NE(resolver, nullptr);
-  ASSERT_NE(reversed_resolver, nullptr);
-  const auto logical_scene = make_projection_runtime_shadow_snapshot(
-      bundle.value().cell_graph.cell_id);
-  const core::ProjectionLeaseBindingDTO lease{
-      {bundle.retained_bundle_id(), bundle.value().cell_graph.graph_revision,
-       logical_scene.shared()->revision},
-      core::ProjectionLeaseId("pneumatic-alias-frame-lease")};
-  const core::SceneFrameResolutionQueryDTO query{
-      core::TargetCarrierSceneFrameRefDTO{component_id, arm_target_id,
-                                          core::FrameRoleId("tcp")}, lease};
-  const auto scene_before = scene->getCurrentJointPositions();
-  const auto resolved = resolver->Resolve(query, logical_scene.shared(), 10);
-  const auto reversed_resolved = reversed_resolver->Resolve(
-      query, logical_scene.shared(), 10);
-  ASSERT_TRUE(resolved.ok()) << resolved.error().message;
-  ASSERT_TRUE(reversed_resolved.ok()) << reversed_resolved.error().message;
-  EXPECT_EQ(reversed_resolved.value(), resolved.value());
-  for (const auto &state : resolved.value().kinematic_state_path_view.resource_states) {
-    EXPECT_NE(state.resource_id, command.value().resources.front().resource_id);
-  }
-  EXPECT_TRUE(scene->getCurrentJointPositions().isApprox(scene_before));
-  const std::vector<double> moved{0.0, -0.785, 0.785, 0.0, 1.57, 0.0};
-  ASSERT_TRUE(arm_channel->publish_state(
-      moved, std::vector<double>(moved.size(), 0.0), 20, 20).applied());
-  const auto after = resolver->Resolve(query, logical_scene.shared(), 20);
-  const auto reversed_after = reversed_resolver->Resolve(
-      query, logical_scene.shared(), 20);
-  ASSERT_TRUE(after.ok()) << after.error().message;
-  ASSERT_TRUE(reversed_after.ok()) << reversed_after.error().message;
-  EXPECT_EQ(reversed_after.value(), after.value());
-  EXPECT_FALSE(after.value().frame_pose_in_cell == resolved.value().frame_pose_in_cell);
-  EXPECT_TRUE(scene->getCurrentJointPositions().isApprox(scene_before));
-
-  const auto rejects_both_orders = [&](const auto &sources) {
-    EXPECT_THROW(static_cast<void>(create(model_map, sources)), std::invalid_argument);
-    EXPECT_THROW(static_cast<void>(create(reversed, sources)), std::invalid_argument);
-  };
-  rejects_both_orders(std::vector<RetainedSceneFrameStateSourceInput>{arm_source});
-  rejects_both_orders(std::vector<RetainedSceneFrameStateSourceInput>{absence});
-  const auto reject_marker = [&](auto marker) {
-    rejects_both_orders(std::vector<RetainedSceneFrameStateSourceInput>{
-        arm_source, std::move(marker)});
-  };
-  auto invalid = absence;
-  invalid.coordinate_authority =
-      RetainedSceneFrameCoordinateAuthority::kRequiredPublication;
-  reject_marker(invalid);
-  invalid = absence;
-  invalid.coordinate_authority = static_cast<RetainedSceneFrameCoordinateAuthority>(999);
-  reject_marker(invalid);
-  invalid = absence;
-  invalid.context.provider_instance_id = core::ProviderInstanceId("foreign-owner");
-  reject_marker(invalid);
-  invalid = absence;
-  invalid.context.runtime_epoch = core::RuntimeEpoch("foreign-epoch");
-  reject_marker(invalid);
-  invalid = absence;
-  invalid.context.control_route_id = core::ControlRouteId("foreign-route");
-  reject_marker(invalid);
-  invalid = absence;
-  invalid.context.controllable_component_id = core::ControllableComponentId("foreign-component");
-  reject_marker(invalid);
-  invalid = absence;
-  invalid.context.resources.front() = core::ResourceId("foreign-resource");
-  reject_marker(invalid);
-  invalid = absence;
-  invalid.context.control_binding_id = core::ControlBindingId("unused-command");
-  reject_marker(invalid);
-  invalid = absence;
-  invalid.context = feedback_context.value();
-  reject_marker(invalid);
-  invalid = absence;
-  invalid.context = arm_source.context;
-  reject_marker(invalid);
-  invalid = absence;
-  invalid.provider = arm_source.provider;
-  reject_marker(invalid);
-  rejects_both_orders(std::vector<RetainedSceneFrameStateSourceInput>{
-      arm_source, absence, absence});
-  auto unused = absence;
-  unused.context.control_binding_id = core::ControlBindingId("unused-command");
-  rejects_both_orders(std::vector<RetainedSceneFrameStateSourceInput>{
-      arm_source, absence, unused});
-  EXPECT_THROW(static_cast<void>(RetainedSceneFrameResolver::create(
-                   collision_model, RetainedSceneFrameResolverInput{
-                       bundle.retained_bundle_id(), bundle.value().cell_graph.graph_revision,
-                       model_map.cell_frame().cell_id,
-                       model_map.cell_frame().compiled_frame_name,
-                       model_map.kinematic_index().frame_paths(), {}, {}, {}, {},
-                       {absence}, 10'000'000})),
-               std::invalid_argument);
-
-  // B2: no target row names a frame of another component (the LOADFIX12
-  // foreign `tcp` row and its exception are gone): such a row is refused.
-  ASSERT_NE(arm_target, nullptr);
-  const auto arm_tcp = std::find_if(
-      arm_target->frames.begin(), arm_target->frames.end(),
-      [](const auto &frame) { return frame.frame_role_id.value() == "tcp"; });
-  ASSERT_NE(arm_tcp, arm_target->frames.end());
-  const auto *arm_tcp_frame =
-      std::get_if<deployment::CompositionComponentModelFrame>(&arm_tcp->frame);
-  ASSERT_NE(arm_tcp_frame, nullptr);
-  const auto target_row = [&](const core::ControllableComponentId &stamp) {
-    return RetainedTargetSceneFrameInput{
-        component_id, arm_target_id, core::FrameRoleId("tcp"),
-        core::ResolvedComponentModelFrameDTO{
-            stamp, arm_tcp_frame->model_instance_id,
-            arm_tcp_frame->frame_role_id, arm_tcp_frame->compiled_frame_name,
-            arm_tcp_frame->model_revision}};
-  };
-  const auto with_target_row = [&](RetainedTargetSceneFrameInput row) {
-    return RetainedSceneFrameResolver::create(
-        collision_model,
-        RetainedSceneFrameResolverInput{
-            bundle.retained_bundle_id(), bundle.value().cell_graph.graph_revision,
-            model_map.cell_frame().cell_id,
-            model_map.cell_frame().compiled_frame_name,
-            model_map.kinematic_index().frame_paths(), {}, {std::move(row)}, {},
-            {}, {arm_source}, 10'000'000});
-  };
-  EXPECT_NE(with_target_row(target_row(component_id)), nullptr);
-  EXPECT_THROW(static_cast<void>(with_target_row(
-                   target_row(core::ControllableComponentId("lite_gripper")))),
-               std::invalid_argument);
-}
-
 TEST(
     RetainedProductCrossConsumer,
     SceneFrameResolverReadsDirectOrExternalOwnerPublicationNotMutablePlannerState) {
@@ -2581,9 +1920,13 @@ TEST(
   ASSERT_TRUE(std::filesystem::create_directory(package_root));
   ASSERT_TRUE(std::filesystem::create_directory(staging_parent));
 
-  const auto materialized = deployment::test::
-      materialize_lite6_ros2_control_motion_arm_gripper_retained_consumer_fixture(
-          package_root);
+  // The maintained Scenario: the arm and its mounted pneumatic gripper are
+  // separate components hosted by the cell's one runtime unit.
+  const auto materialized =
+      deployment::test::MaterializeMaintainedInterruptDeployment(
+          package_root, deployment::parse_strict_json_model_yaml(
+                            R"({"interrupt_rules":[]})")
+                            .root());
   ASSERT_NE(materialized.bundle, nullptr);
   const auto &products = materialized.bundle->value().compiled_products;
   ASSERT_EQ(products.symbol_role_maps.size(), 1U);
@@ -2594,8 +1937,8 @@ TEST(
       package_root, {materialized.bundle->retained_bundle_id(),
                      products.symbol_role_maps.front().product_id});
 
-  const core::ControllableComponentId component_id(
-      std::string(deployment::test::kLite6ControllableComponentId));
+  const core::ControllableComponentId component_id("lite6_robot");
+  const core::ControllableComponentId gripper_component_id("lite_gripper");
   const core::CommandTargetId arm_target_id(
       std::string(deployment::test::kLite6ArmTargetId));
   const core::CommandTargetId gripper_target_id(
@@ -2610,7 +1953,9 @@ TEST(
       materialized.bundle->value().cell_graph.control_bindings,
       [&](const auto &candidate) {
         return candidate.controllable_component_id == component_id &&
-               candidate.command_target_id == arm_target_id;
+               candidate.command_target_id == arm_target_id &&
+               candidate.capability_id ==
+                   core::CapabilityId("execution.trajectory.execute");
       },
       "scene-frame arm control binding");
   const auto &control_domain = require_fixture_one(
@@ -2626,14 +1971,25 @@ TEST(
                              control_domain.runtime_unit_ids.end());
   ASSERT_EQ(local_runtime_units.size(), 1U);
   const auto local_runtime_unit_id = *local_runtime_units.begin();
+  const auto &gripper_component = require_fixture_one(
+      materialized.bundle->value().cell_graph.controllable_components,
+      [&](const auto &candidate) {
+        return candidate.controllable_component_id == gripper_component_id;
+      },
+      "scene-frame gripper component");
+  // The gripper is local too: its sources carry the local runtime epoch.
+  ASSERT_EQ(gripper_component.runtime_unit_ids,
+            std::vector<core::RuntimeUnitId>{local_runtime_unit_id});
   const core::RuntimeEpoch local_runtime_epoch(
       "scene-frame-direct-owner-epoch");
   const auto arm_binding = make_fixture_runtime_participant(
       *materialized.bundle, model_map, component_id, arm_target_id,
-      std::nullopt, std::nullopt, local_runtime_epoch);
+      std::nullopt, std::nullopt, local_runtime_epoch,
+      core::CapabilityId("execution.trajectory.execute"));
   const auto gripper_binding = make_fixture_runtime_participant(
-      *materialized.bundle, model_map, component_id, gripper_target_id,
-      std::nullopt, std::nullopt, local_runtime_epoch);
+      *materialized.bundle, model_map, gripper_component_id, gripper_target_id,
+      std::nullopt, std::nullopt, local_runtime_epoch,
+      core::CapabilityId("tool.gripper.command"));
 
   auto stage =
       RetainedPlanningModelStage::create_verified(retained, staging_parent);
@@ -2702,12 +2058,12 @@ TEST(
       core::ProjectionLeaseId("direct-owner-frame-lease")};
   const core::SceneFrameResolutionQueryDTO query{
       core::TargetCarrierSceneFrameRefDTO{component_id, arm_target_id,
-                                          core::FrameRoleId("tcp")},
+                                          core::FrameRoleId("flange")},
       projection_binding};
   const auto neutral = resolver->Resolve(query, logical_scene.shared(), 10);
   ASSERT_TRUE(neutral.ok()) << neutral.error().message;
   const auto *gripper_target =
-      model_map.find_target(component_id, gripper_target_id);
+      model_map.find_target(gripper_component_id, gripper_target_id);
   ASSERT_NE(gripper_target, nullptr);
   const auto gripper_tcp = std::find_if(
       gripper_target->frames.begin(), gripper_target->frames.end(),
@@ -2719,7 +2075,7 @@ TEST(
   ASSERT_NE(gripper_model_tcp, nullptr);
   const auto resolved_gripper_tcp = resolver->Resolve(
       core::SceneFrameResolutionQueryDTO{
-          core::TargetCarrierSceneFrameRefDTO{component_id, gripper_target_id,
+          core::TargetCarrierSceneFrameRefDTO{gripper_component_id, gripper_target_id,
                                               core::FrameRoleId("tcp")},
           projection_binding},
       logical_scene.shared(), 10);
@@ -2738,18 +2094,18 @@ TEST(
   ASSERT_TRUE(external_neutral.ok()) << external_neutral.error().message;
   EXPECT_EQ(external_neutral.value(), neutral.value());
 
-  // The genuine ROS mixed fixture explicitly selects pneumatic actuation.
+  // The maintained gripper explicitly selects pneumatic actuation.
   // Its seeded gripper channel remains owned, but is not FK authority.
   ASSERT_TRUE(gripper_binding.value().control_path.has_value());
   const auto pneumatic_configuration = deployment::
       ros2_control_execution_runtime_contract::require_component_configuration(
           *materialized.bundle,
           gripper_binding.value().control_path->provider_runtime_unit_id,
-          component_id);
+          gripper_component_id);
   const auto &pneumatic_row = require_fixture_one(
       pneumatic_configuration.gripper_target_configurations,
       [&](const auto &row) {
-        return row.controllable_component_id == component_id &&
+        return row.controllable_component_id == gripper_component_id &&
                row.command_target_id == gripper_target_id;
       },
       "exact pneumatic scene-frame target configuration");
@@ -2774,7 +2130,7 @@ TEST(
   EXPECT_EQ(pneumatic_tcp.value(), neutral.value());
   const auto pneumatic_gripper_tcp = pneumatic_resolver->Resolve(
       core::SceneFrameResolutionQueryDTO{
-          core::TargetCarrierSceneFrameRefDTO{component_id, gripper_target_id,
+          core::TargetCarrierSceneFrameRefDTO{gripper_component_id, gripper_target_id,
                                               core::FrameRoleId("tcp")},
           projection_binding},
       logical_scene.shared(), 10);
@@ -2876,7 +2232,9 @@ TEST(
   ASSERT_EQ(moved.value().kinematic_state_path_view.model_states.size(), 1U);
   EXPECT_FALSE(moved.value().kinematic_state_path_view.resource_states.empty());
 
-  const auto exact_binding = make_fixture_execution_binding(arm_binding);
+  // The split robot carries no tool: its motion endpoint is its flange.
+  const auto exact_binding = make_fixture_execution_binding(
+      arm_binding, core::FrameRoleId("base"), core::FrameRoleId("flange"));
   auto start_publication = arm_channel->addressed_publication()->publication(
       exact_binding.control_binding_id, exact_binding.control_binding_revision);
   ASSERT_TRUE(start_publication.ok()) << start_publication.error().message;
@@ -2943,7 +2301,7 @@ TEST(
        reference_scene.revision},
       core::ProjectionLeaseId("program-reference-resolution-lease")};
   const core::ReferenceDTO tcp_reference(core::ReferenceDTO::Type::kFrameRole,
-                                         "tcp");
+                                         "flange");
   ASSERT_FALSE(exact_binding.collision_body_role_bindings.empty());
   const auto &body_role = exact_binding.collision_body_role_bindings.front();
   ASSERT_GT(body_role.compiled_collision_body_names.size(), 1U);
@@ -3019,7 +2377,7 @@ TEST(
       reference_projection};
   const core::SceneFrameResolutionQueryDTO tcp_query{
       core::TargetCarrierSceneFrameRefDTO{component_id, arm_target_id,
-                                          core::FrameRoleId("tcp")},
+                                          core::FrameRoleId("flange")},
       reference_projection};
   const auto base_pose = resolver->Resolve(base_query, reference_scene_ptr, 20);
   const auto tcp_pose = resolver->Resolve(tcp_query, reference_scene_ptr, 20);
@@ -3951,7 +3309,7 @@ TEST(RetainedProductCrossConsumer,
   ASSERT_TRUE(std::filesystem::create_directory(package_root));
 
   const auto materialized = deployment::test::
-      materialize_lite6_ros2_control_motion_arm_gripper_retained_consumer_fixture(
+      materialize_lite6_stop_capable_ros_motion_retained_consumer_fixture(
           package_root);
   ASSERT_NE(materialized.bundle, nullptr);
   const auto &products = materialized.bundle->value().compiled_products;
@@ -3988,14 +3346,11 @@ TEST(RetainedProductCrossConsumer,
                std::invalid_argument);
 }
 
-enum class Lite6AggregateCheck {
+enum class Lite6MotionCheck {
   kCompose,
   kMovingValidation,
   kResealInventory,
-  kNarrowAliasAtRouteRebind,
   kForeignFrameAtStartup,
-  kForeignFrameAtRouteRebind,
-  kRetainedRouteGenerationReseal,
   kRefreshCellModel,
   kDeploymentFaultStopProfile,
   kDeploymentFastFaultStopProfile,
@@ -4006,22 +3361,14 @@ enum class Lite6AggregateCheck {
   kDeploymentFaultStopProfileWithoutArmJoints,
   kExecutionPortParticipant,
   kMissingSelectedBackend,
-#ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
-  kRosOrdinaryJerkRejection,
-#endif
-  kSameRoutePredecessorQualification,
-  kMeasuredPublication,
-  kResolverRebuildFailures,
-  kStopResponseFollowsRouteRebind,
+  kOrdinaryJerkOn,
+  kOrdinaryJerkOff,
   kQualifiedEndpointPlannerFrames,
   kMovingBudgetPublication,
 #ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
-  kMixedOutputPublication,
   kGeometricHostInstallation,
   kPneumaticCollisionProjection,
 #endif
-  kMeasuredOptionalDomainRace,
-  kMeasuredNullOptionalDomainRace,
   kSoleRuntimeJoin
 };
 
@@ -4037,7 +3384,9 @@ void select_geometric_contact_station(
   auto rows = components->second.as_array();
   std::erase_if(rows, [](const auto &row) {
     const auto *id = row.find_object_member("component_id");
-    return id == nullptr || (id->as_string() != "lite6_robot" &&
+    const auto *owner = row.find_object_member("owner");
+    // The robot's machine stays whole: its owner and every member (§16).
+    return id == nullptr || (id->as_string() != "lite6" && owner == nullptr &&
                              id->as_string() != "lite_gripper" &&
                              id->as_string() != "station_io");
   });
@@ -4081,17 +3430,16 @@ void select_geometric_contact_station(
 #endif
 
 void check_refreshed_cell_model(
-    RetainedNativeRuntime &runtime, ManagedKernelAdmissionGate &admission_gate,
+    RetainedExecutionHost &runtime, ManagedKernelAdmissionGate &admission_gate,
     const RetainedPlanningModelStage &stage,
     const deployment::RetainedBundle &bundle,
     const deployment::VerifiedRetainedModelMap &model_map,
     const deployment::VerifiedRetainedPlanningModel &retained,
     const core::RuntimeParticipantBinding &arm_binding,
-    const core::RuntimeParticipantBinding &gripper_binding,
     const std::string &tcp_frame);
 
-// The selected Core constructor cases never submit a gripper command.
-// The second participant supplies only the required owned interfaces;
+// The split tool's own gripper owner in the geometric host case never
+// receives a command. It supplies only the required owned interfaces;
 // unexpected command/Stop execution fails the fixture instead of simulating law.
 class UnusedSelectedGripperBackend final
     : public core::IGripperCommandBackend,
@@ -4100,17 +3448,6 @@ public:
   UnusedSelectedGripperBackend(core::RuntimeParticipantBinding binding,
       std::shared_ptr<IRetainedObservedStateChannel> channel)
       : binding_(std::move(binding)), channel_(std::move(channel)) {}
-
-  core::Result<void> RebindRoute(core::RuntimeParticipantBinding binding,
-      std::shared_ptr<IRetainedObservedStateChannel> channel) {
-    if (!channel || binding.value().controllable_component_id !=
-                        binding_.value().controllable_component_id ||
-        binding.value().command_target_id != binding_.value().command_target_id)
-      return core::Result<void>::Err({"test_gripper_route_invalid", "selected gripper owner differs", {}});
-    binding_ = std::move(binding);
-    channel_ = std::move(channel);
-    return core::Result<void>::Ok();
-  }
 
   core::GripperCommandResultDTO command_gripper(
       const core::GripperCommandRequestDTO &) override {
@@ -4177,13 +3514,10 @@ private:
 // Focused Core seam: the selected product supplies bindings and state, while
 // FakeExecutionPort exposes ownership/rebind behavior without simulator law.
 [[nodiscard]] RetainedRuntimeBackendFactory selected_core_test_backend_factory(
-    core::ExecutionPortParticipant *&port_participant,
-    bool require_gripper = false) {
-  return [&port_participant, require_gripper](
+    core::ExecutionPortParticipant *&port_participant) {
+  return [&port_participant](
             const core::RuntimeParticipantBinding &motion,
-            const std::optional<core::RuntimeParticipantBinding> &gripper,
             const std::shared_ptr<RetainedObservedStateChannel> &motion_channel,
-            const std::shared_ptr<RetainedObservedStateChannel> &gripper_channel,
             core::IClock &clock, core::IScheduler &scheduler) {
           auto port = std::make_shared<core::testing::FakeExecutionPort>();
           core::ExecutionLaneFactsDTO facts;
@@ -4208,30 +3542,14 @@ private:
                   [] { return core::Result<void>::Ok(); }},
               std::move(config));
           port_participant = participant.get();
-          if (require_gripper) {
-            EXPECT_TRUE(gripper.has_value());
-            EXPECT_NE(gripper_channel, nullptr);
-          }
-          auto gripper_backend = gripper.has_value()
-              ? std::make_shared<UnusedSelectedGripperBackend>(*gripper, gripper_channel)
-              : nullptr;
           RetainedRuntimeBackendSet selected;
           selected.execution = participant;
-          selected.gripper = gripper_backend;
-          selected.gripper_stop_execution_port = gripper_backend.get();
           selected.rebind_motion_route =
               [participant](
                   core::RuntimeParticipantBinding binding,
                   std::vector<core::RuntimeParticipantBinding> aliases) {
                 return participant->RebindRoute(std::move(binding), std::move(aliases));
               };
-          if (gripper_backend) {
-            selected.rebind_gripper_route =
-                [gripper_backend](core::RuntimeParticipantBinding binding,
-                    std::shared_ptr<IRetainedObservedStateChannel> channel) {
-                  return gripper_backend->RebindRoute(std::move(binding), std::move(channel));
-                };
-          }
           return selected;
         };
 }
@@ -4288,35 +3606,36 @@ fixture_tcp_endpoint_resolver_factory() {
   };
 }
 
-void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
+void check_selected_core_lite6_motion(const Lite6MotionCheck check) {
 #ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
-  const bool mixed_output_check =
-      check == Lite6AggregateCheck::kMixedOutputPublication;
   const bool geometric_host_check =
-      check == Lite6AggregateCheck::kGeometricHostInstallation;
-  const bool ros_jerk_rejection =
-      check == Lite6AggregateCheck::kRosOrdinaryJerkRejection;
+      check == Lite6MotionCheck::kGeometricHostInstallation;
+  const bool pneumatic_check =
+      check == Lite6MotionCheck::kPneumaticCollisionProjection;
 #else
-  const bool mixed_output_check = false;
   const bool geometric_host_check = false;
-  const bool ros_jerk_rejection = false;
+  const bool pneumatic_check = false;
 #endif
-  const bool maintained_product_check =
-      mixed_output_check || geometric_host_check;
+  const bool ordinary_jerk_check =
+      check == Lite6MotionCheck::kOrdinaryJerkOn ||
+      check == Lite6MotionCheck::kOrdinaryJerkOff;
+  // The tool cases use a maintained Scenario, whose mounted gripper is its
+  // own component; every other case composes the Lite6 arm alone.
+  const bool maintained_product_check = geometric_host_check || pneumatic_check;
   const bool reseal_capability_inventory =
-      check == Lite6AggregateCheck::kResealInventory;
+      check == Lite6MotionCheck::kResealInventory;
   const bool authored_fault_check =
-      check == Lite6AggregateCheck::kDeploymentFaultStopProfile ||
-      check == Lite6AggregateCheck::kDeploymentFastFaultStopProfile ||
+      check == Lite6MotionCheck::kDeploymentFaultStopProfile ||
+      check == Lite6MotionCheck::kDeploymentFastFaultStopProfile ||
       check ==
-          Lite6AggregateCheck::kDeploymentFaultStopProfileWithExtraJoints ||
-      check == Lite6AggregateCheck::
+          Lite6MotionCheck::kDeploymentFaultStopProfileWithExtraJoints ||
+      check == Lite6MotionCheck::
                    kDeploymentFaultStopProfileWithOnlyExtraSettleOverrides ||
-      check == Lite6AggregateCheck::
+      check == Lite6MotionCheck::
                    kDeploymentFaultStopProfileWithSparseSettleOverrides ||
       check ==
-          Lite6AggregateCheck::kDeploymentFaultStopProfileMissingArmJoint ||
-      check == Lite6AggregateCheck::kDeploymentFaultStopProfileWithoutArmJoints;
+          Lite6MotionCheck::kDeploymentFaultStopProfileMissingArmJoint ||
+      check == Lite6MotionCheck::kDeploymentFaultStopProfileWithoutArmJoints;
   ScopedTemporaryRoot temporary;
   const std::filesystem::path package_root =
       temporary.path() / "retained-package";
@@ -4339,37 +3658,23 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
                   deployment::parse_strict_json_model_yaml(
                       R"({"interrupt_rules":[]})")
                       .root(),
-                  "examples/r5_trial_e_signal.scenario",
+                  "examples/mock_lite6_signal_moves.scenario",
                   select_geometric_contact_station)
                   .bundle};
-    if (mixed_output_check)
+    if (pneumatic_check)
       return {deployment::test::MaterializeMaintainedInterruptDeployment(
                   package_root,
                   deployment::parse_strict_json_model_yaml(
                       R"({"interrupt_rules":[]})")
-                      .root(),
-                  "examples/r5_trial_e_signal.scenario")
+                      .root())
                   .bundle};
-    if (ros_jerk_rejection) {
-      const auto plans = detail::ros2_control_lifecycle_plans_internal::
-          retained_ros2_control_lifecycle_plans();
-      const auto semantic =
-          core::ComputeBrandLifecyclePlanCatalogSemanticDigest(
-              core::ProviderManifestId("manyforge.provider.ros2_control"),
-              plans);
-      if (!semantic.ok())
-        throw std::logic_error(semantic.error().message);
-      return {
-          deployment::test::
-              materialize_lite6_ros2_control_cclc_product_retained_consumer_fixture(
-                  package_root, semantic.value().value())
-                  .bundle};
-    }
 #endif
-    return {
-        deployment::test::
-            materialize_lite6_ros2_control_motion_arm_gripper_retained_consumer_fixture(
-                package_root)
+    // The stoppable ROS Lite6 arm (no tool component).
+    return {deployment::test::materialize_lite6_retained_consumer_fixture_from(
+                package_root,
+                deployment::test::
+                    make_lite6_ros2_control_shared_consumer_retention_fixture(
+                        {}, 1U, true))
                 .bundle};
   }();
   ASSERT_NE(materialized.bundle, nullptr);
@@ -4420,22 +3725,18 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
       core::CommandSchemaId(std::string(core::kGripperPositionCommandSchemaId)),
       core::CommandSchemaRevision(
           std::string(core::kGripperPositionCommandSchemaRevision))};
-  auto gripper_binding = make_fixture_runtime_participant(
-      *materialized.bundle, model_map,
-      maintained_product_check ? core::ControllableComponentId("lite_gripper")
-                               : component_id,
-      gripper_target_id, state_authority, command_schema,
-      maintained_product_check ? std::nullopt : std::optional(local_runtime_epoch),
-      maintained_product_check
-          ? std::optional(core::CapabilityId("tool.gripper.command"))
-          : std::nullopt);
+  // The mounted tool is a separate component with its own control domain.
+  std::optional<core::RuntimeParticipantBinding> gripper_binding;
   if (maintained_product_check) {
+    gripper_binding = make_fixture_runtime_participant(
+        *materialized.bundle, model_map,
+        core::ControllableComponentId("lite_gripper"), gripper_target_id,
+        state_authority, command_schema, std::nullopt,
+        core::CapabilityId("tool.gripper.command"));
     EXPECT_EQ(arm_binding.value().controllable_component_id,
               core::ControllableComponentId("lite6_robot"));
-    EXPECT_EQ(gripper_binding.value().controllable_component_id,
-              core::ControllableComponentId("lite_gripper"));
     EXPECT_NE(arm_binding.value().control_path->control_domain_id,
-              gripper_binding.value().control_path->control_domain_id);
+              gripper_binding->value().control_path->control_domain_id);
   }
   if (geometric_host_check) {
     deployment::FilesystemCatalogArtifactStore artifacts(package_root);
@@ -4456,119 +3757,21 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
         },
         "actual direct gripper Program Binding");
     gripper_binding =
-        with_program_binding_identity(gripper_binding, *direct_gripper);
+        with_program_binding_identity(*gripper_binding, *direct_gripper);
   }
 
-  if (check == Lite6AggregateCheck::kQualifiedEndpointPlannerFrames) {
-    const auto *tool = model_map.find_target(component_id, gripper_target_id);
-    ASSERT_NE(tool, nullptr);
-    // This fixture deliberately maps both physical targets' TCP to the same
-    // modeled frame. The full physical inventory therefore exercises exact
-    // deduplication, rather than providing a sibling-only frame by itself.
-    const auto full_legacy = retained_motion_planner_frames(arm_binding);
-    EXPECT_EQ(retained_motion_planner_frames(arm_binding, &model_map),
-              full_legacy);
+  if (check == Lite6MotionCheck::kQualifiedEndpointPlannerFrames) {
+    // Nothing is mounted on this arm: its planner inventory is exactly its
+    // own participant frames, each once and stamped with the arm.
+    const auto legacy = retained_motion_planner_frames(arm_binding);
+    const auto frames = retained_motion_planner_frames(arm_binding, &model_map);
+    EXPECT_EQ(frames, legacy);
     // LOADFIX9 oracle: the shared helper equals the M6b loop over the frames.
     std::vector<std::string> m6b_frame_names;
-    for (const auto &frame :
-         retained_motion_planner_frames(arm_binding, &model_map))
+    for (const auto &frame : frames)
       m6b_frame_names.push_back(core::compiled_frame_name(frame));
     EXPECT_EQ(retained_motion_planner_frame_names(arm_binding, &model_map),
               m6b_frame_names);
-
-    // Compile an actual Program whose arm declares only its base while its
-    // sibling tool declares the TCP. The selected arm inventory is produced by
-    // the sealed compiler/runtime path, not by editing a verified binding.
-    auto program = deployment::parse_strict_json_model_yaml(R"({
-      "api_version":"manyforge.program.v2",
-      "program_id":"qualified_endpoint_inventory",
-      "program_revision":"sha256:0000000000000000000000000000000000000000000000000000000000000000",
-      "program_profile":"composable-cell-v1",
-      "name":"Qualified endpoint inventory",
-      "component_roles":{"robot":{}},
-      "target_roles":{
-        "arm":{"component_role":"robot",
-          "required_capabilities":[{"capability_id":"execution.trajectory.execute","parameters":{},"disposition":"required"}],
-          "required_frame_roles":["base"],"required_resource_roles":["joints"],
-          "required_collision_body_roles":[],"required_model_roles":["arm_model"]},
-        "tool":{"component_role":"robot",
-          "required_capabilities":[{"capability_id":"tool.gripper.command","parameters":{},"disposition":"required"}],
-          "required_frame_roles":["tcp"],"required_resource_roles":["fingers"],
-          "required_collision_body_roles":[],"required_model_roles":["arm_model"]}},
-      "tree":{"node_id":"sequence","instance_id":"root","parameters":{},"children":[]}
-    })")
-                       .root();
-    auto program_members = program.as_object();
-    program_members.emplace_back(
-        "catalog",
-        deployment::CanonicalValue(deployment::CanonicalValue::Object{
-            {"api_version",
-             deployment::CanonicalValue("manyforge.node_catalog.v2")},
-            {"content_version",
-             deployment::CanonicalValue(
-                 materialized.bundle->value()
-                     .catalogs.node_environment.content_version)}}));
-    program = deployment::normalize_program_authoring(
-        deployment::CanonicalValue(std::move(program_members)));
-    const auto program_revision = deployment::detail::compute_content_identity(
-        program,
-        {"program-revision", "manyforge.program.v2", "program_revision"});
-    program_members = program.as_object();
-    for (auto &[name, value] : program_members)
-      if (name == "program_revision")
-        value = deployment::CanonicalValue(program_revision);
-    const auto contract = deployment::verify_program_binding_contract(
-        deployment::canonical_json(
-            deployment::CanonicalValue(std::move(program_members))),
-        *materialized.bundle);
-    deployment::FilesystemCatalogArtifactStore catalog(package_root);
-    const auto compiled = deployment::compile_program_binding(
-        *contract,
-        {{{core::ComponentRoleId("robot"), component_id}},
-         {{core::TargetRoleId("arm"), arm_target_id},
-          {core::TargetRoleId("tool"), gripper_target_id}}},
-        *materialized.bundle, model_map, catalog);
-    ASSERT_NE(compiled, nullptr);
-    const auto selected_target = deployment::resolve_runtime_program_target(
-        *compiled, core::TargetRoleId("arm"),
-        core::CapabilityId("execution.trajectory.execute"),
-        *materialized.bundle, model_map);
-    const auto &physical = *arm_binding.value().control_path;
-    auto selected = core::verify_runtime_participant_binding(
-        deployment::build_runtime_participant_binding_dto(
-            selected_target,
-            {physical.control_route_id,
-             physical.active_control_configuration_id,
-             physical.active_control_configuration_generation,
-             arm_binding.value().runtime_unit_epochs,
-             {{physical.provider_instance_id, physical.provider_runtime_unit_id,
-               physical.provider_runtime_epoch}}}));
-    ASSERT_TRUE(selected.ok()) << selected.error().message;
-    ASSERT_EQ(selected.value().value().frame_bindings.size(), 1U);
-    EXPECT_EQ(selected.value().value().frame_bindings.front().frame_role_id,
-              core::FrameRoleId("base"));
-    const auto legacy = retained_motion_planner_frames(selected.value());
-    EXPECT_EQ(legacy,
-              make_candidate_binding(selected.value()).permitted_frames);
-    const auto frames =
-        retained_motion_planner_frames(selected.value(), &model_map);
-    EXPECT_EQ(frames,
-              retained_motion_planner_frames(selected.value(), &model_map));
-    std::size_t sibling_only = 0U;
-    for (const auto &exposed : tool->frames) {
-      const auto *frame =
-          std::get_if<deployment::CompositionComponentModelFrame>(
-              &exposed.frame);
-      ASSERT_NE(frame, nullptr);
-      const core::ResolvedFrameDTO exact = core::ResolvedComponentModelFrameDTO{
-          frame->controllable_component_id, frame->model_instance_id,
-          exposed.frame_role_id, frame->compiled_frame_name,
-          frame->model_revision};
-      EXPECT_EQ(std::count(frames.begin(), frames.end(), exact), 1);
-      if (std::find(legacy.begin(), legacy.end(), exact) == legacy.end())
-        ++sibling_only;
-    }
-    EXPECT_GT(sibling_only, 0U);
     for (const auto &frame : frames) {
       const auto *model =
           std::get_if<core::ResolvedComponentModelFrameDTO>(&frame);
@@ -4600,12 +3803,13 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
       std::string(stage.loader_urdf_bytes()), std::string(stage.srdf_bytes()),
       stage.package_paths(), joint_limits});
   auto scene_mutex = std::make_shared<std::mutex>();
+  std::vector<core::RuntimeParticipantBinding> projected_bindings{arm_binding};
+  if (gripper_binding)
+    projected_bindings.push_back(*gripper_binding);
   auto state_projector = std::make_shared<RetainedKinematicStateProjector>(
       RetainedKinematicStateProjector::create_verified(
           scene, scene_mutex, *materialized.bundle, model_map, retained,
-          std::vector<core::RuntimeParticipantBinding>{arm_binding,
-                                                       gripper_binding},
-          0));
+          projected_bindings, 0));
 
   const auto &arm_group = arm_binding.value().model_groups.front();
   auto shared_collision_model = ManyForgeCollisionEngine::load_shared_model(
@@ -4624,7 +3828,7 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
   }
   ASSERT_FALSE(arm_binding.value().runtime_unit_epochs.empty());
   const auto local_runtime = arm_binding.value().runtime_unit_epochs.front();
-  const core::ProjectionNativeRuntimeBindingDTO native_binding{
+  const core::ProjectionExecutionHostBindingDTO native_binding{
       core::CapabilityProviderBindingId("lite6.runtime.projection"),
       core::CapabilityProviderBindingRevision("lite6-runtime-projection-v1"),
       local_runtime.runtime_unit_id, local_runtime.runtime_epoch};
@@ -4635,7 +3839,7 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
   auto projection_result = RetainedPlannerSceneProjection::CreateInitialized(
       std::move(collision_projector), products.planning_collision_model,
       native_binding, *initial_scene.shared(),
-      RetainedPlannerSceneProjectionConfig{"retained-lite6-native-runtime", 32U},
+      RetainedPlannerSceneProjectionConfig{"retained-lite6-execution-host", 32U},
       [&projection_clock] { return projection_clock++; });
   ASSERT_TRUE(projection_result.ok()) << projection_result.error().message;
   auto projection = std::move(projection_result.value());
@@ -4659,28 +3863,14 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
           candidate_binding, RoboPlanCandidateComputerConfig{.rng_seed = 7U},
           std::move(candidate_config)));
   const core::RequestOwnerEpoch owner_epoch("i6.native.runtime.epoch.1");
-  RetainedNativeRuntimeConfig runtime_config{
-      owner_epoch,
-      materialized.bundle->value().cell_graph.cell_id,
-      temporary.path() / std::string(core::kOperationJournalFilename),
-      1024U,
+  RetainedExecutionHostConfig runtime_config{
       core::CacheConfig{},
       core::ExecutionKernelConfig{},
       SimpleSchedulerConfig{},
-      10'000'000,
-      {0.0, 0.0, 1.57, 0.0, 0.0, 0.0},
-      kMaintainedNativeStopSurveillancePolicy,
-      {},
-      {},
-      {},
-      {},
-      {}};
+      {0.0, 0.0, 1.57, 0.0, 0.0, 0.0}};
   ManagedKernelAdmissionGate admission_gate;
-  auto runtime_input = RetainedNativeRuntimeInput{
+  auto runtime_input = RetainedExecutionHostInput{
       arm_binding,
-      maintained_product_check ? std::nullopt : std::optional(gripper_binding),
-      {},
-      {},
       {},
       {},
       scene,
@@ -4707,8 +3897,6 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
       },
       {},
       {},
-      &admission_gate,
-      {},
       {},
       {},
       {}};
@@ -4728,65 +3916,15 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
     }
   }
   runtime_input.deployment_maximum_tcp_linear_speed_mps = 0.15;
-#ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
-  if (ros_jerk_rejection) {
-    core::OrdinaryMotionJerkPolicy jerk_profile{true, false, {}};
-    for (const auto &resource : arm_binding.value().resources)
-      jerk_profile.limits.emplace(*resource.source_joint_name,
-                                  core::AngularJerkDTO{50.0});
+  if (ordinary_jerk_check) {
+    // V2-9: the first joint carries a typed value, the others take the
+    // preset. Off keeps the typed value but applies no jerk limit.
     runtime_input.ordinary_motion_jerk =
-        deployment::native_execution_runtime_contract::OrdinaryMotionJerkSettings{
-            true, 1.0, {}};
-    for (const auto &[joint, limit] : jerk_profile.limits)
-      runtime_input.ordinary_motion_jerk->joint_limits.push_back(
-          {joint, std::get<core::AngularJerkDTO>(limit).value_rad_s3, {}});
-    EXPECT_EQ(graph.runtime_units.front().runtime_profile_id.value(),
-              "manyforge.ros2_control_execution_runtime");
-    ASSERT_TRUE(arm_binding.value().control_path.has_value());
-    EXPECT_EQ(arm_binding.value().control_path->state_authority_class,
-              core::StateAuthorityClass::kCommanded);
-    ASSERT_TRUE(runtime_input.ordinary_motion_jerk.has_value());
-    EXPECT_TRUE(runtime_input.ordinary_motion_jerk->enabled);
-
-    RetainedRos2ControlBackendConfig ros_config;
-    ros_config.node_name = "manyforge_jerk_rejection_fixture";
-    ros_config.node_namespace = "/manyforge/" + component_id.value();
-    ros_config.executor_thread_count = 1U;
-    ros_config.participant.stop.trip_authority =
-        arm_binding.value().control_path->state_authority_class;
-    ros_config.observed_state_authority_profile_id = "manyforge.commanded_simulation";
-    ros_config.defer_ros_start = true;
-    for (const auto& resource : arm_binding.value().resources) {
-      ASSERT_TRUE(resource.source_joint_name.has_value());
-      ros_config.arm.adapter.lane_facts.joint_names.push_back(*resource.source_joint_name);
-    }
-    runtime_input.motion_state_channel_config = retained_ros2_control_motion_state_config(ros_config);
-    runtime_input.gripper_state_channel_config =
-        retained_ros2_control_gripper_state_config(gripper_binding);
-    auto ros_factory = make_retained_ros2_control_backend_factory(std::move(ros_config));
-    ASSERT_TRUE(static_cast<bool>(ros_factory));
-    unsigned factory_calls = 0U;
-    runtime_input.backend_factory =
-        [real_factory = std::move(ros_factory), &factory_calls](
-            const core::RuntimeParticipantBinding& motion,
-            const std::optional<core::RuntimeParticipantBinding>& gripper,
-            const std::shared_ptr<RetainedObservedStateChannel>& motion_channel,
-            const std::shared_ptr<RetainedObservedStateChannel>& gripper_channel,
-            core::IClock& clock, core::IScheduler& scheduler) {
-          ++factory_calls;
-          return real_factory(motion, gripper, motion_channel, gripper_channel, clock, scheduler);
-        };
-    try {
-      static_cast<void>(create_retained_native_runtime(
-          std::move(runtime_input), std::move(runtime_config)));
-      ADD_FAILURE() << "selected ROS ordinary jerk must refuse before backend construction";
-    } catch (const std::invalid_argument& error) {
-      EXPECT_STREQ(error.what(), "ordinary jerk profile requires the native execution backend");
-    }
-    EXPECT_EQ(factory_calls, 0U);
-    return;
+        deployment::execution_runtime_contract::OrdinaryMotionJerkSettings{
+            check == Lite6MotionCheck::kOrdinaryJerkOn, 1.0, {}};
+    runtime_input.ordinary_motion_jerk->joint_limits.push_back(
+        {*arm_binding.value().resources.front().source_joint_name, 50.0});
   }
-#endif
   if (reseal_capability_inventory) {
     // This synthetic DTO fixture adds a real control-facing feedback capability
     // to the same controller. It tests owner classification, not graph/compiler
@@ -4809,14 +3947,14 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
     ASSERT_TRUE(retained_bindings_share_backend_owner(
         arm_binding, representative.value()));
     runtime_input.control_binding_representatives =
-        {arm_binding, gripper_binding, representative.value()};
+        {arm_binding, representative.value()};
   }
   // Q37: a Deployment-authored fault profile (as the ROS host reads it) is
   // the motion target's fault profile; only its load-time defaults resolve.
   core::MotionInterruptStopProfileDTO authored_fault;
   authored_fault.profile_id = "fault_spring_back_hold";
   authored_fault.stop_mode = core::MotionInterruptStopMode::kSpringBackHold;
-  if (check == Lite6AggregateCheck::kDeploymentFastFaultStopProfile) {
+  if (check == Lite6MotionCheck::kDeploymentFastFaultStopProfile) {
     authored_fault.profile_id = "fault_spring_back_fast";
     authored_fault.stop_mode = core::MotionInterruptStopMode::kSpringBackFast;
   }
@@ -4827,8 +3965,8 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
         core::CoordinateAccelerationDTO{core::AngularAccelerationDTO{7.0}});
   auto expected_arm_fault_limits = authored_fault.per_joint_max_deceleration;
   if (authored_fault_check) {
-    if (check != Lite6AggregateCheck::kDeploymentFaultStopProfile &&
-        check != Lite6AggregateCheck::kDeploymentFastFaultStopProfile) {
+    if (check != Lite6MotionCheck::kDeploymentFaultStopProfile &&
+        check != Lite6MotionCheck::kDeploymentFastFaultStopProfile) {
       // The actual UR10e component profile has these six additional gripper
       // joints. This owning constructor fixture uses its real Lite6 arm
       // binding; it does not relabel that model as UR10e.
@@ -4839,26 +3977,26 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
             joint, core::AngularAccelerationDTO{13.0});
       }
     }
-    if (check == Lite6AggregateCheck::kDeploymentFaultStopProfileWithExtraJoints ||
-        check == Lite6AggregateCheck::kDeploymentFaultStopProfileWithOnlyExtraSettleOverrides ||
-        check == Lite6AggregateCheck::kDeploymentFaultStopProfileWithSparseSettleOverrides) {
+    if (check == Lite6MotionCheck::kDeploymentFaultStopProfileWithExtraJoints ||
+        check == Lite6MotionCheck::kDeploymentFaultStopProfileWithOnlyExtraSettleOverrides ||
+        check == Lite6MotionCheck::kDeploymentFaultStopProfileWithSparseSettleOverrides) {
       authored_fault.per_joint_settle_velocity_threshold.emplace();
       for (const auto &[joint, _] : authored_fault.per_joint_max_deceleration) {
         const bool arm = expected_arm_fault_limits.contains(joint);
         authored_fault.per_joint_max_jerk.emplace(
             joint, core::AngularJerkDTO{arm ? 11.0 : 23.0});
-        if (!arm || check == Lite6AggregateCheck::kDeploymentFaultStopProfileWithExtraJoints ||
-            (check == Lite6AggregateCheck::kDeploymentFaultStopProfileWithSparseSettleOverrides &&
+        if (!arm || check == Lite6MotionCheck::kDeploymentFaultStopProfileWithExtraJoints ||
+            (check == Lite6MotionCheck::kDeploymentFaultStopProfileWithSparseSettleOverrides &&
              joint == *arm_binding.value().resources.front().source_joint_name))
           authored_fault.per_joint_settle_velocity_threshold->emplace(
               joint, core::AngularVelocityDTO{arm ? 0.005 : 0.004});
       }
     }
-    if (check == Lite6AggregateCheck::kDeploymentFaultStopProfileMissingArmJoint) {
+    if (check == Lite6MotionCheck::kDeploymentFaultStopProfileMissingArmJoint) {
       const auto missing = *arm_binding.value().resources.front().source_joint_name;
       authored_fault.per_joint_max_deceleration.erase(missing);
       expected_arm_fault_limits.erase(missing);
-    } else if (check == Lite6AggregateCheck::kDeploymentFaultStopProfileWithoutArmJoints) {
+    } else if (check == Lite6MotionCheck::kDeploymentFaultStopProfileWithoutArmJoints) {
       for (const auto &resource : arm_binding.value().resources)
         authored_fault.per_joint_max_deceleration.erase(*resource.source_joint_name);
       expected_arm_fault_limits.clear();
@@ -4870,8 +4008,6 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
   // All constructor cases select the existing Core execution-port seam.
   core::ExecutionPortParticipant *port_participant = nullptr;
   runtime_input.motion_state_channel_config = selected_core_test_state_config(arm_binding);
-  if (!maintained_product_check)
-    runtime_input.gripper_state_channel_config = selected_core_test_state_config(gripper_binding);
   if (authored_fault_check) {
     // These constructor checks need the same resolved Stop authority as the
     // existing measured-publication fixture below.
@@ -4915,9 +4051,9 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
     ASSERT_TRUE(readiness.ok()) << readiness.error().message;
     runtime_input.motion_stop_readiness = std::move(readiness.value());
   }
-  if (check == Lite6AggregateCheck::kMissingSelectedBackend) {
+  if (check == Lite6MotionCheck::kMissingSelectedBackend) {
     try {
-      static_cast<void>(create_retained_native_runtime(
+      static_cast<void>(create_retained_execution_host_participants(
           std::move(runtime_input), std::move(runtime_config)));
       ADD_FAILURE() << "retained runtime requires an explicit selected execution backend";
     } catch (const std::invalid_argument &error) {
@@ -4927,7 +4063,7 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
     EXPECT_EQ(port_participant, nullptr);
     return;
   }
-  runtime_input.backend_factory = selected_core_test_backend_factory(port_participant, !maintained_product_check);
+  runtime_input.backend_factory = selected_core_test_backend_factory(port_participant);
   // Sealing a Program DTO alone does not establish physical-owner membership.
   const auto foreign_frame_binding = [&]() {
     auto dto = arm_binding.value();
@@ -4937,25 +4073,14 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
     dto.frame_bindings.push_back(std::move(frame));
     return core::verify_runtime_participant_binding(std::move(dto));
   };
-  if (check == Lite6AggregateCheck::kNarrowAliasAtRouteRebind ||
-      check == Lite6AggregateCheck::kForeignFrameAtRouteRebind) {
-    auto dto = arm_binding.value();
-    dto.program_binding_id = core::ProgramBindingId("narrow-program-binding");
-    ASSERT_NE(dto.program_binding_id, arm_binding.value().program_binding_id);
-    ASSERT_GE(dto.frame_bindings.size(), 2U);
-    dto.frame_bindings.pop_back();
-    auto narrow_alias = core::verify_runtime_participant_binding(std::move(dto));
-    ASSERT_TRUE(narrow_alias.ok()) << narrow_alias.error().message;
-    runtime_input.motion_binding_aliases.push_back(narrow_alias.value());
-  }
-  if (check == Lite6AggregateCheck::kForeignFrameAtStartup) {
+  if (check == Lite6MotionCheck::kForeignFrameAtStartup) {
     ASSERT_FALSE(arm_binding.value().frame_bindings.empty());
     auto foreign_frame_alias = foreign_frame_binding();
     ASSERT_TRUE(foreign_frame_alias.ok()) << foreign_frame_alias.error().message;
     runtime_input.motion_binding_aliases.push_back(foreign_frame_alias.value());
     testing::internal::CaptureStderr();
     try {
-      static_cast<void>(create_retained_native_runtime(
+      static_cast<void>(create_retained_execution_host_participants(
           std::move(runtime_input), std::move(runtime_config)));
       ADD_FAILURE() << "foreign Program frame must be refused at startup";
     } catch (const std::invalid_argument &error) {
@@ -4969,13 +4094,11 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
     EXPECT_EQ(port_participant, nullptr);
     return;
   }
-  if (check == Lite6AggregateCheck::kCompose ||
-      check == Lite6AggregateCheck::kRefreshCellModel)
-    runtime_input.participant_resolver_factory =
-        fixture_tcp_endpoint_resolver_factory();
-  unsigned rebinds = 0, enabled = 0, retired = 0, reentrant_reads = 0;
+  // Every case below roots the managed cell Kernel, which needs a resolver.
+  runtime_input.participant_resolver_factory =
+      fixture_tcp_endpoint_resolver_factory();
   const bool moving_budget_check =
-      check == Lite6AggregateCheck::kMovingBudgetPublication;
+      check == Lite6MotionCheck::kMovingBudgetPublication;
 #ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
   if (maintained_product_check) {
     runtime_input.participant_resolver_factory = [package_root,
@@ -4996,29 +4119,146 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
   const auto configured_immediate_query_budget_ns =
       runtime_config.kernel.runtime_collision_immediate_query_budget_ns;
   const bool sole_runtime_join_check =
-      check == Lite6AggregateCheck::kSoleRuntimeJoin;
-  auto runtime =
-      (moving_budget_check || mixed_output_check || geometric_host_check ||
-       sole_runtime_join_check)
-          ? create_retained_native_runtime_participants(
-                std::move(runtime_input), std::move(runtime_config))
-          : create_retained_native_runtime(std::move(runtime_input),
-                                           std::move(runtime_config));
+      check == Lite6MotionCheck::kSoleRuntimeJoin;
+  auto runtime = create_retained_execution_host_participants(
+      std::move(runtime_input), std::move(runtime_config));
+  if (ordinary_jerk_check) {
+    // The execution host runs with a selected backend (the ROS host's path);
+    // the applied policy fills the planner request's per-joint jerk limits.
+    ASSERT_TRUE(runtime->motion_participant_policy.has_value());
+    auto requested = core::apply_runtime_participant_motion_jerk_policy(
+        *runtime->motion_participant_policy, {});
+    ASSERT_TRUE(requested.ok()) << requested.error().message;
+    if (check == Lite6MotionCheck::kOrdinaryJerkOff) {
+      EXPECT_FALSE(runtime->motion_participant_policy->value().ordinary_motion_jerk);
+      EXPECT_TRUE(requested.value().empty());
+      return;
+    }
+    const auto &motion = arm_binding.value();
+    auto model = runtime->kinematic_model->joint_limits(
+        motion.controllable_component_id.value(), motion.command_target_id.value());
+    ASSERT_TRUE(model.ok()) << model.error().message;
+    ASSERT_EQ(requested.value().size(), motion.resources.size());
+    for (const auto &resource : motion.resources) {
+      const auto found = std::find(model.value().joint_names.begin(),
+                                   model.value().joint_names.end(),
+                                   resource.compiled_resource_name);
+      ASSERT_NE(found, model.value().joint_names.end());
+      const double expected =
+          &resource == &motion.resources.front()
+              ? 50.0
+              : core::motion_jerk_preset_limit(
+                    model.value().acceleration_max_rad_s2[static_cast<std::size_t>(
+                        found - model.value().joint_names.begin())],
+                    1.0);
+      EXPECT_EQ(requested.value().at(*resource.source_joint_name).max_jerk_rad_s3,
+                expected);
+    }
+    return;
+  }
   if (sole_runtime_join_check) {
-    // lite6_pick_and_place (merge 6 tool split): the robot is the cell's only
-    // runtime; its mounted tool is a gripper-only owner, not a peer. Load
-    // failed here with exit 70. The joined robot still roots the cell once.
-    ASSERT_NO_THROW(join_retained_native_runtime_participants(
+    // mock_lite6_pick_and_place (merge 6 tool split): the robot is the cell's only
+    // motion runtime; its mounted tool is a gripper-only owner, not a peer,
+    // so the host joins it with no peers. Load failed here with exit 70. The
+    // joined robot still roots the cell once.
+    ASSERT_NO_THROW(join_retained_execution_host_participants(
         runtime, {}, fixture_tcp_endpoint_resolver_factory()));
     EXPECT_EQ(runtime->cell_runtime_root, runtime.get());
     EXPECT_TRUE(runtime->participant_peers.empty());
-    EXPECT_NE(runtime->stop_surveillance_owner, nullptr);
     EXPECT_TRUE(static_cast<bool>(runtime->participant_resolver));
-    EXPECT_THROW(join_retained_native_runtime_participants(
+    EXPECT_THROW(join_retained_execution_host_participants(
                      runtime, {}, fixture_tcp_endpoint_resolver_factory()),
                  std::invalid_argument);
     return;
   }
+#ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
+  if (pneumatic_check) {
+    // The mounted tool's own commanded channel writes the shared cell state
+    // projector. Exercise the real no-feedback backend through it and ask
+    // the robot's next collision expansion for the finger coordinate.
+    const auto &motion = arm_binding.value();
+    const auto joint_names = runtime->kinematic_model->group_joint_names(
+        motion.command_target_id.value());
+    ASSERT_TRUE(joint_names.ok()) << joint_names.error().message;
+    const core::RobotStateDTO zero_arm_state{
+        joint_names.value(),
+        std::vector<double>(joint_names.value().size(), 0.0),
+        {}};
+    std::vector<core::ResourceId> motion_resources;
+    for (const auto &resource : motion.resources)
+      motion_resources.push_back(resource.resource_id);
+    const core::TrajectoryDTO stationary_trajectory{
+        std::move(motion_resources),
+        joint_names.value(),
+        {core::TrajectoryWaypointDTO{
+             0.0, std::vector<double>(joint_names.value().size(), 0.0), {}, {}},
+         core::TrajectoryWaypointDTO{
+             1.0, std::vector<double>(joint_names.value().size(), 0.0), {}, {}}}};
+    const auto &gripper_value = gripper_binding->value();
+    ASSERT_EQ(gripper_value.resources.size(), 1U);
+    ASSERT_FALSE(gripper_value.model_groups.empty());
+    const auto group = gripper_value.model_groups.front().compiled_group_name;
+    const auto joint = gripper_value.resources.front().compiled_resource_name;
+    auto tool_channel = std::make_shared<RetainedObservedStateChannel>(
+        *gripper_binding, state_projector,
+        selected_core_test_state_config(*gripper_binding));
+    const auto now = runtime->clock->now();
+    ASSERT_TRUE(tool_channel->initialize_from_projection(now).applied());
+    ASSERT_TRUE(tool_channel
+                    ->publish_and_project(std::vector<double>{0.004},
+                                          std::vector<double>{0.0}, now, now)
+                    .applied());
+    const auto before = runtime->kinematic_model->expand_for_collision(
+        stationary_trajectory, zero_arm_state);
+    ASSERT_TRUE(before.ok()) << before.error().message;
+    const auto before_finger = std::find(before.value().joint_names.begin(),
+                                         before.value().joint_names.end(), joint);
+    ASSERT_NE(before_finger, before.value().joint_names.end());
+    EXPECT_NEAR(before.value().waypoints.front().positions_rad[
+                    static_cast<std::size_t>(before_finger -
+                                             before.value().joint_names.begin())],
+                0.004, 1e-12);
+    auto sink = std::make_shared<RetainedExecutionStateSink>(
+        *runtime->clock, std::vector<RetainedExecutionStateSinkBinding>{
+                             {group, tool_channel, true}});
+    ros2_control_execution::Ros2TransportResources resources(
+        "pneumatic_collision_projection", "/", 1U, sink, "arm",
+        *runtime->clock);
+    ros2_control_execution::Ros2GripperCommandBackend backend(
+        resources, sink, *runtime->clock, *runtime->scheduler, false);
+    ros2_control_execution::Ros2GripperActionConfig config;
+    config.actuation_kind = core::GripperActuationKind::kPneumatic;
+    config.output_mode = core::GripperOutputMode::kNone;
+    config.transport_kind.clear();
+    config.action_name.clear();
+    config.completion_policy = "no_output";
+    config.group_id = group;
+    config.joint_name = joint;
+    backend.configure_gripper_action("tool", config);
+    core::GripperCommandRequestDTO request;
+    request.gripper_id = "tool";
+    request.group_id = group;
+    request.joint_name = joint;
+    request.target_position = 0.0;
+    request.completion_policy = "no_output";
+    request.grasp_confirmation_policy = "not_required";
+    ASSERT_TRUE(backend.command_gripper(request).accepted);
+    ASSERT_EQ(backend.get_gripper_status("tool").state,
+              core::GripperCommandState::kCompleted);
+
+    const auto expanded = runtime->kinematic_model->expand_for_collision(
+        stationary_trajectory, zero_arm_state);
+    ASSERT_TRUE(expanded.ok()) << expanded.error().message;
+    const auto finger = std::find(expanded.value().joint_names.begin(),
+                                  expanded.value().joint_names.end(), joint);
+    ASSERT_NE(finger, expanded.value().joint_names.end());
+    const auto index = static_cast<std::size_t>(
+        finger - expanded.value().joint_names.begin());
+    EXPECT_NEAR(expanded.value().waypoints.front().positions_rad[index], 0.0,
+                1e-12);
+    return;
+  }
+#endif
   if (geometric_host_check) {
     runtime->collision_monitor_period_ns =
         configured_collision_monitor_period_ns;
@@ -5027,15 +4267,8 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
   }
   // Match managed composition: one stable cell Kernel, subordinate engines,
   // and an already sealed cell policy in its current registration snapshot.
-#ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
-  std::shared_ptr<host_detail::IoProviderDriverRecord> mixed_driver;
-  std::shared_ptr<std::vector<host_detail::HostIoOutputChannelEntry>>
-      mixed_channels;
-  std::function<void()> dispatch_mixed_output;
-  std::optional<core::ComponentLifecycleGeneration> mixed_arm_generation;
-#endif
-  std::unique_ptr<RetainedNativeCellRuntime> budget_cell;
-  if (moving_budget_check || mixed_output_check || geometric_host_check) {
+  std::unique_ptr<RetainedCellRuntime> stable_cell;
+  {
     auto rows = runtime->participant_registrations;
     if (moving_budget_check)
       for (auto &row : rows) {
@@ -5055,28 +4288,26 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
                    {}});
             }};
       };
-    const auto resolver = maintained_product_check
-                              ? runtime->participant_resolver
-                              : make_retained_cell_kernel_participant_resolver(
+    const auto resolver = moving_budget_check
+                              ? make_retained_cell_kernel_participant_resolver(
                                     runtime->participant_resolver_factory(
                                         {runtime->motion_binding}),
-                                    rows);
-    RetainedNativeCellRuntimeInput cell_input{
+                                    rows)
+                              : runtime->participant_resolver;
+    RetainedCellRuntimeInput cell_input{
         runtime->clock,
         runtime->scheduler,
-        temporary.path() / "budget-cell.sqlite3",
+        temporary.path() / "cell-operation-journal.sqlite3",
         std::move(rows),
         core::ResourceAddressedExecutionKernelConfig{
             owner_epoch, materialized.bundle->value().cell_graph.cell_id, 1024U,
             resolver, &admission_gate,
-            materialized.bundle->value().cell_graph.graph_revision},
-        runtime->stop_surveillance_owner->SnapshotSources()};
-    budget_cell =
-        std::make_unique<RetainedNativeCellRuntime>(std::move(cell_input));
-    runtime->cell_runtime_owner = budget_cell.get();
-    runtime->stop_surveillance_owner = budget_cell->stop_surveillance_owner();
+            materialized.bundle->value().cell_graph.graph_revision}};
+    stable_cell =
+        std::make_unique<RetainedCellRuntime>(std::move(cell_input));
+    runtime->cell_runtime_owner = stable_cell.get();
     runtime->BindCellRuntimeOwner(
-        *budget_cell, "budget-cell",
+        *stable_cell, "stable-cell",
         materialized.bundle->value().cell_graph.cell_id.value());
   }
 #ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
@@ -5117,7 +4348,7 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
          provider.provider_instance_id, provider.provider_manifest_id,
          provider.provider_manifest_revision, provider.provider_runtime_unit_id,
          station_epoch, provider.lifecycle_plan_catalog_digest},
-        manifest->value(), runtime->clock, 1'000'000'000LL, 10'000'000LL));
+        manifest->value(), runtime->clock));
     auto drivers = std::make_shared<const host_detail::IoProviderDriverGroup>(
         host_detail::IoProviderDriverGroup{driver});
 
@@ -5125,16 +4356,14 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
         materialized.bundle->retained_bundle_id(), graph.graph_revision,
         initial_scene.shared()->revision};
     constexpr std::uint64_t kPublicationGeneration = 1U;
-    // Use the maintained split ownership: the arm has no gripper runtime;
-    // the mounted tool has an independent scalar owner and channel.
-    ASSERT_FALSE(runtime->gripper_binding.has_value());
-    ASSERT_EQ(runtime->gripper_state_channel, nullptr);
+    // Use the maintained split ownership: the mounted tool has an
+    // independent scalar owner and channel.
     auto tool_channel = std::make_shared<RetainedObservedStateChannel>(
-        gripper_binding, state_projector, selected_core_test_state_config(gripper_binding));
+        *gripper_binding, state_projector, selected_core_test_state_config(*gripper_binding));
     ASSERT_TRUE(tool_channel->initialize_from_projection(runtime->clock->now()).applied());
-    auto tool_backend = std::make_shared<UnusedSelectedGripperBackend>(gripper_binding, tool_channel);
-    auto tool_runtime = std::make_shared<RetainedNativeGripperRuntime>(
-        RetainedNativeGripperRuntimeInput{gripper_binding, tool_backend, runtime->clock,
+    auto tool_backend = std::make_shared<UnusedSelectedGripperBackend>(*gripper_binding, tool_channel);
+    auto tool_runtime = std::make_shared<RetainedGripperRuntime>(
+        RetainedGripperRuntimeInput{*gripper_binding, tool_backend, runtime->clock,
                                          tool_channel, tool_backend.get(), std::nullopt,
                                          false, {}, runtime->scheduler, std::nullopt});
 
@@ -5169,22 +4398,22 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
         nullptr, runtime, product_projection,
         core::ActiveBundlePublicationGeneration(kPublicationGeneration),
         std::nullopt, std::nullopt);
-    composition->cell_runtime = budget_cell.get();
+    composition->cell_runtime = stable_cell.get();
     composition->ros2_control_runtime_handle = handle;
     composition->target_resolver =
         std::make_shared<ProductBackedRuntimeParticipantResolver>(
             package_root, materialized.bundle, model_map,
-            std::vector<core::RuntimeParticipantBinding>{runtime->motion_binding, gripper_binding},
+            std::vector<core::RuntimeParticipantBinding>{runtime->motion_binding, *gripper_binding},
             std::vector<core::ProgramBindingId>{});
     composition->direct_control_io_program_bindings = direct.io;
     auto tool_view = std::make_unique<host_detail::Composition>(
         core::ControllableComponentId("lite_gripper"), materialized.bundle,
-        nullptr, nullptr, nullptr, nullptr, std::nullopt, gripper_binding, std::nullopt,
+        nullptr, nullptr, nullptr, nullptr, std::nullopt, *gripper_binding, std::nullopt,
         deployment::CanonicalValue(deployment::CanonicalValue::Object{}),
         deployment::CanonicalValue(deployment::CanonicalValue::Object{}), nullptr, nullptr,
         product_projection, core::ActiveBundlePublicationGeneration(kPublicationGeneration),
         std::nullopt, std::nullopt);
-    tool_view->cell_runtime = budget_cell.get();
+    tool_view->cell_runtime = stable_cell.get();
     tool_view->gripper_runtime = tool_runtime;
     composition->participant_compositions.push_back(std::move(tool_view));
     auto station_view = std::make_unique<host_detail::Composition>(
@@ -5195,7 +4424,7 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
         nullptr, nullptr, product_projection,
         core::ActiveBundlePublicationGeneration(kPublicationGeneration),
         std::nullopt, std::nullopt);
-    station_view->cell_runtime = budget_cell.get();
+    station_view->cell_runtime = stable_cell.get();
     station_view->io_provider_drivers = drivers;
     station_view->component_runtime_pins =
         std::make_shared<const host_detail::ComponentRuntimePins>(
@@ -5221,7 +4450,7 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
                                ->numeric_publication().canonical_joint_names();
     ASSERT_FALSE(arm_names.empty());
     const auto missing_source = host_detail::PrepareCompositionIoProviderResources(
-        *composition, *budget_cell, {}, {});
+        *composition, *stable_cell, {}, {});
     ASSERT_FALSE(missing_source.ok());
     EXPECT_EQ(missing_source.error().code, "io_provider_installation_failed");
     EXPECT_EQ(missing_source.error().message,
@@ -5235,7 +4464,7 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
     add_cell_source(tool_channel);
 
     const auto prepared = host_detail::PrepareCompositionIoProviderResources(
-        *composition, *budget_cell, {}, {});
+        *composition, *stable_cell, {}, {});
     ASSERT_TRUE(prepared.ok()) << prepared.error().message;
     ASSERT_NE(composition->io_signal_runtime, nullptr);
     const auto &installations =
@@ -5272,42 +4501,18 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
 
     composition->io_signal_runtime->Start();
     composition->io_signal_service = composition->io_signal_runtime->service();
-    std::uint64_t lifecycle_sequence = 0U;
-    const auto step = [&](std::string_view primitive) {
-      const auto sequence = ++lifecycle_sequence;
-      const auto snapshot = take(driver->ReadLifecycleSnapshot(
-          domain.control_domain_id, runtime->clock->now()));
-      const auto &actual = driver->occurrence();
-      const core::BrandLifecyclePrimitiveIntentDTO intent{
-          core::LifecycleTransactionId("geometric.driver." +
-                                       std::string(primitive) + "." +
-                                       std::to_string(sequence)),
-          core::LifecycleTransactionGeneration(sequence),
-          station,
-          actual.control_domain_id,
-          actual.control_domain_revision,
-          actual.provider_instance_id,
-          actual.provider_manifest_id,
-          actual.provider_manifest_revision,
-          actual.provider_runtime_unit_id,
-          actual.provider_runtime_epoch,
-          core::LifecyclePrimitiveId("io.provider." + std::string(primitive)),
-          core::LifecyclePrimitiveAttemptId("geometric.attempt." +
-                                            std::string(primitive) + "." +
-                                            std::to_string(sequence)),
-          snapshot.source_generation,
-          1'000'000'000LL,
-          core::ComponentLifecycleStateDTO::kUndeclared};
-      const auto outcome = driver->Dispatch(intent, {});
-      ASSERT_EQ(outcome.outcome, RetainedRos2ControlSwitchOutcome::kSucceeded)
+    // CONTRACTS §6: the generic driver is the I/O component's adapter.
+    const auto step = [&](const core::ComponentAction action) {
+      const auto outcome = driver->Run(action, {});
+      ASSERT_EQ(outcome.outcome, core::ActionOutcome::kSucceeded)
           << (outcome.error ? outcome.error->message : "missing result");
     };
     const core::IoSignalId signal_id{station, "probe_contact"};
     EXPECT_EQ(take(composition->io_signal_service->ReadSignal(signal_id))
                   .availability,
               core::IoSignalAvailability::kMissing);
-    step("prepare");
-    step("enable");
+    step(core::ComponentAction::kPrepare);
+    step(core::ComponentAction::kEnable);
     ASSERT_TRUE(composition->io_signal_runtime->DrainPending().ok());
     const auto contact =
         take(composition->io_signal_service->ReadSignal(signal_id));
@@ -5379,7 +4584,7 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
     const auto initial_source_sequence =
         contact.latest_sample->publication.source_sequence;
 
-    step("disable");
+    step(core::ComponentAction::kDisable);
     auto separated_scene = *projection->logical_snapshot();
     ASSERT_EQ(separated_scene.objects.size(), 1U);
     const auto prior_revision = product_projection;
@@ -5446,8 +4651,8 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
         [&](const auto &body) { return body.body_id == target_body_id; },
         "moved geometric target collision body");
     EXPECT_DOUBLE_EQ(separated_target.pose.position_m.x_m, 100.0);
-    step("prepare");
-    step("enable");
+    step(core::ComponentAction::kPrepare);
+    step(core::ComponentAction::kEnable);
     ASSERT_TRUE(composition->io_signal_runtime->DrainPending().ok());
     const auto separated =
         take(composition->io_signal_service->ReadSignal(signal_id));
@@ -5466,280 +4671,8 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
     return;
   }
 
-  if (mixed_output_check) {
-    // Same genuine maintained arm + model-free station product as the process
-    // trial. The current snapshot supplies the construction generation; no
-    // component Active state or Kernel output admission is fabricated here.
-    const auto take = []<class T>(core::Result<T> value) {
-      if (!value.ok()) {
-        const auto &error = value.error();
-        const auto reason = error.details.find("reason");
-        throw std::logic_error(error.code + ": " + error.message +
-                               (reason == error.details.end()
-                                    ? std::string{}
-                                    : " [" + reason->second + "]"));
-      }
-      return std::move(value.value());
-    };
-    const core::ControllableComponentId station("station_io");
-    const auto catalog = take(deployment::ResolveRetainedIoSignalCatalog(graph));
-    const auto& domain = require_fixture_one(graph.control_domains, [&](const auto& row) {
-      return row.provider() && row.provider()->controllable_component_id == station;
-    }, "actual station provider domain");
-    const auto& provider = *domain.provider();
-    deployment::FilesystemVerifiedRetainedProviderManifestSource manifests(package_root);
-    const auto manifest = manifests.get_verified({materialized.bundle->retained_bundle_id(),
-        provider.provider_manifest_id, provider.provider_manifest_revision});
-    ASSERT_TRUE(manifest);
-    std::vector<core::ResourceId> resources;
-    std::vector<core::IoSignalDescriptorDTO> descriptors;
-    std::map<core::InterruptSourceId, std::vector<deployment::RetainedIoSignalConfiguration>> input_rows;
-    for (const auto& row : catalog) {
-      if (row.descriptor.signal_id.controllable_component_id != station) continue;
-      if (row.descriptor.output_resource) resources.push_back(*row.descriptor.output_resource);
-      else {
-        descriptors.push_back(row.descriptor);
-        input_rows[row.descriptor.source_id].push_back(row);
-      }
-    }
-    std::sort(resources.begin(), resources.end());
-    resources.erase(std::unique(resources.begin(), resources.end()), resources.end());
-    ASSERT_FALSE(resources.empty());
-    const core::RuntimeEpoch station_epoch("mixed.actual.station.driver");
-    const core::ResolvedLifecycleProviderOccurrenceDTO occurrence{
-        domain.control_domain_id, domain.control_domain_revision, provider.provider_instance_id,
-        provider.provider_manifest_id, provider.provider_manifest_revision,
-        provider.provider_runtime_unit_id, station_epoch, provider.lifecycle_plan_catalog_digest};
-    mixed_driver = take(host_detail::IoProviderDriverRecord::Create(
-        {domain.control_domain_id, domain.control_domain_revision,
-         core::ResolvedProviderDomainScopeDTO{provider, station_epoch, {}, resources}},
-        occurrence, manifest->value(), runtime->clock, 1'000'000'000LL, 10'000'000LL));
-
-    component_manager::SqliteActiveBundlePublicationStore publications(
-        temporary.path() / "mixed-active.sqlite3", graph.cell_id);
-    const core::ProjectionRevisionDTO product_projection{
-        materialized.bundle->retained_bundle_id(), graph.graph_revision, initial_scene.shared()->revision};
-    const auto publication = publications.PublishActiveBundle(
-        {core::BootstrapPublicationTransactionDTO{core::BootstrapId("mixed.bootstrap"),
-                                                core::BootstrapGeneration(1U)},
-         product_projection, materialized.bundle->retained_bundle_id(), graph.graph_revision, {},
-         core::ContentDigest(deployment::sha256_digest(materialized.bundle->canonical_bytes()))});
-    core::SqliteCCLCJournal lifecycle_journal(
-        temporary.path() / "mixed-cclc.sqlite3", graph.cell_id, 8U);
-    ASSERT_TRUE(lifecycle_journal.BeginOwnerEpoch(
-        core::RequestOwnerEpoch("mixed.cclc.owner"), runtime->clock->now(), 32U).ok());
-    std::vector<core::BuildOwnedLifecyclePlanCatalogEntryDTO> lifecycle_entries{
-        {manifest->value(), mixed_driver->catalog()}};
-    std::vector<core::ResolvedLifecycleProviderOccurrenceDTO> occurrences{mixed_driver->occurrence()};
-    for (const auto& registration : runtime->participant_registrations) {
-      const auto& path = *registration.binding.value().control_path;
-      if (std::any_of(occurrences.begin(), occurrences.end(), [&](const auto& row) {
-            return row.control_domain_id == path.control_domain_id;
-          })) continue;
-      const auto physical_manifest = manifests.get_verified({materialized.bundle->retained_bundle_id(),
-          path.provider_manifest_id, path.provider_manifest_revision});
-      ASSERT_TRUE(physical_manifest);
-      auto physical_catalog = take(make_retained_ros2_control_lifecycle_catalog(physical_manifest->value()));
-      occurrences.push_back({path.control_domain_id, path.control_domain_revision, path.provider_instance_id,
-          path.provider_manifest_id, path.provider_manifest_revision, path.provider_runtime_unit_id,
-          path.provider_runtime_epoch, physical_catalog.catalog_digest});
-      if (std::none_of(lifecycle_entries.begin(), lifecycle_entries.end(), [&](const auto& row) {
-            return row.provider_manifest.provider_manifest_id == path.provider_manifest_id &&
-                row.provider_manifest.provider_manifest_revision == path.provider_manifest_revision;
-          })) lifecycle_entries.push_back({physical_manifest->value(), std::move(physical_catalog)});
-    }
-    auto lifecycle_catalog = take(core::BuildOwnedLifecyclePlanCatalogSource::Make(std::move(lifecycle_entries)));
-    deployment::VerifiedComponentLifecycleCurrentSnapshotSource current_source(
-        *materialized.bundle, publications, publication, lifecycle_journal,
-        lifecycle_catalog, std::move(occurrences));
-    const auto actual_arm = take(current_source.ReadCurrentComponentSnapshot(component_id));
-    ASSERT_EQ(actual_arm.component_lifecycle_state, core::ComponentLifecycleStateDTO::kDeclared);
-    mixed_arm_generation = actual_arm.component_lifecycle_generation;
-    const auto actual = take(current_source.ReadCurrentComponentSnapshot(station));
-    ASSERT_EQ(actual.component_lifecycle_state, core::ComponentLifecycleStateDTO::kDeclared);
-    ASSERT_EQ(actual.domains.size(), 1U);
-    ASSERT_EQ(actual.domains.front(), mixed_driver->domain());
-    ASSERT_EQ(actual.provider_occurrences.front(), mixed_driver->occurrence());
-
-    std::vector<core::InterruptSourceId> synthetic_sources;
-    for (const auto& [source, rows] : input_rows)
-      if (rows.front().provider.profile == "mock") synthetic_sources.push_back(source);
-    std::shared_ptr<core::IoSignalSubsystem> inputs(take(core::IoSignalSubsystem::Create(
-        {owner_epoch, 1U, descriptors, std::move(synthetic_sources)},
-        {input_rows.size(), descriptors.size(), 16U, 8U, 512U, 1024U}, *runtime->clock)));
-    std::map<core::InterruptSourceId, core::IoSourceIncarnation> incarnations;
-    for (const auto& [source, rows] : input_rows) {
-      const core::IoSourceIncarnation incarnation("mixed." + source.value());
-      ASSERT_TRUE(inputs->InstallSource(source, incarnation, {}).ok());
-      incarnations.emplace(source, incarnation);
-    }
-    std::shared_ptr<core::IoSignalIngress> ingress(take(core::IoSignalIngress::Create(inputs)));
-    std::vector<host_detail::IoProviderInputSourceInstallation> installed_inputs;
-    for (const auto& [source, rows] : input_rows)
-      installed_inputs.push_back(
-          {rows, {}, ingress, incarnations.at(source), std::nullopt});
-    std::vector<host_detail::HostIoOutputAliasInstallation> aliases;
-    {
-      auto delivery = mixed_driver->AcquireDelivery();
-      for (const auto& row : catalog)
-        if (row.descriptor.signal_id.controllable_component_id == station && row.descriptor.output_resource)
-          aliases.push_back({row, mixed_driver->occurrence(),
-              mixed_driver->driver_observation_generation_locked(), mixed_driver,
-              publication.publication_generation});
-    }
-    mixed_channels = std::make_shared<std::vector<host_detail::HostIoOutputChannelEntry>>(
-        take(host_detail::CreateHostIoOutputChannels(std::move(aliases), {}, *runtime->clock)));
-    std::vector<host_detail::IoProviderOutputChannelInstallation> installed_outputs;
-    for (const auto& channel : *mixed_channels) {
-      std::vector<deployment::RetainedIoSignalConfiguration> rows;
-      for (const auto& row : catalog)
-        if (row.descriptor.signal_id.controllable_component_id == station &&
-            row.descriptor.output_resource == channel.resource_id) rows.push_back(row);
-      installed_outputs.push_back({channel.resource_id, std::move(rows), channel.provider});
-    }
-    {
-      auto delivery = mixed_driver->AcquireDelivery();
-      ASSERT_TRUE(mixed_driver->InstallResourcesLocked(
-          std::move(installed_inputs), std::move(installed_outputs), {}).ok());
-    }
-    for (const auto* primitive : {"prepare", "enable"}) {
-      SCOPED_TRACE(primitive);
-      const auto before = take(mixed_driver->ReadLifecycleSnapshot(
-          domain.control_domain_id, runtime->clock->now()));
-      const auto& selected = mixed_driver->occurrence();
-      const core::BrandLifecyclePrimitiveIntentDTO intent{
-          core::LifecycleTransactionId("mixed.driver." + std::string(primitive)),
-          core::LifecycleTransactionGeneration(1U), station, domain.control_domain_id,
-          selected.control_domain_revision, selected.provider_instance_id, selected.provider_manifest_id,
-          selected.provider_manifest_revision, selected.provider_runtime_unit_id,
-          selected.provider_runtime_epoch, core::LifecyclePrimitiveId("io.provider." + std::string(primitive)),
-          core::LifecyclePrimitiveAttemptId("mixed.attempt." + std::string(primitive)),
-          before.source_generation, 1'000'000'000LL,
-          core::ComponentLifecycleStateDTO::kUndeclared};
-      ASSERT_TRUE(intent.locally_valid());
-      const auto outcome = mixed_driver->Dispatch(intent, {});
-      ASSERT_EQ(outcome.outcome, RetainedRos2ControlSwitchOutcome::kSucceeded)
-          << (outcome.error ? outcome.error->code + ": " + outcome.error->message
-                            : "no lifecycle error returned");
-    }
-    EXPECT_EQ(take(current_source.ReadCurrentComponentSnapshot(station)).component_lifecycle_state,
-              core::ComponentLifecycleStateDTO::kDeclared);
-
-    deployment::FilesystemCatalogArtifactStore artifacts(package_root);
-    const auto direct = deployment::compile_direct_control_program_binding_inventory(
-        *materialized.bundle, model_map, artifacts);
-    const auto binding = require_fixture_one(direct.io, [&](const auto& row) {
-      return std::any_of(row->value().target_role_bindings.begin(), row->value().target_role_bindings.end(),
-          [&](const auto& target) { return target.controllable_component_id == station; });
-    }, "genuine station direct output binding");
-    const auto& target = require_fixture_one(binding->value().target_role_bindings,
-        [&](const auto& row) { return row.controllable_component_id == station; }, "station target");
-    const auto sealed_target = deployment::resolve_runtime_program_target(
-        *binding, target.target_role_id, core::CapabilityId("io.gpio.set_output"),
-        *materialized.bundle, model_map);
-    const core::RuntimeProviderDomainConfigurationReadbackDTO closed{
-        materialized.bundle->retained_bundle_id(), graph.graph_revision,
-        actual.component_lifecycle_generation, actual.domains.front(), actual.provider_occurrences.front(),
-        false, 0U, 0U};
-    auto complete = budget_cell->participant_registrations();
-    for (const auto& role : target.signal_role_bindings) {
-      if (role.direction != core::IoSignalDirection::kOutput) continue;
-      auto output = take(core::verify_runtime_participant_binding(
-          deployment::build_runtime_io_output_binding_dto(
-              sealed_target, role.resource_role_id, *materialized.bundle, closed)));
-      const auto& channel = require_fixture_one(*mixed_channels, [&](const auto& row) {
-        return row.resource_id == *output.value().io_output_binding->signal.output_resource;
-      }, "actual station output channel engine");
-      complete.push_back({.binding = std::move(output), .stop_readiness = {},
-          .retained_default_stop_limits = {}, .stop_node_category = core::MotionInterruptNodeCategory::kGeneric,
-          .engine = channel.engine.get(), .stop_execution_port = nullptr, .participant_policy = {},
-          .prepared_motion_engine = channel.engine.get(), .default_operator_stop_profile = {},
-          .default_fault_stop_profile = {}, .deployment_maximum_tcp_linear_speed_mps = {},
-          .intrinsic_direct_control = true, .direct_control_joint_limits = {}});
-    }
-    RetainedRuntimeParticipantResolverFactory current_factory =
-        [package_root, bundle = materialized.bundle, model_map, direct_id = binding->program_binding_id()]
-        (auto composed) {
-          // Active TCP (M7): Robot control resolves through the robot's owner.
-          std::vector<RobotTcpReader> owners;
-          for (const auto &row : composed) owners.push_back(fixture_robot_tcps(row));
-          const RobotTcpReader robot_tcps = [owners](const core::ControllableComponentId &robot) {
-            for (const auto &owner : owners)
-              if (auto state = owner(robot)) return state;
-            return std::optional<ActiveTcp>{};
-          };
-          auto resolver = std::make_shared<ProductBackedRuntimeParticipantResolver>(
-              package_root, bundle, model_map, std::move(composed),
-              std::vector<core::ProgramBindingId>{direct_id});
-          return RetainedRuntimeParticipantResolver{
-              [resolver, robot_tcps](const auto& operation, auto index) {
-                return resolver->ResolveExecutionParticipant(operation, index, robot_tcps);
-              }};
-        };
-    std::vector<core::RuntimeParticipantBinding> all_bindings;
-    for (const auto& row : complete) all_bindings.push_back(row.binding);
-    auto resolver = make_retained_cell_kernel_participant_resolver(
-        current_factory(std::move(all_bindings)), complete);
-    ASSERT_TRUE(budget_cell->addressed_kernel().SetRouteRecoveryPending(true).ok());
-    ASSERT_TRUE(budget_cell->reconfigure_runtime_product(
-        std::move(complete), std::move(resolver), budget_cell->stop_surveillance_owner()->SnapshotSources()).ok());
-    // The current immutable product factory is adopted only after the same
-    // successful stable-cell publication, as in the actual host caller.
-    runtime->AdoptVerifiedParticipantResolverFactory(std::move(current_factory));
-    ASSERT_TRUE(budget_cell->addressed_kernel().SetRouteRecoveryPending(false).ok());
-    auto* const stable = budget_cell.get();
-    dispatch_mixed_output = [stable, binding, driver = mixed_driver, channels = mixed_channels,
-        expected_generation = actual.component_lifecycle_generation, sequence = 0U]() mutable {
-      const auto& selected = require_fixture_one(stable->participant_registrations(), [&](const auto& row) {
-        return row.binding.value().io_output_binding &&
-            row.binding.value().controllable_component_id == core::ControllableComponentId("station_io") &&
-            row.binding.value().io_output_binding->resource_role_id == core::ResourceRoleId("lamp");
-      }, "retained genuine lamp registration");
-      EXPECT_EQ(selected.binding.value().io_output_binding->component_lifecycle_generation, expected_generation);
-      const auto& target = binding->value().target_role_bindings.front();
-      const auto schema = core::builtin_io_signal_write_command_schema();
-      const core::CapabilityCommandIntentDTO command{schema.command_schema_id, schema.command_schema_revision,
-          core::IoSignalWriteCommandValueDTO{core::ResourceRoleId("lamp"), (++sequence % 2U) != 0U}, {}, {}};
-      const core::OperationIntentDTO operation{
-          {core::RequestId("mixed.output." + std::to_string(sequence)), stable->addressed_kernel().request_owner_epoch(), "test", {}},
-          binding->value().program_id, binding->value().program_revision, binding->program_binding_id(),
-          core::ProgramRunId("mixed.output.session"), selected.binding.value().graph_revision,
-          selected.binding.value().retained_bundle_id, {},
-          {{target.component_role_id, target.target_role_id, core::CapabilityId("io.gpio.set_output"), {}, command, {}}}};
-      const auto resolved = stable->participant_resolver()(operation, 0U);
-      ASSERT_TRUE(resolved.ok()) << resolved.error().message;
-      ASSERT_EQ(resolved.value().engine, selected.engine);
-      ASSERT_EQ(resolved.value().prepared_motion_engine, selected.prepared_motion_engine);
-      EXPECT_EQ(resolved.value().binding.value().io_output_binding, selected.binding.value().io_output_binding);
-      ASSERT_FALSE(resolved.value().binding.value().control_path);
-      const auto prepared = core::MakePreparedIoOutputParticipant(
-          core::OperationId("mixed.write." + std::to_string(sequence)), core::OperationRevision(1U),
-          core::OperationParticipantId("lamp"), operation.program_run_id, command, resolved.value().binding);
-      ASSERT_TRUE(prepared.ok()) << prepared.error().message;
-      auto participant = std::make_shared<const core::PreparedOperationParticipantDTO>(prepared.value());
-      const auto& output = std::get<core::PreparedIoOutputCommandDTO>(participant->payload);
-      auto* const engine = resolved.value().prepared_motion_engine;
-      const auto prepared_id = engine->PrepareCapabilityCommand({participant, resolved.value().binding,
-          core::ResolvedPreparedIoOutputCommandAuthorityDTO{output.signal_id, output.output_resource,
-              output.command_value.value, participant->provider()->lifecycle_provider, output.completion_policy}});
-      ASSERT_TRUE(prepared_id.ok()) << prepared_id.error().message;
-      const auto sent = engine->DispatchPreparedCapabilityCommand(prepared_id.value(), participant->prepared_contract_digest,
-          core::ControllerGoalId("mixed.goal." + std::to_string(sequence)), core::ControllerGoalGeneration(1U));
-      ASSERT_TRUE(sent.ok()) << sent.error().message;
-      ASSERT_TRUE(sent.value().accepted);
-      const auto observed = engine->ObservePreparedCapabilityCommand(prepared_id.value());
-      ASSERT_TRUE(observed.ok());
-      ASSERT_TRUE(observed.value().output_observation);
-      EXPECT_EQ(observed.value().output_observation->evidence, core::IoOutputEvidence::kSourceAccepted);
-      EXPECT_EQ(observed.value().output_observation->identity.component_lifecycle_generation, expected_generation);
-      EXPECT_EQ(observed.value().output_observation->identity.provider, driver->occurrence());
-      EXPECT_TRUE(resolved.value().engine->acknowledge_completed(prepared_id.value()).accepted);
-      // Keep the actual leaf/engine and driver alive through the dispatch.
-      EXPECT_FALSE(channels->empty());
-    };
-  }
 #endif
-  if (check == Lite6AggregateCheck::kExecutionPortParticipant) {
+  if (check == Lite6MotionCheck::kExecutionPortParticipant) {
     ASSERT_NE(runtime, nullptr);
     ASSERT_NE(port_participant, nullptr);
     EXPECT_EQ(runtime->execution.get(), port_participant);
@@ -5758,868 +4691,27 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
   }
 
   ASSERT_NE(runtime, nullptr);
-  ASSERT_NE(runtime->active_addressed_kernel(), nullptr);
+  ASSERT_NE(runtime->cell_addressed_kernel, nullptr);
   ASSERT_NE(runtime->participant_engine, nullptr);
-  if (mixed_output_check)
-    EXPECT_FALSE(runtime->gripper_binding.has_value());
-  else
-    ASSERT_TRUE(runtime->gripper_binding.has_value());
-  if (check == Lite6AggregateCheck::kMeasuredPublication ||
-      check == Lite6AggregateCheck::kResolverRebuildFailures ||
-      check == Lite6AggregateCheck::kStopResponseFollowsRouteRebind ||
-      check == Lite6AggregateCheck::kRetainedRouteGenerationReseal ||
-      moving_budget_check || mixed_output_check ||
-      check == Lite6AggregateCheck::kMeasuredOptionalDomainRace ||
-      check == Lite6AggregateCheck::kMeasuredNullOptionalDomainRace) {
-    // Use the verified ROS product and actual Kernel with the focused Core port.
-    // Stop readiness is produced by the existing sealed readiness boundary.
-    deployment::FilesystemVerifiedRetainedProductArtifactSource artifacts(package_root);
-    const auto make_configuration = [&](const core::RuntimeParticipantBinding &binding,
-                                        core::ActiveControlConfigurationGeneration generation) {
-      const auto &path = *binding.value().control_path;
-      const auto desired = std::find_if(
-          materialized.bundle->value().desired_control_configurations.begin(),
-          materialized.bundle->value().desired_control_configurations.end(),
-          [&](const auto &row) { return row.control_domain_id == path.control_domain_id; });
-      if (desired == materialized.bundle->value().desired_control_configurations.end())
-        throw std::runtime_error("actual fixture desired domain missing");
-      std::vector<core::ActiveControlConfigurationBindingRouteDTO> routes;
-      for (const auto &row : desired->binding_routes)
-        routes.push_back({row.control_binding_id, row.control_binding_revision, row.control_route_id});
-      core::ActiveControlConfigurationDTO result{
-          path.active_control_configuration_id, path.control_domain_id,
-          path.control_domain_revision, std::move(routes), desired->activation_set_id,
-          path.controller_topology_id, path.topology_revision,
-          path.provider_runtime_unit_id, path.provider_runtime_epoch, generation.value(),
-          {}, generation, core::ActiveControlConfigurationStateDTO::kReconciled};
-      for (const auto &representative : runtime->control_binding_representatives) {
-        const auto &selected = *representative.value().control_path;
-        if (selected.control_domain_id != path.control_domain_id) continue;
-        const auto channel = retained_bindings_share_backend_owner(runtime->motion_binding, representative)
-                                 ? runtime->motion_state_channel : runtime->gripper_state_channel;
-        for (const auto &resource : representative.value().resources) {
-          core::KinematicResourceSourceProjectionDTO projection{
-              resource.resource_id, {{selected.control_binding_id, selected.control_binding_revision}},
-              selected.provider_instance_id, selected.provider_manifest_id,
-              selected.provider_manifest_revision, selected.state_authority_id,
-              selected.state_authority_class, channel->source_kind()};
-          auto prior = std::find_if(result.kinematic_resource_source_projections.begin(),
-              result.kinematic_resource_source_projections.end(), [&](const auto& row) {
-                return row.resource_id == resource.resource_id;
-              });
-          if (prior == result.kinematic_resource_source_projections.end()) {
-            result.kinematic_resource_source_projections.push_back(std::move(projection));
-          } else {
-            auto same_owner = projection;
-            same_owner.contributing_control_bindings = prior->contributing_control_bindings;
-            if (same_owner != *prior)
-              throw std::logic_error("actual fixture resource has conflicting source owners");
-            prior->contributing_control_bindings.push_back(projection.contributing_control_bindings.front());
-          }
-        }
+  if (moving_budget_check) {
+    // The moving takeover budget reaches every motion registration.
+    const auto &runtime_rows = std::as_const(runtime->participant_registrations);
+    for (const auto *rows : {&runtime_rows, &stable_cell->participant_registrations()}) {
+      ASSERT_FALSE(rows->empty());
+      for (const auto &row : *rows) {
+        const bool motion =
+            row.binding.value().capability_id.value() == "execution.trajectory.execute";
+        EXPECT_EQ(row.motion_takeover_preparation_budget_s,
+                  motion ? std::optional<double>(3.5) : std::nullopt);
       }
-      std::sort(result.kinematic_resource_source_projections.begin(),
-                result.kinematic_resource_source_projections.end(),
-                [](const auto &a, const auto &b) { return a.resource_id < b.resource_id; });
-      for (auto& projection : result.kinematic_resource_source_projections)
-        std::sort(projection.contributing_control_bindings.begin(),
-            projection.contributing_control_bindings.end(), [](const auto& a, const auto& b) {
-              return std::tie(a.control_binding_id, a.control_binding_revision) <
-                     std::tie(b.control_binding_id, b.control_binding_revision);
-            });
-      if (!result.locally_valid())
-        throw std::logic_error("actual fixture route configuration is not canonical");
-      return result;
-    };
-    const auto ready = [&](const core::ActiveControlConfigurationDTO &configuration) {
-      const auto desired = std::find_if(
-          materialized.bundle->value().desired_control_configurations.begin(),
-          materialized.bundle->value().desired_control_configurations.end(),
-          [&](const auto &row) { return row.control_domain_id == configuration.control_domain_id; });
-      if (desired == materialized.bundle->value().desired_control_configurations.end())
-        throw std::runtime_error("actual fixture desired domain missing");
-      const auto expected = deployment::load_verified_controller_lifecycle_expected_domain(
-          *materialized.bundle, artifacts, *desired,
-          configuration.source_runtime_unit_id, configuration.source_runtime_epoch);
-      std::vector<core::RuntimeParticipantBinding> bindings;
-      for (const auto &binding : runtime->control_binding_representatives)
-        if (binding.value().control_path->control_domain_id == configuration.control_domain_id)
-          bindings.push_back(binding);
-      const std::vector<core::RouteSelectionComponentExpectationDTO> components{
-          {component_id, mixed_output_check
-              ? runtime->active_addressed_kernel()->component_command_readiness(component_id).value().component_lifecycle_generation.value()
-              : core::ComponentLifecycleGeneration(1U), mixed_output_check
-              ? core::ComponentLifecycleStateDTO::kDeclared
-              : core::ComponentLifecycleStateDTO::kPrepared}};
-      return deployment::resolve_and_verify_route_readiness_batch(
-          *materialized.bundle, artifacts, expected, configuration, components, bindings);
-    };
-    const auto assert_budget = [&]() {
-      if (!moving_budget_check)
-        return;
-      const auto &runtime_rows =
-          std::as_const(runtime->participant_registrations);
-      for (const auto *rows :
-           {&runtime_rows, &budget_cell->participant_registrations()}) {
-        ASSERT_FALSE(rows->empty());
-        for (const auto &row : *rows) {
-          const bool motion = row.binding.value().capability_id.value() ==
-                              "execution.trajectory.execute";
-          EXPECT_EQ(row.motion_takeover_preparation_budget_s,
-                    motion ? std::optional<double>(3.5) : std::nullopt);
-        }
-      }
-    };
-#ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
-    if (mixed_output_check) {
-      dispatch_mixed_output();
-      ASSERT_TRUE(mixed_arm_generation);
-      const core::ComponentCommandReadinessPublicationDTO publication{
-          core::ComponentReadinessAuthorityDTO::kRestartExclusion, {}, {}, component_id,
-          *mixed_arm_generation, false};
-      EXPECT_FALSE(runtime->PublishComponentCommandReadiness(publication).ok());
-      const auto initial = make_configuration(runtime->motion_binding,
-          runtime->motion_binding.value().control_path->active_control_configuration_generation);
-      // Unchanged predecessor adoption is allowed while drained. A valid
-      // foreign owner revision must still refuse without touching IO.
-      auto foreign_predecessor = initial;
-      foreign_predecessor.control_domain_revision = core::ControlDomainRevision("foreign.domain.revision");
-      ASSERT_TRUE(foreign_predecessor.locally_valid());
-      const auto refused = runtime->AdoptAndReadBackRouteConfigurationPredecessor(foreign_predecessor);
-      ASSERT_FALSE(refused.ok());
-      EXPECT_EQ(refused.error().details.at("reason"), "route_predecessor_rebind_mismatch");
-      dispatch_mixed_output();
-      ASSERT_TRUE(budget_cell->addressed_kernel().SetRouteRecoveryPending(true).ok());
-      const auto readiness = runtime->PublishComponentCommandReadiness(publication);
-      ASSERT_TRUE(readiness.ok()) << readiness.error().message;
-      EXPECT_FALSE(readiness.value().command_eligible);
-      EXPECT_EQ(readiness.value().component_lifecycle_generation, publication.component_lifecycle_generation);
-      dispatch_mixed_output();
-      const auto adopted = runtime->AdoptAndReadBackRouteConfigurationPredecessor(initial);
-      ASSERT_TRUE(adopted.ok()) << adopted.error().message;
-      EXPECT_EQ(adopted.value().active_configuration, initial);
-      EXPECT_FALSE(adopted.value().operation_admission_open);
-      dispatch_mixed_output();
-      const auto successor = make_configuration(runtime->motion_binding,
-          core::ActiveControlConfigurationGeneration(initial.active_control_configuration_generation.value() + 1U));
-      auto successor_ready = ready(successor);
-      ASSERT_TRUE(successor_ready.ok()) << successor_ready.error().message;
-      const auto published = runtime->PublishAndReadBackRouteConfiguration(successor, successor_ready.value());
-      ASSERT_TRUE(published.ok()) << published.error().message;
-      EXPECT_EQ(published.value().active_configuration, successor);
-      dispatch_mixed_output();
-      mixed_driver->Shutdown();
-      return;
     }
-#endif
-    assert_budget();
-    const auto initial = make_configuration(runtime->motion_binding,
-        runtime->motion_binding.value().control_path->active_control_configuration_generation);
-    ASSERT_TRUE(initial.locally_valid());
-    auto initial_ready = ready(initial);
-    ASSERT_TRUE(initial_ready.ok()) << initial_ready.error().message;
-    auto installed = runtime->PublishAndReadBackRouteConfiguration(initial, std::move(initial_ready.value()));
-    ASSERT_TRUE(installed.ok()) << installed.error().message;
-    EXPECT_EQ(installed.value().active_configuration, initial);
-    if (check == Lite6AggregateCheck::kRetainedRouteGenerationReseal) {
-      // This lower-level regression uses the real retained runtime route
-      // publication and strict product reseal. It does not exercise the host
-      // Apply call site; that remains a separate private integration gate.
-      const auto generation_one_motion = arm_binding;
-      const auto generation_one_gripper = gripper_binding;
-      const auto generation_one_representatives =
-          runtime->control_binding_representatives;
-      const auto generation_one_registrations = runtime->participant_registrations;
-      ASSERT_TRUE(generation_one_motion.value().control_path->runtime_scale_qualification);
-      EXPECT_EQ(generation_one_motion.value().control_path
-                    ->active_control_configuration_generation,
-                core::ActiveControlConfigurationGeneration(1U));
-
-      const auto arm_successor = make_configuration(
-          runtime->motion_binding,
-          core::ActiveControlConfigurationGeneration(2U));
-      const auto arm_successor_ready = ready(arm_successor);
-      ASSERT_TRUE(arm_successor_ready.ok()) << arm_successor_ready.error().message;
-      const auto arm_published = runtime->PublishAndReadBackRouteConfiguration(
-          arm_successor, arm_successor_ready.value());
-      ASSERT_TRUE(arm_published.ok()) << arm_published.error().message;
-      EXPECT_EQ(arm_published.value().active_configuration, arm_successor);
-      ASSERT_EQ(runtime->motion_binding.value().control_path
-                    ->active_control_configuration_generation,
-                arm_successor.active_control_configuration_generation);
-
-      ASSERT_TRUE(runtime->gripper_binding.has_value());
-      const auto gripper_successor = make_configuration(
-          *runtime->gripper_binding,
-          core::ActiveControlConfigurationGeneration(2U));
-      const auto gripper_successor_ready = ready(gripper_successor);
-      ASSERT_TRUE(gripper_successor_ready.ok())
-          << gripper_successor_ready.error().message;
-      const auto gripper_published = runtime->PublishAndReadBackRouteConfiguration(
-          gripper_successor, gripper_successor_ready.value());
-      ASSERT_TRUE(gripper_published.ok()) << gripper_published.error().message;
-      EXPECT_EQ(gripper_published.value().active_configuration,
-                gripper_successor);
-      ASSERT_EQ(runtime->gripper_binding->value().control_path
-                    ->active_control_configuration_generation,
-                gripper_successor.active_control_configuration_generation);
-
-      const auto route_for = [&](const core::RuntimeParticipantBinding &binding)
-          -> const core::ActiveControlConfigurationDTO & {
-        return binding.value().control_path->control_domain_id ==
-                       arm_successor.control_domain_id
-                   ? arm_successor
-                   : gripper_successor;
-      };
-
-      auto unreconciled = arm_successor;
-      unreconciled.state = core::ActiveControlConfigurationStateDTO::
-          kExternalOrUnknownUnreconciled;
-      const auto unreconciled_result =
-          detail::rebase_runtime_binding_to_predecessor(
-              generation_one_motion, unreconciled);
-      ASSERT_FALSE(unreconciled_result.ok());
-      EXPECT_EQ(unreconciled_result.error().details.at("reason"),
-                "route_predecessor_rebind_input_invalid");
-      EXPECT_EQ(unreconciled_result.error().message,
-                "durable route predecessor rebind has no exact control path");
-
-      auto wrong_revision = arm_successor;
-      const auto motion_route = std::find_if(
-          wrong_revision.binding_routes.begin(),
-          wrong_revision.binding_routes.end(), [&](const auto &row) {
-            return row.control_binding_id ==
-                   generation_one_motion.value().control_path->control_binding_id;
-          });
-      ASSERT_NE(motion_route, wrong_revision.binding_routes.end());
-      motion_route->control_binding_revision =
-          core::ControlBindingRevision("foreign.binding.revision");
-      for (auto &projection : wrong_revision.kinematic_resource_source_projections) {
-        for (auto &contributor : projection.contributing_control_bindings) {
-          if (contributor.control_binding_id == motion_route->control_binding_id)
-            contributor.control_binding_revision =
-                motion_route->control_binding_revision;
-        }
-      }
-      ASSERT_TRUE(wrong_revision.locally_valid());
-      const auto wrong_revision_result =
-          detail::rebase_runtime_binding_to_predecessor(
-              generation_one_motion, wrong_revision);
-      ASSERT_FALSE(wrong_revision_result.ok());
-      EXPECT_EQ(wrong_revision_result.error().details.at("reason"),
-                "route_predecessor_rebind_mismatch");
-      EXPECT_EQ(wrong_revision_result.error().message,
-                "durable route predecessor crosses its retained runtime binding");
-
-      const auto rebase = [&](const core::RuntimeParticipantBinding &binding) {
-        return detail::rebase_runtime_binding_to_predecessor(
-            binding, route_for(binding));
-      };
-      const auto candidate_motion = rebase(generation_one_motion);
-      ASSERT_TRUE(candidate_motion.ok()) << candidate_motion.error().message;
-      const auto candidate_gripper = rebase(generation_one_gripper);
-      ASSERT_TRUE(candidate_gripper.ok()) << candidate_gripper.error().message;
-      EXPECT_EQ(candidate_motion.value().value().control_path
-                    ->active_control_configuration_generation,
-                arm_successor.active_control_configuration_generation);
-      EXPECT_EQ(candidate_motion.value().value().control_path
-                    ->runtime_scale_qualification,
-                generation_one_motion.value().control_path
-                    ->runtime_scale_qualification);
-      // A newly compiled binding with no retained route facts stays at the
-      // compiler's generation 1; only explicit authoritative retained-route
-      // rebasing moves the existing candidate to generation 2.
-      EXPECT_EQ(generation_one_motion.value().control_path
-                    ->active_control_configuration_generation,
-                core::ActiveControlConfigurationGeneration(1U));
-
-      std::vector<core::RuntimeParticipantBinding> candidate_representatives;
-      candidate_representatives.reserve(generation_one_representatives.size());
-      for (const auto &representative : generation_one_representatives) {
-        const auto rebased = rebase(representative);
-        ASSERT_TRUE(rebased.ok()) << rebased.error().message;
-        EXPECT_EQ(rebased.value().value().runtime_unit_epochs,
-                  representative.value().runtime_unit_epochs);
-        EXPECT_EQ(rebased.value().value().control_path,
-                  runtime->control_binding_representatives.at(
-                      candidate_representatives.size()).value().control_path);
-        candidate_representatives.push_back(rebased.value());
-      }
-      auto candidate_registrations = runtime->participant_registrations;
-      for (auto &candidate : candidate_registrations) {
-        const auto source = std::find_if(
-            generation_one_registrations.begin(),
-            generation_one_registrations.end(), [&](const auto &row) {
-              return row.binding.value().control_path->control_binding_id ==
-                     candidate.binding.value().control_path->control_binding_id;
-            });
-        ASSERT_NE(source, generation_one_registrations.end());
-        const auto predecessor_binding = candidate.binding;
-        const bool is_motion_registration =
-            source->binding.value().control_path->control_binding_id ==
-            generation_one_motion.value().control_path->control_binding_id;
-        if (is_motion_registration) {
-          ASSERT_TRUE(candidate.stop_readiness.has_value());
-        }
-        if (candidate.stop_readiness.has_value()) {
-          const auto &route = route_for(source->binding);
-          const auto desired = std::find_if(
-              materialized.bundle->value().desired_control_configurations.begin(),
-              materialized.bundle->value().desired_control_configurations.end(),
-              [&](const auto &row) {
-                return row.control_domain_id == route.control_domain_id;
-              });
-          ASSERT_NE(desired,
-                    materialized.bundle->value().desired_control_configurations.end());
-          const auto expected_domain =
-              deployment::load_verified_controller_lifecycle_expected_domain(
-                  *materialized.bundle, artifacts, *desired,
-                  route.source_runtime_unit_id, route.source_runtime_epoch);
-          const auto stale_readiness =
-              core::rebind_runtime_participant_stop_readiness_product(
-                  *candidate.stop_readiness, predecessor_binding,
-                  source->binding, expected_domain.sealed());
-          ASSERT_FALSE(stale_readiness.ok());
-          EXPECT_EQ(stale_readiness.error().details.at("reason"),
-                    "runtime_participant_stop_product_rebind_changes_controller");
-        }
-        const auto rebound = rebase(source->binding);
-        ASSERT_TRUE(rebound.ok()) << rebound.error().message;
-        if (candidate.stop_readiness.has_value()) {
-          const auto &route = route_for(source->binding);
-          const auto desired = std::find_if(
-              materialized.bundle->value().desired_control_configurations.begin(),
-              materialized.bundle->value().desired_control_configurations.end(),
-              [&](const auto &row) {
-                return row.control_domain_id == route.control_domain_id;
-              });
-          ASSERT_NE(desired,
-                    materialized.bundle->value().desired_control_configurations.end());
-          const auto expected_domain =
-              deployment::load_verified_controller_lifecycle_expected_domain(
-                  *materialized.bundle, artifacts, *desired,
-                  route.source_runtime_unit_id, route.source_runtime_epoch);
-          const auto rebound_readiness =
-              core::rebind_runtime_participant_stop_readiness_product(
-                  *candidate.stop_readiness, predecessor_binding,
-                  rebound.value(), expected_domain.sealed());
-          ASSERT_TRUE(rebound_readiness.ok()) << rebound_readiness.error().message;
-          candidate.stop_readiness = rebound_readiness.value();
-        }
-        candidate.binding = rebound.value();
-      }
-
-      const core::ConfigurationFenceId fence_id(
-          "retained-route-generation.reseal.apply");
-      const core::ConfigurationFenceScopeDTO scope{};
-      admission_gate.RestoreFence(fence_id, scope);
-      const auto reseal = [&](
-          const core::RuntimeParticipantBinding &motion,
-          const std::optional<core::RuntimeParticipantBinding> &gripper,
-          const std::vector<core::RuntimeParticipantBinding> &representatives,
-          auto candidates) {
-        return reseal_retained_native_runtime_for_apply(
-            *runtime,
-            RetainedNativeRuntimeResealInput{
-                motion, gripper, {}, {},
-                representatives, std::move(candidates), {}, nullptr,
-                runtime->reference_resolver, fence_id, scope, admission_gate});
-      };
-      const auto unreconciled_candidate =
-          reseal(generation_one_motion, generation_one_gripper,
-                 generation_one_representatives, generation_one_registrations);
-      ASSERT_FALSE(unreconciled_candidate.ok());
-      EXPECT_EQ(unreconciled_candidate.error().details.at("reason"),
-                "native_product_reseal_physical_identity_changed");
-
-      const auto accepted =
-          reseal(candidate_motion.value(), candidate_gripper.value(),
-                 candidate_representatives, candidate_registrations);
-      ASSERT_TRUE(accepted.ok()) << accepted.error().message;
-      EXPECT_EQ(runtime->motion_binding.value(), candidate_motion.value().value());
-      ASSERT_TRUE(runtime->gripper_binding.has_value());
-      EXPECT_EQ(runtime->gripper_binding->value(), candidate_gripper.value().value());
-      ASSERT_TRUE(runtime->motion_binding.value().control_path
-                      ->runtime_scale_qualification.has_value());
-      EXPECT_EQ(*runtime->motion_binding.value().control_path
-                     ->runtime_scale_qualification,
-                *generation_one_motion.value().control_path
-                     ->runtime_scale_qualification);
-      return;
-    }
-    if (check == Lite6AggregateCheck::kResolverRebuildFailures) {
-      auto *kernel = runtime->active_addressed_kernel();
-      ASSERT_TRUE(kernel->SetRouteRecoveryPending(true).ok());
-      const auto physical_before = runtime->motion_binding.value();
-      const auto channel_before =
-          runtime->motion_state_channel->binding().value();
-      const auto factory_before = runtime->participant_resolver_factory;
-      const auto resolver_before = runtime->participant_resolver;
-      const auto actual_rebind = runtime->rebind_motion_route;
-      std::size_t rebind_count = 0U;
-      runtime->rebind_motion_route = [&](auto binding, auto aliases) {
-        ++rebind_count;
-        return actual_rebind(std::move(binding), std::move(aliases));
-      };
-      const auto successor = make_configuration(
-          runtime->motion_binding,
-          core::ActiveControlConfigurationGeneration(
-              initial.active_control_configuration_generation.value() + 1U));
-      const auto successor_ready = ready(successor);
-      ASSERT_TRUE(successor_ready.ok()) << successor_ready.error().message;
-      struct Expected final {
-        const char *failed_reason;
-        const char *failed_message;
-        const char *missing_reason;
-        const char *missing_message;
-        const char *thrown_reason;
-      };
-      const Expected expected[]{
-          {"route_publication_resolver_factory_failed",
-           "native participant resolver factory returned no resolver",
-           "route_publication_resolver_factory_missing",
-           "dynamic native participant resolution cannot retain stale physical "
-           "facts",
-           "route_publication_native_composition_failed"},
-          {"component_readiness_resolver_factory_failed",
-           "native participant resolver factory returned no resolver",
-           "component_readiness_resolver_factory_missing",
-           "dynamic native participant resolution cannot retain stale "
-           "readiness",
-           "component_readiness_native_composition_failed"},
-          {"route_predecessor_resolver_factory_failed",
-           "native predecessor resolver factory returned no resolver",
-           "route_predecessor_resolver_factory_missing",
-           "native predecessor adoption cannot retain a stale resolver",
-           "route_predecessor_adoption_failed"}};
-      for (int purpose = 0; purpose < 3; ++purpose) {
-        for (int failure = 0; failure < 3; ++failure) {
-          SCOPED_TRACE(purpose);
-          SCOPED_TRACE(failure);
-          std::size_t factory_calls = 0U;
-          // Presence of the installed resolver is what makes losing a factory
-          // an error. This sentinel must never resolve or dispatch an
-          // operation.
-          runtime->participant_resolver = [](const auto &, std::size_t) {
-            ADD_FAILURE() << "failed rebuild used the installed resolver";
-            return core::Result<core::RuntimeParticipantExecutionRegistration>::
-                Err(core::ErrorCode::kInternalError);
-          };
-          runtime->participant_resolver_factory =
-              failure == 1
-                  ? RetainedRuntimeParticipantResolverFactory{}
-                  : RetainedRuntimeParticipantResolverFactory{[&](auto) {
-                      ++factory_calls;
-                      if (failure == 2)
-                        throw std::runtime_error("factory throw witness");
-                      return RetainedRuntimeParticipantResolver{};
-                    }};
-          const auto expect_refusal = [&](const auto &result) {
-            ASSERT_FALSE(result.ok());
-            EXPECT_EQ(result.error().code,
-                      core::to_string(core::ErrorCode::kInvariantViolation));
-            EXPECT_EQ(result.error().details.at("reason"),
-                      failure == 0   ? expected[purpose].failed_reason
-                      : failure == 1 ? expected[purpose].missing_reason
-                                     : expected[purpose].thrown_reason);
-            EXPECT_EQ(result.error().message,
-                      failure == 0   ? expected[purpose].failed_message
-                      : failure == 1 ? expected[purpose].missing_message
-                                     : "factory throw witness");
-          };
-          if (purpose == 0) {
-            expect_refusal(runtime->PublishAndReadBackRouteConfiguration(
-                successor, successor_ready.value()));
-          } else if (purpose == 1) {
-            expect_refusal(runtime->PublishComponentCommandReadiness(
-                {core::ComponentReadinessAuthorityDTO::kRestartExclusion,
-                 {},
-                 {},
-                 component_id,
-                 core::ComponentLifecycleGeneration(2U),
-                 false}));
-          } else {
-            expect_refusal(
-                runtime->AdoptAndReadBackRouteConfigurationPredecessor(
-                    initial));
-          }
-          EXPECT_EQ(factory_calls, failure == 1 ? 0U : 1U);
-          EXPECT_EQ(rebind_count, 0U);
-          EXPECT_EQ(runtime->motion_binding.value(), physical_before);
-          EXPECT_EQ(runtime->motion_state_channel->binding().value(),
-                    channel_before);
-          const auto readback = kernel->runtime_route_configuration_readback(
-              initial.control_domain_id,
-              initial.active_control_configuration_id,
-              initial.active_control_configuration_generation);
-          ASSERT_TRUE(readback.ok());
-          EXPECT_EQ(readback.value(), installed.value());
-        }
-      }
-      runtime->participant_resolver_factory = factory_before;
-      runtime->participant_resolver = resolver_before;
-      runtime->rebind_motion_route = actual_rebind;
-      return;
-    }
-    if (check == Lite6AggregateCheck::kStopResponseFollowsRouteRebind) {
-      // The composition keeps this construction-time copy as its
-      // direct-control binding and composes its first resolver from it.
-      const auto composed = runtime->CurrentPhysicalBindings();
-      ASSERT_EQ(composed.size(), 2U);
-      ASSERT_EQ(composed.front().value(), runtime->motion_binding.value());
-      ASSERT_EQ(composed.back().value(), runtime->gripper_binding->value());
-      const auto composed_resolver =
-          std::make_shared<ProductBackedRuntimeParticipantResolver>(
-              package_root, materialized.bundle, model_map, composed,
-              std::vector<core::ProgramBindingId>{});
-      const auto outside = [](const auto &reply) {
-        return !reply.ok() && reply.error().code == "invalid_request" &&
-               reply.error().message ==
-                   "Stop metadata is outside the exact composed binding";
-      };
-      const auto route_of = [](const deployment::CanonicalValue &value) {
-        const auto *route = value.find_object_member("control_route_id");
-        return route != nullptr ? route->as_string() : std::string{};
-      };
-      // Without a rebind the current rows are the composed rows.
-      const auto before =
-          composed_resolver->ReadQualifiedStopResponse(composed.front(), composed);
-      ASSERT_TRUE(before.ok()) << before.error().message;
-      EXPECT_EQ(route_of(before.value()),
-                composed.front().value().control_path->control_route_id.value());
-
-      // Route publication rebinds the runtime to a successor generation.
-      runtime->prepare_measured_sources = [](const auto &, const auto &, const auto &) {
-        return core::Result<std::shared_ptr<const RetainedPreparedRobotMeasuredSources>>::Ok(nullptr);
-      };
-      const auto successor = make_configuration(runtime->motion_binding,
-          core::ActiveControlConfigurationGeneration(
-              initial.active_control_configuration_generation.value() + 1U));
-      auto successor_ready = ready(successor);
-      ASSERT_TRUE(successor_ready.ok()) << successor_ready.error().message;
-      const auto published = runtime->PublishAndReadBackRouteConfiguration(
-          successor, successor_ready.value());
-      ASSERT_TRUE(published.ok()) << published.error().message;
-      const auto current = runtime->CurrentPhysicalBindings();
-      ASSERT_EQ(current.size(), composed.size());
-      ASSERT_EQ(current.front().value(), runtime->motion_binding.value());
-      EXPECT_EQ(current.front()
-                    .value()
-                    .control_path->active_control_configuration_generation,
-                successor.active_control_configuration_generation);
-      // Only the control path moved; the target identity is unchanged.
-      ASSERT_NE(current.front().value(), composed.front().value());
-      EXPECT_EQ(current.front().value().command_target_id,
-                composed.front().value().command_target_id);
-      EXPECT_EQ(current.front().value().capability_id,
-                composed.front().value().capability_id);
-      EXPECT_EQ(current.front().value().resources,
-                composed.front().value().resources);
-
-      // A Program-only Apply recomposes the resolver from current
-      // registrations; the stale composition copy is then outside it.
-      std::vector<core::RuntimeParticipantBinding> registered;
-      for (const auto &row : runtime->participant_registrations)
-        registered.push_back(row.binding);
-      const auto recomposed =
-          composed_resolver->WithComposedParticipants(std::move(registered));
-      EXPECT_TRUE(outside(
-          recomposed->ReadQualifiedStopResponse(composed.front(), current)));
-      // The current runtime binding is readable whether or not the resolver
-      // was recomposed after the rebind.
-      for (const auto *resolver : {composed_resolver.get(), recomposed.get()}) {
-        const auto reply =
-            resolver->ReadQualifiedStopResponse(current.front(), current);
-        ASSERT_TRUE(reply.ok()) << reply.error().message;
-        EXPECT_EQ(route_of(reply.value()),
-                  current.front().value().control_path->control_route_id.value());
-      }
-      // Exact identity stays mandatory: a binding off the current rows, or
-      // no current rows at all, is refused.
-      auto foreign = current.front().value();
-      foreign.control_path->active_control_configuration_generation =
-          core::ActiveControlConfigurationGeneration(
-              successor.active_control_configuration_generation.value() + 7U);
-      const auto foreign_binding =
-          core::verify_runtime_participant_binding(std::move(foreign));
-      ASSERT_TRUE(foreign_binding.ok()) << foreign_binding.error().message;
-      EXPECT_TRUE(outside(recomposed->ReadQualifiedStopResponse(
-          foreign_binding.value(), current)));
-      EXPECT_TRUE(outside(
-          recomposed->ReadQualifiedStopResponse(current.front(), {})));
-
-      // A later activation after the recomposition moves the runtime again;
-      // the recomposed resolver's rows are now stale but the read follows.
-      const auto later = make_configuration(runtime->motion_binding,
-          core::ActiveControlConfigurationGeneration(
-              successor.active_control_configuration_generation.value() + 1U));
-      auto later_ready = ready(later);
-      ASSERT_TRUE(later_ready.ok()) << later_ready.error().message;
-      const auto republished = runtime->PublishAndReadBackRouteConfiguration(
-          later, later_ready.value());
-      ASSERT_TRUE(republished.ok()) << republished.error().message;
-      const auto latest = runtime->CurrentPhysicalBindings();
-      ASSERT_EQ(latest.size(), composed.size());
-      EXPECT_EQ(latest.front()
-                    .value()
-                    .control_path->active_control_configuration_generation,
-                later.active_control_configuration_generation);
-      ASSERT_NE(latest.front().value(), current.front().value());
-      EXPECT_TRUE(outside(
-          recomposed->ReadQualifiedStopResponse(current.front(), latest)));
-      for (const auto *resolver : {composed_resolver.get(), recomposed.get()}) {
-        const auto reply =
-            resolver->ReadQualifiedStopResponse(latest.front(), latest);
-        ASSERT_TRUE(reply.ok()) << reply.error().message;
-        EXPECT_EQ(route_of(reply.value()),
-                  latest.front().value().control_path->control_route_id.value());
-      }
-      return;
-    }
-    assert_budget();
-    const auto absent =
-        runtime->active_addressed_kernel()->current_runtime_route_configuration(
-            runtime->gripper_binding->value().control_path->control_domain_id);
-    ASSERT_TRUE(absent.ok());
-    ASSERT_FALSE(absent.value());
-    const auto actual_rebind = runtime->rebind_motion_route;
-    runtime->rebind_motion_route = [&, actual_rebind](auto binding, auto aliases) {
-      ++rebinds;
-      return actual_rebind(std::move(binding), std::move(aliases));
-    };
-    auto successor = make_configuration(runtime->motion_binding,
-        core::ActiveControlConfigurationGeneration(initial.active_control_configuration_generation.value() + 1U));
-    auto successor_ready = ready(successor);
-    ASSERT_TRUE(successor_ready.ok()) << successor_ready.error().message;
-    const auto physical_before = runtime->motion_binding.value();
-    const auto channel_before = runtime->motion_state_channel->binding().value();
-    using PreparedResult = core::Result<std::shared_ptr<const RetainedPreparedRobotMeasuredSources>>;
-    if (check != Lite6AggregateCheck::kMeasuredPublication) {
-      const auto other = make_configuration(*runtime->gripper_binding,
-          runtime->gripper_binding->value().control_path->active_control_configuration_generation);
-      auto other_ready = ready(other);
-      ASSERT_TRUE(other_ready.ok()) << other_ready.error().message;
-      bool outer = true;
-      runtime->prepare_measured_sources = [&](const auto &motion, const auto &, const auto &) {
-        if (!outer) return PreparedResult::Ok(nullptr);
-        outer = false;
-        const auto nested = runtime->PublishAndReadBackRouteConfiguration(other, other_ready.value());
-        EXPECT_TRUE(nested.ok()) << (nested.ok() ? "" : nested.error().message);
-        if (check == Lite6AggregateCheck::kMeasuredNullOptionalDomainRace)
-          return PreparedResult::Ok(nullptr);
-        return PreparedResult::Ok(std::make_shared<RetainedPreparedRobotMeasuredSources>(
-            RetainedPreparedRobotMeasuredSources{{motion.value().controllable_component_id, {}}, [&] { ++enabled; }}));
-      };
-      const auto raced = runtime->PublishAndReadBackRouteConfiguration(successor, successor_ready.value());
-      ASSERT_FALSE(raced.ok());
-      EXPECT_EQ(raced.error().details.at("reason"), "measured_source_association_changed");
-      EXPECT_EQ(rebinds, 0U);
-      EXPECT_EQ(enabled, 0U);
-      EXPECT_EQ(runtime->motion_binding.value(), physical_before);
-      const auto still_current =
-          runtime->active_addressed_kernel()
-              ->current_runtime_route_configuration(initial.control_domain_id);
-      ASSERT_TRUE(still_current.ok());
-      ASSERT_TRUE(still_current.value());
-      EXPECT_EQ(still_current.value()->active_configuration, initial);
-      const auto appeared =
-          runtime->active_addressed_kernel()
-              ->current_runtime_route_configuration(other.control_domain_id);
-      ASSERT_TRUE(appeared.ok());
-      ASSERT_TRUE(appeared.value());
-      EXPECT_EQ(appeared.value()->active_configuration, other);
-      return;
-    }
-    runtime->prepare_measured_sources = [&](const auto &, const auto &, const auto &) {
-      EXPECT_EQ(runtime->motion_binding.value(), physical_before);
-      EXPECT_EQ(runtime->motion_state_channel->binding().value(), channel_before);
-      EXPECT_EQ(rebinds, 0U);
-      return PreparedResult::Err({"test_association_invalid", "exact source association refused", {}});
-    };
-    const auto rejected = runtime->PublishAndReadBackRouteConfiguration(successor, successor_ready.value());
-    ASSERT_FALSE(rejected.ok());
-    EXPECT_EQ(rejected.error().code, "test_association_invalid");
-    EXPECT_EQ(rebinds, 0U);
-    EXPECT_EQ(runtime->motion_binding.value(), physical_before);
-    EXPECT_EQ(runtime->motion_state_channel->binding().value(), channel_before);
-    const auto failed_readback =
-        runtime->active_addressed_kernel()->current_runtime_route_configuration(
-            initial.control_domain_id);
-    ASSERT_TRUE(failed_readback.ok());
-    ASSERT_TRUE(failed_readback.value());
-    EXPECT_EQ(failed_readback.value()->active_configuration, initial);
-    struct ProducerLease final {
-      std::function<void()> retire;
-      ~ProducerLease() { retire(); }
-    };
-    std::weak_ptr<const RetainedPreparedRobotMeasuredSources> committed;
-    runtime->prepare_measured_sources = [&](const auto &motion, const auto &, const auto &configurations) {
-      EXPECT_EQ(runtime->motion_binding.value(), physical_before);
-      EXPECT_EQ(runtime->motion_state_channel->binding().value(), channel_before);
-      EXPECT_EQ(rebinds, 0U);
-      EXPECT_EQ(configurations.size(), 1U); // the genuinely absent tool domain stays absent
-      auto lease = std::make_shared<ProducerLease>();
-      lease->retire = [&, weak_runtime = std::weak_ptr<RetainedNativeRuntime>(runtime)] {
-        ++retired;
-        auto live = weak_runtime.lock();
-        if (!live) return;
-        // Reenter the actual route exclusion after retirement. The configured
-        // nil preparer has no side effects and cannot recursively own a lease.
-        const auto unavailable = live->PrepareCurrentMeasuredSources();
-        EXPECT_FALSE(unavailable.ok());
-        if (!unavailable.ok()) {
-          EXPECT_EQ(unavailable.error().details.at("reason"), "measured_prepared_sources_missing");
-        }
-        ++reentrant_reads;
-      };
-      auto prepared = std::make_shared<RetainedPreparedRobotMeasuredSources>(
-          RetainedPreparedRobotMeasuredSources{{motion.value().controllable_component_id, {}},
-              [&, lease, successor] {
-                ++enabled;
-                const auto current = runtime->active_addressed_kernel()
-                                         ->current_runtime_route_configuration(
-                                             successor.control_domain_id);
-                EXPECT_TRUE(current.ok());
-                if (current.ok() && current.value())
-                  EXPECT_EQ(current.value()->active_configuration, successor);
-                else ADD_FAILURE() << "Enable preceded exact Kernel publication";
-                EXPECT_EQ(runtime->motion_binding.value().control_path->active_control_configuration_generation,
-                          successor.active_control_configuration_generation);
-              }});
-      committed = prepared;
-      return PreparedResult::Ok(prepared);
-    };
-    const auto published = runtime->PublishAndReadBackRouteConfiguration(successor, successor_ready.value());
-    ASSERT_TRUE(published.ok()) << published.error().message;
-    EXPECT_EQ(published.value().active_configuration, successor);
-    assert_budget();
-    EXPECT_EQ(enabled, 1U);
-    EXPECT_EQ(rebinds, 1U);
-    EXPECT_FALSE(committed.expired());
-    EXPECT_EQ(retired, 0U);
-    runtime->prepare_measured_sources = [](const auto &, const auto &, const auto &) { return PreparedResult::Ok(nullptr); };
-    auto nil_configuration = make_configuration(runtime->motion_binding,
-        core::ActiveControlConfigurationGeneration(successor.active_control_configuration_generation.value() + 1U));
-    auto nil_ready = ready(nil_configuration);
-    ASSERT_TRUE(nil_ready.ok()) << nil_ready.error().message;
-    const auto nil_published = runtime->PublishAndReadBackRouteConfiguration(nil_configuration, nil_ready.value());
-    ASSERT_TRUE(nil_published.ok()) << nil_published.error().message;
-    EXPECT_EQ(nil_published.value().active_configuration, nil_configuration);
-    EXPECT_EQ(runtime->motion_state_channel->binding().value(), runtime->motion_binding.value());
-    EXPECT_EQ(enabled, 1U);
-    EXPECT_EQ(rebinds, 2U);
-    EXPECT_TRUE(committed.expired());
-    EXPECT_EQ(retired, 1U);
-    EXPECT_EQ(reentrant_reads, 1U);
-    assert_budget();
-    if (moving_budget_check) {
-      ASSERT_TRUE(
-          budget_cell->addressed_kernel().SetRouteRecoveryPending(true).ok());
-      const auto readiness = runtime->PublishComponentCommandReadiness(
-          {core::ComponentReadinessAuthorityDTO::kRestartExclusion,
-           std::nullopt, std::nullopt, component_id,
-           core::ComponentLifecycleGeneration(2U), false});
-      ASSERT_TRUE(readiness.ok()) << readiness.error().message;
-      assert_budget();
-    }
-    return;
-  }
-  if (check == Lite6AggregateCheck::kSameRoutePredecessorQualification ||
-      check == Lite6AggregateCheck::kNarrowAliasAtRouteRebind ||
-      check == Lite6AggregateCheck::kForeignFrameAtRouteRebind) {
-    const auto before = runtime->motion_binding;
-    const bool narrow_check = check == Lite6AggregateCheck::kNarrowAliasAtRouteRebind ||
-                              check == Lite6AggregateCheck::kForeignFrameAtRouteRebind;
-    if (narrow_check) {
-      ASSERT_EQ(runtime->motion_binding_aliases.size(), 1U);
-      ASSERT_LT(runtime->motion_binding_aliases.front().value().frame_bindings.size(),
-                before.value().frame_bindings.size());
-    }
-    const auto &path = *before.value().control_path;
-    ASSERT_TRUE(path.runtime_scale_qualification.has_value());
-    const auto qualification = *path.runtime_scale_qualification;
-    const auto execution = runtime->execution;
-    const auto channel = runtime->motion_state_channel;
-    core::ActiveControlConfigurationDTO predecessor{
-        path.active_control_configuration_id,
-        path.control_domain_id,
-        path.control_domain_revision,
-        {{path.control_binding_id, path.control_binding_revision,
-          path.control_route_id}},
-        path.activation_set_id,
-        path.controller_topology_id,
-        path.topology_revision,
-        path.provider_runtime_unit_id,
-        path.provider_runtime_epoch,
-        1,
-        {},
-        path.active_control_configuration_generation,
-        core::ActiveControlConfigurationStateDTO::kReconciled};
-    for (const auto &resource : before.value().resources) {
-      predecessor.kinematic_resource_source_projections.push_back(
-          {resource.resource_id,
-           {{path.control_binding_id, path.control_binding_revision}},
-           path.provider_instance_id, path.provider_manifest_id,
-           path.provider_manifest_revision, path.state_authority_id,
-           path.state_authority_class,
-           channel->source_kind()});
-    }
-    ASSERT_TRUE(runtime->addressed_kernel->SetRouteRecoveryPending(true).ok());
-    auto foreign = predecessor;
-    foreign.binding_routes.front().control_binding_revision =
-        core::ControlBindingRevision("foreign-binding-revision");
-    EXPECT_FALSE(runtime->AdoptAndReadBackRouteConfigurationPredecessor(foreign).ok());
-    EXPECT_EQ(runtime->motion_binding.value(), before.value());
-    EXPECT_EQ(channel->binding().value(), before.value());
-    if (check == Lite6AggregateCheck::kForeignFrameAtRouteRebind) {
-      // Inject the already sealed invalid view to exercise rebind's guard;
-      // normal startup refuses it before a runtime can retain it.
-      ASSERT_FALSE(arm_binding.value().frame_bindings.empty());
-      auto foreign_frame_alias = foreign_frame_binding();
-      ASSERT_TRUE(foreign_frame_alias.ok()) << foreign_frame_alias.error().message;
-      runtime->motion_binding_aliases.push_back(foreign_frame_alias.value());
-      const auto rejected =
-          runtime->AdoptAndReadBackRouteConfigurationPredecessor(predecessor);
-      ASSERT_FALSE(rejected.ok());
-      EXPECT_EQ(rejected.error().code,
-                core::to_string(core::ErrorCode::kInvariantViolation));
-      EXPECT_EQ(rejected.error().details.at("reason"),
-                "route_publication_alias_crosses_physical_owner");
-      EXPECT_EQ(runtime->motion_binding.value(), before.value());
-      EXPECT_EQ(channel->binding().value(), before.value());
-      runtime->motion_binding_aliases.pop_back();
-    }
-    const auto adopted =
-        runtime->AdoptAndReadBackRouteConfigurationPredecessor(predecessor);
-    ASSERT_TRUE(adopted.ok()) << adopted.error().message;
-    if (narrow_check) {
-      ASSERT_EQ(runtime->motion_binding_aliases.size(), 1U);
-      EXPECT_EQ(runtime->motion_binding_aliases.front().value().program_binding_id,
-                core::ProgramBindingId("narrow-program-binding"));
-      EXPECT_LT(runtime->motion_binding_aliases.front().value().frame_bindings.size(),
-                runtime->motion_binding.value().frame_bindings.size());
-      EXPECT_EQ(runtime->motion_binding_aliases.front().value().control_path,
-                runtime->motion_binding.value().control_path);
-    }
-    EXPECT_EQ(adopted.value().active_configuration, predecessor);
-    EXPECT_FALSE(adopted.value().operation_admission_open);
-    EXPECT_TRUE(adopted.value().readiness_rows.empty());
-    ASSERT_TRUE(runtime->motion_binding.value().control_path->runtime_scale_qualification);
-    EXPECT_EQ(*runtime->motion_binding.value().control_path->runtime_scale_qualification,
-              qualification);
-    EXPECT_EQ(runtime->motion_binding.value(), before.value());
-    EXPECT_EQ(channel->binding().value(), before.value());
-    EXPECT_EQ(runtime->execution, execution);
-    EXPECT_EQ(runtime->motion_state_channel, channel);
     return;
   }
   if (reseal_capability_inventory) {
-    ASSERT_EQ(runtime->control_binding_representatives.size(), 3U);
-    ASSERT_EQ(runtime->participant_registrations.size(), 3U);
+    ASSERT_EQ(runtime->control_binding_representatives.size(), 2U);
+    ASSERT_EQ(runtime->participant_registrations.size(), 2U);
     const auto motion_engine = runtime->participant_engine;
-    const auto gripper_engine = runtime->gripper_participant_engine;
     const auto motion_channel = runtime->motion_state_channel;
-    const auto gripper_channel = runtime->gripper_state_channel;
     const auto registrations = runtime->participant_registrations;
     const auto secondary = std::find_if(
         registrations.begin(), registrations.end(), [](const auto &row) {
@@ -6634,17 +4726,17 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
     const core::ConfigurationFenceScopeDTO scope{};
     admission_gate.RestoreFence(fence_id, scope);
     const auto reseal = [&](auto candidate_registrations) {
-      return reseal_retained_native_runtime_for_apply(
+      return reseal_retained_execution_host_for_apply(
           *runtime,
-          RetainedNativeRuntimeResealInput{
-              arm_binding, gripper_binding, {}, {},
+          RetainedExecutionHostResealInput{
+              arm_binding, {},
               runtime->control_binding_representatives,
               std::move(candidate_registrations), {}, nullptr,
               runtime->reference_resolver, fence_id, scope, admission_gate});
     };
 
     auto changed_engine = registrations;
-    changed_engine[secondary_index].engine = runtime->participant_engine_for(false);
+    changed_engine[secondary_index].engine = nullptr;
     const auto bad_candidate = reseal(std::move(changed_engine));
     ASSERT_FALSE(bad_candidate.ok());
     EXPECT_EQ(bad_candidate.error().details.at("reason"),
@@ -6660,11 +4752,8 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
     const auto accepted = reseal(registrations);
     ASSERT_TRUE(accepted.ok()) << accepted.error().message;
     EXPECT_EQ(runtime->participant_engine, motion_engine);
-    EXPECT_EQ(runtime->gripper_participant_engine, gripper_engine);
     EXPECT_EQ(runtime->motion_state_channel, motion_channel);
-    EXPECT_EQ(runtime->gripper_state_channel, gripper_channel);
     EXPECT_EQ(runtime->motion_binding.value(), arm_binding.value());
-    EXPECT_EQ(runtime->gripper_binding->value(), gripper_binding.value());
     ASSERT_EQ(runtime->participant_registrations.size(), registrations.size());
     for (std::size_t index = 0U; index < registrations.size(); ++index) {
       const auto &current = runtime->participant_registrations[index];
@@ -6686,20 +4775,20 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
   if (authored_fault_check) {
     auto expected_fault = authored_fault;
     expected_fault.per_joint_max_deceleration = expected_arm_fault_limits;
-    if (check == Lite6AggregateCheck::kDeploymentFaultStopProfileWithExtraJoints ||
-        check == Lite6AggregateCheck::kDeploymentFaultStopProfileWithOnlyExtraSettleOverrides ||
-        check == Lite6AggregateCheck::kDeploymentFaultStopProfileWithSparseSettleOverrides) {
+    if (check == Lite6MotionCheck::kDeploymentFaultStopProfileWithExtraJoints ||
+        check == Lite6MotionCheck::kDeploymentFaultStopProfileWithOnlyExtraSettleOverrides ||
+        check == Lite6MotionCheck::kDeploymentFaultStopProfileWithSparseSettleOverrides) {
       expected_fault.per_joint_max_jerk.clear();
       for (const auto &resource : arm_binding.value().resources)
         expected_fault.per_joint_max_jerk.emplace(*resource.source_joint_name,
                                                  core::AngularJerkDTO{11.0});
-      if (check == Lite6AggregateCheck::kDeploymentFaultStopProfileWithExtraJoints) {
+      if (check == Lite6MotionCheck::kDeploymentFaultStopProfileWithExtraJoints) {
         expected_fault.per_joint_settle_velocity_threshold.emplace();
         expected_fault.per_joint_settle_velocity_threshold->clear();
         for (const auto &resource : arm_binding.value().resources)
           expected_fault.per_joint_settle_velocity_threshold->emplace(
               *resource.source_joint_name, core::AngularVelocityDTO{0.005});
-      } else if (check == Lite6AggregateCheck::kDeploymentFaultStopProfileWithSparseSettleOverrides) {
+      } else if (check == Lite6MotionCheck::kDeploymentFaultStopProfileWithSparseSettleOverrides) {
         expected_fault.per_joint_settle_velocity_threshold.emplace();
         expected_fault.per_joint_settle_velocity_threshold->clear();
         expected_fault.per_joint_settle_velocity_threshold->emplace(
@@ -6745,12 +4834,12 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
         motion_registration->stop_readiness->value().resolved_stop_base_plan, context,
         arm_binding.value().resources, motion_registration->retained_default_stop_limits);
     const bool missing =
-        check == Lite6AggregateCheck::kDeploymentFaultStopProfileMissingArmJoint ||
-        check == Lite6AggregateCheck::kDeploymentFaultStopProfileWithoutArmJoints;
+        check == Lite6MotionCheck::kDeploymentFaultStopProfileMissingArmJoint ||
+        check == Lite6MotionCheck::kDeploymentFaultStopProfileWithoutArmJoints;
     if (missing) {
       ASSERT_FALSE(plan.ok());
       EXPECT_EQ(plan.error().details.at("reason"),
-                check == Lite6AggregateCheck::kDeploymentFaultStopProfileMissingArmJoint
+                check == Lite6MotionCheck::kDeploymentFaultStopProfileMissingArmJoint
                     ? "motion_interrupt_stop_deceleration_coverage_mismatch"
                     : "soft_on_path/spring_back_hold requires a non-empty per_joint_max_deceleration");
     } else {
@@ -6797,7 +4886,6 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
   EXPECT_DOUBLE_EQ(
       *motion_registration->deployment_maximum_tcp_linear_speed_mps, 0.15);
   ASSERT_NE(runtime->motion_state_channel, nullptr);
-  ASSERT_NE(runtime->gripper_state_channel, nullptr);
   const auto initial_motion_state =
       runtime->motion_state_channel->current_controlled_state();
   ASSERT_TRUE(initial_motion_state.ok())
@@ -6830,20 +4918,13 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
   EXPECT_EQ(foreign_frame_resolver.error().details.at("reason"),
             "native_projection_active_frame_resolver_invalid");
   admission_gate.BindResourceTable(
-      runtime->addressed_kernel->resource_admission_table());
-  const auto physical_scope = make_runtime_fence_scope(
-      {&runtime->motion_binding, &*runtime->gripper_binding});
+      runtime->cell_addressed_kernel->resource_admission_table());
+  const auto physical_scope = make_runtime_fence_scope({&runtime->motion_binding});
   EXPECT_EQ(runtime->collision_publisher.get(), projection.get());
   const auto arm_context = runtime->motion_state_channel->query_context();
   EXPECT_TRUE(std::all_of(
       arm_context.coordinate_kinds.begin(), arm_context.coordinate_kinds.end(),
       [](const auto kind) { return kind == core::CoordinateKind::kAngular; }));
-  ASSERT_EQ(
-      runtime->gripper_state_channel->query_context().coordinate_kinds.size(),
-      1U);
-  EXPECT_EQ(
-      runtime->gripper_state_channel->query_context().coordinate_kinds.front(),
-      core::CoordinateKind::kLinear);
 
   const auto &motion_value = runtime->motion_binding.value();
   const auto joint_names = runtime->kinematic_model->group_joint_names(
@@ -6902,71 +4983,6 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
            0.0, std::vector<double>(joint_names.value().size(), 0.0), {}, {}},
        core::TrajectoryWaypointDTO{
            1.0, std::vector<double>(joint_names.value().size(), 0.0), {}, {}}}};
-#ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
-  if (check == Lite6AggregateCheck::kPneumaticCollisionProjection) {
-    // Exercise the real no-feedback backend through the retained commanded
-    // channel and ask the next collision expansion for the finger coordinate.
-    const auto &gripper_value = gripper_binding.value();
-    ASSERT_EQ(gripper_value.resources.size(), 1U);
-    ASSERT_FALSE(gripper_value.model_groups.empty());
-    const auto group = gripper_value.model_groups.front().compiled_group_name;
-    const auto joint = gripper_value.resources.front().compiled_resource_name;
-    const auto now = runtime->clock->now();
-    ASSERT_TRUE(runtime->gripper_state_channel
-                    ->publish_and_project(std::vector<double>{0.004},
-                                          std::vector<double>{0.0}, now, now)
-                    .applied());
-    const auto before = runtime->kinematic_model->expand_for_collision(
-        stationary_trajectory, zero_arm_state);
-    ASSERT_TRUE(before.ok()) << before.error().message;
-    const auto before_finger = std::find(before.value().joint_names.begin(),
-                                         before.value().joint_names.end(), joint);
-    ASSERT_NE(before_finger, before.value().joint_names.end());
-    EXPECT_NEAR(before.value().waypoints.front().positions_rad[
-                    static_cast<std::size_t>(before_finger -
-                                             before.value().joint_names.begin())],
-                0.004, 1e-12);
-    auto sink = std::make_shared<RetainedExecutionStateSink>(
-        *runtime->clock, std::vector<RetainedExecutionStateSinkBinding>{
-                             {group, runtime->gripper_state_channel, true}});
-    ros2_control_execution::Ros2TransportResources resources(
-        "pneumatic_collision_projection", "/", 1U, sink, "arm",
-        *runtime->clock);
-    ros2_control_execution::Ros2GripperCommandBackend backend(
-        resources, sink, *runtime->clock, *runtime->scheduler, false);
-    ros2_control_execution::Ros2GripperActionConfig config;
-    config.actuation_kind = core::GripperActuationKind::kPneumatic;
-    config.output_mode = core::GripperOutputMode::kNone;
-    config.transport_kind.clear();
-    config.action_name.clear();
-    config.completion_policy = "no_output";
-    config.group_id = group;
-    config.joint_name = joint;
-    backend.configure_gripper_action("tool", config);
-    core::GripperCommandRequestDTO request;
-    request.gripper_id = "tool";
-    request.group_id = group;
-    request.joint_name = joint;
-    request.target_position = 0.0;
-    request.completion_policy = "no_output";
-    request.grasp_confirmation_policy = "not_required";
-    ASSERT_TRUE(backend.command_gripper(request).accepted);
-    ASSERT_EQ(backend.get_gripper_status("tool").state,
-              core::GripperCommandState::kCompleted);
-
-    const auto expanded = runtime->kinematic_model->expand_for_collision(
-        stationary_trajectory, zero_arm_state);
-    ASSERT_TRUE(expanded.ok()) << expanded.error().message;
-    const auto finger = std::find(expanded.value().joint_names.begin(),
-                                  expanded.value().joint_names.end(), joint);
-    ASSERT_NE(finger, expanded.value().joint_names.end());
-    const auto index = static_cast<std::size_t>(
-        finger - expanded.value().joint_names.begin());
-    EXPECT_NEAR(expanded.value().waypoints.front().positions_rad[index], 0.0,
-                1e-12);
-    return;
-  }
-#endif
   core::CollisionCancellationToken cancellation;
   const auto validation = runtime->kinematic_model->validate_non_collision(
       stationary_trajectory, core::ValidationOptionsDTO{0.0, {}, {}, false},
@@ -7024,52 +5040,46 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
   ASSERT_TRUE(measured_metrics.peak_tcp_linear_speed_mps.has_value());
   EXPECT_GT(*measured_metrics.peak_tcp_linear_speed_mps, 0.0);
   EXPECT_LE(*measured_metrics.peak_tcp_linear_speed_mps, 0.15);
-  EXPECT_FALSE(measured_metrics.peak_tcp_linear_speed_frame);
-  if (check == Lite6AggregateCheck::kMovingValidation) {
-    // tcp_speed_check over a frame set. The base link stands in for an
-    // active TCP that does not move; the moving TCP link stands in for the
-    // robot flange, so only the flange can exceed the limit.
-    const core::SpeedCheckFrameDTO still_tcp{base_frame.compiled_frame_name,
-                                             "tcp"};
-    const core::SpeedCheckFrameDTO moving_flange{tcp_frame.compiled_frame_name,
-                                                 "flange"};
-    const double flange_peak = *measured_metrics.peak_tcp_linear_speed_mps;
-    core::ValidationOptionsDTO tcp_only{flange_peak * 0.5,
-                                        base_frame.compiled_frame_name,
-                                        base_frame.compiled_frame_name, false};
-    tcp_only.speed_frames = {still_tcp};
-    const auto active_tcp = runtime->kinematic_model->validate_non_collision(
-        measured_trajectory, tcp_only, cancellation);
-    ASSERT_TRUE(active_tcp.valid)
-        << (active_tcp.error ? active_tcp.error->message : "");
-    EXPECT_DOUBLE_EQ(*active_tcp.trajectory_metrics->peak_tcp_linear_speed_mps,
-                     0.0);
-    EXPECT_EQ(active_tcp.trajectory_metrics->peak_tcp_linear_speed_frame,
+  EXPECT_EQ(measured_metrics.peak_tcp_linear_speed_frame,
+            tcp_frame.compiled_frame_name);
+  if (check == Lite6MotionCheck::kMovingValidation) {
+    // The limit holds at the active TCP alone. The base link stands in for
+    // an active TCP that does not move; the moving TCP link exceeds it.
+    const double moving_peak = *measured_metrics.peak_tcp_linear_speed_mps;
+    core::ValidationOptionsDTO still_tcp{moving_peak * 0.5,
+                                         base_frame.compiled_frame_name,
+                                         base_frame.compiled_frame_name, false};
+    still_tcp.tcp_frame_role_id = "tcp";
+    const auto still = runtime->kinematic_model->validate_non_collision(
+        measured_trajectory, still_tcp, cancellation);
+    ASSERT_TRUE(still.valid) << (still.error ? still.error->message : "");
+    EXPECT_DOUBLE_EQ(*still.trajectory_metrics->peak_tcp_linear_speed_mps, 0.0);
+    EXPECT_EQ(still.trajectory_metrics->peak_tcp_linear_speed_frame,
               base_frame.compiled_frame_name);
-    auto with_flange = tcp_only;
-    with_flange.speed_frames = {still_tcp, moving_flange};
+    auto moving_tcp = still_tcp;
+    moving_tcp.tcp_frame = tcp_frame.compiled_frame_name;
     const auto refused = runtime->kinematic_model->validate_non_collision(
-        measured_trajectory, with_flange, cancellation);
+        measured_trajectory, moving_tcp, cancellation);
     ASSERT_FALSE(refused.valid);
     ASSERT_TRUE(refused.error);
     EXPECT_EQ(refused.error->details.at("reason"),
               "tcp_linear_speed_limit_exceeded");
     EXPECT_EQ(refused.error->details.at("frame"),
               tcp_frame.compiled_frame_name);
-    EXPECT_EQ(refused.error->details.at("frame_role"), "flange");
+    EXPECT_EQ(refused.error->details.at("frame_role"), "tcp");
     EXPECT_EQ(refused.error->details.at("tcp_frame"),
-              base_frame.compiled_frame_name);
-    with_flange.max_tcp_linear_speed_mps = flange_peak * 2.0;
+              tcp_frame.compiled_frame_name);
+    moving_tcp.max_tcp_linear_speed_mps = moving_peak * 2.0;
     const auto accepted = runtime->kinematic_model->validate_non_collision(
-        measured_trajectory, with_flange, cancellation);
+        measured_trajectory, moving_tcp, cancellation);
     ASSERT_TRUE(accepted.valid)
         << (accepted.error ? accepted.error->message : "");
     EXPECT_DOUBLE_EQ(*accepted.trajectory_metrics->peak_tcp_linear_speed_mps,
-                     flange_peak);
+                     moving_peak);
     EXPECT_EQ(accepted.trajectory_metrics->peak_tcp_linear_speed_frame,
               tcp_frame.compiled_frame_name);
   }
-  if (check == Lite6AggregateCheck::kMovingValidation) {
+  if (check == Lite6MotionCheck::kMovingValidation) {
     core::ValidationOptionsDTO moving_options{
         1.0, tcp_frame.compiled_frame_name, base_frame.compiled_frame_name,
         false};
@@ -7156,23 +5166,21 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
               "tcp_linear_speed_limit_exceeded");
     EXPECT_EQ(refused_source.error->details.at("tcp_frame"),
               tcp_frame.compiled_frame_name);
-    // The retained prefix keeps its own frame set: a one-point source
-    // prefix, then a two-point future whose flange alone moves.
-    auto future_set = moving_options;
-    future_set.tcp_frame = base_frame.compiled_frame_name;
-    future_set.speed_frames = {
-        core::SpeedCheckFrameDTO{base_frame.compiled_frame_name, "tcp"}};
-    future_set.max_tcp_linear_speed_mps = 1e-6;
-    const auto still_future = validate(seam_trajectory, future_set);
+    // The retained prefix keeps the source's own TCP: a still future TCP
+    // passes a tiny limit; the moving one is refused, named with its role.
+    auto future_tcp = moving_options;
+    future_tcp.tcp_frame = base_frame.compiled_frame_name;
+    future_tcp.tcp_frame_role_id = "tcp";
+    future_tcp.max_tcp_linear_speed_mps = 1e-6;
+    const auto still_future = validate(seam_trajectory, future_tcp);
     ASSERT_TRUE(still_future.valid && still_future.moving_replacement)
         << (still_future.error ? still_future.error->message : "");
-    future_set.speed_frames.push_back(
-        core::SpeedCheckFrameDTO{tcp_frame.compiled_frame_name, "flange"});
-    const auto refused_future_flange = validate(seam_trajectory, future_set);
-    ASSERT_FALSE(refused_future_flange.valid);
-    ASSERT_TRUE(refused_future_flange.error);
-    EXPECT_EQ(refused_future_flange.error->details.at("frame_role"), "flange");
-    EXPECT_EQ(refused_future_flange.error->details.at("frame"),
+    future_tcp.tcp_frame = tcp_frame.compiled_frame_name;
+    const auto refused_moving_future = validate(seam_trajectory, future_tcp);
+    ASSERT_FALSE(refused_moving_future.valid);
+    ASSERT_TRUE(refused_moving_future.error);
+    EXPECT_EQ(refused_moving_future.error->details.at("frame_role"), "tcp");
+    EXPECT_EQ(refused_moving_future.error->details.at("frame"),
               tcp_frame.compiled_frame_name);
     auto future_too_slow = moving_options;
     future_too_slow.max_tcp_linear_speed_mps = 1e-6;
@@ -7260,17 +5268,11 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
             expanded.value().joint_names.size());
 
   const auto motion_accepted =
-      runtime->addressed_kernel->execute(make_motion_operation(
+      runtime->cell_addressed_kernel->execute(make_motion_operation(
           arm_binding, owner_epoch,
           inventory->projection_binding.projection_revision.scene_revision));
   ASSERT_FALSE(motion_accepted.ok());
   EXPECT_EQ(motion_accepted.error().details.at("reason"),
-            "runtime_route_publication_required");
-
-  const auto gripper_accepted = runtime->addressed_kernel->execute(
-      make_gripper_operation(gripper_binding, owner_epoch));
-  ASSERT_FALSE(gripper_accepted.ok());
-  EXPECT_EQ(gripper_accepted.error().details.at("reason"),
             "runtime_route_publication_required");
 
   const auto idle = admission_gate.Observe(physical_scope);
@@ -7278,24 +5280,22 @@ void check_selected_core_lite6_aggregate(const Lite6AggregateCheck check) {
   EXPECT_EQ(idle.affected_active_operation_count, 0U);
   EXPECT_EQ(runtime->participant_engine->get_metrics().executions_completed,
             0U);
-  if (check == Lite6AggregateCheck::kRefreshCellModel)
+  if (check == Lite6MotionCheck::kRefreshCellModel)
     check_refreshed_cell_model(*runtime, admission_gate, stage,
                                *materialized.bundle, model_map, retained,
-                               arm_binding, gripper_binding,
-                               tcp_frame.compiled_frame_name);
+                               arm_binding, tcp_frame.compiled_frame_name);
 }
 
 // The retained controller's whole-cell model changes around it: its root is
 // moved in the cell and a peer joint is added ahead of it, shifting every one
 // of its model coordinates. The controller's own model facts are unchanged.
 void check_refreshed_cell_model(
-    RetainedNativeRuntime &runtime, ManagedKernelAdmissionGate &admission_gate,
+    RetainedExecutionHost &runtime, ManagedKernelAdmissionGate &admission_gate,
     const RetainedPlanningModelStage &stage,
     const deployment::RetainedBundle &bundle,
     const deployment::VerifiedRetainedModelMap &model_map,
     const deployment::VerifiedRetainedPlanningModel &retained,
     const core::RuntimeParticipantBinding &arm_binding,
-    const core::RuntimeParticipantBinding &gripper_binding,
     const std::string &tcp_frame) {
   const std::string predecessor_urdf(stage.loader_urdf_bytes());
   const std::string srdf(stage.srdf_bytes());
@@ -7354,9 +5354,9 @@ void check_refreshed_cell_model(
   };
   const auto candidate_limits =
       limits_of(with_peer(moved_root(retained_urdf)));
-  const std::vector<core::RuntimeParticipantBinding> both{arm_binding,
-                                                          gripper_binding};
-  const auto candidate = make_candidate(candidate_urdf, candidate_limits, both);
+  const std::vector<core::RuntimeParticipantBinding> projected{arm_binding};
+  const auto candidate =
+      make_candidate(candidate_urdf, candidate_limits, projected);
 
   const auto predecessor = runtime.kinematic_model->current_generation();
   const auto predecessor_projector =
@@ -7373,7 +5373,7 @@ void check_refreshed_cell_model(
       core::FkRequestDTO{zero_state, tcp_frame, ""});
   ASSERT_TRUE(world_tcp_before.ok()) << world_tcp_before.error().message;
 
-  // ur5e_lite6_wall_grouped (TCP-C): a mounted tool's second TCP is an
+  // mock_dual_arm_shared_group (TCP-C): a mounted tool's second TCP is an
   // owner-issued planner frame outside the arm binding. FK of it failed the
   // whole control-state read until the owner passes it to the kinematics.
   {
@@ -7383,7 +5383,7 @@ void check_refreshed_cell_model(
     EXPECT_EQ(refused.error().details.at("reason"),
               "retained_fk_binding_mismatch");
     const auto permitted =
-        make_candidate(candidate_urdf, candidate_limits, both, {"peer_link"});
+        make_candidate(candidate_urdf, candidate_limits, projected, {"peer_link"});
     const auto allowed = permitted->kinematics->forward_kinematics(tool_frame);
     EXPECT_TRUE(allowed.ok()) << allowed.error().message;
   }
@@ -7391,8 +5391,8 @@ void check_refreshed_cell_model(
   const core::ConfigurationFenceId fence_id("cell-model.refresh.apply");
   const core::ConfigurationFenceScopeDTO scope{};
   const auto refresh = [&](auto generation) {
-    return refresh_retained_native_runtime_model_for_apply(
-        runtime, RetainedNativeRuntimeModelRefreshInput{
+    return refresh_retained_execution_host_model_for_apply(
+        runtime, RetainedExecutionHostModelRefreshInput{
                      std::move(generation), fence_id, scope, admission_gate});
   };
   const auto unfenced = refresh(candidate);
@@ -7408,7 +5408,8 @@ void check_refreshed_cell_model(
   for (auto &row : slower_limits)
     if (row.joint_name == joint_names.value().front())
       row.maximum_velocity = {1.0};
-  const auto changed = refresh(make_candidate(candidate_urdf, slower_limits, both));
+  const auto changed =
+      refresh(make_candidate(candidate_urdf, slower_limits, projected));
   ASSERT_FALSE(changed.ok());
   EXPECT_EQ(changed.error().details.at("reason"),
             "native_model_refresh_controller_model_changed");
@@ -7420,8 +5421,6 @@ void check_refreshed_cell_model(
   ASSERT_TRUE(refreshed.ok()) << refreshed.error().message;
   EXPECT_EQ(runtime.kinematic_model->current_generation(), candidate);
   EXPECT_EQ(runtime.motion_state_channel->kinematic_projector(),
-            candidate->state_projector);
-  EXPECT_EQ(runtime.gripper_state_channel->kinematic_projector(),
             candidate->state_projector);
   EXPECT_TRUE(admission_gate.exact_fence_is_held(fence_id, scope));
 
@@ -7437,16 +5436,12 @@ void check_refreshed_cell_model(
                   world_tcp_before.value().position_m.z_m, 0.1, 1e-9);
 
   // Observations project into the candidate scene at the candidate's own
-  // coordinate indices: the arm and the model-backed gripper.
+  // coordinate indices.
   const std::vector<double> arm_positions{0.1, -0.2, 1.2, 0.3, -0.4, 0.5};
   const auto now = runtime.clock->now();
   ASSERT_TRUE(runtime.motion_state_channel
                   ->publish_and_project(arm_positions,
                                         std::vector<double>(6U, 0.0), now, now)
-                  .applied());
-  ASSERT_TRUE(runtime.gripper_state_channel
-                  ->publish_and_project(std::vector<double>{0.004},
-                                        std::vector<double>{0.0}, now, now)
                   .applied());
   const auto arm_context = runtime.motion_state_channel->query_context();
   const auto arm_state = candidate->state_projector->current_state(
@@ -7456,14 +5451,6 @@ void check_refreshed_cell_model(
     EXPECT_DOUBLE_EQ(std::get<core::AngularPositionDTO>(
                          arm_state.value().positions[index]).value_rad,
                      arm_positions[index]);
-  const auto gripper_context = runtime.gripper_state_channel->query_context();
-  const auto gripper_state = candidate->state_projector->current_state(
-      gripper_context.control_binding_id,
-      gripper_context.control_binding_revision);
-  ASSERT_TRUE(gripper_state.ok()) << gripper_state.error().message;
-  EXPECT_DOUBLE_EQ(std::get<core::LinearPositionDTO>(
-                       gripper_state.value().positions.front()).value_m,
-                   0.004);
 
   // Collision expansion names every candidate coordinate and places the
   // target's values by name, including the added peer.
@@ -7491,71 +5478,56 @@ void check_refreshed_cell_model(
                      arm_positions[index]);
   }
 
-  // Peer removal: the next candidate drops the peer again. A candidate whose
-  // projector omits the gripper target fails after the arm consumers were
-  // installed; the failure is returned as is, nothing is restored and the
-  // Apply fence keeps admission closed.
+  // Peer removal: the next candidate drops the peer again and every model
+  // consumer follows it under the same held Apply fence.
   const auto removed_urdf = moved_root(predecessor_urdf);
   const auto removed = make_candidate(
       removed_urdf,
       limits_of(moved_root(retained_urdf)),
-      {arm_binding});
-  const auto partial = refresh(removed);
-  ASSERT_FALSE(partial.ok());
-  EXPECT_EQ(partial.error().details.at("reason"),
-            "retained_state_projector_target_mismatch");
+      projected);
+  const auto without_peer = refresh(removed);
+  ASSERT_TRUE(without_peer.ok()) << without_peer.error().message;
   EXPECT_EQ(runtime.kinematic_model->current_generation(), removed);
-  EXPECT_EQ(runtime.gripper_state_channel->kinematic_projector(),
-            candidate->state_projector);
+  EXPECT_EQ(runtime.motion_state_channel->kinematic_projector(),
+            removed->state_projector);
   EXPECT_TRUE(admission_gate.exact_fence_is_held(fence_id, scope));
 }
 
 TEST(RetainedProductCrossConsumer,
-     SelectedCoreLite6AggregateComposesButUnqualifiedParticipantsStayClosed) {
-  check_selected_core_lite6_aggregate(Lite6AggregateCheck::kCompose);
+     SelectedCoreLite6ArmComposesButUnqualifiedParticipantsStayClosed) {
+  check_selected_core_lite6_motion(Lite6MotionCheck::kCompose);
 }
 
 TEST(RetainedProductCrossConsumer,
      SoleMotionRuntimeWithOnlyToolComponentsJoinsWithoutPeers) {
-  check_selected_core_lite6_aggregate(Lite6AggregateCheck::kSoleRuntimeJoin);
+  check_selected_core_lite6_motion(Lite6MotionCheck::kSoleRuntimeJoin);
 }
 
 #ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
 TEST(RetainedProductCrossConsumer,
      NoFeedbackPneumaticCloseReachesNextCollisionExpansion) {
-  check_selected_core_lite6_aggregate(
-      Lite6AggregateCheck::kPneumaticCollisionProjection);
+  check_selected_core_lite6_motion(
+      Lite6MotionCheck::kPneumaticCollisionProjection);
 }
 #endif
 
 TEST(RetainedProductCrossConsumer,
      MovingValidationPreservesJointSeamAndUsesEachTcpFrameAndLimit) {
-  check_selected_core_lite6_aggregate(Lite6AggregateCheck::kMovingValidation);
+  check_selected_core_lite6_motion(Lite6MotionCheck::kMovingValidation);
 }
 
 TEST(RetainedProductCrossConsumer,
      MissingSelectedBackendRefusesInsteadOfConstructingASimulator) {
-  check_selected_core_lite6_aggregate(Lite6AggregateCheck::kMissingSelectedBackend);
+  check_selected_core_lite6_motion(Lite6MotionCheck::kMissingSelectedBackend);
 }
 
-TEST(RetainedProductCrossConsumer,
-     SameRoutePredecessorAdoptionPreservesExactScaleQualificationWithoutOpeningReadiness) {
-  check_selected_core_lite6_aggregate(Lite6AggregateCheck::kSameRoutePredecessorQualification);
-}
-
-TEST(RetainedNativeMeasuredRoutePublication,
+TEST(RetainedMeasuredRoutePublication,
      MovingBudgetSurvivesRouteRebuildAndReadinessPublication) {
-  check_selected_core_lite6_aggregate(
-      Lite6AggregateCheck::kMovingBudgetPublication);
+  check_selected_core_lite6_motion(
+      Lite6MotionCheck::kMovingBudgetPublication);
 }
 
 #ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
-TEST(RetainedNativeMeasuredRoutePublication,
-     ActualMixedOutputResolvesAndDispatchesAcrossArmReadinessAndRouteAdoption) {
-  check_selected_core_lite6_aggregate(
-      Lite6AggregateCheck::kMixedOutputPublication);
-}
-
 // TCPUNMOUNTED-REBASE supplies this genuine retained product; it must be
 // integrated first. Exercise the real resolver and mount index, not a made-up
 // uncarried TCP row or a fake combined runtime.
@@ -7595,124 +5567,90 @@ TEST(RetainedProductCrossConsumer, GeometricContactRefusesARealUnmountedToolTcp)
 
 TEST(RetainedProductCrossConsumer,
      ActualGeometricContactInstallsSplitGripperThroughHostIo) {
-  check_selected_core_lite6_aggregate(
-      Lite6AggregateCheck::kGeometricHostInstallation);
+  check_selected_core_lite6_motion(
+      Lite6MotionCheck::kGeometricHostInstallation);
 }
 #endif
 
 TEST(RetainedProductCrossConsumer,
      QualifiedEndpointPlannerFramesUseTheSealedSameModelInventory) {
-  check_selected_core_lite6_aggregate(
-      Lite6AggregateCheck::kQualifiedEndpointPlannerFrames);
-}
-
-TEST(RetainedNativeMeasuredRoutePublication,
-     ResolverRebuildRefusalsKeepExactErrorsAndDoNotRebindOrPublish) {
-  check_selected_core_lite6_aggregate(
-      Lite6AggregateCheck::kResolverRebuildFailures);
-}
-
-TEST(RetainedNativeMeasuredRoutePublication,
-     StopResponseReadsTheCurrentBindingAfterRouteRebind) {
-  check_selected_core_lite6_aggregate(
-      Lite6AggregateCheck::kStopResponseFollowsRouteRebind);
-}
-
-TEST(RetainedNativeMeasuredRoutePublication, ExactStagePrecedesRebindAndRealThenNullCommitPreserveKernelPublication) {
-  check_selected_core_lite6_aggregate(Lite6AggregateCheck::kMeasuredPublication);
-}
-TEST(RetainedNativeMeasuredRoutePublication, RealStageRefusesOptionalDomainAppearanceBeforePhysicalEffects) {
-  check_selected_core_lite6_aggregate(Lite6AggregateCheck::kMeasuredOptionalDomainRace);
-}
-TEST(RetainedNativeMeasuredRoutePublication, NullStageRefusesOptionalDomainAppearanceBeforePhysicalEffects) {
-  check_selected_core_lite6_aggregate(Lite6AggregateCheck::kMeasuredNullOptionalDomainRace);
+  check_selected_core_lite6_motion(
+      Lite6MotionCheck::kQualifiedEndpointPlannerFrames);
 }
 
 TEST(RetainedProductCrossConsumer,
      RetainedControllerRefreshesEveryModelConsumerWithTheCellModel) {
-  check_selected_core_lite6_aggregate(Lite6AggregateCheck::kRefreshCellModel);
-}
-
-TEST(RetainedProductCrossConsumer, NarrowProgramAliasSurvivesRouteRebind) {
-  check_selected_core_lite6_aggregate(Lite6AggregateCheck::kNarrowAliasAtRouteRebind);
+  check_selected_core_lite6_motion(Lite6MotionCheck::kRefreshCellModel);
 }
 
 TEST(RetainedProductCrossConsumer, ForeignProgramFrameRefusedAtStartup) {
-  check_selected_core_lite6_aggregate(Lite6AggregateCheck::kForeignFrameAtStartup);
-}
-
-TEST(RetainedProductCrossConsumer, ForeignProgramFrameRefusedAtRouteRebind) {
-  check_selected_core_lite6_aggregate(Lite6AggregateCheck::kForeignFrameAtRouteRebind);
+  check_selected_core_lite6_motion(Lite6MotionCheck::kForeignFrameAtStartup);
 }
 
 TEST(RetainedProductCrossConsumer,
      SameControllerCapabilityInventoryResealPreservesOwnersAndRejectsChangedRegistration) {
-  check_selected_core_lite6_aggregate(Lite6AggregateCheck::kResealInventory);
-}
-
-TEST(RetainedProductCrossConsumer,
-     RetainedRouteGenerationRebasePreservesQualificationThroughStrictReseal) {
-  check_selected_core_lite6_aggregate(
-      Lite6AggregateCheck::kRetainedRouteGenerationReseal);
+  check_selected_core_lite6_motion(Lite6MotionCheck::kResealInventory);
 }
 
 TEST(RetainedProductCrossConsumer,
      ExecutionPortParticipantRegistersThroughTheRetainedBackendSeam) {
-  check_selected_core_lite6_aggregate(
-      Lite6AggregateCheck::kExecutionPortParticipant);
+  check_selected_core_lite6_motion(
+      Lite6MotionCheck::kExecutionPortParticipant);
 }
 
-#ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
 TEST(RetainedProductCrossConsumer,
-     SelectedRosOrdinaryJerkRefusesBeforeBackendFactoryConstruction) {
-  check_selected_core_lite6_aggregate(Lite6AggregateCheck::kRosOrdinaryJerkRejection);
+     OrdinaryJerkOnReachesThePlannerWithASelectedBackend) {
+  check_selected_core_lite6_motion(Lite6MotionCheck::kOrdinaryJerkOn);
 }
-#endif
+
+TEST(RetainedProductCrossConsumer, OrdinaryJerkOffAppliesNoJerkLimit) {
+  check_selected_core_lite6_motion(Lite6MotionCheck::kOrdinaryJerkOff);
+}
 
 TEST(RetainedProductCrossConsumer,
      DeploymentAuthoredFaultStopProfileIsTheMotionFaultProfile) {
-  check_selected_core_lite6_aggregate(
-      Lite6AggregateCheck::kDeploymentFaultStopProfile);
+  check_selected_core_lite6_motion(
+      Lite6MotionCheck::kDeploymentFaultStopProfile);
 }
 
 TEST(RetainedProductCrossConsumer,
      DeploymentAuthoredFastFaultProfileSurvivesRegistrationAndStopPreparation) {
-  check_selected_core_lite6_aggregate(
-      Lite6AggregateCheck::kDeploymentFastFaultStopProfile);
+  check_selected_core_lite6_motion(
+      Lite6MotionCheck::kDeploymentFastFaultStopProfile);
 }
 
 TEST(RetainedProductCrossConsumer,
      ComponentFaultStopProfileProjectsExtraJointsOntoActualArmResources) {
-  check_selected_core_lite6_aggregate(
-      Lite6AggregateCheck::kDeploymentFaultStopProfileWithExtraJoints);
+  check_selected_core_lite6_motion(
+      Lite6MotionCheck::kDeploymentFaultStopProfileWithExtraJoints);
 }
 
 TEST(RetainedProductCrossConsumer,
      ComponentFaultStopProfileWithOnlyExtraSettleOverridesUsesRetainedDefaults) {
-  check_selected_core_lite6_aggregate(
-      Lite6AggregateCheck::kDeploymentFaultStopProfileWithOnlyExtraSettleOverrides);
+  check_selected_core_lite6_motion(
+      Lite6MotionCheck::kDeploymentFaultStopProfileWithOnlyExtraSettleOverrides);
 }
 
 TEST(RetainedProductCrossConsumer,
      ComponentFaultStopProfileKeepsSparseSettleOverridesAndOtherRetainedDefaults) {
-  check_selected_core_lite6_aggregate(
-      Lite6AggregateCheck::kDeploymentFaultStopProfileWithSparseSettleOverrides);
+  check_selected_core_lite6_motion(
+      Lite6MotionCheck::kDeploymentFaultStopProfileWithSparseSettleOverrides);
 }
 
 TEST(RetainedProductCrossConsumer,
      ComponentFaultStopProfileMissingArmJointStillRefusesAtPrepare) {
-  check_selected_core_lite6_aggregate(
-      Lite6AggregateCheck::kDeploymentFaultStopProfileMissingArmJoint);
+  check_selected_core_lite6_motion(
+      Lite6MotionCheck::kDeploymentFaultStopProfileMissingArmJoint);
 }
 
 TEST(RetainedProductCrossConsumer,
      ComponentFaultStopProfileWithoutArmJointsStillRefusesAtPrepare) {
-  check_selected_core_lite6_aggregate(
-      Lite6AggregateCheck::kDeploymentFaultStopProfileWithoutArmJoints);
+  check_selected_core_lite6_motion(
+      Lite6MotionCheck::kDeploymentFaultStopProfileWithoutArmJoints);
 }
 
 TEST(RetainedProductCrossConsumer,
-     RootOwnedJoinedTwoLite6TeardownRetiresKernelBeforePeerEngines) {
+     JoinedTwoLite6ResealAndRootSwapBorrowTheCellKernel) {
   ScopedTemporaryRoot temporary;
   const std::filesystem::path package_root =
       temporary.path() / "retained-package";
@@ -7797,7 +5735,7 @@ TEST(RetainedProductCrossConsumer,
   const auto joint_limits = retained_joint_limit_rows(retained);
   const auto initial_scene = make_projection_runtime_shadow_snapshot(
       bundle.value().cell_graph.cell_id);
-  std::vector<std::shared_ptr<RetainedNativeRuntime>> runtimes;
+  std::vector<std::shared_ptr<RetainedExecutionHost>> runtimes;
   runtimes.reserve(physical_bindings.size());
   for (std::size_t index = 0U; index < physical_bindings.size(); ++index) {
     const auto &physical = physical_bindings[index];
@@ -7822,7 +5760,7 @@ TEST(RetainedProductCrossConsumer,
         RetainedCollisionWorldProjector::create_verified(
             shared_collision_model, bundle, model_map, retained);
     const auto &control = *physical.value().control_path;
-    const core::ProjectionNativeRuntimeBindingDTO native_binding{
+    const core::ProjectionExecutionHostBindingDTO native_binding{
         core::CapabilityProviderBindingId("lite6.joined.projection." +
                                           std::to_string(index + 1U)),
         core::CapabilityProviderBindingRevision(
@@ -7861,33 +5799,17 @@ TEST(RetainedProductCrossConsumer,
             RoboPlanCandidateComputerConfig{
                 .rng_seed = static_cast<std::uint64_t>(17U + index)},
             std::move(candidate_config)));
-    RetainedNativeRuntimeConfig runtime_config{
-        core::RequestOwnerEpoch("i6.joined.prejoin." +
-                                std::to_string(index + 1U)),
-        bundle.value().cell_graph.cell_id,
-        temporary.path() /
-            ("unused-joined-" + std::to_string(index + 1U) + ".sqlite3"),
-        1024U,
+    RetainedExecutionHostConfig runtime_config{
         core::CacheConfig{},
         core::ExecutionKernelConfig{},
         SimpleSchedulerConfig{},
-        10'000'000,
-        std::vector<double>(physical.value().resources.size(), 0.0),
-          kMaintainedNativeStopSurveillancePolicy,
-        {},
-        {},
-        {},
-        {},
-        {}};
+        std::vector<double>(physical.value().resources.size(), 0.0)};
     const auto local_runtime_unit_id = control.provider_runtime_unit_id;
     const auto local_runtime_epoch = control.provider_runtime_epoch;
     const auto local_component_id = physical.value().controllable_component_id;
-    auto runtime_input = RetainedNativeRuntimeInput{
+    auto runtime_input = RetainedExecutionHostInput{
         physical,
         std::nullopt,
-        {},
-        {},
-        {},
         {},
         scene,
         scene_mutex,
@@ -7913,8 +5835,6 @@ TEST(RetainedProductCrossConsumer,
         },
         {},
         {},
-        nullptr,
-        {},
         {},
         {},
         {}};
@@ -7923,12 +5843,12 @@ TEST(RetainedProductCrossConsumer,
     runtime_input.motion_state_channel_config = selected_core_test_state_config(physical);
     runtime_input.backend_factory = selected_core_test_backend_factory(selected_participant);
 
-    std::shared_ptr<RetainedNativeRuntime> runtime;
+    std::shared_ptr<RetainedExecutionHost> runtime;
     if (runtimes.empty()) {
-      runtime = create_retained_native_runtime_participants(
+      runtime = create_retained_execution_host_participants(
           std::move(runtime_input), std::move(runtime_config));
     } else {
-      runtime = create_retained_native_runtime_participants(
+      runtime = create_retained_execution_host_participants(
           std::move(runtime_input), std::move(runtime_config),
           runtimes.front()->clock, runtimes.front()->scheduler);
     }
@@ -7942,8 +5862,6 @@ TEST(RetainedProductCrossConsumer,
     EXPECT_EQ(runtime->motion_binding.value(), physical.value());
     EXPECT_EQ(runtime->motion_state_channel->binding().value(),
               physical.value());
-    EXPECT_FALSE(runtime->gripper_binding.has_value());
-    EXPECT_EQ(runtime->gripper_state_channel, nullptr);
     runtimes.push_back(std::move(runtime));
   }
 
@@ -7973,10 +5891,10 @@ TEST(RetainedProductCrossConsumer,
   const core::ConfigurationFenceScopeDTO empty_reseal_scope{};
   reseal_gate.RestoreFence(reseal_fence_id, empty_reseal_scope);
   const auto unchanged_state_binding = primary->motion_state_channel->binding();
-  const auto invalid_reseal = reseal_retained_native_runtime_for_apply(
+  const auto invalid_reseal = reseal_retained_execution_host_for_apply(
       *primary,
-      RetainedNativeRuntimeResealInput{
-          changed_model_binding.value(), std::nullopt, {}, {},
+      RetainedExecutionHostResealInput{
+          changed_model_binding.value(), {},
           {changed_model_binding.value()},
           std::move(changed_model_registrations), {}, nullptr,
           primary->reference_resolver,
@@ -7988,80 +5906,31 @@ TEST(RetainedProductCrossConsumer,
   EXPECT_EQ(primary->motion_state_channel->binding().value(),
             unchanged_state_binding.value());
 
-  auto subscription_ledger =
-      std::make_shared<SubscriptionObservationLedger>();
-  auto retained_primary_engine = primary->participant_engine;
-  auto retained_peer_engine = peer->participant_engine;
-  std::weak_ptr<core::ExecutionKernel> primary_engine_lifetime =
-      retained_primary_engine;
-  std::weak_ptr<core::ExecutionKernel> peer_engine_lifetime =
-      retained_peer_engine;
-  auto primary_subscription =
-      std::make_shared<SubscriptionObservedParticipantEngine>(
-          retained_primary_engine, subscription_ledger, "primary");
-  auto *const peer_observation = peer.get();
-  auto peer_subscription =
-      std::make_shared<SubscriptionObservedParticipantEngine>(
-          retained_peer_engine, subscription_ledger, "peer",
-          [peer_observation] {
-            return peer_observation->cell_addressed_kernel == nullptr &&
-                   peer_observation->cell_runtime_root == nullptr;
-          });
-  std::weak_ptr<SubscriptionObservedParticipantEngine>
-      primary_subscription_lifetime = primary_subscription;
-  std::weak_ptr<SubscriptionObservedParticipantEngine>
-      peer_subscription_lifetime = peer_subscription;
-
-  primary->participant_engine = std::shared_ptr<core::ExecutionKernel>(
-      primary_subscription, retained_primary_engine.get());
-  peer->participant_engine = std::shared_ptr<core::ExecutionKernel>(
-      peer_subscription, retained_peer_engine.get());
-  std::size_t primary_observed_registrations = 0U;
-  for (auto &registration : primary->participant_registrations) {
-    if (registration.engine == retained_primary_engine.get()) {
-      registration.engine = primary_subscription.get();
-      ++primary_observed_registrations;
-    }
-  }
-  std::size_t peer_observed_registrations = 0U;
-  for (auto &registration : peer->participant_registrations) {
-    if (registration.engine == retained_peer_engine.get()) {
-      registration.engine = peer_subscription.get();
-      ++peer_observed_registrations;
-    }
-  }
-  ASSERT_EQ(primary_observed_registrations, 1U);
-  ASSERT_EQ(peer_observed_registrations, 1U);
-
   RetainedRuntimeParticipantResolverFactory joined_resolver_factory =
       fixture_tcp_endpoint_resolver_factory();
-  join_retained_native_runtime_participants(
+  join_retained_execution_host_participants(
       primary, {peer}, joined_resolver_factory);
-  attach_retained_native_addressed_owner(
-      primary,
-      RetainedNativeAddressedOwnerConfig{
+  // As in the managed host, the joined runtimes borrow one stable cell Kernel.
+  auto cell = std::make_unique<RetainedCellRuntime>(RetainedCellRuntimeInput{
+      primary->clock,
+      primary->scheduler,
+      temporary.path() / "joined-operation-journal.sqlite3",
+      primary->participant_registrations,
+      core::ResourceAddressedExecutionKernelConfig{
           core::RequestOwnerEpoch("i6.joined.owner.epoch.1"),
-          bundle.value().cell_graph.cell_id,
-          temporary.path() / "joined-operation-journal.sqlite3",
-          1024U,
-          nullptr,
-          bundle.value().cell_graph.graph_revision,
-              {},
-          {},
-          {},
-          {},
-          {}});
-
-  ASSERT_NE(primary->addressed_kernel, nullptr);
-  EXPECT_TRUE(primary->addressed_kernel->participant_engine_in_use(
-      primary_subscription.get()));
-  EXPECT_TRUE(primary->addressed_kernel->participant_engine_in_use(
-      peer_subscription.get()));
-  const auto subscribed = subscription_ledger->Snapshot();
-  ASSERT_EQ(subscribed.active_subscriptions, 2U);
-  ASSERT_EQ(subscribed.subscriptions, 2U);
-  ASSERT_EQ(subscribed.unsubscriptions, 0U);
-  ASSERT_EQ(peer->cell_addressed_kernel, primary->addressed_kernel.get());
+          bundle.value().cell_graph.cell_id, 1024U,
+          primary->participant_resolver, nullptr,
+          bundle.value().cell_graph.graph_revision}});
+  primary->cell_runtime_owner = cell.get();
+  primary->BindCellRuntimeOwner(*cell, "joined-cell",
+                                bundle.value().cell_graph.cell_id.value());
+  auto *const cell_kernel = &cell->addressed_kernel();
+  EXPECT_TRUE(cell_kernel->participant_engine_in_use(
+      primary->participant_engine.get()));
+  EXPECT_TRUE(cell_kernel->participant_engine_in_use(
+      peer->participant_engine.get()));
+  ASSERT_EQ(primary->cell_addressed_kernel, cell_kernel);
+  ASSERT_EQ(peer->cell_addressed_kernel, cell_kernel);
   ASSERT_EQ(peer->cell_runtime_root, primary.get());
 
   // Re-sealing a joined peer excludes every route reader of that peer for
@@ -8075,13 +5944,6 @@ TEST(RetainedProductCrossConsumer,
         "i6.joined.peer-reseal.apply");
     const core::ConfigurationFenceScopeDTO peer_reseal_scope{};
     peer_reseal_gate.RestoreFence(peer_reseal_fence_id, peer_reseal_scope);
-    // This fixture observes the peer engine through a subscription wrapper;
-    // re-seal resolves registrations against the retained engine itself.
-    const auto observed_registrations = peer->participant_registrations;
-    for (auto &registration : peer->participant_registrations) {
-      if (registration.engine == peer_subscription.get())
-        registration.engine = peer->participant_engine_for(true);
-    }
     const auto retained_rebind = peer->rebind_motion_route;
     ASSERT_TRUE(retained_rebind);
     std::optional<std::future_status> reader_during_reseal;
@@ -8089,25 +5951,24 @@ TEST(RetainedProductCrossConsumer,
     peer->rebind_motion_route =
         [&](core::RuntimeParticipantBinding binding,
             std::vector<core::RuntimeParticipantBinding> aliases) {
-          // A reader that only needs the route lock: the peer has no
-          // gripper, so it answers stale as soon as it holds the lock.
+          // A reader that only needs the route lock: it answers as soon
+          // as it holds the lock.
           reader = std::async(std::launch::async, [&] {
-            return !peer->ReadGripperStatus(peer->motion_binding).ok();
+            return !peer->CurrentPhysicalBindings().empty();
           });
           reader_during_reseal =
               reader.wait_for(std::chrono::milliseconds(200));
           return retained_rebind(std::move(binding), std::move(aliases));
         };
-    const auto resealed = reseal_retained_native_runtime_for_apply(
+    const auto resealed = reseal_retained_execution_host_for_apply(
         *peer,
-        RetainedNativeRuntimeResealInput{
-            peer->motion_binding, std::nullopt, {}, {},
+        RetainedExecutionHostResealInput{
+            peer->motion_binding, {},
             peer->control_binding_representatives,
             peer->participant_registrations, {}, nullptr,
             peer->reference_resolver, peer_reseal_fence_id, peer_reseal_scope,
             peer_reseal_gate});
     peer->rebind_motion_route = retained_rebind;
-    peer->participant_registrations = observed_registrations;
     ASSERT_TRUE(resealed.ok()) << resealed.error().message;
     ASSERT_TRUE(reader_during_reseal.has_value());
     EXPECT_EQ(*reader_during_reseal, std::future_status::timeout);
@@ -8115,132 +5976,37 @@ TEST(RetainedProductCrossConsumer,
     EXPECT_TRUE(reader.get());
   }
 
-  auto stable_stop_observer = primary->stop_surveillance_owner;
-  ASSERT_NE(stable_stop_observer, nullptr);
-  std::weak_ptr<RetainedStopSurveillanceOwner> stable_observer_lifetime =
-      stable_stop_observer;
   ManagedKernelAdmissionGate rejoin_gate;
   const auto rejoin_scope = make_runtime_fence_scope(
       {&primary->motion_binding, &peer->motion_binding});
   const core::ConfigurationFenceId rejoin_fence_id(
       "i6.joined.root-replacement.apply");
   rejoin_gate.RestoreFence(rejoin_fence_id, rejoin_scope);
-  ASSERT_TRUE(primary->stop_surveillance_policy.has_value());
-  const auto original_surveillance_policy = primary->stop_surveillance_policy;
-  {
-    ++primary->stop_surveillance_policy->sample_cadence_ns;
-    std::vector<RetainedStopSurveillanceSourceInput> rejected_sources;
-    const auto rejected = rejoin_retained_native_runtime_participants(
-        peer, {primary}, joined_resolver_factory, stable_stop_observer,
-        rejected_sources, rejoin_gate, rejoin_fence_id, rejoin_scope);
-    primary->stop_surveillance_policy = original_surveillance_policy;
-    ASSERT_FALSE(rejected.ok());
-    EXPECT_EQ(rejected.error().details.at("reason"),
-              "native_participant_rejoin_stop_policy_mismatch");
-    EXPECT_TRUE(rejected_sources.empty());
-  }
-  std::vector<RetainedStopSurveillanceSourceInput> root_swapped_sources;
-  const auto root_swapped = rejoin_retained_native_runtime_participants(
-      peer, {primary}, joined_resolver_factory, stable_stop_observer,
-      root_swapped_sources, rejoin_gate, rejoin_fence_id, rejoin_scope);
+  const auto root_swapped = rejoin_retained_execution_host_participants(
+      peer, {primary}, joined_resolver_factory, rejoin_gate, rejoin_fence_id,
+      rejoin_scope);
   ASSERT_TRUE(root_swapped.ok()) << root_swapped.error().message;
-  ASSERT_EQ(root_swapped_sources.size(), 2U);
   EXPECT_EQ(peer->participant_peers.size(), 1U);
   EXPECT_EQ(peer->participant_peers.front(), primary);
-  EXPECT_EQ(peer->stop_surveillance_owner, stable_stop_observer);
-  EXPECT_EQ(primary->stop_surveillance_owner, stable_stop_observer);
   EXPECT_EQ(primary->cell_runtime_root, peer.get());
   EXPECT_EQ(peer->cell_runtime_root, peer.get());
-  EXPECT_EQ(peer->cell_addressed_kernel, primary->addressed_kernel.get());
+  EXPECT_EQ(peer->cell_addressed_kernel, cell_kernel);
+  EXPECT_EQ(primary->cell_addressed_kernel, cell_kernel);
 
-  // Rejoin can succeed before the host's scoped Core participant install.
-  // If that later step fails, the host retains the private prepared
-  // composition while admission stays closed. Model that ownership boundary:
-  // the candidate root must keep both the old Kernel owner and its exact Stop
-  // observer alive, even after the caller drops its predecessor references.
-  std::weak_ptr<RetainedNativeRuntime> failed_candidate_lifetime = peer;
-  std::weak_ptr<RetainedNativeRuntime> failed_predecessor_lifetime = primary;
-  auto failed_prepared_composition = peer;
-  peer.reset();
-  primary.reset();
-  stable_stop_observer.reset();
-  ASSERT_FALSE(failed_candidate_lifetime.expired());
-  ASSERT_FALSE(failed_predecessor_lifetime.expired());
-  ASSERT_FALSE(stable_observer_lifetime.expired());
-  ASSERT_EQ(failed_prepared_composition->participant_peers.size(), 1U);
-  auto *const failed_predecessor =
-      failed_prepared_composition->participant_peers.front().get();
-  ASSERT_NE(failed_predecessor, nullptr);
-  EXPECT_EQ(failed_predecessor->cell_runtime_root,
-            failed_prepared_composition.get());
-  ASSERT_NE(failed_prepared_composition->cell_addressed_kernel, nullptr);
-  EXPECT_EQ(failed_prepared_composition->cell_addressed_kernel,
-            failed_predecessor->addressed_kernel.get());
-  EXPECT_EQ(failed_prepared_composition->stop_surveillance_owner,
-            failed_predecessor->stop_surveillance_owner);
-
-  // The failed candidate is still available for diagnosis/authorized
-  // restoration. Reacquire the exact retained owners before modeling the next
-  // successful Apply that removes one cell peer.
-  peer = failed_prepared_composition;
-  primary = peer->participant_peers.front();
-  stable_stop_observer = peer->stop_surveillance_owner;
-  failed_prepared_composition.reset();
-
-  // A later Apply can remove the former root entirely. Rejoin accepts zero
-  // peers and returns a one-component Stop table, but must leave the stable
-  // observer on its predecessor table until the host's Kernel commit hook.
-  std::vector<RetainedStopSurveillanceSourceInput> single_component_sources;
-  const auto single_component = rejoin_retained_native_runtime_participants(
-      peer, {}, joined_resolver_factory, stable_stop_observer,
-      single_component_sources, rejoin_gate, rejoin_fence_id, rejoin_scope);
+  // The next successful Apply removes one cell peer: rejoin accepts zero
+  // peers, and the remaining root still borrows the same cell Kernel.
+  const auto single_component = rejoin_retained_execution_host_participants(
+      peer, {}, joined_resolver_factory, rejoin_gate, rejoin_fence_id,
+      rejoin_scope);
   ASSERT_TRUE(single_component.ok()) << single_component.error().message;
-  ASSERT_EQ(single_component_sources.size(), 1U);
-  EXPECT_EQ(single_component_sources.front().binding.value(),
-            peer->motion_binding.value());
   EXPECT_TRUE(peer->participant_peers.empty());
-  EXPECT_EQ(peer->stop_surveillance_owner, stable_stop_observer);
-  peer->addressed_kernel = std::move(primary->addressed_kernel);
-  peer->operation_journal = std::move(primary->operation_journal);
-  primary->stop_surveillance_owner.reset();
-  primary->cell_addressed_kernel = nullptr;
-  primary->cell_runtime_root = nullptr;
-  EXPECT_FALSE(stable_observer_lifetime.expired());
+  EXPECT_EQ(peer->cell_addressed_kernel, cell_kernel);
 
-  std::weak_ptr<RetainedNativeRuntime> primary_runtime_lifetime = primary;
-  std::weak_ptr<RetainedNativeRuntime> peer_runtime_lifetime = peer;
-  primary_subscription.reset();
-  peer_subscription.reset();
-  retained_primary_engine.reset();
-  retained_peer_engine.reset();
-  ASSERT_EQ(primary.use_count(), 1U);
-  ASSERT_FALSE(peer_runtime_lifetime.expired());
-  ASSERT_FALSE(primary_subscription_lifetime.expired());
-  ASSERT_FALSE(peer_subscription_lifetime.expired());
-  ASSERT_FALSE(primary_engine_lifetime.expired());
-  ASSERT_FALSE(peer_engine_lifetime.expired());
-  stable_stop_observer.reset();
-
+  // The cell Kernel unsubscribes from the engines it registered while they
+  // are still alive; the runtimes retire after it.
+  cell.reset();
   peer.reset();
-
-  EXPECT_TRUE(peer_runtime_lifetime.expired());
-  EXPECT_TRUE(stable_observer_lifetime.expired());
-  EXPECT_FALSE(primary_runtime_lifetime.expired());
   primary.reset();
-
-  EXPECT_TRUE(primary_runtime_lifetime.expired());
-  EXPECT_TRUE(primary_subscription_lifetime.expired());
-  EXPECT_TRUE(peer_subscription_lifetime.expired());
-  EXPECT_TRUE(primary_engine_lifetime.expired());
-  EXPECT_TRUE(peer_engine_lifetime.expired());
-  const auto retired = subscription_ledger->Snapshot();
-  EXPECT_EQ(retired.active_subscriptions, 0U);
-  EXPECT_EQ(retired.subscriptions, 2U);
-  EXPECT_EQ(retired.unsubscriptions, 2U);
-  EXPECT_EQ(retired.observer_destructions, 2U);
-  EXPECT_EQ(retired.destructions_with_active_subscription, 0U);
-  EXPECT_EQ(retired.peer_back_pointer_observations, 1U);
-  EXPECT_EQ(retired.uncleared_peer_back_pointers, 0U);
 }
 
 TEST(RetainedProductCrossConsumer,
@@ -8256,8 +6022,10 @@ TEST(RetainedProductCrossConsumer,
   ASSERT_TRUE(std::filesystem::create_directory(staging_parent));
   ASSERT_TRUE(std::filesystem::create_directory(empty_ambient_root));
 
-  const auto materialized = deployment::test::
-      materialize_lite6_ros2_control_arm_gripper_aggregate_retained_consumer_fixture(
+  // The arm component carries the combined Lite6 + Lite gripper model; its
+  // `tcp` frame is the model's gripper TCP.
+  const auto materialized =
+      deployment::test::materialize_lite6_ros2_control_retained_consumer_fixture(
           package_root);
   ASSERT_NE(materialized.bundle, nullptr);
   const auto &products = materialized.bundle->value().compiled_products;
@@ -8574,17 +6342,12 @@ TEST(RetainedProductCrossConsumer,
               expected_gripper_pair_count);
   }
 
-  const core::CommandTargetId gripper_target_id(
-      std::string(deployment::test::kLite6GripperTargetId));
-  const auto *gripper_target =
-      model_map.find_target(component_id, gripper_target_id);
-  ASSERT_NE(gripper_target, nullptr);
   const auto carrier_frame = std::find_if(
-      gripper_target->frames.begin(), gripper_target->frames.end(),
+      arm_target->frames.begin(), arm_target->frames.end(),
       [](const deployment::CompositionTargetFrameResolution &frame) {
         return frame.frame_role_id.value() == "tcp";
       });
-  ASSERT_NE(carrier_frame, gripper_target->frames.end());
+  ASSERT_NE(carrier_frame, arm_target->frames.end());
   const auto *carrier = std::get_if<deployment::CompositionComponentModelFrame>(
       &carrier_frame->frame);
   ASSERT_NE(carrier, nullptr);
@@ -8594,7 +6357,7 @@ TEST(RetainedProductCrossConsumer,
       collision_projector.model_map().targets.end(),
       [&](const RetainedCollisionModelMapInput::Target &candidate) {
         return candidate.controllable_component_id == component_id &&
-               candidate.command_target_id == gripper_target_id;
+               candidate.command_target_id == command_target_id;
       });
   ASSERT_NE(collision_target, collision_projector.model_map().targets.end());
   ASSERT_FALSE(collision_target->bodies.empty());
@@ -8672,14 +6435,14 @@ TEST(RetainedProductCrossConsumer,
       core::CarriedObjectAttachmentRevision(std::string(kZeroDigest)),
       core::SceneResourceId("carried-part"),
       component_id,
-      gripper_target_id,
+      command_target_id,
       core::ComponentSceneFrameRefDTO{
           component_id,
           carrier->model_instance_id,
           core::FrameRoleId("tcp"),
       },
       {{0.0, 0.0, 0.04}, {0.0, 0.0, 0.0, 1.0}},
-      {core::CollisionBodyRoleId("gripper_collision")},
+      {core::CollisionBodyRoleId("arm_collision")},
   };
   attachment.carried_object_attachment_revision =
       core::logical_scene_identity::ComputeCarriedObjectAttachmentRevision(
@@ -8744,7 +6507,7 @@ TEST(RetainedProductCrossConsumer,
   const auto &carried_policy = carried_policy_result.value();
   ASSERT_EQ(
       carried_policy.allowed_touch_link_pairs.size(),
-      gripper_target->collision_bodies.front().compiled_link_names.size());
+      arm_target->collision_bodies.front().compiled_link_names.size());
   for (const auto &pair : carried_policy.allowed_touch_link_pairs) {
     EXPECT_TRUE(pair.body_a == carried_body->body_id ||
                 pair.body_b == carried_body->body_id);
@@ -8866,8 +6629,7 @@ TEST(RetainedProductCrossConsumer,
   ASSERT_TRUE(std::filesystem::create_directory(staging_parent));
 
   const auto materialized = deployment::test::
-      materialize_lite6_ros2_control_arm_gripper_aggregate_retained_consumer_fixture(
-          package_root);
+      materialize_lite6_ros2_control_retained_consumer_fixture(package_root);
   ASSERT_NE(materialized.bundle, nullptr);
   const auto &products = materialized.bundle->value().compiled_products;
   ASSERT_EQ(products.symbol_role_maps.size(), 1U);
@@ -8910,11 +6672,11 @@ TEST(RetainedProductCrossConsumer,
       materialized.bundle->retained_bundle_id(),
       materialized.bundle->value().cell_graph.graph_revision,
       initial_scene.revision};
-  const core::ProjectionNativeRuntimeBindingDTO native_binding{
+  const core::ProjectionExecutionHostBindingDTO native_binding{
       core::CapabilityProviderBindingId("lite6_joint_planner_binding"),
       core::CapabilityProviderBindingRevision("planner-binding-revision"),
-      core::RuntimeUnitId("native-execution-host"),
-      core::RuntimeEpoch("native-execution-host-epoch-1")};
+      core::RuntimeUnitId("execution-host"),
+      core::RuntimeEpoch("execution-host-epoch-1")};
   std::int64_t clock_value = kReceiverTimestampNs + 10;
   bool fail_clock = false;
   auto projection_result = RetainedPlannerSceneProjection::CreateInitialized(
@@ -9339,11 +7101,11 @@ TEST(RetainedProductCrossConsumer,
   EXPECT_EQ(bootstrap_status.state,
             core::NativeProjectionBootstrapStatusState::kRebuilt);
 
-  const core::ProjectionNativeRuntimeBindingDTO added_binding{
+  const core::ProjectionExecutionHostBindingDTO added_binding{
       core::CapabilityProviderBindingId("lite6_added_planner_binding"),
       core::CapabilityProviderBindingRevision("added-binding-revision"),
-      core::RuntimeUnitId("added-native-execution-host"),
-      core::RuntimeEpoch("added-native-execution-host-epoch-1")};
+      core::RuntimeUnitId("added-execution-host"),
+      core::RuntimeEpoch("added-execution-host-epoch-1")};
   std::int64_t added_clock = 300;
   auto added_projection_result =
       RetainedPlannerSceneProjection::CreateUninitialized(
@@ -9403,9 +7165,9 @@ TEST(RetainedProductCrossConsumer, ObservationSelectionMemoKeepsLiveChecksAndExa
   ScopedTemporaryRoot temporary;
   const auto package_root = temporary.path() / "retained-package";
   ASSERT_TRUE(std::filesystem::create_directory(package_root));
-  const auto materialized =
-      deployment::test::materialize_lite6_ros2_control_cclc_product_retained_consumer_fixture(
-          package_root, kZeroDigest, true);
+  const auto materialized = deployment::test::materialize_lite6_retained_consumer_fixture_from(
+      package_root, deployment::test::make_lite_gripper_only_retention_fixture(
+                        kZeroDigest, "pneumatic", std::nullopt, "commanded", true));
   ASSERT_NE(materialized.bundle, nullptr);
   const auto& bundle = *materialized.bundle;
   const auto model_map = load_lite6_model_map(
@@ -9423,7 +7185,7 @@ TEST(RetainedProductCrossConsumer, ObservationSelectionMemoKeepsLiveChecksAndExa
     "required_frame_roles":["tcp"],
     "required_resource_roles":["fingers"],
     "required_collision_body_roles":["gripper_collision"],
-    "required_model_roles":["arm_model"]
+    "required_model_roles":["gripper_model"]
   })")
                                .root();
   std::vector<std::shared_ptr<const deployment::ProgramBinding>> selected;
@@ -9500,7 +7262,7 @@ TEST(RetainedProductCrossConsumer, ObservationSelectionMemoKeepsLiveChecksAndExa
     auto binding = deployment::compile_program_binding(
         *program,
         {{{core::ComponentRoleId("robot"), core::ControllableComponentId(std::string(
-                                               deployment::test::kLite6ControllableComponentId))}},
+                                               deployment::test::kLiteGripperComponentId))}},
          {{core::TargetRoleId("first"),
            core::CommandTargetId(std::string(deployment::test::kLite6GripperTargetId))},
           {core::TargetRoleId("second"),
@@ -9690,7 +7452,7 @@ TEST(RetainedProductCrossConsumer,
   ASSERT_TRUE(std::filesystem::create_directory(package_root));
   const auto materialized = deployment::test::
       materialize_lite6_ros2_control_observed_endpoint_retained_consumer_fixture(
-          package_root, false, true);
+          package_root, true);
   ASSERT_NE(materialized.bundle, nullptr);
   const auto &bundle = *materialized.bundle;
   const auto model_map = load_lite6_model_map(
@@ -10123,7 +7885,7 @@ TEST(
       candidate.bundle->retained_bundle_id(),
       candidate.bundle->value().cell_graph.graph_revision,
       initial_scene.revision};
-  const core::ProjectionNativeRuntimeBindingDTO binding{
+  const core::ProjectionExecutionHostBindingDTO binding{
       core::CapabilityProviderBindingId("cross_bundle_planner_binding"),
       core::CapabilityProviderBindingRevision("cross-bundle-binding-revision"),
       core::RuntimeUnitId("cross_bundle_native_execution"),
@@ -10210,7 +7972,7 @@ struct SceneProjectionFixture final {
     std::filesystem::create_directory(package_root);
     std::filesystem::create_directory(staging_parent);
     bundle = deployment::test::
-                 materialize_lite6_ros2_control_arm_gripper_aggregate_retained_consumer_fixture(
+                 materialize_lite6_ros2_control_retained_consumer_fixture(
                      package_root)
                      .bundle;
     if (bundle == nullptr) {
@@ -10308,11 +8070,11 @@ make_lazy_projection(const SceneProjectionFixture &fixture,
                      const core::LogicalSceneSnapshotDTO &initial) {
   auto created = RetainedPlannerSceneProjection::CreateInitialized(
       *fixture.projector, fixture.planning_collision_model,
-      core::ProjectionNativeRuntimeBindingDTO{
+      core::ProjectionExecutionHostBindingDTO{
           core::CapabilityProviderBindingId("lite6_joint_planner_binding"),
           core::CapabilityProviderBindingRevision("planner-binding-revision"),
-          core::RuntimeUnitId("native-execution-host"),
-          core::RuntimeEpoch("native-execution-host-epoch-1")},
+          core::RuntimeUnitId("execution-host"),
+          core::RuntimeEpoch("execution-host-epoch-1")},
       initial,
       RetainedPlannerSceneProjectionConfig{"retained-lite6-lazy-projection",
                                            8U},
@@ -10455,10 +8217,10 @@ V member(V root, std::string_view name, V value) {
 
 class Fixture final {
 public:
-  explicit Fixture(bool output = false, bool second = false, bool ros = false) {
+  Fixture() {
     const auto retained =
         deployment::test::materialize_boolean_io_retained_fixture(
-            package.path(), !output, output, ros, second);
+            package.path(), true, false, false, false);
     bundle = retained.bundle;
     deployment::FilesystemVerifiedRetainedModelMapSource maps(package.path());
     map = maps.get_verified({bundle->retained_bundle_id(),
@@ -10469,15 +8231,6 @@ public:
       throw std::logic_error(
           "IO resolver fixture has no real retained model map");
     deployment::FilesystemCatalogArtifactStore catalog(package.path());
-    if (output) {
-      const auto direct =
-          deployment::compile_direct_control_program_binding_inventory(
-              *bundle, *map, catalog);
-      if (direct.io.size() != 1U)
-        throw std::logic_error(
-            "IO resolver fixture has no exact direct target");
-      direct_binding = direct.io.front();
-    }
     auto root = deployment::parse_strict_json_model_yaml(R"({
       "api_version":"manyforge.program.v2","program_id":"resolver_io_authored",
       "program_revision":"sha256:0000000000000000000000000000000000000000000000000000000000000000",
@@ -10498,35 +8251,14 @@ public:
     auto target = *roles.find_object_member("signals");
     target = member(target, "required_capabilities",
                     V(V::Array{V(V::Object{
-                        {"capability_id", V(output ? "io.gpio.set_output"
-                                                   : "io.gpio.get_input")},
+                        {"capability_id", V("io.gpio.get_input")},
                         {"parameters", V(V::Object{})},
                         {"disposition", V("required")}})}));
-    V::Array resources{V(output ? "lamp" : "ready")};
-    if (second)
-      resources.emplace_back("lamp_other");
+    V::Array resources{V("ready")};
     root = member(root, "target_roles",
                   member(roles, "signals",
                          member(target, "required_resource_roles",
                                 V(std::move(resources)))));
-    if (output) {
-      V::Array children;
-      for (const auto &role :
-           second ? std::vector<std::string>{"lamp", "lamp_other"}
-                  : std::vector<std::string>{"lamp"})
-        children.emplace_back(
-            V::Object{{"node_id", V("io.set_output")},
-                      {"instance_id", V("write." + role)},
-                      {"parameters", V(V::Object{{"target_role", V("signals")},
-                                                 {"resource_role", V(role)},
-                                                 {"value", V(true)}})},
-                      {"children", V(V::Array{})}});
-      root = member(root, "tree",
-                    V(V::Object{{"node_id", V("sequence")},
-                                {"instance_id", V("root")},
-                                {"parameters", V(V::Object{})},
-                                {"children", V(std::move(children))}}));
-    }
     root = deployment::normalize_program_authoring(root);
     const auto revision = deployment::detail::compute_content_identity(
         root, {"program-revision", "manyforge.program.v2", "program_revision"});
@@ -10547,94 +8279,11 @@ public:
           "IO resolver fixture could not publish exact authored artifacts");
   }
 
-  core::RuntimeParticipantBinding
-  Prototype(std::string role, std::uint64_t generation = 3U,
-            bool authored = false) const {
-    const auto &graph = bundle->value().cell_graph;
-    if (graph.control_domains.size() != 1U ||
-        !graph.control_domains.front().provider())
-      throw std::logic_error(
-          "IO resolver fixture has no qualified provider domain");
-    const auto &domain = graph.control_domains.front();
-    const auto &provider = *domain.provider();
-    const auto rows = deployment::ResolveRetainedIoSignalCatalog(graph);
-    if (!rows.ok())
-      throw std::logic_error(rows.error().message);
-    std::vector<core::ResourceId> resources;
-    for (const auto &row : rows.value())
-      if (row.descriptor.output_resource)
-        resources.push_back(*row.descriptor.output_resource);
-    std::sort(resources.begin(), resources.end());
-    resources.erase(std::unique(resources.begin(), resources.end()),
-                    resources.end());
-    const core::RuntimeEpoch epoch("actual.fixture.provider");
-    const core::RuntimeProviderDomainConfigurationReadbackDTO closed{
-        bundle->retained_bundle_id(),
-        graph.graph_revision,
-        core::ComponentLifecycleGeneration(generation),
-        {domain.control_domain_id, domain.control_domain_revision,
-         core::ResolvedProviderDomainScopeDTO{provider, epoch, std::nullopt,
-                                              resources}},
-        {domain.control_domain_id, domain.control_domain_revision,
-         provider.provider_instance_id, provider.provider_manifest_id,
-         provider.provider_manifest_revision, provider.provider_runtime_unit_id,
-         epoch, provider.lifecycle_plan_catalog_digest},
-        false,
-        0U,
-        0U};
-    const auto &identity = authored ? *authored_binding : *direct_binding;
-    const auto target = deployment::resolve_runtime_program_target(
-        identity, identity.value().target_role_bindings.front().target_role_id,
-        core::CapabilityId("io.gpio.set_output"), *bundle, *map);
-    auto made = core::verify_runtime_participant_binding(
-        deployment::build_runtime_io_output_binding_dto(
-            target, core::ResourceRoleId(std::move(role)), *bundle, closed));
-    if (!made.ok())
-      throw std::logic_error(made.error().message);
-    return std::move(made.value());
-  }
-
-  core::OperationIntentDTO
-  Operation(const core::RuntimeParticipantBinding &prototype, std::string role,
-            bool direct) const {
-    const auto &value = prototype.value();
-    const auto &identity = direct ? *direct_binding : *authored_binding;
-    const auto &target = identity.value().target_role_bindings.front();
-    const auto schema = core::builtin_io_signal_write_command_schema();
-    return {{core::RequestId("request.resolver." + role),
-             core::RequestOwnerEpoch("kernel"),
-             "test",
-             {}},
-            identity.value().program_id,
-            identity.value().program_revision,
-            identity.program_binding_id(),
-            core::ProgramRunId("run.resolver"),
-            value.graph_revision,
-            value.retained_bundle_id,
-            std::nullopt,
-            {{target.component_role_id,
-              target.target_role_id,
-              core::CapabilityId("io.gpio.set_output"),
-              {},
-              core::CapabilityCommandIntentDTO{
-                  schema.command_schema_id,
-                  schema.command_schema_revision,
-                  core::IoSignalWriteCommandValueDTO{core::ResourceRoleId(role),
-                                                     true},
-                  std::nullopt,
-                  {}},
-              direct ? std::nullopt
-                     : std::optional(core::ProgramNodeExecutionScopeDTO{
-                           core::ProgramNodeInstanceId("write." + role),
-                           "attempt.1"})}}};
-  }
-
   ScopedTemporaryRoot package, artifacts;
   std::shared_ptr<const deployment::RetainedBundle> bundle;
   std::optional<deployment::VerifiedRetainedModelMap> map;
   std::shared_ptr<const deployment::ProgramBindingContract> program;
-  std::shared_ptr<const deployment::ProgramBinding> authored_binding,
-      direct_binding;
+  std::shared_ptr<const deployment::ProgramBinding> authored_binding;
 };
 
 TEST(RetainedProductConsumerTest,
@@ -10674,128 +8323,6 @@ TEST(RetainedProductConsumerTest,
   auto injected = request;
   injected.binding = capture.value().binding;
   EXPECT_FALSE(resolver.ResolveProgramCapture(std::move(injected)).ok());
-}
-
-TEST(RetainedProductConsumerTest,
-     IoResolverSelectsActualChannelRoleAndRebindPreservesArtifactRoots) {
-  Fixture fixture(true, true);
-  auto first = fixture.Prototype("lamp");
-  auto other = fixture.Prototype("lamp_other");
-  ASSERT_NE(*first.value().io_output_binding->signal.output_resource,
-            *other.value().io_output_binding->signal.output_resource);
-  ProductBackedRuntimeParticipantResolver empty(
-      fixture.package.path(), fixture.bundle, *fixture.map, {}, {},
-      fixture.artifacts.path());
-  auto current = empty.WithComposedParticipants(
-      {first, other}, {fixture.direct_binding->program_binding_id()});
-  for (const bool direct : {false, true}) {
-    for (const auto &row :
-         std::vector<core::RuntimeParticipantBinding>{first, other}) {
-      const auto role = row.value().io_output_binding->resource_role_id.value();
-      auto request = fixture.Operation(row, role, direct);
-      EXPECT_TRUE(current->ValidateExecutionOrigin(request).ok());
-      const auto resolved = current->ResolveExecutionParticipant(request, 0U);
-      ASSERT_TRUE(resolved.ok()) << resolved.error().message;
-      EXPECT_EQ(resolved.value().intrinsic_direct_control, direct);
-      EXPECT_EQ(resolved.value().binding.value().io_output_binding,
-                row.value().io_output_binding);
-      EXPECT_FALSE(resolved.value().binding.value().control_path);
-      EXPECT_TRUE(resolved.value().binding.value().resources.empty());
-      EXPECT_FALSE(empty.Resolve(request, 0U).ok());
-      std::get<core::IoSignalWriteCommandValueDTO>(
-          std::get<core::CapabilityCommandIntentDTO>(
-              request.participants.front().payload)
-              .command_value)
-          .resource_role_id = core::ResourceRoleId("missing");
-      EXPECT_FALSE(current->Resolve(request, 0U).ok());
-    }
-  }
-  auto request = fixture.Operation(first, "lamp", false);
-  auto resealed = empty.WithComposedParticipants(
-      {fixture.Prototype("lamp", 7U), fixture.Prototype("lamp_other", 7U)},
-      {fixture.direct_binding->program_binding_id()});
-  const auto old = current->Resolve(request, 0U);
-  const auto newer = resealed->Resolve(request, 0U);
-  ASSERT_TRUE(old.ok());
-  ASSERT_TRUE(newer.ok());
-  EXPECT_EQ(
-      old.value().value().io_output_binding->component_lifecycle_generation,
-      core::ComponentLifecycleGeneration(3U));
-  EXPECT_EQ(
-      newer.value().value().io_output_binding->component_lifecycle_generation,
-      core::ComponentLifecycleGeneration(7U));
-  const auto bound = resealed->ResolveBoundTarget(
-      *fixture.authored_binding, core::TargetRoleId("signals"),
-      core::CapabilityId("io.gpio.set_output"));
-  ASSERT_TRUE(bound.ok());
-  EXPECT_EQ(bound.value().program_binding_id(),
-            fixture.authored_binding->program_binding_id());
-  request.participants.front().execution_scope.reset();
-  EXPECT_FALSE(resealed->ValidateExecutionOrigin(request).ok());
-}
-
-TEST(RetainedProductConsumerTest,
-     IoResolverPrefersExactProgramOutputAliasOverDirectChannelPrototype) {
-  Fixture fixture(true, true);
-  const auto direct = fixture.Prototype("lamp");
-  const auto authored = fixture.Prototype("lamp", 3U, true);
-  const auto other_direct = fixture.Prototype("lamp_other");
-  const auto other_authored = fixture.Prototype("lamp_other", 3U, true);
-  ASSERT_NE(direct.value().program_binding_id,
-            authored.value().program_binding_id);
-  ASSERT_EQ(direct.value().io_output_binding,
-            authored.value().io_output_binding);
-  ProductBackedRuntimeParticipantResolver resolver(
-      fixture.package.path(), fixture.bundle, *fixture.map,
-      {direct, authored, other_direct, other_authored},
-      {fixture.direct_binding->program_binding_id()}, fixture.artifacts.path());
-  for (const bool intrinsic : {false, true}) {
-    for (const auto &row :
-         std::vector<core::RuntimeParticipantBinding>{direct, other_direct}) {
-      const auto role = row.value().io_output_binding->resource_role_id.value();
-      const auto request = fixture.Operation(row, role, intrinsic);
-      ASSERT_TRUE(resolver.ValidateExecutionOrigin(request).ok());
-      const auto resolved = resolver.ResolveExecutionParticipant(request, 0U);
-      ASSERT_TRUE(resolved.ok()) << resolved.error().message;
-      EXPECT_EQ(resolved.value().binding.value().program_binding_id,
-                request.program_binding_id);
-      EXPECT_EQ(resolved.value().binding.value().io_output_binding,
-                row.value().io_output_binding);
-      EXPECT_EQ(resolved.value().intrinsic_direct_control, intrinsic);
-    }
-  }
-  const auto duplicate =
-      resolver.WithComposedParticipants({direct, authored, authored});
-  EXPECT_FALSE(
-      duplicate->Resolve(fixture.Operation(direct, "lamp", false), 0U).ok());
-  EXPECT_TRUE(
-      duplicate->Resolve(fixture.Operation(direct, "lamp", true), 0U).ok());
-}
-
-TEST(RetainedProductConsumerTest,
-     IoResolverRebindRefusesForeignProductAndAmbiguousActualChannel) {
-  Fixture fixture(true);
-  Fixture foreign(true, false, true);
-  const auto first = fixture.Prototype("lamp");
-  ProductBackedRuntimeParticipantResolver resolver(
-      fixture.package.path(), fixture.bundle, *fixture.map, {first},
-      {fixture.direct_binding->program_binding_id()}, fixture.artifacts.path());
-  EXPECT_THROW(resolver.WithComposedParticipants({foreign.Prototype("lamp")}),
-               std::invalid_argument);
-  auto duplicated = resolver.WithComposedParticipants({first, first});
-  EXPECT_FALSE(
-      duplicated->Resolve(fixture.Operation(first, "lamp", false), 0U).ok());
-  EXPECT_FALSE(
-      duplicated->Resolve(fixture.Operation(first, "lamp", true), 0U).ok());
-  auto wrong = fixture.Operation(first, "lamp", true);
-  wrong.program_id = core::ProgramId("invented.direct.identity");
-  EXPECT_FALSE(resolver.ValidateExecutionOrigin(wrong).ok());
-  EXPECT_FALSE(resolver.Resolve(wrong, 0U).ok());
-  EXPECT_FALSE(resolver
-                   .ResolveBoundTarget(*foreign.authored_binding,
-                                       core::TargetRoleId("signals"),
-                                       core::CapabilityId("io.gpio.set_output"))
-                   .ok());
 }
 
 TEST(RetainedProductConsumerTest,
@@ -10853,11 +8380,11 @@ TEST(RetainedProductConsumerTest,
 }
 
 #ifdef MANYFORGE_RETAINED_ROS2_CONTROL_TEST_FACTORY
-TEST(RetainedProductConsumerTest, PneumaticCaptureAndOutputResolverUseTheBoundIoComponent) {
+TEST(RetainedProductConsumerTest, PneumaticCaptureDeclaresTheBoundIoEffects) {
   ScopedTemporaryRoot package, artifacts;
   const auto empty_rules = deployment::parse_strict_json_model_yaml(R"({"interrupt_rules":[]})").root();
   const auto product = deployment::test::MaterializeMaintainedInterruptDeployment(
-      package.path(), empty_rules, "examples/lite6_pneumatic_mock.scenario");
+      package.path(), empty_rules, "examples/mock_lite6_pneumatic_pick_and_place.scenario");
   ASSERT_TRUE(product.model_map);
   const auto fixture = deployment::test::compile_pneumatic_program_fixture(package.path(), product);
   const auto &binding = fixture.binding->value();
@@ -10890,52 +8417,6 @@ TEST(RetainedProductConsumerTest, PneumaticCaptureAndOutputResolverUseTheBoundIo
   EXPECT_TRUE(has_effect(valve.target_role_id, "io.gpio.set_output", true));
   EXPECT_TRUE(has_effect(sensor.target_role_id, "io.gpio.wait_for_input", false));
   EXPECT_TRUE(has_effect(sensor.target_role_id, "io.gpio.get_input", false));
-
-  const auto &graph = product.bundle->value().cell_graph;
-  const auto domain = std::find_if(graph.control_domains.begin(), graph.control_domains.end(), [](const auto &row) {
-    return row.provider() && row.provider()->controllable_component_id.value() == "gripper_io";
-  });
-  ASSERT_NE(domain, graph.control_domains.end());
-  const auto &provider = *domain->provider();
-  const auto catalog = deployment::ResolveRetainedIoSignalCatalog(graph);
-  ASSERT_TRUE(catalog.ok()) << catalog.error().message;
-  std::vector<core::ResourceId> resources;
-  for (const auto &row : catalog.value())
-    if (row.descriptor.signal_id.controllable_component_id == provider.controllable_component_id &&
-        row.descriptor.output_resource) resources.push_back(*row.descriptor.output_resource);
-  std::sort(resources.begin(), resources.end());
-  resources.erase(std::unique(resources.begin(), resources.end()), resources.end());
-  const core::RuntimeEpoch epoch("actual.pneumatic.io");
-  const core::RuntimeProviderDomainConfigurationReadbackDTO closed{
-      product.bundle->retained_bundle_id(), graph.graph_revision, core::ComponentLifecycleGeneration(3U),
-      {domain->control_domain_id, domain->control_domain_revision,
-       core::ResolvedProviderDomainScopeDTO{provider, epoch, std::nullopt, resources}},
-      {domain->control_domain_id, domain->control_domain_revision, provider.provider_instance_id,
-       provider.provider_manifest_id, provider.provider_manifest_revision, provider.provider_runtime_unit_id,
-       epoch, provider.lifecycle_plan_catalog_digest}, false, 0U, 0U};
-  const auto target = deployment::resolve_runtime_program_target(
-      *fixture.binding, valve.target_role_id, core::CapabilityId("io.gpio.set_output"),
-      *product.bundle, *product.model_map);
-  auto prototype = core::verify_runtime_participant_binding(deployment::build_runtime_io_output_binding_dto(
-      target, valve.resource_role_id, *product.bundle, closed));
-  ASSERT_TRUE(prototype.ok()) << prototype.error().message;
-  ProductBackedRuntimeParticipantResolver resolver(package.path(), product.bundle, *product.model_map,
-      {prototype.value()}, {}, artifacts.path());
-  const auto schema = core::builtin_io_signal_write_command_schema();
-  const auto &target_row = target.target_role();
-  core::OperationIntentDTO operation{
-      {core::RequestId("pneumatic.output"), core::RequestOwnerEpoch("kernel"), "test", {}},
-      binding.program_id, binding.program_revision, binding.program_binding_id, core::ProgramRunId("run.pneumatic"),
-      graph.graph_revision, product.bundle->retained_bundle_id(), std::nullopt,
-      {{target_row.component_role_id, target_row.target_role_id, core::CapabilityId("io.gpio.set_output"), {},
-        core::CapabilityCommandIntentDTO{schema.command_schema_id, schema.command_schema_revision,
-            core::IoSignalWriteCommandValueDTO{valve.resource_role_id, true}, std::nullopt, {}},
-        core::ProgramNodeExecutionScopeDTO{core::ProgramNodeInstanceId("close_0"), "attempt.1"}}}};
-  ASSERT_TRUE(resolver.ValidateExecutionOrigin(operation).ok());
-  const auto resolved = resolver.ResolveExecutionParticipant(operation, 0U);
-  ASSERT_TRUE(resolved.ok()) << resolved.error().message;
-  EXPECT_EQ(resolved.value().binding.value().controllable_component_id.value(), "gripper_io");
-  EXPECT_EQ(resolved.value().binding.value().io_output_binding->signal.signal_id.name, "valve");
 }
 
 // B7 [C-QB7]: a frame's component is always its owner. On the maintained
@@ -11187,12 +8668,6 @@ TEST(RetainedProductConsumerTest,
       request, nullptr, fixture.authored_binding, *fixture.bundle);
   ASSERT_FALSE(missing_program.ok());
   EXPECT_EQ(missing_program.error().details.at("reason"),
-            "program_capture_source_unavailable");
-  Fixture other(true);
-  const auto wrong_program = detail::ResolveSealedProgramCapture(
-      request, other.program, fixture.authored_binding, *fixture.bundle);
-  ASSERT_FALSE(wrong_program.ok());
-  EXPECT_EQ(wrong_program.error().details.at("reason"),
             "program_capture_source_unavailable");
 }
 

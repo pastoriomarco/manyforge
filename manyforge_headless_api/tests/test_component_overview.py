@@ -5,7 +5,22 @@ from typing import Any
 
 import pytest
 
+from manyforge_headless_api.component_model import ComponentModel, parse_component_model
 from manyforge_headless_api.component_overview import build_component_overview
+
+
+def _model(*states: dict[str, Any]) -> ComponentModel:
+    return parse_component_model({
+        "component_states": list(states),
+        "cell_latch": {"latched": False, "causes": []},
+        "signal_samples": [],
+        "rule_holds": [],
+    })
+
+
+def _component(component_id: str, lifecycle: str = "enabled", **extra: Any) -> dict[str, Any]:
+    return {"component_id": component_id, "lifecycle": lifecycle, "activity": "idle",
+            "streams": [], "capabilities": [], "observed_at_ns": 1, **extra}
 
 
 def _source(owner: str, *, generation: int = 1) -> dict[str, Any]:
@@ -53,7 +68,7 @@ def _facts() -> dict[str, Any]:
                         "converged": True,
                         "desired_units": [{
                             "runtime_unit_id": "robot.native",
-                            "runtime_profile_id": "manyforge.native_execution_runtime",
+                            "runtime_profile_id": "manyforge.ros2_control_execution_runtime",
                             "selected_runtime_contract_offer_digest": offer,
                         }],
                         "observed_units": [{
@@ -150,6 +165,7 @@ def _facts() -> dict[str, Any]:
         "execution_identity_response": identity,
         "execution_targets_response": targets,
         "execution_control_response": control,
+        "component_model": _model(_component("robot-a")),
         "errors": {},
     }
 
@@ -243,7 +259,6 @@ def test_admitted_maintenance_exposes_one_stable_reason_without_hiding_faults() 
     assert _by_id(overview)["manager"]["reason_code"] == (
         "planned_maintenance_in_progress"
     )
-    assert _by_id(overview)["runtime_unit:robot.native"]["status"] == "waiting"
     assert "Controls remain disabled" in overview["user_message"]
 
     facts["source_model"]["source"]["freshness"] = "stale"
@@ -256,9 +271,6 @@ def test_admitted_maintenance_exposes_one_stable_reason_without_hiding_faults() 
     manager["apply"]["records"] = []
     outside_maintenance = build_component_overview(**facts)
     assert outside_maintenance["maintenance_operation"] is None
-    assert _by_id(outside_maintenance)["runtime_unit:robot.native"]["status"] == (
-        "fault"
-    )
 
     manager["apply"]["records"] = [{
         "apply_id": "apply-2",
@@ -269,7 +281,6 @@ def test_admitted_maintenance_exposes_one_stable_reason_without_hiding_faults() 
     }]
     before_admission = build_component_overview(**facts)
     assert before_admission["maintenance_operation"] is None
-    assert _by_id(before_admission)["runtime_unit:robot.native"]["status"] == "fault"
 
     manager["apply"]["records"][0].update({
         "phase": "runtime_convergence_pending",
@@ -277,7 +288,6 @@ def test_admitted_maintenance_exposes_one_stable_reason_without_hiding_faults() 
     })
     unrelated_scope = build_component_overview(**facts)
     assert unrelated_scope["maintenance_operation"] is None
-    assert _by_id(unrelated_scope)["runtime_unit:robot.native"]["status"] == "fault"
 
 
 def test_returned_attention_does_not_relabel_health_but_active_fault_does() -> None:
@@ -391,6 +401,7 @@ def _empty_facts(canonical_empty: bool = True) -> dict[str, Any]:
     runtime.update(active_graph_revision=active["graph_revision"],
                    active_retained_bundle_id=active["retained_bundle_id"])
     manager["apply"] = {"records": []}
+    facts["component_model"] = _model()
     facts["applied_program"] = None
     facts["program_cycle"]["state"] = "idle_after_reset"
     facts["errors"]["applied_program"] = {
@@ -426,7 +437,7 @@ def _warm_empty_facts(canonical_empty: bool = True) -> dict[str, Any]:
             "schema_version": "manyforge.execution_control_state.v6",
             "observed_targets": [], "manual_operations": [], "runtime_scale_control": None,
             "cell_stop_action": {"available": True, "expected_stop_generation": 0,
-                                 "fault": None, "latest_terminal": None,
+                                 "latest_terminal": None,
                                  "unavailable_reason": None},
         },
     }
@@ -456,8 +467,7 @@ def test_verified_empty_publication_has_no_required_equipment_faults(canonical_e
         assert rows[key]["required"] is False
         assert rows[key]["status"] == ("not_applicable" if key in neutral else "offline")
         assert rows[key]["detail"] == ("No robot in this Scenario" if key in neutral else "No components")
-    assert rows["runtime_unit:robot.native"]["required"] is True
-    assert rows["runtime_unit:robot.native"]["status"] == "healthy"
+    assert not any(key.startswith(("component:", "runtime_unit:")) for key in rows)
     assert rows["observe_render"]["status"] == "healthy"
     assert facts == captured
     assert build_component_overview(**facts) == overview
@@ -503,7 +513,7 @@ def test_unverified_empty_keeps_the_existing_reduction(path, value, canonical_em
 
 
 @pytest.mark.parametrize("fault", [
-    "logical_scene", "scene_runtime", "source_model", "runtime_unit",
+    "logical_scene", "scene_runtime", "source_model", "component",
     "program_cycle", "authoring_admission", "alarms", "applied_program",
     "execution_identity", "execution_targets", "execution_control",
 ])
@@ -515,8 +525,10 @@ def test_empty_publication_does_not_hide_actual_source_or_owner_errors(fault, ca
         facts["runtime"]["sections"][fault]["available"] = False
     elif fault == "source_model":
         facts[fault]["source"]["freshness"] = "stale"
-    elif fault == "runtime_unit":
-        facts["runtime"]["sections"]["manager"]["payload"]["runtime"]["observed_units"][0]["source_health"] = "unavailable"
+    elif fault == "component":
+        facts["component_model"] = _model(_component("io", "fault", fault={
+            "code": "fault_communication", "message": "link lost", "clearable": True,
+            "operator_action": "recover", "since_ns": 1}))
     elif fault == "alarms":
         facts["alarms"].update(active_count=1, motion_attention_count=1)
     else:
@@ -542,7 +554,6 @@ def test_empty_publication_does_not_hide_actual_source_or_owner_errors(fault, ca
     (("execution_control_response", "control_state", "manual_operations"), [{}]),
     (("execution_control_response", "control_state", "runtime_scale_control"), {}),
     (("execution_control_response", "control_state", "cell_stop_action", "available"), False),
-    (("execution_control_response", "control_state", "cell_stop_action", "fault"), {"code": "stop_failed"}),
 ])
 def test_warm_empty_requires_current_matching_fault_free_owner_projections(path, value) -> None:
     facts = _warm_empty_facts()

@@ -1,6 +1,6 @@
 #pragma once
 
-#include <manyforge_core/types/io_rule_recovery.hpp>
+#include <manyforge_core/types/io_motion_rule.hpp>
 #include <manyforge_core/types/operation_runtime.hpp>
 #include <span>
 #include <string>
@@ -27,12 +27,5 @@ namespace manyforge::core {
 [[nodiscard]] Result<void> ValidateIoRuleOutcomeParticipant(
     const OperationId& operation_id, OperationRevision operation_revision,
     const OperationParticipantStateDTO& participant);
-
-/// Closed durable global recovery authorization, independent of operation
-/// outcomes and actual rule-state mirror events. Accepts activation scope only.
-[[nodiscard]] Result<std::string> EncodeIoGlobalRuleRecoveryRecord(
-    const IoGlobalRuleRecoveryRecordDTO& record);
-[[nodiscard]] Result<IoGlobalRuleRecoveryRecordDTO> DecodeIoGlobalRuleRecoveryRecord(
-    std::string_view canonical_json);
 
 }  // namespace manyforge::core

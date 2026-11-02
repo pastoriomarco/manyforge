@@ -503,6 +503,8 @@ Result<PickPoseCandidateDTO> PickCandidateGrid::candidate(
   result.descend_path.waypoints = {result.approach_pose, result.pick_pose};
   result.retreat_path = retreat_path_template_;
   result.retreat_path.waypoints = {result.pick_pose, result.retreat_pose};
+  result.descend_path.blend_radii_m = {0.0, 0.0};
+  result.retreat_path.blend_radii_m = {0.0, 0.0};
   return Result<PickPoseCandidateDTO>::Ok(std::move(result));
 }
 

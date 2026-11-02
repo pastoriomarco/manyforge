@@ -40,12 +40,6 @@ import { OperationProgress } from './OperationProgress';
 import { GizmoSteps, StepSelect, useGizmoSettings } from './common/GizmoControls';
 import type { GizmoController } from './common/GizmoControls';
 import { ANGULAR_STEP_OPTIONS } from '../utils/gizmo';
-import {
-  allUncertainOutputsApproved,
-  uncertainOutputKey,
-  uncertainOutputs,
-} from '../utils/uncertainOutputs';
-import { UncertainOutputConfirmation } from './UncertainOutputConfirmation';
 
 const RAD_TO_DEG = 180 / Math.PI;
 const DEG_TO_RAD = Math.PI / 180;
@@ -229,7 +223,7 @@ function ManualMotionSettingsControls({ controller, disabled }: {
   type MotionSettingField = {
     key: Exclude<keyof ManualMotionSettings, 'jointLimits' | 'clearanceM'>;
     label: string; fullLabel: string; unit: string; factor: number; step: number;
-    min?: number; max?: number;
+    max?: number;
   };
   const commonFields: MotionSettingField[] = [
     { key: 'velocityScale', label: 'Vel. (%)', fullLabel: 'Velocity scale (%)', unit: '%', factor: 100, step: 5, max: 100 },
@@ -242,13 +236,12 @@ function ManualMotionSettingsControls({ controller, disabled }: {
     { key: 'tcpAngularAccelerationRadS2', label: 'Ang. Acc. (deg/s²)', fullLabel: 'TCP angular acceleration (deg/s²)', unit: 'deg/s²', factor: RAD_TO_DEG, step: 10 },
     { key: 'cartesianTranslationToleranceM', label: 'Lin. Tol. (m)', fullLabel: 'Cartesian linear path tolerance (m)', unit: 'm', factor: 1, step: 0.001 },
     { key: 'cartesianRotationToleranceRad', label: 'Rot. Tol. (deg)', fullLabel: 'Cartesian rotation path tolerance (deg)', unit: 'deg', factor: RAD_TO_DEG, step: 0.5 },
-    { key: 'cartesianMaxBlendDeviationRad', label: 'Blend (rad)', fullLabel: 'Maximum Cartesian joint-path blend deviation (rad); zero disables blending', unit: 'rad', factor: 1, step: 0.005, min: 0 },
   ] : [];
-  const settingControl = ({ key, label, fullLabel, unit, factor, step, min, max }: MotionSettingField) => (
+  const settingControl = ({ key, label, fullLabel, unit, factor, step, max }: MotionSettingField) => (
     <label key={key} title={fullLabel}>
       <span>{label}</span>
       <RobotNumberInput label={`Manual ${fullLabel}`} value={settings[key] * factor}
-        min={min ?? (key.endsWith('Scale') ? 1 : 0.000001)} max={max} step={step}
+        min={key.endsWith('Scale') ? 1 : 0.000001} max={max} step={step}
         disabled={disabled} limitUnit={unit} hint={fullLabel}
         onCommit={(value) => editMotionSettings({ [key]: value / factor })} />
     </label>
@@ -269,7 +262,7 @@ function ManualMotionSettingsControls({ controller, disabled }: {
         </p>
       )}
       <details className="robot-control-joint-settings">
-        <summary title="Cartesian path fidelity, smoothing and optional tighter per-joint limits.">Advanced</summary>
+        <summary title="Cartesian path fidelity and optional tighter per-joint limits.">Advanced</summary>
         {advancedFields.length > 0 && <div className="robot-control-advanced-settings-grid">
           {advancedFields.map(settingControl)}
         </div>}
@@ -429,34 +422,15 @@ export function RobotControlPanelView({
     if (canStop) stopButton.current?.focus();
   }, [canStop]);
   const recoveryRequired = manualOperationRequiresRecovery(state.operation);
-  // Contract 66: an output with unknown acceptance is released only by a
-  // targeted Reset that acknowledges it explicitly.
-  const operationUncertainOutputs = useMemo(
-    () => uncertainOutputs(state.operation === null ? [] : [state.operation]),
-    [state.operation],
-  );
-  const [approvedUncertain, setApprovedUncertain] = useState<ReadonlySet<string>>(() => new Set());
-  const uncertainApproved = allUncertainOutputsApproved(operationUncertainOutputs, approvedUncertain);
   const resetOperationControl = (
     <>
-      <UncertainOutputConfirmation outputs={operationUncertainOutputs} approved={approvedUncertain}
-        disabled={controlPending !== null}
-        onToggle={(key, approved) => setApprovedUncertain((current) => {
-          const next = new Set(current);
-          if (approved) next.add(key); else next.delete(key);
-          return next;
-        })} />
       <button
         type="button"
         disabled={!enabled || controller.currentStatus == null || state.operation?.resident !== true
-          || !operationStateIsTerminal(state.operation.state) || controlPending !== null || !uncertainApproved}
+          || !operationStateIsTerminal(state.operation.state) || controlPending !== null}
         aria-label="Reset operation"
-        title={uncertainApproved
-          ? 'Release this exact terminal direct operation after the owner has certified containment.'
-          : 'Confirm each output with unknown acceptance first.'}
-        onClick={() => {
-          void reset(operationUncertainOutputs.filter((output) => approvedUncertain.has(uncertainOutputKey(output))));
-        }}
+        title="Release this exact terminal direct operation after the owner has certified containment."
+        onClick={() => { void reset(); }}
       >{controlPending === 'reset' ? 'Sending Reset' : 'Reset operation'}</button>
     </>
   );

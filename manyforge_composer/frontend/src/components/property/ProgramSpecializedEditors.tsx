@@ -1070,6 +1070,42 @@ function JointTargetListEditor({
   );
 }
 
+/** Optional per-waypoint corner blend radius; empty omits it so the node's value applies. */
+function WaypointBlendRadiusField({
+  label,
+  value,
+  disabled,
+  onCommit,
+}: {
+  label: string;
+  value: JsonValue | undefined;
+  disabled: boolean;
+  onCommit: (value: number | undefined) => void;
+}) {
+  const reportInvalid = useSpecializedInvalidReporter();
+  return (
+    <label className="program-specialized-number">
+      <span>Corner blend radius (m)</span>
+      <DraftTextInput
+        type="number"
+        step="any"
+        min={0}
+        value={typeof value === 'number' ? value : ''}
+        disabled={disabled}
+        aria-label={label}
+        placeholder="Node value"
+        title="Empty uses the node's corner blend radius; 0 keeps this corner exact."
+        validate={(text) => text.trim() === ''
+          || (Number.isFinite(Number(text)) && Number(text) >= 0)
+          ? null
+          : `${label} must be a non-negative number.`}
+        onInvalidChange={reportInvalid}
+        onCommit={(text) => onCommit(text.trim() === '' ? undefined : Number(text))}
+      />
+    </label>
+  );
+}
+
 function CartesianPathEditor({
   schema,
   value,
@@ -1084,6 +1120,7 @@ function CartesianPathEditor({
   onCommit: ValueCommit;
 }) {
   const itemSchema = schema.items ?? {};
+  const hasBlendRadius = itemSchema.properties?.blend_radius_m !== undefined;
   return (
     <div className="program-specialized-editor" data-editor="cartesian-path">
       {value.map((waypoint, index) => {
@@ -1107,6 +1144,21 @@ function CartesianPathEditor({
             {waypointPath === undefined
               ? editor
               : <SourceableValue path={waypointPath} schema={itemSchema}>{editor}</SourceableValue>}
+            {hasBlendRadius && (
+              <WaypointBlendRadiusField
+                label={`Waypoint ${index + 1} corner blend radius (m)`}
+                value={objectValue(waypoint).blend_radius_m}
+                disabled={disabled}
+                onCommit={(radius) => {
+                  const nextWaypoint = { ...objectValue(waypoint) };
+                  if (radius === undefined) delete nextWaypoint.blend_radius_m;
+                  else nextWaypoint.blend_radius_m = radius;
+                  const next = [...value];
+                  next[index] = nextWaypoint;
+                  onCommit(next);
+                }}
+              />
+            )}
             <button
               type="button"
               className="text-button"

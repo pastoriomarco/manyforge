@@ -59,7 +59,7 @@ def test_source_identity_round_trip_and_fingerprint(source_factory):
 
 
 def test_configuration_digest_uses_exact_json_ready_preimage(configuration_factory):
-    configuration = configuration_factory(profile=LaunchProfile.NATIVE)
+    configuration = configuration_factory(profile=LaunchProfile.STANDARD)
     assert LaunchConfiguration.model_validate_json(configuration.model_dump_json()) == configuration
     payload = configuration.model_dump(mode="json", exclude={"configuration_digest"})
     assert configuration_digest(payload) == configuration.configuration_digest
@@ -79,7 +79,7 @@ def test_configuration_digest_uses_exact_json_ready_preimage(configuration_facto
 
 
 def test_native_and_isaac_configuration_rules(configuration_factory):
-    native = configuration_factory(profile=LaunchProfile.NATIVE)
+    native = configuration_factory(profile=LaunchProfile.STANDARD)
     isaac = configuration_factory(profile=LaunchProfile.ISAAC)
     assert native.ros_topology is None
     assert isaac.ros_topology is not None
@@ -541,7 +541,7 @@ def test_contract_schema_is_closed_discriminated_and_stable():
     }
     assert rfc8785.dumps(first) == rfc8785.dumps(second)
     assert hashlib.sha256(rfc8785.dumps(first)).hexdigest() == (
-        "89400fdfa3f72a5553f0e094432d1fb7870a5d0a64dc9c8f1660f0fc3e4e996b"
+        "604b04b9daca51130fc8450f112cc851bf03fedee769163f456e2654bb8a716d"
     )
 
 

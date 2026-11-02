@@ -21,7 +21,7 @@ static_assert(!std::is_aggregate_v<QualifiedCommandSchema>);
 static_assert(!std::is_default_constructible_v<QualifiedCommandSchema>);
 
 inline constexpr std::string_view kCommandSchemaClosedSchemaRevision =
-    "sha256:fdce9bb1facd259bde85f502197fd534dc05346a030605a55aa951d9e88c73dd";
+    "sha256:4f23fe66c0dd587d998a52a7b166bddd22d7ab8e5b28caacc48373ff373dcd84";
 
 [[nodiscard]] std::string read_command_schema() {
   const auto path = std::filesystem::path(MANYFORGE_DEPLOYMENT_RESOURCE_DIR) /
@@ -204,54 +204,8 @@ TEST(CommandSchemaCodec, RejectsOpenStaleAndNonBuiltinSemanticContent) {
                CommandSchemaCodecError);
 }
 
-[[nodiscard]] std::string read_output_command_schema() {
-  std::ifstream input(std::filesystem::path(MANYFORGE_DEPLOYMENT_RESOURCE_DIR) /
-                          "catalog" / "io.signal_write_boolean.v1.yaml",
-                      std::ios::binary);
-  if (!input)
-    throw std::runtime_error("unable to open output command schema");
-  std::ostringstream bytes;
-  bytes << input.rdbuf();
-  return bytes.str();
-}
-
-[[nodiscard]] core::CommandSchemaCatalogRecordRefDTO
-output_schema_reference(std::string_view bytes,
-                        const core::ContentAddressedStoreKey &key) {
-  return {
-      core::CommandSchemaId(std::string(core::kIoSignalWriteCommandSchemaId)),
-      core::CommandSchemaRevision(
-          std::string(core::kIoSignalWriteCommandSchemaRevision)),
-      core::SchemaId(std::string(core::kCommandSchemaApiVersion)),
-      core::SchemaRevision(std::string(kCommandSchemaClosedSchemaRevision)),
-      core::ContentDigest(sha256_digest(bytes)),
-      key};
-}
-
-TEST(CommandSchemaCodec,
-     QualifiesBooleanOutputWithoutInventedFeedbackOrStopPolicy) {
-  const auto bytes = read_output_command_schema();
-  const core::ContentAddressedStoreKey key("sha256/io-output-schema");
-  const auto qualified = resolve_and_qualify_command_schema(
-      output_schema_reference(bytes, key), key, bytes);
-  EXPECT_EQ(qualified.value(), core::builtin_io_signal_write_command_schema());
-  EXPECT_TRUE(
-      std::holds_alternative<core::IoSignalWriteCommandValueContractDTO>(
-          qualified.value().command_value));
-  EXPECT_FALSE(qualified.value().completion_rule);
-  EXPECT_FALSE(qualified.value().confirmation_rule);
-  EXPECT_TRUE(qualified.value().stop_evidence_requirements.empty());
-}
-
-TEST(
-    CommandSchemaCodec,
-    BooleanBranchRejectsAuthoredCompletionAndGripperBranchKeepsRequiredFields) {
-  const core::ContentAddressedStoreKey key("sha256/io-output-closed-negative");
-  auto output = read_output_command_schema();
-  output.append("completion_rule: goal_fenced_target_reached\n");
-  EXPECT_THROW(resolve_and_qualify_command_schema(
-                   output_schema_reference(output, key), key, output),
-               ClosedSchemaError);
+TEST(CommandSchemaCodec, GripperBranchKeepsRequiredFields) {
+  const core::ContentAddressedStoreKey key("sha256/gripper-required-fields");
   const auto original = read_command_schema();
   for (const std::string field :
        {"completion_rule: goal_fenced_target_reached\n",
@@ -265,27 +219,6 @@ TEST(
                      command_schema_reference(missing, key), key, missing),
                  ClosedSchemaError);
   }
-}
-
-TEST(CommandSchemaCodec, BooleanBranchRejectsCrossFamilyAndStaleValue) {
-  const core::ContentAddressedStoreKey key("sha256/io-output-cross-negative");
-  auto bytes = read_output_command_schema();
-  const auto position = bytes.find("value_kind: io_signal_write");
-  ASSERT_NE(position, std::string::npos);
-  bytes.replace(position, std::string("value_kind: io_signal_write").size(),
-                "value_kind: gripper_position");
-  EXPECT_THROW(resolve_and_qualify_command_schema(
-                   output_schema_reference(bytes, key), key, bytes),
-               ClosedSchemaError);
-  auto stale = read_output_command_schema();
-  const auto id = stale.find("command_schema_id: io.signal_write_boolean");
-  ASSERT_NE(id, std::string::npos);
-  stale.replace(
-      id, std::string("command_schema_id: io.signal_write_boolean").size(),
-      "command_schema_id: io.other_boolean");
-  EXPECT_THROW(resolve_and_qualify_command_schema(
-                   output_schema_reference(stale, key), key, stale),
-               CommandSchemaCodecError);
 }
 
 } // namespace

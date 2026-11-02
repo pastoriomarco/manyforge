@@ -169,8 +169,8 @@ struct OperatorAlarmRecord final {
 };
 
 /// Whether `record` is a motion-attention member: a motion-attention
-/// definition that requires acknowledgement gates while unacknowledged; one
-/// that does not gates exactly while active.
+/// definition (a condition interlock, which never requires acknowledgement)
+/// gates exactly while active. Acknowledgement never gates work (V2-5).
 [[nodiscard]] bool GatesMotion(const OperatorAlarmRecord &record) noexcept;
 
 struct AlarmLifecycleFact final {
@@ -272,9 +272,6 @@ struct OperatorAlarmSnapshot final {
   std::int64_t timestamp_ns;
 };
 
-/// One record that gates motion (`GatesMotion`) with its canonical subject.
-/// A condition interlock (`acknowledgement_required=false`) gates exactly
-/// while active; any other record gates while unacknowledged.
 struct AlarmConfigurationIdentity final {
   std::string retained_bundle_id;
   std::string graph_revision;
@@ -283,9 +280,10 @@ struct AlarmConfigurationIdentity final {
                          const AlarmConfigurationIdentity &) = default;
 };
 
+/// One record that gates motion (`GatesMotion`) with its canonical subject:
+/// a condition interlock, exactly while active.
 struct AlarmMotionAttentionGate final {
   AlarmAcknowledgementMember acknowledgement;
-  bool condition_interlock;
   AlarmSubject subject;
 };
 

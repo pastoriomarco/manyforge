@@ -6,7 +6,7 @@
 #include <utility>
 
 #include <manyforge_deployment/verified_retained_bundle.hpp>
-#include "native_execution_runtime_unit_internal.hpp"
+#include "execution_host_unit_internal.hpp"
 
 namespace manyforge::deployment {
 namespace {
@@ -52,7 +52,7 @@ detail::select_native_component_configuration(
     }
     if (!motion_components.insert(binding.controllable_component_id).second) {
       throw RetainedBundleError(
-          "native runtime supports at most one motion target per component: " +
+          "execution host supports at most one motion target per component: " +
           binding.controllable_component_id.value());
     }
   }
@@ -93,66 +93,4 @@ detail::select_native_component_configuration(
   return result;
 }
 
-// DX-753: keep the exact held per-component identity projection.
-namespace native_execution_runtime_contract {
-
-Configuration require_component_configuration(
-    const RetainedBundle &bundle, const core::RuntimeUnitId &runtime_unit_id,
-    const core::ControllableComponentId &component_id) {
-  return detail::select_native_component_configuration(
-      require_configuration(bundle, runtime_unit_id), bundle.value().cell_graph,
-      runtime_unit_id, component_id);
-}
-
-CanonicalValue component_configuration_projection(
-    const RetainedBundle &bundle, const core::RuntimeUnitId &runtime_unit_id,
-    const core::ControllableComponentId &component_id) {
-  const auto selected =
-      require_component_configuration(bundle, runtime_unit_id, component_id);
-  const auto *graph = bundle.normalized_root().find_object_member("cell_graph");
-  const auto *units =
-      graph == nullptr ? nullptr : graph->find_object_member("runtime_units");
-  if (units == nullptr || !units->is_array()) {
-    Fail("native component configuration lacks its verified graph projection");
-  }
-  for (const auto &unit : units->as_array()) {
-    const auto *id = unit.find_object_member("runtime_unit_id");
-    if (id == nullptr || !id->is_string() ||
-        id->as_string() != runtime_unit_id.value()) {
-      continue;
-    }
-    const auto *configuration = unit.find_object_member("configuration");
-    if (configuration == nullptr || !configuration->is_object()) {
-      Fail("native component configuration lacks its verified settings");
-    }
-    auto result = configuration->as_object();
-    for (auto &[name, value] : result) {
-      if (name == "initial_joint_positions_rad") {
-        CanonicalValue::Array positions;
-        for (const auto position : selected.initial_joint_positions_rad) {
-          positions.emplace_back(position);
-        }
-        value = CanonicalValue(std::move(positions));
-      } else if (name == "motion_target_limits" ||
-                 name == "direct_control_joint_limits" ||
-                 name == "gripper_target_configurations") {
-        CanonicalValue::Array rows;
-        for (const auto &row : value.as_array()) {
-          const auto *owner = row.find_object_member("controllable_component_id");
-          if (owner == nullptr || !owner->is_string()) {
-            Fail("native target configuration has no component owner");
-          }
-          if (owner->as_string() == component_id.value()) {
-            rows.push_back(row);
-          }
-        }
-        value = CanonicalValue(std::move(rows));
-      }
-    }
-    return CanonicalValue(std::move(result));
-  }
-  Fail("native component configuration has no runtime projection");
-}
-
-} // namespace native_execution_runtime_contract
 } // namespace manyforge::deployment

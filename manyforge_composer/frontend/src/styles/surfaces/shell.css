@@ -550,21 +550,29 @@
   justify-content: center;
   padding-inline: 1.22rem;
   overflow: visible;
+}
+
+/* Components and Deployment are tinted by their status, one palette for both. */
+.workspace-switcher button.deployment-status-button,
+.workspace-switcher button.components-status-button {
   border-color: color-mix(in srgb, var(--deployment-tone-border, var(--mf-border-neutral-35)) 55%, var(--mf-border-neutral-27));
   background: color-mix(in srgb, var(--deployment-tone-bg, var(--mf-bg-neutral-20)) 40%, var(--mf-bg-neutral-11));
 }
 
-.workspace-switcher .deployment-status-button.readiness-ready {
+.workspace-switcher .deployment-status-button.readiness-ready,
+.workspace-switcher .components-status-button.readiness-ready {
   --deployment-tone-border: var(--mf-border-success-40);
   --deployment-tone-bg: var(--mf-bg-success-24);
 }
 
-.workspace-switcher .deployment-status-button.readiness-degraded {
+.workspace-switcher .deployment-status-button.readiness-degraded,
+.workspace-switcher .components-status-button.readiness-degraded {
   --deployment-tone-border: var(--mf-border-warning-43);
   --deployment-tone-bg: var(--mf-bg-warning-27b);
 }
 
-.workspace-switcher .deployment-status-button.readiness-fault {
+.workspace-switcher .deployment-status-button.readiness-fault,
+.workspace-switcher .components-status-button.readiness-fault {
   --deployment-tone-border: var(--mf-border-danger-49);
   --deployment-tone-bg: var(--mf-bg-danger-30);
 }
@@ -574,12 +582,14 @@
   --deployment-tone-bg: var(--mf-bg-danger-21);
 }
 
-.workspace-switcher .deployment-status-button.readiness-waiting {
+.workspace-switcher .deployment-status-button.readiness-waiting,
+.workspace-switcher .components-status-button.readiness-waiting {
   --deployment-tone-border: var(--mf-border-neutral-35);
   --deployment-tone-bg: var(--mf-bg-neutral-20);
 }
 
-.workspace-switcher button.deployment-status-button.active {
+.workspace-switcher button.deployment-status-button.active,
+.workspace-switcher button.components-status-button.active {
   border-color: var(--mf-border-accent-64);
   color: var(--mf-text-neutral-94b);
   background: var(--deployment-tone-bg, var(--mf-bg-neutral-20));

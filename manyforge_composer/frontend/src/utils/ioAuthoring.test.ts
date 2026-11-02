@@ -48,6 +48,24 @@ describe('io node authoring', () => {
     expect(ioSignalRoleChoices('io.set_output', 'gripper', binding)).toEqual([]);
   });
 
+  it('nests an eligible output\'s changed-outside signal under it, and offers it to Clear outside change', () => {
+    const bound = {
+      target_role_bindings: [{ target_role_id: 'arm', controllable_component_id: 'robot', signal_role_bindings: [
+        signal('lamp', 'DO1', 'output'), signal('horn', 'DO2', 'output'), signal('part_present', 'DI0', 'input'),
+      ] }],
+    } as unknown as ProgramBindingDocument;
+    const eligible = new Set(['robot/DO1']);
+    expect(ioSignalRoleChoices('io.check_input', 'arm', bound, undefined, [], eligible)).toEqual([
+      { value: 'part_present', label: 'part_present · DI0 (input)', group: 'arm input signals' },
+      { value: 'lamp.changed_outside', label: 'lamp · DO1 → changed outside', group: 'arm output signals' },
+    ]);
+    expect(ioSignalRoleChoices('io.clear_outside_change', 'arm', bound, undefined, [], eligible)).toEqual([
+      { value: 'lamp', label: 'lamp · DO1 (output)', group: 'arm outputs with changed outside' },
+    ]);
+    // Without an eligible output nothing is added.
+    expect(ioSignalRoleChoices('io.check_input', 'arm', bound)).toHaveLength(1);
+  });
+
   it('offers the generated carried-object-lost input for a required target role before Apply', () => {
     const systemSignal = {
       controllableComponentId: 'robot', commandTargetId: 'gripper',

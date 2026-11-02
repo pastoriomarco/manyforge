@@ -1,0 +1,469 @@
+{
+  "api_version": "manyforge.deployment_intent.v2",
+  "assistant_profile_id": null,
+  "attachments": [
+    {
+      "child": {
+        "component_id": "lite_gripper",
+        "interface": "mount"
+      },
+      "collision_exclusions": [
+        {
+          "child_link": "lite_gripper_base_link",
+          "parent_link": "link5"
+        },
+        {
+          "child_link": "lite_gripper_left_finger",
+          "parent_link": "link4"
+        },
+        {
+          "child_link": "lite_gripper_left_finger",
+          "parent_link": "link5"
+        },
+        {
+          "child_link": "lite_gripper_left_finger",
+          "parent_link": "link6"
+        },
+        {
+          "child_link": "lite_gripper_left_finger",
+          "parent_link": "link_eef"
+        },
+        {
+          "child_link": "lite_gripper_right_finger",
+          "parent_link": "link4"
+        },
+        {
+          "child_link": "lite_gripper_right_finger",
+          "parent_link": "link5"
+        },
+        {
+          "child_link": "lite_gripper_right_finger",
+          "parent_link": "link6"
+        },
+        {
+          "child_link": "lite_gripper_right_finger",
+          "parent_link": "link_eef"
+        }
+      ],
+      "parent": {
+        "component_id": "lite6_robot",
+        "interface": "flange"
+      }
+    }
+  ],
+  "compatibility": {
+    "lane": "manyforge-only",
+    "provides": [
+      "lite_gripper"
+    ],
+    "tags": [
+      "lite6",
+      "r5-live-trial"
+    ]
+  },
+  "components": [
+    {
+      "component_id": "lite6",
+      "component_profile_id": "ufactory.lite6_machine",
+      "configuration": {},
+      "lane": "mock"
+    },
+    {
+      "component_id": "lite6_robot",
+      "component_profile_id": "ufactory.lite6",
+      "configuration": {
+        "default_fault_stop_profile": {
+          "deceleration_time_s": 1.0,
+          "per_joint_max_deceleration_rad_s2": {
+            "joint1": 10.0,
+            "joint2": 10.0,
+            "joint3": 10.0,
+            "joint4": 10.0,
+            "joint5": 10.0,
+            "joint6": 10.0
+          },
+          "profile_id": "fault_spring_back_fast",
+          "require_backend_confirmation": true,
+          "stop_mode": "spring_back_fast"
+        },
+        "runtime_configuration": {
+          "collision_monitor_period_ms": 50.0,
+          "component_streams": [
+            {
+              "budget_ns": 250000000,
+              "controllable_component_id": "lite6_robot",
+              "stream_id": "measured_joints"
+            }
+          ],
+          "execution_tick_hz": 100,
+          "initial_joint_positions_rad": [
+            0.0,
+            0.0,
+            1.57,
+            0.0,
+            0.0,
+            0.0
+          ],
+          "planner_rng_seed": 12345
+        },
+        "runtime_kind": "ros2_control"
+      },
+      "frame_prefix": "",
+      "model_source": {
+        "package_roots": {
+          "manyforge_example_models": {
+            "project_path": "../../manyforge_example_models"
+          }
+        },
+        "srdf": {
+          "project_path": "../../manyforge_example_models/models/lite6/lite6.srdf"
+        },
+        "urdf": {
+          "project_path": "../../manyforge_example_models/models/lite6/lite6.urdf"
+        }
+      },
+      "owner": "lite6",
+      "role": "arm",
+      "root_pose_in_cell": {
+        "orientation_xyzw": [
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "position_m": [
+          0.0,
+          0.0,
+          0.0
+        ]
+      },
+      "target_settings": {
+        "arm": {
+          "controlled_stop": {
+            "allow_natural_completion_on_short_path": false,
+            "deceleration_time_s": 1.0,
+            "jerk_limits_enabled": true,
+            "per_joint_limits": [
+              {
+                "max_deceleration_rad_s2": 10.0,
+                "settle_velocity_threshold_rad_s": 0.01,
+                "source_joint_name": "joint1"
+              },
+              {
+                "max_deceleration_rad_s2": 10.0,
+                "settle_velocity_threshold_rad_s": 0.01,
+                "source_joint_name": "joint2"
+              },
+              {
+                "max_deceleration_rad_s2": 10.0,
+                "settle_velocity_threshold_rad_s": 0.01,
+                "source_joint_name": "joint3"
+              },
+              {
+                "max_deceleration_rad_s2": 10.0,
+                "settle_velocity_threshold_rad_s": 0.01,
+                "source_joint_name": "joint4"
+              },
+              {
+                "max_deceleration_rad_s2": 10.0,
+                "settle_velocity_threshold_rad_s": 0.01,
+                "source_joint_name": "joint5"
+              },
+              {
+                "max_deceleration_rad_s2": 10.0,
+                "settle_velocity_threshold_rad_s": 0.01,
+                "source_joint_name": "joint6"
+              }
+            ],
+            "stop_mode": "soft_on_path"
+          },
+          "maximum_tcp_linear_speed_mps": 0.15
+        }
+      }
+    },
+    {
+      "active": false,
+      "component_id": "lite6_robot_controller_io",
+      "component_profile_id": "ufactory.lite6_controller_io",
+      "owner": "lite6",
+      "role": "controller_io"
+    },
+    {
+      "active": false,
+      "component_id": "lite6_robot_tool_io",
+      "component_profile_id": "ufactory.lite6_tool_io",
+      "owner": "lite6",
+      "role": "tool_io"
+    },
+    {
+      "component_id": "lite_gripper",
+      "component_profile_id": "ufactory.lite_gripper",
+      "configuration": {
+        "runtime_configuration": {
+          "component_streams": [
+            {
+              "budget_ns": 1000000000,
+              "controllable_component_id": "lite_gripper",
+              "stream_id": "gripper_feedback"
+            },
+            {
+              "budget_ns": 250000000,
+              "controllable_component_id": "lite_gripper",
+              "stream_id": "measured_joints"
+            }
+          ],
+          "gripper_target_configurations": [
+            {
+              "actuation_kind": "pneumatic",
+              "attach_frame": "link_tcp",
+              "auxiliary_frames": [
+                "lite_gripper_base_link"
+              ],
+              "closed_state_ref": "closed",
+              "command_duration_s": 0.8,
+              "command_target_id": "gripper",
+              "controllable_component_id": "lite_gripper",
+              "delivery_result_timeout_s": 1.0,
+              "description": "Simulated UFACTORY lite pneumatic gripper.",
+              "mount_frame": "lite_gripper_mount",
+              "open_state_ref": "open",
+              "output_mode": "commanded",
+              "tcp_frame": "link_tcp",
+              "touch_links": [
+                "lite_gripper_base_link",
+                "lite_gripper_left_finger",
+                "lite_gripper_right_finger"
+              ]
+            }
+          ]
+        },
+        "runtime_kind": "ros2_control"
+      },
+      "frame_prefix": "",
+      "lane": "mock",
+      "model_source": {
+        "package_roots": {
+          "manyforge_example_models": {
+            "project_path": "../../manyforge_example_models"
+          }
+        },
+        "srdf": {
+          "project_path": "../../manyforge_example_models/models/lite_gripper/lite_gripper.srdf"
+        },
+        "urdf": {
+          "project_path": "../../manyforge_example_models/models/lite_gripper/lite_gripper.urdf"
+        }
+      },
+      "target_settings": {}
+    },
+    {
+      "component_id": "plc_io",
+      "component_profile_id": "io_device_v0",
+      "configuration": {
+        "runtime_configuration": {
+          "io_provider_devices": [
+            {
+              "controllable_component_id": "plc_io",
+              "output_source_ack_timeout_s": 0.5
+            }
+          ],
+          "io_signals": [
+            {
+              "command_target_id": "io",
+              "controllable_component_id": "plc_io",
+              "direction": "input",
+              "freshness": {
+                "maximum_age_ns": 500000000,
+                "mode": "sample_age"
+              },
+              "provider": {
+                "liveness": {
+                  "mode": "periodic"
+                },
+                "profile": "ros_bool",
+                "topic": "/plc_io/ready"
+              },
+              "resource_role_id": "plc_ready",
+              "signal_name": "plc_ready",
+              "source_id": "plc_io.plc_ready",
+              "transition_capability": "sampled_only",
+              "update_mode": "sampled",
+              "value_type": "bool"
+            },
+            {
+              "command_target_id": "io",
+              "controllable_component_id": "plc_io",
+              "direction": "output",
+              "provider": {
+                "profile": "ros_set_bool",
+                "service": "/plc_io/in_0"
+              },
+              "resource_role_id": "plc_start",
+              "signal_name": "plc_start",
+              "source_id": "plc_io.plc_start",
+              "value_type": "bool"
+            }
+          ]
+        },
+        "runtime_kind": "io_provider"
+      },
+      "target_settings": {}
+    },
+    {
+      "component_id": "station_io",
+      "component_profile_id": "io_device_v0",
+      "configuration": {
+        "runtime_configuration": {
+          "io_provider_devices": [
+            {
+              "controllable_component_id": "station_io"
+            }
+          ],
+          "io_signals": [
+            {
+              "command_target_id": "io",
+              "controllable_component_id": "station_io",
+              "direction": "output",
+              "provider": {
+                "channel": "clamp",
+                "profile": "mock_output"
+              },
+              "resource_role_id": "clamp",
+              "signal_name": "clamp",
+              "source_id": "station_io.clamp",
+              "value_type": "bool"
+            },
+            {
+              "command_target_id": "io",
+              "controllable_component_id": "station_io",
+              "direction": "input",
+              "freshness": {
+                "mode": "provider_validity"
+              },
+              "provider": {
+                "profile": "mock"
+              },
+              "resource_role_id": "curtain_blocked",
+              "signal_name": "curtain_blocked",
+              "source_id": "station_io.curtain_blocked",
+              "transition_capability": "sampled_only",
+              "update_mode": "change_only",
+              "value_type": "bool"
+            },
+            {
+              "command_target_id": "io",
+              "controllable_component_id": "station_io",
+              "direction": "input",
+              "freshness": {
+                "mode": "provider_validity"
+              },
+              "provider": {
+                "profile": "mock"
+              },
+              "resource_role_id": "edge_sensor",
+              "signal_name": "edge_sensor",
+              "source_id": "station_io.edge_sensor",
+              "transition_capability": "sampled_only",
+              "update_mode": "change_only",
+              "value_type": "bool"
+            },
+            {
+              "command_target_id": "io",
+              "controllable_component_id": "station_io",
+              "direction": "output",
+              "provider": {
+                "channel": "lamp",
+                "profile": "mock_output"
+              },
+              "resource_role_id": "lamp",
+              "signal_name": "lamp",
+              "source_id": "station_io.lamp",
+              "value_type": "bool"
+            },
+            {
+              "command_target_id": "io",
+              "controllable_component_id": "station_io",
+              "direction": "input",
+              "freshness": {
+                "mode": "provider_validity"
+              },
+              "provider": {
+                "profile": "mock"
+              },
+              "resource_role_id": "operator_ack",
+              "signal_name": "operator_ack",
+              "source_id": "station_io.operator_ack",
+              "transition_capability": "sampled_only",
+              "update_mode": "change_only",
+              "value_type": "bool"
+            },
+            {
+              "command_target_id": "io",
+              "controllable_component_id": "station_io",
+              "direction": "input",
+              "freshness": {
+                "mode": "provider_validity"
+              },
+              "provider": {
+                "profile": "mock"
+              },
+              "resource_role_id": "part_present",
+              "signal_name": "part_present",
+              "source_id": "station_io.part_present",
+              "transition_capability": "sampled_only",
+              "update_mode": "change_only",
+              "value_type": "bool"
+            },
+            {
+              "command_target_id": "io",
+              "controllable_component_id": "station_io",
+              "direction": "input",
+              "freshness": {
+                "mode": "provider_validity"
+              },
+              "provider": {
+                "profile": "mock"
+              },
+              "resource_role_id": "probe_contact",
+              "signal_name": "probe_contact",
+              "source_id": "station_io.probe_contact",
+              "transition_capability": "sampled_only",
+              "update_mode": "change_only",
+              "value_type": "bool"
+            }
+          ]
+        },
+        "runtime_kind": "io_provider"
+      },
+      "target_settings": {}
+    }
+  ],
+  "deployment_artifact_id": "mock_lite6_signal_moves",
+  "description": "One Lite6 on the ROS Mock lane, one Mock I/O device (station_io), one ROS Bool/SetBool I/O device (plc_io) and one global light-curtain interrupt rule.",
+  "name": "mock_lite6_signal_moves",
+  "policies": {
+    "interrupt_rules": [
+      {
+        "active_at_start": true,
+        "after_stop": "hold",
+        "condition": {
+          "compare": {
+            "op": "==",
+            "operand": {
+              "signal": {
+                "controllable_component_id": "station_io",
+                "signal_name": "curtain_blocked"
+              }
+            },
+            "value": true
+          }
+        },
+        "on_trip": "stop",
+        "priority": 0,
+        "rule_id": "light_curtain",
+        "scope": "all_motion"
+      }
+    ],
+    "motion_takeover_preparation_budget_s": 0.5
+  }
+}

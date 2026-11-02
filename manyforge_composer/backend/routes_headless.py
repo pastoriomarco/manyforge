@@ -10,18 +10,7 @@ from fastapi import APIRouter, HTTPException, Path, Query, Request
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from manyforge_headless_api.cell_recover import (
-    CELL_RECOVER_ABORT_REFERENCE_NOTE,
-    CELL_RECOVER_REFERENCE_NOTE,
-)
 from manyforge_headless_api.client import HeadlessClientError, HeadlessHttpClient
-from manyforge_headless_api.close_wire import (
-    SCENARIO_CLOSE_REFERENCE_NOTE,
-    SCENARIO_FORCE_CLOSE_REFERENCE_NOTE,
-    LifecycleOwnerSettlementRequest,
-    LifecycleTargetRetirementIntent,
-    ScenarioForceCloseRequest,
-)
 from manyforge_headless_api.execution_control import (
     ExecutionControlBusyError,
     ExecutionControlClient,
@@ -31,14 +20,12 @@ from manyforge_headless_api.control_protocol import (
     is_stop_command,
 )
 from manyforge_headless_api.models import (
-    CanonicalEmptyActivationPreparationRequest,
-    ManagerDeploymentCandidatePreviewRequest,
-    ManagerApplyRequest,
     ManagerApplyAcknowledgementRequest,
+    ComponentActionRequest,
+    ComponentGroupActionRequest,
+    SetOutputRequest,
     AcknowledgeAlarmRequest,
     AcknowledgeAllAlarmsRequest,
-    ComponentLifecycleRequest,
-    ComponentProcessStopBody,
     FullStopIntentRequest,
     HistorianReconcileRequest,
     IoSignalReadRequest,
@@ -52,12 +39,8 @@ from manyforge_headless_api.models import (
     RuntimeScaleControlSelectorRequest,
     MAX_RUNTIME_SCALE_SELECTOR_JSON_BYTES,
     decode_runtime_scale_selector_query,
-    RouteSelectionRequest,
     SceneTransactionRequest,
     StopIntentRequest,
-    CellRecoverAbortRequest,
-    CellRecoverRequest,
-    StopFaultRecoveryRequest,
     ProgramRunStartRequest,
     ProgramScenePreparationRequest,
     ProgramRunStopRequest,
@@ -336,51 +319,47 @@ def create_headless_router(
     def runtime() -> dict[str, Any]:
         return _call(client.runtime)
 
-    @router.get("/api/component-overview")
-    def component_overview() -> Response:
-        return Response(
-            content=_call(client.component_overview_payload),
-            media_type="application/json",
-        )
-
     @router.get("/api/manager/status")
     def manager_status() -> dict[str, Any]:
         return _call(client.manager_status)
 
-    @router.post(
-        "/api/activation-preparations",
-        openapi_extra={"x-manyforge-reference-note": SCENARIO_CLOSE_REFERENCE_NOTE},
-    )
-    def prepare_canonical_empty(body: CanonicalEmptyActivationPreparationRequest) -> dict[str, Any]:
-        return _call(lambda: client.prepare_activation(body.model_dump(mode="json")))
+    # Component model v2 (CONTRACTS §1, §2, §5, §7, §10): pass-through.
 
-    @router.post("/api/manager/deployment-candidates/preview")
-    def preview_manager_candidate(body: ManagerDeploymentCandidatePreviewRequest) -> dict[str, Any]:
-        return _call(lambda: client.manager_deployment_candidate_preview(body.model_dump(mode="json")))
+    @router.get("/api/components")
+    def components() -> list[Any]:
+        return _call(client.components)
 
-    @router.post("/api/manager/apply")
-    def apply_manager_candidate(body: ManagerApplyRequest) -> dict[str, Any]:
-        return _call(lambda: client.manager_apply(body.model_dump(mode="json")))
+    @router.post("/api/components/actions", status_code=202)
+    def component_group_action(body: ComponentGroupActionRequest) -> dict[str, Any]:
+        return _call(
+            lambda: client.component_actions(body.action, body.component_ids)
+        )
 
-    @router.get("/api/manager/canonical-empty-selection")
-    def canonical_empty_selection() -> dict[str, Any]:
-        return _call(client.canonical_empty_selection)
+    @router.post("/api/components/{component_id}/actions", status_code=202)
+    def component_action(
+        component_id: Annotated[str, Path(min_length=1, max_length=256)],
+        body: ComponentActionRequest,
+    ) -> dict[str, Any]:
+        return _call(lambda: client.component_action(component_id, body.action))
 
-    @router.get("/api/cclc/targets/retirement-offer")
-    def lifecycle_target_retirement_offer() -> dict[str, Any]:
-        return _call(client.lifecycle_target_retirement_offer)
+    @router.get("/api/cell/latch")
+    def cell_latch() -> dict[str, Any]:
+        return _call(client.cell_latch)
 
-    @router.post("/api/cclc/targets/retire")
-    def retire_lifecycle_targets(body: LifecycleTargetRetirementIntent) -> dict[str, Any]:
-        return _call(lambda: client.retire_lifecycle_targets(body.model_dump(mode="json")))
+    @router.get("/api/io")
+    def io_signals() -> list[Any]:
+        return _call(client.io_signals)
 
-    @router.post("/api/cclc/targets/retire/result")
-    def lifecycle_target_retirement_result(body: LifecycleTargetRetirementIntent) -> dict[str, Any]:
-        return _call(lambda: client.lifecycle_target_retirement_result(body.model_dump(mode="json")))
+    @router.post("/api/io/{signal_id:path}/set")
+    def set_io_output(
+        signal_id: Annotated[str, Path(min_length=1, max_length=256)],
+        body: SetOutputRequest,
+    ) -> dict[str, Any]:
+        return _call(lambda: client.set_io_output(signal_id, body.value))
 
-    @router.post("/api/cclc/targets/settlement")
-    def lifecycle_owner_settlement(body: LifecycleOwnerSettlementRequest) -> dict[str, Any]:
-        return _call(lambda: client.lifecycle_owner_settlement(body.model_dump(mode="json")))
+    @router.get("/api/program/readiness")
+    def program_readiness() -> dict[str, Any]:
+        return _call(client.program_readiness)
 
     @router.get("/api/manager/graph")
     def manager_graph() -> dict[str, Any]:
@@ -389,88 +368,6 @@ def create_headless_router(
     @router.get("/api/manager/diff")
     def manager_diff() -> dict[str, Any]:
         return _call(client.manager_diff)
-
-    @router.get("/api/cclc/components/{component_id}")
-    def cclc_component(
-        component_id: Annotated[str, Path(min_length=1, max_length=256)],
-    ) -> dict[str, Any]:
-        return _call(lambda: client.cclc_component(component_id))
-
-    @router.get("/api/cclc/owner")
-    def cclc_owner_identity() -> dict[str, Any]:
-        return _call(client.cclc_owner_identity)
-
-    @router.get("/api/cclc/components/{component_id}/route-templates")
-    def cclc_route_templates(
-        component_id: Annotated[str, Path(min_length=1, max_length=256)],
-    ) -> dict[str, Any]:
-        return _call(lambda: client.cclc_route_templates(component_id))
-
-    @router.get("/api/cclc/components/{component_id}/process/stop-offer")
-    def component_process_stop_offer(component_id: Annotated[str, Path(min_length=1, max_length=128)]) -> dict[str, Any]:
-        return _call(lambda: client.component_process_stop_offer(component_id))
-
-    @router.post("/api/cclc/components/{component_id}/process/stop")
-    def stop_component_process(
-        component_id: Annotated[str, Path(min_length=1, max_length=128)],
-        body: ComponentProcessStopBody,
-    ) -> dict[str, Any]:
-        if component_id != body.request.controllable_component_id:
-            raise HTTPException(status_code=400, detail={"code": "invalid_request", "message": "Process Stop component path does not match its request", "details": {}, "request_id": body.request.request_context.request_id})
-        return _call(lambda: client.stop_component_process(component_id, body.model_dump(mode="json")))
-
-    @router.post("/api/cclc/components/{component_id}/process/stop/result")
-    def component_process_stop_result(
-        component_id: Annotated[str, Path(min_length=1, max_length=128)],
-        body: ComponentProcessStopBody,
-    ) -> dict[str, Any]:
-        if component_id != body.request.controllable_component_id:
-            raise HTTPException(status_code=400, detail={"code": "invalid_request", "message": "Process Stop component path does not match its request", "details": {}, "request_id": body.request.request_context.request_id})
-        return _call(lambda: client.component_process_stop_result(component_id, body.model_dump(mode="json")))
-
-    @router.post("/api/cclc/lifecycle/requests")
-    def cclc_lifecycle_submit(
-        body: ComponentLifecycleRequest,
-    ) -> dict[str, Any]:
-        payload = body.model_dump(mode="json")
-        if payload.get("close_incident_recovery") is None:
-            payload.pop("close_incident_recovery", None)
-        if payload.get("program_node_evidence") is None:
-            payload.pop("program_node_evidence", None)
-        if payload.get("acknowledge_incident") is None:
-            payload.pop("acknowledge_incident", None)
-        if payload.get("expected_incident_id") is None:
-            payload.pop("expected_incident_id", None)
-        return _call(lambda: client.submit_component_lifecycle(payload))
-
-    @router.get("/api/cclc/lifecycle/transactions/{transaction_id}")
-    def cclc_lifecycle_status(
-        transaction_id: Annotated[str, Path(min_length=1, max_length=256)],
-    ) -> dict[str, Any]:
-        return _call(lambda: client.component_lifecycle_status(transaction_id))
-
-    @router.post("/api/cclc/lifecycle/requests/result")
-    def cclc_lifecycle_request_result(
-        body: ComponentLifecycleRequest,
-    ) -> dict[str, Any]:
-        payload = body.model_dump(mode="json")
-        if payload.get("close_incident_recovery") is None:
-            payload.pop("close_incident_recovery", None)
-        if payload.get("program_node_evidence") is None:
-            payload.pop("program_node_evidence", None)
-        return _call(lambda: client.component_lifecycle_request_result(payload))
-
-    @router.post("/api/cclc/routes/requests")
-    def cclc_route_submit(body: RouteSelectionRequest) -> dict[str, Any]:
-        return _call(
-            lambda: client.submit_route_selection(body.model_dump(mode="json"))
-        )
-
-    @router.get("/api/cclc/routes/transactions/{transaction_id}")
-    def cclc_route_status(
-        transaction_id: Annotated[str, Path(min_length=1, max_length=256)],
-    ) -> dict[str, Any]:
-        return _call(lambda: client.route_selection_status(transaction_id))
 
     @router.get("/api/node-environment")
     def node_environment() -> dict[str, Any]:
@@ -1006,50 +903,6 @@ def create_headless_router(
         return await control_call(
             lambda: client.full_stop(body.model_dump()),
             stop=True,
-        )
-
-    @router.get("/api/execution/stop-fault")
-    def execution_stop_fault() -> dict[str, Any]:
-        return _call(client.stop_fault)
-
-    @router.post("/api/execution/stop-fault/recover")
-    async def execution_recover_stop_fault(
-        body: StopFaultRecoveryRequest,
-    ) -> dict[str, Any]:
-        return await control_call(
-            lambda: client.recover_stop_fault(
-                body.model_dump(mode="json", exclude_unset=True)
-            )
-        )
-
-    @router.post(
-        "/api/execution/cell-recover",
-        openapi_extra={"x-manyforge-reference-note": CELL_RECOVER_REFERENCE_NOTE},
-    )
-    async def execution_cell_recover(body: CellRecoverRequest) -> dict[str, Any]:
-        # Recover cell runs in Headless; Composer forwards only the caller identity.
-        return await control_call(
-            lambda: client.cell_recover(body.model_dump(mode="json"))
-        )
-
-    @router.post(
-        "/api/execution/cell-recover/abort",
-        openapi_extra={"x-manyforge-reference-note": CELL_RECOVER_ABORT_REFERENCE_NOTE},
-    )
-    async def execution_cell_recover_abort(body: CellRecoverAbortRequest) -> dict[str, Any]:
-        # SX-679: the abort runs in Headless; Composer forwards the caller identity.
-        return await control_call(
-            lambda: client.cell_recover_abort(body.model_dump(mode="json"))
-        )
-
-    @router.post(
-        "/api/execution/force-close",
-        openapi_extra={"x-manyforge-reference-note": SCENARIO_FORCE_CLOSE_REFERENCE_NOTE},
-    )
-    async def execution_force_close(body: ScenarioForceCloseRequest) -> dict[str, Any]:
-        # Force close steps run in Headless; Composer forwards them unchanged.
-        return await control_call(
-            lambda: client.force_close(body.model_dump(mode="json"))
         )
 
     @router.post("/api/execution/runtime-scale-control")

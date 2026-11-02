@@ -86,9 +86,6 @@ _PATTERNS = {
 _PATTERNS[".hpp"] = _PATTERNS[".cpp"]
 # Producer file -> codes it produces at a site no pattern above can see.
 _INDIRECT_CODES = {
-    "manyforge_behavior/manyforge_behavior/nodes/v2_owner.py": (
-        "program_stop_settlement_unconfirmed",
-    ),
     "manyforge_behavior/manyforge_behavior/program_run_owner.py": (
         "selected_motion_stop_settling",
     ),

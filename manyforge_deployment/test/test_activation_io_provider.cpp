@@ -270,10 +270,6 @@ TEST(ActivationIoProvider,
         std::get_if<c::CapabilityDefinitionCatalogRecordRefDTO>(&row);
     return capability && capability->record_id.value() == "io.gpio.set_output";
   }));
-  EXPECT_FALSE(std::any_of(records.begin(), records.end(), [](const auto &row) {
-    const auto *schema = std::get_if<c::CommandSchemaCatalogRecordRefDTO>(&row);
-    return schema && schema->record_id.value() == "io.signal_write_boolean";
-  }));
 }
 
 TEST(ActivationIoProvider,
@@ -290,7 +286,7 @@ TEST(ActivationIoProvider,
                               {"maximum_age_ns", Value(1000.0)}}));
       signals.front() =
           With(row, "provider",
-               Value(Object{{"profile", Value("xarm_controller_input")},
+               Value(Object{{"profile", Value("controller_input")},
                             {"topic", Value("/arm/cgpio")},
                             {"input_bit", Value(0.0)},
                             {"ingress_depth", Value(4.0)}}));
@@ -313,13 +309,13 @@ TEST(ActivationIoProvider,
     } catch (const d::ClosedSchemaError &error) {
       EXPECT_TRUE(arm_provider);
       EXPECT_NE(std::string(error.what()).find(
-                    "unknown discriminator xarm_controller_input"),
+                    "unknown discriminator controller_input"),
                 std::string::npos);
     } catch (const std::invalid_argument &error) {
       EXPECT_FALSE(arm_provider);
       EXPECT_NE(std::string(error.what())
-                    .find("I/O-only component has an invalid signal owner, "
-                          "name or arm provider"),
+                    .find("I/O-only component has an invalid signal owner "
+                          "or name"),
                 std::string::npos);
     }
   }

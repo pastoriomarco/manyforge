@@ -5,6 +5,7 @@ import type {
 } from '../types/api';
 import {
   canonicalScope,
+  changedOutsideOutputs,
   conditionKeys,
   conditionProblem,
   deploymentInputSignals,
@@ -83,7 +84,7 @@ describe('interrupt condition authoring', () => {
     expect(choices.find((choice) => choice.key === 'node_outcome.approach')?.values)
       .not.toContain('signal_trip');
     expect(choices.find((choice) => choice.key === 'interrupt_state.part_lost')?.values)
-      .toEqual(['clear', 'tripped', 'latched']);
+      .toEqual(['inactive', 'clear', 'tripped']);
   });
 
   it('lists outcome keys for the interrupt nodes and the global-rule state keys', () => {
@@ -223,7 +224,7 @@ describe('global interrupt rules', () => {
   it('creates a closed default rule and validates every field', () => {
     const rule = newGlobalRule(['rule_1'], choices[0]);
     expect(rule).toEqual({
-      rule_id: 'rule_2', scope: 'all_motion', priority: 0,
+      rule_id: 'rule_2', scope: 'all_motion', priority: 0, on_trip: 'stop',
       condition: { compare: { operand, op: '==', value: true } },
     });
     const valid = rule as unknown as JsonValue;
@@ -231,11 +232,14 @@ describe('global interrupt rules', () => {
     const withRule = (patch: Record<string, JsonValue>) => ({ ...(rule as unknown as Record<string, JsonValue>), ...patch });
     expect(globalRuleProblem(valid, ['rule_2'], choices)).toContain('already uses');
     expect(globalRuleProblem(withRule({ priority: 101 }), [], choices)).toContain('0 to 100');
-    // On trip: gate (default, omitted), full_stop or notify; legacy latch fields stay unknown.
-    expect(globalRuleProblem(withRule({ on_trip: 'gate' }), [], choices)).toBeNull();
-    expect(globalRuleProblem(withRule({ on_trip: 'full_stop' }), [], choices)).toBeNull();
+    // CONTRACTS §8: on_trip stop | notify; gate, full_stop and the latch fields are gone.
     expect(globalRuleProblem(withRule({ on_trip: 'notify' }), [], choices)).toBeNull();
+    expect(globalRuleProblem(withRule({ on_trip: 'gate' }), [], choices)).toContain('On trip');
+    expect(globalRuleProblem(withRule({ on_trip: 'full_stop' }), [], choices)).toContain('On trip');
     expect(globalRuleProblem(withRule({ on_trip: 'never' }), [], choices)).toContain('On trip');
+    const { on_trip: _onTrip, ...withoutOnTrip } = rule as unknown as Record<string, JsonValue>;
+    expect(globalRuleProblem(withoutOnTrip, [], choices)).toContain('On trip');
+    expect(globalRuleProblem(withRule({ idle_behaviour: 'latch' }), [], choices)).toContain('Unknown');
     expect(globalRuleProblem(withRule({ latch_release: 'operator' }), [], choices)).toContain('Unknown');
     expect(globalRuleProblem(withRule({ fallback_outcome: 'fail_node' }), [], choices)).toContain('Unknown');
     expect(globalRuleProblem(withRule({ success_through_stage_id: 'x' }), [], choices)).toContain('Unknown');
@@ -254,15 +258,36 @@ describe('global interrupt rules', () => {
     expect(globalRuleScopeKind({ execution_groups: ['a'] })).toBe('execution_groups');
     expect(globalRuleScopeKind('all')).toBeNull();
     expect(globalRuleScopeGroups({ execution_groups: ['a', 'b'] })).toEqual(['a', 'b']);
-    expect(globalRuleProblem(withRule({ idle_behaviour: 'pause' }), [], choices)).toContain('latch or ignore');
-    expect(globalRuleProblem(withRule({ on_trip: 'full_stop', idle_behaviour: 'ignore' }), [], choices)).toBeNull();
-    expect(globalRuleProblem(withRule({ on_trip: 'notify', idle_behaviour: 'latch' }), [], choices)).toContain('full_stop only');
+    // after_stop: hold | fail_node, stop only; active_at_start: boolean.
+    expect(globalRuleProblem(withRule({ after_stop: 'hold' }), [], choices)).toBeNull();
+    expect(globalRuleProblem(withRule({ after_stop: 'fail_node' }), [], choices)).toBeNull();
+    expect(globalRuleProblem(withRule({ after_stop: 'retry' }), [], choices)).toContain('hold or fail_node');
+    expect(globalRuleProblem(withRule({ on_trip: 'notify', after_stop: 'hold' }), [], choices))
+      .toContain('does not apply to on_trip notify');
     expect(globalRuleProblem(withRule({ on_trip: 'notify', stop_entry_stage_id: 'stage.one' }), [], choices))
       .toContain('does not apply to on_trip notify');
-    // Only Full Stop has an idle behaviour.
-    expect(globalRuleProblem(withRule({ idle_behaviour: 'ignore' }), [], choices)).toContain('full_stop only');
+    expect(globalRuleProblem(withRule({ active_at_start: true }), [], choices)).toBeNull();
+    expect(globalRuleProblem(withRule({ active_at_start: 'yes' }), [], choices)).toContain('Active at start');
     expect(globalRuleProblem(withRule({ condition: { compare: { operand, op: '>', value: true } } }), [], choices))
       .toContain('does not apply');
+  });
+
+  it('nests "changed outside" under each output that holds one (V2-7)', () => {
+    const eligible = changedOutsideOutputs([
+      { signal_id: 'station/clamp' }, { signal_id: 'station/clamp.changed_outside' },
+    ]);
+    expect([...eligible]).toEqual(['station/clamp']);
+    const offered = globalRuleChoices(document, [], undefined, [], eligible);
+    const changed = { signal: { controllable_component_id: 'station', signal_name: 'clamp.changed_outside' } };
+    expect(offered.filter((choice) => choice.key === '').map((choice) => choice.label)).toEqual([
+      'station · part_present (input)',
+      'station · clamp → changed outside',
+    ]);
+    expect(conditionProblem(compare(changed, '==', true), offered)).toBeNull();
+    // Not offered without its core-held sample, but kept for a rule that reads it.
+    expect(globalRuleChoices(document, [], undefined).some((choice) => choice.id === operandId(changed))).toBe(false);
+    expect(conditionProblem(compare(changed, '==', true),
+      globalRuleChoices(document, [], compare(changed, '==', true)))).toBeNull();
   });
 
   it('includes notify in the typed global rule reaction', () => {
@@ -373,7 +398,7 @@ describe('signal liveness in interrupt conditions (contracts 76/81, SX-2194)', (
     components: [{ component_id: 'station', configuration: { runtime_kind: 'io_provider', runtime_configuration: { io_signals: [
       input('door', 'door', { profile: 'ros_bool', topic: '/door', liveness: { mode: 'change_only' } }),
       input('beam', 'beam', { profile: 'ros_bool', topic: '/beam', liveness: { mode: 'periodic' } }),
-      input('di3', 'di3', { profile: 'ur_io_states', topic: '/ur/io_states', pin: 3 }),
+      input('di3', 'di3', { profile: 'ros2_control_gpio', topic: '/gpio/states', group: 'io', interface_name: 'di3' }),
     ] } } }],
   } as unknown as Record<string, JsonValue>;
   const door = { signal: { controllable_component_id: 'station', signal_name: 'door' } };
@@ -449,7 +474,7 @@ describe('system keys and their values (contract 105)', () => {
 });
 
 describe('global rules: user keys (contracts 106, 110) and no rule states (111)', () => {
-  const rule = (id: string, condition: JsonValue) => ({ rule_id: id, scope: 'all_motion', condition });
+  const rule = (id: string, condition: JsonValue) => ({ rule_id: id, scope: 'all_motion', on_trip: 'stop', condition });
   const document = (rules: JsonValue[]) => ({ policies: { interrupt_rules: rules } }) as Record<string, JsonValue>;
   const doorOpen = compare({ key: 'cell.door_open' }, '==', true);
   const doorKey: BlackboardKeyDeclaration = { key: 'cell.door_open', type: 'bool', access: 'read', persistence: 'run', initial: false };

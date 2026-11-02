@@ -15,6 +15,7 @@ from fastapi import FastAPI, Path, Query, Request, WebSocket, WebSocketDisconnec
 from fastapi.responses import JSONResponse
 
 from manyforge_headless_api.app import RequestBodyLimitMiddleware
+from manyforge_headless_api.component_model import RUN_REFUSAL_CODES
 from manyforge_headless_api.execution_control import (
     ExecutionControlBusyError,
     ExecutionControlClient,
@@ -352,13 +353,13 @@ def _status(code: str) -> int:
         in {
             "authoring_not_ready",
             "program_run_stopped_before_start",
-            "program_cycle_reset_required",
             "program_run_already_active",
             "program_run_draft_applied_mismatch",
-            "program_scene_preparation_failed",
             "persistent_key_request_replayed",
             "stale_generation",
         }
+        # RunReadiness reasons and run refusals (CONTRACTS §10).
+        or code in RUN_REFUSAL_CODES
     ):
         return 409
     if (
@@ -422,7 +423,7 @@ def create_app(runtime: ProgramRunnerApplicationPort) -> FastAPI:
 
     app = FastAPI(
         title="ManyForge Program Runner",
-        version="0.1.0",
+        version="0.2.0",
         lifespan=lifespan,
     )
     app.add_middleware(

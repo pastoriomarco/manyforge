@@ -10,7 +10,11 @@
 
 namespace manyforge::core {
 
-enum class IoRuleIdleBehaviourDTO { kLatch, kIgnore };
+/// CONTRACTS §8: what a trip does.
+enum class IoRuleOnTripDTO { kStop, kNotify };
+/// CONTRACTS §8: after a `stop` trip, hold the run (the operator Resumes) or
+/// fail the interrupted motion node with `interrupt_fault`.
+enum class IoRuleAfterStopDTO { kHold, kFailNode };
 
 /// Exact motion subjects resolved from the qualified Applied Program group
 /// table and sealed binding. These are selection facts, never execution claims.
@@ -49,21 +53,18 @@ struct IoActivationRulePolicyBindingDTO final {
   std::shared_ptr<const CheckedIoCondition> condition;
   std::vector<InterruptSourceId> required_signal_sources;
   IoActivationRuleScopeSelectionDTO scope;
-  /// Absence preserves the Run-in-flight idle default, evaluated by Kernel.
-  std::optional<IoRuleIdleBehaviourDTO> idle_behaviour;
   int effective_priority;
   std::optional<StopEscalationStageId> stop_entry_stage_id{};
-  InterruptPostLatchDisposition post_latch_disposition{
-      InterruptPostLatchDisposition::kAwaitOperatorAck};
   /// With no Applied Program, the whole rule waits without a checked
   /// condition or fabricated key types/values. Canonical literal user keys.
   std::vector<std::string> waiting_for_program_keys{};
-  /// Authored `on_trip: full_stop`: a trip with motion in scope is a cell
-  /// Full Stop (as scope `everything`). `gate` keeps the scoped Stop.
-  /// The release (post_latch_disposition) and idle latch are compiled with it.
-  bool full_stop_on_trip{false};
-  /// Notify publishes condition state without a motion effect or latch.
-  bool notify_on_trip{false};
+  /// `stop`: the operator's Stop on the scope, then the scope is gated while
+  /// the condition holds. `notify`: the trip only publishes the state key.
+  IoRuleOnTripDTO on_trip{IoRuleOnTripDTO::kStop};
+  /// Only meaningful with `on_trip: stop`.
+  IoRuleAfterStopDTO after_stop{IoRuleAfterStopDTO::kHold};
+  /// Run end and Load return the rule to this value.
+  bool active_at_start{false};
   friend bool operator==(const IoActivationRulePolicyBindingDTO&,
                          const IoActivationRulePolicyBindingDTO&) = default;
 };

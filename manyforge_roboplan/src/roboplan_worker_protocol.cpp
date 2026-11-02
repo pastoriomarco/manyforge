@@ -421,15 +421,34 @@ void write_motion(Encoder& encoder,
                          });
           encoder.floating(value.max_translation_step_m);
           encoder.floating(value.max_rotation_step_rad);
-          encoder.u8(static_cast<std::uint8_t>(value.speed_mode));
+          encoder.optional(value.speed_mode,
+                           [](Encoder& out, core::CartesianSpeedModeDTO mode) {
+                             out.u8(static_cast<std::uint8_t>(mode));
+                           });
           encoder.floating(value.max_angular_speed_rad_s);
           encoder.floating(value.max_linear_acceleration_mps2);
           encoder.floating(value.max_angular_acceleration_rad_s2);
           encoder.u8(static_cast<std::uint8_t>(value.fallback_policy));
-          encoder.floating(value.max_blend_deviation_rad);
+          write_double_vector(encoder, value.blend_radii_m);
         }
       },
       motion);
+}
+
+[[nodiscard]] core::CartesianSpeedModeDTO read_cartesian_speed_mode(Decoder& decoder) {
+  const auto tag = decoder.u8();
+  if (tag > static_cast<std::uint8_t>(core::CartesianSpeedModeDTO::kTimeOptimal)) {
+    fail("Cartesian speed-mode tag is invalid");
+  }
+  return static_cast<core::CartesianSpeedModeDTO>(tag);
+}
+
+[[nodiscard]] core::MotionTimingDTO read_motion_timing(Decoder& decoder) {
+  const auto tag = decoder.u8();
+  if (tag > static_cast<std::uint8_t>(core::MotionTimingDTO::kFast)) {
+    fail("motion-timing tag is invalid");
+  }
+  return static_cast<core::MotionTimingDTO>(tag);
 }
 
 [[nodiscard]] core::ResolvedMotionSpecDTO read_motion(Decoder& decoder) {
@@ -448,12 +467,8 @@ void write_motion(Encoder& encoder,
           [](Decoder& input) { return read_pose(input); });
       value.max_translation_step_m = decoder.floating();
       value.max_rotation_step_rad = decoder.floating();
-      const auto speed_mode = decoder.u8();
-      if (speed_mode != static_cast<std::uint8_t>(
-                            core::CartesianSpeedModeDTO::kBounded)) {
-        fail("Cartesian speed-mode tag is invalid");
-      }
-      value.speed_mode = core::CartesianSpeedModeDTO::kBounded;
+      value.speed_mode = decoder.optional<core::CartesianSpeedModeDTO>(
+          read_cartesian_speed_mode);
       value.max_angular_speed_rad_s = decoder.floating();
       value.max_linear_acceleration_mps2 = decoder.floating();
       value.max_angular_acceleration_rad_s2 = decoder.floating();
@@ -465,7 +480,7 @@ void write_motion(Encoder& encoder,
       }
       value.fallback_policy =
           static_cast<core::CartesianFallbackPolicyDTO>(fallback);
-      value.max_blend_deviation_rad = decoder.floating();
+      value.blend_radii_m = read_double_vector(decoder);
       return value;
     }
     default:
@@ -482,6 +497,73 @@ void write_optional_double(Encoder& encoder,
 [[nodiscard]] std::optional<double> read_optional_double(Decoder& decoder) {
   return decoder.optional<double>(
       [](Decoder& input) { return input.floating(); });
+}
+
+void write_contact_pairs(
+    Encoder& encoder,
+    const std::vector<std::pair<std::string, std::string>>& pairs) {
+  encoder.vector(pairs, [](Encoder& out,
+                           const std::pair<std::string, std::string>& pair) {
+    out.string(pair.first);
+    out.string(pair.second);
+  });
+}
+
+[[nodiscard]] std::vector<std::pair<std::string, std::string>>
+read_contact_pairs(Decoder& decoder) {
+  return decoder.vector<std::pair<std::string, std::string>>(
+      [](Decoder& input) {
+        std::pair<std::string, std::string> pair{input.string(),
+                                                 input.string()};
+        if (pair.first.empty() || pair.second <= pair.first) {
+          fail("contact-allowed pair is invalid");
+        }
+        return pair;
+      });
+}
+
+[[nodiscard]] core::PlannerSearchDTO read_planner_search(Decoder& decoder) {
+  const auto tag = decoder.u8();
+  if (tag > static_cast<std::uint8_t>(core::PlannerSearchDTO::kRrtConnect)) {
+    fail("planner search tag is invalid");
+  }
+  return static_cast<core::PlannerSearchDTO>(tag);
+}
+
+[[nodiscard]] core::PlannerOptimizeDTO read_planner_optimize(Decoder& decoder) {
+  const auto tag = decoder.u8();
+  if (tag > static_cast<std::uint8_t>(core::PlannerOptimizeDTO::kBestOfN)) {
+    fail("planner optimize tag is invalid");
+  }
+  return static_cast<core::PlannerOptimizeDTO>(tag);
+}
+
+void write_planner_override(Encoder& encoder,
+                            const core::PlannerOverrideDTO& value) {
+  encoder.optional(value.search, [](Encoder& out, core::PlannerSearchDTO item) {
+    out.u8(static_cast<std::uint8_t>(item));
+  });
+  encoder.optional(value.optimize,
+                   [](Encoder& out, core::PlannerOptimizeDTO item) {
+                     out.u8(static_cast<std::uint8_t>(item));
+                   });
+  encoder.optional(value.n, [](Encoder& out, std::uint32_t item) { out.u32(item); });
+  write_optional_double(encoder, value.collision_check_step_rad);
+  encoder.optional(value.max_nodes,
+                   [](Encoder& out, std::uint32_t item) { out.u32(item); });
+}
+
+[[nodiscard]] core::PlannerOverrideDTO read_planner_override(Decoder& decoder) {
+  core::PlannerOverrideDTO value;
+  value.search = decoder.optional<core::PlannerSearchDTO>(read_planner_search);
+  value.optimize =
+      decoder.optional<core::PlannerOptimizeDTO>(read_planner_optimize);
+  value.n = decoder.optional<std::uint32_t>(
+      [](Decoder& input) { return input.u32(); });
+  value.collision_check_step_rad = read_optional_double(decoder);
+  value.max_nodes = decoder.optional<std::uint32_t>(
+      [](Decoder& input) { return input.u32(); });
+  return value;
 }
 
 void write_dynamics(Encoder& encoder,
@@ -658,9 +740,6 @@ void write_trajectory(Encoder& encoder, const core::TrajectoryDTO& value) {
                      out.floating(metrics.unsampled_rotation_bound_rad);
                      out.floating(metrics.certified_max_translation_error_m);
                      out.floating(metrics.certified_max_rotation_error_rad);
-                     out.floating(metrics.requested_max_blend_deviation_rad);
-                     out.floating(metrics.accepted_max_blend_deviation_rad);
-                     out.u32(metrics.planning_attempt_count);
                    });
 }
 
@@ -689,8 +768,7 @@ void write_trajectory(Encoder& encoder, const core::TrajectoryDTO& value) {
         return core::CartesianFidelityMetricsDTO{
             input.floating(), input.floating(), input.floating(),
             input.floating(), input.floating(), input.floating(),
-            input.floating(), input.floating(), input.floating(),
-            input.floating(), input.u32()};
+            input.floating(), input.floating()};
       });
   return value;
 }
@@ -750,6 +828,12 @@ std::string encode_initialization(const WorkerInitializationDTO& value) {
   encoder.u64(value.candidate_config.maximum_trajectory_samples);
   encoder.floating(value.candidate_config.trajectory_sample_period_s);
   encoder.floating(value.candidate_config.collision_check_step_rad);
+  encoder.u8(static_cast<std::uint8_t>(value.candidate_config.planner_search));
+  encoder.u8(static_cast<std::uint8_t>(value.candidate_config.planner_optimize));
+  encoder.u32(value.candidate_config.planner_n);
+  encoder.u32(value.candidate_config.planner_max_nodes);
+  encoder.u8(static_cast<std::uint8_t>(value.candidate_config.cartesian_timing));
+  encoder.u8(static_cast<std::uint8_t>(value.candidate_config.motion_timing));
   return std::move(encoder).finish();
 }
 
@@ -802,6 +886,12 @@ WorkerInitializationDTO decode_initialization(std::string_view bytes) {
       static_cast<std::size_t>(maximum_samples);
   candidate_config.trajectory_sample_period_s = decoder.floating();
   candidate_config.collision_check_step_rad = decoder.floating();
+  candidate_config.planner_search = read_planner_search(decoder);
+  candidate_config.planner_optimize = read_planner_optimize(decoder);
+  candidate_config.planner_n = decoder.u32();
+  candidate_config.planner_max_nodes = decoder.u32();
+  candidate_config.cartesian_timing = read_cartesian_speed_mode(decoder);
+  candidate_config.motion_timing = read_motion_timing(decoder);
   decoder.require_end();
   return WorkerInitializationDTO{std::move(model), std::move(binding),
                                  std::move(candidate_config)};
@@ -830,18 +920,18 @@ std::string encode_candidate_request(
   encoder.floating(value.speed_profile.acceleration_scale);
   write_optional_double(encoder,
                         value.speed_profile.max_tcp_linear_speed_mps);
-  encoder.u8(static_cast<std::uint8_t>(value.planning_profile));
+  write_planner_override(encoder, value.planner);
   write_dynamics(encoder, value.dynamics_limits);
   encoder.floating(value.planning_timeout_s);
   encoder.u32(value.planning_attempt_index);
   encoder.optional(value.action_span, write_action_span);
-  encoder.vector(value.speed_check_frames, write_frame);
   encoder.vector(value.collision_pair_margins,
                  [](Encoder& out, const RoboPlanPairMarginDTO& margin) {
                    out.string(margin.first);
                    out.string(margin.second);
                    out.floating(margin.margin_m);
                  });
+  write_contact_pairs(encoder, value.contact_allowed_pairs);
   // Omit the complete extension when absent, preserving ordinary payloads.
   if (value.moving_replacement) {
     encoder.boolean(true);
@@ -861,7 +951,6 @@ std::string encode_candidate_request(
                           moving.source_speed_profile.max_tcp_linear_speed_mps);
     write_dynamics(encoder, moving.source_per_resource_dynamics_limits);
     encoder.floating(moving.remaining_preparation_budget_s);
-    encoder.vector(moving.source_speed_check_frames, write_frame);
     // Keep legacy moving payloads byte-identical when the new cap is absent.
     if (moving.remaining_planning_budget_s) {
       encoder.boolean(true);
@@ -891,25 +980,18 @@ RoboPlanCandidateRequestDTO decode_candidate_request(
       read_motion(decoder),
       core::TolerancesDTO{decoder.floating(), decoder.floating(),
                           decoder.floating()},
-      core::SpeedProfileDTO{}, core::PlanningProfileDTO::kFirstFeasible,
+      core::SpeedProfileDTO{}, core::PlannerOverrideDTO{},
       {}, 0.0, 0U, std::nullopt};
   value.speed_profile.velocity_scale = decoder.floating();
   value.speed_profile.acceleration_scale = decoder.floating();
   value.speed_profile.max_tcp_linear_speed_mps =
       read_optional_double(decoder);
-  const auto profile = decoder.u8();
-  if (profile >
-      static_cast<std::uint8_t>(core::PlanningProfileDTO::kQualityBounded)) {
-    fail("planning-profile tag is invalid");
-  }
-  value.planning_profile = static_cast<core::PlanningProfileDTO>(profile);
+  value.planner = read_planner_override(decoder);
   value.dynamics_limits = read_dynamics(decoder);
   value.planning_timeout_s = decoder.floating();
   value.planning_attempt_index = decoder.u32();
   value.action_span =
       decoder.optional<core::ActionSpanDTO>(read_action_span);
-  value.speed_check_frames =
-      decoder.vector<core::ResolvedFrameDTO>(read_frame);
   value.collision_pair_margins = decoder.vector<RoboPlanPairMarginDTO>(
       [](Decoder& input) {
         RoboPlanPairMarginDTO margin{input.string(), input.string(), 0.0};
@@ -920,6 +1002,7 @@ RoboPlanCandidateRequestDTO decode_candidate_request(
         }
         return margin;
       });
+  value.contact_allowed_pairs = read_contact_pairs(decoder);
   if (!decoder.at_end()) {
     if (!decoder.boolean()) {
       fail("absent moving-replacement extension must be omitted");
@@ -938,8 +1021,6 @@ RoboPlanCandidateRequestDTO decode_candidate_request(
                               read_optional_double(decoder)},
         read_dynamics(decoder),
         decoder.floating()};
-    value.moving_replacement->source_speed_check_frames =
-        decoder.vector<core::ResolvedFrameDTO>(read_frame);
     if (!decoder.at_end()) {
       if (!decoder.boolean()) fail("absent moving-planning extension must be omitted");
       value.moving_replacement->remaining_planning_budget_s = decoder.floating();
@@ -990,6 +1071,7 @@ std::string encode_ik_request(const WorkerIkRequestDTO& value) {
   write_frame(encoder, value.tcp_frame);
   write_controlled_state(encoder, value.seed_state);
   encoder.floating(value.timeout_s);
+  write_contact_pairs(encoder, value.contact_allowed_pairs);
   return std::move(encoder).finish();
 }
 
@@ -998,7 +1080,8 @@ WorkerIkRequestDTO decode_ik_request(std::string_view bytes) {
   WorkerIkRequestDTO value{read_pose(decoder),
                            read_frame(decoder), read_frame(decoder),
                            read_controlled_state(decoder),
-                           decoder.floating()};
+                           decoder.floating(),
+                           read_contact_pairs(decoder)};
   decoder.require_end();
   return value;
 }

@@ -5,7 +5,7 @@
 #include <manyforge_deployment/program_io_stop_response_validation.hpp>
 
 #include "manyforge_roboplan/retained_collision_world_projector.hpp"
-#include "manyforge_roboplan/retained_native_runtime.hpp"
+#include "manyforge_roboplan/retained_execution_host.hpp"
 
 #include <algorithm>
 #include <array>
@@ -168,20 +168,8 @@ FindExactPrecomposedBinding(
     const core::OperationParticipantIntentDTO &participant,
     const std::vector<core::RuntimeParticipantBinding> &physical_bindings) {
   const core::RuntimeParticipantBinding *result = nullptr;
-  const auto *command =
-      std::get_if<core::CapabilityCommandIntentDTO>(&participant.payload);
-  const auto *output = command
-                           ? std::get_if<core::IoSignalWriteCommandValueDTO>(
-                                 &command->command_value)
-                           : nullptr;
   for (const auto &binding : physical_bindings) {
     const auto &value = binding.value();
-    if (value.io_output_binding && !output)
-      continue;
-    if (output &&
-        (!value.io_output_binding ||
-         value.io_output_binding->resource_role_id != output->resource_role_id))
-      continue;
     if (value.program_id != operation.program_id ||
         value.program_revision != operation.program_revision ||
         value.program_binding_id != operation.program_binding_id ||
@@ -197,95 +185,6 @@ FindExactPrecomposedBinding(
     result = &binding;
   }
   return result;
-}
-
-[[nodiscard]] const core::RuntimeParticipantBinding &RequireOutputBinding(
-    const deployment::RuntimeProgramTargetBinding &target,
-    const core::ResourceRoleId &resource_role,
-    const std::vector<core::RuntimeParticipantBinding> &composed) {
-  const core::RuntimeParticipantBinding *exact = nullptr;
-  const core::RuntimeParticipantBinding *selected = nullptr;
-  bool canonical_ambiguous = false;
-  for (const auto &binding : composed) {
-    const auto &value = binding.value();
-    if (value.controllable_component_id !=
-            target.component().controllable_component_id ||
-        value.command_target_id != target.target_role().command_target_id ||
-        value.capability_id != target.capability().capability_id ||
-        !value.io_output_binding ||
-        value.io_output_binding->resource_role_id != resource_role)
-      continue;
-    if (value.program_binding_id == target.program_binding_id()) {
-      if (exact)
-        throw std::runtime_error(
-            "Program output resolves to multiple composed channel owners");
-      exact = &binding;
-    }
-    if (selected)
-      canonical_ambiguous = true;
-    else
-      selected = &binding;
-  }
-  // Complete host inventories include direct and Program aliases of the same
-  // channel. Prefer the exact sealed Program identity; retain the existing
-  // unique canonical-owner path when no Program alias is composed.
-  if (exact)
-    return *exact;
-  if (canonical_ambiguous)
-    throw std::runtime_error(
-        "Program output resolves to multiple composed channel owners");
-  if (!selected)
-    throw std::runtime_error(
-        "Program output has no exact composed channel owner");
-  return *selected;
-}
-
-[[nodiscard]] core::RuntimeProviderDomainConfigurationReadbackDTO
-ClosedOutputProvenance(const core::RuntimeParticipantBinding &composed,
-                       const deployment::RetainedBundle &bundle) {
-  const auto &value = composed.value();
-  const auto &output = *value.io_output_binding;
-  const auto &graph = bundle.value().cell_graph;
-  const auto domain = std::find_if(
-      graph.control_domains.begin(), graph.control_domains.end(),
-      [&](const auto &row) {
-        return row.control_domain_id == output.provider.control_domain_id &&
-               row.control_domain_revision ==
-                   output.provider.control_domain_revision;
-      });
-  if (domain == graph.control_domains.end() || !domain->provider())
-    throw std::runtime_error("Composed output has no sealed provider domain");
-  const auto catalog = deployment::ResolveRetainedIoSignalCatalog(graph);
-  if (!catalog.ok())
-    throw std::runtime_error(catalog.error().message);
-  std::vector<core::ResourceId> resources;
-  for (const auto &row : catalog.value()) {
-    if (row.descriptor.signal_id.controllable_component_id ==
-            value.controllable_component_id &&
-        row.runtime_unit_id == output.provider.provider_runtime_unit_id &&
-        std::binary_search(domain->provider()->signal_names.begin(),
-                           domain->provider()->signal_names.end(),
-                           row.descriptor.signal_id.name) &&
-        row.descriptor.output_resource)
-      resources.push_back(*row.descriptor.output_resource);
-  }
-  std::sort(resources.begin(), resources.end());
-  resources.erase(std::unique(resources.begin(), resources.end()),
-                  resources.end());
-  // The composed binding carries the actual CCLC/provider occurrence. This
-  // structural view deliberately asserts no driver observation or eligibility;
-  // ordinary Kernel admission still checks its actual current readiness map.
-  return {value.retained_bundle_id,
-          value.graph_revision,
-          output.component_lifecycle_generation,
-          {domain->control_domain_id, domain->control_domain_revision,
-           core::ResolvedProviderDomainScopeDTO{
-               *domain->provider(), output.provider.provider_runtime_epoch,
-               std::nullopt, std::move(resources)}},
-          output.provider,
-          false,
-          0U,
-          0U};
 }
 
 struct ProviderOccurrence final {
@@ -673,10 +572,7 @@ void ProductBackedRuntimeParticipantResolver::ValidateComposition() {
     }
   }
   if (semantic_bodies.empty() && provider_only &&
-      std::all_of(physical_bindings_.begin(), physical_bindings_.end(),
-                  [](const auto &binding) {
-                    return binding.value().io_output_binding.has_value();
-                  })) {
+      physical_bindings_.empty()) {
     // A genuine model-free provider has no collision-body aliases. Physical
     // resolution still requires the original nonempty canonical table.
     return;
@@ -1176,8 +1072,6 @@ ProductBackedRuntimeParticipantResolver::Resolve(
             "direct_control_product_mismatch",
             core::ErrorCode::kInvalidRequest);
       }
-      if (precomposed->value().io_output_binding)
-        return core::Result<core::RuntimeParticipantBinding>::Ok(*precomposed);
       const auto *motion =
           std::get_if<core::MotionParticipantIntentDTO>(&participant.payload);
       const auto *set_tcp =
@@ -1239,29 +1133,6 @@ ProductBackedRuntimeParticipantResolver::Resolve(
         *binding, participant.target_role_id,
         participant.required_capability_id, *retained_bundle_,
         retained_model_map_);
-    if (const auto *command = std::get_if<core::CapabilityCommandIntentDTO>(
-            &participant.payload)) {
-      if (const auto *output = std::get_if<core::IoSignalWriteCommandValueDTO>(
-              &command->command_value)) {
-        const auto &composed = RequireOutputBinding(
-            target, output->resource_role_id, physical_bindings_);
-        auto selected = core::verify_runtime_participant_binding(
-            deployment::build_runtime_io_output_binding_dto(
-                target, output->resource_role_id, *retained_bundle_,
-                ClosedOutputProvenance(composed, *retained_bundle_)));
-        if (!selected.ok())
-          return selected;
-        if (selected.value().value().io_output_binding !=
-                composed.value().io_output_binding ||
-            !PhysicallyContainedBy(composed, selected.value()))
-          return Reject<core::RuntimeParticipantBinding>(
-              "resolved Program output crosses its exact composed channel "
-              "owner",
-              "runtime_program_output_crosses_composed_owner",
-              core::ErrorCode::kInvariantViolation);
-        return selected;
-      }
-    }
     std::vector<deployment::RuntimeProgramTargetBinding> supporting;
     if (const auto *motion = std::get_if<core::MotionParticipantIntentDTO>(
             &participant.payload)) {

@@ -70,7 +70,8 @@ using namespace manyforge::core;
   path.max_angular_speed_rad_s = 0.4;
   path.max_linear_acceleration_mps2 = 0.3;
   path.max_angular_acceleration_rad_s2 = 1.5;
-  path.max_blend_deviation_rad = 0.02;
+  path.speed_mode = CartesianSpeedModeDTO::kTimeOptimal;
+  path.blend_radii_m = {0.0, 0.02};
   path.fallback_policy =
       CartesianFallbackPolicyDTO::kAllowJointSpaceFallback;
   return RoboPlanCandidateRequestDTO{
@@ -85,7 +86,9 @@ using namespace manyforge::core;
       .motion = std::move(path),
       .tolerances = TolerancesDTO{1.0e-4, 2.0e-3, 3.0e-3},
       .speed_profile = SpeedProfileDTO{0.7, 0.6, 0.15},
-      .planning_profile = PlanningProfileDTO::kQualityBounded,
+      .planner = PlannerOverrideDTO{PlannerSearchDTO::kRrt,
+                                    PlannerOptimizeDTO::kBestOfN, 7U, 0.03,
+                                    std::nullopt},
       .dynamics_limits =
           {ResolvedResourceDynamicsLimitDTO{
                selected.resources[0], selected.compiled_joint_names[0],
@@ -136,7 +139,11 @@ TEST(RoboPlanWorkerProtocolTest,
                            "2222222222222222222222222222222222222222222222222"
                            "222222222222222")}},
           {{"body-a", "body-b"}, {"body-c", "body-d"}}},
-      binding(), RoboPlanCandidateComputerConfig{0x1234U, 4096U, 0.02, 0.0075}};
+      binding(), RoboPlanCandidateComputerConfig{
+                     0x1234U, 4096U, 0.02, 0.0075, PlannerSearchDTO::kRrt,
+                     PlannerOptimizeDTO::kRrtStar, 9U, 2500U,
+                     CartesianSpeedModeDTO::kTimeOptimal,
+                     MotionTimingDTO::kFast}};
 
   const auto decoded = decode_initialization(encode_initialization(input));
 
@@ -175,6 +182,14 @@ TEST(RoboPlanWorkerProtocolTest,
                    input.candidate_config.trajectory_sample_period_s);
   // The Deployment's collision-check step reaches the worker's planner.
   EXPECT_DOUBLE_EQ(decoded.candidate_config.collision_check_step_rad, 0.0075);
+  // So does the rest of the Deployment planner block.
+  EXPECT_EQ(decoded.candidate_config.planner_defaults(),
+            input.candidate_config.planner_defaults());
+  // And the Deployment Cartesian timing.
+  EXPECT_EQ(decoded.candidate_config.cartesian_timing,
+            CartesianSpeedModeDTO::kTimeOptimal);
+  // And the robot's motion timing (N12 / RP-3b; the default is smooth).
+  EXPECT_EQ(decoded.candidate_config.motion_timing, MotionTimingDTO::kFast);
 }
 
 TEST(RoboPlanWorkerProtocolTest,
@@ -193,12 +208,21 @@ TEST(RoboPlanWorkerProtocolTest,
   EXPECT_EQ(decoded.tcp_frame, input.tcp_frame);
   EXPECT_EQ(decoded.start_state, input.start_state);
   EXPECT_EQ(decoded.motion, input.motion);
-  EXPECT_DOUBLE_EQ(
-      std::get<CartesianPathDTO>(decoded.motion).max_blend_deviation_rad,
-      0.02);
+  EXPECT_EQ(std::get<CartesianPathDTO>(decoded.motion).blend_radii_m,
+            (std::vector<double>{0.0, 0.02}));
+  EXPECT_EQ(std::get<CartesianPathDTO>(decoded.motion).speed_mode,
+            CartesianSpeedModeDTO::kTimeOptimal);
   EXPECT_EQ(decoded.tolerances, input.tolerances);
   EXPECT_EQ(decoded.speed_profile, input.speed_profile);
-  EXPECT_EQ(decoded.planning_profile, input.planning_profile);
+  EXPECT_EQ(decoded.planner, input.planner);
+  EXPECT_EQ(decode_candidate_request(encode_candidate_request(
+                [&] {
+                  auto unset = input;
+                  unset.planner = {};
+                  return unset;
+                }()))
+                .planner,
+            PlannerOverrideDTO{});
   EXPECT_EQ(decoded.dynamics_limits, input.dynamics_limits);
   EXPECT_DOUBLE_EQ(decoded.planning_timeout_s, input.planning_timeout_s);
   EXPECT_EQ(decoded.planning_attempt_index, input.planning_attempt_index);
@@ -239,6 +263,41 @@ TEST(RoboPlanWorkerProtocolTest, CandidateRequestCarriesPerPairClearanceMargins)
     malformed.collision_pair_margins = {invalid};
     EXPECT_THROW(static_cast<void>(decode_candidate_request(
                      encode_candidate_request(malformed))),
+                 std::invalid_argument);
+  }
+}
+
+TEST(RoboPlanWorkerProtocolTest, PlanAndIkRequestsCarryContactAllowedPairs) {
+  const std::vector<std::pair<std::string, std::string>> pairs{
+      {"finger", "scene-probe-shape-0"}, {"palm", "scene-probe-shape-0"}};
+  auto input = candidate_request();
+  input.contact_allowed_pairs = pairs;
+  const auto bytes = encode_candidate_request(input);
+  const auto decoded = decode_candidate_request(bytes);
+  EXPECT_EQ(decoded.contact_allowed_pairs, pairs);
+  EXPECT_EQ(encode_candidate_request(decoded), bytes);
+  EXPECT_TRUE(decode_candidate_request(encode_candidate_request(candidate_request()))
+                  .contact_allowed_pairs.empty());
+
+  WorkerIkRequestDTO ik{{{0.4, 0.5, 0.6}, {0.1, 0.2, 0.3, 0.9}},
+                        binding().permitted_frames[0],
+                        binding().permitted_frames[1],
+                        state(),
+                        2.75,
+                        pairs};
+  EXPECT_EQ(decode_ik_request(encode_ik_request(ik)).contact_allowed_pairs,
+            pairs);
+
+  for (const auto &invalid : {std::pair<std::string, std::string>{"palm", "finger"},
+                              std::pair<std::string, std::string>{"palm", "palm"},
+                              std::pair<std::string, std::string>{"", "palm"}}) {
+    auto malformed = candidate_request();
+    malformed.contact_allowed_pairs = {invalid};
+    EXPECT_THROW(static_cast<void>(decode_candidate_request(
+                     encode_candidate_request(malformed))),
+                 std::invalid_argument);
+    ik.contact_allowed_pairs = {invalid};
+    EXPECT_THROW(static_cast<void>(decode_ik_request(encode_ik_request(ik))),
                  std::invalid_argument);
   }
 }
@@ -340,48 +399,6 @@ TEST(RoboPlanWorkerProtocolTest,
                std::invalid_argument);
 }
 
-TEST(RoboPlanWorkerProtocolTest, SpeedCheckFrameSetsRoundTrip) {
-  auto input = candidate_request();
-  const ResolvedFrameDTO flange = ResolvedComponentModelFrameDTO{
-      binding().controllable_component_id, binding().model_instance_id,
-      FrameRoleId("flange"), "compiled-flange", binding().model_revision};
-  input.speed_check_frames = {input.tcp_frame, flange};
-  const auto ordinary_bytes = encode_candidate_request(input);
-  const auto decoded = decode_candidate_request(ordinary_bytes);
-  EXPECT_EQ(decoded.speed_check_frames, input.speed_check_frames);
-  EXPECT_FALSE(decoded.moving_replacement);
-  EXPECT_EQ(encode_candidate_request(decoded), ordinary_bytes);
-
-  auto suffix_seed = state();
-  suffix_seed.velocities.reset();
-  input.moving_replacement = MovingReplacementInputDTO{
-      ExecutionGoalKey{ControllerGoalId("source-goal-a"),
-                       ControllerGoalGeneration(3U)},
-      ExecutionBindingEpoch(4U),
-      0.5,
-      TrajectoryDTO{binding().resources,
-                    binding().compiled_joint_names,
-                    {{0.0, {0.25, 0.012}, {0.5, 0.02}, {0.2, -0.03}},
-                     {0.375, {0.45, 0.02}, {0.4, 0.015}, {-0.1, 0.02}}}},
-      0.875,
-      suffix_seed,
-      input.base_frame,
-      input.tcp_frame,
-      SpeedProfileDTO{0.9, 0.8, 0.25},
-      {},
-      1.75};
-  // The retained prefix keeps its own (here one-point) set.
-  input.moving_replacement->source_speed_check_frames = {input.tcp_frame};
-  const auto moving_bytes = encode_candidate_request(input);
-  EXPECT_EQ(moving_bytes.substr(0U, ordinary_bytes.size()), ordinary_bytes);
-  const auto moving = decode_candidate_request(moving_bytes);
-  ASSERT_TRUE(moving.moving_replacement);
-  EXPECT_EQ(moving.speed_check_frames, input.speed_check_frames);
-  EXPECT_EQ(moving.moving_replacement->source_speed_check_frames,
-            std::vector<ResolvedFrameDTO>{input.tcp_frame});
-  EXPECT_EQ(encode_candidate_request(moving), moving_bytes);
-}
-
 TEST(RoboPlanWorkerProtocolTest,
      ResultPayloadsPreservePortableSuccessAndClosedErrors) {
   TrajectoryDTO trajectory{
@@ -393,7 +410,7 @@ TEST(RoboPlanWorkerProtocolTest,
   trajectory.cartesian_waypoint_times_s = {0.0, 0.5, 1.0};
   trajectory.cartesian_fidelity_metrics = CartesianFidelityMetricsDTO{
       0.005, 0.01, 0.001, 0.002, 0.0005, 0.001,
-      0.0015, 0.003, 0.02, 0.01, 2U};
+      0.0015, 0.003};
   const auto decoded_success = decode_trajectory_result(
       encode_trajectory_result(Result<TrajectoryDTO>::Ok(trajectory)));
   ASSERT_TRUE(decoded_success.ok());

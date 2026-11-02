@@ -24,11 +24,11 @@ from .orchestrator import (
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="manyforge-operator")
     parser.add_argument("--state-root", type=Path, default=Path.cwd() / DEFAULT_STATE_ROOT)
-    parser.add_argument("--instance-id", default="native")
+    parser.add_argument("--instance-id", default="workbench")
     parser.add_argument("--json", action="store_true", dest="json_output")
     commands = parser.add_subparsers(dest="operation", required=True)
     start = commands.add_parser("start")
-    start.add_argument("--profile", choices=[item.value for item in LaunchProfile], default="native")
+    start.add_argument("--profile", choices=[item.value for item in LaunchProfile], default="standard")
     start.add_argument("--source-root", type=Path, required=True)
     start.add_argument("--manager-executable", type=Path)
     start.add_argument("--install-root", type=Path)
@@ -40,7 +40,7 @@ def _parser() -> argparse.ArgumentParser:
         "--canonical-empty-admission-filename",
         default="canonical-empty-admission.json",
     )
-    start.add_argument("--cell-id", default="native")
+    start.add_argument("--cell-id", default="cell")
     start.add_argument("--package-aggregate-sha256")
     start.add_argument("--compiler-build-manifest-sha256")
     start.add_argument("--node-environment-sha256")
@@ -113,7 +113,7 @@ def _config(args: argparse.Namespace) -> NativeLauncherConfig:
     )
     missing = [name.replace("_", "-") for name in required if getattr(args, name, None) is None]
     if missing:
-        raise ValueError(f"native profile requires: {', '.join(missing)}")
+        raise ValueError(f"standard profile requires: {', '.join(missing)}")
     return NativeLauncherConfig(
         source_root=args.source_root,
         manager_executable=args.manager_executable,

@@ -15,7 +15,7 @@ namespace manyforge::core {
 inline constexpr std::string_view kCapabilityDefinitionApiVersion =
     "manyforge.capability_definition.v1";
 inline constexpr std::string_view kBuiltinCapabilityDefinitionRegistryDigest =
-    "sha256:713a06c46c5f5100fd4ee1a729ae06be5db753ed84cdff5bdf4d4ac5a77565e0";
+    "sha256:5f7eedf93f5bafe37e49149ceb32d09a7794b5792a823e7e786f0d288d4d5883";
 
 enum class CapabilityScope : std::uint8_t {
   kCellGlobal = 0,
@@ -95,18 +95,6 @@ inline constexpr auto kBuiltinCapabilityDefinitionRegistry =
          std::nullopt},
         {"planning.motion.named_target",
          "sha256:ed009e67ef1c678b31faab8e6e6313ac513d93117b21aa7a499f734823d53130",
-         CapabilityScope::kTargetBinding, CapabilityProviderBindingKind::kCapabilityProviderBinding,
-         std::nullopt},
-        {"planning.profile.first_feasible",
-         "sha256:e0f578ef9af205b3c7c184fb1124ffb4fe3c35874b5e993358b43a2dc43d2674",
-         CapabilityScope::kTargetBinding, CapabilityProviderBindingKind::kCapabilityProviderBinding,
-         std::nullopt},
-        {"planning.profile.balanced",
-         "sha256:14c53dad299a42d6604eac14240d015e22a4bc1adb363fb252111e62a2d2ad90",
-         CapabilityScope::kTargetBinding, CapabilityProviderBindingKind::kCapabilityProviderBinding,
-         std::nullopt},
-        {"planning.profile.quality_bounded",
-         "sha256:7f570672270455207d5fb8eb210cd1dd22a99d7909421cf0dc8036c32e4beffb",
          CapabilityScope::kTargetBinding, CapabilityProviderBindingKind::kCapabilityProviderBinding,
          std::nullopt},
         {"planning.trajectory.time_parameterized",

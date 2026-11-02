@@ -61,6 +61,9 @@ class IsaacGripperActionBridge(Node):
         self._latest_state_time = 0.0
         self._latest_state_generation = 0
         self._active_target_positions: list[float] | None = None
+        # Set by the cancel callback: the goal's target is never published
+        # again, so nothing overrides the hold (N10b).
+        self._goal_cancelled = False
         self._goal_reservation = SingleGoalReservation()
         self._last_readiness_value: bool | None = None
         self._last_readiness_publish_time = 0.0
@@ -258,9 +261,22 @@ class IsaacGripperActionBridge(Node):
             return GoalResponse.REJECT
         if not self._goal_reservation.try_acquire():
             return GoalResponse.REJECT
+        with self._lock:
+            self._goal_cancelled = False
         return GoalResponse.ACCEPT
 
     def _cancel_callback(self, _goal_handle: object) -> CancelResponse:
+        # Like the stock GripperActionController: hold the fingers where they
+        # are before answering ACCEPT (Isaac keeps the last commanded target),
+        # so the accepted cancel already stopped them. The goal loop then
+        # reports the goal cancelled.
+        with self._lock:
+            self._goal_cancelled = True
+            self._active_target_positions = None
+            current = self._latest_positions.get(self._commanded_joint)
+            if current is not None:
+                self._publish_command(map_gripper_positions(
+                    current, self._command_multipliers, self._command_offsets))
         return CancelResponse.ACCEPT
 
     def _execute_goal(self, goal_handle: object) -> GripperCommand.Result:
@@ -282,9 +298,10 @@ class IsaacGripperActionBridge(Node):
             self._completion_offsets,
         )
         with self._lock:
-            self._active_target_positions = list(command_positions)
             first_generation = self._latest_state_generation
-        self._publish_command(command_positions)
+            if not self._goal_cancelled:
+                self._active_target_positions = list(command_positions)
+                self._publish_command(command_positions)
         window = SettledCompletionWindow(
             settle_time_s=self._completion_settle_time_s,
             min_samples=self._completion_min_samples,
@@ -321,7 +338,9 @@ class IsaacGripperActionBridge(Node):
             if time.monotonic() >= deadline:
                 goal_handle.abort()
                 return self._finish_result(result, target, reached=False, stalled=True)
-            self._publish_command(command_positions)
+            with self._lock:
+                if not self._goal_cancelled:
+                    self._publish_command(command_positions)
             time.sleep(self._publish_period_s)
 
         goal_handle.abort()

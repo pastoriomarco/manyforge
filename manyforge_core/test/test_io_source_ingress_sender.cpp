@@ -19,6 +19,7 @@
 #include <future>
 #include <manyforge_core/io_source_ingress_sender.hpp>
 #include <manyforge_core/time/fake_clock.hpp>
+#include <manyforge_core/time/manual_scheduler.hpp>
 #include <mutex>
 #include <vector>
 
@@ -56,6 +57,34 @@ class RecordingIngress final : public IIoSignalIngress {
   std::vector<IoIngressLossNotificationDTO> losses;
   std::size_t capacity_losses = 0;
 };
+
+TEST(IoSourceIngressSenderTest, EveryMessageIsAnArrivalAlsoWhilePaused) {
+  // IO-1: the device's `inputs` stream sees every message, also while its
+  // delivery is paused (a prepared device), never a frame of its own.
+  FakeClock clock;
+  clock.set(1'000'000'000);
+  ManualScheduler scheduler;
+  ComponentStreamHealth health(clock, scheduler);
+  const ControllableComponentId device("io");
+  auto declared = health.Declare(device, {"inputs", 100'000'000, StreamSeverityDTO::kFault,
+                                          StreamRecoveryDTO::kAuto,
+                                          StreamTimestampSourceDTO::kArrival});
+  ASSERT_TRUE(declared.ok());
+  const std::shared_ptr<StreamRecorder> arrivals = std::move(declared.value());
+  auto ingress = std::make_shared<RecordingIngress>();
+  IoSourceIngressSender sender(ingress, clock, kSource, kIncarnation, 1U);
+  sender.SetArrivalRecorder(arrivals);
+  sender.Receive(updates(), sender.CaptureAcquisition(kIncarnation, 1U));
+  scheduler.advance_to(clock.now(), SchedulerPriority::Monitoring);
+  EXPECT_TRUE(ingress->acquisitions.empty());
+  ASSERT_EQ(health.Read(device).size(), 1U);
+  EXPECT_EQ(health.Read(device)[0].state, StreamLivenessStateDTO::kLive);
+  sender.SetArrivalRecorder(nullptr);
+  clock.advance(200'000'000);
+  sender.Receive(updates(), sender.CaptureAcquisition(kIncarnation, 1U));
+  scheduler.advance_to(clock.now(), SchedulerPriority::Monitoring);
+  EXPECT_EQ(health.Read(device)[0].state, StreamLivenessStateDTO::kStale);
+}
 
 TEST(IoSourceIngressSenderTest, SelectedIngressAndShutdownSerializeWithoutASecondAcquisition) {
   FakeClock clock;

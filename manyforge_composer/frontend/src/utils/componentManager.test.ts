@@ -1,18 +1,22 @@
 import { describe, expect, it } from 'vitest';
 
-import type { JsonValue, ManagerDeploymentCandidatePreviewResponse, SourceModelTarget } from '../types/api';
-import type { ComponentCatalogEntry } from '../types/componentCatalog';
+import type { JsonValue, SourceModelTarget } from '../types/api';
+import type { ComponentCatalogEntry, MachineCatalogEntry } from '../types/componentCatalog';
 import {
   addComponentProblem,
+  machineCatalogEntry,
+  machineMembers,
+  withoutMachine,
   componentFrameTargets,
   componentManagerRows,
+  componentRowText,
   componentSignals,
   draftGripperFrames,
   rolesOfComponent,
   framePrefixFor,
   mountCandidates,
+  mountParents,
   nextFreeComponentId,
-  previewChanges,
   renameComponentRows,
   resolvedRobotTcp,
   roleFeedback,
@@ -54,7 +58,7 @@ function document(...components: JsonValue[]): Record<string, JsonValue> {
 }
 
 const entry: ComponentCatalogEntry = {
-  entryId: 'lite6_pneumatic_mock.scenario/lite6_robot',
+  entryId: 'mock_lite6_pneumatic_pick_and_place.scenario/lite6_robot',
   kind: 'robot',
   componentId: 'lite6_robot',
   componentProfileId: 'lite6_mock_commanded_v0',
@@ -62,7 +66,7 @@ const entry: ComponentCatalogEntry = {
   tags: ['articulated-arm', 'gripper'],
   lane: 'manyforge-only',
   description: null,
-  sources: ['examples/lite6_pneumatic_mock.scenario'],
+  sources: ['examples/mock_lite6_pneumatic_pick_and_place.scenario'],
   components: [device, robot],
 };
 
@@ -104,9 +108,10 @@ describe('Tools mounted on a robot flange', () => {
 
   it('lists a tool with its mount', () => {
     const rows = componentManagerRows(mounted(robot, hand), null, profiles);
+    // One tree: the robot, then the tool mounted on it.
     expect(rows.map((row) => [row.componentId, row.kind, row.mount])).toEqual([
-      ['lite_gripper', 'tool', 'lite6_robot.flange'],
       ['lite6_robot', 'robot', null],
+      ['lite_gripper', 'tool', 'lite6_robot.flange'],
     ]);
     // Not mounted yet: the component type's `tool` tag still names the kind.
     expect(componentManagerRows(document(hand), null, profiles)[0].kind).toBe('tool');
@@ -169,7 +174,6 @@ describe('Add component rows', () => {
       configuration: {
         runtime_configuration: {
           io_signals: [
-            { signal_name: 'valve', provider: { profile: 'xarm_digital', robot_component_id: 'lite6_robot' } },
             { signal_name: 'contact', provider: { profile: 'geometric_contact', robot_component_id: 'lite6_robot',
               target_scene_resource_id: 'workpiece' } },
           ],
@@ -180,7 +184,7 @@ describe('Add component rows', () => {
     expect(JSON.stringify(bound)).toContain('"robot_component_id":"lite6_robot_2"');
     expect(JSON.stringify(bound)).not.toContain('"lite6_robot"');
     expect(bound.configuration).toMatchObject({ runtime_configuration: { io_signals: [
-      {}, { provider: { profile: 'geometric_contact', robot_component_id: 'lite6_robot_2' } },
+      { provider: { profile: 'geometric_contact', robot_component_id: 'lite6_robot_2' } },
     ] } });
     // Rows without one are unchanged.
     expect(withMountRobot([device], 'lite6_robot_2')).toEqual([device]);
@@ -260,30 +264,6 @@ describe('Program role feedback', () => {
   });
 });
 
-describe('Manager preview changes', () => {
-  it('keeps changed components and non-empty record diffs', () => {
-    const preview = {
-      converged: false,
-      diff: {
-        model_instances: { added: ['lite6_b.model'], changed: [], removed: [] },
-        control_domains: { added: [], changed: [], removed: [] },
-      },
-      impact: {
-        destructive: false,
-        components: [
-          { controllable_component_id: 'lite6_robot', disposition: 'retain', replacement_reasons: [] },
-          { controllable_component_id: 'lite6_b', disposition: 'add', replacement_reasons: [] },
-        ],
-      },
-    } as unknown as ManagerDeploymentCandidatePreviewResponse;
-    const changes = previewChanges(preview);
-    expect(changes.components.map((row) => row.controllable_component_id)).toEqual(['lite6_b']);
-    expect(changes.records).toEqual([
-      { recordKind: 'model_instances', added: ['lite6_b.model'], changed: [], removed: [] },
-    ]);
-  });
-});
-
 describe('Component page facts', () => {
   const mockInput = (component: string, signal: string): Record<string, JsonValue> => ({
     controllable_component_id: component, command_target_id: 'io', resource_role_id: signal,
@@ -320,9 +300,6 @@ describe('Component page facts', () => {
         mockInput('gripper_io', 'open_sensor'),
         output('gripper_io', 'valve', { profile: 'mock_output', channel: 'valve' }),
       ]),
-      ioDevice('arm_io', [output('arm_io', 'tool_do2', {
-        profile: 'xarm_digital', robot_component_id: 'lite6_robot', bank: 'tool', pin: 2,
-      })]),
       ioDevice('contact_io', [{
         ...mockInput('contact_io', 'touching'), update_mode: 'sampled',
         freshness: { mode: 'sample_age', maximum_age_ns: 100_000_000 },
@@ -358,20 +335,10 @@ describe('Component page facts', () => {
 
   it('lists geometric contact under the selected robot whose Active TCP it follows', () => {
     const signals = componentSignals(cell, 'lite6_robot');
-    // The same robot also hosts arm_io's xArm pin (next test).
-    expect(signals.usedBy.filter((row) => row.componentId === 'contact_io')).toEqual([{
+    expect(signals.owned).toEqual([]);
+    expect(signals.usedBy).toEqual([{
       componentId: 'contact_io', signalName: 'touching', direction: 'input',
       detail: 'Active TCP contact with box',
-    }]);
-  });
-
-  it('lists an xArm pin hosted on a robot under the robot', () => {
-    const signals = componentSignals(cell, 'lite6_robot');
-    expect(signals.owned).toEqual([]);
-    // The same robot's Active TCP also feeds contact_io (previous test).
-    expect(signals.usedBy.filter((row) => row.componentId === 'arm_io')).toEqual([{
-      componentId: 'arm_io', signalName: 'tool_do2', direction: 'output',
-      detail: 'tool digital pin 2 on this robot',
     }]);
   });
 
@@ -421,5 +388,105 @@ describe('Component page facts', () => {
     );
     expect(rolesOfComponent(feedback, 'lite6_robot').map((role) => role.roleId)).toEqual(['arm']);
     expect(rolesOfComponent(feedback, 'gripper_io')).toEqual([]);
+  });
+});
+
+describe('machines: owners and members (CONTRACTS §16)', () => {
+  const owner = { component_id: 'lite6', component_profile_id: 'ufactory.lite6_machine', lane: 'real', configuration: {} };
+  const arm = {
+    component_id: 'lite6_robot', component_profile_id: 'ufactory.lite6', owner: 'lite6', role: 'arm',
+    model_source: { urdf: { project_path: 'lite6.urdf' }, package_roots: {} },
+  };
+  const io = { component_id: 'lite6_robot_controller_io', component_profile_id: 'ufactory.lite6_controller_io',
+    owner: 'lite6', role: 'controller_io' };
+  const tool = { component_id: 'lite6_robot_tool_io', component_profile_id: 'ufactory.lite6_tool_io',
+    owner: 'lite6', role: 'tool_io', active: false };
+  const machine: MachineCatalogEntry = {
+    modelId: 'ufactory.lite6_machine', title: 'UFactory Lite 6', lanes: ['mock', 'real'],
+    defaultOwnerId: 'lite6',
+    ownerRow: { component_id: 'lite6', component_profile_id: 'ufactory.lite6_machine', configuration: {} },
+    members: [
+      { role: 'arm', modelId: 'ufactory.lite6', title: 'Arm',
+        row: { component_id: 'lite6_arm', component_profile_id: 'ufactory.lite6', model_source: arm.model_source } },
+      { role: 'controller_io', modelId: 'ufactory.lite6_controller_io', title: 'Controller I/O',
+        row: { component_id: 'lite6_controller_io', component_profile_id: 'ufactory.lite6_controller_io' } },
+    ],
+  };
+
+  it('lists a machine as its owner with its members right under it', () => {
+    const rows = componentManagerRows(document(io, device, tool, owner, arm), ['lite6'], {
+      'ufactory.lite6': { tags: ['articulated-arm'], attachmentInterfaces: ['flange'], tcpTargets: [] },
+    });
+    expect(rows.map((row) => [row.componentId, row.kind, row.owner, row.role, row.active])).toEqual([
+      ['gripper_io', 'io_device', null, null, true],
+      ['lite6', 'machine', null, null, true],
+      ['lite6_robot', 'robot', 'lite6', 'arm', true],
+      ['lite6_robot_controller_io', 'io_device', 'lite6', 'controller_io', true],
+      ['lite6_robot_tool_io', 'io_device', 'lite6', 'tool_io', false],
+    ]);
+    // Members sort under their owner, whatever their own ids.
+    const early = { ...io, component_id: 'a_io' };
+    expect(componentManagerRows(document(early, owner), null).map((row) => row.componentId)).toEqual(['lite6', 'a_io']);
+    expect(machineMembers(document(owner, arm, device), 'lite6').map((row) => row.component_id)).toEqual(['lite6_robot']);
+  });
+
+  it('lists one tree: the machine, its arm with the tool mounted on it, then its I/O members', () => {
+    const gripper = { component_id: 'lite_gripper', component_profile_id: 'ufactory.lite_gripper' };
+    const draft = { ...document(gripper, owner, arm, io, tool, device), attachments: [toolMountRow('lite6_robot', 'lite_gripper')] };
+    expect(mountParents(draft)).toEqual({ lite_gripper: 'lite6_robot' });
+    const rows = componentManagerRows(draft, ['lite6', 'lite6_robot', 'lite_gripper']);
+    expect(rows.map((row) => [row.componentId, row.depth])).toEqual([
+      ['gripper_io', 0],
+      ['lite6', 0],
+      ['lite6_robot', 1],
+      ['lite_gripper', 2],
+      ['lite6_robot_controller_io', 1],
+      ['lite6_robot_tool_io', 1],
+    ]);
+    const text = (id: string) => {
+      const row = rows.find((candidate) => candidate.componentId === id)!;
+      return componentRowText(row, row.owner === null && row.depth > 0);
+    };
+    expect(text('lite6')).toBe('Machine · ufactory.lite6_machine');
+    expect(text('lite6_robot')).toBe('Arm · ufactory.lite6');
+    expect(text('lite_gripper')).toBe('Tool on flange · ufactory.lite_gripper');
+    expect(text('lite6_robot_controller_io')).toBe('I/O device · controller_io');
+    expect(rows.find((row) => row.componentId === 'lite6_robot_tool_io')?.active).toBe(false);
+    // A tool whose parent isn't listed stays at the top with its whole mount.
+    const alone = componentManagerRows({ ...document(gripper), attachments: draft.attachments }, null);
+    expect(alone.map((row) => [row.componentId, row.depth])).toEqual([['lite_gripper', 0]]);
+    expect(componentRowText(alone[0], false)).toBe('Tool on lite6_robot.flange · ufactory.lite_gripper');
+  });
+
+  it('renames follow the owner link; mounting a tool leaves it alone', () => {
+    const [renamedOwner, renamedArm] = renameComponentRows([owner, arm], { lite6: 'cell_a', lite6_robot: 'cell_a_arm' });
+    expect(renamedOwner.component_id).toBe('cell_a');
+    expect(renamedArm).toMatchObject({ component_id: 'cell_a_arm', owner: 'cell_a', role: 'arm' });
+    expect(renameComponentRows([arm], { lite6_robot: 'x' })[0].owner).toBe('lite6');
+    expect(withMountRobot([arm], 'other_robot')[0].owner).toBe('lite6');
+  });
+
+  it('removes a machine with its members and their attachments; other rows stay', () => {
+    const draft = { ...document(owner, arm, io, device), attachments: [
+      { parent: { component_id: 'lite6_robot', interface: 'flange' }, child: { component_id: 'hand', interface: 'mount' } },
+      { parent: { component_id: 'other', interface: 'flange' }, child: { component_id: 'hand2', interface: 'mount' } },
+    ] };
+    const kept = withoutMachine(draft, 'lite6');
+    expect(kept.components).toEqual([device]);
+    expect(kept.attachments).toHaveLength(1);
+  });
+
+  it('builds a machine add from the model\'s ready rows: owner on its lane, members with default ids', () => {
+    const added = machineCatalogEntry(machine, 'real', {
+      'ufactory.lite6': { tags: ['articulated-arm'], attachmentInterfaces: ['flange'], tcpTargets: [] },
+    });
+    expect(added).toMatchObject({ kind: 'machine', componentId: 'lite6', tags: ['articulated-arm'], lane: 'real' });
+    expect(added.components).toEqual([
+      { component_id: 'lite6', component_profile_id: 'ufactory.lite6_machine', lane: 'real', configuration: {} },
+      { component_id: 'lite6_arm', component_profile_id: 'ufactory.lite6', model_source: arm.model_source,
+        owner: 'lite6', role: 'arm' },
+      { component_id: 'lite6_controller_io', component_profile_id: 'ufactory.lite6_controller_io',
+        owner: 'lite6', role: 'controller_io' },
+    ]);
   });
 });

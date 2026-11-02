@@ -158,19 +158,4 @@ ArmBinding(const deployment::RetainedBundle &bundle,
   return std::move(sealed.value());
 }
 
-inline core::BrandLifecycleObservationQueryDTO
-Query(const core::ResolvedLifecycleProviderOccurrenceDTO &occurrence,
-      const core::ControllableComponentId &component) {
-  return {core::LifecycleTransactionId("product.test.transaction"),
-          core::LifecycleTransactionGeneration(1),
-          component,
-          occurrence.control_domain_id,
-          occurrence.control_domain_revision,
-          occurrence.provider_instance_id,
-          occurrence.provider_manifest_id,
-          occurrence.provider_manifest_revision,
-          occurrence.provider_runtime_unit_id,
-          occurrence.provider_runtime_epoch};
-}
-
 } // namespace manyforge::roboplan_backend::product_test

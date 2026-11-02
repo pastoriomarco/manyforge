@@ -106,7 +106,6 @@ STRONG_STRING_TYPES = (
     "RuntimePolicyRevision",
     "InterruptSourceId",
     "InterruptPolicyId",
-    "InterruptLatchId",
     "MotionInterruptScopeId",
     "ComponentTypeId",
     "ComponentTypeRevision",
@@ -186,13 +185,10 @@ STRONG_STRING_TYPES = (
     "RequestId",
     "LifecycleTransactionId",
     "LifecycleFactId",
-    "LifecyclePrimitiveId",
-    "LifecyclePrimitiveAttemptId",
     "ConfigurationFenceId",
     "OperationId",
     "StopId",
     "StopCertificateId",
-    "StopFaultLatchId",
 )
 
 
@@ -793,7 +789,7 @@ def test_every_core_strong_string_has_distinct_immutable_python_type():
         with pytest.raises(TypeError):
             cls()
 
-    assert len(STRONG_STRING_TYPES) == 104
+    assert len(STRONG_STRING_TYPES) == 100
     assert len({type(value) for value in values}) == len(STRONG_STRING_TYPES)
     assert len(set(values)) == len(STRONG_STRING_TYPES)
     for index, left in enumerate(values):
@@ -806,17 +802,6 @@ def test_every_core_strong_string_has_distinct_immutable_python_type():
 
         class InvalidSubclass(core.CellId):
             pass
-
-
-def test_stop_terminal_fault_generation_is_a_distinct_immutable_counter():
-    generation = core.StopFaultLatchGeneration(7)
-    assert generation.value == 7
-    assert generation.nonzero is True
-    assert generation == core.StopFaultLatchGeneration(7)
-    assert generation != core.StopGeneration(7)
-    assert generation != core.StopCertificateRevision(7)
-    with pytest.raises(AttributeError):
-        generation.value = 8
 
 
 @pytest.mark.parametrize("case", CATALOG_REF_CASES)
@@ -889,7 +874,7 @@ def test_capability_definition_registry_and_qualified_referent_are_exact():
     assert len({row.capability_id for row in registry}) == len(registry)
     assert all(row.requirement_parameters_schema_ref is None for row in registry)
     assert core.BUILTIN_CAPABILITY_DEFINITION_REGISTRY_DIGEST == (
-        "sha256:713a06c46c5f5100fd4ee1a729ae06be5db753ed84cdff5bdf4d4ac5a77565e0"
+        "sha256:5f7eedf93f5bafe37e49149ceb32d09a7794b5792a823e7e786f0d288d4d5883"
     )
     assert core.find_builtin_capability_definition("context.state.current") is None
 
@@ -1806,8 +1791,8 @@ target: 0.5
         for entry in registry.catalog_schemas
         if entry.qualification == core.CatalogSchemaQualification.kUnqualified
     )
-    # Seven value schemas since M6 (runtime.pose_source.v2 joined the set).
-    assert len(registry.value_schemas) == 7
+    # Six value schemas (the native runtime schema went with the native lane).
+    assert len(registry.value_schemas) == 6
     assert {
         (entry.schema_id.value, entry.schema_revision.value)
         for entry in registry.value_schemas
@@ -1825,16 +1810,12 @@ target: 0.5
             "sha256:03457d535d31818fedaa7e44f48432a08feb705e4d22c9a8f5e50977c8dbf785",
         ),
         (
-            "manyforge.value_schema.runtime.native_execution.v1",
-            "sha256:19db78f3505f27815b6a90556de58caa0541c91193ead9b6a643f475383d5190",
-        ),
-        (
             "manyforge.value_schema.runtime.ros2_control_execution.v1",
-            "sha256:fb270d54f86ecc3f03cc520ea6b7c13cd2a32fef86d7da0700532fb4b2de7b59",
+            "sha256:1c557174fd45649c43d2e20239ec614635ca31aa79608d87727e35edcf8c2c90",
         ),
         (
             "manyforge.value_schema.runtime.io_provider_execution.v1",
-            "sha256:253091b4459b65d16bf23acc539e5d3c9ee65938008a147fd438ec6b6d8d53d7",
+            "sha256:500cfe739120003e06057cdf78a94f006eb4fc4ef157a7f55f70ab4d1aa45b1d",
         ),
         (
             "manyforge.value_schema.runtime.pose_source.v2",

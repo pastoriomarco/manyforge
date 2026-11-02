@@ -27,10 +27,23 @@ gripper:
   command_duration_s: 0.8        # the valve dwell in seconds (lane-free profile)
   touch_links: [lite_gripper_base_link, lite_gripper_left_finger, lite_gripper_right_finger]
 lanes:
-  mock:
-    controllers:                  # its gripper-only Mock row (no arm controller)
-      template: ufactory
-      hardware_component_name: MockLiteGripperSystem
-      gripper_controller: lite_gripper_controller
-      hard_stop_completion_timeout_s: 1.5
-      gripper_result_timeout_s: 5.0
+  mock:                           # Mock lane adapter (manyforge_ros2_control_execution/lane/)
+    adapter: mock
+    controller: lite_gripper_controller
+    controllers_file: mock_controllers.yaml
+    hard_stop_completion_timeout_s: 1.5
+    gripper_result_timeout_s: 5.0
+    gripper_stop_finish_tolerance: 0.0004 # m of finger travel (5% of the 8.1 mm stroke): a Stop this close lets the command finish
+  isaac:                          # Isaac lane adapter: the finger joint is in the robot's articulation
+    adapter: isaac
+    gripper_transport: isaac_joint_state_effort   # effort written straight to the joint command topic, no bridge
+    controller: lite_gripper_controller   # its GripperCommand action is <controller>/gripper_cmd
+    command_topic: /isaac_joint_commands_gripper
+    state_topic: /isaac_joint_states
+    completion_policy: dwell_elapsed
+    open_position: 0.0081
+    closed_position: 0.0
+    open_effort: 5.0
+    close_effort: -5.0
+    publish_nominal_position: true
+    gripper_result_timeout_s: 5.0

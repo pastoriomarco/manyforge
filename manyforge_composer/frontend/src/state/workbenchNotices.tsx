@@ -77,7 +77,7 @@ export interface WorkbenchNotice {
   incidentKind?: ViewerIncidentKind;
   /**
    * A warning that blocks nothing and stays until the operator acknowledges
-   * it (locally, per browser session), or until Reset or Scenario Close. Its
+   * it (locally, per browser session), or until Reset or Scenario New. Its
    * own `acknowledge` action, if any, runs on acknowledgement.
    */
   acknowledgeable?: boolean;

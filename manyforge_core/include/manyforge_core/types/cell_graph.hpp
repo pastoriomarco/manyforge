@@ -1,5 +1,6 @@
 #pragma once
 
+#include <compare>
 #include <cstdint>
 #include <manyforge_core/time/iclock.hpp>
 #include <manyforge_core/types/json_value.hpp>
@@ -279,6 +280,16 @@ struct ControlBindingDTO {
   friend bool operator==(const ControlBindingDTO&, const ControlBindingDTO&) = default;
 };
 
+/// A link pair the mount disables for collision checking: a source link of
+/// the child component's model and one of the parent component's model.
+struct ComponentAttachmentCollisionExclusionDTO {
+  std::string child_link;
+  std::string parent_link;
+
+  friend auto operator<=>(const ComponentAttachmentCollisionExclusionDTO&,
+                          const ComponentAttachmentCollisionExclusionDTO&) = default;
+};
+
 /// One of exactly six mutable graph-record kinds.
 struct ComponentAttachmentEdgeDTO {
   ComponentAttachmentId component_attachment_id;
@@ -288,6 +299,8 @@ struct ComponentAttachmentEdgeDTO {
   PlacementPoseDTO child_interface_pose_in_parent_interface;
   /// B5: the authored primary tool among several on one parent interface.
   bool primary{};
+  /// Authored arm-tool pairs that never touch, sorted; empty when unset.
+  std::vector<ComponentAttachmentCollisionExclusionDTO> collision_exclusions{};
 
   friend bool operator==(const ComponentAttachmentEdgeDTO&,
                          const ComponentAttachmentEdgeDTO&) = default;

@@ -1,107 +1,182 @@
 name: python-tests
 
+# ROS-free Python suites on the runner, one parallel job per package. The same
+# test sets as scripts/test-all.sh python / bridge / composer, plus the
+# headless API and Program runner unit tests (their process tests need ROS).
+# Tests marked `slow` run nightly in python-nightly.yml; the frontend half of
+# `test-all.sh composer` is frontend-build.yml. The nightly schedule runs this
+# on dev and seeds the ccache that pushes and PRs restore.
 on:
   pull_request:
     paths:
-      - "Dockerfile"
-      - "docker-entrypoint.sh"
-      - "manyforge_content_identity/**"
-      - "manyforge_core/**"
-      - "manyforge_deployment/**"
       - "manyforge_behavior/**"
+      - "manyforge_operator/**"
+      - "manyforge_example_nodes/**"
+      - "manyforge_example_models/**"
       - "manyforge_composer/**"
-      - "manyforge_supervision/**"
       - "manyforge_assistant_bridge/**"
-      - "tests/composable_cell_i4/**"
-      - "verification/composable_cell_i4/**"
+      - "manyforge_headless/**"
+      - "manyforge_headless_api/**"
+      - "manyforge_program_runner/**"
+      - "manyforge_core/**"
+      - "manyforge_content_identity/**"
+      - "manyforge_persistence/**"
+      - "manyforge_deployment/**"
+      - "manyforge_component_manager/**"
+      - "manyforge_scene/**"
       - "manyforge_ros/manyforge_ros/diagnostics_bridge.py"
       - "manyforge_ros/tests/test_diagnostics_bridge.py"
-      - "manyforge_medkit_adapter/manyforge_medkit_adapter/adapter.py"
-      - "manyforge_medkit_adapter/manyforge_medkit_adapter/forwarder.py"
+      - "manyforge_medkit_adapter/manyforge_medkit_adapter/**"
       - "manyforge_medkit_adapter/tests/test_forwarder.py"
-      - "scripts/test-all.sh"
-      - "scripts/ci/generate-core-bindings-contract.py"
-      - "scripts/ci/core-bindings-sanitizer-host.cpp"
-      - "scripts/ci/run-core-bindings.sh"
-      - "scripts/ci/run-core-bindings-contract.sh"
-      - "scripts/ci/run-core-bindings-sanitizer.sh"
-      - "verification/composable_cell_i2/**"
-      - "scripts/setup-docker.sh"
+      - "scripts/qualification/**"
+      - "scripts/lib/**"
+      - "tests/**"
+      - "verification/composable_cell_i4/**"
+      - "pytest.ini"
       - ".github/workflows/python-tests.yml"
   push:
     branches: [main, dev]
     paths:
-      - "Dockerfile"
-      - "docker-entrypoint.sh"
-      - "manyforge_content_identity/**"
-      - "manyforge_core/**"
-      - "manyforge_deployment/**"
       - "manyforge_behavior/**"
+      - "manyforge_operator/**"
+      - "manyforge_example_nodes/**"
+      - "manyforge_example_models/**"
       - "manyforge_composer/**"
-      - "manyforge_supervision/**"
       - "manyforge_assistant_bridge/**"
-      - "tests/composable_cell_i4/**"
-      - "verification/composable_cell_i4/**"
+      - "manyforge_headless/**"
+      - "manyforge_headless_api/**"
+      - "manyforge_program_runner/**"
+      - "manyforge_core/**"
+      - "manyforge_content_identity/**"
+      - "manyforge_persistence/**"
+      - "manyforge_deployment/**"
+      - "manyforge_component_manager/**"
+      - "manyforge_scene/**"
       - "manyforge_ros/manyforge_ros/diagnostics_bridge.py"
       - "manyforge_ros/tests/test_diagnostics_bridge.py"
-      - "manyforge_medkit_adapter/manyforge_medkit_adapter/adapter.py"
-      - "manyforge_medkit_adapter/manyforge_medkit_adapter/forwarder.py"
+      - "manyforge_medkit_adapter/manyforge_medkit_adapter/**"
       - "manyforge_medkit_adapter/tests/test_forwarder.py"
-      - "scripts/test-all.sh"
-      - "scripts/ci/generate-core-bindings-contract.py"
-      - "scripts/ci/core-bindings-sanitizer-host.cpp"
-      - "scripts/ci/run-core-bindings.sh"
-      - "scripts/ci/run-core-bindings-contract.sh"
-      - "scripts/ci/run-core-bindings-sanitizer.sh"
-      - "verification/composable_cell_i2/**"
-      - "scripts/setup-docker.sh"
+      - "scripts/qualification/**"
+      - "scripts/lib/**"
+      - "tests/**"
+      - "verification/composable_cell_i4/**"
+      - "pytest.ini"
       - ".github/workflows/python-tests.yml"
+  schedule:
+    - cron: "0 2 * * *"
   workflow_dispatch:
 
-# Qualification is container-only. The job builds the repository development
-# image, resolves that tag to an immutable image ID, and runs the retained
-# ROS-free I2 compiler bindings, retained Behavior/observation assertions,
-# assistant protocol/supervisor clients, and structural Composer shell inside
-# that image. Live runtime products remain unavailable and are not represented
-# by skips or mock lanes.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   python-tests:
-    name: I2 bindings, retained Python, and Composer (AMD64 Docker)
+    name: Python ${{ matrix.suite }}
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Root pytest.ini (-c) where test-all.sh passes several roots at once.
+          - suite: behavior
+            binding: true
+            pytest: -c pytest.ini --rootdir . -n auto -m "not slow" manyforge_behavior/tests
+          - suite: headless_api
+            binding: true
+            pytest: -c pytest.ini --rootdir . -n auto manyforge_headless_api/tests
+          - suite: program_runner
+            binding: true
+            pytest: -c pytest.ini --rootdir . -n auto manyforge_program_runner/tests
+          - suite: composer
+            binding: true
+            pytest: -n auto manyforge_composer/tests
+          - suite: bridge
+            binding: false
+            pytest: manyforge_assistant_bridge/tests
+          # The rest of test-all.sh python: small, in-repo subprocess tests; serial.
+          - suite: other
+            binding: true
+            pytest: >-
+              -c pytest.ini --rootdir .
+              manyforge_operator/tests scripts/qualification/tests tests/composable_cell_i4
+              tests/test_benchmark.py tests/test_public_contract_entrypoint_reconciliation.py
+              tests/test_regen.py tests/test_qualification_wrapper_entrypoints.py
+              tests/test_ros_qualification_helpers.py tests/test_grouped_gtest_runner.py
+              tests/test_release_golden_workflow.py tests/test_test_all_script_contract.py
+    env:
+      HEADLESS_BUILD: ${{ github.workspace }}/build/headless
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_MAXSIZE: 600M
+      CMAKE_C_COMPILER_LAUNCHER: ccache
+      CMAKE_CXX_COMPILER_LAUNCHER: ccache
     steps:
       - uses: actions/checkout@v4
-
-      - name: Prepare pinned RoboPlan Docker context
-        run: ./scripts/setup-docker.sh --prepare-only
-
-      - name: Build development image
-        run: docker build --platform linux/amd64 -t manyforge-python-ci:${GITHUB_SHA} .
-
-      - name: Resolve immutable development image
-        id: image
-        shell: bash
+        with:
+          ref: ${{ github.event_name == 'schedule' && 'dev' || '' }}
+      - name: Install native build dependencies
+        if: matrix.binding
         run: |
-          set -euo pipefail
-          image_id="$(docker image inspect "manyforge-python-ci:${GITHUB_SHA}" --format '{{.Id}}')"
-          if [[ ! "${image_id}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
-            echo "Could not resolve immutable development image identity" >&2
-            exit 1
-          fi
-          echo "id=${image_id}" >> "${GITHUB_OUTPUT}"
-          echo "Qualified image: ${image_id}"
-          docker image inspect "${image_id}" --format 'Image size (bytes): {{.Size}}'
-
-      - name: Run I2 bindings, retained Python, and Composer qualification
-        shell: bash
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build ccache pkg-config \
+            libsqlite3-dev libssl-dev libexpat1-dev zlib1g-dev libyaml-dev \
+            libdouble-conversion-dev libutf8proc-dev
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: .github/workflows/python-tests.yml
+      - name: Install Python dependencies (dev-image pins)
+        run: |
+          python -m pip install \
+            pytest==9.0.3 pytest-xdist==3.8.0 numpy==2.3.5 py_trees==2.4.0 \
+            pybind11==3.0.3 pyyaml==6.0.3 rfc8785==0.1.4 pillow==10.2.0 \
+            trimesh==4.11.5 yourdfpy==0.0.60 fastapi==0.135.3 \
+            "uvicorn[standard]==0.44.0" httpx==0.28.1 httpx2==2.12.0 \
+            websockets==16.0 mcp==1.27.0
+      # One cache for the expression binding: every job restores it, the
+      # behavior job saves it on push and on the nightly run.
+      - name: Restore ccache
+        if: matrix.binding
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ccache-headless-py-${{ github.run_id }}
+          restore-keys: ccache-headless-py-
+      # Same configuration as setup_expression_binding in scripts/test-all.sh.
+      - name: Build the expression binding (manyforge_headless_py)
+        if: matrix.binding
+        run: |
+          cmake -S manyforge_headless -B "$HEADLESS_BUILD" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DMANYFORGE_CORE_BUILD_SQLITE_OPERATION_JOURNAL=ON \
+            -DMANYFORGE_HEADLESS_BUILD_PYTHON=ON \
+            -Dpybind11_DIR="$(python3 -c 'import pybind11; print(pybind11.get_cmake_dir())')"
+          cmake --build "$HEADLESS_BUILD" --parallel 4 --target manyforge_headless_py
+          ccache --show-stats
+      - name: Save ccache
+        if: ${{ !cancelled() && matrix.suite == 'behavior' && github.event_name != 'pull_request' }}
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ccache-headless-py-${{ github.run_id }}
+      - name: pytest ${{ matrix.suite }}
         env:
-          IMAGE_ID: ${{ steps.image.outputs.id }}
+          PYTEST_SELECTION: ${{ matrix.pytest }}
         run: |
-          set -euo pipefail
-          docker run --rm --platform linux/amd64 \
-            -e WORKSPACE=/workspace \
-            -e MANYFORGE_BUILD_DIR=/tmp/manyforge-ci-build \
-            -e PYTHONPYCACHEPREFIX=/tmp/manyforge-pycache \
-            -v "${GITHUB_WORKSPACE}:/workspace" \
-            -w /workspace \
-            "${IMAGE_ID}" \
-            bash -lc 'set -euo pipefail; git config --global --add safe.directory /workspace; ./scripts/test-all.sh bindings; ./scripts/test-all.sh python; ./scripts/test-all.sh bridge; cd manyforge_composer/frontend; npm ci --ignore-scripts; cd /workspace; ./scripts/test-all.sh composer'
+          export PYTHONPATH="$HEADLESS_BUILD:$GITHUB_WORKSPACE:$GITHUB_WORKSPACE/manyforge_behavior"
+          eval "pytest -p no:cacheprovider -p no:launch_testing -p no:launch_ros \
+            --durations=25 -v $PYTEST_SELECTION"
+      - name: Diagnostics and Medkit client tests
+        if: matrix.suite == 'other'
+        run: |
+          export PYTHONPATH="$GITHUB_WORKSPACE/manyforge_ros:$GITHUB_WORKSPACE/manyforge_medkit_adapter:$GITHUB_WORKSPACE:$GITHUB_WORKSPACE/manyforge_behavior"
+          pytest manyforge_ros/tests/test_diagnostics_bridge.py \
+            manyforge_medkit_adapter/tests/test_forwarder.py \
+            -k 'not statuses_to_msg_builds_diagnostic_array' -v

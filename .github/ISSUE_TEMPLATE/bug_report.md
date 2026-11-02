@@ -29,7 +29,7 @@ filed here — email pastoriomarco@gmail.com (see SECURITY.md).
 
 - **ManyForge version**: <!-- cat VERSION -->
 - **Lane**: Mock / Isaac / Real
-- **Scenario project**: <!-- e.g. `--project examples/ur5e_lite6_wall_workbench.scenario` or the Scenario loaded in Composer -->
+- **Scenario project**: <!-- e.g. `--project examples/mock_dual_arm_workbench.scenario` or the Scenario loaded in Composer -->
 - **AI assistant used**: yes / no
 - **OS**: <!-- e.g. Ubuntu 24.04 -->
 - **Docker version**: <!-- docker version | head -3 -->

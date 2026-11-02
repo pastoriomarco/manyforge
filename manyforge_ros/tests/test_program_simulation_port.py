@@ -252,6 +252,26 @@ def test_program_tasks_translate_all_four_nodes_without_blocking_ticks() -> None
     port.close()
 
 
+
+def test_task_retention_evicts_the_oldest_finished_task_at_its_bound() -> None:
+    # R3: a long Run keeps starting node attempts; the bound evicts settled
+    # tasks instead of refusing, and only in-flight work can fill it.
+    client = _ControlClient()
+    port = SimulationProgramTaskPort(client, _site(), maximum_retained_tasks=2)
+    port.bind(_context())
+    for index in range(1, 7):
+        identity = _identity(index)
+        started = port.start(
+            "simulation.step", identity, OwnerNodeInputs(parameters={"steps": index})
+        )
+        assert _settled(port, started.task_id).state is OwnerTaskState.SUCCEEDED
+        port.acknowledge(started.task_id, identity)
+    # The newest task is retained: reusing its identity is still detected.
+    with pytest.raises(ValueError, match="reused with new intent"):
+        port.start("simulation.step", _identity(6), OwnerNodeInputs(parameters={"steps": 9}))
+    port.unbind("run.simulation")
+    port.close()
+
 class _BlockingControlClient(_ControlClient):
     def __init__(self) -> None:
         super().__init__()

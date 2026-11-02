@@ -228,6 +228,12 @@ OperatorAlarmDefinition DecodeDefinition(const CanonicalValue &root) {
       RequiredBool(root, "acknowledgement_reason_required");
   Require(acknowledgement_required || !acknowledgement_reason_required,
           "acknowledgement_reason_required needs acknowledgement_required");
+  const bool requires_motion_attention =
+      RequiredBool(root, "requires_motion_attention");
+  // V2-5: acknowledgement never gates work. Only a condition interlock (no
+  // acknowledgement) may gate motion.
+  Require(!(acknowledgement_required && requires_motion_attention),
+          "an alarm that requires acknowledgement must not gate motion");
   auto message_template =
       RequiredString(root, "message_template", kMaximumDefinitionTextBytes);
   ValidateMessageTemplate(message_template);
@@ -258,7 +264,7 @@ OperatorAlarmDefinition DecodeDefinition(const CanonicalValue &root) {
       std::move(runtime_modes),
       acknowledgement_required,
       acknowledgement_reason_required,
-      RequiredBool(root, "requires_motion_attention"),
+      requires_motion_attention,
       max_evidence_refs,
   };
 }

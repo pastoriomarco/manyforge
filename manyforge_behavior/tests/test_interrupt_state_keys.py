@@ -53,7 +53,7 @@ def test_a_program_check_on_a_rule_state_validates_as_a_read_only_key() -> None:
 
     declaration = program.blackboard_keys[_KEY]
     assert (declaration.type, declaration.access) == ("string", "read")
-    assert "clear | tripped | latched" in declaration.description
+    assert "inactive | clear | tripped" in declaration.description
     assert program.interrupt_state_rule_ids == ("light_curtain",)
     # The authored document declares nothing; only the validation view does.
     assert all(row["key"] != _KEY for row in program.to_dict().get("blackboard", {}).get("keys", []))
@@ -75,7 +75,7 @@ def test_a_computed_key_may_combine_rule_states() -> None:
     blackboard["namespaces"].sort(key=lambda row: row["namespace_id"])
     blackboard["keys"].append({
         "key": "cell.curtain_latched", "type": "bool", "access": "read", "persistence": "run",
-        "expression": f'key.{_KEY} == "latched"',
+        "expression": f'key.{_KEY} == "tripped"',
     })
     blackboard["keys"].sort(key=lambda row: row["key"])
     program = _program(document)
@@ -101,3 +101,17 @@ def test_the_deployment_join_refuses_an_undeclared_rule() -> None:
     applied = program.with_interrupt_state_keys(["light_curtain", "part_lost"])
     assert "interrupt_state.part_lost" in applied.blackboard_keys
     assert applied.interrupt_state_rule_ids == ("light_curtain",)
+
+
+def test_a_set_rule_active_names_a_rule_the_deployment_must_declare() -> None:
+    """CONTRACTS §9: a `rules.set_active` naming a rule that isn't in the
+    Deployment is refused before Execute by the same Program x Deployment join."""
+
+    document = _document()
+    _append(document, "rules.set_active", "arm_curtain", rule_id="light_curtain", active=True)
+    program = _program(document)
+    assert program.rule_activation_rule_ids == ("light_curtain",)
+    assert program.interrupt_state_rule_ids == ()
+    require_interrupt_state_rules(program, ["light_curtain"])
+    with pytest.raises(ProgramValidationError, match="does not declare: light_curtain"):
+        require_interrupt_state_rules(program, ["part_lost"])

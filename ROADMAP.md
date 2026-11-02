@@ -1,25 +1,17 @@
 # ManyForge roadmap
 
-> **Composable-cell cutover status (2026-07-31):** this document preserves the
-> public product outcomes and acceptance themes recorded before the destructive
-> runtime relocation. It is restoration backlog, not a statement that the old
-> runtime or its public wires are available, and it does not override the
-> dependency order of the active implementation plan. On current `dev`, only
-> the retained ROS-free C++ package qualifications, build-owned v2
-> node-environment inspection, and Composer's structural catalog/files/URDF
-> shell are available. Program execution, assistant/MCP operation, live scene
-> editing/viewing, native planning, Isaac/ROS product launch, and real-robot
-> operation are unavailable. Terms such as “existing”, “already”, “wired”,
-> “shipped”, and “currently” below refer to the captured pre-cutover baseline
-> at `manyforge@08222188293df8e12f90dc72e204c21f22f92ea1`, not the current
-> branch. Reuse the outcomes and tests, but reassign them to the new headless
-> owners and named restoration gates instead of reviving deleted Python
-> semantic owners or v0 wire contracts.
+> **Status (2026-11-02):** `v0.1.0` is tagged on the old `main` (`8ae05265`).
+> `0.2.0` is in validation: component model v2, every lane on ROS 2 Lyrical
+> with `ros2_control` and the stock joint trajectory controller (Mock, Isaac
+> Sim attach-only, Real for UFACTORY xArm-family robots), and RoboPlan 0.8
+> planning. See [CHANGELOG.md](CHANGELOG.md). Physical execution is not
+> qualified. The workstreams below are planned work; where a line names
+> something that exists, it says so.
 
 This is the public product-direction backlog. It is not a commitment to
 delivery dates or versions: items can move, be reordered, or be deferred as
-integration work surfaces new constraints. See CHANGELOG.md for what is
-actually planned for the next tag and what has shipped after tags exist.
+integration work surfaces new constraints. See CHANGELOG.md for what each
+tag ships and what the next one adds.
 
 The roadmap is structured by **what** before **when**: the workstreams below
 describe outcomes the project is working toward, in rough priority order. Each
@@ -37,23 +29,24 @@ planning a release that crosses the boundary.
 
 ## Real-Robot Execution Lane
 
-**Goal.** Ship the third execution lane (`real-robot`) alongside the
-existing `manyforge-only` and `isaac-sim` lanes. The `commanded_sim` /
-`observed_robot` source-mode split already exists in the kernel; what's
-missing is a paired deployment YAML, qualified tolerances, and a
-launcher scenario.
+**Goal.** Qualify the Real lane alongside the Mock and Isaac lanes. In
+0.2.0 each component names its `lane` (`mock`, `isaac`, `real`); the Real
+lane drives UFACTORY xArm-family robots through the vendor driver (Lite 6
+measured on hardware, `real_lite6_*` Scenarios). What's missing is
+qualified tolerances, a second hardware target, and the runbook items
+below.
 
 **Acceptance criteria.**
 
-- `examples/<arm>_real_robot.deployment.yaml` for at least one supported
-  hardware target (UR10e + Robotiq 2F-140 baseline).
+- A `real_*` Scenario for at least one further supported hardware target
+  (UR10e + Robotiq 2F-140 baseline; there is no real UR lane yet).
 - `execution_state_source_mode: observed_robot` qualified end-to-end
   (controller-feedback freshness, tracking-tolerance envelope,
   stop-completion timeout) per spec 240.
 - Re-enable controller-owned path/goal tolerance aborts (Isaac preview
   disables them; real robot must keep them on).
-- Launcher scenario `--lane real-robot` + an `isaac-sim`-style
-  readiness gate that probes the live controller.
+- A readiness gate that probes the live controller before Execute, as
+  the Isaac lane's attach checks do.
 - Operator runbook for first power-on, e-stop integration, and
   measured stop-completion characterization.
 
@@ -76,18 +69,19 @@ convergence, gripper action server hang.
 
 ## Assistant Graduations
 
-**Goal.** Move two assistant modes from preview to qualified:
+**Goal.** Move the `composer-assistant` mode from preview to qualified.
+It authors the Scene and the behavior tree; its edits land in the Program
+Draft, and the operator applies or discards them. It was validated on the
+smoke corpus before the 0.2.0 rework (iter-32 production recipe: 51/66 =
+77.3%) and needs hardening before it's the recommended path for new
+operators. The read-only `query` mode was removed; the assistant uses an
+`ai_model` Deployment component as its endpoint.
 
-- `query` mode — read-only inspection. Already validated; needs CI gates.
-- `composer-assistant` mode — scene + behavior-tree authoring with
-  proposal-then-review semantics. Validated on the smoke corpus
-  (iter-32 production recipe: 51/66 = 77.3%); needs hardening before
-  it's the recommended path for new operators.
-
-The read-only `inspect_isaac_scene` tool is already wired into the
-`isaac-ur10e-light-scene-assistant` deployment and has been exercised through
-the live ROS/Isaac query path. That is a shipped integration baseline, not a
-claim that every current model/profile combination is release-qualified.
+The read-only `inspect_isaac_scene` tool is in the `composer-assistant`
+catalog of the `sim_ur10e_assistant_scene_authoring` Scenario. It was
+exercised through the live ROS/Isaac path before the 0.2.0 rework; that is
+an integration baseline, not a claim that every current model/profile
+combination is release-qualified.
 
 **Acceptance criteria.**
 
@@ -99,15 +93,16 @@ claim that every current model/profile combination is release-qualified.
 
 ## Observability And Supervisability
 
-**Goal.** Promote the existing tracing/heartbeat surfaces from
-"present" to "production-supervisable."
+**Goal.** Promote the tracing and health surfaces from "present" to
+"production-supervisable."
 
 **Acceptance criteria.**
 
-- External-watchdog policy that consumes
-  `/api/infra/heartbeat`: an off-the-shelf example wired to either
-  systemd-watchdog (real robot) or an Isaac stop hook
-  (`commanded_sim`).
+- External-watchdog policy that consumes the cell's health
+  (`GET /api/components`, `GET /api/cell/latch`; 0.1.0's
+  `/api/infra/heartbeat` is not in 0.2.0): an off-the-shelf example wired
+  to either systemd-watchdog (Real lane) or an Isaac stop hook (Isaac
+  lane).
 - Failure-archive contents extended with: executing trajectory,
   rolling observed/predicted samples, controller result code/string
   as structured fields, deployment hash, program/artifact hash,
@@ -130,11 +125,11 @@ NemoClaw-Thor ROADMAP §"Thor SBSA + fine-tuning".
 
 The bar for calling ManyForge production-ready:
 
-1. All three execution lanes (manyforge-only, isaac-sim, real-robot)
-   ship with qualified tolerances and an external-watchdog example.
+1. All three lanes (Mock, Isaac, Real) ship with qualified tolerances
+   and an external-watchdog example.
 1. Smoke-corpus + chaos tests are mandatory CI gates on every release.
 1. The assistant `composer-assistant` mode hits ≥85% on the smoke
-   corpus with the production recipe (currently 77.3%).
+   corpus with the production recipe (77.3% before the 0.2.0 rework).
 1. Public-facing APIs (kernel state surfaces, deployment YAML schema,
    assistant-provider contract) are versioned per spec 430 §schema and stable
    enough that breaking changes are explicit major-release decisions, not

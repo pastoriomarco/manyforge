@@ -453,13 +453,7 @@ class ProgramRuntimeControls:
                     or owner.get("acknowledged_non_moving") is True
                 )
             )
-            # An unconfirmed Stop holds whatever the policy, on an undecided
-            # assessment: Continue is its Acknowledge, and the node goes on
-            # with the Stop's normal outcome (it closes only if it can).
-            continue_enabled = (
-                intervention.reason_code == "program_stop_settlement_unconfirmed"
-                or (intervention_allowed and closable)
-            )
+            continue_enabled = intervention_allowed and closable
             actions.append(
                 {
                     "action_id": "continue_with_failure",
@@ -479,8 +473,7 @@ class ProgramRuntimeControls:
             )
         operator_stop_settled = (
             isinstance(owner, dict)
-            and owner.get("recovery_class")
-            in {"ordinary_operator_stop", "stop_fault_intervention"}
+            and owner.get("recovery_class") == "ordinary_operator_stop"
             and owner.get("status") in {"retry_ready", "reset_required"}
             and owner.get("execution_state") == "Stopped"
             and owner.get("backend_stop_confirmed") is True
@@ -492,16 +485,10 @@ class ProgramRuntimeControls:
             and owner["stop_owner_generation"] > 0
             and "reset_cycle" in owner_actions
         )
-        stop_fault_reset_required = (
-            isinstance(owner, dict)
-            and owner.get("recovery_class") == "stop_fault_intervention"
-            and owner.get("status") == "reset_required"
-            and owner.get("retry_admissible") is False
-        )
         held_reset_enabled = (
             operator_stop_recovery
             and operator_stop_settled
-            and (owner.get("retry_admissible") is True or stop_fault_reset_required)
+            and owner.get("retry_admissible") is True
         )
         actions.append(
             {
@@ -600,11 +587,6 @@ class ProgramRuntimeControls:
                 "retained_bundle_id": self._capture["retained_bundle_id"],
                 "cycle_generation": cycle_generation,
                 **self._recovery_fences,
-                "latch_id": (
-                    owner.get("latch_id")
-                    if isinstance(owner, dict) and owner.get("latch_id")
-                    else None
-                ),
                 "stop_id": (
                     owner.get("stop_id")
                     if isinstance(owner, dict)

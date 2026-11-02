@@ -42,10 +42,12 @@ The response must be a standard non-streaming chat completion with one choice
 and OpenAI `tool_calls`. Any tool outside the active mode rejects the whole
 response (`response_rejected`).
 
-With the default `endpoint` stream setting (warning, auto), Prepare and Enable never refuse because of the model server. At runtime each
-`ai_model` component has one supervised stream, `endpoint` (probe every 2 s,
-budget 10 s, severity `warning`, recovery `auto`; override with a
-`policies.component_streams` row).
+Prepare and Enable never refuse because of the model server. Each `ai_model`
+component has one stream, `endpoint`: every 2 s a probe sends
+`GET {base_url}/models` and records a sample only when the server answers 2xx
+and lists the configured model (budget 10 s). A stale `endpoint` stream shows
+only in the component's stream freshness; it is never a fault and never
+latches the cell.
 
 ## Mode and tools
 

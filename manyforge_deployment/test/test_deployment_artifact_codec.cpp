@@ -10,8 +10,9 @@
 #include <optional>
 #include <limits>
 
+#include "gripper_only_retention_fixture.hpp"
 #include "lite6_controllable_retention_fixture.hpp"
-#include "native_execution_runtime_unit_internal.hpp"
+#include "execution_host_unit_internal.hpp"
 #include "ros2_control_execution_runtime_unit_internal.hpp"
 #include <set>
 #include <span>
@@ -653,8 +654,7 @@ CanonicalValue authored_gripper_field(const CanonicalValue &value,
 
 TEST(DeploymentArtifactCodec, RosGripperDwellPreservesDraftAndRetainedBoundaries) {
   for (const std::string_view kind : {"pneumatic", "position_commanded"}) {
-    const auto fixture = test::make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture(
-        {}, kind);
+    const auto fixture = test::make_lite_gripper_only_retention_fixture({}, kind);
     const auto &source = fixture.qualified.deployment().normalized_authored_root();
     for (const double duration : {0.0, 0.5, 60.0, -0.1, 60.1}) {
       SCOPED_TRACE(std::string(kind) + ":" + std::to_string(duration));
@@ -701,7 +701,7 @@ TEST(DeploymentArtifactCodec, RosGripperDwellPreservesDraftAndRetainedBoundaries
 
 TEST(DeploymentArtifactCodec, RosGripperOutputChoiceIsExplicitAndPositionAlwaysCommanded) {
   for (const std::string_view kind : {"pneumatic", "position_commanded"}) {
-    const auto fixture = test::make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture({}, kind);
+    const auto fixture = test::make_lite_gripper_only_retention_fixture({}, kind);
     const auto &source = fixture.qualified.deployment().normalized_authored_root();
     for (const std::string_view mode : {"commanded", "none", "unknown"}) {
       SCOPED_TRACE(std::string(kind) + ":" + std::string(mode));
@@ -744,7 +744,7 @@ TEST(DeploymentArtifactCodec, RosGripperOutputChoiceIsExplicitAndPositionAlwaysC
         common, "ros2_control runtime configuration"));
   }
   for (const double dwell : {0.0, 0.25}) {
-    const auto fixture = test::make_lite6_ros2_control_no_output_gripper_retention_fixture({}, dwell);
+    const auto fixture = test::make_lite_gripper_only_retention_fixture({}, "pneumatic", dwell, "none");
     const auto &unit = fixture.qualified.deployment().graph().graph().runtime_units.front();
     const auto rows = std::get<core::JsonValueDTO::Array>(unit.configuration.at("gripper_target_configurations").value);
     const auto decoded = detail::decode_ros2_control_execution_gripper_target_configurations(rows);
@@ -758,8 +758,7 @@ TEST(DeploymentArtifactCodec, RosGripperOutputChoiceIsExplicitAndPositionAlwaysC
 }
 
 TEST(DeploymentArtifactCodec, PneumaticIoResolvesTypedSignalsAndRejectsInvalidMappings) {
-  const auto fixture = test::make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture(
-      {}, "pneumatic");
+  const auto fixture = test::make_lite_gripper_only_retention_fixture({}, "pneumatic");
   const auto &unit = fixture.qualified.deployment().graph().graph().runtime_units.front();
   auto rows = std::get<core::JsonValueDTO::Array>(
       unit.configuration.at("gripper_target_configurations").value);
@@ -822,7 +821,7 @@ TEST(DeploymentArtifactCodec, PneumaticIoResolvesTypedSignalsAndRejectsInvalidMa
 TEST(DeploymentArtifactCodec, GraspConfirmationIsOptInAndNeedsItsEvidenceSource) {
   const auto rows_of = [](std::string_view kind) {
     const auto fixture =
-        test::make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture({}, kind);
+        test::make_lite_gripper_only_retention_fixture({}, kind);
     return std::get<core::JsonValueDTO::Array>(
         fixture.qualified.deployment().graph().graph().runtime_units.front()
             .configuration.at("gripper_target_configurations").value);
@@ -903,6 +902,32 @@ TEST(DeploymentArtifactCodec, GraspConfirmationIsOptInAndNeedsItsEvidenceSource)
                RetainedBundleError);
 }
 
+TEST(DeploymentArtifactCodec, StopFinishToleranceIsAnOptionalPositionGripperOverride) {
+  const auto rows_of = [](std::string_view kind) {
+    const auto fixture = test::make_lite_gripper_only_retention_fixture({}, kind);
+    return std::get<core::JsonValueDTO::Array>(
+        fixture.qualified.deployment().graph().graph().runtime_units.front()
+            .configuration.at("gripper_target_configurations").value);
+  };
+  const auto with = [](core::JsonValueDTO::Array rows, core::JsonValueDTO value) {
+    std::get<core::JsonObjectDTO>(rows.front().value)
+        .emplace("stop_finish_tolerance", std::move(value));
+    return rows;
+  };
+  const auto decode = [](const core::JsonValueDTO::Array &rows) {
+    return detail::decode_ros2_control_execution_gripper_target_configurations(rows);
+  };
+  const auto position = rows_of("position_commanded");
+  EXPECT_FALSE(decode(position).front().stop_finish_tolerance.has_value());
+  EXPECT_DOUBLE_EQ(*decode(with(position, core::JsonValueDTO{0.02})).front().stop_finish_tolerance,
+                   0.02);
+  EXPECT_DOUBLE_EQ(*decode(with(position, core::JsonValueDTO{0.0})).front().stop_finish_tolerance,
+                   0.0);
+  EXPECT_THROW((void)decode(with(position, core::JsonValueDTO{-0.01})), RetainedBundleError);
+  EXPECT_THROW((void)decode(with(rows_of("pneumatic"), core::JsonValueDTO{0.02})),
+               RetainedBundleError);
+}
+
 // The authored ROS runtime configuration with its `component_streams` member
 // replaced, or removed when no rows are given.
 CanonicalValue authored_component_streams(const CanonicalValue &value,
@@ -925,45 +950,48 @@ CanonicalValue authored_component_streams(const CanonicalValue &value,
 }
 
 TEST(DeploymentArtifactCodec, RosComponentStreamsAreRequiredData) {
-  const auto fixture = test::make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture(
-      {}, "pneumatic");
+  const auto fixture = test::make_lite_gripper_only_retention_fixture({}, "pneumatic");
   const auto &source = fixture.qualified.deployment().normalized_authored_root();
   const auto &unit = fixture.qualified.deployment().graph().graph().runtime_units.front();
   const auto component = fixture.qualified.deployment().graph().graph()
                              .controllable_components.front().controllable_component_id.value();
-  const auto row = [&](std::string_view stream, double budget_ns, std::string_view severity,
-                       std::string_view recovery, std::string_view owner = {}) {
+  const auto row = [&](std::string_view stream, double budget_ns,
+                       std::string_view owner = {}) {
     return CanonicalValue(CanonicalValue::Object{
         {"budget_ns", CanonicalValue(budget_ns)},
         {"controllable_component_id",
          CanonicalValue(owner.empty() ? component : std::string(owner))},
-        {"recovery", CanonicalValue(std::string(recovery))},
-        {"severity", CanonicalValue(std::string(severity))},
         {"stream_id", CanonicalValue(std::string(stream))},
     });
+  };
+  // CONTRACTS §7: a stream row has no severity or recovery any more.
+  const auto with_field = [](CanonicalValue value, std::string name,
+                             std::string text) {
+    auto fields = value.as_object();
+    fields.emplace_back(std::move(name), CanonicalValue(std::move(text)));
+    return CanonicalValue(std::move(fields));
   };
   const auto rows = [](std::initializer_list<CanonicalValue> values) {
     return std::optional<CanonicalValue>(CanonicalValue(CanonicalValue::Array(values)));
   };
-  const auto feedback = row("gripper_feedback", 1e9, "fault", "ack");
-  const auto measured = row("measured_joints", 1e9, "fault", "ack");
+  const auto feedback = row("gripper_feedback", 1e9);
+  const auto measured = row("measured_joints", 1e9);
   for (const double budget : {1e7, 2.5e8, 6e10}) {
     SCOPED_TRACE(std::to_string(budget));
     EXPECT_NO_THROW((void)compile_deployment_draft(canonical_json(authored_component_streams(
-        source, rows({row("gripper_feedback", budget, "blocking", "auto"), measured})))));
+        source, rows({row("gripper_feedback", budget), measured})))));
   }
-  // `fault` + `auto` is the user's choice: the incident closes once fresh.
-  EXPECT_NO_THROW((void)compile_deployment_draft(canonical_json(authored_component_streams(
-      source, rows({row("gripper_feedback", 1e9, "fault", "auto"), measured})))));
   for (const auto &rejected : {
            std::optional<CanonicalValue>{},
            rows({measured}),
            rows({feedback}),
-           rows({feedback, measured, row("measured_joints", 1e9, "fault", "ack", "foreign_robot")}),
-           rows({row("gripper_feedback", 9999999.0, "fault", "ack"), measured}),
-           rows({row("gripper_feedback", 60000000001.0, "fault", "ack"), measured}),
-           rows({row("gripper_feedback", 1e9 + 0.5, "fault", "ack"), measured}),
-           rows({feedback, measured, row("poses", 1e9, "warning", "auto")}),
+           rows({feedback, measured, row("measured_joints", 1e9, "foreign_robot")}),
+           rows({row("gripper_feedback", 9999999.0), measured}),
+           rows({row("gripper_feedback", 60000000001.0), measured}),
+           rows({row("gripper_feedback", 1e9 + 0.5), measured}),
+           rows({feedback, measured, row("poses", 1e9)}),
+           rows({with_field(feedback, "severity", "fault"), measured}),
+           rows({with_field(feedback, "recovery", "ack"), measured}),
        }) {
     SCOPED_TRACE(rejected.has_value() ? canonical_json(*rejected) : "absent");
     EXPECT_THROW((void)compile_deployment_draft(
@@ -977,8 +1005,6 @@ TEST(DeploymentArtifactCodec, RosComponentStreamsAreRequiredData) {
   EXPECT_EQ(decoded.front().controllable_component_id.value(), component);
   EXPECT_EQ(decoded.front().stream_id, "gripper_feedback");
   EXPECT_EQ(decoded.front().budget_ns, 1'000'000'000);
-  EXPECT_EQ(decoded.front().severity, core::StreamSeverityDTO::kFault);
-  EXPECT_EQ(decoded.front().recovery, core::StreamRecoveryDTO::kAck);
   EXPECT_EQ(decoded.back().stream_id, "measured_joints");
   const auto edited = [&](auto &&edit) {
     auto configuration = unit.configuration;
@@ -988,9 +1014,12 @@ TEST(DeploymentArtifactCodec, RosComponentStreamsAreRequiredData) {
   const auto field = [](core::JsonValueDTO &value, const std::string &name) -> core::JsonValueDTO & {
     return std::get<core::JsonObjectDTO>(value.value).at(name);
   };
-  // `fault` + `auto` is accepted.
-  EXPECT_NO_THROW((void)detail::decode_ros2_control_execution_component_streams(edited(
-      [&](auto &streams) { field(streams.front(), "recovery").value = std::string("auto"); })));
+  EXPECT_THROW((void)detail::decode_ros2_control_execution_component_streams(edited(
+                   [](auto &streams) {
+                     std::get<core::JsonObjectDTO>(streams.front().value)
+                         .emplace("severity", core::JsonValueDTO{std::string("fault")});
+                   })),
+               RetainedBundleError);
   EXPECT_THROW((void)detail::decode_ros2_control_execution_component_streams(edited(
                    [&](auto &streams) { field(streams.front(), "budget_ns").value = 5e6; })),
                RetainedBundleError);
@@ -1007,9 +1036,7 @@ TEST(DeploymentArtifactCodec, RosComponentStreamsAreRequiredData) {
   auto &profiles = std::get<core::JsonValueDTO::Array>(real.at("controller_profiles").value);
   ASSERT_EQ(profiles.size(), 1U);
   auto &profile = std::get<core::JsonObjectDTO>(profiles.front().value);
-  profile.erase("mock_profile");
-  profile.erase("isaac_profile");
-  profile.emplace("real_profile", core::JsonValueDTO{std::string("lite6_real")});
+  profile.at("lane").value = std::string("real");
   auto &streams = std::get<core::JsonValueDTO::Array>(real.at("component_streams").value);
   std::erase_if(streams, [&](const auto &entry) {
     const auto &fields = std::get<core::JsonObjectDTO>(entry.value);
@@ -1057,12 +1084,7 @@ TEST(DeploymentArtifactCodec, ComponentStreamOverridesNameGraphComponents) {
     return std::string(
                ",\"policies\":{\"retained_policy_records\":[],"
                "\"stop_stage_parameters\":[],"
-               "\"commissioned_stop_interfaces\":[],"
-               "\"interrupt_sources\":[],\"interrupt_policies\":[],"
-               "\"interrupt_config\":{\"queue_depth\":8,"
-               "\"cancel_validation_timeout_ns\":1000,"
-               "\"motion_scope_arm_timeout_ns\":1000,"
-               "\"supervisory_poll_rate_hz\":10}") +
+               "\"commissioned_stop_interfaces\":[]") +
            std::string(streams) + "}";
   };
   // An absent or empty table keeps the existing Deployment identity.
@@ -1074,12 +1096,11 @@ TEST(DeploymentArtifactCodec, ComponentStreamOverridesNameGraphComponents) {
   EXPECT_EQ(empty_table.deployment_revision(), ordinary.deployment_revision());
   expect_compute_error(
       document(empty_graph(), "[]", "{\"records\":[]}",
-               policies(R"(,"component_streams":[{"controllable_component_id":"octomap_1","stream_id":"map_updates","severity":"fault"}])")),
+               policies(R"(,"component_streams":[{"controllable_component_id":"octomap_1","stream_id":"map_updates","budget_ns":5}])")),
       "$.policies.component_streams[0].controllable_component_id");
 
   const auto fixture =
-      test::make_lite6_ros2_control_gripper_only_cclc_product_retention_fixture(
-          {}, "pneumatic");
+      test::make_lite_gripper_only_retention_fixture({}, "pneumatic");
   const auto &deployment = fixture.qualified.deployment();
   ASSERT_FALSE(deployment.graph().graph().controllable_components.empty());
   const auto &component = deployment.graph()

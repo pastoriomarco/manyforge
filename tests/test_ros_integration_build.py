@@ -27,7 +27,8 @@ def test_managed_ros_host_and_worker_keep_the_same_artifact_directory() -> None:
 def build_fixture(tmp_path: Path) -> dict[str, str]:
     source = tmp_path / "source"
     for name in ("manyforge_roboplan/CMakeLists.txt", "manyforge_ros2_control_execution/CMakeLists.txt",
-                 "manyforge_cclc_msgs/package.xml", "manyforge_ros_bringup/package.xml",
+                 "manyforge_xarm_control/CMakeLists.txt", "manyforge_isaac_adapter/CMakeLists.txt",
+                 "manyforge_ros_bringup/package.xml",
                  "aggregate/CMakeLists.txt"):
         path = source / name
         path.parent.mkdir(parents=True, exist_ok=True)

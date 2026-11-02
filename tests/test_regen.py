@@ -31,7 +31,7 @@ def test_steps_run_in_dependency_order() -> None:
     assert names.index("node-catalog") < names.index("assistant-registry")
     assert names.index("assistant-registry") < names.index("node-environment")
     assert names.index("program-revisions") < names.index("maintained-occurrences")
-    assert names.index("ui6i-scenario") < names.index("scenario-pins")
+    assert names.index("maintained-occurrences") < names.index("scenario-pins")
     assert names[-1] == "rest-contracts"
 
 
@@ -46,7 +46,7 @@ def test_digest_pairs_follow_identity_keys_not_list_positions() -> None:
 
 def test_check_mode_reports_a_moved_pin_as_stale() -> None:
     regen = _module()
-    ctx = regen.Context(update=False, deployment_tool=None, program_tool=None)
+    ctx = regen.Context(update=False, tools={})
     with pytest.raises(regen.Stale):
         regen.repin(ctx, OLD, NEW)
     regen.repin(ctx, OLD, OLD)  # an unchanged pin is current
@@ -71,7 +71,7 @@ def test_update_replaces_copies_but_not_docs_sealed_or_generated_files(
     monkeypatch.setattr(
         regen, "STEPS", (regen.Step("gen", lambda ctx: None, ("pkg/resources/*.json",)),)
     )
-    ctx = regen.Context(update=True, deployment_tool=None, program_tool=None)
+    ctx = regen.Context(update=True, tools={})
 
     regen.repin(ctx, OLD, NEW)
     regen.flush_pins(ctx)

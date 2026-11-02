@@ -99,54 +99,6 @@ def _alarms() -> dict[str, Any]:
     }
 
 
-def _component_overview() -> dict[str, Any]:
-    runtime = _runtime()
-    alarms = _alarms()
-    sections = runtime["sections"]
-    return {
-        "schema_version": "manyforge.component_overview.v2",
-        "overview_revision": "sha256:" + "a" * 64,
-        "readiness": "ready",
-        "summary_label": "Application surfaces ready",
-        "profile_label": "native",
-        "authority_label": "owner-issued scoped facts",
-        "user_message": "Current owner facts are ready.",
-        "capabilities": [
-            "Observe / Render",
-            "Plan / Preview",
-            "Execute / Control",
-        ],
-        "components": [],
-        "basis": {
-            "runtime_projection_owner_epoch": runtime["projection_owner_epoch"],
-            "runtime_projection_generation": runtime["projection_generation"],
-            "manager_source_owner_epoch": sections["manager"]["source_owner_epoch"],
-            "logical_scene_source_owner_epoch": sections["logical_scene"][
-                "source_owner_epoch"
-            ],
-            "logical_scene_source_generation": sections["logical_scene"][
-                "source_generation"
-            ],
-            "scene_runtime_source_owner_epoch": sections["scene_runtime"][
-                "source_owner_epoch"
-            ],
-            "scene_runtime_source_generation": sections["scene_runtime"][
-                "source_generation"
-            ],
-            "alarm_owner_epoch": alarms["owner_epoch"],
-            "alarm_generation": alarms["generation"],
-            "alarm_state_revision": alarms["state_revision"],
-            "admission_generation": 7,
-            "program_runner_owner_epoch": None,
-            "program_cycle_generation": None,
-            "applied_program_owner_epoch": None,
-            "applied_program_generation": None,
-            "execution_owner_epoch": None,
-            "execution_publication_generation": None,
-        },
-    }
-
-
 def _execution_observation() -> dict[str, Any]:
     return {
         "api_version": "manyforge.execution_command_response.v1",
@@ -488,8 +440,6 @@ def headless_client() -> (
             }
         elif path == "/api/runtime":
             payload = _runtime()
-        elif path == "/api/component-overview":
-            payload = _component_overview()
         elif path == "/api/manager/status":
             payload = {
                 "schema_version": "manyforge.manager_status_projection.v1",
@@ -605,8 +555,6 @@ def headless_client() -> (
         elif path in {
             "/api/execution/stops",
             "/api/execution/full-stop",
-            "/api/execution/stop-fault",
-            "/api/execution/stop-fault/recover",
             "/api/execution/runtime-scale-control",
         } or path.startswith("/api/execution/operations/"):
             payload = {
@@ -723,26 +671,8 @@ def headless_client() -> (
             }
         elif path.startswith("/api/program/persistent-values"):
             payload = {"forwarded": path}
-        elif path == "/api/execution/cell-recover":
-            payload = {
-                "schema_version": "manyforge.cell_recover_result.v1",
-                "request_id": body["request_context"]["request_id"],
-                "outcome": "done",
-                "acknowledged_incidents": [],
-                "latch_cleared": True,
-                "recovered_components": [],
-                "reason": None,
-            }
         elif path == "/api/program/runs/program-run.7/node-correction-previews":
             payload = {"forwarded": path}
-        elif path == "/api/execution/force-close":
-            if body["step"] == "stop":
-                return httpx.Response(409, json={"ok": False, "error": {
-                    "code": "scenario_force_close_stop_unconfirmed", "message": "unconfirmed",
-                    "details": {"reason": "stop_not_contained"}}}, request=request)
-            payload = {"ok": True, "command": "force_close", "result": {
-                "step": body["step"], "stop_generation": 5, "operations": [],
-                "released_orphan_resources": []}}
         else:
             return httpx.Response(404, json={"detail": "unknown"}, request=request)
         return httpx.Response(200, json=payload, request=request)
@@ -881,7 +811,6 @@ def test_public_control_rest_contract_is_a_strict_transparent_adapter(
 
     assert projection.json()["execution_control_revision"] == 4
     assert accepted.json()["receipt"]["correlation_id"] == ("request.external.stop.1")
-    assert malformed.status_code == 422
     forwarded = [item for item in requests if item["path"].startswith("/api/control/")]
     assert [(item["method"], item["path"]) for item in forwarded] == [
         ("GET", "/api/control/state"),
@@ -987,32 +916,6 @@ def _caller() -> dict[str, Any]:
     }
 
 
-def test_component_overview_route_reads_one_fresh_headless_projection() -> None:
-    class Client:
-        calls = 0
-
-        def component_overview_payload(self) -> bytes:
-            self.calls += 1
-            return json.dumps(
-                {**_component_overview(), "summary_label": "cold read"}
-            ).encode("utf-8")
-
-    client = Client()
-    app = FastAPI()
-    app.include_router(
-        create_headless_router(
-            client,  # type: ignore[arg-type]
-            ComposerState(),
-        )
-    )
-
-    with TestClient(app) as composer:
-        response = composer.get("/api/component-overview")
-        assert response.status_code == 200
-        assert response.json()["summary_label"] == "cold read"
-        assert client.calls == 1
-
-
 def test_composer_proxies_direct_scene_clear_without_repeating_it():
     class Client:
         calls = []
@@ -1046,7 +949,6 @@ def test_composer_projects_headless_reads_without_local_runtime_state(
         assert "ready" not in health["headless"]
         assert "robot_readiness" not in health["headless"]
         assert composer.get("/api/runtime").json() == _runtime()
-        assert composer.get("/api/component-overview").json() == (_component_overview())
         assert composer.get("/api/manager/status").status_code == 200
         assert composer.get("/api/manager/graph").status_code == 200
         assert composer.get("/api/manager/diff").status_code == 200
@@ -1201,7 +1103,6 @@ def test_composer_program_routes_forward_when_draft_matches_applied(
             json={
                 **stop,
                 "request_id": "request.program.motion-start.1",
-                "expected_run_revision": 1,
                 "expected_selection_revision": 0,
                 "reason": "initial operator motion Run",
             },
@@ -1346,29 +1247,6 @@ def test_composer_operation_controls_are_strict_stateless_forwarders(
         },
         "expected_stop_generation": 0,
     }
-    recovery = {
-        "request_context": {
-            **context,
-            "request_id": "request.stop-recovery.1",
-        },
-        "expected_latch_id": "stop-fault.1",
-        "expected_latch_generation": 1,
-        "expected_recovery_assessment_revision": 1,
-        "expected_stop_certificate_id": "stop-certificate.1",
-        "expected_stop_certificate_revision": 1,
-        "expected_cell_id": "cell.1",
-        "expected_retained_bundle_id": "sha256:" + "1" * 64,
-        "expected_graph_revision": "sha256:" + "2" * 64,
-        "configuration_expectations": [
-            {
-                "control_domain_id": "domain.1",
-                "active_control_configuration_id": "configuration.1",
-                "active_control_configuration_generation": 1,
-            }
-        ],
-        "reason": None,
-    }
-
     with _composer(client) as composer:
         for endpoint in ("reset", "acknowledge-completed"):
             response = composer.post(
@@ -1379,13 +1257,6 @@ def test_composer_operation_controls_are_strict_stateless_forwarders(
         assert composer.post("/api/execution/stops", json=stop).status_code == 200
         assert (
             composer.post("/api/execution/full-stop", json=full_stop).status_code == 200
-        )
-        assert composer.get("/api/execution/stop-fault").status_code == 200
-        assert (
-            composer.post(
-                "/api/execution/stop-fault/recover", json=recovery
-            ).status_code
-            == 200
         )
         assert (
             composer.post(
@@ -1475,7 +1346,6 @@ def test_composer_operation_controls_are_strict_stateless_forwarders(
         for item in requests
         if item["path"] == "/api/execution/stops"
         or item["path"] == "/api/execution/full-stop"
-        or item["path"].startswith("/api/execution/stop-fault")
         or item["path"].startswith("/api/execution/operations/")
         or item["path"] == "/api/execution/runtime-scale-control"
     ]
@@ -1484,8 +1354,6 @@ def test_composer_operation_controls_are_strict_stateless_forwarders(
         "acknowledge-completed",
         "stops",
         "full-stop",
-        "stop-fault",
-        "recover",
         "runtime-scale-control",
         "runtime-scale-control",
         "runtime-scale-control",
@@ -1493,13 +1361,11 @@ def test_composer_operation_controls_are_strict_stateless_forwarders(
     assert forwarded[0]["body"] == control
     assert forwarded[2]["body"] == stop
     assert forwarded[3]["body"] == full_stop
-    assert forwarded[4]["method"] == "GET"
-    assert forwarded[5]["body"] == recovery
-    assert forwarded[6]["body"] == scale_control
-    assert forwarded[7]["method"] == "GET"
-    assert forwarded[8]["method"] == "GET"
+    assert forwarded[4]["body"] == scale_control
+    assert forwarded[5]["method"] == "GET"
+    assert forwarded[6]["method"] == "GET"
     assert json.loads(
-        dict(parse_qsl(forwarded[8]["query"]))["group_targets"]
+        dict(parse_qsl(forwarded[6]["query"]))["group_targets"]
     ) == [
         {"component_role_id": "robot-a", "target_role_id": "arm"},
         {"component_role_id": "robot-b", "target_role_id": "arm"},
@@ -2286,51 +2152,6 @@ def test_composer_does_not_serve_removed_runtime_override_routes(headless_client
     assert not any("runtime-override" in item["path"] for item in requests)
 
 
-@pytest.mark.parametrize("result", [None, {"replay_status": "replayed_exact", "acceptance": None, "status": None}])
-def test_lifecycle_request_result_proxy_forwards_normalized_request_without_submit(result) -> None:
-    body = {
-        "request_context": _caller(), "controllable_component_id": "component.arm",
-        "intent": "prepare", "expected_graph_revision": "graph.1",
-        "expected_component_lifecycle_generation": 4,
-        "expected_admission_generation": 7,
-        "expected_control_domains": [{
-            "kind": "controller",
-            "control_domain_id": "domain.arm", "control_domain_revision": "domain.1",
-            "controller_topology_id": "topology.arm", "topology_revision": "topology.1",
-            "expected_active_control_configuration": {
-                "presence": "absent", "active_control_configuration_id": None,
-                "active_control_configuration_generation": None,
-            },
-            "expected_control_bindings": [{"control_binding_id": "binding.arm",
-                "control_binding_revision": "binding.1", "control_route_id": "route.1"}],
-        }],
-        "reason": "operator-confirmed Composer request", "confirmed": True,
-    }
-    calls = []
-
-    class Client:
-        def component_lifecycle_request_result(self, payload):
-            calls.append(payload)
-            return {"result": result}
-
-        def submit_component_lifecycle(self, payload):
-            raise AssertionError("request-result read must never submit")
-
-    app = FastAPI()
-    app.include_router(create_headless_router(Client(), ComposerState()))
-    with TestClient(app) as composer:
-        response = composer.post("/api/cclc/lifecycle/requests/result", json=body)
-    assert response.status_code == 200
-    assert response.json() == {"result": result}
-    # The validated route serializes the newer optional incident fields as
-    # null. Headless drops null fields before asking CCLC for the result.
-    assert calls == [{
-        **body,
-        "acknowledge_incident": None,
-        "expected_incident_id": None,
-    }]
-
-
 def _close_detach_body():
     body = _scene_body()
     body.pop("expected_admission_generation")
@@ -2445,146 +2266,3 @@ def test_close_runtime_detach_still_rejects_native_authoring_fences(headless_cli
         response = composer.post("/api/scene/transactions", json=body)
         assert response.status_code == 422, response.text
         assert not [request for request in requests if request["path"] == "/api/scene/transactions"]
-
-
-def test_composer_forwards_the_targeted_reset_acknowledgement_unchanged(
-    headless_client,
-) -> None:
-    client, requests, _node_environment = headless_client
-    control = {
-        "request_context": {
-            "request_id": "request.control.ack",
-            "request_owner_epoch": "execution.epoch.1",
-            "source_label": "composer_ui",
-            "correlation_id": None,
-        },
-        "operation_id": "operation-1",
-        "expected_operation_revision": 3,
-        "reason": None,
-        "acknowledged_uncertain_outputs": [
-            {"operation_id": "operation-1", "operation_revision": 3}
-        ],
-    }
-    with _composer(client) as composer:
-        accepted = composer.post(
-            "/api/execution/operations/operation-1/reset", json=control
-        )
-        refused = composer.post(
-            "/api/execution/operations/operation-1/reset",
-            json={
-                **control,
-                "acknowledged_uncertain_outputs": [
-                    {"operation_id": "operation-9", "operation_revision": 1}
-                ],
-            },
-        )
-    assert accepted.status_code == 200
-    assert refused.status_code == 422
-    forwarded = [
-        item
-        for item in requests
-        if item["path"] == "/api/execution/operations/operation-1/reset"
-    ]
-    assert [item["body"] for item in forwarded] == [control]
-
-
-def test_global_io_rule_recovery_variant_is_proxied_unchanged(headless_client) -> None:
-    client, requests, _node_environment = headless_client
-    selector = {
-        "context": {
-            "owner_epoch": "kernel.epoch.1",
-            "catalog_generation": "4",
-            "active_publication_generation": 2,
-            "bundle": "sha256:" + "1" * 64,
-            "graph": "sha256:" + "2" * 64,
-        },
-        "rule_id": "door_open",
-        "expected_rule_registration_id": "18446744073709551615",
-    }
-    recovery = {
-        "kind": "global_io_rule",
-        "request_context": {
-            "request_id": "request.rule-recovery.1",
-            "request_owner_epoch": "execution.epoch.1",
-            "source_label": "composer_ui",
-            "correlation_id": None,
-        },
-        "selector": selector,
-        "reason": None,
-    }
-    with _composer(client) as composer:
-        accepted = composer.post("/api/execution/stop-fault/recover", json=recovery)
-        unknown = composer.post(
-            "/api/execution/stop-fault/recover", json={**recovery, "kind": "other"}
-        )
-        numeric = composer.post(
-            "/api/execution/stop-fault/recover",
-            json={
-                **recovery,
-                "selector": {**selector, "expected_rule_registration_id": 7},
-            },
-        )
-    assert accepted.status_code == 200, accepted.text
-    assert unknown.status_code == 422
-    assert numeric.status_code == 422
-    forwarded = [
-        item for item in requests if item["path"] == "/api/execution/stop-fault/recover"
-    ]
-    assert [item["body"] for item in forwarded] == [recovery]
-
-
-def test_cell_recover_forwards_caller_identity_with_schema_defaults(headless_client) -> None:
-    client, requests, _node_environment = headless_client
-    body = {
-        "request_context": {
-            "request_id": "request.cell-recover.1",
-            "source_label": "composer_ui",
-            "correlation_id": None,
-        }
-    }
-    with _composer(client) as composer:
-        accepted = composer.post("/api/execution/cell-recover", json=body)
-        echoed = composer.post(
-            "/api/execution/cell-recover",
-            json={
-                "request_context": {
-                    **body["request_context"],
-                    "request_owner_epoch": "execution.epoch.1",
-                },
-                "expected_latch_id": "stop-fault.1",
-            },
-        )
-    assert accepted.status_code == 200, accepted.text
-    assert accepted.json()["outcome"] == "done"
-    assert echoed.status_code == 422
-    forwarded = [item for item in requests if item["path"] == "/api/execution/cell-recover"]
-    assert forwarded == [{
-        "method": "POST",
-        "path": "/api/execution/cell-recover",
-        "query": "",
-        "body": {
-            **body,
-            "expected_incident_ids": None,
-            "replay_only": False,
-        },
-    }]
-
-
-def test_force_close_steps_forward_unchanged_with_their_typed_refusal(headless_client) -> None:
-    # Item 37: Force close runs in Headless; Composer forwards each step.
-    client, requests, _node_environment = headless_client
-    context = {"request_id": "force-close.1", "request_owner_epoch": "kernel.epoch.1",
-               "source_label": "composer_ui", "correlation_id": None}
-    stop = {"request_context": context, "step": "stop", "expected_stop_generation": 4}
-    operations = {"request_context": context, "step": "close_operations", "expected_stop_generation": None}
-    with _composer(client) as composer:
-        refused = composer.post("/api/execution/force-close", json=stop)
-        closed = composer.post("/api/execution/force-close", json=operations)
-        malformed = composer.post("/api/execution/force-close", json={"request_context": context, "step": "stop"})
-    assert refused.status_code == 409, refused.text
-    assert "scenario_force_close_stop_unconfirmed" in refused.text
-    assert closed.status_code == 200, closed.text
-    assert closed.json()["result"]["step"] == "close_operations"
-    assert malformed.status_code == 422
-    forwarded = [item["body"] for item in requests if item["path"] == "/api/execution/force-close"]
-    assert forwarded == [stop, operations]

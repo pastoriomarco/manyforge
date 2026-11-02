@@ -1,4 +1,4 @@
-// Lean Stop record (operation journal v17): measured stored bytes per Stop.
+// Lean Stop record (operation journal v18): measured stored bytes per Stop.
 //
 // Every Stop here is written through the public SqliteOperationJournal API and
 // measured with plain sqlite3 reads: the sum of length(payload_json) of the
@@ -392,11 +392,10 @@ struct StopFixture final {
 };
 
 /// A Full Stop over `participants`. Participant i runs `attempts[i]` stages:
-/// the last one succeeds, every earlier one fails and escalates. `latched`
-/// adds the escalation fault latch the Kernel raises for such a Stop.
+/// the last one succeeds, every earlier one fails and escalates.
 [[nodiscard]] StopFixture BuildStop(const RequestOwnerEpoch& epoch,
                                     const std::vector<ParticipantFixture>& participants,
-                                    const std::vector<std::size_t>& attempts, const bool latched) {
+                                    const std::vector<std::size_t>& attempts) {
   if (attempts.size() != participants.size()) throw std::logic_error("attempt count mismatch");
   const StopId stop_id("stop.size");
   const StopGeneration stop_generation(1U);
@@ -478,48 +477,10 @@ struct StopFixture final {
       std::move(entries),
       std::move(attempted),
       std::nullopt,
-      latched ? std::optional<StopFaultLatchId>(StopFaultLatchId("latch.stop.size"))
-              : std::nullopt,
-      latched ? std::optional<StopFaultLatchGeneration>(StopFaultLatchGeneration(1U))
-              : std::nullopt,
       100,
       std::nullopt};
   auto certificate = ReduceStopTerminal(input);
   if (!certificate.ok()) throw std::logic_error("Stop certificate: " + certificate.error().message);
-
-  std::optional<StopFaultLatchDTO> latch;
-  if (latched) {
-    std::vector<OperationId> operations;
-    for (const auto& participant : participants) {
-      operations.push_back(participant.plan.operation_id);
-    }
-    const auto& base = participants.front().base;
-    latch = StopFaultLatchDTO{
-        CellId("cell.1"),
-        stop_id,
-        stop_generation,
-        StopCertificateRefDTO{certificate.value().stop_certificate_id,
-                              certificate.value().stop_certificate_revision, stop_id,
-                              stop_generation},
-        StopFaultLatchId("latch.stop.size"),
-        StopFaultLatchGeneration(1U),
-        StopFaultTriggerDTO::kEscalated,
-        false,
-        std::move(operations),
-        resources,
-        base.retained_bundle_id,
-        base.graph_revision,
-        StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kPending, std::nullopt,
-                                       std::nullopt},
-        StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kNotApplicable,
-                                       std::nullopt, std::nullopt},
-        StopFaultLatchStateDTO::kLatched,
-        1U,
-        StopFaultRecoveryStatusDTO::kWaitingForObservation,
-        "stop_fault_latched",
-        {},
-        {StopFaultTriggerDTO::kEscalated}};
-  }
 
   // The status exactly as the Kernel hands it to the journal: the certificate
   // join plus the stored-only rest, with the terminal projection pending.
@@ -529,20 +490,16 @@ struct StopFixture final {
       StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kRecorded, std::nullopt,
                                      std::nullopt},
       StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kPending, std::nullopt,
-                                     std::nullopt},
-      StopDurableProjectionStatusDTO{StopDurableProjectionStateDTO::kNotApplicable, std::nullopt,
-                                     std::nullopt},
-      std::nullopt};
-  auto status = TerminalStopStatusFromCertificate(rest, certificate.value(), latch);
-  if (const auto error = stop_terminal_projection_field_error(status, certificate.value(), latch);
+                                     std::nullopt}};
+  auto status = TerminalStopStatusFromCertificate(rest, certificate.value());
+  if (const auto error = stop_terminal_projection_field_error(status, certificate.value());
       error.has_value()) {
     throw std::logic_error("Stop terminal status: " + std::string(*error));
   }
   return StopFixture{
       acceptance, intent, EmergencyStopAffectedStateSnapshotDTO{{}, std::move(resources)},
       accepted,
-      StopJournalTerminalProjectionDTO{std::move(status), std::move(certificate.value()),
-                                       std::move(latch)}};
+      StopJournalTerminalProjectionDTO{std::move(status), std::move(certificate.value())}};
 }
 
 struct StoredRow final {
@@ -560,10 +517,10 @@ struct StoredStop final {
   std::string all_bytes;
 };
 
-/// Records acceptance, terminal and (when latched) the operator fault clear
-/// through the journal, then reads the Stop's stored bytes with plain sqlite3.
+/// Records acceptance and terminal through the journal, then reads the Stop's
+/// stored bytes with plain sqlite3.
 void RecordAndMeasure(const StopFixture& stop, const std::vector<ResourceId>& inventory,
-                      const bool clear, StoredStop* stored) {
+                      StoredStop* stored) {
   ScopedTemporaryDirectory temporary;
   const auto database = temporary.path() / std::string(kOperationJournalFilename);
   const RequestOwnerEpoch& epoch = stop.acceptance.owner_epoch;
@@ -578,54 +535,12 @@ void RecordAndMeasure(const StopFixture& stop, const std::vector<ResourceId>& in
         << (accepted.error.has_value() ? accepted.error->code + ": " + accepted.error->message
                                        : std::string{});
     const auto& terminal = stop.terminal;
-    const auto recorded = journal.RecordStopTerminal(epoch, terminal.stop_status,
-                                                     terminal.certificate, terminal.fault_latch);
+    const auto recorded =
+        journal.RecordStopTerminal(epoch, terminal.stop_status, terminal.certificate);
     ASSERT_EQ(recorded.state, StopForensicProjectionStateDTO::kRecorded)
         << (recorded.error.has_value() ? recorded.error->code + ": " + recorded.error->message
                                        : std::string{});
 
-    if (clear) {
-      ASSERT_TRUE(terminal.fault_latch.has_value());
-      auto cleared_latch = *terminal.fault_latch;
-      cleared_latch.terminal_projection = StopDurableProjectionStatusDTO{
-          StopDurableProjectionStateDTO::kRecorded, std::nullopt, std::nullopt};
-      cleared_latch.clear_projection = StopDurableProjectionStatusDTO{
-          StopDurableProjectionStateDTO::kRecorded, std::nullopt, std::nullopt};
-      cleared_latch.state = StopFaultLatchStateDTO::kCleared;
-      cleared_latch.recovery_assessment_revision = 3U;
-      cleared_latch.recovery_status = StopFaultRecoveryStatusDTO::kCleared;
-      cleared_latch.reason_code = "stop_fault_recovery_cleared";
-      cleared_latch.evidence_refs = {
-          StopFaultRecoveryEvidenceRefDTO{StopFaultRecoveryEvidenceKindDTO::kSettlement,
-                                          ContentDigest(kDigestA)},
-          StopFaultRecoveryEvidenceRefDTO{StopFaultRecoveryEvidenceKindDTO::kConfiguration,
-                                          ContentDigest(kDigestB)}};
-      const StopFaultRecoveryIntentDTO recovery_intent{
-          PublicRequestContextDTO{RequestId("request.stop.size.clear"), epoch,
-                                  "stop-record-size-test", std::nullopt},
-          cleared_latch.latch_id,
-          cleared_latch.latch_generation,
-          2U,
-          terminal.certificate.stop_certificate_id,
-          terminal.certificate.stop_certificate_revision,
-          cleared_latch.cell_id,
-          cleared_latch.retained_bundle_id,
-          cleared_latch.graph_revision,
-          {StopFaultRecoveryConfigurationExpectationDTO{
-              ControlDomainId("domain.arm"), ActiveControlConfigurationId("active.arm"),
-              ActiveControlConfigurationGeneration(7U)}},
-          std::string("operator verified cell")};
-      auto resulting_status = terminal.stop_status;
-      resulting_status.terminal_projection = StopDurableProjectionStatusDTO{
-          StopDurableProjectionStateDTO::kRecorded, std::nullopt, std::nullopt};
-      resulting_status.fault_latch = cleared_latch;
-      const StopFaultRecoveryResultDTO recovery_result{
-          recovery_intent.request_context.request_id, RequestReplayStatusDTO::kAcceptedNew, true,
-          cleared_latch, std::nullopt};
-      const auto cleared = journal.RecordStopFaultCleared(epoch, recovery_intent, recovery_result,
-                                                          cleared_latch, resulting_status);
-      ASSERT_TRUE(cleared.ok()) << cleared.error().code << ": " << cleared.error().message;
-    }
     journal.Close();
   }
 
@@ -686,10 +601,6 @@ void RecordAndMeasure(const StopFixture& stop, const std::vector<ResourceId>& in
     }
   }
   ASSERT_EQ(terminal_rows, 1U);
-  const auto clear_rows =
-      std::count_if(stored->rows.begin(), stored->rows.end(),
-                    [](const auto& row) { return row.record_kind == "stop_fault_cleared"; });
-  EXPECT_EQ(clear_rows, clear ? 1 : 0);
 
   // The measured bytes are the lean record itself: they decode to the exact
   // certificate the Kernel handed over.
@@ -718,7 +629,7 @@ void ExpectEachPlanStoredOnce(const StoredStop& stored,
   const auto root = ci::parse_canonical_json(stored.terminal_payload, limits);
   ASSERT_TRUE(root.is_array());
   const auto& fields = root.as_array();
-  ASSERT_EQ(fields.size(), 5U);
+  ASSERT_EQ(fields.size(), 4U);
   ASSERT_TRUE(fields.front().is_string());
   EXPECT_EQ(fields.front().as_string(), std::string(kStopJournalTerminalProjectionApiVersion));
   ASSERT_TRUE(fields.back().is_array());
@@ -774,9 +685,9 @@ void Report(const std::string& label, const StoredStop& stored) {
 
 TEST(StopRecordSizeTest, OneArmOneGripperNominalStaysWithin32KiB) {
   const auto participants = Participants(1U, 1U);
-  const auto stop = BuildStop(Epoch(), participants, {1U, 1U}, false);
+  const auto stop = BuildStop(Epoch(), participants, {1U, 1U});
   StoredStop stored;
-  ASSERT_NO_FATAL_FAILURE(RecordAndMeasure(stop, Inventory(participants), false, &stored));
+  ASSERT_NO_FATAL_FAILURE(RecordAndMeasure(stop, Inventory(participants), &stored));
   Report("arm1_gripper1_nominal", stored);
   EXPECT_LE(stored.total_bytes, 32U * kKiB);
   ExpectEachPlanStoredOnce(stored, participants);
@@ -784,28 +695,28 @@ TEST(StopRecordSizeTest, OneArmOneGripperNominalStaysWithin32KiB) {
 
 TEST(StopRecordSizeTest, TwoArmsTwoGrippersNominalStaysWithin64KiB) {
   const auto participants = Participants(2U, 2U);
-  const auto stop = BuildStop(Epoch(), participants, std::vector<std::size_t>(4U, 1U), false);
+  const auto stop = BuildStop(Epoch(), participants, std::vector<std::size_t>(4U, 1U));
   StoredStop stored;
-  ASSERT_NO_FATAL_FAILURE(RecordAndMeasure(stop, Inventory(participants), false, &stored));
+  ASSERT_NO_FATAL_FAILURE(RecordAndMeasure(stop, Inventory(participants), &stored));
   Report("arm2_gripper2_nominal", stored);
   EXPECT_LE(stored.total_bytes, 64U * kKiB);
   ExpectEachPlanStoredOnce(stored, participants);
 }
 
-TEST(StopRecordSizeTest, TwoArmsTwoGrippersFullyEscalatedAndClearedStaysWithin96KiB) {
+TEST(StopRecordSizeTest, TwoArmsTwoGrippersFullyEscalatedStaysWithin96KiB) {
   const auto participants = Participants(2U, 2U);
   // Every participant runs through all its stages (a = K): arms 3, grippers 2.
   std::vector<std::size_t> attempts;
   for (const auto& participant : participants) {
     attempts.push_back(participant.plan.stage_commands.size());
   }
-  const auto stop = BuildStop(Epoch(), participants, attempts, true);
+  const auto stop = BuildStop(Epoch(), participants, attempts);
   ASSERT_EQ(stop.terminal.certificate.result, StopCertificateResultDTO::kSucceededEscalated);
   ASSERT_EQ(stop.terminal.certificate.attempted_stage_results.size(),
             2U * kArmStageCount + 2U * kGripperStageCount);
   StoredStop stored;
-  ASSERT_NO_FATAL_FAILURE(RecordAndMeasure(stop, Inventory(participants), true, &stored));
-  Report("arm2_gripper2_escalated_cleared", stored);
+  ASSERT_NO_FATAL_FAILURE(RecordAndMeasure(stop, Inventory(participants), &stored));
+  Report("arm2_gripper2_escalated", stored);
   EXPECT_LE(stored.total_bytes, 96U * kKiB);
   ExpectEachPlanStoredOnce(stored, participants);
 }
@@ -815,9 +726,9 @@ TEST(StopRecordSizeTest, OneExtraAttemptAddsLessThan4KiBBecauseItsPlanIsNotRepea
   ASSERT_EQ(participants.front().kind, ParticipantKind::kArm);
   std::vector<StoredStop> measured(kArmStageCount);
   for (std::size_t arm_attempts = 1U; arm_attempts <= kArmStageCount; ++arm_attempts) {
-    const auto stop = BuildStop(Epoch(), participants, {arm_attempts, 1U}, false);
+    const auto stop = BuildStop(Epoch(), participants, {arm_attempts, 1U});
     auto& stored = measured[arm_attempts - 1U];
-    ASSERT_NO_FATAL_FAILURE(RecordAndMeasure(stop, Inventory(participants), false, &stored));
+    ASSERT_NO_FATAL_FAILURE(RecordAndMeasure(stop, Inventory(participants), &stored));
     Report("arm1_gripper1_arm_attempts_" + std::to_string(arm_attempts), stored);
     ExpectEachPlanStoredOnce(stored, participants);
   }

@@ -1,3 +1,4 @@
+#include "execution_host_responses.hpp"
 #include "host_io_signal_runtime.hpp"
 #include "ros_host_composition.hpp"
 
@@ -208,6 +209,27 @@ TEST_F(HostRuleEvidenceWakeupTest, CarriedObjectLostSignalFollowsTheHostStore) {
   system->Shutdown();
 }
 
+
+// G2: readiness requires a Program-bound system signal; the component-model
+// read samples it from the compiled catalog (it is never authored), and the
+// sample it reports must count as fresh before any loss.
+TEST_F(HostRuleEvidenceWakeupTest, ASystemSignalSampleIsFreshForReadiness) {
+  const auto row = SystemRow("robot.g2", "gripper");
+  auto system = HostIoSignalRuntime::Create(core::RequestOwnerEpoch("host"), 1U,
+                                            {}, clock, scheduler, 0U, {row});
+  system->Start();
+  system->AdoptCarriedObjectLostSignals();
+  Advance();
+  const auto observed = system->ReadSignal(row.descriptor.signal_id);
+  ASSERT_TRUE(observed.ok());
+  const auto sample = SignalSampleValue(core::ToSignalSample(observed.value()),
+                                        observed.value().descriptor);
+  EXPECT_EQ(sample.find_object_member("signal_id")->as_string(),
+            "robot.g2/carried_object_lost.gripper");
+  EXPECT_TRUE(sample.find_object_member("fresh")->as_bool());
+  EXPECT_FALSE(sample.find_object_member("value")->as_bool());
+  system->Shutdown();
+}
 
 TEST_F(HostRuleEvidenceWakeupTest, ARefusedApplyCandidateLeavesTheRowsAndTheSinkUntouched) {
   // SX-206: an Apply candidate starts (and replays the levels) before the

@@ -9,37 +9,31 @@
 #include <manyforge_core/bounded_stop_stage_attempt_executor.hpp>
 #include <manyforge_core/emergency_stop_acceptance_reserve.hpp>
 #include <manyforge_core/kernel_cell_admission_owner.hpp>
-#include <manyforge_core/orphan_resource_reconciliation.hpp>
 #include <manyforge_core/ports/i_manager_liveness_fail_safe_port.hpp>
 #include <manyforge_core/ports/iaddressed_motion_preview.hpp>
 #include <manyforge_core/ports/iaddressed_operation_owner.hpp>
-#include <manyforge_core/ports/icclc_component_command_readiness_port.hpp>
 #include <manyforge_core/ports/icontrol_domain_execution_port.hpp>
 #include <manyforge_core/ports/ioperation_journal.hpp>
 #include <manyforge_core/ports/iio_signal_service.hpp>
 #include <manyforge_core/ports/iresolved_participant_execution_engine.hpp>
 #include <manyforge_core/ports/iresolved_prepared_participant_execution_engine.hpp>
-#include <manyforge_core/ports/istop_surveillance_observation_port.hpp>
 #include <manyforge_core/resource_slot_table.hpp>
-#include <manyforge_core/route_selection_owner.hpp>
+#include <manyforge_core/runtime_route_configuration.hpp>
 #include <manyforge_core/runtime_participant_policy.hpp>
 #include <manyforge_core/runtime_participant_registry.hpp>
 #include <manyforge_core/runtime_participant_stop_readiness.hpp>
-#include <manyforge_core/stop_fault_latch_origin.hpp>
-#include <manyforge_core/stop_fault_recovery.hpp>
 #include <manyforge_core/stop_scope_resolver.hpp>
 #include <manyforge_core/time/iclock.hpp>
 #include <manyforge_core/time/ischeduler.hpp>
 #include <manyforge_core/types/component_lifecycle.hpp>
+#include <manyforge_core/types/component_state.hpp>
 #include <manyforge_core/types/io_activation_rule.hpp>
-#include <manyforge_core/types/io_rule_recovery.hpp>
+#include <manyforge_core/types/io_rule_service_configuration.hpp>
+#include <manyforge_core/types/io_rule_state.hpp>
 #include <manyforge_core/types/prepared_participant_stop_plan.hpp>
-#include <manyforge_core/types/provider_candidate_facts.hpp>
 #include <manyforge_core/types/program_blackboard_context.hpp>
 #include <manyforge_core/types/program_execution_control.hpp>
 #include <manyforge_core/types/program_io.hpp>
-#include <manyforge_core/types/runtime_domain_configuration.hpp>
-#include <manyforge_core/types/tcp_speed_check.hpp>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -52,7 +46,6 @@
 
 namespace manyforge::core {
 
-struct ApplyBringUpAdmissionOfferDTO;
 struct ActiveOperationParticipant;
 
 inline constexpr std::size_t kMaxI6OperationReplayEntries = 4096U;
@@ -133,11 +126,6 @@ struct RuntimeParticipantExecutionRegistration final {
   /// Deployment target. Motion admission fails closed when it is absent.
   std::optional<double> deployment_maximum_tcp_linear_speed_mps;
 
-  /// The robot flange when this target's Deployment `tcp_speed_check` is
-  /// `active_tcp_and_flange`; absent for `active_tcp`. The ceiling above then
-  /// also holds at the flange (`speed_check_frames`, computed at admission).
-  std::optional<ResolvedFrameDTO> speed_check_flange_frame{};
-
   /// Composition-owned classification from an exact compiler-direct product,
   /// never inferred from missing Program origin or a caller's source label.
   bool intrinsic_direct_control{};
@@ -170,18 +158,6 @@ struct RuntimeParticipantExecutionRegistration final {
 using RuntimeParticipantAdmissionResolver =
     std::function<Result<RuntimeParticipantExecutionRegistration>(const OperationIntentDTO&,
                                                                   std::size_t)>;
-using StopFaultRecoveryFactsResolver =
-    std::function<Result<StopFaultRecoveryFactsDTO>(const StopStatusDTO&, std::int64_t)>;
-
-/// One construction-fixed post-terminal observation owner. The observer is
-/// non-owning and must outlive the addressed Kernel. Absence is
-/// reserved for explicitly Stop-surveillance-unqualified compositions; such a
-/// composition can contain a Stop but can never claim late-quiescence or clear
-/// a fault that requires it.
-struct StopSurveillanceExecutionConfig final {
-  IStopSurveillanceObservationPort* observer{};
-  StopSurveillancePolicyDTO policy;
-};
 
 /// Bounded canonical-safe infrastructure diagnostic. Valid NFC text retains
 /// its bytes; otherwise an explicit reversible ASCII-byte representation is
@@ -289,65 +265,12 @@ struct CellStopTerminalSummaryDTO final {
                          const CellStopTerminalSummaryDTO&) = default;
 };
 
-struct CellStopFaultSummaryDTO final {
-  StopFaultLatchId latch_id;
-  StopFaultLatchGeneration latch_generation;
-  StopFaultLatchStateDTO state{StopFaultLatchStateDTO::kLatched};
-  StopFaultTriggerDTO trigger{StopFaultTriggerDTO::kPersistenceDegraded};
-  StopFaultRecoveryStatusDTO recovery_status{StopFaultRecoveryStatusDTO::kWaitingForObservation};
-  std::string reason_code;
-  std::optional<StopCertificateRefDTO> certificate;
-  /// The latch's distinct triggers in first-seen order (includes `trigger`).
-  std::vector<StopFaultTriggerDTO> observed_triggers;
-
-  friend bool operator==(const CellStopFaultSummaryDTO&, const CellStopFaultSummaryDTO&) = default;
-};
-
 struct CellStopActionProjectionDTO final {
   StopGeneration expected_stop_generation{0U};
   std::optional<CellStopTerminalSummaryDTO> latest_terminal;
-  std::optional<CellStopFaultSummaryDTO> fault;
 
   friend bool operator==(const CellStopActionProjectionDTO&,
                          const CellStopActionProjectionDTO&) = default;
-};
-
-/// Item 37 Force close: one participant target of a force-closed operation.
-struct ForceClosedTargetDTO final {
-  ControllableComponentId controllable_component_id;
-  CommandTargetId command_target_id;
-  /// Its output write ended acceptance-unknown: the physical output state is unknown.
-  bool output_unknown{};
-
-  friend bool operator==(const ForceClosedTargetDTO&, const ForceClosedTargetDTO&) = default;
-};
-
-/// Item 37 Force close: one resident operation the Kernel moved into history.
-struct ForceClosedOperationDTO final {
-  OperationId operation_id;
-  OperationRevision operation_revision;
-  /// Its state when Force close moved it (history records it InterventionRequired
-  /// unless it was already Completed, Stopped, Failed or CancelledPreDispatch).
-  OperationStateKind state{OperationStateKind::kInterrupted};
-  bool containment_uncertain{};
-  std::vector<ForceClosedTargetDTO> targets;
-
-  friend bool operator==(const ForceClosedOperationDTO&, const ForceClosedOperationDTO&) = default;
-};
-
-/// Item 37 Force close: what the Kernel step left in an unknown state.
-struct ForceCloseResultDTO final {
-  /// The operator's confirmed Full Stop the step relied on.
-  StopGeneration stop_generation{0U};
-  std::vector<ForceClosedOperationDTO> operations;
-  /// Unowned orphan slots (from an earlier Kernel incarnation) it freed.
-  std::vector<ResourceId> released_orphan_resources;
-  /// FIX1: the cell-wide motion block an unresolved operation closure left
-  /// (U6), or the orphan-slot block an earlier restart left, was cleared.
-  /// Motion still needs the ordinary Prepare/Enable.
-  bool motion_block_cleared{};
-
-  friend bool operator==(const ForceCloseResultDTO&, const ForceCloseResultDTO&) = default;
 };
 
 struct ResourceAddressedExecutionKernelConfig final {
@@ -359,9 +282,7 @@ struct ResourceAddressedExecutionKernelConfig final {
       std::optional<GraphRevision> current_graph_revision = {},
       std::size_t stop_correlation_capacity = kMaximumEmergencyStopCorrelationEntries,
       std::size_t maximum_live_stop_participants = 0U,
-      std::size_t forensic_projection_capacity = 0U,
-      std::optional<StopSurveillanceExecutionConfig> surveillance = {},
-      StopFaultRecoveryFactsResolver recovery_facts_resolver = {})
+      std::size_t forensic_projection_capacity = 0U)
       : request_owner_epoch(std::move(owner_epoch)),
         cell_id(std::move(cell_identity)),
         request_replay_capacity(replay_capacity),
@@ -370,9 +291,7 @@ struct ResourceAddressedExecutionKernelConfig final {
         graph_revision(std::move(current_graph_revision)),
         emergency_stop_correlation_capacity(stop_correlation_capacity),
         prequalified_max_live_stop_participants(maximum_live_stop_participants),
-        stop_forensic_projection_capacity(forensic_projection_capacity),
-        stop_surveillance(std::move(surveillance)),
-        stop_fault_recovery_facts_resolver(std::move(recovery_facts_resolver)) {}
+        stop_forensic_projection_capacity(forensic_projection_capacity) {}
 
   RequestOwnerEpoch request_owner_epoch;
   CellId cell_id;
@@ -400,12 +319,6 @@ struct ResourceAddressedExecutionKernelConfig final {
   /// positive bound is legal: exhaustion degrades persistence and closes
   /// admission, but cannot reject or pin an already accepted Stop.
   std::size_t stop_forensic_projection_capacity{};
-  /// Optional only for explicitly unqualified compositions. When present,
-  /// every field is validated together before operation admission opens.
-  std::optional<StopSurveillanceExecutionConfig> stop_surveillance;
-  /// Construction-fixed current-facts owner. It reads only owner-issued
-  /// immutable facts; callers cannot supply recovery evidence.
-  StopFaultRecoveryFactsResolver stop_fault_recovery_facts_resolver;
   /// Exact retained descriptor identity used only when the Kernel is
   /// bootstrapped with no runtime participants. It must be supplied together
   /// with `empty_runtime_graph_revision`; participant-backed configurations
@@ -430,10 +343,6 @@ struct ResourceAddressedExecutionKernelConfig final {
   /// projection and fail closed while it is missing, unreconciled or stale.
   std::optional<OperatorAlarmAttentionPolicyDTO> operator_alarm_attention;
   CellAdmissionProgramResetStatusSource cell_admission_program_reset_status_source;
-  /// Read-only existing CCLC durable Disable/Enable proof, invoked outside
-  /// Kernel state. Absence fails closed for acknowledged unknown output Reset.
-  std::function<Result<IoOutputLocalResynchronizationProofDTO>(const RuntimeParticipantBindingDTO&)>
-      io_output_local_resynchronization_source{};
   /// Queue existing rule processing for this exact affected service after
   /// owner/state locks unwind. This lifetime pin grants no health/currentness.
   std::function<void(const std::shared_ptr<IIoSignalService>&)>
@@ -454,11 +363,11 @@ struct OperationRecoveryParticipantDTO final {
   CommandTargetId command_target_id;
   CapabilityId capability_id;
   ControlDomainId control_domain_id;
-  std::optional<ControlBindingId> control_binding_id;
+  ControlBindingId control_binding_id;
   std::optional<CapabilityProviderBindingId> capability_provider_binding_id;
-  std::optional<ControlRouteId> control_route_id;
-  std::optional<ActiveControlConfigurationId> active_control_configuration_id;
-  std::optional<ActiveControlConfigurationGeneration> active_control_configuration_generation;
+  ControlRouteId control_route_id;
+  ActiveControlConfigurationId active_control_configuration_id;
+  ActiveControlConfigurationGeneration active_control_configuration_generation;
   std::vector<ResourceId> resource_ids;
 };
 
@@ -494,8 +403,8 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   ResourceAddressedExecutionKernel& operator=(const ResourceAddressedExecutionKernel&) = delete;
 
   /// Lock-only first-fault snapshot; it never consults or writes the journal.
-  /// Reset, successful reads/writes and a Stop-fault clear do not clear this
-  /// Workbench fault; motion admission stays closed until restart.
+  /// Reset and successful reads/writes do not clear this Workbench fault;
+  /// motion admission stays closed until restart.
   [[nodiscard]] std::optional<OperationJournalWriteFaultDTO>
   get_operation_journal_write_fault() const;
   /// Lock-only snapshot of the contained internal fault (see ContainInternalFault),
@@ -528,27 +437,6 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
 
   [[nodiscard]] Result<StopAcceptedDTO> stop(const StopIntentDTO& intent);
   [[nodiscard]] Result<StopAcceptedDTO> full_stop(const FullStopIntentDTO& intent);
-  /// Item 37 Force close, first Kernel step: record that the operator's Full
-  /// Stop `stop_generation` is confirmed (it is the cell's newest Stop and its
-  /// certificate succeeded). From then until the product changes, the Close
-  /// lease no longer refuses resident operations. Otherwise refused with
-  /// `scenario_force_close_stop_unconfirmed`; `details.reason` is
-  /// `stop_pending` while that Stop has no certificate yet.
-  [[nodiscard]] Result<StopGeneration> arm_force_close(StopGeneration stop_generation);
-  /// Item 37 Force close, second Kernel step: only after `arm_force_close` and
-  /// the Close retirement, with the component processes already stopped by
-  /// the caller. Moves every resident operation into history marked
-  /// `cell_force_closed_by_operator`, journals that settled state (so a restart
-  /// finds it in history, not as an orphan), frees its resource slots and any
-  /// unowned orphan slot, and reports what was left in an unknown state. The
-  /// orphaned operations of a freed orphan slot are journaled settled too, and
-  /// the orphan-slot motion block ends. When one of
-  /// them had an unresolved closure, it also clears the cell-wide motion block
-  /// that closure left, by the Stop-fault-clear rule (a restart-only fault,
-  /// Manager liveness, an open latch or a pending containment keeps it). It
-  /// does not wait for a pending I/O-rule Stop response (item 39). It
-  /// commands nothing: no output, no motion.
-  [[nodiscard]] Result<ForceCloseResultDTO> force_close_operations();
   /// Install the sealed immutable Program association before any node effect.
   /// Repeated exact registration preserves current admission holds. This is
   /// process-local composition, not a public caller-supplied table interface.
@@ -583,23 +471,29 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] Result<StopStatusDTO> get_stop_status(const StopId& stop_id) const;
   [[nodiscard]] Result<StopCertificateDTO> get_stop_certificate(
       const StopCertificateId& certificate_id) const;
-  [[nodiscard]] std::optional<StopFaultLatchDTO> get_stop_fault_latch() const;
-  /// Why the Stop behind this latch was requested (operator traceability
-  /// only; no latch is recovered automatically). Only containment Stops this
-  /// Kernel issued itself are `kProviderAvailabilityLoss` (Manager liveness
-  /// loss) or `kComponentIncident` (CCLC incident); that attribution is
-  /// resident only, so a replacement Kernel reports the certificate-derived
-  /// origin or `kUnattributed`.
-  [[nodiscard]] StopFaultLatchOriginDTO get_stop_fault_latch_origin(
-      const StopFaultLatchDTO& latch) const;
-  [[nodiscard]] Result<std::optional<StopFaultRecoveryOfferDTO>> get_stop_fault_recovery_offer()
-      const;
-  /// Refresh owner-held recovery predicates without clearing the fault or
-  /// issuing effects. Run on the noncritical reconciliation lane; reads may
-  /// call bounded source adapters. No active terminal fault is a no-op.
-  [[nodiscard]] Result<void> refresh_stop_fault_recovery_assessment();
-  [[nodiscard]] Result<StopFaultRecoveryResultDTO> recover_stop_fault(
-      const StopFaultRecoveryIntentDTO& intent);
+  /// Component model v2 (CONTRACTS §5): the execution host passes the
+  /// current state of every component in the cell on every change. Components
+  /// absent from `states` no longer count. Nothing is stored or journaled.
+  void observe_component_states(std::vector<ComponentState> states);
+  /// The cell latch, derived from the last observed component states and the
+  /// Kernel's own Stops and execution. While latched, Program dispatch, node
+  /// commands, manual motion and manual I/O are refused with `cell_latched`
+  /// and interrupt evaluation is paused.
+  [[nodiscard]] CellLatch get_cell_latch() const;
+  /// Readiness reasons the Kernel owns that belong to no component: the
+  /// internal fault (`execution_host_internal_fault`, until host restart) and
+  /// a lost Manager (`manager_unavailable`, until it is alive again), a
+  /// restart waiting for the first component report
+  /// (`execution_host_restart_awaiting_components`) or for every component
+  /// to be idle (`execution_host_restart_settling`, when no latch cause shows
+  /// it). Each
+  /// blocks motion; nothing blocks invisibly (CONTRACTS §10).
+  [[nodiscard]] std::vector<ErrorDTO> ReadExecutionBlocks() const;
+  /// CONTRACTS §2: called once for every newly accepted Stop (operator Stop
+  /// and Halt, a rule's Stop, Reset's Stop, a containment Stop), outside the
+  /// Kernel's locks, so the host interrupts every component action in
+  /// progress. Set once by the execution host before the Kernel runs.
+  void set_stop_listener(std::function<void()> on_stop_accepted);
   [[nodiscard]] Result<RuntimeScaleAcceptedDTO> set_runtime_scale(
       const RuntimeScaleRequestDTO& request);
   [[nodiscard]] Result<RuntimeScaleStatusDTO> get_runtime_scale(
@@ -622,37 +516,17 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       std::shared_ptr<IIoSignalService>* actual_retired_service = nullptr) override;
   [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireCellAdmissionClaim(
       const CellAdmissionClaimIntentDTO& intent) override;
-  [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireComponentLifecycleClaim(
-      const CellAdmissionClaimIntentDTO& claim,
-      const ComponentLifecycleIntentDTO& lifecycle) override;
-  /// Process-local Q91 composition only. Ordinary public acquire is unchanged.
-  /// This input is insufficient without the original Manager live-plan interlock.
-  /// Incomplete composition: aggregate-deficit source attribution is not
-  /// wired; proof-unavailable refusal is not permanent Q91 policy.
-  [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireApplyBringUpCellAdmissionClaim(
-      const CellAdmissionClaimIntentDTO& intent, const ApplyBringUpAdmissionOfferDTO& offer);
   /// Trusted ordinary Apply convergence on this Kernel's existing claim owner.
   /// The host supplies actual installed-state and immutable terminal checks;
   /// no public request can provide or skip this process-local validator.
-  /// D6: `canonical_empty_candidate` = the exact canonical-empty candidate;
-  /// only that Apply is admitted while a latched Close runs.
   [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireConfigurationApplyCellAdmissionClaim(
       const CellAdmissionClaimIntentDTO& intent,
-      const CellAdmissionConfigurationApplyValidator& validate, bool canonical_empty_candidate = false);
+      const CellAdmissionConfigurationApplyValidator& validate);
   /// Fresh ordinary Apply success, after every exact old fence is released.
   [[nodiscard]] Result<AuthoringAdmissionDTO> ReleaseTerminalApplyClaimsAfterSuccess(
       const CellAdmissionClaimDTO& fresh_claim,
       const CellAdmissionClaimReleaseDTO& fresh_success_release,
       const CellAdmissionConfigurationApplySuccessValidator& validate);
-  [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireIoOutputRecoveryLifecycleClaim(
-      const CellAdmissionClaimIntentDTO& intent,
-      const ComponentLifecycleIntentDTO& lifecycle_intent) override;
-  [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireRouteRecoveryCellAdmissionClaim(
-      const CellAdmissionClaimIntentDTO& intent,
-      const ActiveControlConfigurationDTO& predecessor) override;
-  [[nodiscard]] Result<CellAdmissionClaimDTO> AcquireSelectedComponentBringUpClaim(
-      const CellAdmissionClaimIntentDTO& intent,
-      const SelectedComponentBringUpOfferDTO& offer) override;
   [[nodiscard]] Result<AuthoringAdmissionDTO> ReleaseCellAdmissionClaim(
       const CellAdmissionClaimReleaseDTO& release) override;
   [[nodiscard]] Result<AuthoringAdmissionDTO> ReconcileCellAdmissionClaims(
@@ -718,10 +592,27 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   installed_global_io_rule_catalog() const;
   [[nodiscard]] std::optional<IoRuleStateProjectionDTO> ReadInterruptRuleStateBaseline() const;
 
-  [[nodiscard]] Result<std::vector<IoGlobalRuleRecoveryOfferDTO>>
-  ReadGlobalIoRuleRecoveryOffers() const;
-  [[nodiscard]] Result<IoGlobalRuleRecoveryResultDTO> recover_global_io_rule(
-      const IoGlobalRuleRecoveryIntentDTO& intent);
+  /// CONTRACTS §8 activation (node `rules.set_active`): succeeds at once; an
+  /// unknown rule id is refused with `rule_unknown`. Activating a rule whose
+  /// condition holds trips it at once.
+  [[nodiscard]] Result<void> set_rule_active(const InterruptPolicyId& rule_id, bool active);
+  /// Every rule back to its `active_at_start` (run end, Load).
+  [[nodiscard]] Result<void> reset_rule_activation();
+  /// The rules gating their scope now (`rule_holds`, with `rule_id`): a
+  /// `stop` rule whose condition holds after its trip, or any active rule
+  /// that can't watch its signals. Readiness reads this; nothing recomputes it.
+  [[nodiscard]] std::vector<ErrorDTO> ReadRuleHolds() const;
+  /// CONTRACTS §7 (node `io.clear_outside_change`): clears the core-held
+  /// `<signal_id>.changed_outside` flag of one output; writes nothing.
+  [[nodiscard]] Result<void> clear_outside_change(const IoSignalId& output);
+  /// CONTRACTS §7 (one write path): admission of every output write, manual
+  /// or Program, made through the execution host's `set_io_output`. Refused
+  /// `cell_latched` while the cell latch holds, and `rule_holds` (with
+  /// `rule_id`) while an active rule whose scope covers the signal
+  /// (`everything`) gates it. A `manual` write is refused
+  /// `io_manual_write_motion_executing` while any motion executes in the
+  /// cell; otherwise allowed (idle, pause, Program without motion). Effect-free.
+  [[nodiscard]] Result<void> admit_output_write(const IoSignalId& output, bool manual) const;
 
 
   [[nodiscard]] Result<void> InstallProgramIoSignalService(
@@ -743,6 +634,8 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   /// The host retains its actual shared composition currentness guard through
   /// this call and verifies the retained context against that publication.
   /// Public fields never establish Applied ownership or receiver time.
+  /// BBK-1: an accepted frame is evaluated by the rules before the ACK
+  /// returns, so the Runner's next admission sees it.
   [[nodiscard]] Result<IoProgramBlackboardAcknowledgementDTO> PublishProgramBlackboard(
       const IoProgramBlackboardPublicationDTO& publication);
   [[nodiscard]] std::shared_ptr<const AppliedProgramBlackboardContextDTO>
@@ -765,33 +658,24 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       const ProgramIoWatchScopeReleaseRequestDTO& request);
   /// Existing host scheduling calls after ingress drain and at NextIoRuleExpiry.
   [[nodiscard]] Result<void> ProcessIoRuleEvidence();
-  /// Local managed I/O lifecycle boundary, before input Pause/Resume. The
-  /// existing exclusive lifecycle claim and idle checks remain authoritative.
+  /// Local managed I/O lifecycle boundary, before input Pause/Resume. Disabling
+  /// requires an idle cell.
   [[nodiscard]] Result<void> SetGlobalIoSourcesPlannedDisabled(
       const std::shared_ptr<IIoSignalService>& expected_service,
-      std::span<const InterruptSourceId> sources,
-      const LifecycleTransactionId& actual_lifecycle_transaction, bool disabled);
+      std::span<const InterruptSourceId> sources, bool disabled);
   [[nodiscard]] Result<std::optional<TimePoint>> NextIoRuleExpiry() const;
   void LatchAndContain(const ManagerLivenessLossIntentDTO& intent) noexcept override;
   /// A callback threw on the Stop/safety path (scheduler lane or runtime-
   /// collision lookahead). The first call records `reason_code` as the
-  /// internal fault, closes motion admission until a Workbench restart (a
-  /// Stop-fault clear does not reopen it) and attempts one Full Stop under
+  /// internal fault, closes motion admission until a Workbench restart and
+  /// attempts one Full Stop under
   /// this Kernel's own request identity, with `reason_code` as its
   /// correlation; it records whether that Stop was accepted (or its refusal
   /// reason; no retry) and writes one typed line. Later calls only count.
   void ContainInternalFault(std::string_view reason_code) noexcept;
-  /// Component-incident containment: a cell Full Stop under this Kernel's own
-  /// request identity (owner epoch + incident id) whose transaction latches a
-  /// `physical_rest_unproven` Stop fault, so the cell stays latched even when
-  /// it was idle until the operator's exact Stop-fault recovery.
   [[nodiscard]] Result<void> PublishComponentStreamHold(
       const ControllableComponentId& component, const std::optional<ErrorDTO>& hold,
       bool cell_wide = false) override;
-  [[nodiscard]] Result<ComponentIncidentContainmentReceiptDTO> RequestComponentIncidentContainment(
-      const ComponentIncidentContainmentIntentDTO& intent) override;
-  [[nodiscard]] Result<bool> RecoverComponentIncidentContainment(
-      const std::string& incident_id) override;
   [[nodiscard]] Result<AuthoringAdmissionDTO> ReplaceManagerLivenessRequiredSet(
       const ManagerLivenessRequiredSetDTO& required_set);
 
@@ -840,13 +724,6 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   /// this projection.
   [[nodiscard]] ResourceSlotTableSnapshotDTO resource_table_snapshot() const;
 
-  /// Command-free, process-local release of an exact subset of durable
-  /// orphan-resource fences. Facts come only from the installed runtime owner;
-  /// the Kernel independently joins them to its current binding, route, and
-  /// slot generation before one atomic release.
-  [[nodiscard]] Result<OrphanResourceReconciliationResultDTO> reconcile_orphaned_resources(
-      const OrphanResourceReconciliationFactsDTO& facts);
-
   /// Atomically select a verified candidate participant set while preserving
   /// the stable addressed owner, operation journal, replay ledgers, and any
   /// unaffected in-flight operation. The caller must hold the exact durable
@@ -865,19 +742,14 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   /// fence. Unchanged registrations retain their engines and route facts. An
   /// optional prevalidated commit callback runs at the inventory/registration
   /// publication boundary while admission and state remain locked; it must not
-  /// call back into the Kernel. Retained generic provider facts require exact
-  /// candidate membership/occurrence and the original held parent claim when
-  /// re-anchoring their product identity; lifecycle and driver facts are copied.
+  /// call back into the Kernel.
   [[nodiscard]] Result<void> reconfigure_runtime_component_set(
       std::vector<RuntimeParticipantExecutionRegistration> registrations,
       RuntimeParticipantAdmissionResolver participant_resolver,
       RetainedBundleId candidate_retained_bundle_id, GraphRevision candidate_graph_revision,
       const ConfigurationFenceId& apply_fence_id, const ConfigurationFenceScopeDTO& scope,
       const std::vector<ControllableComponentId>& retained_components = {},
-      std::function<Result<void>()> commit_publication = {},
-      std::span<const ResolvedLifecycleControlDomainScopeDTO> retained_provider_domains = {},
-      std::span<const ResolvedLifecycleProviderOccurrenceDTO> retained_provider_occurrences = {},
-      const CellAdmissionClaimDTO* actual_parent_claim = nullptr);
+      std::function<Result<void>()> commit_publication = {});
 
   /// Publish the candidate-side active-configuration identities already
   /// declared by the installed registrations while the exact durable Apply
@@ -925,66 +797,6 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] Result<std::optional<RuntimeRouteConfigurationReadbackDTO>>
   current_runtime_route_configuration(const ControlDomainId& control_domain_id) const;
 
-  /// Install actual provider-domain lifecycle observations into the same
-  /// domain inventory as controller routes. No controller configuration is
-  /// fabricated for a fixed provider. Apply supplies its exact held scope;
-  /// ordinary CCLC publication uses its existing exclusive lifecycle claim.
-  /// An empty observation vector installs only closed, exact provider metadata
-  /// for initial BringUp. It cannot establish driver readiness or admit commands.
-  [[nodiscard]] Result<std::vector<RuntimeProviderDomainConfigurationReadbackDTO>>
-  publish_runtime_provider_configuration(
-      const ComponentCommandReadinessPublicationDTO& authority,
-      const ComponentLifecycleCurrentSnapshotDTO& actual_snapshot,
-      const std::vector<BrandLifecycleObservationDTO>& actual_driver_observations);
-
-  /// Trusted installation only: exact original source facts under the actual
-  /// held parent/fence. This entry can publish only CLOSED zero-watermark
-  /// metadata; it has no command eligibility or observation argument.
-  [[nodiscard]] Result<std::vector<RuntimeProviderDomainConfigurationReadbackDTO>>
-  publish_installed_provider_candidate_closed(
-      const ConfigurationFenceStatusQueryDTO& held_fence,
-      const CellAdmissionClaimDTO& actual_parent_claim,
-      const InstalledProviderCandidateFactsDTO& facts);
-
-  [[nodiscard]] Result<std::optional<RuntimeProviderDomainConfigurationReadbackDTO>>
-  current_runtime_provider_configuration(const ControlDomainId& control_domain_id) const;
-
-  /// Close one component's command eligibility under its exact held
-  /// lifecycle claim, before any transition effect. Routes, engines and Stop
-  /// readiness stay installed; Stop and containment remain available.
-  [[nodiscard]] Result<ComponentCommandReadinessDTO> close_component_command_eligibility(
-      const LifecycleTransactionId& lifecycle_transaction_id,
-      const ControllableComponentId& controllable_component_id);
-
-  /// Private selected-effect closure. Revalidates the full held claim and
-  /// current contained predecessor before closing only its component.
-  [[nodiscard]] Result<ComponentCommandReadinessDTO> close_component_command_eligibility(
-      const CellAdmissionClaimDTO& selected_claim, const SelectedComponentBringUpOfferDTO& offer);
-
-  /// Publish one complete component result: re-seal every participant of the
-  /// component at the published lifecycle generation (reusing engines, route
-  /// configurations and Stop-plan bytes) and set its eligibility for all of
-  /// its domains together. The caller supplies the rebuilt participant
-  /// resolver whose physical registrations carry the same generation. A
-  /// failure leaves the component command-closed.
-  [[nodiscard]] Result<ComponentCommandReadinessDTO> publish_component_command_readiness(
-      const ComponentCommandReadinessPublicationDTO& publication,
-      RuntimeParticipantAdmissionResolver participant_resolver = {});
-
-  /// False-only successor proof under the full held selected permission.
-  /// All supplied rows must already be installed and sealed; this does no
-  /// reconfiguration, resolver rebuild, or product reseal.
-  [[nodiscard]] Result<ComponentCommandReadinessDTO> publish_component_command_readiness(
-      const CellAdmissionClaimDTO& selected_claim, const SelectedComponentBringUpOfferDTO& owner_offer,
-      const ComponentLifecycleStatusDTO& selected_status,
-      const SelectedControllerOccurrenceDTO& installed_occurrence,
-      const std::vector<RuntimeParticipantExecutionRegistration>& installed_candidate_registrations,
-      const std::vector<ActiveControlConfigurationDTO>& installed_candidate_configurations,
-      bool command_eligible = false);
-
-  /// Bounded readback of one component's current command eligibility.
-  [[nodiscard]] Result<ComponentCommandReadinessDTO> component_command_readiness(
-      const ControllableComponentId& controllable_component_id) const;
 
   /// A removed subordinate engine stays lifetime-pinned while an operation
   /// still references it. Once this returns false, release_retired_engine()
@@ -1029,13 +841,9 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       const OperationId& operation_id, OperationRevision expected_operation_revision,
       const KernelRecoveryActionRequestDTO& request);
   [[nodiscard]] Result<void> retire_preempted_motion_operations();
-  /// `force` (item 37, Force close): the caller has refused the busy cases and
-  /// frees every slot of its operations at once (`force_release`); the drain
-  /// checks and the per-operation slot release are skipped, and I/O rules,
-  /// takeovers' included, are retired whatever their result.
   [[nodiscard]] Result<void> retire_operation_ownership_locked(
       const OperationId& operation_id, bool clear_continuation,
-      bool discard_node_continuations = false, bool force = false);
+      bool discard_node_continuations = false);
   [[nodiscard]] std::optional<std::vector<std::size_t>> fresh_motion_node_indices_locked(
       const ActiveOperation& operation) const;
   void mark_motion_retry_run_end_locked(const ProgramRunId& run_id);
@@ -1059,58 +867,14 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] std::vector<ResourceId> program_selection_resources_locked(
       const std::vector<std::uint32_t>& node_indices) const;
   /// The one eligibility predicate shared by single, coordinated, manual,
-  /// Program, arm and gripper dispatch. A domain without route authority has
-  /// no lifecycle projection to consult. Returns the refusal, if any.
+  /// Program, arm, gripper and output dispatch: the component must report
+  /// `enabled` (`component_not_enabled`). A domain without route authority has
+  /// no component to consult. Returns the refusal, if any.
   [[nodiscard]] std::optional<ErrorDTO> component_command_refusal_locked(
       const RuntimeParticipantExecutionRegistration& registration) const;
-  [[nodiscard]] Result<void> validate_selected_bring_up_offer_identity(
-      const CellAdmissionClaimIntentDTO& intent,
-      const SelectedComponentBringUpOfferDTO& offer) const;
-  [[nodiscard]] Result<void> validate_selected_bring_up_predecessor_locked(
-      const CellAdmissionClaimIntentDTO& intent, const SelectedComponentBringUpOfferDTO& offer);
-  [[nodiscard]] Result<void> validate_bring_up_component_closure_locked(
-      const ComponentLifecycleCurrentSnapshotDTO &predecessor,
-      const std::vector<RuntimeParticipantBindingDTO> &candidates,
-      const std::vector<ResolvedLifecycleControlDomainScopeDTO>
-          &candidate_provider_domains,
-      const ConfigurationFenceAdmissionSnapshotDTO &admission);
-  [[nodiscard]] Result<void> validate_bring_up_candidate_peer_closure_locked(
-      const ControllableComponentId &component,
-      const std::vector<RuntimeParticipantBindingDTO> &candidates,
-      const std::vector<ResolvedLifecycleControlDomainScopeDTO>
-          &candidate_provider_domains,
-      const ConfigurationFenceAdmissionSnapshotDTO &admission);
-  [[nodiscard]] Result<void> validate_apply_bring_up_current_locked(
-      const CellAdmissionClaimIntentDTO& intent, const ApplyBringUpAdmissionOfferDTO& offer,
-      const CellAdmissionReadinessSnapshotDTO& readiness);
-  [[nodiscard]] Result<ComponentCommandReadinessDTO> close_component_command_eligibility_locked(
-      const ControllableComponentId& controllable_component_id);
-  [[nodiscard]] Result<std::vector<RuntimeProviderDomainConfigurationReadbackDTO>>
-  publish_runtime_provider_configuration_impl(
-      const ComponentCommandReadinessPublicationDTO& authority,
-      const RetainedBundleId& retained_bundle_id, const GraphRevision& graph_revision,
-      std::span<const ResolvedLifecycleControlDomainScopeDTO> domains,
-      std::span<const ResolvedLifecycleProviderOccurrenceDTO> provider_occurrences,
-      std::span<const BrandLifecycleObservationDTO> actual_driver_observations,
-      const CellAdmissionClaimDTO* actual_parent_claim);
-  [[nodiscard]] Result<void> require_held_lifecycle_claim_locked(
-      const LifecycleTransactionId& lifecycle_transaction_id) const;
-  [[nodiscard]] Result<void> require_io_output_recovery_lifecycle_publication(
-      const ComponentCommandReadinessPublicationDTO& publication) const;
-  [[nodiscard]] Result<const ActiveOperation*> qualify_io_output_recovery_operation_locked(
-      const ControllableComponentId& component) const;
-  [[nodiscard]] Result<void> validate_io_output_recovery_claims_locked(
-      const ControllableComponentId& component, std::span<const CellAdmissionClaimDTO> held,
-      const CellAdmissionReadinessSnapshotDTO& readiness) const;
-  [[nodiscard]] Result<void> require_idle_for_component_readiness_locked(
-      const ControllableComponentId* io_recovery_component = nullptr) const;
-  [[nodiscard]] Result<void> require_component_routes_current_locked(
-      const ControllableComponentId& controllable_component_id, bool command_eligible) const;
-  [[nodiscard]] Result<void> require_installed_component_routes_current_locked(
-      const ControllableComponentId& controllable_component_id) const;
-  [[nodiscard]] Result<ComponentCommandReadinessDTO> commit_component_command_readiness_locked(
-      const ControllableComponentId& component, ComponentLifecycleGeneration generation,
-      bool command_eligible);
+  /// The component's last observed state is `enabled` (state_mutex_).
+  [[nodiscard]] bool component_enabled_locked(const ControllableComponentId& component) const;
+  [[nodiscard]] Result<void> require_idle_for_component_readiness_locked() const;
   [[nodiscard]] std::vector<IResolvedParticipantExecutionEngine*> operation_control_engines_locked(
       const std::vector<RuntimeParticipantExecutionRegistration>& registrations) const;
   [[nodiscard]] const RuntimeParticipantExecutionRegistration* registration_for(
@@ -1226,6 +990,11 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   void set_global_io_rule_state_locked(std::size_t index, IoGlobalRuleState state,
       std::optional<IoRuleAcquisitionKeyDTO> acquisition = {},
       std::optional<ErrorDTO> unavailable_reason = {});
+  /// The row can't watch: retire its registration, withdraw its key, gate.
+  [[nodiscard]] Result<void> unwatch_global_io_rule_locked(std::size_t index, ErrorDTO reason);
+  [[nodiscard]] std::optional<ErrorDTO> global_io_rule_hold_locked(std::size_t index,
+                                                                   bool output_write) const;
+  [[nodiscard]] Result<void> set_global_io_rule_active_locked(std::size_t index, bool active);
   void ProjectGlobalIoRuleStates() noexcept;
   void retire_all_io_rules_locked();
   [[nodiscard]] bool has_active_io_rules_locked() const;
@@ -1241,20 +1010,12 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   [[nodiscard]] Result<void> arm_pending_global_io_rules_locked();
   [[nodiscard]] Result<IoRuleRegistrationDTO> arm_global_io_rule_locked(
       const IoActivationRulePolicyBindingDTO& rule, const IoRuleStateContextDTO& context,
-      const std::shared_ptr<IIoSignalService>& service, bool require_inactive);
-  [[nodiscard]] Result<void> refresh_global_latched_condition_locked(std::size_t index);
-  [[nodiscard]] Result<void> prepare_global_io_rule_recovery_locked(
-      const IoGlobalRuleRecoveryIntentDTO& intent, bool automatic);
-  [[nodiscard]] Result<IoGlobalRuleRecoveryResultDTO> recover_global_io_rule_impl(
-      const IoGlobalRuleRecoveryIntentDTO& intent, bool automatic);
-  [[nodiscard]] Result<IoGlobalRuleRecoveryResultDTO> commit_global_io_rule_recovery_locked(
-      const IoGlobalRuleRecoveryRecordDTO& record, StopWorkHandoff& handoff);
+      const std::shared_ptr<IIoSignalService>& service);
   [[nodiscard]] Result<bool> global_io_rule_supersedes_node_locked(
       const IoMotionRulePolicyBindingDTO& policy, const IoRuleEvidenceDTO& evidence,
       const ActiveOperationParticipant& participant) const;
   [[nodiscard]] Result<void> process_global_io_rule_evidence_locked(
-      StopWorkHandoff& handoff, const OperationId* dispatch_boundary = nullptr,
-      std::optional<std::size_t> recovering_index = {}, std::optional<std::size_t> only_index = {});
+      StopWorkHandoff& handoff, const OperationId* dispatch_boundary = nullptr);
   [[nodiscard]] Result<void> validate_global_io_rule_stop_locked(
       const GlobalInterruptStopSelection& selection) const;
   struct InterruptStopSelection;
@@ -1323,10 +1084,7 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       const std::vector<ControllableComponentId>* retained_components = nullptr,
       const RetainedBundleId* candidate_retained_bundle_id = nullptr,
       const GraphRevision* candidate_graph_revision = nullptr,
-      const std::function<Result<void>()>* commit_publication = nullptr,
-      std::span<const ResolvedLifecycleControlDomainScopeDTO> retained_provider_domains = {},
-      std::span<const ResolvedLifecycleProviderOccurrenceDTO> retained_provider_occurrences = {},
-      const CellAdmissionClaimDTO* actual_parent_claim = nullptr);
+      const std::function<Result<void>()>* commit_publication = nullptr);
   [[nodiscard]] StopIntentDTO internal_control_stop_intent_locked(
       const ActiveOperation& operation, const OperationControlAcceptedDTO& accepted,
       std::string_view reason) const;
@@ -1354,20 +1112,20 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   void wake_stop_after_preparation_borrow_locked(const OperationId& operation_id) noexcept;
   OperationStateDTO capture_control_failure_locked(ActiveOperation& operation);
   void ProjectStop(StopControlWorkToken token) noexcept;
-  void RunStopSurveillance(StopCertificateId certificate_id,
-                           std::uint64_t schedule_generation) noexcept;
-  void ScheduleStopSurveillance(StopCertificateId certificate_id,
-                                std::int64_t deadline_ns) noexcept;
   [[nodiscard]] std::optional<StopControlWorkToken> allocate_stop_projection_job_locked() noexcept;
-  void latch_stop_fault_locked(StopTransaction& transaction, StopFaultTriggerDTO trigger);
-  void refresh_stop_fault_latch_locked();
-  /// Ordinary acquire; `close_disable` marks a Kernel-verified Disable (D6).
   [[nodiscard]] Result<CellAdmissionClaimDTO> acquire_cell_admission_claim(
-      const CellAdmissionClaimIntentDTO& intent, bool close_disable);
-  /// D6: how the active latch restricts cell admission (state_mutex_ held).
-  [[nodiscard]] StopFaultAdmissionScope stop_fault_admission_scope_locked() const noexcept;
-  [[nodiscard]] Result<void> publish_stop_fault_assessment_locked(
-      const StopStatusDTO& expected, const StopFaultLatchDTO& assessed);
+      const CellAdmissionClaimIntentDTO& intent);
+  /// Cell latch (CONTRACTS §5), state_mutex_ held. `arm` arms the latch
+  /// condition; the arm clears when every component is healthy and idle.
+  void observe_component_states_locked(std::vector<ComponentState> states);
+  void refresh_cell_latch_locked(bool arm);
+  /// Every component in the cell is healthy and idle (or latch-exempt).
+  [[nodiscard]] bool cell_settled_locked() const;
+  [[nodiscard]] bool cell_latched_locked() const;
+  /// `cell_latched` while latched (R1), else nothing.
+  [[nodiscard]] std::optional<ErrorDTO> cell_latch_refusal_locked() const;
+  /// A run, a node, manual motion or I/O is executing.
+  [[nodiscard]] bool execution_in_progress_locked() const;
   [[nodiscard]] bool commit_stop_terminal_locked(StopTransaction& transaction,
                                                  std::int64_t completed_at_ns) noexcept;
   struct MotionTakeoverStopSelection final {
@@ -1379,7 +1137,6 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       EmergencyStopProjectedIntentDTO intent,
       const PartialDispatchStopScope* partial_dispatch_scope = nullptr,
       const MalformedStopIngressDTO* malformed_ingress = nullptr,
-      std::optional<StopFaultTriggerDTO> required_fault_latch = std::nullopt,
       const MotionTakeoverStopSelection* takeover_selection = nullptr,
       const InterruptStopSelection* interrupt_selection = nullptr,
       std::span<const InterruptStopSelection> disjoint_interrupt_selections = {});
@@ -1389,31 +1146,36 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   struct StopWorkHandoff final {
     std::optional<StopControlWorkToken> control;
     std::optional<StopControlWorkToken> projection;
+    /// A new Stop was accepted: `publish_stop_work` calls the Stop listener.
+    bool accepted{};
   };
   [[nodiscard]] Result<StopAcceptedDTO> accept_stop_locked(
       EmergencyStopProjectedIntentDTO intent, StopWorkHandoff& handoff, TimePoint accepted_at_ns,
       const PartialDispatchStopScope* partial_dispatch_scope = nullptr,
       const MalformedStopIngressDTO* malformed_ingress = nullptr,
-      std::optional<StopFaultTriggerDTO> required_fault_latch = std::nullopt,
       const MotionTakeoverStopSelection* takeover_selection = nullptr,
       const InterruptStopSelection* interrupt_selection = nullptr,
       std::span<const InterruptStopSelection> disjoint_interrupt_selections = {},
       const GlobalInterruptStopSelection* global_selection = nullptr);
   void publish_stop_work(const StopWorkHandoff& handoff) noexcept;
-  void attribute_containment_stop_locked(const StopAcceptedDTO& stopped,
-                                         StopFaultLatchOriginDTO origin);
+  void refresh_manager_liveness_inhibition();
+  /// The operator's Program Stop (`stop_program_selection`) under the lock;
+  /// a global `stop`/`hold` rule trip issues the same (CONTRACTS §8).
+  [[nodiscard]] Result<ProgramExecutionSelectionAcceptedDTO> stop_program_selection_locked(
+      const ProgramExecutionSelectionRequestDTO& request, StopWorkHandoff& handoff,
+      TimePoint accepted_at_ns);
+  /// AUD-6: the Program run hold of global rule `index` (`hold_run`).
+  [[nodiscard]] Result<void> hold_program_run_for_rule_locked(std::size_t index,
+                                                              StopWorkHandoff& handoff);
   [[nodiscard]] bool ordinary_request_id_retained_locked(const RequestId& request_id) const;
 
   RuntimeParticipantRegistry registry_;
   std::shared_ptr<std::recursive_mutex> admission_mutex_;
   std::shared_ptr<ResourceSlotTable> resource_slots_;
   std::vector<RuntimeParticipantExecutionRegistration> registrations_;
-  std::map<ControlDomainId, RuntimeDomainConfigurationReadbackDTO>
+  std::map<ControlDomainId, RuntimeRouteConfigurationReadbackDTO>
       runtime_route_configuration_readbacks_;
   std::set<ControlDomainId> runtime_route_configuration_publication_required_;
-  /// Component command eligibility, separate from route readiness. Guarded
-  /// like the route readbacks it is checked together with.
-  std::map<ControllableComponentId, ComponentCommandReadinessDTO> component_command_readiness_;
   /// CP9 stream holds (state_mutex_): refusal of new commands per component.
   std::map<ControllableComponentId, ErrorDTO> component_stream_holds_;
   /// CP9 holds of components without motion: refusal of every component.
@@ -1449,6 +1211,8 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
       const std::shared_ptr<IIoSignalService>& affected_service) const;
   [[nodiscard]] Result<void> retire_program_blackboard_source_locked(
       std::shared_ptr<IIoSignalService>* actual_retired_service = nullptr);
+  [[nodiscard]] Result<IoProgramBlackboardAcknowledgementDTO> admit_program_blackboard_frame(
+      const IoProgramBlackboardPublicationDTO& publication);
   [[nodiscard]] Result<void> reconcile_program_blackboard_cycle_locked(
       const std::optional<ProgramCycleStatusDTO>& cycle,
       std::shared_ptr<IIoSignalService>* actual_retired_service = nullptr);
@@ -1467,10 +1231,6 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   // callbacks to take state_mutex_. The subordinate execute call is required
   // to be prompt/non-blocking by its port contract.
   mutable std::mutex submission_mutex_;
-  // Serializes the non-emergency durable fault-clear workflow. Stop ingress
-  // never takes this mutex, so a slow current-facts owner or journal cannot
-  // delay emergency containment.
-  mutable std::mutex stop_fault_recovery_mutex_;
   mutable std::mutex operation_recovery_mutex_;
   mutable std::mutex state_mutex_;
   struct ProgramRunStopFence final {
@@ -1482,6 +1242,8 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
     std::uint64_t legacy_selection_revision{};
     std::vector<ProgramNodeHoldStateDTO> node_states{};
     std::vector<ProgramNodeStopEffectDTO> pending_effects{};
+    /// The global rule whose `hold` trip held this run (stopped_by: rule).
+    std::optional<InterruptPolicyId> held_by_rule{};
   };
   struct ProgramCycleClaimRun final {
     ProgramRunId program_run_id;
@@ -1529,8 +1291,6 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   std::vector<RuntimeScaleReplayEntry> runtime_scale_replay_ledger_;
   std::vector<RuntimeScaleControlReplayEntry> runtime_scale_control_replay_ledger_;
   std::vector<RuntimeScaleControlSetting> runtime_scale_control_settings_;
-  struct StopFaultRecoveryReplayEntry;
-  std::vector<StopFaultRecoveryReplayEntry> stop_fault_recovery_replay_ledger_;
   struct OperationRecoveryReplayEntry;
   std::vector<OperationRecoveryReplayEntry> operation_recovery_replay_ledger_;
   std::vector<OperationStateDTO> historical_operations_;
@@ -1572,54 +1332,39 @@ class ResourceAddressedExecutionKernel final : public IAddressedOperationOwner,
   std::unique_ptr<BoundedOperationControlExecutor> operation_control_executor_;
   bool operation_control_reconfiguration_in_progress_{};
   std::size_t prequalified_max_live_stop_participants_{};
-  std::condition_variable stop_surveillance_schedule_cv_;
-  std::size_t stop_surveillance_schedule_publications_{};
-  bool stop_surveillance_shutting_down_{};
+  // A restart found its predecessor unclosed (an unterminated Stop, an
+  // unclosed owner epoch or orphan resources). It counts as a Stop for the
+  // cell latch (every unhealthy component shows) and ends once every
+  // component reports healthy and idle: the orphan resources are released
+  // (R2; no Force close).
   bool motion_admission_unreconciled_{};
+  std::vector<ResourceId> recovered_orphan_resources_;
   std::uint64_t next_operation_id_{1U};
   std::uint64_t next_stop_id_{1U};
   StopGeneration cell_stop_generation_{0U};
-  StopFaultLatchGeneration cell_stop_fault_latch_generation_{0U};
-  std::optional<StopFaultLatchDTO> active_stop_fault_latch_;
-  /// D6: Scenario Close retired the current product's lifecycle targets. Set
-  /// by the Close lease after retirement; cleared when the product changes.
-  bool close_retired_product_{};
-  /// Item 37: the confirmed Full Stop of an operator Force close. Set by
-  /// `arm_force_close`; cleared with `close_retired_product_`, by a newer
-  /// Stop and by a newly admitted operation.
-  std::optional<StopGeneration> force_close_stop_generation_;
+  /// Cell latch inputs (CONTRACTS §5): the last observed state of every
+  /// component in the cell, and whether a latch condition is armed.
+  std::vector<ComponentState> component_states_;
+  bool cell_latch_armed_{};
+  std::function<void()> stop_listener_;
+  // Mirrors the cell-admission owner's Manager-liveness loss: set by
+  // `LatchAndContain`, cleared when the Manager is alive again (`Publish`,
+  // `ReplaceManagerLivenessRequiredSet`). `manager_liveness_mutex_` orders
+  // the owner update with this mirror.
   bool manager_liveness_motion_inhibited_{};
-  struct AttributedContainmentStop final {
-    StopId stop_id;
-    StopGeneration stop_generation;
-    StopFaultLatchOriginDTO origin;
-  };
-  /// Fresh containment Stops this Kernel issued itself (bounded, newest last).
-  std::vector<AttributedContainmentStop> attributed_containment_stops_;
-  /// Incident containments by incident id (bounded, newest last). A real
-  /// receipt replays its Stop; absence reserves restrictive admission before
-  /// acceptance and survives a failed acceptance until retry or owner restart.
-  struct RememberedIncidentContainment final {
-    std::string incident_id;
-    std::optional<ComponentIncidentContainmentReceiptDTO> receipt;
-    /// Only original acceptance attributes the component. A replay whose
-    /// original bounded row was retired cannot invent that missing fact.
-    std::optional<ControllableComponentId> controllable_component_id;
-  };
-  std::vector<RememberedIncidentContainment> incident_containments_;
-  // Closed refuses all new admission. A Full Stop no longer closes admission
-  // by itself (its causing fault gates motion).
-  bool motion_admission_closed_{};
+  std::mutex manager_liveness_mutex_;
   /// A2a-2: engines held by a running immediate component step
   /// (`ImmediateComponentStep::holds_engine`). Guarded by `state_mutex_`.
   std::set<IResolvedParticipantExecutionEngine*> immediate_step_engines_;
   std::optional<OperationJournalWriteFaultDTO> operation_journal_write_fault_{};
   std::optional<KernelInternalFaultDTO> internal_fault_{};
-  // Restart-only Workbench faults (internal fault, journal write fault): each
-  // keeps its typed cause in the runtime-fault status and holds motion
-  // admission closed until restart; a Stop-fault clear never reopens it.
-  [[nodiscard]] bool restart_required_fault_locked() const noexcept {
-    return internal_fault_.has_value() || operation_journal_write_fault_.has_value();
+  // New motion admission stays closed only for the Kernel's internal fault
+  // (until host restart) and while the Manager is lost (until it is alive
+  // again); both belong to no component and show in readiness
+  // (`ReadExecutionBlocks`). A journal write fault blocks nothing. Every
+  // other cause is component state the cell latch derives (CONTRACTS §5, R2).
+  [[nodiscard]] bool motion_admission_closed_locked() const noexcept {
+    return internal_fault_.has_value() || manager_liveness_motion_inhibited_;
   }
   std::optional<RetainedOperatorAlarmAttentionDTO> operator_alarm_attention_;
 };

@@ -36,9 +36,8 @@ namespace {
 } // namespace
 
 /// One request on a ready client, bounded and never retried; a non-zero
-/// vendor return is an unknown outcome (R7 §2.3). M6 XADAPT: every sent
-/// request logs one INFO line with its measured duration (per-call caps are
-/// to be set from these data).
+/// vendor return is reported with the answer. Every sent request logs one
+/// INFO line with its measured duration.
 template <typename Service>
 [[nodiscard]] XArmServiceCallResult
 await_response(const typename rclcpp::Client<Service>::SharedPtr &client,
@@ -92,8 +91,8 @@ await_response(const typename rclcpp::Client<Service>::SharedPtr &client,
   result.vendor_return = response->ret;
   if (answered != nullptr) *answered = response;
   if (response->ret != 0) {
-    // A non-zero vendor return is not a known failure: the next status
-    // report shows what the controller did (R7 §2.3).
+    // The caller reads the vendor return (`ret=1`: a controller error is
+    // present; the call may still have taken effect).
     result.reason = "xarm_service_returned_nonzero";
     return result;
   }
@@ -108,37 +107,35 @@ XArmDriverServices::XArmDriverServices(rclcpp::Node &node,
           service_name(driver_namespace, "clean_error"))),
       clean_warn_(node.create_client<xarm_msgs::srv::Call>(
           service_name(driver_namespace, "clean_warn"))),
-      set_tcp_load_(node.create_client<xarm_msgs::srv::SetTcpLoad>(
-          service_name(driver_namespace, "set_tcp_load"))),
-      set_tcp_offset_(node.create_client<xarm_msgs::srv::SetFloat32List>(
-          service_name(driver_namespace, "set_tcp_offset"))),
-      set_mode_(node.create_client<xarm_msgs::srv::SetInt16>(
-          service_name(driver_namespace, "set_mode"))),
+      get_err_warn_code_(node.create_client<xarm_msgs::srv::GetInt16List>(
+          service_name(driver_namespace, "get_err_warn_code"))),
       set_state_(node.create_client<xarm_msgs::srv::SetInt16>(
           service_name(driver_namespace, "set_state"))),
-      get_state_(node.create_client<xarm_msgs::srv::GetInt16>(
-          service_name(driver_namespace, "get_state"))),
-      get_err_warn_code_(node.create_client<xarm_msgs::srv::GetInt16List>(
-          service_name(driver_namespace, "get_err_warn_code"))) {}
+      set_tcp_offset_(node.create_client<xarm_msgs::srv::SetFloat32List>(
+          service_name(driver_namespace, "set_tcp_offset"))),
+      set_tcp_load_(node.create_client<xarm_msgs::srv::SetTcpLoad>(
+          service_name(driver_namespace, "set_tcp_load"))),
+      set_cgpio_digital_(node.create_client<xarm_msgs::srv::SetDigitalIO>(
+          service_name(driver_namespace, "set_cgpio_digital"))),
+      set_tgpio_digital_(node.create_client<xarm_msgs::srv::SetDigitalIO>(
+          service_name(driver_namespace, "set_tgpio_digital"))),
+      system_control_(node.create_client<xarm_msgs::srv::SetInt16>(
+          service_name(driver_namespace, "system_control"))) {}
 
 XArmServiceCallResult
-XArmDriverServices::Call(const XArmLifecycleCommand command,
-                         const std::chrono::nanoseconds timeout,
-                         const std::stop_token cancellation) const {
-  rclcpp::Client<xarm_msgs::srv::Call>::SharedPtr client;
-  if (command == XArmLifecycleCommand::kClearError)
-    client = clean_error_;
-  else if (command == XArmLifecycleCommand::kClearWarning)
-    client = clean_warn_;
-  if (!client) {
-    XArmServiceCallResult result;
-    result.reason = "xarm_service_command_unsupported";
-    return result;
-  }
+XArmDriverServices::CleanError(const std::chrono::nanoseconds timeout,
+                               const std::stop_token cancellation) const {
   return await_response<xarm_msgs::srv::Call>(
-      client, std::make_shared<xarm_msgs::srv::Call::Request>(), timeout,
-      cancellation, logger_,
-      command == XArmLifecycleCommand::kClearError ? "clean_error" : "clean_warn");
+      clean_error_, std::make_shared<xarm_msgs::srv::Call::Request>(), timeout,
+      cancellation, logger_, "clean_error");
+}
+
+XArmServiceCallResult
+XArmDriverServices::CleanWarn(const std::chrono::nanoseconds timeout,
+                              const std::stop_token cancellation) const {
+  return await_response<xarm_msgs::srv::Call>(
+      clean_warn_, std::make_shared<xarm_msgs::srv::Call::Request>(), timeout,
+      cancellation, logger_, "clean_warn");
 }
 
 XArmServiceCallResult XArmDriverServices::SetTcpLoad(
@@ -167,21 +164,35 @@ XArmServiceCallResult XArmDriverServices::SetTcpOffset(
 }
 
 XArmServiceCallResult
-XArmDriverServices::SetMode(const int mode, const std::chrono::nanoseconds timeout,
-                            const std::stop_token cancellation) const {
-  auto request = std::make_shared<xarm_msgs::srv::SetInt16::Request>();
-  request->data = static_cast<std::int16_t>(mode);
-  return await_response<xarm_msgs::srv::SetInt16>(set_mode_, std::move(request),
-                                                  timeout, cancellation, logger_, "set_mode");
-}
-
-XArmServiceCallResult
 XArmDriverServices::SetState(const int state, const std::chrono::nanoseconds timeout,
                              const std::stop_token cancellation) const {
   auto request = std::make_shared<xarm_msgs::srv::SetInt16::Request>();
   request->data = static_cast<std::int16_t>(state);
   return await_response<xarm_msgs::srv::SetInt16>(set_state_, std::move(request),
                                                   timeout, cancellation, logger_, "set_state");
+}
+
+XArmServiceCallResult XArmDriverServices::SetDigitalOutput(
+    const XArmIoBank bank, const int ionum, const bool value,
+    const std::chrono::nanoseconds timeout, const std::stop_token cancellation) const {
+  // The driver's defaults: no delay, the motion queue (`sync`) kept.
+  auto request = std::make_shared<xarm_msgs::srv::SetDigitalIO::Request>();
+  request->ionum = static_cast<std::int16_t>(ionum);
+  request->value = value ? 1 : 0;
+  const bool tool = bank == XArmIoBank::kTool;
+  return await_response<xarm_msgs::srv::SetDigitalIO>(
+      tool ? set_tgpio_digital_ : set_cgpio_digital_, std::move(request), timeout,
+      cancellation, logger_, tool ? "set_tgpio_digital" : "set_cgpio_digital");
+}
+
+XArmServiceCallResult
+XArmDriverServices::SystemControl(const int value, const std::chrono::nanoseconds timeout,
+                                  const std::stop_token cancellation) const {
+  auto request = std::make_shared<xarm_msgs::srv::SetInt16::Request>();
+  request->data = static_cast<std::int16_t>(value);
+  return await_response<xarm_msgs::srv::SetInt16>(system_control_, std::move(request),
+                                                  timeout, cancellation, logger_,
+                                                  "system_control");
 }
 
 XArmErrWarnRead
@@ -199,19 +210,6 @@ XArmDriverServices::GetErrWarnCode(const std::chrono::nanoseconds timeout,
     read.error = response->datas[0];
     read.warning = response->datas[1];
   }
-  return read;
-}
-
-XArmStateRead XArmDriverServices::GetState(
-    const std::chrono::nanoseconds timeout,
-    const std::stop_token cancellation) const {
-  XArmStateRead read;
-  xarm_msgs::srv::GetInt16::Response::SharedPtr response;
-  read.call = await_response<xarm_msgs::srv::GetInt16>(
-      get_state_, std::make_shared<xarm_msgs::srv::GetInt16::Request>(), timeout,
-      cancellation, logger_, "get_state", &response);
-  if (read.call.outcome == XArmServiceCallOutcome::kSucceeded && response)
-    read.state = response->data;
   return read;
 }
 

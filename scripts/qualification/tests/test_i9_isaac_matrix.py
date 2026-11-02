@@ -33,7 +33,7 @@ def exact_environment(runner: ModuleType) -> dict[str, str]:
 
 def row_for(runner: ModuleType, scenario) -> dict[str, object]:
     details: dict[str, object] = {"terminal": {"state": "qualified"}}
-    if scenario.scenario_id == "isaac-lite6-trocar-foundationpose":
+    if scenario.scenario_id == "sim_lite6_foundationpose_trocar_pick":
         details["recovery"] = recovery_for(runner, scenario)
     return {
         "schema_version": runner.ROW_SCHEMA,
@@ -143,11 +143,11 @@ def test_frozen_matrix_has_exact_five_non_aliasing_owner_rows(
     runner: ModuleType,
 ) -> None:
     assert tuple(row.scenario_id for row in runner.SCENARIOS) == (
-        "isaac-lite6-pick-place",
-        "isaac-lite6-trocar-foundationpose",
-        "isaac-ur10e-light-scene",
-        "isaac-ur10e-light-scene-assistant",
-        "isaac-ur10e-light-scene-collision",
+        "sim_lite6_pick_and_place",
+        "sim_lite6_foundationpose_trocar_pick",
+        "sim_ur10e_pick_and_place",
+        "sim_ur10e_assistant_scene_authoring",
+        "sim_ur10e_runtime_collision_stop",
     )
     assert len({row.cell_id for row in runner.SCENARIOS}) == 5
     assert len({row.component_id for row in runner.SCENARIOS}) == 5
@@ -378,7 +378,7 @@ def test_reducer_surfaces_failed_row_checks_without_accepting_pass_field(
     )
     assert result["passed"] is False
     assert result["failures"]["rows"] == {
-        "isaac-ur10e-light-scene-collision": ["collision_stop_terminal"]
+        "sim_ur10e_runtime_collision_stop": ["collision_stop_terminal"]
     }
 
 

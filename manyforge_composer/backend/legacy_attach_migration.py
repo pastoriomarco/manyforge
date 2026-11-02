@@ -21,11 +21,9 @@ def migrate_legacy_attach(authoring: dict[str, Any], deployment: Any, assignment
             or not isinstance(component_assignments, list) or not isinstance(target_assignments, list)):
         return False
     try:
-        _profile_ids, families, family_facts = _profiles()
+        _model_ids, _families, facts = _profiles()
     except (OSError, ValueError, KeyError, TypeError):
         return False
-    facts = {profile: family_facts[family] for profile, family in families.items()
-             if family in family_facts}
     roots = authoring.get("forest")
     if roots is None:
         roots = [authoring.get("tree")]

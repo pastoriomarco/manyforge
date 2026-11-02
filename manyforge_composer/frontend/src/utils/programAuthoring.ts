@@ -147,7 +147,7 @@ export const PROGRAM_MOTION_FIELDS = [
   'velocity_scale',
   'acceleration_scale',
   'translation_tol_m',
-  'max_blend_deviation_rad',
+  'blend_radius_m',
 ] as const;
 
 export const PROGRAM_MOTION_CEILING_FIELDS = [
@@ -161,7 +161,7 @@ export interface ProgramMotionValues {
   velocity_scale: number;
   acceleration_scale: number;
   translation_tol_m: number;
-  max_blend_deviation_rad: number;
+  blend_radius_m: number;
 }
 
 export interface ProgramMotionConfiguration {
@@ -300,7 +300,6 @@ export function deriveProgramMotionConfiguration(
 /** Program motion defaults that also seed manual Cartesian moves. */
 export const PROGRAM_MANUAL_CARTESIAN_FIELDS: readonly ProgramMotionField[] = [
   'translation_tol_m',
-  'max_blend_deviation_rad',
 ];
 
 /** What makes one Program parameter a Program motion default. */

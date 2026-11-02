@@ -21,7 +21,6 @@ from manyforge_behavior.program import Program
 from manyforge_headless_api.native import HeadlessApiError
 from manyforge_program_runner.bbkey_publication import (
     FAULT_CODE,
-    MAXIMUM_PENDING_FRAMES,
     ProgramBlackboardKeyPublisher,
     ProgramBlackboardPublicationScope,
 )
@@ -36,7 +35,6 @@ from manyforge_program_runner.tests.test_liveness import _expected_status_digest
 
 _ROOT = Path(__file__).resolve().parents[2]
 _CATALOG = NodeCatalog(_ROOT / "manyforge_behavior/resources/node_catalog.yaml")
-_BUDGET_NS = 30_000_000_000
 _KEYS = ("count", "door_open", "label", "speed")
 
 
@@ -76,14 +74,6 @@ def _program(*extra: dict[str, Any]) -> Program:
         api_version="manyforge.program.v2",
     )
     return Program.from_dict(document, _CATALOG)
-
-
-class _Clock:
-    def __init__(self) -> None:
-        self.now = 1_000
-
-    def __call__(self) -> int:
-        return self.now
 
 
 class _Queue:
@@ -131,7 +121,6 @@ def _publisher(
     host: _Host,
     submit: Callable[[Callable[[], None]], None],
     *,
-    clock: _Clock | None = None,
     events: list[Any] | None = None,
     between_runs: bool = False,
 ) -> ProgramBlackboardKeyPublisher:
@@ -151,8 +140,6 @@ def _publisher(
         stop_run=lambda run_id: events.append(("stop", run_id)),
         on_fault=lambda fault, reference: events.append(("fault", fault, reference)),
         fault_reference=ProgramRuntime._digest,  # noqa: SLF001
-        budget_ns=_BUDGET_NS,
-        **({} if clock is None else {"monotonic_ns": clock}),
     )
 
 
@@ -160,22 +147,33 @@ def _inline(work: Callable[[], None]) -> None:
     work()
 
 
-def test_baseline_then_ordered_typed_updates_cleared_by_exact_ack() -> None:
+def _rows(frame: dict[str, Any]) -> dict[str, Any]:
+    return {row["name"]: row["value"] for row in frame["values"]}
+
+
+_LOSS_SEQUENCE = str(2**64 - 1)
+
+
+def test_baseline_then_each_write_forwarded_before_it_returns() -> None:
+    # BBK-1: no pool, no queue: a write returns after its frame's ACK, so
+    # the writer's next step (a node's motion) follows the Kernel's
+    # evaluation of it. One frame per write, never merged.
     store = _store()
     host, queue = _Host(), _Queue()
     publisher = _publisher(host, queue)
-    publisher.start(store, _KEYS)
+    assert publisher.start(store, _KEYS) is True
     store.write("count", 7)
+    assert [frame["message_sequence"] for frame in host.frames] == ["1", "2"]
     store.write("label", "café")
     store.write("count", 8)
-    assert publisher.pending_sequences() == (1, 2, 3)
+    assert queue.work == []
 
-    queue.run()
-
-    assert publisher.pending_sequences() == ()
     assert [
         (f["kind"], f["message_sequence"], f["previous_sequence"]) for f in host.frames
-    ] == [("baseline", "1", "0"), ("update", "2", "1"), ("update", "3", "2")]
+    ] == [
+        ("baseline", "1", "0"), ("update", "2", "1"), ("update", "3", "2"),
+        ("update", "4", "3"),
+    ]
     # The baseline carries the whole union; an unset key is null.
     assert host.frames[0]["values"] == [
         {"name": "count", "value_type": "int64", "value": "0"},
@@ -183,14 +181,9 @@ def test_baseline_then_ordered_typed_updates_cleared_by_exact_ack() -> None:
         {"name": "label", "value_type": "string", "value": None},
         {"name": "speed", "value_type": "float64", "value": 0.5},
     ]
-    # Updates carry only changed keys (bb-wire-shapes03). Different keys
-    # share an unsent frame; the same key starts the next one.
-    assert host.frames[1]["values"] == [
-        {"name": "count", "value_type": "int64", "value": "7"},
-        {"name": "label", "value_type": "string", "value": "café"},
-    ]
-    assert host.frames[2]["values"] == [
-        {"name": "count", "value_type": "int64", "value": "8"},
+    # An update carries only its written key (bb-wire-shapes03).
+    assert [_rows(frame) for frame in host.frames[1:]] == [
+        {"count": "7"}, {"label": "café"}, {"count": "8"},
     ]
     assert {
         key: host.frames[0][key]
@@ -200,36 +193,63 @@ def test_baseline_then_ordered_typed_updates_cleared_by_exact_ack() -> None:
     assert publisher.fault is None
 
 
-def test_unchanged_and_unsubscribed_writes_create_no_obligation() -> None:
+def test_a_pulse_reaches_the_kernel_as_two_frames() -> None:
+    # BBK-1: true then false at once is two evaluations, never the latest.
     store = _store()
-    host, queue = _Host(), _Queue()
-    publisher = _publisher(host, queue)
+    host = _Host()
+    publisher = _publisher(host, _Queue())
+    publisher.start(store, ("door_open",))
+    store.write("door_open", True)
+    store.write("door_open", False)
+    assert [_rows(frame) for frame in host.frames] == [
+        {"door_open": False}, {"door_open": True}, {"door_open": False},
+    ]
+
+
+def test_operator_write_then_tree_write_are_both_forwarded_in_order() -> None:
+    # BBK-1: every writer commits through the one store. An operator write
+    # (runtime control) still in flight holds the tree's write until its
+    # frame is ACKed: the Kernel sees true, then false.
+    store = _store()
+    host = _Host()
+    publisher = _publisher(host, _Queue())
+    publisher.start(store, ("door_open",))
+    in_flight, release = threading.Event(), threading.Event()
+
+    def hold_operator_frame(request: dict[str, Any]) -> None:
+        if _rows(request) == {"door_open": True}:
+            in_flight.set()
+            assert release.wait(5.0)
+
+    host.during = hold_operator_frame
+    operator = threading.Thread(target=lambda: store.write(
+        "door_open", True,
+        metadata={"program_run_id": "run-1", "request_id": "r-1",
+                  "value_source": "runtime_control"},
+    ))
+    operator.start()
+    assert in_flight.wait(5.0)
+    tree = threading.Thread(target=lambda: store.write("door_open", False))
+    tree.start()
+    tree.join(0.2)
+    assert tree.is_alive()  # The tree's write waits for the operator's ACK.
+    release.set()
+    operator.join(5.0)
+    tree.join(5.0)
+    assert [_rows(frame) for frame in host.frames[1:]] == [
+        {"door_open": True}, {"door_open": False},
+    ]
+    assert publisher.fault is None
+
+
+def test_unchanged_and_unsubscribed_writes_send_nothing() -> None:
+    store = _store()
+    host = _Host()
+    publisher = _publisher(host, _Queue())
     publisher.start(store, ("count", "door_open"))
     store.write("count", 0)
     store.write("speed", 2.0)
-    assert publisher.pending_sequences() == (1,)
-
-
-def test_one_request_in_flight_never_absorbs_later_writes() -> None:
-    store = _store()
-    host, queue = _Host(), _Queue()
-    publisher = _publisher(host, queue)
-    publisher.start(store, _KEYS)
-    queue.run()
-    store.write("door_open", True)
-
-    def write_while_in_flight(request: dict[str, Any]) -> None:
-        if request["message_sequence"] == "2":
-            store.write("speed", 1.5)
-            assert publisher.pending_sequences() == (2, 3)
-
-    host.during = write_while_in_flight
-    queue.run()
-    rows = [
-        {row["name"]: row["value"] for row in frame["values"]}
-        for frame in host.frames[1:]
-    ]
-    assert rows == [{"door_open": True}, {"speed": 1.5}]
+    assert [frame["kind"] for frame in host.frames] == ["baseline"]
 
 
 def test_baseline_capture_is_atomic_with_concurrent_writes() -> None:
@@ -239,9 +259,9 @@ def test_baseline_capture_is_atomic_with_concurrent_writes() -> None:
     started = threading.Event()
 
     def writer() -> None:
-        for value in range(1, 2_001):
+        for value in range(1, 501):
             store.write("count", value)
-            if value == 200:
+            if value == 50:
                 started.set()
 
     thread = threading.Thread(target=writer)
@@ -253,17 +273,20 @@ def test_baseline_capture_is_atomic_with_concurrent_writes() -> None:
     published = [int(frame["values"][0]["value"]) for frame in host.frames]
     assert host.frames[0]["kind"] == "baseline"
     # Every change after the baseline arrives once, in order, ending last.
-    assert published == list(range(published[0], 2_001))
+    assert published == list(range(published[0], 501))
     assert publisher.fault is None
 
 
-def test_budget_expiry_latches_fault_stop_first_and_fences_liveness(
+def test_a_failed_forward_is_source_loss_before_the_write_returns(
     tmp_path: Path,
 ) -> None:
+    # BBK-1 (a): after the source exists, a refused or unanswered forward
+    # makes the Kernel's source unavailable (exact-sender gap) before the
+    # write returns, so its rules can't watch and hold their scope; then the
+    # Run's Program Stop, then the fault fences liveness. No resend.
     receiver, _rclock, _losses, _reconciliations = _receiver(tmp_path)
     receiver._handle(_heartbeat())  # noqa: SLF001
     events: list[Any] = []
-    clock = _Clock()
     store = _store()
     host, queue = _Host(), _Queue()
     publisher = ProgramBlackboardKeyPublisher(
@@ -278,19 +301,19 @@ def test_budget_expiry_latches_fault_stop_first_and_fences_liveness(
             receiver.latch_publisher_fault(fault, reference),
         ),
         fault_reference=ProgramRuntime._digest,  # noqa: SLF001
-        budget_ns=_BUDGET_NS,
-        monotonic_ns=clock,
     )
-    receiver._publication_check = publisher.check_budget  # noqa: SLF001
     publisher.start(store, _KEYS)
-    clock.now += _BUDGET_NS
-    receiver.check_publication()
-    assert publisher.fault is None
-    clock.now += 1
-    receiver.check_publication()
-
+    host.fail_with = HeadlessApiError("execution_owner_unavailable", "lost")
+    store.write("count", 1)
+    # The write has returned: the loss frame was already sent.
+    assert [(f["message_sequence"], f["previous_sequence"]) for f in host.frames] == [
+        ("1", "0"), ("2", "1"), (_LOSS_SEQUENCE, str(2**64 - 2)),
+    ]
+    assert publisher.fault is not None and not publisher.loss_confirmed
+    store.write("count", 2)
+    assert len(host.frames) == 3  # Nothing is sent after the fault.
+    queue.run()  # Containment, off the store lock.
     assert events == [("stop", "run-1"), ("fault", FAULT_CODE)]
-    assert publisher.pending_sequences() == ()
     acknowledgement = receiver._handle(_heartbeat(sequence=2))  # noqa: SLF001
     assert len(acknowledgement) == 24
     assert acknowledgement["publisher_fault"]["code"] == FAULT_CODE
@@ -307,11 +330,44 @@ def test_budget_expiry_latches_fault_stop_first_and_fences_liveness(
     assert receiver.manager_fault_reference is None
     with pytest.raises(ProgramRunnerLivenessError, match="publication fault"):
         receiver.require_current()
-    # No frame is sent after the fault, even if the tick pool runs.
-    queue.run()
+
+
+def test_a_sequence_gap_reply_confirms_the_loss() -> None:
+    store = _store()
+    host = _Host()
+    publisher = _publisher(host, _inline)
+    publisher.start(store, ("count",))
+
+    def refuse_then_confirm(request: dict[str, Any]) -> None:
+        host.fail_with = (
+            _SEQUENCE_GAP if request["message_sequence"] == _LOSS_SEQUENCE else _SCOPE_STALE
+        )
+
+    host.during = refuse_then_confirm
+    store.write("count", 1)
+    assert publisher.fault is not None and publisher.loss_confirmed
+
+
+def test_writes_before_the_source_exists_are_carried_by_its_baseline() -> None:
+    # BBK-1 (a): while the Kernel answers the baseline `bb_source_not_ready`
+    # (Apply or Reset still installing), a write only commits; the owner's
+    # next start sends a baseline built from the store then. No fault.
+    events: list[Any] = []
+    store = _store()
+    host = _Host(fail_with=HeadlessApiError("bb_source_not_ready", "Apply installing"))
+    publisher = _publisher(host, _inline, events=events, between_runs=True)
+    assert publisher.start(store, ("count", "door_open")) is False
+    store.write("count", 4)
+    store.write("door_open", True)
+    assert len(host.frames) == 1 and events == [] and publisher.fault is None
+    host.fail_with = None
+    assert publisher.start(store, ("count", "door_open")) is True
+    baseline = host.frames[1]
+    assert (baseline["kind"], baseline["message_sequence"]) == ("baseline", "1")
+    assert _rows(baseline) == {"count": "4", "door_open": True}
     store.write("count", 5)
-    queue.run()
-    assert host.frames == []
+    assert (host.frames[2]["message_sequence"], _rows(host.frames[2])) == ("2", {"count": "5"})
+    assert events == [] and publisher.baseline_accepted
 
 
 def test_reconciliation_and_later_heartbeats_never_clear_the_latch(
@@ -346,34 +402,16 @@ def test_reconciliation_and_later_heartbeats_never_clear_the_latch(
         )
 
 
-def test_unknown_reply_latches_once_and_never_resends() -> None:
-    events: list[Any] = []
-    store = _store()
-    host, queue = _Host(fail_with=HeadlessApiError("execution_owner_unavailable", "lost")), _Queue()
-    publisher = _publisher(host, queue, events=events)
-    publisher.start(store, _KEYS)
-    store.write("count", 1)
-    queue.run()
-    store.write("count", 2)
-    queue.run()
-
-    assert [frame["message_sequence"] for frame in host.frames] == ["1"]
-    assert [event[0] for event in events] == ["stop", "fault"]
-    assert events[1][1]["code"] == FAULT_CODE
-    assert publisher.pending_sequences() == ()
-
-
 def test_wrong_reply_kind_is_a_fault() -> None:
     events: list[Any] = []
     store = _store()
-    host, queue = _Host(), _Queue()
+    host = _Host()
 
     def wrong(request: dict[str, Any]) -> dict[str, Any]:
         return {**host(request), "command": "events"}
 
-    publisher = _publisher(wrong, queue, events=events)  # type: ignore[arg-type]
+    publisher = _publisher(wrong, _inline, events=events)  # type: ignore[arg-type]
     publisher.start(store, _KEYS)
-    queue.run()
     assert [event[0] for event in events] == ["stop", "fault"]
 
 
@@ -382,28 +420,15 @@ def test_ack_echo_is_not_compared() -> None:
 
     events: list[Any] = []
     store = _store()
-    host, queue = _Host(), _Queue()
+    host = _Host()
 
     def echo(request: dict[str, Any]) -> dict[str, Any]:
         return {**host(request), "accepted_sequence": "9"}
 
-    publisher = _publisher(echo, queue, events=events)  # type: ignore[arg-type]
+    publisher = _publisher(echo, _inline, events=events)  # type: ignore[arg-type]
     publisher.start(store, _KEYS)
-    queue.run()
-    assert events == [] and publisher.pending_sequences() == ()
-
-
-def test_pending_frame_overflow_fails_closed() -> None:
-    events: list[Any] = []
-    store = _store()
-    queue = _Queue()
-    publisher = _publisher(_Host(), queue, events=events)
-    publisher.start(store, ("count",))
-    for value in range(1, MAXIMUM_PENDING_FRAMES + 1):
-        store.write("count", value)
-    queue.work.pop(0)  # The sender never ran: frames stay unsent.
-    queue.run()
-    assert [event[0] for event in events] == ["stop", "fault"]
+    store.write("count", 1)
+    assert events == [] and publisher.fault is None
 
 
 def _store(program: Program | None = None) -> ProgramValueStore:
@@ -416,19 +441,16 @@ def _store(program: Program | None = None) -> ProgramValueStore:
 def test_reset_retires_the_run_source_locally_without_a_clearing_frame() -> None:
     events: list[Any] = []
     store = _store()
-    host, queue = _Host(), _Queue()
-    publisher = _publisher(host, queue, events=events)
+    host = _Host()
+    publisher = _publisher(host, _inline, events=events)
     publisher.start(store, ("count", "label", "total"))
     store.write("label", "held")
-    queue.run()
-    # Held/finished: the values stay and nothing is sent or retired.
-    assert publisher.pending_sequences() == ()
+    # Held/finished: the values stay and nothing is retired.
     store.write("total", 9)
     publisher.retire()  # The Runner's own Reset transition (DX-1281).
     store.clear_run_values()
-    queue.run()
-    assert [frame["message_sequence"] for frame in host.frames] == ["1", "2"]
-    assert events == [] and publisher.pending_sequences() == ()
+    assert [frame["message_sequence"] for frame in host.frames] == ["1", "2", "3"]
+    assert events == []
 
 
 @pytest.mark.parametrize(
@@ -442,8 +464,8 @@ def test_reset_retires_the_run_source_locally_without_a_clearing_frame() -> None
 def test_a_late_reply_for_a_source_the_runner_retired_is_recorded_only(reply) -> None:
     events: list[Any] = []
     store = _store()
-    host, queue = _Host(), _Queue()
-    publisher = _publisher(host, queue, events=events)
+    host = _Host()
+    publisher = _publisher(host, _inline, events=events)
     publisher.start(store, ("count",))
 
     def retire_while_in_flight(request: dict[str, Any]) -> dict[str, Any]:
@@ -454,7 +476,7 @@ def test_a_late_reply_for_a_source_the_runner_retired_is_recorded_only(reply) ->
         raise reply
 
     publisher._publish = retire_while_in_flight  # noqa: SLF001
-    queue.run()
+    store.write("count", 1)
     assert events == [] and publisher.fault is None
 
 
@@ -464,58 +486,37 @@ def test_unknown_or_stale_reply_for_the_current_source_still_latches() -> None:
     host = _Host(fail_with=HeadlessApiError(
         "stale_generation", "stale", details={"reason": "program_bb_scope_stale"}
     ))
-    queue = _Queue()
-    publisher = _publisher(host, queue, events=events)
+    publisher = _publisher(host, _inline, events=events)
     publisher.start(store, ("count",))
-    queue.run()
     assert [event[0] for event in events] == ["stop", "fault"]
     # The owner's typed code and sub-reason stay visible in the fault.
     assert "code=stale_generation reason=program_bb_scope_stale" in events[1][1]["message"]
 
 
-def test_source_not_ready_is_retried_within_the_budget_then_latches() -> None:
+def test_source_not_ready_after_the_baseline_is_source_loss() -> None:
+    # BBK-1 (a): only the baseline may wait for the Kernel's source; an
+    # update refused not-ready is lost like any other refusal (no retry).
     events: list[Any] = []
-    clock = _Clock()
     store = _store()
-    host = _Host(fail_with=HeadlessApiError("bb_source_not_ready", "Apply installing"))
-    queue = _Queue()
-    publisher = _publisher(host, queue, clock=clock, events=events, between_runs=True)
+    host = _Host()
+    publisher = _publisher(host, _inline, events=events)
     publisher.start(store, ("count",))
-    queue.run()
-    # Kept, not resent until the next observation, no fault.
-    assert publisher.pending_sequences() == (1,) and events == []
+    host.fail_with = HeadlessApiError("bb_source_not_ready", "transition")
     store.write("count", 4)
-    queue.run()
-    assert len(host.frames) == 1
-    clock.now += _BUDGET_NS // 2
-    assert publisher.check_budget() is False
-    host.fail_with = None
-    queue.run()
-    assert [frame["message_sequence"] for frame in host.frames] == ["1", "1", "2"]
-    assert publisher.pending_sequences() == () and events == []
-    # Still not ready when the overall budget is spent: the fault latches.
-    host.fail_with = HeadlessApiError("bb_source_not_ready", "Apply installing")
-    store.write("count", 5)
-    queue.run()
-    clock.now += _BUDGET_NS + 1
-    assert publisher.check_budget() is True
-    assert [event[0] for event in events] == ["fault"]
-    assert "source not ready" in events[0][1]["message"]
+    assert [event[0] for event in events] == ["stop", "fault"]
+    assert host.frames[-1]["message_sequence"] == _LOSS_SEQUENCE
 
 
 def test_computed_key_is_published_only_when_its_value_changes() -> None:
     pytest.importorskip("manyforge_headless_py")
     store = _store(_program(_key("double", "int64", access="read", expression="key.count * 2")))
-    host, queue = _Host(), _Queue()
-    publisher = _publisher(host, queue)
+    host = _Host()
+    publisher = _publisher(host, _inline)
     publisher.start(store, ("door_open", "double"))
     store.write("count", 3)
     store.write("speed", 1.0)
     store.write("count", 3)
-    queue.run()
-    assert [
-        {row["name"]: row["value"] for row in frame["values"]} for frame in host.frames
-    ] == [
+    assert [_rows(frame) for frame in host.frames] == [
         {"door_open": False, "double": "0"},
         {"double": "6"},
     ]
@@ -523,23 +524,18 @@ def test_computed_key_is_published_only_when_its_value_changes() -> None:
 
 def test_next_run_or_shutdown_retires_the_sender() -> None:
     events: list[Any] = []
-    clock = _Clock()
     store = _store()
-    host, queue = _Host(), _Queue()
-    publisher = _publisher(host, queue, clock=clock, events=events)
+    host = _Host()
+    publisher = _publisher(host, _inline, events=events)
     publisher.start(store, _KEYS)
     publisher.retire()
     store.write("count", 4)
-    queue.run()
-    clock.now += _BUDGET_NS * 2
-    assert publisher.check_budget() is False
-    assert host.frames == [] and events == []
-    assert publisher.pending_sequences() == ()
+    assert [frame["kind"] for frame in host.frames] == ["baseline"] and events == []
 
 
 def test_subscription_is_fixed_once_and_scalar_only() -> None:
     store = _store()
-    publisher = _publisher(_Host(), _Queue())
+    publisher = _publisher(_Host(), _inline)
     for keys in (("pose",), ("undeclared",), ("count", "count"), ("speed", "count"), ()):
         with pytest.raises(ProgramValueError):
             store.subscribe_published_keys(
@@ -686,21 +682,18 @@ def _superseded(request: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def test_superseded_reply_retires_only_that_obligation() -> None:
+def test_superseded_reply_retires_the_source_without_a_fault() -> None:
     events: list[Any] = []
     store = _store()
-    host, queue = _Host(), _Queue()
-    publisher = _publisher(host, queue, events=events)
+    host = _Host()
+    publisher = _publisher(host, _inline, events=events)
     publisher.start(store, ("count", "label"))
-    queue.run()
-    store.write("label", "held")
-    store.write("count", 2)
-    store.write("count", 3)
     publisher._publish = lambda request: host(request) and _superseded(request)  # noqa: SLF001
-    queue.run()
-    assert [frame["message_sequence"] for frame in host.frames] == ["1", "2", "3"]
+    store.write("label", "held")
+    store.write("count", 2)  # The occurrence was replaced: nothing more is sent.
+    assert [frame["message_sequence"] for frame in host.frames] == ["1", "2"]
     assert events == []  # No Program Stop, no publisher fault.
-    assert publisher.fault is None and publisher.pending_sequences() == ()
+    assert publisher.fault is None
 
 
 def test_between_run_baseline_start_failure_keeps_the_source_without_fence(
@@ -845,7 +838,6 @@ def _publisher_for(
         stop_run=lambda _run_id: None,
         on_fault=lambda _fault, _reference: None,
         fault_reference=ProgramRuntime._digest,  # noqa: SLF001
-        budget_ns=_BUDGET_NS,
     )
 
 
@@ -1061,7 +1053,7 @@ def test_refused_between_run_baseline_is_declared_lost_without_fence(
     runtime._follow_cell_bbkey_source()  # noqa: SLF001
     fresh = runtime._bbkey_publishers[None]  # noqa: SLF001
     assert fresh.scope.cycle_generation == 8 and fresh.fault is None
-    assert fresh.pending_sequences() == ()
+    assert fresh.baseline_accepted
     assert host.frames[-1]["cycle_generation"] == 8
     assert host.frames[-1]["message_sequence"] == "1"
     assert receiver._handle(_heartbeat(sequence=4))["publisher_fault"] is None  # noqa: SLF001
@@ -1105,27 +1097,20 @@ def _queued_fencing_runtime(
     return runtime, journal, receiver, pool.queue
 
 
-def test_between_run_fault_fences_until_the_kernel_confirms_the_loss(
+def test_between_run_fault_is_lost_in_the_kernel_before_any_containment(
     tmp_path: Path,
 ) -> None:
-    # SX-543 (1): with queued (not inline) work, the window between the
-    # refusal and the Kernel's confirmed loss is fenced: nothing gated by the
-    # previous value can be admitted meanwhile.
+    # SX-543 (1) / BBK-1 (a): the refused sender declares its loss in the
+    # Kernel before its containment runs (queued, not inline), so nothing
+    # gated by the previous value can be admitted meanwhile.
     host = _ScriptedHost(_SEQUENCE_STALE, _SEQUENCE_GAP)
     runtime, _journal, receiver, queue = _queued_fencing_runtime(tmp_path, host)
     runtime._follow_cell_bbkey_source()  # noqa: SLF001
-    assert host.frames == []  # The baseline is still queued.
-    queue.work.pop(0)()  # The baseline is refused; containment is queued.
-    assert [frame["message_sequence"] for frame in host.frames] == ["1"]
-    assert len(queue.work) == 1
-    fenced = receiver._handle(_heartbeat(sequence=2))  # noqa: SLF001
-    assert fenced["publisher_fault"]["code"] == FAULT_CODE
-    assert fenced["command_fenced"] is True
-    with pytest.raises(ProgramRunnerLivenessError, match="publication fault"):
-        receiver.require_current()
-    queue.run()  # The loss frame: the Kernel confirms the exact-sender gap.
-    assert host.frames[-1]["message_sequence"] == str(2**64 - 1)
-    released = receiver._handle(_heartbeat(sequence=3))  # noqa: SLF001
+    assert [frame["message_sequence"] for frame in host.frames] == ["1", _LOSS_SEQUENCE]
+    assert runtime._bbkey_publishers[None].loss_confirmed  # noqa: SLF001
+    assert len(queue.work) == 1  # Containment, off the store lock.
+    queue.run()
+    released = receiver._handle(_heartbeat(sequence=2))  # noqa: SLF001
     assert released["publisher_fault"] is None and released["command_fenced"] is False
     receiver.require_current()
 
@@ -1133,47 +1118,42 @@ def test_between_run_fault_fences_until_the_kernel_confirms_the_loss(
 def test_late_reply_for_a_superseded_between_run_source_releases_the_fence(
     tmp_path: Path,
 ) -> None:
-    # SX-543 (2) / SX-547 (1): a Reset installs a newer source before the old
-    # loss is processed. The old scope-stale reply alone keeps the fence; the
-    # Kernel's ACK of the newer baseline releases it.
+    # SX-543 (2) / SX-547 (1): the old loss is unconfirmed (scope stale); the
+    # Kernel's ACK of the newer baseline releases the fence.
     host = _ScriptedHost(_SEQUENCE_STALE, _SCOPE_STALE)
     runtime, journal, receiver, queue = _queued_fencing_runtime(tmp_path, host)
     runtime._follow_cell_bbkey_source()  # noqa: SLF001
-    queue.work.pop(0)()  # Old baseline refused; its containment is queued.
     journal.cycle_generation = 8  # Reset: a new Idle cycle.
     runtime._follow_cell_bbkey_source()  # noqa: SLF001
     newer = runtime._bbkey_publishers[None]  # noqa: SLF001
-    assert newer.scope.cycle_generation == 8
-    queue.work.pop(0)()  # Old loss frame: scope stale, the newer one pending.
+    assert newer.scope.cycle_generation == 8 and newer.baseline_accepted
+    queue.work.pop(0)()  # The old containment: the fence latches.
     held = receiver._handle(_heartbeat(sequence=2))  # noqa: SLF001
     assert held["publisher_fault"]["code"] == FAULT_CODE and held["command_fenced"] is True
-    assert not newer.baseline_accepted
-    queue.run()  # The newer baseline is ACKed.
+    queue.run()  # The newer baseline's ACK settles the old loss.
     assert [(f["cycle_generation"], f["message_sequence"]) for f in host.frames] == [
-        (7, "1"), (7, str(2**64 - 1)), (8, "1"),
+        (7, "1"), (7, _LOSS_SEQUENCE), (8, "1"),
     ]
-    assert newer.fault is None and newer.pending_sequences() == ()
-    assert newer.baseline_accepted
+    assert newer.fault is None
     released = receiver._handle(_heartbeat(sequence=3))  # noqa: SLF001
     assert released["publisher_fault"] is None and released["command_fenced"] is False
     receiver.require_current()
 
 
 def test_unacked_successor_does_not_release_the_fence(tmp_path: Path) -> None:
-    # SX-547 (1): a successor inserted locally whose baseline is still pending
-    # (and an old gap reply that never confirms) is no proof: fence kept.
+    # SX-547 (1): a successor whose baseline is refused too (and an old gap
+    # reply that never confirms) is no proof: fence kept.
     host = _ScriptedHost(_SEQUENCE_STALE, _SCOPE_STALE, _SEQUENCE_STALE, _SCOPE_STALE)
     runtime, journal, receiver, queue = _queued_fencing_runtime(tmp_path, host)
     runtime._follow_cell_bbkey_source()  # noqa: SLF001
-    queue.work.pop(0)()  # Old baseline refused; containment queued.
     journal.cycle_generation = 8
     runtime._follow_cell_bbkey_source()  # noqa: SLF001
     successor = runtime._bbkey_publishers[None]  # noqa: SLF001
-    queue.work.pop(0)()  # Old loss: scope stale; successor pending.
     assert not successor.baseline_accepted
+    queue.work.pop(0)()  # The old containment: fenced.
     with pytest.raises(ProgramRunnerLivenessError, match="publication fault"):
         receiver.require_current()
-    queue.run()  # The successor's baseline is refused too: never ACKed.
+    queue.run()
     assert not successor.baseline_accepted
     held = receiver._handle(_heartbeat(sequence=2))  # noqa: SLF001
     assert held["publisher_fault"]["code"] == FAULT_CODE and held["command_fenced"] is True
@@ -1182,25 +1162,20 @@ def test_unacked_successor_does_not_release_the_fence(tmp_path: Path) -> None:
 
 def test_fence_waits_for_every_unconfirmed_loss(tmp_path: Path) -> None:
     # SX-547 (2): A and B both fault; A's confirmed loss alone does not lift
-    # the fence while B's gap reply is still delayed.
-    host = _ScriptedHost(_SEQUENCE_STALE, _SEQUENCE_STALE, _SEQUENCE_GAP, _SEQUENCE_GAP)
+    # the fence while B's loss is unconfirmed.
+    host = _ScriptedHost(_SEQUENCE_STALE, _SEQUENCE_GAP, _SEQUENCE_STALE, _SCOPE_STALE)
     runtime, journal, receiver, queue = _queued_fencing_runtime(tmp_path, host)
     runtime._follow_cell_bbkey_source()  # noqa: SLF001
-    queue.work.pop(0)()  # A's baseline refused: [contain A].
     journal.cycle_generation = 8
     runtime._follow_cell_bbkey_source()  # noqa: SLF001
-    queue.work.pop(1)()  # B's baseline refused: [contain A, contain B].
     assert len(queue.work) == 2
-    queue.work.pop(0)()  # A's gap is confirmed; B's is still delayed.
+    queue.run()
+    assert [frame["cycle_generation"] for frame in host.frames] == [7, 7, 8, 8]
     held = receiver._handle(_heartbeat(sequence=2))  # noqa: SLF001
     assert held["publisher_fault"]["code"] == FAULT_CODE and held["command_fenced"] is True
+    assert len(runtime._bbkey_open_losses) == 1  # noqa: SLF001
     with pytest.raises(ProgramRunnerLivenessError, match="publication fault"):
         receiver.require_current()
-    queue.run()  # B's gap is confirmed: no loss left unconfirmed.
-    assert [frame["cycle_generation"] for frame in host.frames] == [7, 8, 7, 8]
-    released = receiver._handle(_heartbeat(sequence=3))  # noqa: SLF001
-    assert released["publisher_fault"] is None and released["command_fenced"] is False
-    receiver.require_current()
 
 
 def test_late_ack_of_a_replaced_sender_leaves_the_newer_loss_open(tmp_path: Path) -> None:
@@ -1223,9 +1198,9 @@ def test_late_ack_of_a_replaced_sender_leaves_the_newer_loss_open(tmp_path: Path
     runtime, journal, receiver, queue = _queued_fencing_runtime(tmp_path, host)  # type: ignore[arg-type]
     holder.update(runtime=runtime, journal=journal, queue=queue)
     runtime._follow_cell_bbkey_source()  # noqa: SLF001
-    queue.work.pop(0)()  # A's drain: its ACK callback runs after B's fault.
+    queue.work.pop(0)()  # B's queued loss settlement; A's ACK callback follows.
     assert [(f["cycle_generation"], f["message_sequence"]) for f in frames] == [
-        (7, "1"), (8, "1"),
+        (7, "1"), (8, "1"), (8, _LOSS_SEQUENCE),
     ]
     assert len(runtime._bbkey_open_losses) == 1  # B's loss stays open.  # noqa: SLF001
     held = receiver._handle(_heartbeat(sequence=2))  # noqa: SLF001
@@ -1289,3 +1264,26 @@ def test_refused_run_publication_still_stops_the_run_and_fences(tmp_path: Path) 
     assert acknowledgement["command_fenced"] is True
     with pytest.raises(ProgramRunnerLivenessError, match="publication fault"):
         receiver.require_current()
+
+
+def test_a_source_not_ready_starts_later_from_the_values_committed_meanwhile(
+    tmp_path: Path,
+) -> None:
+    # BBK-1 (a): the Kernel has not installed the source yet (Reset just
+    # journaled): writes only commit, and the next liveness observation sends
+    # the baseline built from the store then. No fault, no fence.
+    host = _ScriptedHost(HeadlessApiError("bb_source_not_ready", "cycle not observed"))
+    runtime, _applied, _journal, receiver, stops = _fencing_runtime(tmp_path, host)
+    runtime._applied_condition_keys = ("door",)  # noqa: SLF001
+    runtime._follow_cell_bbkey_source()  # noqa: SLF001
+    assert None in runtime._bbkey_pending  # noqa: SLF001
+    runtime._bbkey_idle_store.write("door", True)  # noqa: SLF001
+    assert len(host.frames) == 1
+    runtime._retry_pending_bbkey_sources()  # The liveness observation.  # noqa: SLF001
+    assert [(f["kind"], f["message_sequence"]) for f in host.frames] == [
+        ("baseline", "1"), ("baseline", "1"),
+    ]
+    assert _rows(host.frames[1]) == {"door": True}
+    assert runtime._bbkey_pending == {} and stops == []  # noqa: SLF001
+    assert runtime._bbkey_publishers[None].baseline_accepted  # noqa: SLF001
+    assert receiver._handle(_heartbeat(sequence=2))["publisher_fault"] is None  # noqa: SLF001

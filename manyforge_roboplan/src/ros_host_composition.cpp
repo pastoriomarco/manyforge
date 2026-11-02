@@ -5,10 +5,10 @@
 #include "io_provider_lifecycle_product.hpp"
 
 #include <manyforge_roboplan/controller_launch_process.hpp>
-#include <manyforge_roboplan/retained_native_cell_runtime.hpp>
-#include <manyforge_roboplan/retained_native_component_owner.hpp>
-#include <manyforge_roboplan/retained_native_gripper_runtime.hpp>
-#include <manyforge_roboplan/retained_native_runtime.hpp>
+#include <manyforge_roboplan/retained_cell_runtime.hpp>
+#include <manyforge_roboplan/retained_component_owner.hpp>
+#include <manyforge_roboplan/retained_gripper_runtime.hpp>
+#include <manyforge_roboplan/retained_execution_host.hpp>
 
 #include <algorithm>
 #include <set>
@@ -51,6 +51,22 @@ bool IsProviderOnlyNativeComponent(
                          provider->provider_runtime_unit_id) !=
                    domain.runtime_unit_ids.end();
       });
+}
+
+std::vector<core::ControllableComponentId> MemberCarriedOwnerIds(const Composition &cell) {
+  std::vector<const Composition *> views{&cell};
+  for (const auto &peer : cell.participant_compositions) views.push_back(peer.get());
+  std::vector<core::ControllableComponentId> owners;
+  for (const auto *view : views)
+    if (view->owner_component &&
+        view->owner_component->component_id != view->controllable_component_id.value() &&
+        std::none_of(views.begin(), views.end(), [&](const auto *other) {
+          return other->controllable_component_id.value() == view->owner_component->component_id;
+        }))
+      owners.emplace_back(view->owner_component->component_id);
+  std::sort(owners.begin(), owners.end());
+  owners.erase(std::unique(owners.begin(), owners.end()), owners.end());
+  return owners;
 }
 
 core::Result<MockIoInputSetResult> SetCompositionMockInput(
@@ -109,7 +125,7 @@ Composition::~Composition() {
     if (cell_runtime != nullptr) {
       return &cell_runtime->addressed_kernel();
     }
-    return runtime != nullptr ? runtime->active_addressed_kernel() : nullptr;
+    return runtime != nullptr ? runtime->cell_addressed_kernel : nullptr;
   }
 
 [[nodiscard]] const void *Composition::component_runtime_identity() const noexcept {
@@ -119,9 +135,10 @@ Composition::~Composition() {
     return runtime.get();
   if (gripper_runtime)
     return gripper_runtime.get();
-  return io_provider_drivers && !io_provider_drivers->empty()
-             ? static_cast<const void *>(io_provider_drivers.get())
-             : nullptr;
+  if (io_provider_drivers && !io_provider_drivers->empty())
+    return io_provider_drivers.get();
+  // An adapter-only component (CONTRACTS §6, e.g. a sensor) is its adapter.
+  return component_adapter.get();
   }
 
 [[nodiscard]] std::vector<core::RuntimeUnitEpochBindingDTO>
@@ -154,14 +171,12 @@ Composition::~Composition() {
   Composition::component_registrations() const {
   std::vector<core::RuntimeParticipantExecutionRegistration> result;
   if (runtime != nullptr)
-    result = RetainedNativeComponentOwner(runtime).registrations();
+    result = RetainedComponentOwner(runtime).registrations();
   else if (gripper_runtime != nullptr)
-    result = RetainedNativeComponentOwner(gripper_runtime).registrations();
+    result = RetainedComponentOwner(gripper_runtime).registrations();
   else
-    Require(io_provider_drivers && !io_provider_drivers->empty(),
+    Require((io_provider_drivers && !io_provider_drivers->empty()) || component_adapter,
             "native component has no execution registration owner");
-  result.insert(result.end(), io_output_registrations.begin(),
-                io_output_registrations.end());
   return result;
   }
 
@@ -183,7 +198,7 @@ Composition::Composition(
       CanonicalValue selected_direct_control_motion_descriptor,
       CanonicalValue selected_direct_control_gripper_descriptor,
       std::shared_ptr<const RetainedPlanningModelStage> selected_stage,
-      std::shared_ptr<RetainedNativeRuntime> selected_runtime,
+      std::shared_ptr<RetainedExecutionHost> selected_runtime,
       core::ProjectionRevisionDTO selected_projection,
       core::ActiveBundlePublicationGeneration selected_generation,
       std::optional<core::TargetRoleId> selected_status_motion_target_role_id,
@@ -241,7 +256,6 @@ void BindHostIoRuleEvidenceProcessor(
       [weak = std::weak_ptr(actual_access)](
           const std::shared_ptr<core::IIoSignalService> &service,
           std::span<const core::InterruptSourceId> sources,
-          const core::LifecycleTransactionId &transaction,
           bool disabled) -> core::Result<void> {
         const auto access = weak.lock();
         if (!access)
@@ -255,8 +269,7 @@ void BindHostIoRuleEvidenceProcessor(
               {"invalid_state_transition",
                "Input lifecycle Kernel is unavailable",
                {}});
-        return kernel->SetGlobalIoSourcesPlannedDisabled(service, sources,
-                                                         transaction, disabled);
+        return kernel->SetGlobalIoSourcesPlannedDisabled(service, sources, disabled);
       });
 }
 
@@ -270,7 +283,38 @@ void ExecutionCompositionAccess::detach_addressed_owner() {
     selected->io_signal_runtime->DetachRuleEvidenceProcessor();
 }
 
-void ExecutionCompositionAccess::replace_current(Composition *replacement) {
+std::vector<core::CoordinatedComponent> CoordinatedComponentsOf(const Composition *cell) {
+  std::vector<core::CoordinatedComponent> components;
+  if (cell == nullptr) return components;
+  // CONTRACTS §16: an owner comes before its arm member (its composition
+  // builds it), and every member carries its owner and role. The owner of a
+  // machine with its arm deactivated is a view of its own (its adapter is
+  // the view's).
+  const auto add = [&](const Composition &view) {
+    if (view.owner_component) {
+      components.push_back(*view.owner_component);
+      components.back().owner = true;
+    }
+    if (view.component_adapter &&
+        !(view.owner_component &&
+          view.owner_component->component_id == view.controllable_component_id.value()))
+      components.push_back({view.controllable_component_id.value(), view.component_adapter,
+                            view.owner_id, view.member_role});
+    if (view.io_provider_drivers)
+      for (const auto &driver : *view.io_provider_drivers)
+        if (driver)
+          components.push_back(
+              {driver->domain().provider()->provider.controllable_component_id.value(), driver,
+               view.owner_id, view.member_role});
+  };
+  add(*cell);
+  for (const auto &participant : cell->participant_compositions)
+    if (participant) add(*participant);
+  return components;
+}
+
+std::vector<std::jthread> ExecutionCompositionAccess::replace_current(
+    Composition *replacement) {
     HostRobotTcpReaders readers;
     const auto stage = [&](const Composition &composition) {
       if (composition.staged_robot_tcp_reader)
@@ -288,8 +332,8 @@ void ExecutionCompositionAccess::replace_current(Composition *replacement) {
     // observed-state source. Waking a retained channel would falsely report
     // a controller disconnect to readers waiting on that stable source.
     if (current != nullptr && current != replacement) {
-      std::set<const RetainedNativeRuntime *> retained_motion;
-      std::set<const RetainedNativeGripperRuntime *> retained_grippers;
+      std::set<const RetainedExecutionHost *> retained_motion;
+      std::set<const RetainedGripperRuntime *> retained_grippers;
       const auto include_retained = [&](const Composition &composition) {
         if (composition.runtime != nullptr)
           retained_motion.insert(composition.runtime.get());
@@ -307,9 +351,6 @@ void ExecutionCompositionAccess::replace_current(Composition *replacement) {
           if (composition.runtime->motion_state_channel != nullptr)
             composition.runtime->motion_state_channel
                 ->notify_composition_replaced();
-          if (composition.runtime->gripper_state_channel != nullptr)
-            composition.runtime->gripper_state_channel
-                ->notify_composition_replaced();
         }
         if (composition.gripper_runtime != nullptr &&
             !retained_grippers.contains(composition.gripper_runtime.get())) {
@@ -324,16 +365,21 @@ void ExecutionCompositionAccess::replace_current(Composition *replacement) {
     }
     SelectHostRobotTcps(std::move(readers), [&] { current = replacement; });
     logical_product.reset();
+    // CONTRACTS §5, §11 (R3): the selected cell's components are the ones the
+    // component runtime coordinates; removed components no longer count.
+    if (!component_runtime) return {};
+    return component_runtime->SetComponents(CoordinatedComponentsOf(replacement));
   }
 
-void ExecutionCompositionAccess::replace_logical_product(
+std::vector<std::jthread> ExecutionCompositionAccess::replace_logical_product(
     std::shared_ptr<ExecutionProduct> replacement) {
   // Caller holds mutex exclusively and retains any physical predecessor until
   // its existing retirement checks complete. Reuse those exact notifications.
   Require(!replacement || (replacement->bundle &&
               replacement->bundle->value().cell_graph.controllable_components.empty()),
           "logical cell product contains an actual physical component");
-  replace_current(nullptr);
+  auto removed = replace_current(nullptr);
   logical_product = std::move(replacement);
+  return removed;
 }
 } // namespace manyforge::roboplan_backend::host_detail

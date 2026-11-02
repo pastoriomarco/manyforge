@@ -437,7 +437,6 @@ class ProgramRunTickHost:
         self,
         program_run_id: str,
         *,
-        expected_run_revision: int,
         expected_selection_revision: int,
         request_id: str,
         group_id: str | list[str] = "all",
@@ -446,7 +445,6 @@ class ProgramRunTickHost:
         try:
             return self._owner.resume_motion(
                 program_run_id,
-                expected_run_revision=expected_run_revision,
                 expected_selection_revision=expected_selection_revision,
                 request_id=request_id,
                 group_id=group_id,
@@ -461,7 +459,6 @@ class ProgramRunTickHost:
         self,
         program_run_id: str,
         *,
-        expected_run_revision: int,
         expected_selection_revision: int,
         request_id: str,
         group_id: str | list[str] = "all",
@@ -472,7 +469,6 @@ class ProgramRunTickHost:
         try:
             return self._owner.start_motion(
                 program_run_id,
-                expected_run_revision=expected_run_revision,
                 expected_selection_revision=expected_selection_revision,
                 request_id=request_id,
                 group_id=group_id,

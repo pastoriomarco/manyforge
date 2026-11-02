@@ -151,12 +151,15 @@ function controller(document: Record<string, JsonValue>): DeploymentWorkspaceCon
       unavailableReasons: [],
     },
     loading: false, busy: false, applying: false, error: null, feedback: null,
-    acceptedApply: null, acceptedApplyCorrelationId: null, activationScope: null,
-    pendingApplyConfirmation: null, mutationAvailable: true, mutationUnavailableReason: null,
+    applyPreview: null,
+    applyPreviewKind: 'apply',
+    applyConfirmationOpen: false,
+    busyOperation: null,
+    mutationAvailable: true, mutationUnavailableReason: null,
     documentUnavailableReason: null,
     refresh: vi.fn(), clearFeedback: vi.fn(), dismissError: vi.fn(), open: vi.fn(), mutate: vi.fn(),
     updateControlledStop: vi.fn(), updateMotionTargetLimit: vi.fn(), revert: vi.fn(), save: vi.fn(),
-    saveAs: vi.fn(), discard: vi.fn(), applyDraft: vi.fn(), confirmApply: vi.fn(),
+    saveAs: vi.fn(), discard: vi.fn(), applyDraft: vi.fn(), applyConfirmedScope: vi.fn(), confirmApply: vi.fn(),
     cancelApplyConfirmation: vi.fn(),
   } as unknown as DeploymentWorkspaceController;
 }

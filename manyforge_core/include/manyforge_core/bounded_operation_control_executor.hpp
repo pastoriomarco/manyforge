@@ -38,7 +38,6 @@ struct OperationControlEffectRequest final {
   OperationParticipantPayloadKind payload_kind{OperationParticipantPayloadKind::kMotion};
   std::string command_target;
   std::uint64_t subordinate_generation{};
-  std::optional<IoOutputResetAuthorityDTO> output_reset_authority{};
 };
 
 struct OperationControlEffectResult final {

@@ -21,9 +21,7 @@ namespace {
                                          const RuntimeParticipantBindingDTO& rhs) noexcept {
   return lhs.program_binding_id == rhs.program_binding_id &&
          lhs.component_role_id == rhs.component_role_id &&
-         lhs.target_role_id == rhs.target_role_id && lhs.capability_id == rhs.capability_id &&
-         (!lhs.io_output_binding || !rhs.io_output_binding ||
-          lhs.io_output_binding->resource_role_id == rhs.io_output_binding->resource_role_id);
+         lhs.target_role_id == rhs.target_role_id && lhs.capability_id == rhs.capability_id;
 }
 
 [[nodiscard]] const ProgramFrameRoleBindingDTO* find_frame(
@@ -61,31 +59,21 @@ namespace {
           // Active TCP (M7): the robot's motion target, its endpoint resolved
           // from the selector exactly as a move's.
           if (!runtime.control_path.has_value() || runtime.resources.empty() ||
-              runtime.io_output_binding || !runtime.motion_endpoint ||
+              !runtime.motion_endpoint ||
               !tcp_selector_admits(payload.tcp, *runtime.motion_endpoint, std::nullopt)) {
             return reject("Set TCP lacks the robot's exact runtime mapping",
                           "runtime_motion_mapping_incomplete");
           }
           return Result<RuntimeParticipantBinding>::Ok(binding);
         } else {
-          if (const auto* output = std::get_if<IoSignalWriteCommandValueDTO>(&payload.command_value)) {
-            if (!runtime.io_output_binding || runtime.control_path || !runtime.command_schema ||
-                runtime.command_schema->command_schema_id != payload.command_schema_id ||
-                runtime.command_schema->command_schema_revision != payload.command_schema_revision ||
-                runtime.io_output_binding->resource_role_id != output->resource_role_id) {
-              return reject("output command lacks its exact sealed provider channel and schema",
-                            "runtime_io_output_mapping_incomplete");
-            }
-            return Result<RuntimeParticipantBinding>::Ok(binding);
-          }
-          if (runtime.io_output_binding || !runtime.control_path.has_value() || !runtime.command_schema.has_value() ||
+          if (!runtime.control_path.has_value() || !runtime.command_schema.has_value() ||
               runtime.command_schema->command_schema_id != payload.command_schema_id ||
               runtime.command_schema->command_schema_revision != payload.command_schema_revision ||
               runtime.resources.empty()) {
             return reject("capability command lacks its exact runtime schema or path",
                           "runtime_command_mapping_incomplete");
           }
-          const auto& command = std::get<GripperPositionCommandValueDTO>(payload.command_value);
+          const auto& command = payload.command_value;
           const auto kind = coordinate_kind(command.position);
           if (std::any_of(runtime.resources.begin(), runtime.resources.end(),
                           [&](const RuntimeResourceBindingDTO& resource) {
@@ -118,8 +106,6 @@ RuntimeParticipantRegistry::RuntimeParticipantRegistry(
     for (const auto& resource : value.resources) {
       resource_inventory_.push_back(resource.resource_id);
     }
-    if (value.io_output_binding)
-      resource_inventory_.push_back(*value.io_output_binding->signal.output_resource);
   }
   std::sort(resource_inventory_.begin(), resource_inventory_.end());
   resource_inventory_.erase(std::unique(resource_inventory_.begin(), resource_inventory_.end()),
@@ -153,12 +139,6 @@ Result<RuntimeParticipantBinding> RuntimeParticipantRegistry::resolve(
         value.target_role_id != participant.target_role_id ||
         value.capability_id != participant.required_capability_id) {
       continue;
-    }
-    if (const auto* command = std::get_if<CapabilityCommandIntentDTO>(&participant.payload)) {
-      if (const auto* output = std::get_if<IoSignalWriteCommandValueDTO>(&command->command_value)) {
-        if (!value.io_output_binding ||
-            value.io_output_binding->resource_role_id != output->resource_role_id) continue;
-      }
     }
     if (match != nullptr) {
       return reject("operation participant resolution is ambiguous",

@@ -25,19 +25,8 @@ CaptureCompositionIoResourcePredecessors(
 // projections. New resources are paused; retained source/alias replacement is
 // an actual Apply effect, including the approved once-publication model reset.
 [[nodiscard]] core::Result<void> PrepareCompositionIoProviderResources(
-    Composition &candidate, RetainedNativeCellRuntime &cell,
+    Composition &candidate, RetainedCellRuntime &cell,
     rclcpp::Node::SharedPtr generic_node,
     std::span<const CompositionIoResourcePredecessor> actual_existing);
-
-using IoProviderConstructionGenerations =
-    std::map<core::ControllableComponentId, core::ComponentLifecycleGeneration>;
-
-// Generations must come from the actual accepted CCLC child/recorded Apply
-// plan, or the actual published facade's current snapshot. This constructs
-// CLOSED binding metadata only; no driver/readiness/admission fact is
-// manufactured.
-[[nodiscard]] core::Result<void> BindCompositionIoOutputParticipants(
-    Composition &candidate,
-    const IoProviderConstructionGenerations &actual_generations);
 
 } // namespace manyforge::roboplan_backend::host_detail

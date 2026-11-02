@@ -1,7 +1,7 @@
 """Frozen O1.2 profile-adapter protocol (internal, not a public SDK surface).
 
 This module is the narrow seam between the common operator-launch
-orchestration (O1.3+) and the native/Isaac profile adapters.  It defines
+orchestration (O1.3+) and the standard/Isaac profile adapters.  It defines
 only typed request/result DTOs and protocols:
 
 * the common orchestration owns the lock, the status record, durable
@@ -121,7 +121,7 @@ class OwnedResourceRecorder(Protocol):
 
 
 class ProfileAdapter(Protocol):
-    """Protocol boundary for native/Isaac profile adapters.
+    """Protocol boundary for standard/Isaac profile adapters.
 
     No implementation is provided at this slice; the common
     orchestration selects and drives one qualified adapter per profile.

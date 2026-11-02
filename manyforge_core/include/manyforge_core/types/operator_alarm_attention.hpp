@@ -35,27 +35,16 @@ inline constexpr Duration kOperatorAlarmAttentionMaximumSnapshotAgeNs = 2'000'00
 /// Stable refusal reasons (spec 450 §5.2, spec 530 §11).
 inline constexpr std::string_view kOperatorAlarmInterlockActiveReason =
     "operator_alarm_interlock_active";
-inline constexpr std::string_view kUnacknowledgedOperatorAlarmsReason =
-    "unacknowledged_operator_alarms";
 inline constexpr std::string_view kOperatorAlarmStateUnavailableReason =
     "operator_alarm_state_unavailable";
 
-/// Why one motion-attention record gates: a condition interlock
-/// (`acknowledgement_required=false`) gates exactly while active; an
-/// acknowledgement-gated record gates while unacknowledged.
-enum class OperatorAlarmAttentionGateDTO {
-  kConditionInterlock,
-  kAcknowledgement,
-};
-
-[[nodiscard]] std::string_view to_string(OperatorAlarmAttentionGateDTO value) noexcept;
-
-/// One gating `motion_attention_membership` record with its canonical subject.
+/// One gating `motion_attention_membership` record with its canonical subject:
+/// a condition interlock (an alarm that needs no acknowledgement), present
+/// exactly while active. Acknowledgement never gates work (V2-5).
 struct OperatorAlarmAttentionMemberDTO final {
   std::string condition_id;
   std::string activation_id;
   std::uint64_t record_revision{};
-  OperatorAlarmAttentionGateDTO gate{OperatorAlarmAttentionGateDTO::kAcknowledgement};
   std::string subject_kind;
   std::string subject_id;
   /// Sorted, unique canonical Kernel resource ids; empty only for the
@@ -141,9 +130,8 @@ struct RetainedOperatorAlarmAttentionDTO final {
 /// reserved resource set (union over coordinated participants) is
 /// `reserved_resources`. Returns the refusal, or nothing when this attention
 /// input admits the operation. A matching condition interlock reports
-/// `operator_alarm_interlock_active`, else a matching acknowledgement-gated
-/// record reports `unacknowledged_operator_alarms`; both memberships are always
-/// carried (each bounded, see `kMaximumOperatorAlarmRefusalMembershipBytes`).
+/// `operator_alarm_interlock_active` with its membership (bounded, see
+/// `kMaximumOperatorAlarmRefusalMembershipBytes`).
 /// A missing, unreconciled, foreign-cell, stale snapshot, or one judged
 /// against another active configuration than `active_configuration` (the
 /// Kernel's own), reports `operator_alarm_state_unavailable`.

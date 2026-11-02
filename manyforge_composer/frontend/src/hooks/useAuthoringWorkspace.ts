@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-import { api, ApiError, apiErrorCode, failedAuthoringRequest, isStaleWorkspaceError, refusedBeforeEffect, type AuthoringRequestIdentity } from '../api/client';
+import { api, ApiError, apiErrorCode, currentScenarioText, failedAuthoringRequest, isStaleWorkspaceError, KnownOutcomeError, refusedBeforeEffect, type AuthoringRequestIdentity } from '../api/client';
 import { parseManagerApplyAvailability } from '../api/parsers';
+import { authoringOperation, busyReason, type AuthoringCommand, type BusyOperation } from '../state/busyOperation';
 import { sameManagerApply, type ManagerApplyIdentity } from '../state/managerApply';
 import { errorMessage } from '../state/structuralResource';
 import {
@@ -10,6 +11,7 @@ import {
   draftEditUnavailableReason,
   projectFacts,
   publicationIsCurrent,
+  scenarioReplacementUnavailableReason,
   type PublishedAuthoringWorkspace,
 } from '../state/authoringWorkspace';
 import type { AuthoringWorkspaceProjectFacts, ManagerApplyStatus } from '../types/api';
@@ -45,9 +47,18 @@ export function useAuthoringWorkspace(
   const inFlight = useRef(new Map<string, Promise<void>>());
   const installedKey = useRef<string | null>(null);
   const reconnectPending = useRef(false);
-  const submission = useRef<null | 'sending' | 'unknown' | ManagerApplyIdentity>(null);
+  // Gates only while this browser's own request is in flight, or until the
+  // owner observes the Apply its reply accepted.
+  const submission = useRef<null | 'sending' | ManagerApplyIdentity>(null);
   const [submissionState, setSubmissionState] = useState<typeof submission.current>(null);
-  const unknownRequest = useRef<AuthoringRequestIdentity | null>(null);
+  // The operation this browser submitted, named until its submission settles.
+  const [submittedOperation, setSubmittedOperation] = useState<BusyOperation | null>(null);
+  // A lost reply is the browser's own uncertainty, not backend state: it gates
+  // nothing (backend admission decides) and is only shown, until Recheck reads
+  // the outcome or a later successful action settles it. Nothing is replayed.
+  // `request` is the exact identity Recheck can look up, when there is one.
+  const unconfirmed = useRef<{ request: AuthoringRequestIdentity | null } | null>(null);
+  const [unconfirmedState, setUnconfirmedState] = useState<typeof unconfirmed.current>(null);
   const recheckingRef = useRef(false);
   const [rechecking, setRechecking] = useState(false);
   const [recheckMessage, setRecheckMessage] = useState<string | null>(null);
@@ -55,17 +66,21 @@ export function useAuthoringWorkspace(
   const manager = snapshot?.runtime.sections?.manager;
   const managerAdmission = useMemo(() => {
     if (!manager?.available || manager.freshness !== 'fresh') {
-      return { records: [], reason: 'Current Manager status is unavailable.' };
+      return { records: [], reason: 'Current Manager status is unavailable.', replaceReason: null, applying: null };
     }
     try {
       const apply = parseManagerApplyAvailability(manager.payload?.apply, 'manager.payload.apply');
+      const inFlight = apply.records.some((record) => record.incomplete);
       return {
         records: apply.records,
-        reason: !apply.mutationAvailable || apply.records.some((record) => record.incomplete)
+        reason: !apply.mutationAvailable || inFlight
           ? 'A Manager operation is pending or authoring is unavailable.' : null,
+        // New and Load wait only for an Apply actually in flight (R3).
+        replaceReason: inFlight ? 'A Manager Apply is in progress.' : null,
+        applying: inFlight,
       };
     } catch {
-      return { records: [], reason: 'Manager operation status is invalid.' };
+      return { records: [], reason: 'Manager operation status is invalid.', replaceReason: null, applying: null };
     }
   }, [manager]);
 
@@ -85,8 +100,8 @@ export function useAuthoringWorkspace(
     // A lost reply is not a lost operation. Every Manager-submitting route
     // records this browser's own request id as the Apply's correlation id, so
     // the exact record (never merely the latest one) identifies its Apply.
-    const request = unknownRequest.current;
-    if (submission.current !== 'unknown' || request === null) return;
+    const request = unconfirmed.current?.request ?? null;
+    if (request === null) return;
     // An Apply sent with a shared correlation (Apply after Reset) is
     // recorded under that correlation instead of its own request id.
     const record = managerAdmission.records.find(
@@ -94,12 +109,11 @@ export function useAuthoringWorkspace(
     );
     if (record === undefined) return;
     const identity = { applyId: record.applyId, applyGeneration: record.applyGeneration };
-    submission.current = identity;
-    unknownRequest.current = null;
-    setSubmissionState(identity);
+    unconfirmed.current = null;
+    setUnconfirmedState(null);
     setCorrelatedApply(identity);
     setRecheckMessage(`Request ${request.requestId}: Manager recorded Apply ${identity.applyId} (${identity.applyGeneration}).`);
-  }, [managerAdmission, submissionState]);
+  }, [managerAdmission, unconfirmedState]);
 
   const observed = snapshot === null ? null : snapshot.authoringWorkspace;
   const observedKey = observed === null
@@ -199,49 +213,92 @@ export function useAuthoringWorkspace(
   const editOwnerReason = transportStatus !== 'connected'
     ? 'Current backend status is unavailable.'
     : draftEditUnavailableReason(published, snapshot);
+  // New and Load: the server decides a run (R3); the rest still applies.
+  const replaceOwnerReason = transportStatus !== 'connected'
+    ? 'Current backend status is unavailable.'
+    : scenarioReplacementUnavailableReason(published, snapshot) ?? managerAdmission.replaceReason;
+  const operation = submissionState === null ? null : submittedOperation;
   const submissionReason = submissionState === null ? null
-    : submissionState === 'unknown' ? 'Submission outcome is unconfirmed; inspect backend status before further changes.'
-      : 'Waiting for the submitted operation to be observed by the backend.';
+    : busyReason(operation) ?? 'Waiting for the submitted operation to be observed by the backend.';
   const unavailableReason = submissionReason ?? ownerReason;
   const editUnavailableReason = submissionReason ?? editOwnerReason;
-  /** `edit`: a Draft-only edit (or Discard); `document`: every other action. */
-  const beginMutation = useCallback((kind: 'edit' | 'document' = 'document') => {
+  const replaceUnavailableReason = submissionReason ?? replaceOwnerReason;
+  /**
+   * `edit`: a Draft-only edit (or Discard); `replace`: New, Load or Close;
+   * `document`: every other action. `command` names the operation to the
+   * GUI (its button's busy label, the other commands' tooltips) until it settles.
+   */
+  const beginMutation = useCallback((
+    kind: 'edit' | 'replace' | 'document',
+    command: AuthoringCommand,
+  ) => {
     if (submission.current !== null
-      || (kind === 'edit' ? editOwnerReason : ownerReason) !== null) return false;
+      || (kind === 'edit' ? editOwnerReason : kind === 'replace' ? replaceOwnerReason : ownerReason) !== null) return false;
     submission.current = 'sending';
-    unknownRequest.current = null;
     setRecheckMessage(null);
+    setSubmittedOperation(authoringOperation(command));
     setSubmissionState('sending');
     return true;
-  }, [editOwnerReason, ownerReason]);
+  }, [editOwnerReason, ownerReason, replaceOwnerReason]);
   const finishMutation = useCallback((accepted: ManagerApplyIdentity | null = null, failure?: unknown) => {
     // Only a definite refusal proves that the effect was not accepted: the
     // backend's before-effect marker, a typed stale fence, a Manager
     // rejection or a client-error status. A transport/parse/server failure is
     // not permission to replay a mutation.
-    submission.current = failure === undefined ? accepted
-      : refusedBeforeEffect(failure) || isStaleWorkspaceError(failure)
-        || apiErrorCode(failure) === 'manager_apply_rejected'
-        || (failure instanceof ApiError && [400, 403, 404, 422].includes(failure.status))
-        ? null : 'unknown';
-    unknownRequest.current = submission.current === 'unknown' ? failedAuthoringRequest(failure) : null;
-    if (unknownRequest.current !== null) {
-      setRecheckMessage(`Request ${unknownRequest.current.requestId}${unknownRequest.current.path ? ` (${unknownRequest.current.path})` : ''}: outcome unconfirmed.`);
-    }
+    // A request error re-worded for the operator is classified by its cause.
+    const settled = failure instanceof Error && failure.cause !== undefined ? failure.cause : failure;
+    const definite = failure === undefined
+      || settled instanceof KnownOutcomeError
+      || refusedBeforeEffect(settled) || isStaleWorkspaceError(settled)
+      || apiErrorCode(settled) === 'manager_apply_rejected'
+      || (settled instanceof ApiError && [400, 403, 404, 422].includes(settled.status));
+    submission.current = failure === undefined ? accepted : null;
     setSubmissionState(submission.current);
+    if (failure === undefined) {
+      // A later successful action settles an earlier lost reply.
+      unconfirmed.current = null;
+      setUnconfirmedState(null);
+    } else if (!definite) {
+      const request = failedAuthoringRequest(failure);
+      unconfirmed.current = { request };
+      setUnconfirmedState(unconfirmed.current);
+      setRecheckMessage(request === null ? null
+        : `Request ${request.requestId}${request.path ? ` (${request.path})` : ''}: outcome unconfirmed.`);
+    }
   }, []);
   const recheckSubmission = useCallback(async () => {
-    if (submission.current !== 'unknown' || recheckingRef.current) return;
-    const request = unknownRequest.current;
+    const pending = unconfirmed.current;
+    if (pending === null || recheckingRef.current) return;
+    const request = pending.request;
     if (request === null) {
-      setRecheckMessage('The failed request has no verifiable identity. Its outcome remains unknown.');
+      // No exact record to look up: settled from current state. With no Apply
+      // in flight the lost request has ended; the current Scenario says how.
+      if (managerAdmission.applying !== false) {
+        setRecheckMessage(managerAdmission.applying === null
+          ? 'Current Manager status is unavailable; recheck once it is back. Nothing was retried.'
+          : 'A Manager Apply is still in progress; recheck once it ends. Nothing was retried.');
+        return;
+      }
+      recheckingRef.current = true;
+      setRechecking(true);
+      try {
+        const text = await currentScenarioText();
+        if (!mounted.current || unconfirmed.current !== pending) return;
+        unconfirmed.current = null;
+        setUnconfirmedState(null);
+        setRecheckMessage(`${text} Nothing was retried.`);
+        await refresh();
+      } finally {
+        recheckingRef.current = false;
+        if (mounted.current) setRechecking(false);
+      }
       return;
     }
     recheckingRef.current = true;
     setRechecking(true);
     try {
       const outcome = await api.authoringWorkspace.submissionOutcome(request);
-      if (!mounted.current || submission.current !== 'unknown' || unknownRequest.current !== request) return;
+      if (!mounted.current || unconfirmed.current !== pending) return;
       if (outcome === null) {
         setRecheckMessage('No confirmed outcome is available for this exact request. It may still be processing, or its evidence is unavailable. Nothing was retried.');
         return;
@@ -251,10 +308,9 @@ export function useAuthoringWorkspace(
       const status = outcome.apply === null ? null : await api.manager.applyStatus(
         outcome.apply.applyId, outcome.apply.applyGeneration,
       );
-      if (!mounted.current || submission.current !== 'unknown' || unknownRequest.current !== request) return;
-      submission.current = status?.state === 'pending' ? outcome.apply : null;
-      unknownRequest.current = null;
-      setSubmissionState(submission.current);
+      if (!mounted.current || unconfirmed.current !== pending) return;
+      unconfirmed.current = null;
+      setUnconfirmedState(null);
       setRecheckMessage(outcome.apply === null
         ? `Request ${request.requestId}: the authoring change is confirmed settled.`
         : `Request ${request.requestId}: Apply ${outcome.apply.applyId} (${outcome.apply.applyGeneration}) is ${status!.state}. Backend admission still applies.`);
@@ -265,7 +321,7 @@ export function useAuthoringWorkspace(
       recheckingRef.current = false;
       if (mounted.current) setRechecking(false);
     }
-  }, [refresh]);
+  }, [managerAdmission.applying, refresh]);
   const observeApply = useCallback((status: ManagerApplyStatus | null) => {
     const pending = submission.current;
     // Bounded stream inventories may age a completed record out. An exact
@@ -286,21 +342,26 @@ export function useAuthoringWorkspace(
     unavailableReason,
     /** Why a Draft-only edit (or Discard) is unavailable, or ``null``. */
     editUnavailableReason,
+    /** Why New, Load or Close is unavailable, or ``null``. */
+    replaceUnavailableReason,
     /** The Scenario project facts of the installed publication. */
     project: facts,
     reading,
     error,
     refresh,
+    /** The submitted operation in progress (busy label and tooltip), or null. */
+    operation,
     beginMutation,
     finishMutation,
     observeApply,
-    submissionUnconfirmed: submissionState === 'unknown',
+    /** A lost reply's outcome is not known yet; informational, gates nothing. */
+    submissionUnconfirmed: unconfirmedState !== null,
     /** The Manager Apply found for a lost reply by its exact request id. */
     correlatedApply,
     rechecking,
     recheckMessage,
     recheckSubmission,
-  }), [current, error, facts, published, reading, refresh, unavailableReason, editUnavailableReason, beginMutation, finishMutation, observeApply, submissionState, correlatedApply, rechecking, recheckMessage, recheckSubmission]);
+  }), [current, error, facts, published, reading, refresh, operation, unavailableReason, editUnavailableReason, replaceUnavailableReason, beginMutation, finishMutation, observeApply, unconfirmedState, correlatedApply, rechecking, recheckMessage, recheckSubmission]);
 }
 
 export type AuthoringWorkspaceController = ReturnType<typeof useAuthoringWorkspace>;

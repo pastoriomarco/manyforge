@@ -382,7 +382,7 @@ export function ProgramSettingsEditor({
       velocity_scale: values.velocity_scale,
       acceleration_scale: values.acceleration_scale,
       translation_tol_m: values.translation_tol_m,
-      max_blend_deviation_rad: values.max_blend_deviation_rad,
+      blend_radius_m: values.blend_radius_m,
       parameter_bindings: motionConfiguration.configuration.bindings,
       conflict_resolution: conflictResolution,
     });
@@ -407,10 +407,10 @@ export function ProgramSettingsEditor({
       || motion.acceleration_scale > 1
       || !Number.isFinite(motion.translation_tol_m)
       || motion.translation_tol_m <= 0
-      || !Number.isFinite(motion.max_blend_deviation_rad)
-      || motion.max_blend_deviation_rad < 0
+      || !Number.isFinite(motion.blend_radius_m)
+      || motion.blend_radius_m < 0
     ) {
-      setMotionError('Scales must be in (0, 1], translation tolerance must be positive, and blend deviation must be non-negative.');
+      setMotionError('Scales must be in (0, 1], translation tolerance must be positive, and corner blend radius must be non-negative.');
       return;
     }
     const count = motionConflictCount(motion);
@@ -517,7 +517,7 @@ export function ProgramSettingsEditor({
         <p>
           These are portable Program defaults. Velocity, acceleration and TCP
           speed remain ceilings; Cartesian nodes may override the inherited
-          path tolerance and blend value. The live command-bar Velocity
+          path tolerance and corner blend radius. The live command-bar Velocity
           control further scales current and subsequent compatible moves for
           the addressed target without changing these Program values.
         </p>
@@ -593,22 +593,22 @@ export function ProgramSettingsEditor({
                   <span>m</span>
                 </span>
               </label>
-              <label>
-                Max blend deviation
+              <label title="0 keeps exact corners; the tool stops at sharp corners.">
+                Corner blend radius
                 <span className="dunit">
                   <input
-                    aria-label="Program maximum Cartesian blend deviation"
+                    aria-label="Program Cartesian corner blend radius"
                     type="number"
                     min="0"
-                    step="0.005"
-                    value={motion.max_blend_deviation_rad}
+                    step="0.001"
+                    value={motion.blend_radius_m}
                     disabled={busy}
                     onChange={(event) => setMotion((current) => current === null ? null : ({
                       ...current,
-                      max_blend_deviation_rad: event.currentTarget.valueAsNumber,
+                      blend_radius_m: event.currentTarget.valueAsNumber,
                     }))}
                   />
-                  <span>rad</span>
+                  <span>m</span>
                 </span>
               </label>
             </div>

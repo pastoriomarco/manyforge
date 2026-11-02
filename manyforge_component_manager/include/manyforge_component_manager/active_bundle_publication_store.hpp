@@ -13,8 +13,8 @@
 namespace manyforge::component_manager {
 
 inline constexpr std::string_view kActiveBundlePublicationStoreSchemaId =
-    "manyforge.internal.active-bundle-publication-store.i4.v1";
-inline constexpr std::int64_t kActiveBundlePublicationStoreSchemaVersion = 1;
+    "manyforge.internal.active-bundle-publication-store.i4.v2";
+inline constexpr std::int64_t kActiveBundlePublicationStoreSchemaVersion = 2;
 inline constexpr std::int64_t kActiveBundlePublicationStoreSqliteApplicationId =
     1296449872;
 inline constexpr std::int64_t kMaximumActiveBundlePublicationReceipts = 4096;
@@ -69,7 +69,9 @@ struct ActiveBundlePublicationStoreIntegrityReport final {
 ///
 /// The store contains no Manager journal, scene/process/Kernel/robot effect,
 /// compiler product construction, or caller authority. Exact immutable
-/// receipts are retained for idempotent Publish replay and integrity. The
+/// receipts are retained for idempotent Publish replay and integrity, bounded
+/// by eviction: publishing into a full inventory first deletes the oldest
+/// receipt (never the head). The
 /// reader capability succeeds only when its requested generation still names
 /// the singleton active pointer.
 class SqliteActiveBundlePublicationStore final

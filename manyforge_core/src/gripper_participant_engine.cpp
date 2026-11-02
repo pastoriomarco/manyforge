@@ -20,7 +20,7 @@ namespace {
     return false;
   }
   const auto& resource = binding.resources.front();
-  const auto& value = std::get<GripperPositionCommandValueDTO>(command->command_value);
+  const auto& value = command->command_value;
   const auto kind = coordinate_kind(value.position);
   const auto target = kind == CoordinateKind::kAngular
                           ? std::get<AngularPositionDTO>(value.position).value_rad
@@ -32,11 +32,17 @@ namespace {
                  : std::get<LinearEffortDTO>(*value.max_effort).value_n;
   }
   double duration = 0.0;
+  bool wait_for_duration = false;
   for (const auto& option : command->validated_options) {
-    if (option.option_id.value() != "command_duration_s") {
+    const auto* value_s = std::get_if<double>(&option.value);
+    const auto* value_bool = std::get_if<bool>(&option.value);
+    if (option.option_id.value() == "command_duration_s" && value_s != nullptr) {
+      duration = *value_s;
+    } else if (option.option_id.value() == "wait_for_duration" && value_bool != nullptr) {
+      wait_for_duration = *value_bool;
+    } else {
       return false;
     }
-    duration = option.value_s;
   }
   const bool model_backed = resource.source_joint_name.has_value();
   const auto expected_group = model_backed && binding.model_groups.size() == 1U
@@ -46,6 +52,7 @@ namespace {
          request.group_id == expected_group &&
          request.joint_name == resource.compiled_resource_name &&
          request.target_position == target && request.duration_s == duration &&
+         request.wait_for_duration == wait_for_duration &&
          request.max_effort == effort && request.commanded_state == "position" &&
          request.actuation_kind == (kind == CoordinateKind::kAngular ? "angular" : "linear") &&
          request.state_authority == binding.control_path->state_authority_id.value() &&
@@ -268,11 +275,6 @@ AddressedParticipantStopFenceDisposition GripperParticipantEngine::fence_address
 
 Result<std::uint64_t> GripperParticipantEngine::PrepareCapabilityCommand(
     ResolvedPreparedCapabilityCommandExecutionRequestDTO request) {
-  if (request.output() != nullptr) {
-    return Result<std::uint64_t>::Err(ErrorDTO{kErrorUnsupportedCapability,
-        "Gripper participant cannot prepare a boolean output",
-        {{"reason", "prepared_command_transport_mismatch"}}});
-  }
   if (!request.participant) {
     return Result<std::uint64_t>::Err(
         ErrorDTO{kErrorInvalidRequest,
